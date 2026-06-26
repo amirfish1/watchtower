@@ -5,6 +5,7 @@ Phase-1 commands:
 
     wt status                 per-queue depth / oldest-open age / stuck flag
     wt queues                 list queues + counts
+    wt ls -q Q [--status ..]  list the tickets in one queue
     wt enqueue -q Q --title.. file a ticket
     wt claim -q Q             claim the oldest open ticket (atomic)
     wt next -q Q              alias for claim
@@ -126,6 +127,32 @@ def cmd_queues(args: argparse.Namespace) -> int:
             f"{name:<14}{c['open']:>5}{c['in_progress']:>5}"
             f"{c['closed']:>6}{c['total']:>7}"
         )
+    return 0
+
+
+def cmd_ls(args: argparse.Namespace) -> int:
+    """List the tickets in a single queue (the actual items, not just counts)."""
+    items = q.list_items(project=args.queue)
+    want = args.status
+    if want == "active":
+        items = [i for i in items if i.get("status") in ("open", "in_progress")]
+    elif want != "all":
+        items = [i for i in items if i.get("status") == want]
+    if args.json:
+        print(json.dumps(items, indent=2))
+        return 0
+    if not items:
+        print(f"(no {('' if want=='all' else want+' ')}items in {args.queue})")
+        return 0
+    limit = args.limit or len(items)
+    print(f"{'REF':<14}{'STATUS':<12}{'WORKER':<22}TITLE")
+    print("-" * 72)
+    for it in items[:limit]:
+        worker = str(it.get("claimed_by") or it.get("claimed_session_id") or "")[:20]
+        title = (it.get("title") or it.get("note") or "")[:56]
+        print(f"{str(it.get('ref','')):<14}{str(it.get('status','')):<12}{worker:<22}{title}")
+    if len(items) > limit:
+        print(f"... and {len(items) - limit} more (raise --limit)")
     return 0
 
 
@@ -330,6 +357,18 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("queues", help="list queues + counts")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_queues)
+
+    s = sub.add_parser("ls", help="list the tickets in one queue")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument(
+        "--status",
+        default="active",
+        choices=["active", "open", "in_progress", "closed", "all"],
+        help="which tickets to show (default: active = open + in_progress)",
+    )
+    s.add_argument("--limit", type=int, default=0, help="max rows (0 = all)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_ls)
 
     s = sub.add_parser("enqueue", help="file a ticket")
     s.add_argument("-q", "--queue", required=True)
