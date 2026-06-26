@@ -27,6 +27,8 @@ wt enqueue -q DEMO --title "Fix nav" --note "navbar overlaps on mobile" \
 wt claim  -q DEMO                      # claim the oldest open ticket (atomic)
 wt next   -q DEMO                      # alias for claim
 wt close  DEMO-1                       # close a ticket by ref
+wt close  DEMO-1 --summary "fixed the overlap" \
+          --caveat "only tested on iOS" --follow-up "add a regression test"
 
 wt workers                             # list worker subprocesses this CLI started
 wt spawn-worker -q DEMO --n 2 --engine claude   # launch 2 draining workers
@@ -104,7 +106,8 @@ alongside the watcher in one process (`--host`/`--port` apply there as well).
 - A **workers** section — worker id (mono), queue, activity (`→ SHIP-3 (4m)` or
   `idle`), and a LIVE / DEAD pill.
 - **Drill-down** — clicking a queue card opens `/q/<queue>`, listing that
-  queue's tickets (ref / status / worker / title) in the same design.
+  queue's active tickets (ref / status / worker / title) and, below them, a
+  **Closed** section where each row shows its resolution summary + chips.
 - An **empty state** that reads as an invitation, not an error: a dim beacon and
   "All queues clear".
 
@@ -113,7 +116,34 @@ It also exposes read-only JSON:
 - `GET /api/status` — health rows (each annotated with worker counts) + the
   worker roster.
 - `GET /api/queues` — per-queue counts (mirrors `wt queues`).
-- `GET /api/queue/<name>` — the active tickets in one queue (mirrors `wt ls`).
+- `GET /api/queue/<name>` — the active tickets in one queue plus a `closed`
+  array (each closed item carries its `resolution`).
+
+### Resolutions: record HOW a ticket was fixed
+
+Closing a ticket is also where a worker records *what it did* — the trust-layer
+signal that turns a drained queue into an auditable log:
+
+```bash
+wt close DEMO-1 --summary "rewrote the flex container" \
+         --caveat "watch the sticky footer on Safari" \
+         --follow-up "add a visual regression test" \
+         --unresolved "the print stylesheet still clips"
+```
+
+`--summary` is the one-liner; `--caveat`, `--follow-up`, and `--unresolved` are
+repeatable. All are optional — `wt close DEMO-1` with no flags still works. The
+resolution is stored on the item (`item["resolution"]`) and surfaced in the
+dashboard's per-queue **Closed** section and on closed `wt ls` rows. Spawned
+workers are instructed to always pass `--summary` so nothing closes silently.
+
+Pass `--enqueue-follow-ups` to also file each follow-up / unresolved item as a
+new open ticket in the same queue (opt-in), so loose ends don't get lost.
+
+The drill-down page (`/q/<queue>`) lists active tickets, then a **Closed**
+section (most-recent first) where each row shows its summary with small chips for
+caveats / follow-ups / unresolved. `GET /api/queue/<name>` returns both the
+active `tickets` and the `closed` array (closed items carry their `resolution`).
 
 ### The signature feature: `wt wait`
 

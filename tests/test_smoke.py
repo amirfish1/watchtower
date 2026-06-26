@@ -386,6 +386,147 @@ def test_dashboard_launch_nonblocking_and_stop(store, tmp_path, monkeypatch, cap
         assert not pidfile.exists()
 
 
+def test_close_with_resolution_round_trips(store):
+    """A resolution passed to close() persists and reloads on the item."""
+    import watchtower.queue as q
+
+    q.enqueue(project="RES", note="fix the thing")
+    closed = q.close(
+        "RES-1",
+        "worker-9",
+        resolution={
+            "summary": "did X",
+            "caveats": ["watch Y"],
+            "follow_ups": ["do Z later"],
+            "unresolved": [],
+        },
+    )
+    assert closed["status"] == "closed"
+    res = closed["resolution"]
+    assert res["summary"] == "did X"
+    assert res["caveats"] == ["watch Y"]
+    assert res["follow_ups"] == ["do Z later"]
+    # Empty list field is dropped on normalize.
+    assert "unresolved" not in res
+
+    # Reloads from disk identically.
+    again = q.get("RES-1")
+    assert again["resolution"] == res
+
+    # A bare-string resolution is accepted as the summary.
+    q.enqueue(project="RES", note="another")
+    c2 = q.close("RES-2", "worker-9", resolution="just a summary")
+    assert c2["resolution"]["summary"] == "just a summary"
+
+    # Back-compat: no resolution -> no key.
+    q.enqueue(project="RES", note="third")
+    c3 = q.close("RES-3", "worker-9")
+    assert "resolution" not in c3
+
+
+def test_cli_close_builds_resolution(store, capsys):
+    """`wt close --summary/--caveat/...` records the resolution + prints it."""
+    import watchtower.queue as q
+    from watchtower.cli import main
+
+    q.enqueue(project="CLIRES", note="work")
+    rc = main([
+        "close", "CLIRES-1",
+        "--summary", "did X",
+        "--caveat", "watch Y",
+        "--follow-up", "do Z later",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "CLOSED: CLIRES-1 — did X" in out
+
+    it = q.get("CLIRES-1")
+    assert it["resolution"]["summary"] == "did X"
+    assert it["resolution"]["caveats"] == ["watch Y"]
+    assert it["resolution"]["follow_ups"] == ["do Z later"]
+
+    # The closed wt ls row shows the summary + counts.
+    assert main(["ls", "-q", "CLIRES", "--status", "closed"]) == 0
+    ls_out = capsys.readouterr().out
+    assert "— did X" in ls_out
+    assert "1 caveat" in ls_out
+
+
+def test_cli_close_enqueue_follow_ups(store, capsys):
+    """--enqueue-follow-ups files each follow-up/unresolved as a new ticket."""
+    import watchtower.queue as q
+    from watchtower.cli import main
+
+    q.enqueue(project="CARRY", note="work")
+    rc = main([
+        "close", "CARRY-1",
+        "--summary", "did the main bit",
+        "--follow-up", "polish the edges",
+        "--unresolved", "the flaky test",
+        "--enqueue-follow-ups",
+    ])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "FILED follow-up:" in out
+
+    open_items = q.list_items(project="CARRY", status="open")
+    notes = sorted(i["note"] for i in open_items)
+    assert notes == ["polish the edges", "the flaky test"]
+
+
+def test_dashboard_drilldown_renders_closed_resolution(store):
+    """/q/<queue> renders a Closed section with the resolution summary + chips."""
+    import watchtower.queue as q
+    import watchtower.dashboard as dashboard
+
+    q.enqueue(project="CDASH", title="still open", note="n1")
+    q.enqueue(project="CDASH", title="will close", note="n2")
+    q.close(
+        "CDASH-2",
+        "w",
+        resolution={"summary": "patched it", "caveats": ["watch the cache"]},
+    )
+
+    payload = dashboard.status_payload()
+    page = dashboard.render_queue(
+        "CDASH", payload, dashboard.queue_tickets("CDASH"),
+        closed=dashboard.closed_tickets("CDASH"), total_closed=1,
+    )
+    assert "Closed" in page
+    assert "patched it" in page  # the summary, prominently
+    assert "watch the cache" in page  # the caveat chip
+    assert "chip caveat" in page  # palette marker for caveats
+
+
+def test_api_queue_includes_closed_with_resolution(store):
+    """/api/queue/<name> returns active tickets + a closed array w/ resolution."""
+    import watchtower.queue as q
+    import watchtower.dashboard as dashboard
+
+    q.enqueue(project="ACLOSE", note="open one")
+    q.enqueue(project="ACLOSE", note="to close")
+    q.close("ACLOSE-2", "w", resolution="finished it")
+
+    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/queue/ACLOSE", timeout=5
+        ) as resp:
+            data = json.loads(resp.read().decode())
+    finally:
+        t.join(timeout=5)
+        httpd.server_close()
+
+    assert data["queue"] == "ACLOSE"
+    assert len(data["tickets"]) == 1  # one still open
+    assert len(data["closed"]) == 1
+    assert data["closed"][0]["ref"] == "ACLOSE-2"
+    assert data["closed"][0]["resolution"]["summary"] == "finished it"
+
+
 def test_worker_activity_join_idle_when_unclaimed(store):
     """A worker holding no in-progress ticket reports idle (active_ref None)."""
     import watchtower.queue as q

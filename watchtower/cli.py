@@ -155,7 +155,19 @@ def cmd_ls(args: argparse.Namespace) -> int:
     for it in items[:limit]:
         worker = str(it.get("claimed_by") or it.get("claimed_session_id") or "")[:20]
         title = (it.get("title") or it.get("note") or "")[:56]
-        print(f"{str(it.get('ref','')):<14}{str(it.get('status','')):<12}{worker:<22}{title}")
+        line = f"{str(it.get('ref','')):<14}{str(it.get('status','')):<12}{worker:<22}{title}"
+        res = it.get("resolution") if it.get("status") == "closed" else None
+        if res and res.get("summary"):
+            line += f"  — {res['summary']}"
+            extras = []
+            for key, label in (("caveats", "caveat"), ("follow_ups", "follow-up"),
+                               ("unresolved", "unresolved")):
+                n = len(res.get(key) or [])
+                if n:
+                    extras.append(f"{n} {label}{'s' if n != 1 else ''}")
+            if extras:
+                line += f" [{', '.join(extras)}]"
+        print(line)
     if len(items) > limit:
         print(f"... and {len(items) - limit} more (raise --limit)")
     return 0
@@ -189,13 +201,43 @@ def cmd_claim(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolution_from_args(args: argparse.Namespace) -> Optional[dict]:
+    """Build a resolution dict from --summary/--caveat/--follow-up/--unresolved.
+
+    Returns None when no flag was given (so close stays back-compatible)."""
+    res = {
+        "summary": args.summary or "",
+        "caveats": list(args.caveat or []),
+        "follow_ups": list(args.follow_up or []),
+        "unresolved": list(args.unresolved or []),
+    }
+    if not any(res.values()):
+        return None
+    return res
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     worker = args.worker or f"wt-cli-{os.getpid()}"
-    item = q.close(args.ref, worker)
+    resolution = _resolution_from_args(args)
+    item = q.close(args.ref, worker, resolution=resolution)
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
-    print(f"CLOSED: {item['ref']}")
+    res = item.get("resolution") or {}
+    summary = res.get("summary", "")
+    print(f"CLOSED: {item['ref']}" + (f" — {summary}" if summary else ""))
+
+    # STRETCH (opt-in): file each follow-up / unresolved item as a new open
+    # ticket in the same queue so nothing falls through the cracks.
+    if getattr(args, "enqueue_follow_ups", False):
+        carry = (res.get("follow_ups") or []) + (res.get("unresolved") or [])
+        for note in carry:
+            new = q.enqueue(
+                project=item.get("project", ""),
+                note=note,
+                source="wt-followup",
+            )
+            print(f"  FILED follow-up: {new['ref']}  {note}")
     return 0
 
 
@@ -505,9 +547,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_claim)
 
-    s = sub.add_parser("close", help="close a ticket")
+    s = sub.add_parser("close", help="close a ticket (record how you fixed it)")
     s.add_argument("ref")
     s.add_argument("--worker", default="")
+    s.add_argument("--summary", default="",
+                   help="one-line description of what you changed")
+    s.add_argument("--caveat", action="append",
+                   help="something to watch out for (repeatable)")
+    s.add_argument("--follow-up", action="append", dest="follow_up",
+                   help="a notable follow-up task (repeatable)")
+    s.add_argument("--unresolved", action="append",
+                   help="something you could not fix (repeatable)")
+    s.add_argument("--enqueue-follow-ups", action="store_true",
+                   dest="enqueue_follow_ups",
+                   help="also file each follow-up/unresolved as a new open ticket")
     s.set_defaults(func=cmd_close)
 
     s = sub.add_parser("workers", help="list workers this CLI started")

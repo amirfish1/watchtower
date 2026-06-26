@@ -12,7 +12,7 @@ Routes:
     GET  /q/<queue>        per-queue drill-down (tickets, mirrors `wt ls`)
     GET  /api/status       {"queues": [...health rows + workers...], "workers": [...]}
     GET  /api/queues       raw per-queue counts (mirrors `wt queues`)
-    GET  /api/queue/<name> tickets in one queue (mirrors `wt ls`)
+    GET  /api/queue/<name> active + closed tickets (closed carry resolution)
 
 It reuses :mod:`watchtower.health` for the stuck computation and
 :mod:`watchtower.workers` for liveness — neither is duplicated here.
@@ -49,10 +49,22 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     return {"queues": rows, "workers": wrows}
 
 
+CLOSED_LIMIT = 50  # cap the drill-down's closed section to the most-recent N.
+
+
 def queue_tickets(name: str) -> List[Dict[str, Any]]:
     """Active (open + in_progress) tickets for one queue, mirroring ``wt ls``."""
     items = q.list_items(project=name)
     return [it for it in items if it.get("status") in ("open", "in_progress")]
+
+
+def closed_tickets(name: str, limit: int = CLOSED_LIMIT) -> List[Dict[str, Any]]:
+    """Closed tickets for one queue, most-recent first, capped to ``limit``.
+
+    Each carries its ``resolution`` (when the closer recorded one)."""
+    items = [it for it in q.list_items(project=name) if it.get("status") == "closed"]
+    items.sort(key=lambda it: str(it.get("closed_at") or ""), reverse=True)
+    return items[:limit]
 
 
 # --------------------------------------------------------------------------- css
@@ -244,6 +256,37 @@ _STYLE = """
     .tworker { font-size: 12px; color: var(--muted); overflow: hidden;
                text-overflow: ellipsis; }
     .ttitle { font-size: 13.5px; color: var(--ink); }
+    .tstatus.closed { color: var(--muted); }
+
+    /* ---- closed tickets + resolution ---- */
+    .closed-head {
+      display: flex; align-items: baseline; gap: 8px;
+    }
+    .closed-head .count { color: var(--muted); font-size: 11px; font-weight: 600; }
+    .crow {
+      padding: 13px 4px; border-bottom: 1px solid var(--line);
+    }
+    .crow:last-child { border-bottom: 0; }
+    .crow-top {
+      display: grid;
+      grid-template-columns: minmax(0,.7fr) minmax(0,1fr) minmax(0,2.4fr);
+      gap: 12px; align-items: baseline;
+    }
+    .csummary { font-size: 13.5px; color: var(--ink); }
+    .csummary.none { color: var(--muted); font-style: italic; }
+    .chips { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+      font-size: 11px; font-weight: 600; letter-spacing: .02em;
+      padding: 3px 9px; border-radius: 99px; white-space: nowrap;
+      border: 1px solid transparent;
+    }
+    .chip .lbl { opacity: .8; }
+    .chip.caveat { background: rgba(255,176,32,.12); color: var(--warn);
+                   border-color: rgba(255,176,32,.25); }
+    .chip.unresolved { background: rgba(255,92,92,.12); color: var(--alarm);
+                       border-color: rgba(255,92,92,.25); }
+    .chip.follow { background: rgba(111,179,255,.12); color: var(--beam);
+                   border-color: rgba(111,179,255,.25); }
 
     .foot { margin-top: 40px; font-size: 12px; color: var(--muted); }
     .foot .mono { color: var(--muted); }
@@ -454,10 +497,75 @@ def render_index(payload: Dict[str, Any]) -> str:
     return _page("WatchTower", header + grid + workers_block + foot)
 
 
-def render_queue(name: str, payload: Dict[str, Any], tickets: List[Dict[str, Any]]) -> str:
-    """Per-queue drill-down page: the queue's instrument header + its tickets."""
+def _resolution_chips(res: Dict[str, Any]) -> str:
+    """Small palette chips for a resolution's caveats / follow-ups / unresolved.
+
+    Caveats/unresolved lean --warn/--alarm; follow-ups lean --beam."""
+    specs = (
+        ("caveats", "caveat", "caveat"),
+        ("follow_ups", "follow", "follow-up"),
+        ("unresolved", "unresolved", "unresolved"),
+    )
+    chips = []
+    for key, cls, label in specs:
+        for val in res.get(key) or []:
+            chips.append(
+                f'<span class="chip {cls}">'
+                f'<span class="lbl">{label}:</span> {html.escape(str(val))}</span>'
+            )
+    if not chips:
+        return ""
+    return '        <div class="chips">\n          ' + "\n          ".join(chips) + "\n        </div>\n"
+
+
+def _closed_block(closed: List[Dict[str, Any]], total_closed: int) -> str:
+    """The 'Closed' section: each row shows its resolution summary + chips."""
+    if not closed:
+        return ""
+    extra = f' <span class="count mono">{total_closed}</span>' if total_closed else ""
+    crows = []
+    for it in closed:
+        ref = html.escape(str(it.get("ref", "")))
+        worker = html.escape(
+            str(it.get("closed_by") or it.get("claimed_by") or "—")[:28]
+        )
+        res = it.get("resolution") or {}
+        summary = res.get("summary", "")
+        if summary:
+            summary_html = f'<span class="csummary">{html.escape(str(summary))}</span>'
+        else:
+            title = it.get("title") or it.get("note") or "(no resolution recorded)"
+            summary_html = f'<span class="csummary none">{html.escape(str(title))}</span>'
+        crows.append(
+            f'      <div class="crow">\n'
+            f'        <div class="crow-top">\n'
+            f'          <span class="tref mono">{ref}</span>\n'
+            f'          <span class="tworker mono">{worker}</span>\n'
+            f'          {summary_html}\n'
+            f'        </div>\n'
+            f"{_resolution_chips(res)}"
+            f"      </div>"
+        )
+    return (
+        f'    <h2 class="closed-head">Closed{extra}</h2>\n'
+        '    <div class="tickets">\n' + "\n".join(crows) + "\n    </div>\n"
+    )
+
+
+def render_queue(
+    name: str,
+    payload: Dict[str, Any],
+    tickets: List[Dict[str, Any]],
+    closed: List[Dict[str, Any]] = None,
+    total_closed: int = 0,
+) -> str:
+    """Per-queue drill-down page: the queue's instrument header + its tickets.
+
+    ``closed`` (most-recent first) renders below the active tickets, each with
+    its resolution; ``total_closed`` is the full count for the section header."""
     rows = payload["queues"]
     row = next((r for r in rows if r["queue"] == name), None)
+    closed = closed or []
 
     safe_name = html.escape(name)
     header = (
@@ -472,6 +580,8 @@ def render_queue(name: str, payload: Dict[str, Any], tickets: List[Dict[str, Any
         header += f'      <div class="fleet">{_readout(row)}</div>\n'
     header += "    </header>\n    <hr class=\"divider\">\n"
 
+    closed_block = _closed_block(closed, total_closed)
+
     if not tickets:
         body = header + (
             '    <div class="empty">\n'
@@ -479,7 +589,7 @@ def render_queue(name: str, payload: Dict[str, Any], tickets: List[Dict[str, Any
             '      <div class="line disp">No active tickets</div>\n'
             '      <div class="sub mono">This queue is clear.</div>\n'
             "    </div>\n"
-        )
+        ) + closed_block
         return _page(f"{name} · WatchTower", body)
 
     trows = [
@@ -503,7 +613,7 @@ def render_queue(name: str, payload: Dict[str, Any], tickets: List[Dict[str, Any
             f"      </div>"
         )
     tickets_block = '    <div class="tickets">\n' + "\n".join(trows) + "\n    </div>\n"
-    return _page(f"{name} · WatchTower", header + tickets_block)
+    return _page(f"{name} · WatchTower", header + tickets_block + closed_block)
 
 
 # Back-compat shim: the old single entry point. Tests + any caller that asked for
@@ -539,14 +649,27 @@ class _Handler(BaseHTTPRequestHandler):
             name = urllib.parse.unquote(path[len("/q/"):])
             norm = q._norm_project(name)
             payload = status_payload()
-            self._html(200, render_queue(norm, payload, queue_tickets(norm)))
+            all_closed = [
+                it for it in q.list_items(project=norm)
+                if it.get("status") == "closed"
+            ]
+            self._html(200, render_queue(
+                norm, payload, queue_tickets(norm),
+                closed=closed_tickets(norm), total_closed=len(all_closed),
+            ))
         elif path == "/api/status":
             self._json(200, status_payload())
         elif path == "/api/queues":
             self._json(200, q.queues())
         elif path.startswith("/api/queue/"):
             name = q._norm_project(urllib.parse.unquote(path[len("/api/queue/"):]))
-            self._json(200, {"queue": name, "tickets": queue_tickets(name)})
+            # Closed tickets (with resolution) are always included; ?status=all
+            # additionally widens it, but closed is the default extra payload.
+            self._json(200, {
+                "queue": name,
+                "tickets": queue_tickets(name),
+                "closed": closed_tickets(name),
+            })
         else:
             self._json(404, {"error": "not found", "path": path})
 

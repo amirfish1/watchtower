@@ -38,10 +38,14 @@ DRAIN_GOAL_TEMPLATE = (
     "or nothing when the queue is drained). Read the ticket's note/text and, "
     "if present, open its screenshot_path and resolve its selector. Make the "
     "change in the relevant repo and verify it. Commit only the paths you "
-    "changed (never `git add -A`/`.`/`-a`). Close the ticket with "
-    "`wt close <ref> --worker {worker_id}`, then claim the next one. When "
-    "nothing is open, idle and re-poll later — never busy-wait. Do not push "
-    "unless explicitly asked."
+    "changed (never `git add -A`/`.`/`-a`). When you close the ticket, ALWAYS "
+    "record HOW you fixed it: `wt close <ref> --worker {worker_id} --summary "
+    "\"what you changed\"`. Add `--caveat \"...\"` for anything to watch out "
+    "for, `--follow-up \"...\"` for notable next steps, and `--unresolved "
+    "\"...\"` for anything you could not fix (each flag is repeatable). This "
+    "resolution is the trust signal the dashboard surfaces, so never close "
+    "silently. Then claim the next one. When nothing is open, idle and re-poll "
+    "later — never busy-wait. Do not push unless explicitly asked."
 )
 
 _ENGINE_BIN = {"claude": "claude", "codex": "codex"}

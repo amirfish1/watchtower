@@ -37,6 +37,10 @@ Item shape::
       "screenshot_path": "...", "repo_path": "...",
       "claimed_by": null, "claimed_at": null, "closed_at": null,
       "claimed_session_id": null,        # real worker/session id, when known
+      "resolution": {                    # HOW it was fixed (set on close, optional)
+        "summary": "...",                # the main one-liner
+        "caveats": [...], "follow_ups": [...], "unresolved": [...]
+      },
       "created_at": "2026-06-25T20:05:00Z",
       "updated_at": "2026-06-25T20:05:00Z"
     }
@@ -355,11 +359,41 @@ def claim_next(
         return item
 
 
+def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
+    """Coerce a resolution into the stored shape, or None when empty.
+
+    Accepts a bare string (treated as the summary) or a dict with any of
+    ``summary`` / ``caveats`` / ``follow_ups`` / ``unresolved``. List fields are
+    coerced to lists of clipped strings; empty fields are dropped. Returns None
+    when nothing meaningful was supplied (so close stays back-compatible)."""
+    if resolution is None:
+        return None
+    if isinstance(resolution, str):
+        resolution = {"summary": resolution}
+    if not isinstance(resolution, dict):
+        return None
+    out: Dict[str, Any] = {}
+    summary = _clip(resolution.get("summary", ""), 4000)
+    if summary:
+        out["summary"] = summary
+    for field in ("caveats", "follow_ups", "unresolved"):
+        raw = resolution.get(field)
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            raw = [raw]
+        vals = [_clip(v, 4000) for v in raw if str(v or "").strip()]
+        if vals:
+            out[field] = vals
+    return out or None
+
+
 def update_status(
     ident: Any,
     status: str,
     session_id: str = "",
     session_uuid: str = "",
+    resolution: Any = None,
 ) -> Optional[Dict[str, Any]]:
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {VALID_STATUSES}")
@@ -384,6 +418,11 @@ def update_status(
                         it["closed_by"] = str(session_id)
                     elif it.get("claimed_by"):
                         it["closed_by"] = it["claimed_by"]
+                    # Record HOW it was fixed — the trust-layer signal. Optional:
+                    # absent resolution leaves the item without the key.
+                    norm = _normalize_resolution(resolution)
+                    if norm is not None:
+                        it["resolution"] = norm
                 if status == "open":
                     it["claimed_by"] = None
                     it["claimed_at"] = None
@@ -394,8 +433,15 @@ def update_status(
     return None
 
 
-def close(ident: Any, session_id: str = "") -> Optional[Dict[str, Any]]:
-    return update_status(ident, "closed", session_id)
+def close(
+    ident: Any, session_id: str = "", resolution: Any = None
+) -> Optional[Dict[str, Any]]:
+    """Close a ticket, optionally recording HOW it was fixed.
+
+    ``resolution`` may be a bare summary string or a dict with any of
+    ``summary`` / ``caveats`` / ``follow_ups`` / ``unresolved``. Absent ->
+    closes with no resolution (back-compatible)."""
+    return update_status(ident, "closed", session_id, resolution=resolution)
 
 
 def next_item(
