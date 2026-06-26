@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wt-agent"
+version = "0.1.0"
+description = "WatchTower — run fleets of AI coding-agent workers and know which queues are stuck."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Amir Fish" }]
+keywords = ["queue", "agents", "fleet", "cli", "watchtower"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Environment :: Console",
+    "Topic :: Software Development :: Build Tools",
+]
+# stdlib-only at runtime — no pip dependencies by design.
+dependencies = []
+
+[project.scripts]
+wt = "watchtower.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+include = ["watchtower*"]

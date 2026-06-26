@@ -1,0 +1,368 @@
+#!/usr/bin/env python3
+"""WatchTower CLI — the ``wt`` binary.
+
+Phase-1 commands:
+
+    wt status                 per-queue depth / oldest-open age / stuck flag
+    wt queues                 list queues + counts
+    wt enqueue -q Q --title.. file a ticket
+    wt claim -q Q             claim the oldest open ticket (atomic)
+    wt next -q Q              alias for claim
+    wt close <ref>            close a ticket
+    wt workers                list workers this CLI started
+    wt spawn-worker -q Q      launch N draining worker subprocess(es)
+    wt wait -q Q [--cmd ..]   block until the queue is drained, then run --cmd
+    wt start / wt stop        start/stop the background watcher daemon
+    wt serve                  (phase 2) HTTP viewer — stub
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+from typing import List, Optional
+
+from . import __version__
+from . import health, queue as q, workers
+
+DAEMON_PID_FILE = Path(
+    os.environ.get("WATCHTOWER_DAEMON_PID")
+    or (Path.home() / ".watchtower" / "daemon.pid")
+)
+
+
+# --------------------------------------------------------------------------- fmt
+def _print_status(rows: List[dict]) -> None:
+    print(f"store: {q.store_path()}")
+    if not rows:
+        print("(no queues)")
+        return
+    hdr = f"{'QUEUE':<14}{'OPEN':>5}{'WIP':>5}{'DONE':>6}  {'OLDEST':>8}  {'IDLE':>8}  STATUS"
+    print(hdr)
+    print("-" * len(hdr))
+    for r in rows:
+        flag = "STUCK" if r["stuck"] else ("ok" if r["depth"] == 0 else "draining")
+        print(
+            f"{r['queue']:<14}{r['depth']:>5}{r['in_progress']:>5}{r['closed']:>6}"
+            f"  {r['oldest_open_age']:>8}  {r['since_progress']:>8}  {flag}"
+        )
+
+
+def _print_item(it: Optional[dict]) -> None:
+    if not it:
+        print("(none)")
+        return
+    print(json.dumps(it, indent=2))
+
+
+# ----------------------------------------------------------------------- commands
+def cmd_status(args: argparse.Namespace) -> int:
+    rows = health.all_status(project=args.queue, stuck_minutes=args.stuck_minutes)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        _print_status(rows)
+    return 0
+
+
+def cmd_queues(args: argparse.Namespace) -> int:
+    data = q.queues()
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+    print(f"store: {q.store_path()}")
+    if not data:
+        print("(no queues)")
+        return 0
+    print(f"{'QUEUE':<14}{'OPEN':>5}{'WIP':>5}{'DONE':>6}{'TOTAL':>7}")
+    for name in sorted(data):
+        c = data[name]
+        print(
+            f"{name:<14}{c['open']:>5}{c['in_progress']:>5}"
+            f"{c['closed']:>6}{c['total']:>7}"
+        )
+    return 0
+
+
+def cmd_enqueue(args: argparse.Namespace) -> int:
+    item = q.enqueue(
+        project=args.queue,
+        title=args.title or "",
+        note=args.note or (args.title or ""),
+        text=args.text or "",
+        url=args.url or "",
+        lane=args.lane,
+        source="wt",
+    )
+    print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
+    return 0
+
+
+def cmd_claim(args: argparse.Namespace) -> int:
+    worker = args.worker or f"wt-cli-{os.getpid()}"
+    item = q.claim_next(worker, project=args.queue)
+    if not item:
+        print(f"(nothing open in {args.queue})")
+        return 0
+    if args.json:
+        _print_item(item)
+    else:
+        print(f"CLAIMED: {item['ref']} -> {worker}")
+        print(item.get("text") or item.get("note") or "")
+    return 0
+
+
+def cmd_close(args: argparse.Namespace) -> int:
+    worker = args.worker or f"wt-cli-{os.getpid()}"
+    item = q.close(args.ref, worker)
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    print(f"CLOSED: {item['ref']}")
+    return 0
+
+
+def cmd_workers(args: argparse.Namespace) -> int:
+    rows = workers.list_workers()
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("(no workers tracked)")
+        return 0
+    print(f"{'WORKER':<22}{'PID':>8}  {'QUEUE':<12}{'ENGINE':<8}{'ALIVE':<6}STARTED")
+    for w in rows:
+        print(
+            f"{w.get('worker_id',''):<22}{w.get('pid',0):>8}  "
+            f"{w.get('queue',''):<12}{w.get('engine',''):<8}"
+            f"{'yes' if w.get('alive') else 'no':<6}{w.get('started_at','')}"
+        )
+    return 0
+
+
+def cmd_spawn_worker(args: argparse.Namespace) -> int:
+    spawned = workers.spawn_workers(
+        args.queue, n=args.n, engine=args.engine, dry_run=args.dry_run
+    )
+    for s in spawned:
+        tag = " (dry-run)" if s.get("dry_run") else f" pid={s['pid']}"
+        print(f"SPAWNED worker {s['worker_id']} engine={s['engine']}{tag}")
+        if args.dry_run:
+            print(f"  argv: {s['argv']}")
+    return 0
+
+
+def cmd_wait(args: argparse.Namespace) -> int:
+    """Block until the queue has 0 open items, then exit 0 (run --cmd if set)."""
+    deadline = time.time() + args.timeout if args.timeout else None
+    interval = max(1, args.interval)
+    while True:
+        rows = health.all_status(project=args.queue)
+        row = rows[0] if rows else {"depth": 0, "stuck": False}
+        depth = row.get("depth", 0)
+        if depth == 0:
+            print(f"DRAINED: {args.queue} has 0 open tickets")
+            if args.cmd:
+                print(f"running: {args.cmd}")
+                return os.system(args.cmd) >> 8
+            return 0
+        stuck = " STUCK" if row.get("stuck") else ""
+        print(f"waiting: {args.queue} open={depth}{stuck} (re-check in {interval}s)")
+        if deadline and time.time() >= deadline:
+            print(f"TIMEOUT: {args.queue} still has {depth} open", file=sys.stderr)
+            return 2
+        time.sleep(interval)
+
+
+def _daemon_loop(args: argparse.Namespace) -> None:
+    interval = max(5, args.interval)
+    while True:
+        rows = health.all_status(stuck_minutes=args.stuck_minutes)
+        for r in rows:
+            if not r["stuck"]:
+                continue
+            live = workers.live_worker_count(r["queue"])
+            if live == 0 and args.auto_spawn:
+                print(
+                    f"[watchtower] STUCK {r['queue']} open={r['depth']} "
+                    f"no live workers -> auto-spawn",
+                    flush=True,
+                )
+                workers.spawn_workers(r["queue"], n=1, engine=args.engine)
+            else:
+                print(
+                    f"[watchtower] STUCK {r['queue']} open={r['depth']} "
+                    f"live_workers={live} (auto-spawn off)",
+                    flush=True,
+                )
+        time.sleep(interval)
+
+
+def cmd_start(args: argparse.Namespace) -> int:
+    if DAEMON_PID_FILE.exists():
+        try:
+            pid = int(DAEMON_PID_FILE.read_text().strip())
+            os.kill(pid, 0)
+            print(f"watcher already running (pid {pid})")
+            return 0
+        except (ValueError, ProcessLookupError, OSError):
+            pass  # stale pidfile
+    if args.foreground:
+        DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        DAEMON_PID_FILE.write_text(str(os.getpid()))
+        try:
+            _daemon_loop(args)
+        finally:
+            DAEMON_PID_FILE.unlink(missing_ok=True)
+        return 0
+    # Re-exec ourselves in the background in foreground-mode.
+    import subprocess
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "watchtower.cli",
+        "start",
+        "--foreground",
+        "--interval",
+        str(args.interval),
+        "--stuck-minutes",
+        str(args.stuck_minutes),
+        "--engine",
+        args.engine,
+    ]
+    if args.auto_spawn:
+        cmd.append("--auto-spawn")
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    print(f"watcher started (pid {proc.pid}); auto-spawn={'on' if args.auto_spawn else 'off'}")
+    return 0
+
+
+def cmd_stop(args: argparse.Namespace) -> int:
+    if not DAEMON_PID_FILE.exists():
+        print("watcher not running")
+        return 0
+    try:
+        pid = int(DAEMON_PID_FILE.read_text().strip())
+    except ValueError:
+        DAEMON_PID_FILE.unlink(missing_ok=True)
+        print("removed stale pidfile")
+        return 0
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"stopped watcher (pid {pid})")
+    except ProcessLookupError:
+        print("watcher process already gone")
+    finally:
+        DAEMON_PID_FILE.unlink(missing_ok=True)
+    return 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    # TODO(phase-2): stdlib http.server viewer that renders `wt status` as HTML
+    # and exposes read-only JSON at /api/status and /api/queues. Keep it
+    # stdlib-only (http.server + json) to match the engine's no-deps ethos.
+    print("HTTP viewer coming in phase 2")
+    return 0
+
+
+# --------------------------------------------------------------------------- main
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="wt", description="WatchTower queue CLI")
+    p.add_argument("--version", action="version", version=f"wt {__version__}")
+    sub = p.add_subparsers(dest="command")
+
+    s = sub.add_parser("status", help="per-queue depth / age / stuck flag")
+    s.add_argument("-q", "--queue", default=None)
+    s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("queues", help="list queues + counts")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_queues)
+
+    s = sub.add_parser("enqueue", help="file a ticket")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--title", default="")
+    s.add_argument("--note", default="")
+    s.add_argument("--text", default="")
+    s.add_argument("--url", default="")
+    s.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
+    s.set_defaults(func=cmd_enqueue)
+
+    s = sub.add_parser("claim", help="claim the oldest open ticket")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--worker", default="")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_claim)
+
+    s = sub.add_parser("next", help="alias for claim")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--worker", default="")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_claim)
+
+    s = sub.add_parser("close", help="close a ticket")
+    s.add_argument("ref")
+    s.add_argument("--worker", default="")
+    s.set_defaults(func=cmd_close)
+
+    s = sub.add_parser("workers", help="list workers this CLI started")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_workers)
+
+    s = sub.add_parser("spawn-worker", help="launch draining worker subprocess(es)")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--n", type=int, default=1)
+    s.add_argument("--engine", default="claude", choices=["claude", "codex"])
+    s.add_argument("--dry-run", action="store_true")
+    s.set_defaults(func=cmd_spawn_worker)
+
+    s = sub.add_parser("wait", help="block until the queue is drained")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--timeout", type=float, default=0.0, help="seconds; 0 = forever")
+    s.add_argument("--interval", type=float, default=5.0)
+    s.add_argument("--cmd", default="", help="shell command to run once drained")
+    s.set_defaults(func=cmd_wait)
+
+    s = sub.add_parser("start", help="start the background watcher daemon")
+    s.add_argument("--interval", type=int, default=30)
+    s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
+    s.add_argument("--engine", default="claude", choices=["claude", "codex"])
+    s.add_argument("--auto-spawn", action="store_true",
+                   help="auto spawn-worker on a stuck queue with no live workers")
+    s.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(func=cmd_start)
+
+    s = sub.add_parser("stop", help="stop the background watcher daemon")
+    s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("serve", help="(phase 2) HTTP viewer — stub")
+    s.set_defaults(func=cmd_serve)
+
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "command", None):
+        parser.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
