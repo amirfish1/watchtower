@@ -36,6 +36,11 @@ DAEMON_PID_FILE = Path(
     or (Path.home() / ".watchtower" / "daemon.pid")
 )
 
+DASHBOARD_PID_FILE = Path(
+    os.environ.get("WATCHTOWER_DASHBOARD_PID")
+    or (Path.home() / ".watchtower" / "dashboard.pid")
+)
+
 
 # --------------------------------------------------------------------------- fmt
 def _eta_note(r: dict) -> str:
@@ -248,6 +253,21 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
 def _daemon_loop(args: argparse.Namespace) -> None:
     interval = max(5, args.interval)
+    if getattr(args, "dashboard", False):
+        # Host the dashboard alongside the watcher in a background thread, so
+        # `wt start --dashboard` brings both up in one process.
+        import threading
+
+        from . import dashboard
+
+        host = getattr(args, "host", "127.0.0.1")
+        port = getattr(args, "port", 8787)
+        httpd = dashboard.ThreadingHTTPServer((host, port), dashboard._Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        print(
+            f"[watchtower] dashboard on http://{host}:{port}",
+            flush=True,
+        )
     while True:
         rows = health.all_status(stuck_minutes=args.stuck_minutes)
         for r in rows:
@@ -305,6 +325,8 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     if args.auto_spawn:
         cmd.append("--auto-spawn")
+    if getattr(args, "dashboard", False):
+        cmd += ["--dashboard", "--host", args.host, "--port", str(args.port)]
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -336,10 +358,102 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _pid_from_file(path: Path) -> Optional[int]:
+    """Return the live pid recorded in ``path``, or None (cleaning up stale)."""
+    if not path.exists():
+        return None
+    try:
+        pid = int(path.read_text().strip())
+    except (ValueError, OSError):
+        path.unlink(missing_ok=True)
+        return None
+    try:
+        os.kill(pid, 0)
+        return pid
+    except (ProcessLookupError, OSError):
+        path.unlink(missing_ok=True)
+        return None
+
+
+def _ensure_dashboard(host: str, port: int) -> int:
+    """Start the dashboard server detached if not already running. Idempotent.
+
+    Returns the pid of the (new or existing) background server.
+    """
+    existing = _pid_from_file(DASHBOARD_PID_FILE)
+    if existing is not None:
+        return existing
+    import subprocess
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "watchtower.cli",
+        "dashboard",
+        "--foreground",
+        "--host",
+        host,
+        "--port",
+        str(port),
+    ]
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    DASHBOARD_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DASHBOARD_PID_FILE.write_text(str(proc.pid))
+    return proc.pid
+
+
 def cmd_dashboard(args: argparse.Namespace) -> int:
     from . import dashboard
 
-    return dashboard.serve(host=args.host, port=args.port, once=args.once)
+    # --stop: kill the background dashboard via its pidfile.
+    if getattr(args, "stop", False):
+        pid = _pid_from_file(DASHBOARD_PID_FILE)
+        if pid is None:
+            print("dashboard not running")
+            return 0
+        try:
+            os.kill(pid, signal.SIGTERM)
+            print(f"stopped dashboard (pid {pid})")
+        except ProcessLookupError:
+            print("dashboard process already gone")
+        finally:
+            DASHBOARD_PID_FILE.unlink(missing_ok=True)
+        return 0
+
+    # --foreground (or --once): the old blocking server. Used for debugging and
+    # as the body of the detached background process we spawn below.
+    if getattr(args, "foreground", False) or args.once:
+        DASHBOARD_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not args.once:
+            DASHBOARD_PID_FILE.write_text(str(os.getpid()))
+        try:
+            return dashboard.serve(host=args.host, port=args.port, once=args.once)
+        finally:
+            if not args.once:
+                DASHBOARD_PID_FILE.unlink(missing_ok=True)
+
+    # Default: ensure the server runs in the background, open a browser, return.
+    pid = _ensure_dashboard(args.host, args.port)
+    url = f"http://{args.host}:{args.port}/"
+    started = pid is not None
+    print(f"WatchTower dashboard: {url} (pid {pid})")
+    if args.no_open:
+        print("  (browser not opened: --no-open)")
+    else:
+        import webbrowser
+
+        if webbrowser.open(url):
+            print("  opened in your browser")
+        else:
+            print("  open it in your browser")
+    print("  wt dashboard --stop   to stop the background server")
+    return 0 if started else 0
 
 
 # --------------------------------------------------------------------------- main
@@ -420,6 +534,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--engine", default="claude", choices=["claude", "codex"])
     s.add_argument("--auto-spawn", action="store_true",
                    help="auto spawn-worker on a stuck queue with no live workers")
+    s.add_argument("--dashboard", action="store_true",
+                   help="also host the dashboard alongside the watcher")
+    s.add_argument("--host", default="127.0.0.1",
+                   help="dashboard bind host (with --dashboard)")
+    s.add_argument("--port", type=int, default=8787,
+                   help="dashboard bind port (with --dashboard)")
     s.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_start)
 
@@ -427,10 +547,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_stop)
 
     s = sub.add_parser(
-        "dashboard", aliases=["serve"], help="phone-first HTTP dashboard"
+        "dashboard",
+        aliases=["serve"],
+        help="open the night-watch dashboard (background server + browser)",
     )
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8787)
+    s.add_argument("--no-open", action="store_true",
+                   help="ensure the server is up but don't open a browser")
+    s.add_argument("--stop", action="store_true",
+                   help="stop the background dashboard server")
+    s.add_argument("--foreground", action="store_true",
+                   help="run the server in the foreground (blocking; for debugging)")
     s.add_argument("--once", action="store_true",
                    help="handle one request then exit (for tests)")
     s.set_defaults(func=cmd_dashboard)

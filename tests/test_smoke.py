@@ -225,10 +225,15 @@ def test_dashboard_html_renders(store):
     assert "<!doctype html>" in page
     assert "viewport" in page  # mobile-first meta
     assert "HTML" in page
-    assert "STUCK" in page
+    # Night-watch redesign: a stuck queue renders the stuck card + STALLED readout.
+    assert "card stuck" in page
+    assert "STALLED" in page
+    # Design-system markers: beacon + the night-watch palette token.
+    assert "beacon" in page
+    assert "--alarm" in page
 
     empty = dashboard.render_html({"queues": [], "workers": []})
-    assert "All queues clear." in empty
+    assert "All queues clear" in empty
 
 
 def test_drain_rate_eta_fields(store):
@@ -299,6 +304,86 @@ def test_api_status_includes_drain_and_activity(store):
     # The worker is joined to the in-progress ticket it claimed.
     assert w["active_ref"] == "DASH-1"
     assert w["active_since_human"] is not None
+
+
+def test_dashboard_drilldown_page_and_api(store):
+    """/q/<queue> renders the queue's tickets; /api/queue/<name> mirrors wt ls."""
+    import watchtower.queue as q
+    import watchtower.dashboard as dashboard
+
+    q.enqueue(project="DRILL", title="first ticket", note="n1")
+    q.enqueue(project="DRILL", title="second ticket", note="n2")
+
+    # Drill-down HTML.
+    payload = dashboard.status_payload()
+    page = dashboard.render_queue("DRILL", payload, dashboard.queue_tickets("DRILL"))
+    assert "DRILL" in page
+    assert "first ticket" in page
+    assert "all queues" in page  # back link
+    assert "DRILL-1" in page
+
+    # JSON for the same queue over the wire.
+    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/queue/DRILL", timeout=5
+        ) as resp:
+            data = json.loads(resp.read().decode())
+    finally:
+        t.join(timeout=5)
+        httpd.server_close()
+    assert data["queue"] == "DRILL"
+    assert len(data["tickets"]) == 2
+    assert data["tickets"][0]["ref"] == "DRILL-1"
+
+
+def test_dashboard_launch_nonblocking_and_stop(store, tmp_path, monkeypatch, capsys):
+    """`wt dashboard --no-open` returns immediately (non-blocking) and writes a
+    pidfile; `wt dashboard --stop` tears the background server down."""
+    import importlib
+    import time
+
+    pidfile = tmp_path / "dashboard.pid"
+    monkeypatch.setenv("WATCHTOWER_DASHBOARD_PID", str(pidfile))
+    import watchtower.cli as cli
+    importlib.reload(cli)
+
+    # Pick a likely-free ephemeral-ish port for the real background server.
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+
+    try:
+        # Non-blocking: this call must return without serving forever.
+        rc = cli.main(["dashboard", "--no-open", "--port", str(port)])
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "dashboard" in out.lower()
+        assert pidfile.exists()
+        pid = int(pidfile.read_text().strip())
+        # The background server process is alive.
+        import os as _os
+
+        _os.kill(pid, 0)
+
+        # Idempotent: a second launch does not start a second server.
+        assert cli.main(["dashboard", "--no-open", "--port", str(port)]) == 0
+        assert int(pidfile.read_text().strip()) == pid
+    finally:
+        # --stop kills the background server and removes the pidfile.
+        assert cli.main(["dashboard", "--stop"]) == 0
+        # Give the process a moment to die, then confirm it is gone.
+        for _ in range(20):
+            if not pidfile.exists():
+                break
+            time.sleep(0.05)
+        assert not pidfile.exists()
 
 
 def test_worker_activity_join_idle_when_unclaimed(store):

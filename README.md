@@ -33,8 +33,11 @@ wt spawn-worker -q DEMO --n 2 --engine claude   # launch 2 draining workers
 wt wait   -q DEMO --timeout 600 --cmd "say done" # block until drained, then run cmd
 
 wt start  --auto-spawn                 # background watcher: log/auto-handle stuck queues
+wt start  --auto-spawn --dashboard     # watcher + dashboard in one process
 wt stop                                # stop the watcher
-wt dashboard --port 8787               # phone-first HTTP dashboard (queues + workers)
+wt dashboard                           # open the night-watch dashboard (non-blocking)
+wt dashboard --no-open                 # ensure the server is up, don't open a browser
+wt dashboard --stop                    # stop the background dashboard server
 ```
 
 `wt status` shows, per queue, depth (open) / WIP / done, oldest-open age, idle
@@ -63,22 +66,54 @@ new persistent state, no transcript parsing. `/api/status` carries
 ### The dashboard: `wt dashboard`
 
 ```bash
-wt dashboard [--port 8787] [--host 127.0.0.1] [--once]
+wt dashboard [--port 8787] [--host 127.0.0.1]
+             [--no-open] [--stop] [--foreground] [--once]
 ```
 
-A read-only, mobile-first HTTP view over the same queue engine — stdlib-only
-(`http.server` + `json`), no dependencies. The page auto-refreshes (~5s) and
-shows one card per queue (depth, oldest-open age, live workers, a
-STUCK/LIVE/clear badge, and a `clearing in ~20m` / `stalled` ETA line), plus a
-workers section with an `ACTIVITY` column (the ticket each worker holds and how
-long ago). Empty state reads "All queues clear." It also exposes read-only JSON:
+`wt dashboard` is a **night-watch operations console** — a calm, dark instrument
+panel over your agent fleet that lights up like a beacon when a queue stalls.
+It does **not** block your terminal:
+
+1. Starts the HTTP server **detached** in the background if it isn't already
+   running (idempotent — a second `wt dashboard` won't start a second server),
+   recording its pid in `~/.watchtower/dashboard.pid` (override with
+   `$WATCHTOWER_DASHBOARD_PID`).
+2. Opens your browser to the URL (`webbrowser.open`).
+3. Prints the URL and returns immediately.
+
+Flags:
+
+- `--no-open` — ensure the server is up, but don't open a browser.
+- `--stop` — stop the background dashboard server (via the pidfile).
+- `--foreground` — run the server in the foreground (blocking), for debugging.
+- `--once` — handle a single request then exit (used by the test suite).
+- `--host` / `--port` — bind address (default `127.0.0.1:8787`, local-first).
+
+The watcher can host it too: `wt start --dashboard` brings the dashboard up
+alongside the watcher in one process (`--host`/`--port` apply there as well).
+
+**The page** (stdlib-only `http.server`, no dependencies, auto-refreshes ~5s):
+
+- A **tower** header — the `WatchTower` wordmark with a beacon dot (calm green
+  normally, amber when any queue is stuck) and a mono fleet summary
+  (`3 queues · 1 stuck · 2 workers live`).
+- A responsive **instrument grid** — one card per queue with a big mono readout
+  (`7 open · empty in ~14m`, `STALLED`, or `clear`), a slim drain bar, and a
+  live-worker count. A **stuck** card gets an amber accent border and a slow
+  pulsing beacon glow (respecting `prefers-reduced-motion`).
+- A **workers** section — worker id (mono), queue, activity (`→ SHIP-3 (4m)` or
+  `idle`), and a LIVE / DEAD pill.
+- **Drill-down** — clicking a queue card opens `/q/<queue>`, listing that
+  queue's tickets (ref / status / worker / title) in the same design.
+- An **empty state** that reads as an invitation, not an error: a dim beacon and
+  "All queues clear".
+
+It also exposes read-only JSON:
 
 - `GET /api/status` — health rows (each annotated with worker counts) + the
   worker roster.
 - `GET /api/queues` — per-queue counts (mirrors `wt queues`).
-
-Binds `127.0.0.1` by default (local-first). `--once` handles a single request
-then exits (used by the test suite).
+- `GET /api/queue/<name>` — the active tickets in one queue (mirrors `wt ls`).
 
 ### The signature feature: `wt wait`
 
@@ -97,7 +132,8 @@ WatchTower resolves its store in this order:
 3. `~/.watchtower/queues.json` — WatchTower's own default.
 
 Tracked workers live in `~/.watchtower/workers.json`; the watcher daemon's
-pidfile is `~/.watchtower/daemon.pid`.
+pidfile is `~/.watchtower/daemon.pid`, and the background dashboard server's is
+`~/.watchtower/dashboard.pid`.
 
 ## Stuck detection
 
