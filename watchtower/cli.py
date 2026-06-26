@@ -13,7 +13,7 @@ Phase-1 commands:
     wt spawn-worker -q Q      launch N draining worker subprocess(es)
     wt wait -q Q [--cmd ..]   block until the queue is drained, then run --cmd
     wt start / wt stop        start/stop the background watcher daemon
-    wt serve                  (phase 2) HTTP viewer — stub
+    wt dashboard              (phase 2) HTTP viewer — stub
 """
 
 from __future__ import annotations
@@ -269,11 +269,11 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_serve(args: argparse.Namespace) -> int:
-    # TODO(phase-2): stdlib http.server viewer that renders `wt status` as HTML
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    # TODO(phase-2): stdlib http.server dashboard that renders `wt status` as HTML
     # and exposes read-only JSON at /api/status and /api/queues. Keep it
     # stdlib-only (http.server + json) to match the engine's no-deps ethos.
-    print("HTTP viewer coming in phase 2")
+    print("Dashboard (HTTP viewer) coming in phase 2")
     return 0
 
 
@@ -349,8 +349,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("stop", help="stop the background watcher daemon")
     s.set_defaults(func=cmd_stop)
 
-    s = sub.add_parser("serve", help="(phase 2) HTTP viewer — stub")
-    s.set_defaults(func=cmd_serve)
+    s = sub.add_parser("dashboard", aliases=["serve"], help="(phase 2) HTTP viewer — stub")
+    s.set_defaults(func=cmd_dashboard)
 
     return p
 
