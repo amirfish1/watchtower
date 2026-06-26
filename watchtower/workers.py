@@ -126,6 +126,21 @@ def live_worker_count(queue: Optional[str] = None) -> int:
     return n
 
 
+def worker_counts(prune: bool = False) -> Dict[str, Dict[str, int]]:
+    """Per-queue worker tally: ``{queue: {"total": n, "live": n}}``.
+
+    A single pass over the tracked workers so callers (``wt status``, the
+    dashboard) don't fan out one liveness probe per queue.
+    """
+    out: Dict[str, Dict[str, int]] = {}
+    for w in list_workers(prune=prune):
+        row = out.setdefault(w.get("queue", ""), {"total": 0, "live": 0})
+        row["total"] += 1
+        if w.get("alive"):
+            row["live"] += 1
+    return out
+
+
 def build_drain_command(queue: str, engine: str, worker_id: str) -> List[str]:
     """Construct the argv for one worker subprocess.
 

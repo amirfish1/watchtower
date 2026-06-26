@@ -13,7 +13,7 @@ Phase-1 commands:
     wt spawn-worker -q Q      launch N draining worker subprocess(es)
     wt wait -q Q [--cmd ..]   block until the queue is drained, then run --cmd
     wt start / wt stop        start/stop the background watcher daemon
-    wt dashboard              (phase 2) HTTP viewer — stub
+    wt dashboard              phone-first HTTP dashboard (queues + workers)
 """
 
 from __future__ import annotations
@@ -39,17 +39,37 @@ DAEMON_PID_FILE = Path(
 # --------------------------------------------------------------------------- fmt
 def _print_status(rows: List[dict]) -> None:
     print(f"store: {q.store_path()}")
+    counts = workers.worker_counts()
     if not rows:
         print("(no queues)")
+    else:
+        hdr = (
+            f"{'QUEUE':<14}{'OPEN':>5}{'WIP':>5}{'DONE':>6}  {'OLDEST':>8}"
+            f"  {'IDLE':>8}  {'WORKERS':<12}STATUS"
+        )
+        print(hdr)
+        print("-" * len(hdr))
+        for r in rows:
+            flag = "STUCK" if r["stuck"] else ("ok" if r["depth"] == 0 else "draining")
+            wc = counts.get(r["queue"], {"total": 0, "live": 0})
+            wcell = f"{wc['total']} ({wc['live']} live)"
+            print(
+                f"{r['queue']:<14}{r['depth']:>5}{r['in_progress']:>5}{r['closed']:>6}"
+                f"  {r['oldest_open_age']:>8}  {r['since_progress']:>8}"
+                f"  {wcell:<12}{flag}"
+            )
+
+    rows_w = workers.list_workers(prune=False)
+    print()
+    print(f"workers ({sum(1 for w in rows_w if w.get('alive'))} live / {len(rows_w)})")
+    if not rows_w:
+        print("  (no workers tracked)")
         return
-    hdr = f"{'QUEUE':<14}{'OPEN':>5}{'WIP':>5}{'DONE':>6}  {'OLDEST':>8}  {'IDLE':>8}  STATUS"
-    print(hdr)
-    print("-" * len(hdr))
-    for r in rows:
-        flag = "STUCK" if r["stuck"] else ("ok" if r["depth"] == 0 else "draining")
+    for w in rows_w:
+        state = "LIVE" if w.get("alive") else "DEAD"
         print(
-            f"{r['queue']:<14}{r['depth']:>5}{r['in_progress']:>5}{r['closed']:>6}"
-            f"  {r['oldest_open_age']:>8}  {r['since_progress']:>8}  {flag}"
+            f"  {w.get('worker_id',''):<22} q={w.get('queue',''):<12} "
+            f"pid={w.get('pid',0):<8} {state}"
         )
 
 
@@ -270,11 +290,9 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 def cmd_dashboard(args: argparse.Namespace) -> int:
-    # TODO(phase-2): stdlib http.server dashboard that renders `wt status` as HTML
-    # and exposes read-only JSON at /api/status and /api/queues. Keep it
-    # stdlib-only (http.server + json) to match the engine's no-deps ethos.
-    print("Dashboard (HTTP viewer) coming in phase 2")
-    return 0
+    from . import dashboard
+
+    return dashboard.serve(host=args.host, port=args.port, once=args.once)
 
 
 # --------------------------------------------------------------------------- main
@@ -349,7 +367,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("stop", help="stop the background watcher daemon")
     s.set_defaults(func=cmd_stop)
 
-    s = sub.add_parser("dashboard", aliases=["serve"], help="(phase 2) HTTP viewer — stub")
+    s = sub.add_parser(
+        "dashboard", aliases=["serve"], help="phone-first HTTP dashboard"
+    )
+    s.add_argument("--host", default="127.0.0.1")
+    s.add_argument("--port", type=int, default=8787)
+    s.add_argument("--once", action="store_true",
+                   help="handle one request then exit (for tests)")
     s.set_defaults(func=cmd_dashboard)
 
     return p

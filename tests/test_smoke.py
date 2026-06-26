@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import importlib
 import json
+import threading
+import urllib.request
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -27,6 +29,11 @@ def store(tmp_path, monkeypatch):
     importlib.reload(q)
     importlib.reload(health)
     importlib.reload(workers)
+    try:
+        import watchtower.dashboard as dashboard
+        importlib.reload(dashboard)
+    except ImportError:
+        pass
     return path
 
 
@@ -138,8 +145,87 @@ def test_cli_enqueue_and_status(store, capsys):
     assert "CLOSED: CLI-1" in out
 
 
-def test_serve_is_stub(store, capsys):
+def test_status_includes_workers(store, capsys):
+    import watchtower.queue as q
+    import watchtower.workers as workers
     from watchtower.cli import main
 
-    assert main(["serve"]) == 0
-    assert "phase 2" in capsys.readouterr().out
+    q.enqueue(project="WK", note="work")
+    # Fake a tracked worker for this queue (our own pid is alive).
+    import os
+
+    workers.record_worker(os.getpid(), "WK", "claude", "wk-test01")
+
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    # Per-queue WORKERS column + the workers section header.
+    assert "WORKERS" in out
+    assert "1 (1 live)" in out
+    assert "wk-test01" in out
+    assert "LIVE" in out
+
+
+def test_dashboard_serves_status_json(store):
+    import os
+
+    import watchtower.queue as q
+    import watchtower.workers as workers
+    import watchtower.dashboard as dashboard
+
+    # A couple of queued items + an aged, stuck one.
+    q.enqueue(project="DASH", note="item one")
+    q.enqueue(project="DASH", note="item two")
+    workers.record_worker(os.getpid(), "DASH", "claude", "dash-w1")
+
+    old = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    data = json.loads(store.read_text())
+    for it in data["items"]:
+        it["created_at"] = old
+    store.write_text(json.dumps(data))
+
+    # Bind an ephemeral port, serve exactly one request, hit it.
+    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/status", timeout=5
+        ) as resp:
+            assert resp.status == 200
+            payload = json.loads(resp.read().decode())
+    finally:
+        t.join(timeout=5)
+        httpd.server_close()
+
+    assert "queues" in payload and "workers" in payload
+    dash = next(r for r in payload["queues"] if r["queue"] == "DASH")
+    assert dash["depth"] == 2
+    assert dash["stuck"] is True
+    assert dash["workers_live"] == 1
+    assert any(w["worker_id"] == "dash-w1" for w in payload["workers"])
+
+
+def test_dashboard_html_renders(store):
+    import watchtower.queue as q
+    import watchtower.dashboard as dashboard
+
+    q.enqueue(project="HTML", note="needs work")
+    old = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    data = json.loads(store.read_text())
+    for it in data["items"]:
+        it["created_at"] = old
+    store.write_text(json.dumps(data))
+
+    page = dashboard.render_html(dashboard.status_payload())
+    assert "<!doctype html>" in page
+    assert "viewport" in page  # mobile-first meta
+    assert "HTML" in page
+    assert "STUCK" in page
+
+    empty = dashboard.render_html({"queues": [], "workers": []})
+    assert "All queues clear." in empty

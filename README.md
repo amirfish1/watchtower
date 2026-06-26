@@ -34,8 +34,32 @@ wt wait   -q DEMO --timeout 600 --cmd "say done" # block until drained, then run
 
 wt start  --auto-spawn                 # background watcher: log/auto-handle stuck queues
 wt stop                                # stop the watcher
-wt serve                               # phase 2: HTTP viewer (stub for now)
+wt dashboard --port 8787               # phone-first HTTP dashboard (queues + workers)
 ```
+
+`wt status` shows, per queue, depth (open) / WIP / done, oldest-open age, idle
+time, a `WORKERS` column (`total (n live)`), and a STUCK/draining/ok flag — then
+a workers section listing each tracked worker's id, queue, pid, and LIVE/DEAD
+state (process liveness via `os.kill(pid, 0)`).
+
+### The dashboard: `wt dashboard`
+
+```bash
+wt dashboard [--port 8787] [--host 127.0.0.1] [--once]
+```
+
+A read-only, mobile-first HTTP view over the same queue engine — stdlib-only
+(`http.server` + `json`), no dependencies. The page auto-refreshes (~5s) and
+shows one card per queue (depth, oldest-open age, live workers, and a
+STUCK/LIVE/clear badge), plus a workers section. Empty state reads
+"All queues clear." It also exposes read-only JSON:
+
+- `GET /api/status` — health rows (each annotated with worker counts) + the
+  worker roster.
+- `GET /api/queues` — per-queue counts (mirrors `wt queues`).
+
+Binds `127.0.0.1` by default (local-first). `--once` handles a single request
+then exits (used by the test suite).
 
 ### The signature feature: `wt wait`
 
@@ -64,6 +88,6 @@ the queue file alone, with no dependency on any external liveness signal.
 
 ## Roadmap
 
-- Phase 1 (now): the `wt` CLI and queue engine.
-- Phase 2: `wt serve` — a read-only HTTP viewer over the same queue.
+- Phase 1: the `wt` CLI and queue engine.
+- Phase 2 (now): `wt dashboard` — a read-only HTTP viewer over the same queue.
 - Later: CCC becomes just one WatchTower client.
