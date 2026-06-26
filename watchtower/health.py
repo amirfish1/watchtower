@@ -15,13 +15,18 @@ whole point of WatchTower.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from . import queue as q
 
 # Minutes of no progress (no ticket closed) before an open queue is "stuck".
 STUCK_MINUTES = 10
+
+# Window (minutes) over which the drain rate is measured: tickets closed in the
+# last DRAIN_WINDOW_MINUTES divided by the window gives closes/min, which feeds
+# the ETA estimate. A short window keeps the rate responsive to current pace.
+DRAIN_WINDOW_MINUTES = 30
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
@@ -57,11 +62,29 @@ def _fmt_age(seconds: Optional[int]) -> str:
     return f"{days}d{hours % 24:02d}h"
 
 
+def _fmt_eta(seconds: Optional[int]) -> Optional[str]:
+    """Human ETA string from seconds-to-empty. None -> 'stalled' is the
+    caller's job (we return None here so JSON can carry a real null)."""
+    if seconds is None:
+        return None
+    if seconds < 60:
+        return f"~{max(1, seconds)}s"
+    mins = round(seconds / 60)
+    if mins < 60:
+        return f"~{mins}m"
+    hours = mins / 60
+    if hours < 24:
+        return f"~{round(hours)}h"
+    days = round(hours / 24)
+    return f"~{days}d"
+
+
 def queue_status(
     project: str,
     items: List[Dict[str, Any]],
     now: Optional[datetime] = None,
     stuck_minutes: int = STUCK_MINUTES,
+    drain_window_minutes: int = DRAIN_WINDOW_MINUTES,
 ) -> Dict[str, Any]:
     """Compute the status row for a single queue from its items."""
     now = now or datetime.now(timezone.utc)
@@ -91,6 +114,24 @@ def queue_status(
         and since_progress >= stuck_minutes * 60
     )
 
+    # Drain rate: closes within the recent window / window minutes => closes/min.
+    window_start = now - timedelta(minutes=drain_window_minutes)
+    closed_in_window = 0
+    for it in closed:
+        dt = _parse_iso(it.get("closed_at"))
+        if dt is not None and dt >= window_start:
+            closed_in_window += 1
+    drain_rate = round(closed_in_window / drain_window_minutes, 2)
+
+    # ETA to empty: depth / rate (seconds). Zero rate => stalled (null/None).
+    if drain_rate > 0 and depth > 0:
+        eta_seconds: Optional[int] = int(round(depth / drain_rate * 60))
+    elif depth == 0:
+        eta_seconds = 0
+    else:
+        eta_seconds = None
+    eta_human = "empty" if eta_seconds == 0 else _fmt_eta(eta_seconds)
+
     return {
         "queue": project,
         "depth": depth,
@@ -101,6 +142,9 @@ def queue_status(
         "since_progress_s": since_progress,
         "since_progress": _fmt_age(since_progress),
         "stuck": stuck,
+        "drain_rate_per_min": drain_rate,
+        "eta_seconds": eta_seconds,
+        "eta_human": eta_human,
     }
 
 
@@ -108,6 +152,7 @@ def all_status(
     project: Optional[str] = None,
     now: Optional[datetime] = None,
     stuck_minutes: int = STUCK_MINUTES,
+    drain_window_minutes: int = DRAIN_WINDOW_MINUTES,
 ) -> List[Dict[str, Any]]:
     """Status rows for every queue (or one, if ``project`` is given).
 
@@ -119,7 +164,13 @@ def all_status(
     for it in q.list_items(project=project):
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
     rows = [
-        queue_status(name, items, now=now, stuck_minutes=stuck_minutes)
+        queue_status(
+            name,
+            items,
+            now=now,
+            stuck_minutes=stuck_minutes,
+            drain_window_minutes=drain_window_minutes,
+        )
         for name, items in by_queue.items()
     ]
     # Stuck first, then deepest, then name.

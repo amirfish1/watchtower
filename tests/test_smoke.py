@@ -229,3 +229,85 @@ def test_dashboard_html_renders(store):
 
     empty = dashboard.render_html({"queues": [], "workers": []})
     assert "All queues clear." in empty
+
+
+def test_drain_rate_eta_fields(store):
+    """A queue with recent closes reports a positive rate + an ETA; an
+    untouched queue reports rate 0 and a null ('stalled') ETA."""
+    import watchtower.queue as q
+    import watchtower.health as health
+
+    # Two open + two closed (closed just now => inside the drain window).
+    q.enqueue(project="ETA", note="open one")
+    q.enqueue(project="ETA", note="open two")
+    a = q.enqueue(project="ETA", note="done a")
+    b = q.enqueue(project="ETA", note="done b")
+    q.close(a["ref"], "w")
+    q.close(b["ref"], "w")
+
+    row = {r["queue"]: r for r in health.all_status()}["ETA"]
+    assert row["depth"] == 2
+    assert row["drain_rate_per_min"] > 0
+    assert row["eta_seconds"] is not None and row["eta_seconds"] > 0
+    assert row["eta_human"] and row["eta_human"].startswith("~")
+
+    # A queue with open work but no closes at all => stalled (rate 0, eta null).
+    q.enqueue(project="STALL", note="nobody draining")
+    stall = {r["queue"]: r for r in health.all_status()}["STALL"]
+    assert stall["drain_rate_per_min"] == 0
+    assert stall["eta_seconds"] is None
+    assert stall["eta_human"] is None
+
+
+def test_api_status_includes_drain_and_activity(store):
+    """/api/status carries drain_rate/eta on queues and active_ref on workers."""
+    import os
+
+    import watchtower.queue as q
+    import watchtower.workers as workers
+    import watchtower.dashboard as dashboard
+
+    q.enqueue(project="DASH", note="item one")
+    item = q.enqueue(project="DASH", note="item two")
+    a = q.enqueue(project="DASH", note="done a")
+    q.close(a["ref"], "w")
+
+    # A tracked worker (our own live pid) that claims one ticket => in_progress.
+    workers.record_worker(os.getpid(), "DASH", "claude", "dash-live01")
+    q.claim_next("dash-live01", project="DASH")
+
+    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/api/status", timeout=5
+        ) as resp:
+            payload = json.loads(resp.read().decode())
+    finally:
+        t.join(timeout=5)
+        httpd.server_close()
+
+    dash = next(r for r in payload["queues"] if r["queue"] == "DASH")
+    assert "drain_rate_per_min" in dash
+    assert "eta_seconds" in dash
+    assert "eta_human" in dash
+    assert dash["drain_rate_per_min"] > 0  # one recent close
+
+    w = next(w for w in payload["workers"] if w["worker_id"] == "dash-live01")
+    # The worker is joined to the in-progress ticket it claimed.
+    assert w["active_ref"] == "DASH-1"
+    assert w["active_since_human"] is not None
+
+
+def test_worker_activity_join_idle_when_unclaimed(store):
+    """A worker holding no in-progress ticket reports idle (active_ref None)."""
+    import watchtower.queue as q
+    import watchtower.workers as workers
+
+    q.enqueue(project="IDLEQ", note="open work, unclaimed")
+    rows = [{"worker_id": "idle-w1", "queue": "IDLEQ"}]
+    workers.annotate_activity(rows, q.list_items())
+    assert rows[0]["active_ref"] is None
+    assert rows[0]["active_since_human"] is None

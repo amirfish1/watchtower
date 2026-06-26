@@ -19,6 +19,7 @@ import os
 import subprocess
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -139,6 +140,60 @@ def worker_counts(prune: bool = False) -> Dict[str, Dict[str, int]]:
         if w.get("alive"):
             row["live"] += 1
     return out
+
+
+def _age_human(claimed_at: Optional[str]) -> Optional[str]:
+    """Compact age string for how long ago a ticket was claimed (e.g. '4m')."""
+    if not claimed_at:
+        return None
+    try:
+        dt = datetime.strptime(claimed_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+    except (ValueError, TypeError):
+        return None
+    secs = max(0, int((datetime.now(timezone.utc) - dt).total_seconds()))
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours}h{mins % 60:02d}m"
+    days = hours // 24
+    return f"{days}d{hours % 24:02d}h"
+
+
+def annotate_activity(
+    rows: List[Dict[str, Any]], items: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Join each worker row to the in-progress ticket it currently holds.
+
+    One pass over ``items`` builds the lookup (by ``claimed_session_id`` and by
+    ``claimed_by``), then one pass over ``rows`` attaches ``active_ref`` /
+    ``active_since`` / ``active_since_human`` (None when the worker is idle).
+    O(items + workers), consistent with ``worker_counts``.
+    """
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for it in items:
+        if it.get("status") != "in_progress":
+            continue
+        for key in (it.get("claimed_session_id"), it.get("claimed_by")):
+            if key:
+                by_key.setdefault(str(key), it)
+    for row in rows:
+        wid = str(row.get("worker_id", ""))
+        active = by_key.get(wid)
+        if active:
+            row["active_ref"] = active.get("ref")
+            row["active_since"] = active.get("claimed_at")
+            row["active_since_human"] = _age_human(active.get("claimed_at"))
+        else:
+            row["active_ref"] = None
+            row["active_since"] = None
+            row["active_since_human"] = None
+    return rows
 
 
 def build_drain_command(queue: str, engine: str, worker_id: str) -> List[str]:

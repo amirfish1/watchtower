@@ -37,6 +37,19 @@ DAEMON_PID_FILE = Path(
 
 
 # --------------------------------------------------------------------------- fmt
+def _eta_note(r: dict) -> str:
+    """Drain-rate + ETA readout for a queue row, e.g. '~3/min · empty in ~20m'.
+
+    'stalled' when the rate is 0 and there is open work; '' for a clear queue."""
+    rate = r.get("drain_rate_per_min") or 0
+    if r.get("depth", 0) == 0:
+        return ""
+    if not rate:
+        return "stalled"
+    eta = r.get("eta_human") or "?"
+    return f"~{rate}/min · empty in {eta}"
+
+
 def _print_status(rows: List[dict]) -> None:
     print(f"store: {q.store_path()}")
     counts = workers.worker_counts()
@@ -56,10 +69,11 @@ def _print_status(rows: List[dict]) -> None:
             print(
                 f"{r['queue']:<14}{r['depth']:>5}{r['in_progress']:>5}{r['closed']:>6}"
                 f"  {r['oldest_open_age']:>8}  {r['since_progress']:>8}"
-                f"  {wcell:<12}{flag}"
+                f"  {wcell:<12}{flag}  {_eta_note(r)}"
             )
 
     rows_w = workers.list_workers(prune=False)
+    workers.annotate_activity(rows_w, q.list_items())
     print()
     print(f"workers ({sum(1 for w in rows_w if w.get('alive'))} live / {len(rows_w)})")
     if not rows_w:
@@ -67,9 +81,15 @@ def _print_status(rows: List[dict]) -> None:
         return
     for w in rows_w:
         state = "LIVE" if w.get("alive") else "DEAD"
+        ref = w.get("active_ref")
+        if ref:
+            since = w.get("active_since_human")
+            activity = f"-> {ref}" + (f" ({since})" if since else "")
+        else:
+            activity = "idle"
         print(
             f"  {w.get('worker_id',''):<22} q={w.get('queue',''):<12} "
-            f"pid={w.get('pid',0):<8} {state}"
+            f"pid={w.get('pid',0):<8} {state}  {activity}"
         )
 
 

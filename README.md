@@ -38,9 +38,27 @@ wt dashboard --port 8787               # phone-first HTTP dashboard (queues + wo
 ```
 
 `wt status` shows, per queue, depth (open) / WIP / done, oldest-open age, idle
-time, a `WORKERS` column (`total (n live)`), and a STUCK/draining/ok flag — then
-a workers section listing each tracked worker's id, queue, pid, and LIVE/DEAD
-state (process liveness via `os.kill(pid, 0)`).
+time, a `WORKERS` column (`total (n live)`), and a STUCK/draining/ok flag,
+followed by a **drain readout** (`~3/min · empty in ~20m`, or `stalled` when no
+ticket has closed recently). Then a workers section listing each tracked
+worker's id, queue, pid, LIVE/DEAD state (process liveness via
+`os.kill(pid, 0)`), and what it is doing right now — `-> DASH-3 (4m)` (the
+in-progress ticket it holds and how long ago it claimed it) or `idle`.
+
+### Drain rate + ETA
+
+WatchTower turns the queue's own close timestamps into a live estimate, so
+`wt status` and the dashboard read like a forecast rather than a static count:
+
+- **drain rate** — tickets closed in the last 30 minutes (a fixed window) over
+  the window, i.e. closes/min.
+- **ETA** — `depth / drain_rate`, rendered as `~20m` / `~2h`; `stalled` (null in
+  JSON) when nothing has closed in the window.
+
+These are computed from data already in the queue (`closed_at` timestamps) — no
+new persistent state, no transcript parsing. `/api/status` carries
+`drain_rate_per_min`, `eta_seconds`, and `eta_human` on each queue, and
+`active_ref` / `active_since_human` on each worker.
 
 ### The dashboard: `wt dashboard`
 
@@ -50,9 +68,10 @@ wt dashboard [--port 8787] [--host 127.0.0.1] [--once]
 
 A read-only, mobile-first HTTP view over the same queue engine — stdlib-only
 (`http.server` + `json`), no dependencies. The page auto-refreshes (~5s) and
-shows one card per queue (depth, oldest-open age, live workers, and a
-STUCK/LIVE/clear badge), plus a workers section. Empty state reads
-"All queues clear." It also exposes read-only JSON:
+shows one card per queue (depth, oldest-open age, live workers, a
+STUCK/LIVE/clear badge, and a `clearing in ~20m` / `stalled` ETA line), plus a
+workers section with an `ACTIVITY` column (the ticket each worker holds and how
+long ago). Empty state reads "All queues clear." It also exposes read-only JSON:
 
 - `GET /api/status` — health rows (each annotated with worker counts) + the
   worker roster.
@@ -89,5 +108,14 @@ the queue file alone, with no dependency on any external liveness signal.
 ## Roadmap
 
 - Phase 1: the `wt` CLI and queue engine.
-- Phase 2 (now): `wt dashboard` — a read-only HTTP viewer over the same queue.
+- Phase 2 (now): `wt dashboard` — a read-only HTTP viewer over the same queue,
+  with a live drain rate + ETA and per-worker activity.
 - Later: CCC becomes just one WatchTower client.
+
+### Roadmap (later)
+
+Deliberately deferred to keep the dashboard read-only and focused:
+
+- **Tap-to-act / buttons** — claim, close, or requeue tickets from the UI.
+- **Cost / token tracking** — per-queue and per-worker spend.
+- **Push notifications** — alert on a queue going stuck or draining.

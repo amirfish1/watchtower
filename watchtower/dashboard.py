@@ -40,10 +40,29 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
         wc = counts.get(r["queue"], {"total": 0, "live": 0})
         r["workers_total"] = wc["total"]
         r["workers_live"] = wc["live"]
-    return {"queues": rows, "workers": workers.list_workers(prune=False)}
+    wrows = workers.list_workers(prune=False)
+    workers.annotate_activity(wrows, q.list_items())
+    return {"queues": rows, "workers": wrows}
 
 
 # --------------------------------------------------------------------------- html
+def _eta_line(row: Dict[str, Any]) -> str:
+    """Prominent ETA readout for a card: 'clearing in ~20m' / 'stalled' / 'clear'.
+
+    This is the line that makes the dashboard feel smart — a live estimate of
+    when the queue empties, not just a static count."""
+    if row.get("depth", 0) == 0:
+        return '<span class="eta-clear">clear</span>'
+    rate = row.get("drain_rate_per_min") or 0
+    if not rate:
+        return '<span class="eta-stalled">stalled</span>'
+    eta = html.escape(str(row.get("eta_human") or "?"))
+    return (
+        f'<span class="eta-rate">~{html.escape(str(rate))}/min</span> · '
+        f'clearing in <span class="eta-time">{eta}</span>'
+    )
+
+
 def _badge(row: Dict[str, Any]) -> str:
     if row["stuck"]:
         return '<span class="badge stuck">STUCK</span>'
@@ -75,6 +94,7 @@ def render_html(payload: Dict[str, Any]) -> str:
         <div><span class="num">{html.escape(str(r['oldest_open_age']))}</span><span class="lbl">oldest</span></div>
         <div><span class="num">{html.escape(workers_cell)}</span><span class="lbl">workers</span></div>
       </div>
+      <div class="eta">{_eta_line(r)}</div>
     </div>"""
             )
         queues_block = "\n".join(cards)
@@ -85,17 +105,29 @@ def render_html(payload: Dict[str, Any]) -> str:
         wrows = []
         for w in wkrs:
             live = w.get("alive")
+            ref = w.get("active_ref")
+            if ref:
+                since = w.get("active_since_human")
+                activity = html.escape(str(ref)) + (
+                    f" <span class=\"ago\">({html.escape(str(since))})</span>"
+                    if since
+                    else ""
+                )
+            else:
+                activity = '<span class="idle">idle</span>'
             wrows.append(
                 f"""      <tr>
         <td class="wid">{html.escape(str(w.get('worker_id', '')))}</td>
         <td>{html.escape(str(w.get('queue', '')))}</td>
         <td>{w.get('pid', 0)}</td>
         <td><span class="badge {'live' if live else 'stuck'}">{'LIVE' if live else 'DEAD'}</span></td>
+        <td class="activity">{activity}</td>
       </tr>"""
             )
         workers_block = (
             "    <table class=\"workers\">\n"
-            "      <tr><th>worker</th><th>queue</th><th>pid</th><th>state</th></tr>\n"
+            "      <tr><th>worker</th><th>queue</th><th>pid</th><th>state</th>"
+            "<th>activity</th></tr>\n"
             + "\n".join(wrows)
             + "\n    </table>"
         )
@@ -131,6 +163,13 @@ def render_html(payload: Dict[str, Any]) -> str:
     .metrics {{ display: flex; gap: 24px; margin-top: 12px; }}
     .metrics .num {{ display: block; font-size: 22px; font-weight: 600; }}
     .metrics .lbl {{ display: block; font-size: 12px; color: #8b93a1; }}
+    .eta {{ margin-top: 12px; font-size: 14px; color: #8b93a1; }}
+    .eta .eta-rate, .eta .eta-time {{ color: #e6e8eb; font-weight: 600; }}
+    .eta .eta-stalled {{ color: #f3b14b; font-weight: 700; }}
+    .eta .eta-clear {{ color: #5fd18a; font-weight: 600; }}
+    td.activity {{ color: #e6e8eb; }}
+    td.activity .ago {{ color: #8b93a1; }}
+    td.activity .idle {{ color: #8b93a1; }}
     .badge {{
       font-size: 12px; font-weight: 700; padding: 4px 10px; border-radius: 999px;
       letter-spacing: .04em;
