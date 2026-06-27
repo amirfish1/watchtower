@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import signal
 import sys
 import time
@@ -240,6 +241,79 @@ def cmd_close(args: argparse.Namespace) -> int:
             )
             print(f"  FILED follow-up: {new['ref']}  {note}")
     return 0
+
+
+def cmd_block(args: argparse.Namespace) -> int:
+    """A worker parks a ticket that needs a human decision (WT-28). Stays
+    in_progress, bound to its session; flagged needs_input with a question."""
+    item = q.block(
+        args.ref, session_id=args.worker,
+        question=args.question, progress=args.progress,
+    )
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    print(f"BLOCKED: {item['ref']} — {item.get('block_question') or '(no question)'}")
+    sid = item.get("claimed_session_id")
+    if sid:
+        print(f"  session {sid} — resume with: wt discuss {item['ref']}")
+    else:
+        print("  (no resumable session id recorded; a human can still read progress notes)")
+    return 0
+
+
+def cmd_blocked(args: argparse.Namespace) -> int:
+    """List tickets parked for a human (WT-28)."""
+    rows = q.list_blocked(project=args.queue)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("(nothing blocked)")
+        return 0
+    for it in rows:
+        print(f"{it['ref']:<12} {it.get('block_question') or '(no question)'}")
+        print(f"             session={it.get('claimed_session_id') or '-'}  "
+              f"repo={it.get('repo_path') or '-'}")
+    return 0
+
+
+def cmd_answer(args: argparse.Namespace) -> int:
+    """Quick-inject a human answer onto a blocked ticket; clears needs_input so
+    the resumed session continues (WT-28)."""
+    item = q.answer(args.ref, args.text, session_id=args.worker)
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    print(f"ANSWERED: {item['ref']} — needs_input cleared. "
+          f"Resume the session to continue: wt discuss {item['ref']}")
+    return 0
+
+
+def cmd_discuss(args: argparse.Namespace) -> int:
+    """Attach to a blocked ticket's worker session for a real discussion (WT-28).
+    Resolves the ticket's session id + repo and runs `claude --resume` there
+    (engine-aware). With --print, shows the command instead of running it."""
+    item = q.get(args.ref)
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    sid = item.get("claimed_session_id")
+    if not sid:
+        print(f"(no resumable session on {args.ref} — it was never claimed with a "
+              f"real session id)", file=sys.stderr)
+        return 1
+    repo = item.get("repo_path") or os.getcwd()
+    if args.engine == "codex":
+        inner = ["codex", "resume", sid]
+    else:
+        inner = ["claude", "--resume", sid]
+    cmd = "cd " + shlex.quote(repo) + " && " + " ".join(shlex.quote(c) for c in inner)
+    if args.print:
+        print(cmd)
+        return 0
+    print(f"Resuming {item['ref']} (session {sid}) in {repo} …")
+    return os.system(cmd) >> 8
 
 
 def cmd_workers(args: argparse.Namespace) -> int:
@@ -689,6 +763,33 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="enqueue_follow_ups",
                    help="also file each follow-up/unresolved as a new open ticket")
     s.set_defaults(func=cmd_close)
+
+    s = sub.add_parser("block", help="park a ticket that needs a human decision")
+    s.add_argument("ref")
+    s.add_argument("--worker", default="", help="your session/worker id")
+    s.add_argument("--question", default="", help="the specific decision you need")
+    s.add_argument("--progress", default="",
+                   help="analysis-so-far note (backstop if the session is lost)")
+    s.set_defaults(func=cmd_block)
+
+    s = sub.add_parser("blocked", help="list tickets parked for a human")
+    s.add_argument("-q", "--queue", default=None)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_blocked)
+
+    s = sub.add_parser("answer", help="answer a blocked ticket (clears needs_input)")
+    s.add_argument("ref")
+    s.add_argument("text", help="your answer")
+    s.add_argument("--worker", default="")
+    s.set_defaults(func=cmd_answer)
+
+    s = sub.add_parser("discuss",
+                       help="attach to a blocked ticket's session (claude --resume)")
+    s.add_argument("ref")
+    s.add_argument("--engine", default="claude", choices=["claude", "codex"])
+    s.add_argument("--print", action="store_true", dest="print",
+                   help="print the resume command instead of running it")
+    s.set_defaults(func=cmd_discuss)
 
     s = sub.add_parser("workers", help="list workers this CLI started")
     s.add_argument("--json", action="store_true")

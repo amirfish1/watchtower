@@ -412,6 +412,7 @@ def update_status(
                         it["claimed_session_id"] = real_sid
                 if status == "closed":
                     it["closed_at"] = now
+                    it["needs_input"] = False  # a closed ticket isn't waiting
                     # Attribute the close so a worker that closed by ref
                     # (without a prior claim) still gets credited.
                     if session_id:
@@ -428,6 +429,10 @@ def update_status(
                     it["claimed_at"] = None
                     it["closed_at"] = None
                     it["claimed_session_id"] = None
+                    # reopening drops any block — it's back in the pool
+                    it["needs_input"] = False
+                    it["block_question"] = ""
+                    it["blocked_at"] = None
                 _save_unlocked(data)
                 return it
     return None
@@ -442,6 +447,89 @@ def close(
     ``summary`` / ``caveats`` / ``follow_ups`` / ``unresolved``. Absent ->
     closes with no resolution (back-compatible)."""
     return update_status(ident, "closed", session_id, resolution=resolution)
+
+
+def block(
+    ident: Any,
+    session_id: str = "",
+    question: str = "",
+    progress: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Park a ticket that needs a human decision.
+
+    The ticket STAYS ``in_progress`` bound to its session (so ``claim_next``,
+    which only picks ``open``, can never hand it to another worker) and is flagged
+    ``needs_input`` with the worker's specific ``question``. The worker process
+    may then exit to save tokens — continuity is not lost, because the Claude
+    session is resumable by id (``claimed_session_id``).
+
+    ``progress`` is an optional analysis-so-far note, stored append-only as a
+    backstop so a fresh worker could resume from notes if the session is ever
+    truly gone. Resume-first, notes-as-fallback.
+    """
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                now = _now_iso()
+                it["needs_input"] = True
+                it["block_question"] = _clip(question, 4000)
+                it["blocked_at"] = now
+                it["updated_at"] = now
+                if it.get("status") == "open":
+                    it["status"] = "in_progress"
+                if session_id:
+                    it["claimed_by"] = it.get("claimed_by") or str(session_id)
+                    real = _coerce_session_uuid(session_id)
+                    if real and not it.get("claimed_session_id"):
+                        it["claimed_session_id"] = real
+                if progress:
+                    notes = it.get("progress_notes")
+                    if not isinstance(notes, list):
+                        notes = []
+                    notes.append({"at": now, "text": _clip(progress, 24000)})
+                    it["progress_notes"] = notes
+                _save_unlocked(data)
+                return it
+    return None
+
+
+def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, Any]]:
+    """Record a human answer on a blocked ticket and clear ``needs_input`` so the
+    resumed session can continue. Answers are append-only, preserving a
+    back-and-forth. Does not change ``status`` — the ticket is still
+    ``in_progress`` with its worker; the human just unblocked it."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                now = _now_iso()
+                ans = it.get("answers")
+                if not isinstance(ans, list):
+                    ans = []
+                ans.append({"at": now, "text": _clip(text, 24000),
+                            "by": str(session_id or "human")})
+                it["answers"] = ans
+                it["needs_input"] = False
+                it["answered_at"] = now
+                it["updated_at"] = now
+                _save_unlocked(data)
+                return it
+    return None
+
+
+def list_blocked(project: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Tickets parked for a human (``needs_input`` truthy), optionally scoped to
+    one queue. The CLI's ``wt blocked`` and CCC both read this."""
+    proj = _norm_project(project) if project else None
+    out = []
+    for it in _load_unlocked().get("items", []):
+        if not it.get("needs_input"):
+            continue
+        if proj and it.get("project") != proj:
+            continue
+        out.append(it)
+    return out
 
 
 def next_item(

@@ -543,6 +543,58 @@ def test_api_queue_includes_closed_with_resolution(store):
     assert data["closed"][0]["resolution"]["summary"] == "finished it"
 
 
+def test_block_answer_resume_flow(store):
+    """WT-28 blocked-work: a claimed ticket can be blocked (stays in_progress,
+    not reclaimable), answered (clears needs_input), and exposes a resumable
+    session id."""
+    import watchtower.queue as q
+
+    q.enqueue(project="BLK", note="needs a human call")
+    sid = "11111111-2222-3333-4444-555555555555"
+    claimed = q.claim_next("worker-1", project="BLK", session_uuid=sid)
+    assert claimed["status"] == "in_progress"
+
+    blocked = q.block(claimed["ref"], session_id=sid,
+                      question="ship A or B?", progress="A is safer")
+    assert blocked["needs_input"] is True
+    assert blocked["status"] == "in_progress"  # never bounces back to open
+    assert blocked["block_question"] == "ship A or B?"
+    assert blocked["claimed_session_id"] == sid  # resumable
+    assert blocked["progress_notes"][0]["text"] == "A is safer"
+
+    # A blocked ticket is NOT reclaimable by another worker.
+    assert q.claim_next("worker-2", project="BLK") is None
+    assert [it["ref"] for it in q.list_blocked(project="BLK")] == [blocked["ref"]]
+
+    answered = q.answer(blocked["ref"], "go with A", session_id="human")
+    assert answered["needs_input"] is False
+    assert answered["answers"][0]["text"] == "go with A"
+    assert q.list_blocked(project="BLK") == []
+
+    # Closing clears any lingering block flag.
+    closed = q.close(answered["ref"], "worker-1", resolution="shipped A")
+    assert closed["status"] == "closed"
+    assert closed["needs_input"] is False
+
+
+def test_discuss_command_prints_resume(store, capsys):
+    """`wt discuss <ref> --print` resolves the session + repo into a
+    `claude --resume` command without executing it."""
+    import watchtower.queue as q
+    import watchtower.cli as cli
+
+    q.enqueue(project="DSC", note="blocked thing", repo_path="/tmp/somerepo")
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    item = q.claim_next("w", project="DSC", session_uuid=sid)
+    q.block(item["ref"], session_id=sid, question="which?")
+
+    rc = cli.main(["discuss", item["ref"], "--print"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "claude" in out and "--resume" in out and sid in out
+    assert "/tmp/somerepo" in out
+
+
 def test_worker_activity_join_idle_when_unclaimed(store):
     """A worker holding no in-progress ticket reports idle (active_ref None)."""
     import watchtower.queue as q

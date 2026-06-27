@@ -45,8 +45,12 @@ DRAIN_GOAL_TEMPLATE = (
     "for, `--follow-up \"...\"` for notable next steps, and `--unresolved "
     "\"...\"` for anything you could not fix (each flag is repeatable). This "
     "resolution is the trust signal the dashboard surfaces, so never close "
-    "silently. Then claim the next one. When nothing is open, idle and re-poll "
-    "later — never busy-wait. Do not push unless explicitly asked."
+    "silently. If a ticket genuinely cannot be resolved without a human "
+    "decision, do NOT close it and do NOT guess: run `wt block <ref> --worker "
+    "{worker_id} --question \"the specific decision you need\" --progress \"what "
+    "you've figured out so far\"`, then move on to the next ticket. Then claim "
+    "the next one. When nothing is open, idle and re-poll later — never "
+    "busy-wait. Do not push unless explicitly asked."
 )
 
 _ENGINE_BIN = {"claude": "claude", "codex": "codex"}
