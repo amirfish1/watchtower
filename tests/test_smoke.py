@@ -125,7 +125,9 @@ def test_spawn_worker_dry_run(store):
         assert s["dry_run"] is True
         assert s["pid"] == 0
         assert s["argv"][0] == "claude"
-        assert "DEMO" in s["argv"][1]
+        assert "-p" in s["argv"]  # headless print mode, not interactive
+        assert any("DEMO" in a for a in s["argv"])  # queue name in the goal
+        assert "bypassPermissions" in s["argv"]  # autonomous drain
 
 
 def test_cli_enqueue_and_status(store, capsys):

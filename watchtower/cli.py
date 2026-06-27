@@ -261,11 +261,15 @@ def cmd_workers(args: argparse.Namespace) -> int:
 
 def cmd_spawn_worker(args: argparse.Namespace) -> int:
     spawned = workers.spawn_workers(
-        args.queue, n=args.n, engine=args.engine, dry_run=args.dry_run
+        args.queue, n=args.n, engine=args.engine,
+        repo_path=args.repo, dry_run=args.dry_run,
     )
     for s in spawned:
         tag = " (dry-run)" if s.get("dry_run") else f" pid={s['pid']}"
         print(f"SPAWNED worker {s['worker_id']} engine={s['engine']}{tag}")
+        print(f"  repo: {s.get('repo_path','')}")
+        if s.get("log"):
+            print(f"  log:  {s['log']}")
         if args.dry_run:
             print(f"  argv: {s['argv']}")
     return 0
@@ -571,6 +575,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("--n", type=int, default=1)
     s.add_argument("--engine", default="claude", choices=["claude", "codex"])
+    s.add_argument("--repo", default="", help="repo the worker drains in (default: cwd)")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_spawn_worker)
 

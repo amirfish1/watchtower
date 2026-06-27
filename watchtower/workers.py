@@ -32,7 +32,8 @@ WORKERS_FILE = Path(
 # Generalized: no CCC paths, no shared-clone assumptions. The worker drains one
 # queue via the `wt` CLI it was spawned by and idles when empty.
 DRAIN_GOAL_TEMPLATE = (
-    "/goal Drain the {queue}-* WatchTower queue and keep it empty. "
+    "Drain the {queue} WatchTower queue and keep it empty. "
+    "Work in the git repo at {repo}. "
     "Your worker id is {worker_id}. Loop: claim the oldest open ticket with "
     "`wt claim -q {queue} --worker {worker_id}` (it returns the ticket JSON, "
     "or nothing when the queue is drained). Read the ticket's note/text and, "
@@ -85,7 +86,12 @@ def _pid_alive(pid: int) -> bool:
 
 
 def record_worker(
-    pid: int, queue: str, engine: str, worker_id: str
+    pid: int,
+    queue: str,
+    engine: str,
+    worker_id: str,
+    repo_path: str = "",
+    log: str = "",
 ) -> Dict[str, Any]:
     data = _load()
     rec = {
@@ -93,6 +99,8 @@ def record_worker(
         "pid": int(pid),
         "queue": queue,
         "engine": engine,
+        "repo_path": repo_path,
+        "log": log,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     data["workers"].append(rec)
@@ -200,16 +208,25 @@ def annotate_activity(
     return rows
 
 
-def build_drain_command(queue: str, engine: str, worker_id: str) -> List[str]:
+def build_drain_command(
+    queue: str, engine: str, worker_id: str, repo_path: str = ""
+) -> List[str]:
     """Construct the argv for one worker subprocess.
 
-    The engine CLI is invoked in non-interactive mode with the drain goal as the
-    prompt. Exact flags vary per engine; we pass the goal as a single prompt
-    argument, which both ``claude`` and ``codex`` accept positionally.
+    The engine CLI is invoked **headless and autonomous** so it actually runs
+    without a TTY: ``claude -p <goal>`` (print/non-interactive) with
+    ``--permission-mode bypassPermissions`` so it can edit, run, and commit while
+    draining; ``codex exec <goal>`` is the codex equivalent. The goal carries the
+    target repo, and the process is launched with ``cwd`` set to it (see
+    ``spawn_workers``), so the worker operates in the right tree.
     """
     bin_name = _ENGINE_BIN.get(engine, engine)
-    goal = DRAIN_GOAL_TEMPLATE.format(queue=queue, worker_id=worker_id)
-    return [bin_name, goal]
+    goal = DRAIN_GOAL_TEMPLATE.format(
+        queue=queue, worker_id=worker_id, repo=repo_path or os.getcwd()
+    )
+    if engine == "codex":
+        return [bin_name, "exec", goal]
+    return [bin_name, "-p", goal, "--permission-mode", "bypassPermissions"]
 
 
 def spawn_workers(
@@ -217,17 +234,24 @@ def spawn_workers(
     n: int = 1,
     engine: str = "claude",
     *,
+    repo_path: str = "",
     dry_run: bool = False,
 ) -> List[Dict[str, Any]]:
     """Launch ``n`` worker subprocesses draining ``queue``.
 
-    Returns a list of records (with ``pid``). ``dry_run`` builds and records the
-    command without actually spawning — used by tests so no real engine runs.
+    ``repo_path`` is the tree the workers operate in (defaults to the current
+    working directory) — it becomes the subprocess ``cwd`` and is injected into
+    the drain goal. Each worker's stdout+stderr go to
+    ``~/.watchtower/logs/<worker_id>.log`` so a dead worker leaves a trail
+    instead of vanishing into ``/dev/null``. Returns records (with ``pid``).
+    ``dry_run`` builds + records the command without spawning (tests).
     """
+    repo_path = repo_path or os.getcwd()
+    log_dir = WORKERS_FILE.parent / "logs"
     spawned: List[Dict[str, Any]] = []
     for _ in range(max(1, n)):
         worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
-        argv = build_drain_command(queue, engine, worker_id)
+        argv = build_drain_command(queue, engine, worker_id, repo_path)
         if dry_run:
             spawned.append(
                 {
@@ -235,19 +259,29 @@ def spawn_workers(
                     "pid": 0,
                     "queue": queue,
                     "engine": engine,
+                    "repo_path": repo_path,
                     "argv": argv,
                     "dry_run": True,
                 }
             )
             continue
-        proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path = log_dir / f"{worker_id}.log"
+        logf = open(log_path, "ab")
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                cwd=repo_path,
+            )
+        finally:
+            logf.close()  # the child holds its own dup'd fd
+        rec = record_worker(
+            proc.pid, queue, engine, worker_id, repo_path, str(log_path)
         )
-        rec = record_worker(proc.pid, queue, engine, worker_id)
         rec["argv"] = argv
         spawned.append(rec)
     return spawned
