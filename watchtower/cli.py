@@ -259,6 +259,22 @@ def cmd_workers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_monitor(args: argparse.Namespace) -> int:
+    """Monitor-as-a-job (WT-FEATURES-20): run a check command; if it fails
+    (non-zero exit), file a ticket into the queue so a worker drains it. Pair
+    with cron/launchd for scheduled sanity checks (e.g. a landing page)."""
+    from . import queue as q
+    rc = os.system(args.cmd) >> 8
+    if rc == 0:
+        print(f"OK: `{args.cmd}` passed (rc=0); no ticket filed")
+        return 0
+    note = args.note or f"Monitor failed: `{args.cmd}` exited {rc}"
+    item = q.enqueue(note=note, title=(args.title or "monitor failure"),
+                     project=args.queue)
+    print(f"FAIL (rc={rc}) -> filed {item.get('ref')} in {args.queue}")
+    return 0
+
+
 def cmd_dedup(args: argparse.Namespace) -> int:
     """Exact-key dedup pass (WT-FEATURES-14, first cut): group open tickets by
     normalized title+note, keep the oldest in each group, and (with --apply)
@@ -649,6 +665,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("workers", help="list workers this CLI started")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
+
+    s = sub.add_parser("monitor", help="run a check; file a ticket if it fails")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--cmd", required=True, help="shell command; non-zero exit = fail")
+    s.add_argument("--title", default="", help="ticket title on failure")
+    s.add_argument("--note", default="", help="ticket note on failure")
+    s.set_defaults(func=cmd_monitor)
 
     s = sub.add_parser("dedup", help="close exact-duplicate open tickets")
     s.add_argument("-q", "--queue", default=None)
