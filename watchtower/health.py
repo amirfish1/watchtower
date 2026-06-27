@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+from . import config
 from . import queue as q
 
 # Minutes of no progress (no ticket closed) before an open queue is "stuck".
@@ -85,8 +86,15 @@ def queue_status(
     now: Optional[datetime] = None,
     stuck_minutes: int = STUCK_MINUTES,
     drain_window_minutes: int = DRAIN_WINDOW_MINUTES,
+    auto_drain: bool = True,
 ) -> Dict[str, Any]:
-    """Compute the status row for a single queue from its items."""
+    """Compute the status row for a single queue from its items.
+
+    ``auto_drain`` (the queue's policy) shapes the *display* ``state`` but not
+    the raw ``stuck`` ground-truth: a queue that's opted out of auto-drain
+    (a prioritization backlog) reports ``state="backlog"`` — calm, expected —
+    instead of ``state="stuck"`` (alarm), so a parking lot isn't mistaken for a
+    fire. ``stuck`` itself stays true to the queue so nothing is hidden."""
     now = now or datetime.now(timezone.utc)
     open_items = [it for it in items if it.get("status") == "open"]
     in_progress = [it for it in items if it.get("status") == "in_progress"]
@@ -132,6 +140,16 @@ def queue_status(
         eta_seconds = None
     eta_human = "empty" if eta_seconds == 0 else _fmt_eta(eta_seconds)
 
+    # Display state, derived from raw `stuck` + the queue's auto_drain policy.
+    if depth == 0:
+        state = "clear"
+    elif stuck and not auto_drain:
+        state = "backlog"   # opted out: non-empty is normal, not an alarm
+    elif stuck:
+        state = "stuck"     # real alarm: open work, no progress, should drain
+    else:
+        state = "active"    # open work, progressing
+
     return {
         "queue": project,
         "depth": depth,
@@ -142,6 +160,8 @@ def queue_status(
         "since_progress_s": since_progress,
         "since_progress": _fmt_age(since_progress),
         "stuck": stuck,
+        "auto_drain": bool(auto_drain),
+        "state": state,
         "drain_rate_per_min": drain_rate,
         "eta_seconds": eta_seconds,
         "eta_human": eta_human,
@@ -170,9 +190,11 @@ def all_status(
             now=now,
             stuck_minutes=stuck_minutes,
             drain_window_minutes=drain_window_minutes,
+            auto_drain=config.auto_drain(name),
         )
         for name, items in by_queue.items()
     ]
-    # Stuck first, then deepest, then name.
-    rows.sort(key=lambda r: (not r["stuck"], -r["depth"], r["queue"]))
+    # Real alarms first (stuck AND meant to drain), then deepest, then name.
+    # A backlog (opted out) is calm, so it sorts with the normal rows.
+    rows.sort(key=lambda r: (r["state"] != "stuck", -r["depth"], r["queue"]))
     return rows

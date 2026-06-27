@@ -178,6 +178,9 @@ _STYLE = """
     }
     .state.draining { color: var(--calm); }
     .state.stuck { color: var(--warn); }
+    .state.backlog { color: var(--beam); }
+    .readout.backlog { color: var(--beam); }
+    .card.backlog { opacity: 0.92; }
     .readout {
       margin: 14px 0 4px; font-size: 21px; font-weight: 500;
       color: var(--ink); line-height: 1.25;
@@ -347,6 +350,11 @@ def _readout(row: Dict[str, Any]) -> str:
     depth = row.get("depth", 0)
     if depth == 0:
         return '<div class="readout clear mono">clear</div>'
+    if row.get("state") == "backlog":
+        return (
+            f'<div class="readout backlog mono">{depth} open '
+            '<span style="font-size:14px">·</span> backlog</div>'
+        )
     rate = row.get("drain_rate_per_min") or 0
     open_lbl = "open"
     if not rate:
@@ -362,24 +370,22 @@ def _readout(row: Dict[str, Any]) -> str:
 
 
 def _state_word(row: Dict[str, Any]) -> str:
-    if row["stuck"]:
-        return "stalled"
-    if row["depth"] > 0:
-        return "draining"
-    return "clear"
+    return {
+        "stuck": "stalled", "backlog": "backlog",
+        "active": "draining", "clear": "clear",
+    }.get(row.get("state"), "clear")
 
 
 def _card_class(row: Dict[str, Any]) -> str:
-    if row["stuck"]:
-        return "stuck"
-    if row["depth"] > 0:
-        return "draining"
-    return "clear"
+    return {
+        "stuck": "stuck", "backlog": "backlog",
+        "active": "draining", "clear": "clear",
+    }.get(row.get("state"), "clear")
 
 
 def _drain_bar(row: Dict[str, Any]) -> str:
     """A slim fill. Calm width proportional to live-vs-total; warn when stuck."""
-    if row["stuck"]:
+    if row.get("state") == "stuck":
         return '<div class="bar"><span class="warn" style="width:100%"></span></div>'
     depth = row.get("depth", 0)
     if depth == 0:
@@ -396,8 +402,8 @@ def render_index(payload: Dict[str, Any]) -> str:
     rows: List[Dict[str, Any]] = payload["queues"]
     wkrs: List[Dict[str, Any]] = payload["workers"]
 
-    any_stuck = any(r["stuck"] for r in rows)
-    stuck_n = sum(1 for r in rows if r["stuck"])
+    any_stuck = any(r.get("state") == "stuck" for r in rows)
+    stuck_n = sum(1 for r in rows if r.get("state") == "stuck")
     live_workers = sum(1 for w in wkrs if w.get("alive"))
 
     # Header / the tower.

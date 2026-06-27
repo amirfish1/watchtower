@@ -69,7 +69,8 @@ def _print_status(rows: List[dict]) -> None:
         print(hdr)
         print("-" * len(hdr))
         for r in rows:
-            flag = "STUCK" if r["stuck"] else ("ok" if r["depth"] == 0 else "draining")
+            flag = {"stuck": "STUCK", "backlog": "backlog",
+                    "active": "draining", "clear": "ok"}.get(r.get("state"), "ok")
             wc = counts.get(r["queue"], {"total": 0, "live": 0})
             wcell = f"{wc['total']} ({wc['live']} live)"
             print(
