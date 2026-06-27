@@ -259,6 +259,33 @@ def cmd_workers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_register(args: argparse.Namespace) -> int:
+    """Declare/configure a queue in the registry (WT-FEATURES-13). Also writes
+    the auto_drain policy through to the shared config so the watcher honors it."""
+    from . import config, registry
+    rec = registry.register(
+        args.queue, backend=args.backend, owner=args.owner,
+        auto_drain=not args.no_auto_drain,
+    )
+    config.set_auto_drain(args.queue, not args.no_auto_drain)
+    print(f"registered {rec['name']}: backend={rec['backend']} "
+          f"owner={rec['owner'] or '-'} auto_drain={rec['auto_drain']}")
+    return 0
+
+
+def cmd_registry(args: argparse.Namespace) -> int:
+    """List declared queues."""
+    from . import registry
+    qs = registry.all_queues()
+    if not qs:
+        print("(no queues registered)")
+        return 0
+    for name, r in sorted(qs.items()):
+        print(f"{name:16} backend={r.get('backend','store'):8} "
+              f"owner={r.get('owner') or '-':12} auto_drain={r.get('auto_drain', True)}")
+    return 0
+
+
 def cmd_monitor(args: argparse.Namespace) -> int:
     """Monitor-as-a-job (WT-FEATURES-20): run a check command; if it fails
     (non-zero exit), file a ticket into the queue so a worker drains it. Pair
@@ -665,6 +692,16 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("workers", help="list workers this CLI started")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
+
+    s = sub.add_parser("register", help="declare/configure a queue in the registry")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--backend", default="store", choices=["store", "github"])
+    s.add_argument("--owner", default="")
+    s.add_argument("--no-auto-drain", action="store_true", dest="no_auto_drain")
+    s.set_defaults(func=cmd_register)
+
+    s = sub.add_parser("registry", help="list declared queues")
+    s.set_defaults(func=cmd_registry)
 
     s = sub.add_parser("monitor", help="run a check; file a ticket if it fails")
     s.add_argument("-q", "--queue", required=True)
