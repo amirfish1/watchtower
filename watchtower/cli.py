@@ -259,6 +259,44 @@ def cmd_workers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_dedup(args: argparse.Namespace) -> int:
+    """Exact-key dedup pass (WT-FEATURES-14, first cut): group open tickets by
+    normalized title+note, keep the oldest in each group, and (with --apply)
+    close the rest as duplicates. The semantic merge+rank pass is a follow-up."""
+    import re
+    from . import queue as q
+
+    def norm(it: dict) -> str:
+        s = (str(it.get("title", "")) + " " + str(it.get("note", ""))).lower()
+        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", s)).strip()
+
+    items = [
+        i for i in q.list_items(status="open")
+        if not args.queue or i.get("project") == args.queue
+    ]
+    groups: dict = {}
+    for it in items:
+        key = norm(it)
+        if key:
+            groups.setdefault(key, []).append(it)
+    dups = {k: v for k, v in groups.items() if len(v) > 1}
+    if not dups:
+        print("no exact duplicates")
+        return 0
+    closed = 0
+    for v in dups.values():
+        v.sort(key=lambda x: int(x.get("number", 0)))
+        keep, rest = v[0], v[1:]
+        print(f"dup group: keep {keep['ref']} | dupes {[x['ref'] for x in rest]}")
+        if args.apply:
+            for x in rest:
+                q.close(x["ref"], resolution=f"duplicate of {keep['ref']}")
+                closed += 1
+    print(f"closed {closed} duplicate(s)" if args.apply
+          else "(dry-run; pass --apply to close duplicates)")
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     """Get/set per-queue config. Today: the auto_drain opt-out (WT-FEATURES #16)."""
     from . import config
@@ -611,6 +649,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("workers", help="list workers this CLI started")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
+
+    s = sub.add_parser("dedup", help="close exact-duplicate open tickets")
+    s.add_argument("-q", "--queue", default=None)
+    s.add_argument("--apply", action="store_true", help="close dupes (default: dry-run)")
+    s.set_defaults(func=cmd_dedup)
 
     s = sub.add_parser("config", help="per-queue config (auto-drain opt-out)")
     s.add_argument("-q", "--queue", required=True)
