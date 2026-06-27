@@ -28,6 +28,11 @@ WORKERS_FILE = Path(
     or (Path.home() / ".watchtower" / "workers.json")
 )
 
+STOP_SIGNALS_DIR = Path(
+    os.environ.get("WATCHTOWER_STOP_SIGNALS_DIR")
+    or (Path.home() / ".watchtower" / "stop-signals")
+)
+
 # Drain goal adapted from CCC's docs/ux-fixes-worker-brief.md canonical /goal.
 # Generalized: no CCC paths, no shared-clone assumptions. The worker drains one
 # queue via the `wt` CLI it was spawned by and idles when empty.
@@ -35,22 +40,30 @@ DRAIN_GOAL_TEMPLATE = (
     "Drain the {queue} WatchTower queue and keep it empty. "
     "Work in the git repo at {repo}. "
     "Your worker id is {worker_id}. Loop: claim the oldest open ticket with "
-    "`wt claim -q {queue} --worker {worker_id}` (it returns the ticket JSON, "
-    "or nothing when the queue is drained). Read the ticket's note/text and, "
-    "if present, open its screenshot_path and resolve its selector. Make the "
-    "change in the relevant repo and verify it. Commit only the paths you "
-    "changed (never `git add -A`/`.`/`-a`). When you close the ticket, ALWAYS "
-    "record HOW you fixed it: `wt close <ref> --worker {worker_id} --summary "
+    "`wt claim -q {queue} --worker {worker_id} --json` (it returns the ticket "
+    "JSON, nothing when the queue is drained, or {{\"stop\": true}} when the "
+    "reconciler is winding you down). "
+    "STOP SIGNAL: if `wt claim` returns {{\"stop\": true}}, exit immediately -- "
+    "the reconciler has determined no worker is needed for this queue right now. "
+    "Do not claim another ticket; just exit. "
+    "Read the ticket's note/text and, if present, open its screenshot_path and "
+    "resolve its selector. Make the change in the relevant repo and verify it. "
+    "Commit only the paths you changed (never `git add -A`/`.`/`-a`). "
+    "RESOLUTION IS MANDATORY: NEVER close a ticket without `--summary`. "
+    "When you close a ticket: `wt close <ref> --worker {worker_id} --summary "
     "\"what you changed\"`. Add `--caveat \"...\"` for anything to watch out "
     "for, `--follow-up \"...\"` for notable next steps, and `--unresolved "
     "\"...\"` for anything you could not fix (each flag is repeatable). This "
-    "resolution is the trust signal the dashboard surfaces, so never close "
-    "silently. If a ticket genuinely cannot be resolved without a human "
-    "decision, do NOT close it and do NOT guess: run `wt block <ref> --worker "
-    "{worker_id} --question \"the specific decision you need\" --progress \"what "
-    "you've figured out so far\"`, then move on to the next ticket. Then claim "
-    "the next one. When nothing is open, idle and re-poll later — never "
-    "busy-wait. Do not push unless explicitly asked."
+    "resolution is the trust signal the dashboard surfaces; a close without "
+    "--summary will be rejected with exit code 1. "
+    "If a ticket genuinely cannot be resolved without a human decision, do NOT "
+    "close it and do NOT guess: run `wt block <ref> --worker {worker_id} "
+    "--question \"the specific decision you need\" --progress \"what you've "
+    "figured out so far\"`, then move on to the next ticket. "
+    "WARM IDLE: when the queue is empty, wait 2 minutes and re-poll, up to "
+    "5 minutes total idle time. After 5 minutes of an empty queue, exit cleanly "
+    "-- the reconciler will spawn a fresh worker if new work arrives. "
+    "Do not busy-wait. Do not push unless explicitly asked."
 )
 
 _ENGINE_BIN = {"claude": "claude", "codex": "codex"}
@@ -231,6 +244,98 @@ def build_drain_command(
     if engine == "codex":
         return [bin_name, "exec", goal]
     return [bin_name, "-p", goal, "--permission-mode", "bypassPermissions"]
+
+
+def request_stop(worker_id: str) -> Path:
+    """Ask a running worker to stop by dropping a sentinel file.
+
+    The worker's next ``wt claim`` call will detect the file, delete it, and
+    return ``{"stop": True}`` so the worker exits cleanly instead of being
+    killed. Uses the file-system only -- does NOT touch workers.json so the
+    record stays visible until the worker process dies and is pruned.
+    """
+    stop_dir = STOP_SIGNALS_DIR
+    stop_dir.mkdir(parents=True, exist_ok=True)
+    signal_path = stop_dir / worker_id
+    signal_path.touch()
+    return signal_path
+
+
+def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
+    """One reconciler tick.
+
+    Loads the registry + live workers + queue depths and for each registered
+    queue decides:
+      - desired = desired_workers (default 1) if auto_drain AND depth > 0 else 0
+      - if actual_live < desired: spawn the delta (or record in dry_run)
+      - if actual_live > desired: call request_stop() on the excess workers
+
+    Returns ``{"spawned": [...], "stopped": [...], "skipped": [...]}``.
+    ``skipped`` entries explain why a queue was left alone (e.g. auto_drain=off
+    or depth=0).  In ``dry_run`` mode no subprocesses are started and no
+    stop-signal files are created; the return value shows what *would* happen.
+    """
+    from . import config, health, registry as reg
+
+    result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": []}
+
+    all_reg = reg.all_queues()
+    # Build live-worker counts keyed by queue.
+    live_by_queue: Dict[str, List[Dict[str, Any]]] = {}
+    for w in list_workers(prune=False):
+        if w.get("alive"):
+            q_name = w.get("queue", "")
+            live_by_queue.setdefault(q_name, []).append(w)
+
+    # Use health for queue depth -- one call covers all queues.
+    depth_by_queue: Dict[str, int] = {}
+    for row in health.all_status():
+        depth_by_queue[row["queue"]] = row.get("depth", 0)
+
+    for q_name, rec in all_reg.items():
+        auto = rec.get("auto_drain", True) and config.auto_drain(q_name)
+        desired = int(rec.get("desired_workers", 1)) if auto else 0
+        depth = depth_by_queue.get(q_name, 0)
+        if not auto:
+            result["skipped"].append({"queue": q_name, "reason": "auto_drain=off"})
+            continue
+        if depth == 0:
+            result["skipped"].append({"queue": q_name, "reason": "depth=0"})
+            # If there are surplus workers idling on an empty queue, wind them down.
+            live = live_by_queue.get(q_name, [])
+            for w in live:
+                wid = w.get("worker_id", "")
+                if not dry_run:
+                    request_stop(wid)
+                result["stopped"].append({"queue": q_name, "worker_id": wid,
+                                          "dry_run": dry_run})
+            continue
+        live = live_by_queue.get(q_name, [])
+        actual = len(live)
+        if actual < desired:
+            to_spawn = desired - actual
+            engine = rec.get("engine", "claude")
+            repo_path = rec.get("repo_path", "")
+            spawned = spawn_workers(
+                q_name, n=to_spawn, engine=engine,
+                repo_path=repo_path, dry_run=dry_run,
+            )
+            result["spawned"].extend(spawned)
+        elif actual > desired:
+            # Wind down excess workers (LIFO -- stop the most recently started).
+            excess = live[desired:]
+            for w in excess:
+                wid = w.get("worker_id", "")
+                if not dry_run:
+                    request_stop(wid)
+                result["stopped"].append({"queue": q_name, "worker_id": wid,
+                                          "dry_run": dry_run})
+        else:
+            result["skipped"].append(
+                {"queue": q_name, "reason": f"actual={actual}==desired={desired}"}
+            )
+
+    return result
 
 
 def spawn_workers(

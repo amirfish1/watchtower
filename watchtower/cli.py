@@ -196,6 +196,13 @@ def cmd_claim(args: argparse.Namespace) -> int:
     if not item:
         print(f"(nothing open in {args.queue})")
         return 0
+    # Stop signal: reconciler asked this worker to wind down.
+    if item.get("stop"):
+        if args.json:
+            print(json.dumps({"stop": True}))
+        else:
+            print("STOP: reconciler requested shutdown; exiting")
+        return 0
     if args.json:
         _print_item(item)
     else:
@@ -220,6 +227,13 @@ def _resolution_from_args(args: argparse.Namespace) -> Optional[dict]:
 
 
 def cmd_close(args: argparse.Namespace) -> int:
+    if not (args.summary or "").strip():
+        print(
+            "error: --summary is required when closing a ticket\n"
+            "  example: wt close <ref> --summary \"what you changed\"",
+            file=sys.stderr,
+        )
+        return 1
     worker = args.worker or f"wt-cli-{os.getpid()}"
     resolution = _resolution_from_args(args)
     item = q.close(args.ref, worker, resolution=resolution)
@@ -480,6 +494,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
 def _daemon_loop(args: argparse.Namespace) -> None:
     interval = max(5, args.interval)
+    dry_run = getattr(args, "dry_run", False)
     if getattr(args, "dashboard", False):
         # Host the dashboard alongside the watcher in a background thread, so
         # `wt start --dashboard` brings both up in one process.
@@ -496,36 +511,48 @@ def _daemon_loop(args: argparse.Namespace) -> None:
             flush=True,
         )
     while True:
-        from . import config
-        rows = health.all_status(stuck_minutes=args.stuck_minutes)
-        for r in rows:
-            if not r["stuck"]:
-                continue
-            live = workers.live_worker_count(r["queue"])
-            if live == 0 and args.auto_spawn and config.auto_drain(r["queue"]):
-                print(
-                    f"[watchtower] STUCK {r['queue']} open={r['depth']} "
-                    f"no live workers -> auto-spawn",
-                    flush=True,
-                )
-                workers.spawn_workers(r["queue"], n=1, engine=args.engine)
-            elif live == 0 and args.auto_spawn and not config.auto_drain(r["queue"]):
-                print(
-                    f"[watchtower] STUCK {r['queue']} open={r['depth']} "
-                    f"auto_drain=off (backlog, opted out)",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[watchtower] STUCK {r['queue']} open={r['depth']} "
-                    f"live_workers={live} (auto-spawn off)",
-                    flush=True,
-                )
+        result = workers.reconcile_once(dry_run=dry_run)
+        for rec in result.get("spawned", []):
+            tag = " (dry-run)" if rec.get("dry_run") else ""
+            print(
+                f"[watchtower] spawned worker {rec.get('worker_id','')} "
+                f"for {rec.get('queue','')}{tag}",
+                flush=True,
+            )
+        for rec in result.get("stopped", []):
+            tag = " (dry-run)" if rec.get("dry_run") else ""
+            print(
+                f"[watchtower] requested stop for {rec.get('worker_id','')} "
+                f"on {rec.get('queue','')}{tag}",
+                flush=True,
+            )
+        # Also handle legacy stuck-queue auto-spawn for queues NOT in the registry
+        # (so the old --auto-spawn behaviour still works for ad-hoc queues).
+        if args.auto_spawn:
+            from . import config
+            rows = health.all_status(stuck_minutes=args.stuck_minutes)
+            from . import registry as _reg
+            registered = set(_reg.all_queues().keys())
+            for r in rows:
+                if r["queue"] in registered:
+                    continue  # already handled by reconcile_once
+                if not r["stuck"]:
+                    continue
+                live = workers.live_worker_count(r["queue"])
+                if live == 0 and config.auto_drain(r["queue"]):
+                    print(
+                        f"[watchtower] STUCK {r['queue']} open={r['depth']} "
+                        f"no live workers -> auto-spawn",
+                        flush=True,
+                    )
+                    if not dry_run:
+                        workers.spawn_workers(r["queue"], n=1, engine=args.engine)
         time.sleep(interval)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
-    if DAEMON_PID_FILE.exists():
+    dry_run = getattr(args, "dry_run", False)
+    if not dry_run and DAEMON_PID_FILE.exists():
         try:
             pid = int(DAEMON_PID_FILE.read_text().strip())
             os.kill(pid, 0)
@@ -533,13 +560,17 @@ def cmd_start(args: argparse.Namespace) -> int:
             return 0
         except (ValueError, ProcessLookupError, OSError):
             pass  # stale pidfile
-    if args.foreground:
-        DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-        DAEMON_PID_FILE.write_text(str(os.getpid()))
+    if args.foreground or dry_run:
+        if not dry_run:
+            DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+            DAEMON_PID_FILE.write_text(str(os.getpid()))
         try:
             _daemon_loop(args)
+        except KeyboardInterrupt:
+            print("\n[watchtower] interrupted, stopping", file=sys.stderr)
         finally:
-            DAEMON_PID_FILE.unlink(missing_ok=True)
+            if not dry_run:
+                DAEMON_PID_FILE.unlink(missing_ok=True)
         return 0
     # Re-exec ourselves in the background in foreground-mode.
     import subprocess
@@ -826,12 +857,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="POST JSON to this URL when the queue drains (async reply)")
     s.set_defaults(func=cmd_wait)
 
-    s = sub.add_parser("start", help="start the background watcher daemon")
-    s.add_argument("--interval", type=int, default=30)
+    s = sub.add_parser("start", help="start the background watcher / reconciler daemon")
+    s.add_argument("--interval", type=int, default=30,
+                   help="reconciler tick interval in seconds (default 30)")
     s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
     s.add_argument("--engine", default="claude", choices=["claude", "codex"])
     s.add_argument("--auto-spawn", action="store_true",
                    help="auto spawn-worker on a stuck queue with no live workers")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="reconciler tick: log what would happen but don't spawn/stop")
     s.add_argument("--dashboard", action="store_true",
                    help="also host the dashboard alongside the watcher")
     s.add_argument("--host", default="127.0.0.1",

@@ -156,7 +156,7 @@ def test_cli_enqueue_and_status(store, capsys):
     assert "CLI" in out
 
     assert main(["claim", "-q", "CLI"]) == 0
-    assert main(["close", "CLI-1"]) == 0
+    assert main(["close", "CLI-1", "--summary", "done"]) == 0
     out = capsys.readouterr().out
     assert "CLOSED: CLI-1" in out
 
@@ -605,3 +605,84 @@ def test_worker_activity_join_idle_when_unclaimed(store):
     workers.annotate_activity(rows, q.list_items())
     assert rows[0]["active_ref"] is None
     assert rows[0]["active_since_human"] is None
+
+
+# WT-27: reconciler, stop-signal, and mandatory-summary tests
+
+
+def test_reconcile_once_dry_run(store, tmp_path, monkeypatch):
+    """reconcile_once(dry_run=True) reports that it would spawn a worker for a
+    registered queue with auto_drain=True and open tickets."""
+    import importlib
+
+    monkeypatch.setenv("WATCHTOWER_REGISTRY_FILE", str(tmp_path / "registry.json"))
+    monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "qconfig.json"))
+    monkeypatch.setenv("WATCHTOWER_STOP_SIGNALS_DIR", str(tmp_path / "stop-signals"))
+    import watchtower.registry as registry
+    import watchtower.config as config
+    import watchtower.workers as workers
+    import watchtower.queue as q
+    importlib.reload(registry)
+    importlib.reload(config)
+    importlib.reload(workers)
+    importlib.reload(q)
+
+    # Register a queue with auto_drain=True (the default).
+    registry.register("RECONCQ", auto_drain=True)
+    # Drop a ticket into the queue so depth > 0.
+    q.enqueue(project="RECONCQ", note="waiting for a worker")
+
+    result = workers.reconcile_once(dry_run=True)
+
+    # At least one worker should be recorded as would-be-spawned.
+    assert result["spawned"], f"expected spawned entries, got {result}"
+    spawned_queues = [s.get("queue") for s in result["spawned"]]
+    assert "RECONCQ" in spawned_queues
+    # dry_run=True: no real process was started (pid==0), file not spawned.
+    for s in result["spawned"]:
+        if s.get("queue") == "RECONCQ":
+            assert s.get("dry_run") is True
+            assert s.get("pid") == 0
+
+
+def test_close_requires_summary(store, capsys):
+    """wt close without --summary must exit 1 and print a helpful error."""
+    import watchtower.queue as q
+    from watchtower.cli import main
+
+    q.enqueue(project="NOSUMQ", note="needs fixing")
+    q.claim_next("w", project="NOSUMQ")
+
+    rc = main(["close", "NOSUMQ-1"])
+    assert rc == 1, "expected exit code 1 when --summary is missing"
+    err = capsys.readouterr().err
+    assert "--summary" in err
+
+
+def test_stop_signal_file(store, tmp_path, monkeypatch):
+    """request_stop(worker_id) creates a sentinel file; claim_next for that
+    worker_id deletes the file and returns {"stop": True} instead of a ticket."""
+    import importlib
+
+    monkeypatch.setenv("WATCHTOWER_STOP_SIGNALS_DIR", str(tmp_path / "stop-signals"))
+    import watchtower.workers as workers
+    import watchtower.queue as q
+    importlib.reload(workers)
+    importlib.reload(q)
+
+    worker_id = "test-worker-stop-01"
+    signal_path = workers.request_stop(worker_id)
+
+    # The file must exist immediately after request_stop().
+    assert signal_path.exists(), "stop signal file was not created"
+
+    # Queue has an open ticket, but the stop signal takes priority.
+    q.enqueue(project="STOPQ", note="pending work")
+    result = q.claim_next(worker_id, project="STOPQ")
+
+    assert result == {"stop": True}, f"expected stop sentinel, got {result}"
+    # File must have been consumed (deleted) by claim_next.
+    assert not signal_path.exists(), "stop signal file was not cleaned up"
+    # The ticket must still be open (not claimed).
+    item = q.get("STOPQ-1")
+    assert item["status"] == "open"

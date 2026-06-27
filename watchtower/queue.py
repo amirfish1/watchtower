@@ -328,9 +328,29 @@ def claim_next(
 
     Scoped to ``project`` when given, so a worker only drains its own queue.
     Express lane jumps the line. Returns ``None`` when nothing is open.
+
+    Stop signal: if a reconciler has requested this worker to stop (by placing
+    a sentinel file in the stop-signals directory keyed to ``session_id``), the
+    file is deleted and ``{"stop": True}`` is returned so the worker can exit
+    cleanly without claiming a new ticket.
     """
     if not session_id:
         raise ValueError("session_id is required")
+
+    # Check for a reconciler stop signal before touching the queue.
+    try:
+        from . import workers as _workers
+        stop_dir = _workers.STOP_SIGNALS_DIR
+    except Exception:
+        stop_dir = Path.home() / ".watchtower" / "stop-signals"
+    signal_file = stop_dir / session_id
+    if signal_file.exists():
+        try:
+            signal_file.unlink()
+        except OSError:
+            pass
+        return {"stop": True}
+
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
