@@ -259,6 +259,19 @@ def cmd_workers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config(args: argparse.Namespace) -> int:
+    """Get/set per-queue config. Today: the auto_drain opt-out (WT-FEATURES #16)."""
+    from . import config
+    if args.auto_drain is not None:
+        cfg = config.set_auto_drain(args.queue, args.auto_drain == "true")
+        print(f"{args.queue}: auto_drain={cfg['auto_drain']}")
+    else:
+        val = config.auto_drain(args.queue)
+        explicit = "auto_drain" in config.get_queue_config(args.queue)
+        print(f"{args.queue}: auto_drain={val}" + ("" if explicit else " (default)"))
+    return 0
+
+
 def cmd_spawn_worker(args: argparse.Namespace) -> int:
     spawned = workers.spawn_workers(
         args.queue, n=args.n, engine=args.engine,
@@ -315,18 +328,25 @@ def _daemon_loop(args: argparse.Namespace) -> None:
             flush=True,
         )
     while True:
+        from . import config
         rows = health.all_status(stuck_minutes=args.stuck_minutes)
         for r in rows:
             if not r["stuck"]:
                 continue
             live = workers.live_worker_count(r["queue"])
-            if live == 0 and args.auto_spawn:
+            if live == 0 and args.auto_spawn and config.auto_drain(r["queue"]):
                 print(
                     f"[watchtower] STUCK {r['queue']} open={r['depth']} "
                     f"no live workers -> auto-spawn",
                     flush=True,
                 )
                 workers.spawn_workers(r["queue"], n=1, engine=args.engine)
+            elif live == 0 and args.auto_spawn and not config.auto_drain(r["queue"]):
+                print(
+                    f"[watchtower] STUCK {r['queue']} open={r['depth']} "
+                    f"auto_drain=off (backlog, opted out)",
+                    flush=True,
+                )
             else:
                 print(
                     f"[watchtower] STUCK {r['queue']} open={r['depth']} "
@@ -570,6 +590,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("workers", help="list workers this CLI started")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
+
+    s = sub.add_parser("config", help="per-queue config (auto-drain opt-out)")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--auto-drain", choices=["true", "false"], default=None,
+                   dest="auto_drain", help="opt this queue in/out of auto-spawn")
+    s.set_defaults(func=cmd_config)
 
     s = sub.add_parser("spawn-worker", help="launch draining worker subprocess(es)")
     s.add_argument("-q", "--queue", required=True)

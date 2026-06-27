@@ -130,6 +130,20 @@ def test_spawn_worker_dry_run(store):
         assert "bypassPermissions" in s["argv"]  # autonomous drain
 
 
+def test_auto_drain_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "qc.json"))
+    import watchtower.config as config
+    importlib.reload(config)
+    # default-on: a fresh queue is auto-drained
+    assert config.auto_drain("FRESH") is True
+    # a backlog can opt out
+    config.set_auto_drain("BACKLOG", False)
+    assert config.auto_drain("BACKLOG") is False
+    # and opt back in
+    config.set_auto_drain("BACKLOG", True)
+    assert config.auto_drain("BACKLOG") is True
+
+
 def test_cli_enqueue_and_status(store, capsys):
     from watchtower.cli import main
 
