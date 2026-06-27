@@ -309,20 +309,34 @@ _FONT_LINK = (
 
 
 def _page(title: str, body: str, refresh: bool = True) -> str:
-    refresh_meta = (
-        f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">' if refresh else ""
-    )
+    # In-place poll instead of a full-page <meta refresh>: the meta version
+    # reloaded the whole document every few seconds, flashing the screen and
+    # losing scroll position. This fetches the same page and swaps only the
+    # .wrap contents, so the console updates without a flicker (WT-BUGS-1).
+    poll = (
+        "<script>\n"
+        f"  const _WT_MS = {int(REFRESH_SECONDS)} * 1000;\n"
+        "  setInterval(async () => {\n"
+        "    try {\n"
+        "      const r = await fetch(location.href, {cache: 'no-store'});\n"
+        "      const d = new DOMParser().parseFromString(await r.text(), 'text/html');\n"
+        "      const fresh = d.querySelector('.wrap'), cur = document.querySelector('.wrap');\n"
+        "      if (fresh && cur) cur.innerHTML = fresh.innerHTML;\n"
+        "    } catch (e) {}\n"
+        "  }, _WT_MS);\n"
+        "</script>"
+    ) if refresh else ""
     return (
         "<!doctype html>\n"
         '<html lang="en">\n<head>\n'
         '  <meta charset="utf-8">\n'
         '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        f"  {refresh_meta}\n"
         f"  <title>{html.escape(title)}</title>\n"
         f"  {_FONT_LINK}\n"
         f"  <style>{_STYLE}</style>\n"
         "</head>\n<body>\n"
         f'  <div class="wrap">\n{body}\n  </div>\n'
+        f"  {poll}\n"
         "</body>\n</html>\n"
     )
 
