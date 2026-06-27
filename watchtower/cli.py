@@ -288,6 +288,23 @@ def cmd_spawn_worker(args: argparse.Namespace) -> int:
     return 0
 
 
+def _post_webhook(url: str, payload: dict) -> None:
+    """Best-effort async reply: POST JSON to a webhook when a queue drains
+    (WT-FEATURES-19, the async half of spawn-and-reply; `wt wait` is the sync
+    half). Never raises — a failed notify must not fail the wait."""
+    import json as _json
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            url, data=_json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10).close()
+        print(f"notified: {url}")
+    except Exception as e:  # noqa: BLE001 - best-effort, report and move on
+        print(f"notify failed ({url}): {e}", file=sys.stderr)
+
+
 def cmd_wait(args: argparse.Namespace) -> int:
     """Block until the queue has 0 open items, then exit 0 (run --cmd if set)."""
     deadline = time.time() + args.timeout if args.timeout else None
@@ -298,6 +315,10 @@ def cmd_wait(args: argparse.Namespace) -> int:
         depth = row.get("depth", 0)
         if depth == 0:
             print(f"DRAINED: {args.queue} has 0 open tickets")
+            if getattr(args, "notify_webhook", ""):
+                _post_webhook(args.notify_webhook, {
+                    "event": "drained", "queue": args.queue, "open": 0,
+                })
             if args.cmd:
                 print(f"running: {args.cmd}")
                 return os.system(args.cmd) >> 8
@@ -610,6 +631,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--timeout", type=float, default=0.0, help="seconds; 0 = forever")
     s.add_argument("--interval", type=float, default=5.0)
     s.add_argument("--cmd", default="", help="shell command to run once drained")
+    s.add_argument("--notify-webhook", default="", dest="notify_webhook",
+                   help="POST JSON to this URL when the queue drains (async reply)")
     s.set_defaults(func=cmd_wait)
 
     s = sub.add_parser("start", help="start the background watcher daemon")
