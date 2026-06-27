@@ -10,8 +10,9 @@ Phase-1 commands:
     wt claim -q Q             claim the oldest open ticket (atomic)
     wt next -q Q              alias for claim
     wt close <ref>            close a ticket
-    wt workers                list workers this CLI started
-    wt spawn-worker -q Q      launch N draining worker subprocess(es)
+    wt workers                list workers the watcher started
+    wt block / blocked        park a ticket needing a human / list parked
+    wt answer / discuss       answer a blocked ticket / attach to its session
     wt wait -q Q [--cmd ..]   block until the queue is drained, then run --cmd
     wt start / wt stop        start/stop the background watcher daemon
     wt dashboard              phone-first HTTP dashboard (queues + workers)
@@ -428,20 +429,10 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_spawn_worker(args: argparse.Namespace) -> int:
-    spawned = workers.spawn_workers(
-        args.queue, n=args.n, engine=args.engine,
-        repo_path=args.repo, dry_run=args.dry_run,
-    )
-    for s in spawned:
-        tag = " (dry-run)" if s.get("dry_run") else f" pid={s['pid']}"
-        print(f"SPAWNED worker {s['worker_id']} engine={s['engine']}{tag}")
-        print(f"  repo: {s.get('repo_path','')}")
-        if s.get("log"):
-            print(f"  log:  {s['log']}")
-        if args.dry_run:
-            print(f"  argv: {s['argv']}")
-    return 0
+# NOTE: there is intentionally no user-facing `wt spawn-worker` command. Workers
+# are a function of policy (per-queue auto_drain) + queue depth, spawned by the
+# watcher/reconciler (`wt start`) via workers.spawn_workers(), not by hand. See
+# docs/worker-lifecycle.md. The spawn primitive lives in workers.py.
 
 
 def _post_webhook(url: str, payload: dict) -> None:
@@ -823,13 +814,8 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="auto_drain", help="opt this queue in/out of auto-spawn")
     s.set_defaults(func=cmd_config)
 
-    s = sub.add_parser("spawn-worker", help="launch draining worker subprocess(es)")
-    s.add_argument("-q", "--queue", required=True)
-    s.add_argument("--n", type=int, default=1)
-    s.add_argument("--engine", default="claude", choices=["claude", "codex"])
-    s.add_argument("--repo", default="", help="repo the worker drains in (default: cwd)")
-    s.add_argument("--dry-run", action="store_true")
-    s.set_defaults(func=cmd_spawn_worker)
+    # No `wt spawn-worker`: workers are spawned by the watcher (`wt start`) from
+    # per-queue auto_drain policy + depth, not by hand. See workers.spawn_workers.
 
     s = sub.add_parser("wait", help="block until the queue is drained")
     s.add_argument("-q", "--queue", required=True)
