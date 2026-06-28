@@ -635,7 +635,12 @@ _LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    """Write a LaunchAgent plist so the WT service starts automatically on login."""
+    """Write a LaunchAgent plist so the WT service starts automatically on login.
+
+    Writes the plist unconditionally (so it's ready), but only loads it into
+    launchctl if at least one queue has auto-drain enabled — otherwise the
+    service would start for no reason."""
+    from . import config as _cfg
     import shutil
     python = shutil.which("wt") or sys.executable
     if shutil.which("wt"):
@@ -668,9 +673,17 @@ def cmd_install(args: argparse.Namespace) -> int:
     _LAUNCHAGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
     _LAUNCHAGENT_PLIST.write_text(plist)
     print(f"wrote {_LAUNCHAGENT_PLIST}")
+    # Only activate if some queue has auto-drain on — no point starting the
+    # service when there's nothing to drain.
+    drain_queues = [q for q in (_cfg._load().keys()) if _cfg.auto_drain(q)]
+    if not drain_queues:
+        print("no queues have drain=on yet — plist written but not loaded")
+        print("run 'wt drain on <queue>' to activate, then 'wt install' again")
+        return 0
     rc = os.system(f"launchctl load '{_LAUNCHAGENT_PLIST}'")
     if rc == 0:
-        print(f"loaded: {_LAUNCHAGENT_LABEL} — service will start on every login")
+        print(f"loaded: {_LAUNCHAGENT_LABEL} — service starts on every login")
+        print(f"  drain-on queues: {', '.join(drain_queues)}")
     else:
         print(f"warning: launchctl load exited {rc} — plist written but not loaded")
     return 0
