@@ -194,17 +194,27 @@ def cmd_add(args: argparse.Namespace) -> int:
         confidence=getattr(args, "confidence", "") or "",
     )
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
-    # Auto-drain queues get an immediate reconcile so a worker spawns now
-    # instead of on the next daemon tick. Idempotent: no-op if a worker is
-    # already alive (working or warm-idle), so this never double-spawns and
-    # never disturbs a warm worker that still holds context. Best-effort.
+    # Auto-drain queues: push the new work to a live worker NOW via its
+    # stream-json FIFO (immediate pickup, warm context, no polling). Only if no
+    # live worker accepts do we reconcile to spawn a fresh one. Idempotent and
+    # best-effort -- a hiccup here never fails the enqueue.
     try:
         from . import config, workers
         if config.auto_drain(args.queue):
-            result = workers.reconcile_once()
-            for rec in result.get("spawned", []):
-                print(f"[watchtower] spawned worker {rec.get('worker_id','')} "
-                      f"for {rec.get('queue','')}")
+            nudge = (
+                f"New ticket {item['ref']} filed on {args.queue}. "
+                f"Claim it with `wt claim -q {args.queue} --worker <your-id> "
+                f"--json` and drain the queue."
+            )
+            delivered = workers.notify_workers(args.queue, nudge)
+            if delivered:
+                print(f"[watchtower] nudged {delivered} live worker(s) on "
+                      f"{args.queue}")
+            else:
+                result = workers.reconcile_once()
+                for rec in result.get("spawned", []):
+                    print(f"[watchtower] spawned worker {rec.get('worker_id','')} "
+                          f"for {rec.get('queue','')}")
     except Exception:
         pass
     return 0
