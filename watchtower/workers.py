@@ -500,6 +500,7 @@ def build_drain_command(
         "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--verbose",
+        "--name", f"{queue} queue worker",
         "--permission-mode", "bypassPermissions",
     ]
 
