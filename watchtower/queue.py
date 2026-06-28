@@ -251,6 +251,11 @@ def _prio_rank(it: Dict[str, Any]) -> int:
     return {"p0": 0, "p1": 1, "p2": 2, "p3": 3, "p4": 4}.get(it.get("priority", ""), 5)
 
 
+def _type_rank(it: Dict[str, Any]) -> int:
+    """Bugs before features within same priority tier."""
+    return {"bug": 0, "feature": 1}.get(it.get("item_type") or it.get("type", ""), 2)
+
+
 def _clip(value: Any, max_len: int) -> str:
     s = "" if value is None else str(value)
     s = " ".join(s.split()) if max_len <= 240 else s  # keep prompts multi-line
@@ -401,19 +406,23 @@ def claim_next(
     project: Optional[str] = None,
     session_uuid: str = "",
     shaping: bool = False,
-    urgent: bool = False,
+    oldest: bool = False,
+    item_type: str = "",
+    readiness_filter: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Atomically move the next ``open`` item to ``in_progress`` and return it.
 
     Scoped to ``project`` when given, so a worker only drains its own queue.
-    By default claims the oldest item (FIFO). With ``urgent=True``, claims
-    by priority (express lane first, then p0..p4, then oldest within tier).
-    Returns ``None`` when nothing is open.
+    Default sort: express lane → priority (p0 first) → bugs before features →
+    oldest within tier. Pass ``oldest=True`` for pure FIFO regardless of priority.
 
-    When ``shaping=False`` (default), items where ``readiness`` is
-    ``"needs-shaping"`` or ``"needs-spec"`` are excluded — they are not ready
-    for automated work. Pass ``shaping=True`` to include all readiness levels
-    (for human triage work).
+    ``item_type`` ("bug" | "feature" | ""): if set, only claim that type.
+    ``readiness_filter`` ("ready" | "needs-shaping" | "needs-spec" | ""):
+      if set, only claim items with that readiness (and bypasses the default
+      exclusion of unready items). If empty, excludes needs-shaping/needs-spec
+      unless ``shaping=True``.
+
+    Returns ``None`` when nothing matches.
 
     Stop signal: if a reconciler has requested this worker to stop (by placing
     a sentinel file in the stop-signals directory keyed to ``session_id``), the
@@ -446,23 +455,31 @@ def claim_next(
             candidates = [it for it in candidates if it.get("project") == proj]
         if lane:
             candidates = [it for it in candidates if it.get("lane") == lane]
-        if not shaping:
+        if readiness_filter:
+            candidates = [it for it in candidates if it.get("readiness", "") == readiness_filter]
+        elif not shaping:
             candidates = [
                 it for it in candidates
                 if it.get("readiness", "") not in ("needs-shaping", "needs-spec")
             ]
+        if item_type:
+            candidates = [
+                it for it in candidates
+                if (it.get("item_type") or it.get("type", "")) == item_type
+            ]
         if not candidates:
             return None
-        if urgent:
+        if oldest:
+            candidates.sort(key=lambda it: int(it.get("number", 0)))
+        else:
             candidates.sort(
                 key=lambda it: (
                     0 if it.get("lane") == "express" else 1,
                     _prio_rank(it),
+                    _type_rank(it),
                     int(it.get("number", 0)),
                 )
             )
-        else:
-            candidates.sort(key=lambda it: int(it.get("number", 0)))
         item = candidates[0]
         item["status"] = "in_progress"
         item["claimed_by"] = str(session_id)

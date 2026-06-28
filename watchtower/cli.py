@@ -4,8 +4,10 @@
     wt status                 per-queue depth / age / drain / stuck flag
     wt ls -q Q [--status ..]  list the tickets in one queue
     wt add -q Q --title..     file a ticket
-    wt claim -q Q             claim the oldest open ticket (atomic)
-    wt claim -q Q --urgent    claim the highest-priority open ticket
+    wt claim -q Q             claim next ticket (smart: priority → type → age)
+    wt claim -q Q --oldest    claim oldest ticket (pure FIFO)
+    wt claim -q Q --type bug  claim only bugs (or --type feature for ideas)
+    wt claim -q Q --readiness needs-shaping  claim unspecced ideas
     wt close <ref>            close a ticket (--summary required)
     wt drain on|off Q         opt a queue in/out of auto-spawn
     wt workers                list workers the watcher started
@@ -180,7 +182,13 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 def cmd_claim(args: argparse.Namespace) -> int:
     worker = args.worker or f"wt-cli-{os.getpid()}"
-    item = q.claim_next(worker, project=args.queue, urgent=getattr(args, "urgent", False))
+    item = q.claim_next(
+        worker,
+        project=args.queue,
+        oldest=getattr(args, "oldest", False),
+        item_type=getattr(args, "type", "") or "",
+        readiness_filter=getattr(args, "readiness", "") or "",
+    )
     if not item:
         print(f"(nothing open in {args.queue})")
         return 0
@@ -726,11 +734,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="confidence: H, M, or L")
     s.set_defaults(func=cmd_add)
 
-    s = sub.add_parser("claim", help="claim next open ticket (oldest by default)")
+    s = sub.add_parser("claim", help="claim next open ticket (smart sort: priority + type + age)")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("--worker", default="")
-    s.add_argument("--urgent", action="store_true",
-                   help="claim highest-priority ticket instead of oldest")
+    s.add_argument("--oldest", action="store_true",
+                   help="FIFO: claim oldest ticket regardless of priority")
+    s.add_argument("--type", default="", choices=["bug", "feature", ""],
+                   help="only claim this item type")
+    s.add_argument("--readiness", default="",
+                   choices=["ready", "needs-shaping", "needs-spec", ""],
+                   help="only claim items with this readiness (default: only 'ready')")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_claim)
 
