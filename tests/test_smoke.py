@@ -659,6 +659,102 @@ def test_close_requires_summary(store, capsys):
     assert "--summary" in err
 
 
+def test_enqueue_with_triage_fields(store):
+    """Triage fields (item_type, readiness, priority, value, confidence) are
+    stored on the item under the canonical key names."""
+    import watchtower.queue as q
+
+    item = q.enqueue(
+        project="TRIAGE",
+        note="ship the feature",
+        item_type="feature",
+        readiness="ready",
+        priority="p1",
+        value="H",
+        confidence="M",
+    )
+    assert item["type"] == "feature"
+    assert item["readiness"] == "ready"
+    assert item["priority"] == "p1"
+    assert item["value"] == "H"
+    assert item["confidence"] == "M"
+    # Schema completeness: block fields present from creation.
+    assert item["needs_input"] is False
+    assert item["block_question"] == ""
+
+    # Reload from disk to confirm persistence.
+    reloaded = q.get(item["ref"])
+    assert reloaded["type"] == "feature"
+    assert reloaded["priority"] == "p1"
+
+
+def test_claim_skips_unready(store):
+    """claim_next(shaping=False) skips needs-shaping/needs-spec items;
+    claim_next(shaping=True) includes them."""
+    import watchtower.queue as q
+
+    item = q.enqueue(
+        project="UNREADY", note="shape me first", readiness="needs-shaping"
+    )
+
+    # Default (shaping=False) should not claim an unready item.
+    assert q.claim_next("worker-1", project="UNREADY") is None
+
+    # Explicitly shaping=True should claim it.
+    claimed = q.claim_next("worker-1", project="UNREADY", shaping=True)
+    assert claimed is not None
+    assert claimed["ref"] == item["ref"]
+    assert claimed["status"] == "in_progress"
+
+
+def test_update_patches_fields(store):
+    """update() patches triage fields in place and persists them."""
+    import watchtower.queue as q
+
+    item = q.enqueue(project="UPD", note="needs priority")
+    assert item.get("priority", "") == ""
+
+    updated = q.update(item["ref"], priority="p1", value="H")
+    assert updated is not None
+    assert updated["priority"] == "p1"
+    assert updated["value"] == "H"
+    assert updated["ref"] == item["ref"]
+
+    # Also accepts "item_type" alias (stored as "type").
+    q.update(item["ref"], item_type="bug")
+    reloaded = q.get(item["ref"])
+    assert reloaded["type"] == "bug"
+
+    # State-machine fields are silently ignored.
+    q.update(item["ref"], status="closed", number=999)
+    reloaded2 = q.get(item["ref"])
+    assert reloaded2["status"] == "open"
+    assert reloaded2["number"] == item["number"]
+
+    # Returns None for unknown ident.
+    assert q.update("DOES-NOT-EXIST", priority="p0") is None
+
+
+def test_priority_sort_in_claim(store):
+    """claim_next returns the highest-priority (lowest p-number) item first,
+    regardless of insertion order."""
+    import watchtower.queue as q
+
+    low = q.enqueue(project="PRIO", note="low prio", priority="p2")
+    high = q.enqueue(project="PRIO", note="high prio", priority="p0")
+
+    # p0 was filed second but should be claimed first.
+    first = q.claim_next("worker-1", project="PRIO")
+    assert first is not None
+    assert first["ref"] == high["ref"]
+    assert first["priority"] == "p0"
+
+    second = q.claim_next("worker-1", project="PRIO")
+    assert second is not None
+    assert second["ref"] == low["ref"]
+    assert second["priority"] == "p2"
+
+
 def test_stop_signal_file(store, tmp_path, monkeypatch):
     """request_stop(worker_id) creates a sentinel file; claim_next for that
     worker_id deletes the file and returns {"stop": True} instead of a ticket."""

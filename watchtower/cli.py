@@ -185,6 +185,11 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
         url=args.url or "",
         lane=args.lane,
         source="wt",
+        item_type=getattr(args, "type", "") or "",
+        readiness=getattr(args, "readiness", "") or "",
+        priority=getattr(args, "priority", "") or "",
+        value=getattr(args, "value", "") or "",
+        confidence=getattr(args, "confidence", "") or "",
     )
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
     return 0
@@ -760,6 +765,18 @@ def build_parser() -> argparse.ArgumentParser:
         s.add_argument("--text", default="")
         s.add_argument("--url", default="")
         s.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
+        s.add_argument("--type", default="", choices=["bug", "feature", ""],
+                       help="item type: bug or feature")
+        s.add_argument("--readiness", default="",
+                       choices=["ready", "needs-shaping", "needs-spec", ""],
+                       help="readiness level")
+        s.add_argument("--priority", default="",
+                       choices=["p0", "p1", "p2", "p3", "p4", ""],
+                       help="priority: p0 (highest) through p4 (lowest)")
+        s.add_argument("--value", default="", choices=["H", "M", "L", ""],
+                       help="business value: H, M, or L")
+        s.add_argument("--confidence", default="", choices=["H", "M", "L", ""],
+                       help="confidence: H, M, or L")
         s.set_defaults(func=cmd_enqueue)
 
     s = sub.add_parser("claim", help="claim the oldest open ticket")

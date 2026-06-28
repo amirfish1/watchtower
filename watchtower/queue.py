@@ -66,6 +66,12 @@ except Exception:  # pragma: no cover - non-POSIX
 VALID_STATUSES = ("open", "in_progress", "closed")
 VALID_LANES = ("normal", "express")
 
+VALID_ITEM_TYPES = ("bug", "feature", "")
+VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "")
+VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
+VALID_VALUES = ("H", "M", "L", "")
+VALID_CONFIDENCES = ("H", "M", "L", "")
+
 # Legacy CCC store — WatchTower reads it if present so it works on this machine
 # today, before any WatchTower-native queue exists.
 _CCC_LEGACY_STORE = Path.home() / ".claude" / "command-center" / "ux-fixes-queue.json"
@@ -221,6 +227,19 @@ def _save_unlocked(data: Dict[str, Any]) -> None:
     os.replace(tmp, path)
 
 
+def _norm_choice(value: Any, valid_values: tuple, default: str = "") -> str:
+    """Coerce ``value`` to one of ``valid_values``, or return ``default``."""
+    s = str(value or "").strip()
+    if s in valid_values:
+        return s
+    return default
+
+
+def _prio_rank(it: Dict[str, Any]) -> int:
+    """Numeric rank for priority sorting (lower = higher priority)."""
+    return {"p0": 0, "p1": 1, "p2": 2, "p3": 3, "p4": 4}.get(it.get("priority", ""), 5)
+
+
 def _clip(value: Any, max_len: int) -> str:
     s = "" if value is None else str(value)
     s = " ".join(s.split()) if max_len <= 240 else s  # keep prompts multi-line
@@ -240,6 +259,11 @@ def enqueue(
     screenshot_path: str = "",
     repo_path: str = "",
     lane: str = "normal",
+    item_type: str = "",
+    readiness: str = "",
+    priority: str = "",
+    value: str = "",
+    confidence: str = "",
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref)."""
     note = _clip(note, 4000)
@@ -266,6 +290,13 @@ def enqueue(
             "selector": _clip(selector, 1000),
             "screenshot_path": str(screenshot_path or ""),
             "repo_path": str(repo_path or ""),
+            "type": _norm_choice(item_type, VALID_ITEM_TYPES),
+            "readiness": _norm_choice(readiness, VALID_READINESS),
+            "priority": _norm_choice(priority, VALID_PRIORITIES),
+            "value": _norm_choice(value, VALID_VALUES),
+            "confidence": _norm_choice(confidence, VALID_CONFIDENCES),
+            "needs_input": False,
+            "block_question": "",
             "claimed_by": None,
             "claimed_at": None,
             "closed_at": None,
@@ -318,16 +349,58 @@ def get(ident: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
+    """Patch arbitrary fields on an item. Used for triage edits (priority,
+    readiness, value, etc.).
+
+    Allowed fields: item_type, readiness, priority, value, confidence, note,
+    title, url, selector, screenshot_path, repo_path, needs_input,
+    block_question.
+
+    Disallowed (managed by state machine): status, claimed_by, claimed_at,
+    closed_at, claimed_session_id, number, project, ref, seq, created_at.
+
+    ``item_type`` and ``"type"`` are aliases — both are stored as ``"type"``.
+    Returns the updated item, or None if not found.
+    """
+    ALLOWED = frozenset({
+        "item_type", "type", "readiness", "priority", "value", "confidence",
+        "note", "title", "url", "selector", "screenshot_path", "repo_path",
+        "needs_input", "block_question",
+    })
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                now = _now_iso()
+                for k, v in fields.items():
+                    if k in ALLOWED:
+                        # "item_type" and "type" are aliases — store as "type"
+                        key = "type" if k == "item_type" else k
+                        it[key] = v
+                it["updated_at"] = now
+                _save_unlocked(data)
+                return it
+    return None
+
+
 def claim_next(
     session_id: str,
     lane: Optional[str] = None,
     project: Optional[str] = None,
     session_uuid: str = "",
+    shaping: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Atomically move the oldest ``open`` item to ``in_progress`` and return it.
 
     Scoped to ``project`` when given, so a worker only drains its own queue.
-    Express lane jumps the line. Returns ``None`` when nothing is open.
+    Express lane jumps the line; items are then sorted by priority (p0 first),
+    then by global number (oldest first). Returns ``None`` when nothing is open.
+
+    When ``shaping=False`` (default), items where ``readiness`` is
+    ``"needs-shaping"`` or ``"needs-spec"`` are excluded — they are not ready
+    for automated work. Pass ``shaping=True`` to include all readiness levels
+    (for human triage work).
 
     Stop signal: if a reconciler has requested this worker to stop (by placing
     a sentinel file in the stop-signals directory keyed to ``session_id``), the
@@ -360,11 +433,17 @@ def claim_next(
             candidates = [it for it in candidates if it.get("project") == proj]
         if lane:
             candidates = [it for it in candidates if it.get("lane") == lane]
+        if not shaping:
+            candidates = [
+                it for it in candidates
+                if it.get("readiness", "") not in ("needs-shaping", "needs-spec")
+            ]
         if not candidates:
             return None
         candidates.sort(
             key=lambda it: (
                 0 if it.get("lane") == "express" else 1,
+                _prio_rank(it),
                 int(it.get("number", 0)),
             )
         )
