@@ -126,7 +126,10 @@ def test_spawn_worker_dry_run(store):
         assert s["pid"] == 0
         assert s["argv"][0] == "claude"
         assert "-p" in s["argv"]  # headless print mode, not interactive
-        assert any("DEMO" in a for a in s["argv"])  # queue name in the goal
+        # claude workers run in stream-json mode; the goal is delivered on the
+        # FIFO, not in argv. The queue name lives in the drain goal text.
+        assert "stream-json" in s["argv"]
+        assert "DEMO" in workers.drain_goal("DEMO", s["worker_id"])
         assert "bypassPermissions" in s["argv"]  # autonomous drain
 
 
@@ -134,20 +137,21 @@ def test_auto_drain_config(tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "qc.json"))
     import watchtower.config as config
     importlib.reload(config)
-    # default-on: a fresh queue is auto-drained
-    assert config.auto_drain("FRESH") is True
-    # a backlog can opt out
-    config.set_auto_drain("BACKLOG", False)
-    assert config.auto_drain("BACKLOG") is False
-    # and opt back in
+    # default-OFF: a fresh queue is a backlog until you opt in (safe default;
+    # no surprise worker spawns on a parking-lot queue).
+    assert config.auto_drain("FRESH") is False
+    # opt in
     config.set_auto_drain("BACKLOG", True)
     assert config.auto_drain("BACKLOG") is True
+    # and opt back out
+    config.set_auto_drain("BACKLOG", False)
+    assert config.auto_drain("BACKLOG") is False
 
 
 def test_cli_enqueue_and_status(store, capsys):
     from watchtower.cli import main
 
-    assert main(["enqueue", "-q", "CLI", "--title", "t", "--note", "n"]) == 0
+    assert main(["add", "-q", "CLI", "--title", "t", "--note", "n"]) == 0
     out = capsys.readouterr().out
     assert "FILED: CLI-1" in out
 
@@ -612,23 +616,20 @@ def test_worker_activity_join_idle_when_unclaimed(store):
 
 def test_reconcile_once_dry_run(store, tmp_path, monkeypatch):
     """reconcile_once(dry_run=True) reports that it would spawn a worker for a
-    registered queue with auto_drain=True and open tickets."""
+    config'd queue with auto_drain=True and open tickets."""
     import importlib
 
-    monkeypatch.setenv("WATCHTOWER_REGISTRY_FILE", str(tmp_path / "registry.json"))
     monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "qconfig.json"))
     monkeypatch.setenv("WATCHTOWER_STOP_SIGNALS_DIR", str(tmp_path / "stop-signals"))
-    import watchtower.registry as registry
     import watchtower.config as config
     import watchtower.workers as workers
     import watchtower.queue as q
-    importlib.reload(registry)
     importlib.reload(config)
     importlib.reload(workers)
     importlib.reload(q)
 
-    # Register a queue with auto_drain=True (the default).
-    registry.register("RECONCQ", auto_drain=True)
+    # Opt the queue into auto-drain (config is the single source of truth now).
+    config.set_auto_drain("RECONCQ", True)
     # Drop a ticket into the queue so depth > 0.
     q.enqueue(project="RECONCQ", note="waiting for a worker")
 
