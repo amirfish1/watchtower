@@ -418,12 +418,18 @@ def cmd_dedup(args: argparse.Namespace) -> int:
 
 
 def cmd_set(args: argparse.Namespace) -> int:
-    """Set queue-level config (repo_path, etc.)."""
+    """Set queue-level config (repo_path, engine, desired_workers, etc.)."""
     from . import config
     changed = []
     if args.repo_path is not None:
         config.set_repo_path(args.queue, args.repo_path)
         changed.append(f"repo_path={args.repo_path}")
+    if args.engine is not None:
+        config.set_engine(args.queue, args.engine)
+        changed.append(f"engine={args.engine}")
+    if args.desired_workers is not None:
+        config.set_desired_workers(args.queue, args.desired_workers)
+        changed.append(f"desired_workers={args.desired_workers}")
     if not changed:
         cfg = config.get_queue_config(args.queue)
         print(f"{args.queue}: {cfg if cfg else '(no config)'}")
@@ -551,15 +557,15 @@ def _daemon_loop(args: argparse.Namespace) -> None:
                 f"on {rec.get('queue','')}{tag}",
                 flush=True,
             )
-        # Also handle legacy stuck-queue auto-spawn for queues NOT in the registry
-        # (so the old --auto-spawn behaviour still works for ad-hoc queues).
+        # Handle stuck-queue auto-spawn for queues not handled by reconcile_once
+        # (queues with auto_drain=True that appeared stuck but had depth=0 at
+        # reconcile time, or queues only known via health scan).
         if args.auto_spawn:
             from . import config
             rows = health.all_status(stuck_minutes=args.stuck_minutes)
-            from . import registry as _reg
-            registered = set(_reg.all_queues().keys())
+            managed = set(config.all_queues().keys())
             for r in rows:
-                if r["queue"] in registered:
+                if r["queue"] in managed:
                     continue  # already handled by reconcile_once
                 if not r["stuck"]:
                     continue
@@ -924,10 +930,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
 
-    s = sub.add_parser("set", help="set queue-level config (repo_path, etc.)")
+    s = sub.add_parser("set", help="set queue-level config (repo_path, engine, workers)")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("--repo-path", default=None, dest="repo_path",
                    help="default cwd for workers spawned on this queue")
+    s.add_argument("--engine", default=None, choices=["claude", "codex"],
+                   help="agent engine for workers on this queue (default: claude)")
+    s.add_argument("--desired-workers", default=None, type=int, dest="desired_workers",
+                   help="number of concurrent workers the reconciler should maintain")
     s.set_defaults(func=cmd_set)
 
     s = sub.add_parser("drain", help="enable or disable auto-drain for a queue")

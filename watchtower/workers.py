@@ -275,11 +275,17 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     or depth=0).  In ``dry_run`` mode no subprocesses are started and no
     stop-signal files are created; the return value shows what *would* happen.
     """
-    from . import config, health, registry as reg
+    from . import config, health
+
+    # One-time import of legacy queue-registry.json (no-op after first run).
+    try:
+        config.migrate_from_registry()
+    except Exception:
+        pass
 
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": []}
 
-    all_reg = reg.all_queues()
+    all_cfg = config.all_queues()
     # Build live-worker counts keyed by queue.
     live_by_queue: Dict[str, List[Dict[str, Any]]] = {}
     for w in list_workers(prune=False):
@@ -292,9 +298,9 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     for row in health.all_status():
         depth_by_queue[row["queue"]] = row.get("depth", 0)
 
-    for q_name, rec in all_reg.items():
-        auto = rec.get("auto_drain", True) and config.auto_drain(q_name)
-        desired = int(rec.get("desired_workers", 1)) if auto else 0
+    for q_name in all_cfg:
+        auto = config.auto_drain(q_name)
+        desired = config.desired_workers(q_name) if auto else 0
         depth = depth_by_queue.get(q_name, 0)
         if not auto:
             result["skipped"].append({"queue": q_name, "reason": "auto_drain=off"})
@@ -314,17 +320,14 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
         actual = len(live)
         if actual < desired:
             to_spawn = desired - actual
-            engine = rec.get("engine", "claude")
-            from . import config as _cfg
             from . import queue as _q
-            # Peek at the next ticket to get its repo_path; fall back to
-            # queue-level config, then registry, then cwd.
+            # Peek at the next ticket to get its repo_path; fall back to queue config.
             peeked = _q.peek_next(project=q_name)
             repo_path = (
                 (peeked or {}).get("repo_path", "")
-                or rec.get("repo_path", "")
-                or _cfg.repo_path(q_name)
+                or config.repo_path(q_name)
             )
+            engine = config.engine(q_name)
             spawned = spawn_workers(
                 q_name, n=to_spawn, engine=engine,
                 repo_path=repo_path, dry_run=dry_run,

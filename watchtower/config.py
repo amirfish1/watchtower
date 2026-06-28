@@ -69,3 +69,77 @@ def set_repo_path(queue: str, path: str) -> Dict[str, Any]:
 def repo_path(queue: str) -> str:
     """Return the configured repo_path for a queue, or empty string."""
     return _load().get(queue, {}).get("repo_path", "")
+
+
+def set_engine(queue: str, eng: str) -> Dict[str, Any]:
+    data = _load()
+    q = data.setdefault(queue, {})
+    q["engine"] = eng
+    _save(data)
+    return q
+
+
+def engine(queue: str) -> str:
+    return _load().get(queue, {}).get("engine", "claude")
+
+
+def set_desired_workers(queue: str, n: int) -> Dict[str, Any]:
+    data = _load()
+    q = data.setdefault(queue, {})
+    q["desired_workers"] = int(n)
+    _save(data)
+    return q
+
+
+def desired_workers(queue: str) -> int:
+    return int(_load().get(queue, {}).get("desired_workers", 1))
+
+
+def all_queues() -> Dict[str, Any]:
+    """Return all configured queues (any queue with an entry in the config file)."""
+    return dict(_load())
+
+
+def ensure_entry(queue: str) -> Dict[str, Any]:
+    """Create a config entry for queue if none exists yet."""
+    data = _load()
+    if queue not in data:
+        data[queue] = {}
+        _save(data)
+    return dict(data[queue])
+
+
+_REGISTRY_FILE = Path.home() / ".watchtower" / "queue-registry.json"
+
+
+def migrate_from_registry() -> int:
+    """One-time import of legacy queue-registry.json into queue-config.json.
+
+    Renames the source file to ``*.migrated`` so it won't be re-processed.
+    Returns the number of queues imported.
+    """
+    if not _REGISTRY_FILE.exists():
+        return 0
+    try:
+        import json as _json
+        with open(_REGISTRY_FILE) as f:
+            reg = _json.load(f)
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(reg, dict):
+        return 0
+    data = _load()
+    count = 0
+    for name, rec in reg.items():
+        entry = data.setdefault(name, {})
+        for key in ("auto_drain", "engine", "desired_workers", "repo_path"):
+            if key in rec and key not in entry:
+                entry[key] = rec[key]
+        count += 1
+    if count:
+        _save(data)
+    try:
+        _REGISTRY_FILE.rename(_REGISTRY_FILE.with_suffix(".json.migrated"))
+    except OSError:
+        pass
+    return count
