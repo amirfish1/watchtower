@@ -315,7 +315,8 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
         if actual < desired:
             to_spawn = desired - actual
             engine = rec.get("engine", "claude")
-            repo_path = rec.get("repo_path", "")
+            from . import config as _cfg
+            repo_path = rec.get("repo_path", "") or _cfg.repo_path(q_name)
             spawned = spawn_workers(
                 q_name, n=to_spawn, engine=engine,
                 repo_path=repo_path, dry_run=dry_run,

@@ -417,6 +417,21 @@ def cmd_dedup(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_set(args: argparse.Namespace) -> int:
+    """Set queue-level config (repo_path, etc.)."""
+    from . import config
+    changed = []
+    if args.repo_path is not None:
+        config.set_repo_path(args.queue, args.repo_path)
+        changed.append(f"repo_path={args.repo_path}")
+    if not changed:
+        cfg = config.get_queue_config(args.queue)
+        print(f"{args.queue}: {cfg if cfg else '(no config)'}")
+    else:
+        print(f"{args.queue}: {', '.join(changed)}")
+    return 0
+
+
 def cmd_drain(args: argparse.Namespace) -> int:
     """Enable or disable auto-drain for a queue (wt drain on|off <queue>)."""
     from . import config
@@ -908,6 +923,12 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("workers", help="list workers this CLI started")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
+
+    s = sub.add_parser("set", help="set queue-level config (repo_path, etc.)")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--repo-path", default=None, dest="repo_path",
+                   help="default cwd for workers spawned on this queue")
+    s.set_defaults(func=cmd_set)
 
     s = sub.add_parser("drain", help="enable or disable auto-drain for a queue")
     s.add_argument("onoff", choices=["on", "off"], help="on = auto-spawn workers; off = backlog mode")

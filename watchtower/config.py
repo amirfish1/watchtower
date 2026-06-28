@@ -56,3 +56,16 @@ def auto_drain(queue: str) -> bool:
     """False unless explicitly opted in. Default-off so a fresh queue is a
     backlog until you run ``wt drain on <queue>``."""
     return bool(_load().get(queue, {}).get("auto_drain", False))
+
+
+def set_repo_path(queue: str, path: str) -> Dict[str, Any]:
+    data = _load()
+    q = data.setdefault(queue, {})
+    q["repo_path"] = str(path)
+    _save(data)
+    return q
+
+
+def repo_path(queue: str) -> str:
+    """Return the configured repo_path for a queue, or empty string."""
+    return _load().get(queue, {}).get("repo_path", "")
