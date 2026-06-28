@@ -59,6 +59,7 @@ def _eta_note(r: dict) -> str:
 
 
 def _print_status(rows: List[dict]) -> None:
+    from . import config as _cfg
     print(f"store: {q.store_path()}")
     counts = workers.worker_counts()
     if not rows:
@@ -66,7 +67,7 @@ def _print_status(rows: List[dict]) -> None:
     else:
         hdr = (
             f"{'QUEUE':<14}{'OPEN':>5}{'WIP':>5}{'DONE':>6}  {'OLDEST':>8}"
-            f"  {'IDLE':>8}  {'WORKERS':<12}STATUS"
+            f"  {'IDLE':>8}  {'WORKERS':<12}{'DRAIN':<7}STATUS"
         )
         print(hdr)
         print("-" * len(hdr))
@@ -75,10 +76,12 @@ def _print_status(rows: List[dict]) -> None:
                     "active": "draining", "clear": "ok"}.get(r.get("state"), "ok")
             wc = counts.get(r["queue"], {"total": 0, "live": 0})
             wcell = f"{wc['total']} ({wc['live']} live)"
+            drain_val = _cfg.auto_drain(r["queue"])
+            drain_cell = "on " if drain_val else "off"
             print(
                 f"{r['queue']:<14}{r['depth']:>5}{r['in_progress']:>5}{r['closed']:>6}"
                 f"  {r['oldest_open_age']:>8}  {r['since_progress']:>8}"
-                f"  {wcell:<12}{flag}  {_eta_note(r)}"
+                f"  {wcell:<12}{drain_cell:<7}{flag}  {_eta_note(r)}"
             )
 
     rows_w = workers.list_workers(prune=False)
@@ -358,11 +361,20 @@ def cmd_register(args: argparse.Namespace) -> int:
     """Declare/configure a queue in the registry (WT-FEATURES-13). Also writes
     the auto_drain policy through to the shared config so the watcher honors it."""
     from . import config, registry
+    if args.auto_drain is None:
+        print(
+            "error: --auto-drain true|false is required when registering a queue.\n"
+            "  auto-drain=true  → reconciler spawns workers automatically when the queue has open tickets\n"
+            "  auto-drain=false → backlog mode; workers must be started manually",
+            file=sys.stderr,
+        )
+        return 1
+    drain = args.auto_drain == "true"
     rec = registry.register(
         args.queue, backend=args.backend, owner=args.owner,
-        auto_drain=not args.no_auto_drain,
+        auto_drain=drain,
     )
-    config.set_auto_drain(args.queue, not args.no_auto_drain)
+    config.set_auto_drain(args.queue, drain)
     print(f"registered {rec['name']}: backend={rec['backend']} "
           f"owner={rec['owner'] or '-'} auto_drain={rec['auto_drain']}")
     return 0
@@ -628,6 +640,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+
 def _pid_from_file(path: Path) -> Optional[int]:
     """Return the live pid recorded in ``path``, or None (cleaning up stale)."""
     if not path.exists():
@@ -842,7 +855,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("--backend", default="store", choices=["store", "github"])
     s.add_argument("--owner", default="")
-    s.add_argument("--no-auto-drain", action="store_true", dest="no_auto_drain")
+    s.add_argument("--auto-drain", choices=["true", "false"], default=None,
+                   dest="auto_drain",
+                   help="REQUIRED: true = reconciler drains automatically; false = backlog, manual only")
     s.set_defaults(func=cmd_register)
 
     s = sub.add_parser("registry", help="list declared queues")
