@@ -424,6 +424,28 @@ def cmd_drain(args: argparse.Namespace) -> int:
     config.set_auto_drain(args.queue, enabled)
     state = "on" if enabled else "off"
     print(f"{args.queue}: drain {state} — reconciler will {'spawn workers automatically' if enabled else 'leave this queue alone'}")
+    if enabled:
+        # Auto-start the service if it isn't already running.
+        daemon_live = False
+        if DAEMON_PID_FILE.exists():
+            try:
+                pid = int(DAEMON_PID_FILE.read_text().strip())
+                os.kill(pid, 0)
+                daemon_live = True
+            except (ValueError, ProcessLookupError, OSError):
+                pass
+        if not daemon_live:
+            import subprocess
+            cmd = [sys.executable, "-m", "watchtower.cli", "start", "--foreground",
+                   "--auto-spawn"]
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, start_new_session=True,
+            )
+            DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+            DAEMON_PID_FILE.write_text(str(proc.pid))
+            print(f"service auto-started (pid {proc.pid})")
     return 0
 
 
