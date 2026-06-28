@@ -3,9 +3,9 @@
 
 Currently holds the ``auto_drain`` policy (WT-FEATURES #16): the watcher's
 ``--auto-spawn`` only starts a worker for a stuck queue when that queue is
-auto-drained. A queue is auto-drained **by default**; prioritization backlogs
-(e.g. BYMPROD, WT-FEATURES) opt OUT so a never-meant-to-drain backlog doesn't
-keep getting workers thrown at it just for being non-empty.
+auto-drained. Auto-drain is **off by default** — a new queue is a backlog
+until you explicitly opt in with ``wt drain on <queue>``. This prevents
+surprise worker spawns on queues that are just parking lots.
 
 Stored as ``~/.watchtower/queue-config.json`` = ``{queue: {auto_drain: bool}}``.
 """
@@ -53,6 +53,6 @@ def set_auto_drain(queue: str, enabled: bool) -> Dict[str, Any]:
 
 
 def auto_drain(queue: str) -> bool:
-    """True unless the queue has explicitly opted out. Default-on so a fresh
-    queue drains; a backlog opts out with ``set_auto_drain(queue, False)``."""
-    return bool(_load().get(queue, {}).get("auto_drain", True))
+    """False unless explicitly opted in. Default-off so a fresh queue is a
+    backlog until you run ``wt drain on <queue>``."""
+    return bool(_load().get(queue, {}).get("auto_drain", False))
