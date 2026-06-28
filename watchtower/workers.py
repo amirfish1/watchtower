@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 import uuid
@@ -275,6 +276,41 @@ def _save(data: Dict[str, Any]) -> None:
     os.replace(tmp, WORKERS_FILE)
 
 
+_SESSION_ID_RE = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+
+
+def resolve_session_id_from_log(log_path: str) -> str:
+    """Extract the cloud-assigned session UUID from a worker's stream-json log.
+
+    A ``claude -p --output-format stream-json`` worker emits an init/system event
+    carrying ``session_id`` (the UUID Claude/cloud assigns -- WatchTower does NOT
+    mint it). We scan the first lines of the captured output log for it. Returns
+    "" until the event has been written (the worker must have started its first
+    turn). Mirrors CCC's extract_session_id."""
+    if not log_path:
+        return ""
+    try:
+        with open(log_path, "r") as f:
+            for i, line in enumerate(f):
+                if i >= 80:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                sid = ev.get("session_id") or ev.get("sessionId")
+                if sid and _SESSION_ID_RE.fullmatch(str(sid)):
+                    return str(sid)
+    except (OSError, UnicodeDecodeError):
+        pass
+    return ""
+
+
 def _pid_alive(pid: int) -> bool:
     if not pid:
         return False
@@ -322,7 +358,17 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
     data = _load()
     out: List[Dict[str, Any]] = []
     kept: List[Dict[str, Any]] = []
+    backfilled = False
     for w in data["workers"]:
+        # Backfill the cloud session UUID from the worker's output log once it
+        # appears (the worker has to start its first turn before the init event
+        # is written). Persisted so CCC can resolve worker -> session and link
+        # to its conversation. Parsed at most once per worker (skip if known).
+        if not w.get("session_id") and w.get("log"):
+            sid = resolve_session_id_from_log(w["log"])
+            if sid:
+                w["session_id"] = sid
+                backfilled = True
         alive = _pid_alive(int(w.get("pid", 0)))
         row = dict(w)
         row["alive"] = alive
@@ -338,7 +384,9 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                 except OSError:
                     pass
     if prune and len(kept) != len(data["workers"]):
-        _save({"workers": kept})
+        _save({"workers": kept})  # kept holds the same dicts -> backfill persists
+    elif backfilled:
+        _save(data)
     return out
 
 

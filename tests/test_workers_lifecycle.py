@@ -364,3 +364,42 @@ def test_reap_spares_warm_worker(wt):
     rec = _live_worker(wt, "Q")
     _age_worker_log(wt, rec, wt.workers.WARM_TTL_S - 30)  # warm
     assert wt.workers.reap_stale_workers(queue="Q") == []
+
+
+# ===================================== cloud session-id resolution (WT-38)
+def test_resolve_session_id_from_log(wt):
+    """The cloud UUID is parsed from the stream-json init event in the log."""
+    log = wt.tmp / "w.log"
+    log.write_text(
+        '{"type":"system","subtype":"init",'
+        '"session_id":"c44f96bc-d720-49d3-a5e6-115426939f82"}\n'
+        '{"type":"assistant","message":{}}\n'
+    )
+    assert (wt.workers.resolve_session_id_from_log(str(log))
+            == "c44f96bc-d720-49d3-a5e6-115426939f82")
+
+
+def test_resolve_session_id_absent_returns_empty(wt):
+    log = wt.tmp / "noinit.log"
+    log.write_text('{"type":"assistant","message":{}}\n')
+    assert wt.workers.resolve_session_id_from_log(str(log)) == ""
+
+
+def test_list_workers_backfills_and_persists_session_id(wt):
+    """list_workers parses the log, stamps session_id on the record, persists it
+    so CCC can resolve worker -> session and link to its conversation."""
+    log = wt.tmp / "bf.log"
+    log.write_text(
+        '{"type":"system","session_id":"c44f96bc-d720-49d3-a5e6-115426939f82"}\n'
+    )
+    rec = wt.workers.record_worker(
+        os.getpid(), "Q", "claude", "q-bf", str(wt.tmp), str(log), fifo="",
+    )
+    assert not rec.get("session_id")  # not known at spawn
+    rows = wt.workers.list_workers(prune=False)
+    row = next(r for r in rows if r["worker_id"] == "q-bf")
+    assert row["session_id"] == "c44f96bc-d720-49d3-a5e6-115426939f82"
+    # persisted: a fresh read still has it (no re-parse needed)
+    again = next(r for r in wt.workers.list_workers(prune=False)
+                 if r["worker_id"] == "q-bf")
+    assert again["session_id"] == "c44f96bc-d720-49d3-a5e6-115426939f82"
