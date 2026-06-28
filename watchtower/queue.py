@@ -592,7 +592,11 @@ def update_status(
                     it["claimed_by"] = None
                     it["claimed_at"] = None
                     it["closed_at"] = None
-                    it["claimed_session_id"] = None
+                    # Keep claimed_session_id: reopening drops the claim *lock*
+                    # (so a new worker can claim) but preserves the handle to the
+                    # session that last worked this ticket, so `wt discuss` can
+                    # still resume that context for a follow-up. A re-claim with a
+                    # real session id overwrites it in claim_next.
                     # reopening drops any block — it's back in the pool
                     it["needs_input"] = False
                     it["block_question"] = ""
