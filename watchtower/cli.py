@@ -12,7 +12,7 @@
     wt block / blocked        park a ticket needing a human / list parked
     wt answer / discuss       answer a blocked ticket / attach to its session
     wt wait -q Q [--cmd ..]   block until the queue is drained, then run --cmd
-    wt start / wt stop        start/stop the background watcher daemon
+    wt start / wt stop        start/stop service (watcher, reconciler, dashboard, HTTP API)
     wt dashboard              phone-first HTTP dashboard (queues + workers)
 """
 
@@ -810,7 +810,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="POST JSON to this URL when the queue drains (async reply)")
     s.set_defaults(func=cmd_wait)
 
-    s = sub.add_parser("start", help="start the background watcher / reconciler daemon")
+    s = sub.add_parser("start", help="start service (watcher, reconciler, dashboard, HTTP API)")
     s.add_argument("--interval", type=int, default=30,
                    help="reconciler tick interval in seconds (default 30)")
     s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
@@ -828,7 +828,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_start)
 
-    s = sub.add_parser("stop", help="stop the background watcher daemon")
+    s = sub.add_parser("stop", help="stop service (watcher, reconciler, dashboard, HTTP API)")
     s.set_defaults(func=cmd_stop)
 
     s = sub.add_parser(
