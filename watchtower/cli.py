@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """WatchTower CLI — the ``wt`` binary.
 
-Phase-1 commands:
-
-    wt status                 per-queue depth / oldest-open age / stuck flag
-    wt queues                 list queues + counts
+    wt status                 per-queue depth / age / drain / stuck flag
     wt ls -q Q [--status ..]  list the tickets in one queue
-    wt add -q Q --title..     file a ticket  (alias: wt enqueue)
+    wt add -q Q --title..     file a ticket
     wt claim -q Q             claim the oldest open ticket (atomic)
-    wt next -q Q              alias for claim
-    wt close <ref>            close a ticket
+    wt claim -q Q --urgent    claim the highest-priority open ticket
+    wt close <ref>            close a ticket (--summary required)
+    wt drain on|off Q         opt a queue in/out of auto-spawn
     wt workers                list workers the watcher started
     wt block / blocked        park a ticket needing a human / list parked
     wt answer / discuss       answer a blocked ticket / attach to its session
@@ -122,24 +120,6 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_queues(args: argparse.Namespace) -> int:
-    data = q.queues()
-    if args.json:
-        print(json.dumps(data, indent=2))
-        return 0
-    print(f"store: {q.store_path()}")
-    if not data:
-        print("(no queues)")
-        return 0
-    print(f"{'QUEUE':<14}{'OPEN':>5}{'WIP':>5}{'DONE':>6}{'TOTAL':>7}")
-    for name in sorted(data):
-        c = data[name]
-        print(
-            f"{name:<14}{c['open']:>5}{c['in_progress']:>5}"
-            f"{c['closed']:>6}{c['total']:>7}"
-        )
-    return 0
-
 
 def cmd_ls(args: argparse.Namespace) -> int:
     """List the tickets in a single queue (the actual items, not just counts)."""
@@ -179,7 +159,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_enqueue(args: argparse.Namespace) -> int:
+def cmd_add(args: argparse.Namespace) -> int:
     item = q.enqueue(
         project=args.queue,
         title=args.title or "",
@@ -200,7 +180,7 @@ def cmd_enqueue(args: argparse.Namespace) -> int:
 
 def cmd_claim(args: argparse.Namespace) -> int:
     worker = args.worker or f"wt-cli-{os.getpid()}"
-    item = q.claim_next(worker, project=args.queue)
+    item = q.claim_next(worker, project=args.queue, urgent=getattr(args, "urgent", False))
     if not item:
         print(f"(nothing open in {args.queue})")
         return 0
@@ -357,41 +337,6 @@ def cmd_workers(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_register(args: argparse.Namespace) -> int:
-    """Declare/configure a queue in the registry (WT-FEATURES-13). Also writes
-    the auto_drain policy through to the shared config so the watcher honors it."""
-    from . import config, registry
-    if args.auto_drain is None:
-        print(
-            "error: --auto-drain true|false is required when registering a queue.\n"
-            "  auto-drain=true  → reconciler spawns workers automatically when the queue has open tickets\n"
-            "  auto-drain=false → backlog mode; workers must be started manually",
-            file=sys.stderr,
-        )
-        return 1
-    drain = args.auto_drain == "true"
-    rec = registry.register(
-        args.queue, backend=args.backend, owner=args.owner,
-        auto_drain=drain,
-    )
-    config.set_auto_drain(args.queue, drain)
-    print(f"registered {rec['name']}: backend={rec['backend']} "
-          f"owner={rec['owner'] or '-'} auto_drain={rec['auto_drain']}")
-    return 0
-
-
-def cmd_registry(args: argparse.Namespace) -> int:
-    """List declared queues."""
-    from . import registry
-    qs = registry.all_queues()
-    if not qs:
-        print("(no queues registered)")
-        return 0
-    for name, r in sorted(qs.items()):
-        print(f"{name:16} backend={r.get('backend','store'):8} "
-              f"owner={r.get('owner') or '-':12} auto_drain={r.get('auto_drain', True)}")
-    return 0
-
 
 def cmd_monitor(args: argparse.Namespace) -> int:
     """Monitor-as-a-job (WT-FEATURES-20): run a check command; if it fails
@@ -447,16 +392,13 @@ def cmd_dedup(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_config(args: argparse.Namespace) -> int:
-    """Get/set per-queue config. Today: the auto_drain opt-out (WT-FEATURES #16)."""
+def cmd_drain(args: argparse.Namespace) -> int:
+    """Enable or disable auto-drain for a queue (wt drain on|off <queue>)."""
     from . import config
-    if args.auto_drain is not None:
-        cfg = config.set_auto_drain(args.queue, args.auto_drain == "true")
-        print(f"{args.queue}: auto_drain={cfg['auto_drain']}")
-    else:
-        val = config.auto_drain(args.queue)
-        explicit = "auto_drain" in config.get_queue_config(args.queue)
-        print(f"{args.queue}: auto_drain={val}" + ("" if explicit else " (default)"))
+    enabled = args.onoff == "on"
+    config.set_auto_drain(args.queue, enabled)
+    state = "on" if enabled else "off"
+    print(f"{args.queue}: drain {state} — reconciler will {'spawn workers automatically' if enabled else 'leave this queue alone'}")
     return 0
 
 
@@ -751,10 +693,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_status)
 
-    s = sub.add_parser("queues", help="list queues + counts")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(func=cmd_queues)
-
     s = sub.add_parser("ls", help="list the tickets in one queue")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument(
@@ -767,40 +705,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_ls)
 
-    for _add_name, _add_help in [
-        ("add", "file a ticket"),
-        ("enqueue", argparse.SUPPRESS),  # back-compat alias for `add`
-    ]:
-        s = sub.add_parser(_add_name, help=_add_help)
-        s.add_argument("-q", "--queue", required=True)
-        s.add_argument("--title", default="")
-        s.add_argument("--note", default="")
-        s.add_argument("--text", default="")
-        s.add_argument("--url", default="")
-        s.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
-        s.add_argument("--type", default="", choices=["bug", "feature", ""],
-                       help="item type: bug or feature")
-        s.add_argument("--readiness", default="",
-                       choices=["ready", "needs-shaping", "needs-spec", ""],
-                       help="readiness level")
-        s.add_argument("--priority", default="",
-                       choices=["p0", "p1", "p2", "p3", "p4", ""],
-                       help="priority: p0 (highest) through p4 (lowest)")
-        s.add_argument("--value", default="", choices=["H", "M", "L", ""],
-                       help="business value: H, M, or L")
-        s.add_argument("--confidence", default="", choices=["H", "M", "L", ""],
-                       help="confidence: H, M, or L")
-        s.set_defaults(func=cmd_enqueue)
+    s = sub.add_parser("add", help="file a ticket")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--title", default="")
+    s.add_argument("--note", default="")
+    s.add_argument("--text", default="")
+    s.add_argument("--url", default="")
+    s.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
+    s.add_argument("--type", default="", choices=["bug", "feature", ""],
+                   help="item type: bug or feature")
+    s.add_argument("--readiness", default="",
+                   choices=["ready", "needs-shaping", "needs-spec", ""],
+                   help="readiness level")
+    s.add_argument("--priority", default="",
+                   choices=["p0", "p1", "p2", "p3", "p4", ""],
+                   help="priority: p0 (highest) through p4 (lowest)")
+    s.add_argument("--value", default="", choices=["H", "M", "L", ""],
+                   help="business value: H, M, or L")
+    s.add_argument("--confidence", default="", choices=["H", "M", "L", ""],
+                   help="confidence: H, M, or L")
+    s.set_defaults(func=cmd_add)
 
-    s = sub.add_parser("claim", help="claim the oldest open ticket")
+    s = sub.add_parser("claim", help="claim next open ticket (oldest by default)")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("--worker", default="")
-    s.add_argument("--json", action="store_true")
-    s.set_defaults(func=cmd_claim)
-
-    s = sub.add_parser("next", help="alias for claim")
-    s.add_argument("-q", "--queue", required=True)
-    s.add_argument("--worker", default="")
+    s.add_argument("--urgent", action="store_true",
+                   help="claim highest-priority ticket instead of oldest")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_claim)
 
@@ -851,17 +781,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
 
-    s = sub.add_parser("register", help="declare/configure a queue in the registry")
-    s.add_argument("-q", "--queue", required=True)
-    s.add_argument("--backend", default="store", choices=["store", "github"])
-    s.add_argument("--owner", default="")
-    s.add_argument("--auto-drain", choices=["true", "false"], default=None,
-                   dest="auto_drain",
-                   help="REQUIRED: true = reconciler drains automatically; false = backlog, manual only")
-    s.set_defaults(func=cmd_register)
-
-    s = sub.add_parser("registry", help="list declared queues")
-    s.set_defaults(func=cmd_registry)
+    s = sub.add_parser("drain", help="enable or disable auto-drain for a queue")
+    s.add_argument("onoff", choices=["on", "off"], help="on = auto-spawn workers; off = backlog mode")
+    s.add_argument("queue", metavar="QUEUE", help="queue name (e.g. CCC, WT)")
+    s.set_defaults(func=cmd_drain)
 
     s = sub.add_parser("monitor", help="run a check; file a ticket if it fails")
     s.add_argument("-q", "--queue", required=True)
@@ -874,12 +797,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-q", "--queue", default=None)
     s.add_argument("--apply", action="store_true", help="close dupes (default: dry-run)")
     s.set_defaults(func=cmd_dedup)
-
-    s = sub.add_parser("config", help="per-queue config (auto-drain opt-out)")
-    s.add_argument("-q", "--queue", required=True)
-    s.add_argument("--auto-drain", choices=["true", "false"], default=None,
-                   dest="auto_drain", help="opt this queue in/out of auto-spawn")
-    s.set_defaults(func=cmd_config)
 
     # No `wt spawn-worker`: workers are spawned by the watcher (`wt start`) from
     # per-queue auto_drain policy + depth, not by hand. See workers.spawn_workers.

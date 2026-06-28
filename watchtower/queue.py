@@ -401,12 +401,14 @@ def claim_next(
     project: Optional[str] = None,
     session_uuid: str = "",
     shaping: bool = False,
+    urgent: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Atomically move the oldest ``open`` item to ``in_progress`` and return it.
+    """Atomically move the next ``open`` item to ``in_progress`` and return it.
 
     Scoped to ``project`` when given, so a worker only drains its own queue.
-    Express lane jumps the line; items are then sorted by priority (p0 first),
-    then by global number (oldest first). Returns ``None`` when nothing is open.
+    By default claims the oldest item (FIFO). With ``urgent=True``, claims
+    by priority (express lane first, then p0..p4, then oldest within tier).
+    Returns ``None`` when nothing is open.
 
     When ``shaping=False`` (default), items where ``readiness`` is
     ``"needs-shaping"`` or ``"needs-spec"`` are excluded — they are not ready
@@ -451,13 +453,16 @@ def claim_next(
             ]
         if not candidates:
             return None
-        candidates.sort(
-            key=lambda it: (
-                0 if it.get("lane") == "express" else 1,
-                _prio_rank(it),
-                int(it.get("number", 0)),
+        if urgent:
+            candidates.sort(
+                key=lambda it: (
+                    0 if it.get("lane") == "express" else 1,
+                    _prio_rank(it),
+                    int(it.get("number", 0)),
+                )
             )
-        )
+        else:
+            candidates.sort(key=lambda it: int(it.get("number", 0)))
         item = candidates[0]
         item["status"] = "in_progress"
         item["claimed_by"] = str(session_id)
