@@ -287,6 +287,8 @@ def test_drain_goal_content(wt):
     assert "claim" in goal.lower()
     # New FIFO model: end-turn-on-empty, no sleep-loop.
     assert "end" in goal.lower()
+    # Per-queue learnings: read at spawn, update at drain-completion.
+    assert "learnings/Q.md" in goal
 
 
 def test_config_is_reconcile_source_and_default_off(wt):
