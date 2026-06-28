@@ -228,11 +228,18 @@ def test_dashboard_serves_status_json(store):
     assert any(w["worker_id"] == "dash-w1" for w in payload["workers"])
 
 
-def test_dashboard_html_renders(store):
+def test_dashboard_html_renders(store, monkeypatch):
     import watchtower.queue as q
+    import watchtower.config as config
     import watchtower.dashboard as dashboard
 
+    monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(store.parent / "qcfg.json"))
+    importlib.reload(config)
     q.enqueue(project="HTML", note="needs work")
+    # A queue is "stuck" only when it's opted into draining but making no
+    # progress. auto_drain now defaults OFF (a fresh queue is a backlog), so
+    # opt HTML in to exercise the stuck-card rendering.
+    config.set_auto_drain("HTML", True)
     old = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
