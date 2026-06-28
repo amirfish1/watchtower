@@ -441,14 +441,15 @@ def cmd_drain(args: argparse.Namespace) -> int:
                 pass
         if not daemon_live:
             import subprocess
-            # Spawn without --foreground so cmd_start handles its own daemonization
-            # and pidfile writing. We don't write the pidfile here.
-            subprocess.Popen(
-                [sys.executable, "-m", "watchtower.cli", "start", "--auto-spawn"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, start_new_session=True,
-            )
-            print("service auto-started (check 'wt status' in a moment)")
+            log_path = Path.home() / ".watchtower" / "watcher.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "a") as log_f:
+                subprocess.Popen(
+                    [sys.executable, "-m", "watchtower.cli", "start", "--auto-spawn"],
+                    stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
+                    start_new_session=True,
+                )
+            print(f"service auto-started (log: {log_path})")
     return 0
 
 
