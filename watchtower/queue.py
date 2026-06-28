@@ -407,8 +407,8 @@ def claim_next(
     session_uuid: str = "",
     shaping: bool = False,
     oldest: bool = False,
-    item_type: str = "",
-    readiness_filter: str = "",
+    item_types: Optional[List[str]] = None,
+    readiness_filters: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Atomically move the next ``open`` item to ``in_progress`` and return it.
 
@@ -416,11 +416,10 @@ def claim_next(
     Default sort: express lane → priority (p0 first) → bugs before features →
     oldest within tier. Pass ``oldest=True`` for pure FIFO regardless of priority.
 
-    ``item_type`` ("bug" | "feature" | ""): if set, only claim that type.
-    ``readiness_filter`` ("ready" | "needs-shaping" | "needs-spec" | ""):
-      if set, only claim items with that readiness (and bypasses the default
-      exclusion of unready items). If empty, excludes needs-shaping/needs-spec
-      unless ``shaping=True``.
+    ``item_types``: if non-empty, only claim items whose type is in the list.
+    ``readiness_filters``: if non-empty, only claim items whose readiness is in
+      the list (bypasses default exclusion of unready items). If empty/None,
+      excludes needs-shaping/needs-spec unless ``shaping=True``.
 
     Returns ``None`` when nothing matches.
 
@@ -455,17 +454,17 @@ def claim_next(
             candidates = [it for it in candidates if it.get("project") == proj]
         if lane:
             candidates = [it for it in candidates if it.get("lane") == lane]
-        if readiness_filter:
-            candidates = [it for it in candidates if it.get("readiness", "") == readiness_filter]
+        if readiness_filters:
+            candidates = [it for it in candidates if it.get("readiness", "") in readiness_filters]
         elif not shaping:
             candidates = [
                 it for it in candidates
                 if it.get("readiness", "") not in ("needs-shaping", "needs-spec")
             ]
-        if item_type:
+        if item_types:
             candidates = [
                 it for it in candidates
-                if (it.get("item_type") or it.get("type", "")) == item_type
+                if (it.get("item_type") or it.get("type", "")) in item_types
             ]
         if not candidates:
             return None

@@ -203,8 +203,8 @@ def cmd_claim(args: argparse.Namespace) -> int:
         worker,
         project=args.queue,
         oldest=getattr(args, "oldest", False),
-        item_type=getattr(args, "type", "") or "",
-        readiness_filter=getattr(args, "readiness", "") or "",
+        item_types=getattr(args, "type", None) or [],
+        readiness_filters=getattr(args, "readiness", None) or [],
     )
     if not item:
         print(f"(nothing open in {args.queue})")
@@ -756,11 +756,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--worker", default="")
     s.add_argument("--oldest", action="store_true",
                    help="FIFO: claim oldest ticket regardless of priority")
-    s.add_argument("--type", default="", choices=["bug", "feature", ""],
-                   help="only claim this item type")
-    s.add_argument("--readiness", default="",
-                   choices=["ready", "needs-shaping", "needs-spec", ""],
-                   help="only claim items with this readiness (default: only 'ready')")
+    s.add_argument("--type", action="append", default=None,
+                   choices=["bug", "feature"],
+                   help="only claim this type (repeatable: --type bug --type feature)")
+    s.add_argument("--readiness", action="append", default=None,
+                   choices=["ready", "needs-shaping", "needs-spec"],
+                   help="only claim items with this readiness (repeatable)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_claim)
 
