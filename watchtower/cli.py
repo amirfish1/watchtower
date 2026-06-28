@@ -58,9 +58,26 @@ def _eta_note(r: dict) -> str:
     return f"~{rate}/min · empty in {eta}"
 
 
+def _svc_state(pid_file: Path) -> str:
+    """Return 'running (pid N)' or 'stopped' based on the pidfile."""
+    if not pid_file.exists():
+        return "stopped"
+    try:
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)
+        return f"running  (pid {pid})"
+    except (ValueError, ProcessLookupError, OSError):
+        pid_file.unlink(missing_ok=True)
+        return "stopped  (stale pidfile removed)"
+
+
 def _print_status(rows: List[dict]) -> None:
     from . import config as _cfg
-    print(f"store: {q.store_path()}")
+    daemon_state = _svc_state(DAEMON_PID_FILE)
+    dash_state   = _svc_state(DASHBOARD_PID_FILE)
+    print(f"service:  daemon={daemon_state}  dashboard={dash_state}")
+    print(f"store:    {q.store_path()}")
+    print()
     counts = workers.worker_counts()
     if not rows:
         print("(no queues)")
