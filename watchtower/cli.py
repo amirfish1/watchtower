@@ -5,6 +5,7 @@
     wt ls -q Q [--status ..]  list the tickets in one queue
     wt add -q Q --title..     file a ticket
     wt claim -q Q             claim next ticket (smart: priority → type → age)
+    wt claim -q Q CCC-42      claim a specific ticket by ref
     wt claim -q Q --oldest    claim oldest ticket (pure FIFO)
     wt claim -q Q --type bug  claim only bugs (or --type feature for ideas)
     wt claim -q Q --readiness needs-shaping  claim unspecced ideas
@@ -229,23 +230,36 @@ def cmd_add(args: argparse.Namespace) -> int:
 
 def cmd_claim(args: argparse.Namespace) -> int:
     worker = args.worker or f"wt-cli-{os.getpid()}"
-    item = q.claim_next(
-        worker,
-        project=args.queue,
-        oldest=getattr(args, "oldest", False),
-        item_types=getattr(args, "type", None) or [],
-        readiness_filters=getattr(args, "readiness", None) or [],
-    )
-    if not item:
-        print(f"(nothing open in {args.queue})")
-        return 0
-    # Stop signal: reconciler asked this worker to wind down.
-    if item.get("stop"):
-        if args.json:
-            print(json.dumps({"stop": True}))
-        else:
-            print("STOP: reconciler requested shutdown; exiting")
-        return 0
+    ref = getattr(args, "ref", None) or None
+
+    if ref:
+        try:
+            item = q.claim_by_ref(ref, worker)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if not item:
+            print(f"error: {ref} not found", file=sys.stderr)
+            return 1
+    else:
+        item = q.claim_next(
+            worker,
+            project=args.queue,
+            oldest=getattr(args, "oldest", False),
+            item_types=getattr(args, "type", None) or [],
+            readiness_filters=getattr(args, "readiness", None) or [],
+        )
+        if not item:
+            print(f"(nothing open in {args.queue})")
+            return 0
+        # Stop signal: reconciler asked this worker to wind down.
+        if item.get("stop"):
+            if args.json:
+                print(json.dumps({"stop": True}))
+            else:
+                print("STOP: reconciler requested shutdown; exiting")
+            return 0
+
     if args.json:
         _print_item(item)
     else:
@@ -954,6 +968,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("claim", help="claim next open ticket (smart sort: priority + type + age)")
     s.add_argument("-q", "--queue", required=True)
+    s.add_argument("ref", nargs="?", default="",
+                   help="claim a specific ticket by ref (e.g. CCC-42); omit to claim next")
     s.add_argument("--worker", default="")
     s.add_argument("--oldest", action="store_true",
                    help="FIFO: claim oldest ticket regardless of priority")

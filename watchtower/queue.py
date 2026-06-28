@@ -490,6 +490,37 @@ def claim_next(
         return item
 
 
+def claim_by_ref(
+    ref: str,
+    session_id: str,
+    session_uuid: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim a specific ticket by its ref (e.g. 'CCC-42').
+
+    Returns the claimed item, or None if the ref doesn't exist or isn't open.
+    Raises ValueError if the ticket is already in_progress or closed.
+    """
+    if not session_id:
+        raise ValueError("session_id is required")
+    real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        item = next((it for it in data["items"] if it.get("ref") == ref), None)
+        if item is None:
+            return None
+        status = item.get("status", "open")
+        if status != "open":
+            raise ValueError(f"{ref} is not open (status={status})")
+        item["status"] = "in_progress"
+        item["claimed_by"] = str(session_id)
+        if real_sid:
+            item["claimed_session_id"] = real_sid
+        item["claimed_at"] = _now_iso()
+        item["updated_at"] = item["claimed_at"]
+        _save_unlocked(data)
+        return item
+
+
 def peek_next(
     project: Optional[str] = None,
     lane: Optional[str] = None,
