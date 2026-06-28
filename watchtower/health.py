@@ -110,7 +110,7 @@ def queue_status(
     # Most recent progress = most recent close. If never closed, fall back to
     # the oldest open item's creation time (so a never-touched queue ages).
     last_close = max(
-        (it.get("closed_at") for it in closed if it.get("closed_at")),
+        (str(it["closed_at"]) for it in closed if it.get("closed_at") and isinstance(it.get("closed_at"), str)),
         default=None,
     )
     progress_ref = last_close or oldest_created
