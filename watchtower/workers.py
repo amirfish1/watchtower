@@ -324,8 +324,8 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             # Peek at the next ticket to get its repo_path; fall back to queue config.
             peeked = _q.peek_next(project=q_name)
             repo_path = (
-                (peeked or {}).get("repo_path", "")
-                or config.repo_path(q_name)
+                config.repo_path(q_name)
+                or (peeked or {}).get("repo_path", "")
             )
             engine = config.engine(q_name)
             spawned = spawn_workers(
