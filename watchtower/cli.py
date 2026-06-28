@@ -329,15 +329,68 @@ def cmd_blocked(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resume_session_headless(sid: str, repo: str, prompt: str, engine: str) -> bool:
+    """Wake a blocked worker's session non-interactively and hand it the answer.
+
+    Spawns `claude --resume <sid> -p <prompt>` (or the codex equivalent)
+    detached, in the ticket's repo, logging to ~/.watchtower/logs. The resumed
+    session has its full original context, applies the answer, finishes the
+    ticket, and closes it. Returns True if the resume process started."""
+    import subprocess
+    if engine == "codex":
+        argv = ["codex", "resume", sid, prompt]
+    else:
+        argv = ["claude", "--resume", sid, "-p", prompt,
+                "--permission-mode", "bypassPermissions"]
+    log_dir = Path.home() / ".watchtower" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"resume-{sid}.log"
+    try:
+        logf = open(log_path, "ab")
+        try:
+            subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=logf,
+                stderr=subprocess.STDOUT, start_new_session=True,
+                cwd=repo or os.getcwd(),
+            )
+        finally:
+            logf.close()
+        return True
+    except (OSError, FileNotFoundError):
+        return False
+
+
 def cmd_answer(args: argparse.Namespace) -> int:
-    """Quick-inject a human answer onto a blocked ticket; clears needs_input so
-    the resumed session continues (WT-28)."""
+    """Inject a human answer onto a blocked ticket and auto-resume its session.
+
+    Clears needs_input, then wakes the blocked worker's session headless with
+    the answer so it finishes and closes the ticket — no manual `wt discuss`
+    step (WT-28)."""
     item = q.answer(args.ref, args.text, session_id=args.worker)
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
-    print(f"ANSWERED: {item['ref']} — needs_input cleared. "
-          f"Resume the session to continue: wt discuss {item['ref']}")
+    sid = item.get("claimed_session_id")
+    if not sid:
+        print(f"ANSWERED: {item['ref']} — needs_input cleared. "
+              f"(no resumable session recorded; a worker will pick it up on "
+              f"next claim)")
+        return 0
+    repo = item.get("repo_path") or os.getcwd()
+    prompt = (
+        f"A human answered your blocked question on ticket {item['ref']}. "
+        f"Their answer: {args.text}. Apply it, finish the ticket, and close it "
+        f"with `wt close {item['ref']} --worker <your-id> --summary \"...\"`. "
+        f"If it still cannot be resolved, run `wt block` again with the new "
+        f"open question."
+    )
+    started = _resume_session_headless(sid, repo, prompt, args.engine)
+    if started:
+        print(f"ANSWERED: {item['ref']} — resuming session {sid} in {repo} "
+              f"to apply your answer and close.")
+    else:
+        print(f"ANSWERED: {item['ref']} — needs_input cleared, but auto-resume "
+              f"failed to start. Resume manually: wt discuss {item['ref']}")
     return 0
 
 
@@ -935,10 +988,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_blocked)
 
-    s = sub.add_parser("answer", help="answer a blocked ticket (clears needs_input)")
+    s = sub.add_parser("answer",
+                       help="answer a blocked ticket; auto-resumes its session")
     s.add_argument("ref")
     s.add_argument("text", help="your answer")
     s.add_argument("--worker", default="")
+    s.add_argument("--engine", default="claude", choices=["claude", "codex"],
+                   help="engine to resume the blocked session with")
     s.set_defaults(func=cmd_answer)
 
     s = sub.add_parser("discuss",
