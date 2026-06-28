@@ -425,7 +425,12 @@ def cmd_drain(args: argparse.Namespace) -> int:
     state = "on" if enabled else "off"
     print(f"{args.queue}: drain {state} — reconciler will {'spawn workers automatically' if enabled else 'leave this queue alone'}")
     if enabled:
-        # Auto-start the service if it isn't already running.
+        # Load the LaunchAgent if installed but not yet active.
+        if _LAUNCHAGENT_PLIST.exists():
+            rc = os.system(f"launchctl load '{_LAUNCHAGENT_PLIST}' 2>/dev/null")
+            if rc == 0:
+                print(f"LaunchAgent activated (survives reboots)")
+        # Also start the service right now if daemon isn't running.
         daemon_live = False
         if DAEMON_PID_FILE.exists():
             try:
@@ -677,8 +682,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     # service when there's nothing to drain.
     drain_queues = [q for q in (_cfg._load().keys()) if _cfg.auto_drain(q)]
     if not drain_queues:
-        print("no queues have drain=on yet — plist written but not loaded")
-        print("run 'wt drain on <queue>' to activate, then 'wt install' again")
+        print("no queues have drain=on yet — plist written, will activate on first 'wt drain on <queue>'")
         return 0
     rc = os.system(f"launchctl load '{_LAUNCHAGENT_PLIST}'")
     if rc == 0:
