@@ -8,11 +8,16 @@ an instrument panel — calm and dark until a queue needs you, then it lights up
 
 Routes:
 
-    GET  /                 the tower: fleet summary + queue instrument grid
-    GET  /q/<queue>        per-queue drill-down (tickets, mirrors `wt ls`)
-    GET  /api/status       {"queues": [...health rows + workers...], "workers": [...]}
-    GET  /api/queues       raw per-queue counts (mirrors `wt queues`)
-    GET  /api/queue/<name> active + closed tickets (closed carry resolution)
+    GET  /                          the tower: fleet summary + queue instrument grid
+    GET  /q/<queue>                 per-queue drill-down (tickets, mirrors `wt ls`)
+    GET  /api/status                {"queues": [...health rows + workers...], "workers": [...]}
+    GET  /api/queues                raw per-queue counts (mirrors `wt queues`)
+    GET  /api/queue/<name>          active + closed tickets (closed carry resolution)
+    POST /api/queue/<name>/add      ingest a ticket — {"note": "...", "url": "...",
+                                      "selector": "...", "repo_path": "...",
+                                      "title": "...", "source": "...", "text": "..."}
+                                    → {"ok": true, "ref": "MYAPP-7", "number": 7,
+                                       "project": "MYAPP"}
 
 It reuses :mod:`watchtower.health` for the stuck computation and
 :mod:`watchtower.workers` for liveness — neither is duplicated here.
@@ -694,6 +699,48 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found", "path": path})
 
     do_HEAD = do_GET
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0].rstrip("/")
+        # POST /api/queue/<name>/add  — ingest a ticket
+        if path.startswith("/api/queue/") and path.endswith("/add"):
+            name = path[len("/api/queue/"):-len("/add")]
+            # Read and parse the JSON body.
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length) if length > 0 else b"{}"
+                data = json.loads(body)
+            except (ValueError, json.JSONDecodeError) as exc:
+                self._json(400, {"error": f"invalid JSON: {exc}"})
+                return
+            note = data.get("note", "")
+            if not isinstance(note, str) or not note.strip():
+                self._json(400, {"error": "note is required"})
+                return
+            # Derive project from repo_path if provided; queue.enqueue handles it.
+            repo_path = str(data.get("repo_path") or "")
+            try:
+                item = q.enqueue(
+                    note=note,
+                    title=str(data.get("title") or ""),
+                    url=str(data.get("url") or ""),
+                    selector=str(data.get("selector") or ""),
+                    repo_path=repo_path,
+                    source=str(data.get("source") or "api"),
+                    text=str(data.get("text") or ""),
+                    project=q._norm_project(name),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"error": str(exc)})
+                return
+            self._json(200, {
+                "ok": True,
+                "ref": item["ref"],
+                "number": item["number"],
+                "project": item["project"],
+            })
+        else:
+            self._json(404, {"error": "not found", "path": path})
 
     def log_message(self, *args: Any) -> None:  # silence per-request stderr noise
         pass

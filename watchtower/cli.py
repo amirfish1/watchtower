@@ -6,7 +6,7 @@ Phase-1 commands:
     wt status                 per-queue depth / oldest-open age / stuck flag
     wt queues                 list queues + counts
     wt ls -q Q [--status ..]  list the tickets in one queue
-    wt enqueue -q Q --title.. file a ticket
+    wt add -q Q --title..     file a ticket  (alias: wt enqueue)
     wt claim -q Q             claim the oldest open ticket (atomic)
     wt next -q Q              alias for claim
     wt close <ref>            close a ticket
@@ -495,21 +495,19 @@ def cmd_wait(args: argparse.Namespace) -> int:
 def _daemon_loop(args: argparse.Namespace) -> None:
     interval = max(5, args.interval)
     dry_run = getattr(args, "dry_run", False)
-    if getattr(args, "dashboard", False):
-        # Host the dashboard alongside the watcher in a background thread, so
-        # `wt start --dashboard` brings both up in one process.
-        import threading
+    # Always host the HTTP server alongside the watcher.
+    import threading
 
-        from . import dashboard
+    from . import dashboard
 
-        host = getattr(args, "host", "127.0.0.1")
-        port = getattr(args, "port", 8787)
-        httpd = dashboard.ThreadingHTTPServer((host, port), dashboard._Handler)
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        print(
-            f"[watchtower] dashboard on http://{host}:{port}",
-            flush=True,
-        )
+    host = getattr(args, "host", "127.0.0.1")
+    port = getattr(args, "port", 8787)
+    httpd = dashboard.ThreadingHTTPServer((host, port), dashboard._Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(
+        f"[watchtower] HTTP server on http://{host}:{port}",
+        flush=True,
+    )
     while True:
         result = workers.reconcile_once(dry_run=dry_run)
         for rec in result.get("spawned", []):
@@ -590,8 +588,7 @@ def cmd_start(args: argparse.Namespace) -> int:
     ]
     if args.auto_spawn:
         cmd.append("--auto-spawn")
-    if getattr(args, "dashboard", False):
-        cmd += ["--dashboard", "--host", args.host, "--port", str(args.port)]
+    cmd += ["--host", args.host, "--port", str(args.port)]
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
@@ -599,7 +596,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    print(f"watcher started (pid {proc.pid}); auto-spawn={'on' if args.auto_spawn else 'off'}")
+    print(
+        f"watcher started (pid {proc.pid}); auto-spawn={'on' if args.auto_spawn else 'off'}"
+        f"; HTTP on http://{args.host}:{args.port}"
+    )
     return 0
 
 
@@ -749,14 +749,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_ls)
 
-    s = sub.add_parser("enqueue", help="file a ticket")
-    s.add_argument("-q", "--queue", required=True)
-    s.add_argument("--title", default="")
-    s.add_argument("--note", default="")
-    s.add_argument("--text", default="")
-    s.add_argument("--url", default="")
-    s.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
-    s.set_defaults(func=cmd_enqueue)
+    for _add_name, _add_help in [
+        ("add", "file a ticket"),
+        ("enqueue", argparse.SUPPRESS),  # back-compat alias for `add`
+    ]:
+        s = sub.add_parser(_add_name, help=_add_help)
+        s.add_argument("-q", "--queue", required=True)
+        s.add_argument("--title", default="")
+        s.add_argument("--note", default="")
+        s.add_argument("--text", default="")
+        s.add_argument("--url", default="")
+        s.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
+        s.set_defaults(func=cmd_enqueue)
 
     s = sub.add_parser("claim", help="claim the oldest open ticket")
     s.add_argument("-q", "--queue", required=True)
@@ -867,11 +871,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true", dest="dry_run",
                    help="reconciler tick: log what would happen but don't spawn/stop")
     s.add_argument("--dashboard", action="store_true",
-                   help="also host the dashboard alongside the watcher")
+                   help=argparse.SUPPRESS)  # deprecated: HTTP is now always-on
     s.add_argument("--host", default="127.0.0.1",
-                   help="dashboard bind host (with --dashboard)")
+                   help="HTTP server bind host (default 127.0.0.1)")
     s.add_argument("--port", type=int, default=8787,
-                   help="dashboard bind port (with --dashboard)")
+                   help="HTTP server bind port (default 8787)")
     s.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_start)
 
