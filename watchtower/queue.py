@@ -490,6 +490,39 @@ def claim_next(
         return item
 
 
+def peek_next(
+    project: Optional[str] = None,
+    lane: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return a copy of the next claimable open item without claiming it.
+
+    Uses the same smart sort as claim_next (priority → type → age).
+    Returns None when nothing is open and claimable."""
+    proj = _norm_project(project) if project else None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        candidates = [it for it in data["items"] if it.get("status") == "open"]
+        if proj:
+            candidates = [it for it in candidates if it.get("project") == proj]
+        if lane:
+            candidates = [it for it in candidates if it.get("lane") == lane]
+        candidates = [
+            it for it in candidates
+            if it.get("readiness", "") not in ("needs-shaping", "needs-spec")
+        ]
+        if not candidates:
+            return None
+        candidates.sort(
+            key=lambda it: (
+                0 if it.get("lane") == "express" else 1,
+                _prio_rank(it),
+                _type_rank(it),
+                int(it.get("number", 0)),
+            )
+        )
+        return dict(candidates[0])
+
+
 def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
     """Coerce a resolution into the stored shape, or None when empty.
 

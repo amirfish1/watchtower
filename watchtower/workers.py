@@ -316,7 +316,15 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             to_spawn = desired - actual
             engine = rec.get("engine", "claude")
             from . import config as _cfg
-            repo_path = rec.get("repo_path", "") or _cfg.repo_path(q_name)
+            from . import queue as _q
+            # Peek at the next ticket to get its repo_path; fall back to
+            # queue-level config, then registry, then cwd.
+            peeked = _q.peek_next(project=q_name)
+            repo_path = (
+                (peeked or {}).get("repo_path", "")
+                or rec.get("repo_path", "")
+                or _cfg.repo_path(q_name)
+            )
             spawned = spawn_workers(
                 q_name, n=to_spawn, engine=engine,
                 repo_path=repo_path, dry_run=dry_run,
