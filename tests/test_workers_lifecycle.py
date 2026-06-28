@@ -33,6 +33,9 @@ def wt(tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_WORKERS_FILE", str(tmp_path / "workers.json"))
     monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "config.json"))
     monkeypatch.setenv("WATCHTOWER_STOP_SIGNALS_DIR", str(tmp_path / "stop-signals"))
+    monkeypatch.setenv(
+        "WATCHTOWER_WORKER_SESSIONS_FILE", str(tmp_path / "worker-sessions.json")
+    )
 
     import watchtower.queue as q
     import watchtower.health as health
@@ -403,3 +406,52 @@ def test_list_workers_backfills_and_persists_session_id(wt):
     again = next(r for r in wt.workers.list_workers(prune=False)
                  if r["worker_id"] == "q-bf")
     assert again["session_id"] == "c44f96bc-d720-49d3-a5e6-115426939f82"
+
+
+# ============================== persistent worker-session ledger (survives prune)
+def test_ledger_records_session_id_on_backfill(wt):
+    """Resolving a worker's session_id from its log appends it to the persistent
+    ledger, which survives the worker being pruned from workers.json."""
+    sid = "c44f96bc-d720-49d3-a5e6-115426939f82"
+    log = wt.tmp / "led.log"
+    log.write_text('{"type":"system","session_id":"%s"}\n' % sid)
+    wt.workers.record_worker(
+        os.getpid(), "Q", "claude", "q-led", str(wt.tmp), str(log), fifo="",
+    )
+    # Backfill resolves + ledgers the id.
+    wt.workers.list_workers(prune=False)
+    assert sid in wt.workers._load_worker_session_ledger()
+
+    # Survives prune: even after the worker is gone from workers.json, the
+    # ledger still holds its session_id. Simulate by clearing the live store.
+    wt.workers._save({"workers": []})
+    assert wt.workers.list_workers(prune=True) == []
+    assert sid in wt.workers._load_worker_session_ledger()
+
+
+def test_ledger_records_session_id_on_record_worker(wt):
+    """record_worker with a known session_id ledgers it immediately."""
+    sid = "a1b2c3d4-e5f6-7890-abcd-ef0123456789"
+    wt.workers.record_worker(
+        os.getpid(), "Q", "claude", "q-rec", str(wt.tmp), log="", fifo="",
+        session_id=sid,
+    )
+    assert sid in wt.workers._load_worker_session_ledger()
+
+
+def test_ledger_dedupes_and_caps(wt):
+    """The ledger de-dupes and caps growth to the most recent entries."""
+    sid = "a1b2c3d4-e5f6-7890-abcd-ef0123456789"
+    wt.workers._add_worker_session_id(sid)
+    wt.workers._add_worker_session_id(sid)  # duplicate -> no-op
+    assert wt.workers._load_worker_session_ledger().count(sid) == 1
+    # Push past the cap with synthetic UUIDs; oldest drops, newest kept.
+    import uuid as _uuid
+    last = ""
+    for _ in range(wt.workers._WORKER_SESSIONS_CAP + 10):
+        last = str(_uuid.uuid4())
+        wt.workers._add_worker_session_id(last)
+    ids = wt.workers._load_worker_session_ledger()
+    assert len(ids) == wt.workers._WORKER_SESSIONS_CAP
+    assert last in ids
+    assert sid not in ids  # the very first id was evicted

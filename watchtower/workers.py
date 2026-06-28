@@ -34,6 +34,19 @@ STOP_SIGNALS_DIR = Path(
     or (Path.home() / ".watchtower" / "stop-signals")
 )
 
+# Persistent, append-only ledger of every cloud session_id a WatchTower worker
+# has ever used. workers.json PRUNES dead workers, so once a worker is reaped its
+# session_id is lost from that store. CCC needs the historical set to hide *past*
+# worker sessions from its Current-sessions list (a reaped worker leaves a dead
+# session behind). This ledger survives pruning. Shape: {"session_ids": [...]}.
+WORKER_SESSIONS_FILE = Path(
+    os.environ.get("WATCHTOWER_WORKER_SESSIONS_FILE")
+    or (Path.home() / ".watchtower" / "worker-sessions.json")
+)
+
+# Cap to avoid unbounded growth; oldest entries are dropped first.
+_WORKER_SESSIONS_CAP = 500
+
 # Drain goal adapted from CCC's docs/ux-fixes-worker-brief.md canonical /goal.
 # Generalized: no CCC paths, no shared-clone assumptions. The worker drains one
 # queue via the `wt` CLI it was spawned by and idles when empty.
@@ -276,6 +289,48 @@ def _save(data: Dict[str, Any]) -> None:
     os.replace(tmp, WORKERS_FILE)
 
 
+def _load_worker_session_ledger() -> List[str]:
+    """Return the de-duped, ordered list of worker session_ids from the ledger.
+
+    Empty list on a missing/unreadable/malformed file. No exceptions escape."""
+    try:
+        with open(WORKER_SESSIONS_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    ids = data.get("session_ids")
+    if not isinstance(ids, list):
+        return []
+    return [str(s) for s in ids if isinstance(s, str)]
+
+
+def _add_worker_session_id(sid: str) -> None:
+    """Append a worker session_id to the persistent ledger if not already present.
+
+    Cheap: only writes when a genuinely new id is added. Caps the list to the
+    most recent ``_WORKER_SESSIONS_CAP`` ids (drops oldest). Atomic tmp+replace,
+    mirroring ``_save``. Silently no-ops on a falsy/non-UUID id or write error."""
+    if not sid or not _SESSION_ID_RE.fullmatch(str(sid)):
+        return
+    sid = str(sid)
+    ids = _load_worker_session_ledger()
+    if sid in ids:
+        return
+    ids.append(sid)
+    if len(ids) > _WORKER_SESSIONS_CAP:
+        ids = ids[-_WORKER_SESSIONS_CAP:]
+    try:
+        WORKER_SESSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(WORKER_SESSIONS_FILE) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"session_ids": ids}, f, indent=2)
+        os.replace(tmp, WORKER_SESSIONS_FILE)
+    except OSError:
+        pass
+
+
 _SESSION_ID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
@@ -333,6 +388,7 @@ def record_worker(
     repo_path: str = "",
     log: str = "",
     fifo: str = "",
+    session_id: str = "",
 ) -> Dict[str, Any]:
     data = _load()
     rec = {
@@ -345,8 +401,12 @@ def record_worker(
         "fifo": fifo,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if session_id:
+        rec["session_id"] = session_id
     data["workers"].append(rec)
     _save(data)
+    # If a session_id is somehow known at record time, ledger it (survives prune).
+    _add_worker_session_id(rec.get("session_id", ""))
     return rec
 
 
@@ -369,6 +429,8 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
             if sid:
                 w["session_id"] = sid
                 backfilled = True
+                # Ledger it so it survives this worker being pruned later.
+                _add_worker_session_id(sid)
         alive = _pid_alive(int(w.get("pid", 0)))
         row = dict(w)
         row["alive"] = alive
