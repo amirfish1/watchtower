@@ -215,6 +215,17 @@ def _load_unlocked() -> Dict[str, Any]:
     items = data.get("items")
     data["items"] = items if isinstance(items, list) else []
     _normalize_items(data["items"])
+    # WT-2: guard against the stored counter being behind the highest item number
+    # already in the file.  This happens when two systems (e.g. CCC's
+    # ux_fixes_queue.py and watchtower) share the same store file and write their
+    # own counter independently.  Without this bump, enqueue() assigns a number
+    # that already belongs to a different item; the final
+    # ``next(it for it in items if it["number"] == number)`` then returns the
+    # pre-existing item, making the new ticket appear to belong to the wrong queue.
+    if data["items"]:
+        max_num = max(int(it.get("number", 0)) for it in data["items"])
+        if max_num > int(data["counter"]):
+            data["counter"] = max_num
     return data
 
 
