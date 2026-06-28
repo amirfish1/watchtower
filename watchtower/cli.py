@@ -194,6 +194,19 @@ def cmd_add(args: argparse.Namespace) -> int:
         confidence=getattr(args, "confidence", "") or "",
     )
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
+    # Auto-drain queues get an immediate reconcile so a worker spawns now
+    # instead of on the next daemon tick. Idempotent: no-op if a worker is
+    # already alive (working or warm-idle), so this never double-spawns and
+    # never disturbs a warm worker that still holds context. Best-effort.
+    try:
+        from . import config, workers
+        if config.auto_drain(args.queue):
+            result = workers.reconcile_once()
+            for rec in result.get("spawned", []):
+                print(f"[watchtower] spawned worker {rec.get('worker_id','')} "
+                      f"for {rec.get('queue','')}")
+    except Exception:
+        pass
     return 0
 
 
