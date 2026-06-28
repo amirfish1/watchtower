@@ -512,12 +512,14 @@ def _daemon_loop(args: argparse.Namespace) -> None:
 
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 8787)
-    httpd = dashboard.ThreadingHTTPServer((host, port), dashboard._Handler)
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    print(
-        f"[watchtower] HTTP server on http://{host}:{port}",
-        flush=True,
-    )
+    # Only bind HTTP if the dashboard isn't already running on this port.
+    dashboard_already_up = _pid_from_file(DASHBOARD_PID_FILE) is not None
+    if not dashboard_already_up:
+        httpd = dashboard.ThreadingHTTPServer((host, port), dashboard._Handler)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        print(f"[watchtower] HTTP server on http://{host}:{port}", flush=True)
+    else:
+        print(f"[watchtower] dashboard already running; skipping HTTP bind", flush=True)
     while True:
         result = workers.reconcile_once(dry_run=dry_run)
         for rec in result.get("spawned", []):
