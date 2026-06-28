@@ -630,6 +630,63 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 
+_LAUNCHAGENT_LABEL = "ai.watchtower.watcher"
+_LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Write a LaunchAgent plist so the WT service starts automatically on login."""
+    import shutil
+    python = shutil.which("wt") or sys.executable
+    if shutil.which("wt"):
+        program_args = ["wt", "start", "--foreground", "--auto-spawn"]
+    else:
+        program_args = [sys.executable, "-m", "watchtower.cli", "start",
+                        "--foreground", "--auto-spawn"]
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{_LAUNCHAGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    {''.join(f'<string>{a}</string>' + chr(10) + '    ' for a in program_args).rstrip()}
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>{Path.home()}/.watchtower/watcher.log</string>
+  <key>StandardErrorPath</key>
+  <string>{Path.home()}/.watchtower/watcher.log</string>
+</dict>
+</plist>
+"""
+    _LAUNCHAGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    _LAUNCHAGENT_PLIST.write_text(plist)
+    print(f"wrote {_LAUNCHAGENT_PLIST}")
+    rc = os.system(f"launchctl load '{_LAUNCHAGENT_PLIST}'")
+    if rc == 0:
+        print(f"loaded: {_LAUNCHAGENT_LABEL} — service will start on every login")
+    else:
+        print(f"warning: launchctl load exited {rc} — plist written but not loaded")
+    return 0
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    """Remove the LaunchAgent so WT no longer starts on login."""
+    if _LAUNCHAGENT_PLIST.exists():
+        os.system(f"launchctl unload '{_LAUNCHAGENT_PLIST}'")
+        _LAUNCHAGENT_PLIST.unlink(missing_ok=True)
+        print(f"removed {_LAUNCHAGENT_PLIST} and unloaded from launchctl")
+    else:
+        print("not installed")
+    return 0
+
+
 def _pid_from_file(path: Path) -> Optional[int]:
     """Return the live pid recorded in ``path``, or None (cleaning up stale)."""
     if not path.exists():
@@ -883,6 +940,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("stop", help="stop service (watcher, reconciler, dashboard, HTTP API)")
     s.set_defaults(func=cmd_stop)
+
+    s = sub.add_parser("install", help="install LaunchAgent so service starts on login")
+    s.set_defaults(func=cmd_install)
+
+    s = sub.add_parser("uninstall", help="remove LaunchAgent (stop auto-start on login)")
+    s.set_defaults(func=cmd_uninstall)
 
     s = sub.add_parser(
         "dashboard",
