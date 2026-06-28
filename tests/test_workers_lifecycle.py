@@ -21,6 +21,7 @@ import importlib
 import json
 import os
 import subprocess
+import time
 
 import pytest
 
@@ -74,12 +75,13 @@ def _live_worker(wt, queue, *, with_fifo=True):
     workers = wt.workers
     wid = f"{queue.lower()}-live-{len(wt._readers)}"
     fifo_path = ""
+    log = wt.tmp / f"{wid}.log"
+    log.write_text("")  # real log file so mtime (idle clock) is resolvable
     if with_fifo:
-        log = wt.tmp / f"{wid}.log"
         fifo_path, rdwr_fd = workers._make_stdin_fifo(log)
         wt._readers.append(rdwr_fd)
     return workers.record_worker(
-        os.getpid(), queue, "claude", wid, str(wt.tmp), str(log) if with_fifo else "",
+        os.getpid(), queue, "claude", wid, str(wt.tmp), str(log),
         fifo=fifo_path or "",
     )
 
@@ -311,3 +313,52 @@ def test_repo_path_config_priority(wt):
     r = wt.workers.reconcile_once(dry_run=True)
     spawned = [s for s in r["spawned"] if s["queue"] == "Q"]
     assert spawned and spawned[0]["repo_path"] == "/configured/path"
+
+
+# ============================================ cache-TTL staleness (warm vs cold)
+def _age_worker_log(wt, rec, seconds):
+    """Backdate a worker's log mtime so it reads as idle for `seconds`."""
+    log = rec.get("log")
+    old = time.time() - seconds
+    os.utime(log, (old, old))
+
+
+def test_notify_pushes_to_warm_worker(wt):
+    """A worker idle WITHIN the cache TTL is warm -> gets the FIFO push."""
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S - 30)  # warm
+    assert wt.workers.notify_workers("Q", "wake warm") == 1
+
+
+def test_notify_skips_cold_worker(wt):
+    """A worker idle PAST the cache TTL is cold -> not woken (would re-read a
+    bloated context uncached); caller must reap+respawn instead."""
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)  # cold
+    assert wt.workers.notify_workers("Q", "do not wake") == 0
+
+
+def test_reap_kills_cold_idle_worker(wt):
+    """reap_stale_workers SIGTERMs a cold idle worker so a fresh one can spawn.
+
+    Uses a real short-lived child process as the 'worker' so the kill is
+    observable without touching this test process."""
+    child = subprocess.Popen(["sleep", "30"])
+    log = wt.tmp / "cold.log"
+    log.write_text("")
+    fifo, fd = wt.workers._make_stdin_fifo(log)
+    wt._readers.append(fd)
+    rec = wt.workers.record_worker(
+        child.pid, "Q", "claude", "q-cold", str(wt.tmp), str(log), fifo=fifo or "",
+    )
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)  # cold
+    reaped = wt.workers.reap_stale_workers(queue="Q")
+    assert any(r["worker_id"] == "q-cold" for r in reaped)
+    child.wait(timeout=5)  # it was terminated
+    assert child.poll() is not None
+
+
+def test_reap_spares_warm_worker(wt):
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S - 30)  # warm
+    assert wt.workers.reap_stale_workers(queue="Q") == []

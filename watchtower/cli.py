@@ -206,11 +206,18 @@ def cmd_add(args: argparse.Namespace) -> int:
                 f"Claim it with `wt claim -q {args.queue} --worker <your-id> "
                 f"--json` and drain the queue."
             )
+            # Push only to WARM workers (idle < cache TTL). If none are warm,
+            # reap any cold idle workers (waking them would re-read a bloated
+            # context uncached) and spawn a fresh, small-context worker.
             delivered = workers.notify_workers(args.queue, nudge)
             if delivered:
-                print(f"[watchtower] nudged {delivered} live worker(s) on "
+                print(f"[watchtower] nudged {delivered} warm worker(s) on "
                       f"{args.queue}")
             else:
+                reaped = workers.reap_stale_workers(queue=args.queue)
+                if reaped:
+                    print(f"[watchtower] reaped {len(reaped)} cold worker(s) on "
+                          f"{args.queue}")
                 result = workers.reconcile_once()
                 for rec in result.get("spawned", []):
                     print(f"[watchtower] spawned worker {rec.get('worker_id','')} "

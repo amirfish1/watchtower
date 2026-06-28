@@ -145,21 +145,104 @@ def write_to_worker_fifo(fifo_path: str, text: str) -> bool:
         _close_fd_quiet(fd)
 
 
-def notify_workers(queue: str, text: str) -> int:
-    """Push `text` to every live worker on `queue` via its FIFO.
+# Anthropic prompt-cache TTL. A worker idle LONGER than this has lost its
+# context cache, so waking it would pay a full uncached re-read of its entire
+# (by-then bloated) accumulated context -- the worst case. Past this window we
+# retire it and spawn a FRESH worker instead (cold but tiny context = cheaper).
+WARM_TTL_S = 300
 
-    Returns the number of workers that accepted the message. A return of 0 means
-    no live worker is listening -- the caller should reconcile/spawn one."""
+
+def _worker_idle_s(w: Dict[str, Any]) -> float:
+    """Seconds since this worker last did anything.
+
+    The stream-json output log is written on every turn, so its mtime is the
+    worker's last-activity clock. Falls back to ``started_at`` if the log is
+    missing. Returns a large number when nothing is resolvable (treat as cold)."""
+    log = w.get("log")
+    if log:
+        try:
+            return max(0.0, time.time() - os.path.getmtime(log))
+        except OSError:
+            pass
+    started = w.get("started_at")
+    if started:
+        try:
+            dt = datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=timezone.utc
+            )
+            return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds())
+        except (ValueError, TypeError):
+            pass
+    return float("inf")
+
+
+def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) -> int:
+    """Push `text` to live workers on `queue` via their FIFO.
+
+    ``max_idle_s`` (default ``WARM_TTL_S`` when None) skips workers idle longer
+    than the prompt-cache TTL: pushing to a cold worker is the worst case, so
+    the caller should reap+respawn instead. Returns the number of WARM workers
+    that accepted the message; 0 means "no warm worker -- reap stale + spawn"."""
+    if max_idle_s is None:
+        max_idle_s = WARM_TTL_S
     n = 0
     for w in list_workers():
         if not w.get("alive"):
             continue
         if w.get("queue") != queue:
             continue
+        if _worker_idle_s(w) >= max_idle_s:
+            continue  # cold cache -- do not wake; let the caller spawn fresh
         fifo = w.get("fifo")
         if fifo and write_to_worker_fifo(fifo, text):
             n += 1
     return n
+
+
+def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
+                       queue: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Kill live workers idle past ``max_idle_s`` (cold cache).
+
+    An idle worker has ended its turn and is blocked reading its FIFO -- nothing
+    is in flight, so SIGTERM is safe. Killing it frees the queue so the next
+    add/reconcile spawns a fresh, small-context worker instead of waking a cold,
+    bloated one. Returns the records reaped (after pruning + FIFO cleanup)."""
+    reaped: List[Dict[str, Any]] = []
+    pids: List[int] = []
+    for w in list_workers(prune=False):
+        if not w.get("alive"):
+            continue
+        if queue and w.get("queue") != queue:
+            continue
+        if _worker_idle_s(w) < max_idle_s:
+            continue
+        pid = int(w.get("pid", 0) or 0)
+        if pid:
+            try:
+                os.kill(pid, 15)
+                reaped.append(w)
+                pids.append(pid)
+            except OSError:
+                pass
+    # SIGTERM is async -- the process keeps answering os.kill(pid, 0) until it
+    # actually exits. Wait for death (escalating to SIGKILL) BEFORE returning so
+    # a caller that reconciles next sees the slot truly free and spawns fresh.
+    # Without this wait, reconcile counts the dying worker as live and skips the
+    # respawn, stranding the ticket until the next daemon tick.
+    deadline = time.time() + 3.0
+    while pids and time.time() < deadline:
+        pids = [p for p in pids if _pid_alive(p)]
+        if not pids:
+            break
+        time.sleep(0.05)
+    for p in pids:  # stubborn ones: SIGKILL
+        try:
+            os.kill(p, 9)
+        except OSError:
+            pass
+    if reaped:
+        list_workers(prune=True)  # drop the dead records + unlink their FIFOs
+    return reaped
 
 
 def _load() -> Dict[str, Any]:
@@ -399,7 +482,17 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     except Exception:
         pass
 
-    result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": []}
+    result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [], "reaped": []}
+
+    # Reap cold idle workers first (idle past the prompt-cache TTL): waking one
+    # would re-read its bloated context uncached. Killing it lets the spawn pass
+    # below start a fresh, small-context worker instead. Skipped in dry_run.
+    if not dry_run:
+        try:
+            result["reaped"] = [r.get("worker_id", "")
+                                for r in reap_stale_workers()]
+        except Exception:
+            pass
 
     all_cfg = config.all_queues()
     # Build live-worker counts keyed by queue.
