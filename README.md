@@ -2,68 +2,61 @@
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-WatchTower is a queue-focused, CLI-first tool for running fleets of AI
-coding-agent workers unattended and knowing, at a glance, which queues are
-stuck. You file tickets into named queues, point workers at them to drain the
-work, and `wt status` tells you which queues have open work that nobody is
-making progress on. The engine is a single durable JSON queue (append-only,
-file-locked) — stdlib-only Python, no runtime dependencies.
+**Run fleets of AI coding-agent workers, unattended.** File tickets into named queues. Workers drain them automatically. `wt status` shows which queues are stuck — nothing more, nothing less.
+
+The engine is a single durable JSON queue (append-only, file-locked) — stdlib-only Python, zero runtime dependencies.
+
+## Quick start (3 steps)
+
+**Requirements:** Python 3.11+, macOS or Linux, [Claude Code](https://claude.ai/code) CLI.
+
+```bash
+# 1. Install
+git clone https://github.com/amirfish1/watchtower.git
+cd watchtower && pip install -e .
+
+# 2. Create a queue, point it at your repo
+wt set -q MYAPP --repo-path /path/to/your/repo --engine claude
+wt drain on MYAPP      # enable auto-drain + install the service
+
+# 3. File your first ticket
+wt add -q MYAPP --title "Fix the login page" --type bug
+```
+
+That's it. A Claude worker spawns automatically in `/path/to/your/repo` and starts draining. Open the dashboard to watch:
+
+```bash
+wt dashboard    # opens http://127.0.0.1:8787 in your browser
+```
 
 ## Install
 
-**Requirements:** Python 3.11+, macOS or Linux.
-
 ```bash
-# 1. Clone
 git clone https://github.com/amirfish1/watchtower.git
 cd watchtower
-
-# 2. Install the `wt` command
-pip install -e .
-
-# 3. Verify
+pip install -e .     # installs the `wt` CLI
 wt --version
 ```
 
-### Start the service
+### Service (background watcher + reconciler)
 
 ```bash
-wt start        # start the background watcher + reconciler (one-shot, survives the shell)
-wt status       # confirm it's running
+wt install      # install as a macOS LaunchAgent — auto-starts on login
+wt uninstall    # remove it
 ```
 
-### Auto-start on login (macOS LaunchAgent)
+After `wt install`, the watcher starts on every login and restarts on crash. No need to run `wt start` manually.
 
+Manual start (without LaunchAgent):
 ```bash
-wt install      # writes ~/Library/LaunchAgents/ai.amirfish.watchtower.plist and loads it
-wt uninstall    # unload and remove the LaunchAgent
+wt start    # foreground-detached; survives the shell
+wt stop     # stop it
+wt status   # check service + queue health
 ```
 
-After `wt install`, the watcher starts automatically on every login and restarts
-if it crashes. No manual `wt start` needed after that.
+### Browser annotation widget (optional)
 
-### Make a queue and enable auto-drain
-
-```bash
-wt add -q MYAPP --title "First ticket" --text "Fix the login page"
-wt set -q MYAPP --repo-path /path/to/your/repo --engine claude
-wt drain on MYAPP      # auto-spawn workers; installs the LaunchAgent if not present
-```
-
-That's it. When a ticket lands in `MYAPP`, the reconciler spawns a Claude
-worker in `/path/to/your/repo` to drain it. `wt status` shows progress.
-
-### Claude Code skill (optional)
-
-If you use [Claude Code](https://claude.ai/code), drop the bundled skill into
-your Claude config so agents can file tickets directly from within a session:
-
-```bash
-cp contrib/annotate-widget.js your-project/static/dev/  # browser annotation widget
-```
-
-See [`contrib/annotate-widget.md`](contrib/annotate-widget.md) for the full
-widget setup.
+Drop `contrib/annotate-widget.js` into your project to let users file tickets directly from the browser with a single click. See [`contrib/annotate-widget.md`](contrib/annotate-widget.md).
 
 ## Usage
 
