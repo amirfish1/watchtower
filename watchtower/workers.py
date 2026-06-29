@@ -597,6 +597,7 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     stop-signal files are created; the return value shows what *would* happen.
     """
     from . import config, health
+    import sys
 
     # One-time import of legacy queue-registry.json (no-op after first run).
     try:
@@ -677,6 +678,24 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             result["skipped"].append(
                 {"queue": q_name, "reason": f"actual={actual}==desired={desired}"}
             )
+
+    # Log the reconcile event
+    import json
+    import time
+    try:
+        log_path = WORKERS_FILE.parent / "reconcile.log"
+        with open(log_path, "a") as f:
+            event = {
+                "ts": time.time(),
+                "dry_run": dry_run,
+                "spawned": len(result.get("spawned", [])),
+                "stopped": len(result.get("stopped", [])),
+                "reaped": len(result.get("reaped", [])),
+                "skipped": result.get("skipped", []),
+            }
+            f.write(json.dumps(event) + "\n")
+    except Exception:
+        pass
 
     return result
 
