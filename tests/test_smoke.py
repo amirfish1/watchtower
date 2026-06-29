@@ -252,9 +252,9 @@ def test_dashboard_html_renders(store, monkeypatch):
     assert "<!doctype html>" in page
     assert "viewport" in page  # mobile-first meta
     assert "HTML" in page
-    # Night-watch redesign: a stuck queue renders the stuck card + STALLED readout.
-    assert "card stuck" in page
-    assert "STALLED" in page
+    # CCC-style list layout: a stuck queue renders is-stuck group + STUCK state pill.
+    assert "is-stuck" in page
+    assert "STUCK" in page
     # Design-system markers: beacon + the night-watch palette token.
     assert "beacon" in page
     assert "--alarm" in page

@@ -304,6 +304,56 @@ _STYLE = """
       .beacon.alert, .card.stuck { animation: none; }
       .card:hover { transform: none; }
     }
+
+    /* ---- new list layout ---- */
+    .layout { display: grid; grid-template-columns: 1fr; gap: 24px; margin-top: 0; }
+    @media (min-width: 700px) { .layout { grid-template-columns: 1.8fr 1fr; } }
+
+    .queue-list { display: flex; flex-direction: column; gap: 2px; }
+    .queue-group { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin-bottom: 8px; }
+    .queue-group.is-stuck { border-color: rgba(255,176,32,.5); box-shadow: 0 0 18px -4px rgba(255,176,32,.35); animation: glow 2.6s ease-in-out infinite; }
+    .queue-header { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--line); text-decoration: none; color: inherit; cursor: pointer; transition: background .12s; }
+    .queue-header:hover { background: var(--panel-2); }
+    .qh-name { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--ink); flex-shrink: 0; }
+    .qh-meta { display: flex; align-items: center; gap: 5px; font-size: 11px; color: var(--muted); flex: 1; min-width: 0; overflow: hidden; }
+    .qh-sep { opacity: .4; }
+    .qh-drain.on { color: #3fb950; }
+    .qh-drain.off { opacity: .6; }
+    .qh-state { margin-left: auto; flex-shrink: 0; font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; padding: 2px 8px; border-radius: 999px; }
+    .qh-state.ready { background: rgba(63,185,80,.15); color: #3fb950; }
+    .qh-state.draining { background: rgba(63,185,80,.15); color: #3fb950; }
+    .qh-state.stuck { background: rgba(255,92,92,.18); color: #ff5c5c; animation: beat 2.4s ease-in-out infinite; }
+    .qh-state.backlog { background: rgba(139,148,158,.16); color: var(--muted); }
+
+    .wk-row { display: flex; align-items: center; gap: 8px; padding: 6px 12px 6px 16px; border-bottom: 1px solid rgba(37,50,74,.6); font-size: 12px; color: var(--muted); }
+    .wk-row:last-child { border-bottom: 0; }
+    .wk-dot { color: #3fb950; font-size: 7px; flex-shrink: 0; }
+    .wk-dot.dead { color: var(--alarm); }
+    .wk-id { font-family: ui-monospace, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 140px; }
+    .wk-act { margin-left: 4px; }
+    .wk-act .arrow { color: var(--beam); }
+    .wk-pill { margin-left: auto; font-size: 9px; font-weight: 700; letter-spacing: .05em; padding: 1px 7px; border-radius: 999px; flex-shrink: 0; }
+    .wk-pill.live { background: rgba(56,211,159,.14); color: var(--calm); }
+    .wk-pill.dead { background: rgba(255,92,92,.14); color: var(--alarm); }
+
+    /* ---- add ticket panel ---- */
+    .add-panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; position: sticky; top: 20px; }
+    .add-panel h3 { margin: 0 0 14px; font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
+    .add-panel label { display: block; font-size: 11.5px; color: var(--muted); margin-bottom: 4px; margin-top: 12px; }
+    .add-panel label:first-of-type { margin-top: 0; }
+    .add-panel select, .add-panel input, .add-panel textarea {
+      width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 7px;
+      color: var(--ink); padding: 7px 10px; font-size: 13px; font-family: inherit;
+      outline: none; transition: border-color .15s;
+    }
+    .add-panel select:focus, .add-panel input:focus, .add-panel textarea:focus { border-color: var(--beam); }
+    .add-panel textarea { resize: vertical; min-height: 72px; }
+    .add-btn { margin-top: 14px; width: 100%; padding: 9px; background: var(--beam); color: #0c121e; border: 0; border-radius: 8px; font-size: 13px; font-weight: 700; cursor: pointer; transition: opacity .15s; }
+    .add-btn:hover { opacity: .88; }
+    .add-btn:active { opacity: .75; }
+    .add-msg { margin-top: 10px; font-size: 12px; padding: 7px 10px; border-radius: 7px; display: none; }
+    .add-msg.ok { background: rgba(56,211,159,.14); color: var(--calm); display: block; }
+    .add-msg.err { background: rgba(255,92,92,.14); color: var(--alarm); display: block; }
 """
 
 _FONT_LINK = (
@@ -411,11 +461,8 @@ def render_index(payload: Dict[str, Any]) -> str:
     stuck_n = sum(1 for r in rows if r.get("state") == "stuck")
     live_workers = sum(1 for w in wkrs if w.get("alive"))
 
-    # Header / the tower.
-    beacon_cls = "beacon alert" if any_stuck else "beacon"
-    if not rows:
-        beacon_cls = "beacon dim"
-    fleet_bits = [f'<span class="mono">{len(rows)}</span> queues']
+    beacon_cls = "beacon alert" if any_stuck else ("beacon dim" if not rows else "beacon")
+    fleet_bits = [f'<span class="mono">{len(rows)}</span> queue{"" if len(rows)==1 else "s"}']
     if stuck_n:
         fleet_bits.append(f'<span class="hot mono">{stuck_n} stuck</span>')
     fleet_bits.append(
@@ -435,91 +482,186 @@ def render_index(payload: Dict[str, Any]) -> str:
         '    <hr class="divider">\n'
     )
 
-    if not rows:
-        body = header + (
+    # Build per-queue worker index: queue -> list of workers
+    workers_by_queue: Dict[str, List[Dict[str, Any]]] = {}
+    for w in wkrs:
+        qn = str(w.get("queue", ""))
+        workers_by_queue.setdefault(qn, []).append(w)
+
+    # Get closed/total counts per queue from one pass over all items
+    closed_by_q: Dict[str, int] = {}
+    total_by_q: Dict[str, int] = {}
+    try:
+        for it in (q.list_items() or []):
+            qn = str(it.get("project") or "").upper()
+            if not qn:
+                continue
+            total_by_q[qn] = total_by_q.get(qn, 0) + 1
+            if it.get("status") == "closed":
+                closed_by_q[qn] = closed_by_q.get(qn, 0) + 1
+    except Exception:
+        pass
+
+    def _queue_state_class(r: Dict[str, Any]) -> str:
+        s = r.get("state", "clear")
+        if s == "stuck":
+            return "stuck"
+        depth = r.get("depth", 0)
+        auto = r.get("auto_drain", False)
+        workers_live = r.get("workers_live", 0)
+        if depth == 0 and auto:
+            return "ready"
+        if depth > 0 and workers_live > 0:
+            return "draining"
+        if not auto:
+            return "backlog"
+        return "ready"
+
+    queue_groups = []
+    for r in rows:
+        qname = str(r["queue"])
+        qname_safe = html.escape(qname)
+        href = "/q/" + urllib.parse.quote(qname, safe="")
+        qwkrs = workers_by_queue.get(qname, [])
+        live_w = r.get("workers_live", 0)
+        total_closed = closed_by_q.get(qname, 0)
+        total_items = total_by_q.get(qname, 0)
+        progress = f"{total_closed}/{total_items}" if total_items else "—"
+
+        auto = r.get("auto_drain", False)
+        drain_cls = "on" if auto else "off"
+        drain_lbl = "drain on" if auto else "drain off"
+
+        sc = _queue_state_class(r)
+        state_labels = {
+            "ready": "READY", "draining": "DRAINING",
+            "stuck": "STUCK", "backlog": "BACKLOG",
+        }
+        state_lbl = state_labels.get(sc, sc.upper())
+
+        wk_count = f'{live_w} worker{"" if live_w == 1 else "s"}'
+
+        group_cls = "queue-group" + (" is-stuck" if sc == "stuck" else "")
+
+        qh = (
+            f'      <a class="queue-header" href="{href}">\n'
+            f'        <span class="qh-name">{qname_safe}</span>\n'
+            f'        <span class="qh-meta">\n'
+            f'          <span class="qh-sep">·</span>\n'
+            f'          <span>{html.escape(progress)}</span>\n'
+            f'          <span class="qh-sep">·</span>\n'
+            f'          <span>{html.escape(wk_count)}</span>\n'
+            f'          <span class="qh-sep">·</span>\n'
+            f'          <span class="qh-drain {drain_cls}">{drain_lbl}</span>\n'
+            f'        </span>\n'
+            f'        <span class="qh-state {sc}">{state_lbl}</span>\n'
+            f'      </a>\n'
+        )
+
+        wk_rows = ""
+        for w in qwkrs:
+            alive = w.get("alive")
+            dot_cls = "wk-dot" if alive else "wk-dot dead"
+            pill_cls = "wk-pill live" if alive else "wk-pill dead"
+            pill_lbl = "LIVE" if alive else "DEAD"
+            wid = html.escape(str(w.get("worker_id", ""))[:24])
+            ref = w.get("active_ref")
+            if ref:
+                since = w.get("active_since_human", "")
+                ago = (
+                    f' <span style="opacity:.6">({html.escape(str(since))})</span>'
+                    if since else ""
+                )
+                act = f'<span class="arrow">→</span> {html.escape(str(ref))}{ago}'
+            else:
+                act = '<span style="opacity:.5">idle</span>'
+            wk_rows += (
+                f'      <div class="wk-row">\n'
+                f'        <span class="{dot_cls}">●</span>\n'
+                f'        <span class="wk-id mono">{wid}</span>\n'
+                f'        <span class="wk-act mono">{act}</span>\n'
+                f'        <span class="{pill_cls}">{pill_lbl}</span>\n'
+                f'      </div>\n'
+            )
+
+        queue_groups.append(
+            f'    <div class="{group_cls}">\n'
+            f'{qh}'
+            f'{wk_rows}'
+            f'    </div>\n'
+        )
+
+    if rows:
+        queue_list_html = '    <div class="queue-list">\n' + "".join(queue_groups) + "    </div>\n"
+    else:
+        queue_list_html = (
             '    <div class="empty">\n'
             '      <div class="beacon dim" aria-hidden="true"></div>\n'
             '      <div class="line disp">All queues clear</div>\n'
-            '      <div class="sub mono">Nothing open. The tower is quiet.</div>\n'
+            '      <div class="sub mono">No queues configured yet. Run <code>wt drain on MYAPP</code> to get started.</div>\n'
             "    </div>\n"
         )
-        return _page("WatchTower", body)
 
-    cards = []
-    for r in rows:
-        cls = _card_class(r)
-        name = html.escape(str(r["queue"]))
-        live = r.get("workers_live", 0)
-        total = r.get("workers_total", 0)
-        wk = f"{live} live"
-        if total != live:
-            wk = f"{live} live / {total}"
-        href = "/q/" + urllib.parse.quote(str(r["queue"]), safe="")
-        cards.append(
-            f'      <a class="card {cls}" href="{href}">\n'
-            f'        <div class="card-top">\n'
-            f'          <span class="qname disp">{name}</span>\n'
-            f'          <span class="state {cls}">{_state_word(r)}</span>\n'
-            f"        </div>\n"
-            f"        {_readout(r)}\n"
-            f"        {_drain_bar(r)}\n"
-            f'        <div class="card-foot">\n'
-            f'          <span class="wk mono">{html.escape(wk)}</span>\n'
-            f'          <span class="mono">oldest {html.escape(str(r["oldest_open_age"]))}</span>\n'
-            f"        </div>\n"
-            f"      </a>"
-        )
-    grid = '    <div class="grid">\n' + "\n".join(cards) + "\n    </div>\n"
+    # Queue names for the add-ticket dropdown
+    queue_options = "\n".join(
+        f'<option value="{html.escape(str(r["queue"]))}">{html.escape(str(r["queue"]))}</option>'
+        for r in rows
+    )
 
-    # Workers.
-    if wkrs:
-        wlist = []
-        for w in wkrs:
-            alive = w.get("alive")
-            ref = w.get("active_ref")
-            if ref:
-                since = w.get("active_since_human")
-                ago = (
-                    f' <span class="ago">({html.escape(str(since))})</span>'
-                    if since
-                    else ""
-                )
-                activity = (
-                    f'<span class="arrow">&rarr;</span> '
-                    f"{html.escape(str(ref))}{ago}"
-                )
-            else:
-                activity = '<span class="idle">idle</span>'
-            pill = (
-                '<span class="pill live">LIVE</span>'
-                if alive
-                else '<span class="pill dead">DEAD</span>'
-            )
-            wlist.append(
-                f'      <div class="wrow">\n'
-                f'        <span class="wid mono">{html.escape(str(w.get("worker_id", "")))}</span>\n'
-                f'        <span class="wq mono">{html.escape(str(w.get("queue", "")))}</span>\n'
-                f'        <span class="wact mono">{activity}</span>\n'
-                f"        {pill}\n"
-                f"      </div>"
-            )
-        workers_block = (
-            "    <h2>Workers</h2>\n"
-            '    <div class="workers">\n' + "\n".join(wlist) + "\n    </div>\n"
-        )
-    else:
-        workers_block = (
-            "    <h2>Workers</h2>\n"
-            '    <div class="empty" style="padding:32px">\n'
-            '      <div class="sub mono">No workers tracked.</div>\n'
-            "    </div>\n"
-        )
+    add_panel = (
+        '    <div class="add-panel" id="add-panel">\n'
+        '      <h3>Add Ticket</h3>\n'
+        '      <label for="ap-queue">Queue</label>\n'
+        f'      <select id="ap-queue">\n        {queue_options}\n      </select>\n'
+        '      <label for="ap-title">Title</label>\n'
+        '      <input id="ap-title" type="text" placeholder="Short description" autocomplete="off">\n'
+        '      <label for="ap-text">Details (optional)</label>\n'
+        '      <textarea id="ap-text" placeholder="Steps to reproduce, links, context…"></textarea>\n'
+        '      <button class="add-btn" onclick="apSubmit()">File Ticket</button>\n'
+        '      <div class="add-msg" id="ap-msg"></div>\n'
+        '    </div>\n'
+        '    <script>\n'
+        '    async function apSubmit() {\n'
+        "      const q = document.getElementById('ap-queue').value;\n"
+        "      const title = document.getElementById('ap-title').value.trim();\n"
+        "      const text = document.getElementById('ap-text').value.trim();\n"
+        "      const msg = document.getElementById('ap-msg');\n"
+        "      if (!title) { msg.className='add-msg err'; msg.textContent='Title is required.'; return; }\n"
+        "      msg.className='add-msg'; msg.textContent='Filing…';\n"
+        '      try {\n'
+        "        const r = await fetch('/api/queue/' + encodeURIComponent(q) + '/add', {\n"
+        "          method: 'POST',\n"
+        "          headers: {'Content-Type': 'application/json'},\n"
+        '          body: JSON.stringify({title, text})\n'
+        '        });\n'
+        '        const d = await r.json();\n'
+        '        if (d.ok) {\n'
+        "          msg.className='add-msg ok'; msg.textContent='Filed: ' + d.ref;\n"
+        "          document.getElementById('ap-title').value='';\n"
+        "          document.getElementById('ap-text').value='';\n"
+        '        } else {\n'
+        "          msg.className='add-msg err'; msg.textContent='Error: ' + (d.error||'unknown');\n"
+        '        }\n'
+        '      } catch(e) {\n'
+        "        msg.className='add-msg err'; msg.textContent='Network error.';\n"
+        '      }\n'
+        '    }\n'
+        '    </script>\n'
+    )
 
     foot = (
         '    <div class="foot mono">store: '
         f"{html.escape(str(q.store_path()))} · refreshes every {REFRESH_SECONDS}s</div>\n"
     )
-    return _page("WatchTower", header + grid + workers_block + foot)
+
+    layout = (
+        '    <div class="layout">\n'
+        f'      <div>\n{queue_list_html}      </div>\n'
+        f'      <div>\n{add_panel}      </div>\n'
+        '    </div>\n'
+    )
+
+    return _page("WatchTower", header + layout + foot)
 
 
 def _resolution_chips(res: Dict[str, Any]) -> str:
@@ -713,9 +855,9 @@ class _Handler(BaseHTTPRequestHandler):
             except (ValueError, json.JSONDecodeError) as exc:
                 self._json(400, {"error": f"invalid JSON: {exc}"})
                 return
-            note = data.get("note", "")
+            note = data.get("note", "") or data.get("title", "")
             if not isinstance(note, str) or not note.strip():
-                self._json(400, {"error": "note is required"})
+                self._json(400, {"error": "note or title is required"})
                 return
             # Derive project from repo_path if provided; queue.enqueue handles it.
             repo_path = str(data.get("repo_path") or "")
