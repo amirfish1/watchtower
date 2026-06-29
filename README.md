@@ -1,5 +1,7 @@
 # WatchTower
 
+[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 WatchTower is a queue-focused, CLI-first tool for running fleets of AI
 coding-agent workers unattended and knowing, at a glance, which queues are
 stuck. You file tickets into named queues, point workers at them to drain the
@@ -19,27 +21,30 @@ Requires Python 3.11+.
 
 ```bash
 wt status                              # per-queue depth, oldest-open age, stuck flag
-wt queues                              # list queues + open/wip/done counts
+wt ls -q DEMO                          # list tickets in a queue
 
-wt enqueue -q DEMO --title "Fix nav" --note "navbar overlaps on mobile" \
-           --text "Full detail: where it shows up, suggested fix."
+wt add -q DEMO --title "Fix nav" \
+       --text "navbar overlaps on mobile" --type bug
 
-wt claim  -q DEMO                      # claim the oldest open ticket (atomic)
-wt next   -q DEMO                      # alias for claim
+wt claim  -q DEMO                      # claim the next open ticket (smart sort)
+wt claim  -q DEMO DEMO-1               # claim a specific ticket by ref
 wt close  DEMO-1                       # close a ticket by ref
 wt close  DEMO-1 --summary "fixed the overlap" \
           --caveat "only tested on iOS" --follow-up "add a regression test"
 
-wt workers                             # list worker subprocesses this CLI started
-wt spawn-worker -q DEMO --n 2 --engine claude   # launch 2 draining workers
+wt drain on DEMO                       # enable auto-drain for a queue
+wt drain off DEMO                      # disable auto-drain
+wt set -q DEMO --repo-path /path/to/repo --engine claude
+
+wt workers                             # list workers the watcher started
 wt wait   -q DEMO --timeout 600 --cmd "say done" # block until drained, then run cmd
 
-wt start  --auto-spawn                 # background watcher: log/auto-handle stuck queues
-wt start  --auto-spawn --dashboard     # watcher + dashboard in one process
+wt start                               # start the background watcher + reconciler
 wt stop                                # stop the watcher
+wt install                             # install the watcher as a LaunchAgent (auto-start on login)
+wt uninstall                           # remove the LaunchAgent
 wt dashboard                           # open the night-watch dashboard (non-blocking)
 wt dashboard --no-open                 # ensure the server is up, don't open a browser
-wt dashboard --stop                    # stop the background dashboard server
 ```
 
 `wt status` shows, per queue, depth (open) / WIP / done, oldest-open age, idle
@@ -173,15 +178,10 @@ the queue file alone, with no dependency on any external liveness signal.
 
 ## Roadmap
 
-- Phase 1: the `wt` CLI and queue engine.
-- Phase 2 (now): `wt dashboard` — a read-only HTTP viewer over the same queue,
-  with a live drain rate + ETA and per-worker activity.
-- Later: CCC becomes just one WatchTower client.
-
-### Roadmap (later)
-
-Deliberately deferred to keep the dashboard read-only and focused:
-
-- **Tap-to-act / buttons** — claim, close, or requeue tickets from the UI.
+- **Tap-to-act / buttons** — claim, close, or requeue tickets from the dashboard UI.
 - **Cost / token tracking** — per-queue and per-worker spend.
 - **Push notifications** — alert on a queue going stuck or draining.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
