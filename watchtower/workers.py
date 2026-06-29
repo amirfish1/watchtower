@@ -367,6 +367,11 @@ def resolve_session_id_from_log(log_path: str) -> str:
 
 
 def _pid_alive(pid: int) -> bool:
+    """Check if a process is truly alive (not a zombie).
+
+    os.kill(pid, 0) succeeds on zombies, so we check /proc (or ps on macOS)
+    to distinguish live from zombie processes.
+    """
     if not pid:
         return False
     try:
@@ -377,7 +382,23 @@ def _pid_alive(pid: int) -> bool:
         return True  # exists, owned by someone else
     except OSError:
         return False
-    return True
+
+    # Process exists, but check if it's a zombie (defunct).
+    # On macOS, use ps; on Linux, check /proc.
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "stat="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        stat = result.stdout.strip()
+        # Z or Z+ indicates zombie; anything else is truly alive.
+        return not stat.startswith("Z")
+    except Exception:
+        # If ps fails, assume the process is alive (safer than killing live processes).
+        return True
 
 
 def record_worker(
