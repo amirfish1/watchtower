@@ -700,7 +700,7 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
                 {"queue": q_name, "reason": f"actual={actual}==desired={desired}"}
             )
 
-    # Log the reconcile event
+    # Log the reconcile event with full details (queue, reason, worker_id).
     import json
     import time
     try:
@@ -709,10 +709,10 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             event = {
                 "ts": time.time(),
                 "dry_run": dry_run,
-                "spawned": len(result.get("spawned", [])),
-                "stopped": len(result.get("stopped", [])),
-                "reaped": len(result.get("reaped", [])),
-                "skipped": result.get("skipped", []),
+                "spawned": result.get("spawned", []),  # full list: queue, worker_id, ...
+                "stopped": result.get("stopped", []),  # full list: queue, worker_id, ...
+                "reaped": result.get("reaped", []),    # worker_ids
+                "skipped": result.get("skipped", []),  # full list: queue, reason
             }
             f.write(json.dumps(event) + "\n")
     except Exception:
