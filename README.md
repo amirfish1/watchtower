@@ -35,8 +35,8 @@ wt status       # confirm it's running
 ### Auto-start on login (macOS LaunchAgent)
 
 ```bash
-wt install      # writes ~/.local/share/watchtower/wt.plist and loads it
-wt uninstall    # remove the LaunchAgent
+wt install      # writes ~/Library/LaunchAgents/ai.amirfish.watchtower.plist and loads it
+wt uninstall    # unload and remove the LaunchAgent
 ```
 
 After `wt install`, the watcher starts automatically on every login and restarts
