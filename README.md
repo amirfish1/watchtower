@@ -11,11 +11,59 @@ file-locked) — stdlib-only Python, no runtime dependencies.
 
 ## Install
 
+**Requirements:** Python 3.11+, macOS or Linux.
+
 ```bash
-pip install -e .        # installs the `wt` console command (package: wt-agent)
+# 1. Clone
+git clone https://github.com/amirfish1/watchtower.git
+cd watchtower
+
+# 2. Install the `wt` command
+pip install -e .
+
+# 3. Verify
+wt --version
 ```
 
-Requires Python 3.11+.
+### Start the service
+
+```bash
+wt start        # start the background watcher + reconciler (one-shot, survives the shell)
+wt status       # confirm it's running
+```
+
+### Auto-start on login (macOS LaunchAgent)
+
+```bash
+wt install      # writes ~/.local/share/watchtower/wt.plist and loads it
+wt uninstall    # remove the LaunchAgent
+```
+
+After `wt install`, the watcher starts automatically on every login and restarts
+if it crashes. No manual `wt start` needed after that.
+
+### Make a queue and enable auto-drain
+
+```bash
+wt add -q MYAPP --title "First ticket" --text "Fix the login page"
+wt set -q MYAPP --repo-path /path/to/your/repo --engine claude
+wt drain on MYAPP      # auto-spawn workers; installs the LaunchAgent if not present
+```
+
+That's it. When a ticket lands in `MYAPP`, the reconciler spawns a Claude
+worker in `/path/to/your/repo` to drain it. `wt status` shows progress.
+
+### Claude Code skill (optional)
+
+If you use [Claude Code](https://claude.ai/code), drop the bundled skill into
+your Claude config so agents can file tickets directly from within a session:
+
+```bash
+cp contrib/annotate-widget.js your-project/static/dev/  # browser annotation widget
+```
+
+See [`contrib/annotate-widget.md`](contrib/annotate-widget.md) for the full
+widget setup.
 
 ## Usage
 
