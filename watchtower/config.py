@@ -58,6 +58,30 @@ def auto_drain(queue: str) -> bool:
     return bool(_load().get(queue, {}).get("auto_drain", False))
 
 
+def set_claim_types(queue: str, types: Any) -> Dict[str, Any]:
+    """Restrict which ticket types an auto-drain worker claims (e.g. ['bug']).
+
+    Empty/None means no restriction — the worker drains all types. Stored as a
+    list under ``claim_types`` so ``wt drain on Q --type bug`` makes the queue's
+    workers claim only bugs and leave features for a human."""
+    valid = {"bug", "feature"}
+    norm = [t for t in (types or []) if t in valid]
+    data = _load()
+    q = data.setdefault(queue, {})
+    if norm:
+        q["claim_types"] = norm
+    else:
+        q.pop("claim_types", None)
+    _save(data)
+    return q
+
+
+def claim_types(queue: str) -> list:
+    """Return the configured claim-type restriction for a queue, or [] (all)."""
+    v = _load().get(queue, {}).get("claim_types", [])
+    return list(v) if isinstance(v, list) else []
+
+
 def set_repo_path(queue: str, path: str) -> Dict[str, Any]:
     data = _load()
     q = data.setdefault(queue, {})

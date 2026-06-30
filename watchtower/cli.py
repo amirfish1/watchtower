@@ -96,10 +96,15 @@ def _print_status(rows: List[dict]) -> None:
             wcell = f"{wc['total']} ({wc['live']} live)"
             drain_val = _cfg.auto_drain(r["queue"])
             drain_cell = "on " if drain_val else "off"
+            ctypes = _cfg.claim_types(r["queue"])
+            note = _eta_note(r)
+            if ctypes:
+                label = f"{ctypes[0]}s only" if len(ctypes) == 1 else ",".join(ctypes)
+                note = f"{note} [{label}]".strip()
             print(
                 f"{r['queue']:<14}{r['depth']:>5}{r['in_progress']:>5}{r['closed']:>6}"
                 f"  {r['oldest_open_age']:>8}  {r['since_progress']:>8}"
-                f"  {wcell:<12}{drain_cell:<7}{flag}  {_eta_note(r)}"
+                f"  {wcell:<12}{drain_cell:<7}{flag}  {note}"
             )
 
     rows_w = workers.list_workers(prune=False)
@@ -540,8 +545,14 @@ def cmd_drain(args: argparse.Namespace) -> int:
     from . import config
     enabled = args.onoff == "on"
     config.set_auto_drain(args.queue, enabled)
+    # Claim-type restriction: set on `on`, cleared on `off` (off = no policy).
+    types = (getattr(args, "type", None) or []) if enabled else []
+    config.set_claim_types(args.queue, types)
     state = "on" if enabled else "off"
-    print(f"{args.queue}: drain {state} — reconciler will {'spawn workers automatically' if enabled else 'leave this queue alone'}")
+    restriction = (
+        f"claiming only: {', '.join(types)}" if types else "claiming: all types"
+    )
+    print(f"{args.queue}: drain {state} — reconciler will {'spawn workers automatically' if enabled else 'leave this queue alone'} — {restriction}")
     if enabled:
         # Load the LaunchAgent if installed but not yet active.
         if _LAUNCHAGENT_PLIST.exists():
@@ -1045,6 +1056,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("drain", help="enable or disable auto-drain for a queue")
     s.add_argument("onoff", choices=["on", "off"], help="on = auto-spawn workers; off = backlog mode")
     s.add_argument("queue", metavar="QUEUE", help="queue name (e.g. CCC, WT)")
+    s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
+                   help="restrict auto-drain workers to these ticket types (repeatable); omit to clear")
     s.set_defaults(func=cmd_drain)
 
     s = sub.add_parser("monitor", help="run a check; file a ticket if it fails")

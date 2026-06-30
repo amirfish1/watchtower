@@ -59,7 +59,7 @@ DRAIN_GOAL_TEMPLATE = (
     "from prior workers on THIS queue (infra quirks, recurring ticket patterns, "
     "env gotchas, where the runbook is). Treat it as your cold-start brief. "
     "Loop: claim the oldest open ticket with "
-    "`wt claim -q {queue} --worker {worker_id} --json` (it returns the ticket "
+    "`wt claim -q {queue} --worker {worker_id}{claim_filter} --json` (it returns the ticket "
     "JSON, nothing when the queue is drained, or {{\"stop\": true}} when the "
     "reconciler is winding you down). "
     "STOP SIGNAL: if `wt claim` returns {{\"stop\": true}}, exit immediately -- "
@@ -555,8 +555,11 @@ def annotate_activity(
 
 def drain_goal(queue: str, worker_id: str, repo_path: str = "") -> str:
     """The canonical drain goal text for one worker."""
+    from . import config
+    claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
     return DRAIN_GOAL_TEMPLATE.format(
-        queue=queue, worker_id=worker_id, repo=repo_path or os.getcwd()
+        queue=queue, worker_id=worker_id, repo=repo_path or os.getcwd(),
+        claim_filter=claim_filter,
     )
 
 
