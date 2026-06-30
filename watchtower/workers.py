@@ -700,33 +700,23 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
                 {"queue": q_name, "reason": f"actual={actual}==desired={desired}"}
             )
 
-    # Log the reconcile event in plain text — one line per action/skip.
-    import time as _time
+    # Log the reconcile event to the unified activity log via queue._log().
     try:
-        from datetime import datetime, timezone
-        log_path = WORKERS_FILE.parent / "reconcile.log"
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        lines = []
+        from watchtower.queue import _log
         for w in result.get("spawned", []):
             wid = w.get("worker_id", "?")
             q = w.get("queue", "?")
             pid = w.get("pid", "?")
-            lines.append(f"{now}  SPAWN   {wid} ({q}, pid {pid})")
+            _log("SPAWN", f"{wid} ({q}, pid {pid})")
         for w in result.get("stopped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
-            q = w.get("queue", "") if isinstance(w, dict) else ""
-            lines.append(f"{now}  STOP    {wid}" + (f" ({q})" if q else ""))
+            q = (w.get("queue", "") if isinstance(w, dict) else "")
+            _log("STOP", wid + (f" ({q})" if q else ""))
         for w in result.get("reaped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
-            lines.append(f"{now}  REAP    {wid}")
-        for s in result.get("skipped", []):
-            q = s.get("queue", "?") if isinstance(s, dict) else s
-            reason = s.get("reason", "") if isinstance(s, dict) else ""
-            lines.append(f"{now}  skip    {q} — {reason}")
-        if not lines:
-            lines.append(f"{now}  (no-op)")
-        with open(log_path, "a") as f:
-            f.write("\n".join(lines) + "\n")
+            _log("REAP", str(wid))
+        if not result.get("spawned") and not result.get("stopped") and not result.get("reaped"):
+            pass  # silent no-op ticks — skip lines are noise
     except Exception:
         pass
 

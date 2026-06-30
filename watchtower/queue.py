@@ -77,6 +77,20 @@ VALID_CONFIDENCES = ("H", "M", "L", "")
 _CCC_LEGACY_STORE = Path.home() / ".claude" / "command-center" / "ux-fixes-queue.json"
 # WatchTower's own default home.
 _WT_DEFAULT_STORE = Path.home() / ".watchtower" / "queues.json"
+# Unified activity log — queue events (enqueue/claim/close) + reconciler (spawn/reap).
+_ACTIVITY_LOG = Path.home() / ".watchtower" / "activity.log"
+
+
+def _log(verb: str, detail: str) -> None:
+    """Append one plain-text line to the unified activity log."""
+    try:
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        _ACTIVITY_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_ACTIVITY_LOG, "a") as f:
+            f.write(f"{now}  {verb:<8}{detail}\n")
+    except Exception:
+        pass
 
 
 def _resolve_store_path() -> Path:
@@ -323,7 +337,9 @@ def enqueue(
         data["items"].append(item)
         _normalize_items(data["items"])  # assign this item's seq/ref
         _save_unlocked(data)
-        return next(it for it in data["items"] if it.get("number") == number)
+        saved = next(it for it in data["items"] if it.get("number") == number)
+    _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}")
+    return saved
 
 
 def list_items(
@@ -487,7 +503,8 @@ def claim_next(
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
         _save_unlocked(data)
-        return item
+    _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}")
+    return item
 
 
 def claim_by_ref(
@@ -518,7 +535,8 @@ def claim_by_ref(
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
         _save_unlocked(data)
-        return item
+    _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}")
+    return item
 
 
 def peek_next(
@@ -633,6 +651,17 @@ def update_status(
                     it["block_question"] = ""
                     it["blocked_at"] = None
                 _save_unlocked(data)
+                verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
+                verb = verbs.get(status, status.upper())
+                summary = ""
+                if status == "closed":
+                    res = it.get("resolution") or {}
+                    if isinstance(res, dict):
+                        summary = res.get("summary", "")
+                    elif isinstance(res, str):
+                        summary = res
+                detail = f"{it.get('ref', '?')} — {summary or it.get('title') or it.get('note', '')[:60]}"
+                _log(verb, detail)
                 return it
     return None
 
