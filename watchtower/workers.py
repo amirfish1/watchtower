@@ -603,6 +603,55 @@ def request_stop(worker_id: str) -> Path:
     return signal_path
 
 
+def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
+    """Reopen in_progress tickets whose claiming worker is no longer alive.
+
+    A worker that dies, crashes, or is reaped mid-ticket leaves its ticket
+    stranded as ``in_progress`` forever — ``claim_next`` only picks ``open``, so
+    nothing re-drains it and nothing closes it. The queue then reads depth=0
+    ("Ready") while work is genuinely unfinished. This sweep is the durable fix:
+    any in_progress ticket whose ``claimed_by`` worker_id is not in the live set
+    (and that was claimed longer ago than ``grace_s``, to avoid a spawn/claim
+    race) is reopened so a fresh worker re-claims it.
+
+    Returns the list of reopened items."""
+    from . import queue as _q
+    import time as _time
+    live_ids = {str(w.get("worker_id", "")) for w in list_workers(prune=False)
+                if w.get("alive")}
+    now = _time.time()
+    reopened: List[Dict[str, Any]] = []
+    try:
+        items = _q.list_items()
+    except Exception:
+        return reopened
+    for it in items:
+        if it.get("status") != "in_progress":
+            continue
+        claimer = str(it.get("claimed_by") or "")
+        if claimer and claimer in live_ids:
+            continue  # its worker is alive — leave it
+        # Grace window guards against a just-claimed ticket whose worker record
+        # hasn't been written yet (spawn/claim race).
+        claimed_at = it.get("claimed_at")
+        if claimed_at:
+            try:
+                from datetime import datetime, timezone
+                ts = datetime.fromisoformat(str(claimed_at).replace("Z", "+00:00")).timestamp()
+                if (now - ts) < grace_s:
+                    continue
+            except Exception:
+                pass
+        ref = it.get("ref")
+        try:
+            item = _q.update_status(ref, "open")
+            if item:
+                reopened.append(item)
+        except Exception:
+            pass
+    return reopened
+
+
 def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     """One reconciler tick.
 
@@ -626,7 +675,8 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     except Exception:
         pass
 
-    result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [], "reaped": []}
+    result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
+                              "reaped": [], "requeued": []}
 
     # Reap cold idle workers first (idle past the prompt-cache TTL): waking one
     # would re-read its bloated context uncached. Killing it lets the spawn pass
@@ -635,6 +685,14 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
         try:
             result["reaped"] = [r.get("worker_id", "")
                                 for r in reap_stale_workers()]
+        except Exception:
+            pass
+        # Release tickets stranded in_progress by a dead/reaped/crashed worker so
+        # the spawn pass below re-drains them. Without this a queue reads depth=0
+        # ("Ready") while work is unfinished. Must run BEFORE the depth read.
+        try:
+            result["requeued"] = [it.get("ref", "")
+                                  for it in requeue_orphaned_tickets()]
         except Exception:
             pass
 
@@ -715,8 +773,8 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
         for w in result.get("reaped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
             _log("REAP", str(wid))
-        if not result.get("spawned") and not result.get("stopped") and not result.get("reaped"):
-            pass  # silent no-op ticks — skip lines are noise
+        for ref in result.get("requeued", []):
+            _log("REQUEUE", f"{ref} — worker gone, reopened for re-drain")
     except Exception:
         pass
 
