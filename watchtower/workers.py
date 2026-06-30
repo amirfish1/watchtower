@@ -842,6 +842,12 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
                 q_name, n=to_spawn, engine=engine,
                 repo_path=repo_path, dry_run=dry_run,
             )
+            # Why this spawn happened: open depth + how short of desired we were.
+            spawn_reason = (
+                f"{depth} open, {actual} live < {desired} desired"
+            )
+            for rec in spawned:
+                rec["spawn_reason"] = spawn_reason
             result["spawned"].extend(spawned)
         elif actual > desired:
             # Wind down excess workers (LIFO -- stop the most recently started).
@@ -865,7 +871,8 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             wid = w.get("worker_id", "?")
             q = w.get("queue", "?")
             pid = w.get("pid", "?")
-            _log("SPAWN", f"{wid} (pid {pid})", queue=q)
+            reason = w.get("spawn_reason", "")
+            _log("SPAWN", f"{wid} (pid {pid})" + (f" — {reason}" if reason else ""), queue=q)
         for w in result.get("stopped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
             q = (w.get("queue", "") if isinstance(w, dict) else "")
