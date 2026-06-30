@@ -179,12 +179,36 @@ def _norm_project(value: Any) -> str:
     return s.strip("-_")
 
 
+def _queue_for_repo_path(repo_path: str) -> str:
+    """Return the configured queue whose repo_path matches, else ''.
+
+    Configured queues use short codes (CCC, BYM) that rarely equal the repo
+    basename (claude-command-center, BYM+Finie). A client that files by
+    repo_path alone must still land in the right queue, so we check the config
+    for an exact repo_path match before falling back to the basename."""
+    if not repo_path:
+        return ""
+    target = str(repo_path).rstrip("/")
+    try:
+        from . import config
+        for name, conf in (config.all_queues() or {}).items():
+            cfg_rp = str((conf or {}).get("repo_path") or "").rstrip("/")
+            if cfg_rp and cfg_rp == target:
+                return _norm_project(name)
+    except Exception:
+        pass
+    return ""
+
+
 def _project_for(source: str = "", repo_path: str = "", project: str = "") -> str:
-    """Decide an item's queue: explicit > repo basename > source > GEN."""
+    """Decide an item's queue: explicit > configured-repo match > repo basename > source > GEN."""
     explicit = _norm_project(project)
     if explicit:
         return explicit
     if repo_path:
+        configured = _queue_for_repo_path(repo_path)
+        if configured:
+            return configured
         base = os.path.basename(str(repo_path).rstrip("/")).lower()
         if base:
             return _norm_project(base)
