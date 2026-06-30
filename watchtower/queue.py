@@ -472,19 +472,19 @@ def claim_next(
     if not session_id:
         raise ValueError("session_id is required")
 
-    # Check for a reconciler stop signal before touching the queue.
+    # A reconciler stop signal means "wind down — you're not needed". But it is
+    # only honored when there is genuinely nothing for this worker to claim:
+    # otherwise a STOP dropped during a brief drained window races with a new
+    # enqueue, and the worker — nudged awake by the new ticket — would consume
+    # the stale signal and exit, orphaning the just-filed ticket. So: note the
+    # signal here, but defer the decision until after we know if work exists.
     try:
         from . import workers as _workers
         stop_dir = _workers.STOP_SIGNALS_DIR
     except Exception:
         stop_dir = Path.home() / ".watchtower" / "stop-signals"
     signal_file = stop_dir / session_id
-    if signal_file.exists():
-        try:
-            signal_file.unlink()
-        except OSError:
-            pass
-        return {"stop": True}
+    has_stop_signal = signal_file.exists()
 
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
     proj = _norm_project(project) if project else None
@@ -507,6 +507,17 @@ def claim_next(
                 it for it in candidates
                 if (it.get("item_type") or it.get("type", "")) in item_types
             ]
+        # Resolve the stop signal now that we know whether claimable work exists.
+        # Either way the signal is consumed (one-shot). If nothing is claimable,
+        # honor it and exit; if there IS work, the signal's premise is void —
+        # discard it and claim, so a new ticket racing a STOP isn't orphaned.
+        if has_stop_signal:
+            try:
+                signal_file.unlink()
+            except OSError:
+                pass
+            if not candidates:
+                return {"stop": True}
         if not candidates:
             return None
         if oldest:
