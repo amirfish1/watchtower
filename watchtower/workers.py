@@ -700,21 +700,33 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
                 {"queue": q_name, "reason": f"actual={actual}==desired={desired}"}
             )
 
-    # Log the reconcile event with full details (queue, reason, worker_id).
-    import json
-    import time
+    # Log the reconcile event in plain text — one line per action/skip.
+    import time as _time
     try:
+        from datetime import datetime, timezone
         log_path = WORKERS_FILE.parent / "reconcile.log"
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        lines = []
+        for w in result.get("spawned", []):
+            wid = w.get("worker_id", "?")
+            q = w.get("queue", "?")
+            pid = w.get("pid", "?")
+            lines.append(f"{now}  SPAWN   {wid} ({q}, pid {pid})")
+        for w in result.get("stopped", []):
+            wid = w.get("worker_id", w) if isinstance(w, dict) else w
+            q = w.get("queue", "") if isinstance(w, dict) else ""
+            lines.append(f"{now}  STOP    {wid}" + (f" ({q})" if q else ""))
+        for w in result.get("reaped", []):
+            wid = w.get("worker_id", w) if isinstance(w, dict) else w
+            lines.append(f"{now}  REAP    {wid}")
+        for s in result.get("skipped", []):
+            q = s.get("queue", "?") if isinstance(s, dict) else s
+            reason = s.get("reason", "") if isinstance(s, dict) else ""
+            lines.append(f"{now}  skip    {q} — {reason}")
+        if not lines:
+            lines.append(f"{now}  (no-op)")
         with open(log_path, "a") as f:
-            event = {
-                "ts": time.time(),
-                "dry_run": dry_run,
-                "spawned": result.get("spawned", []),  # full list: queue, worker_id, ...
-                "stopped": result.get("stopped", []),  # full list: queue, worker_id, ...
-                "reaped": result.get("reaped", []),    # worker_ids
-                "skipped": result.get("skipped", []),  # full list: queue, reason
-            }
-            f.write(json.dumps(event) + "\n")
+            f.write("\n".join(lines) + "\n")
     except Exception:
         pass
 
