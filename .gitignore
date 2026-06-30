@@ -22,11 +22,12 @@ env/
 .coverage
 htmlcov/
 
-# Editor / OS
+# Editor / OS / local agent config
 .DS_Store
 *.swp
 .idea/
 .vscode/
+.claude/
 
 # WatchTower runtime state (never commit local queues / worker tracking)
 *.tmp
