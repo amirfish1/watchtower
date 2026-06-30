@@ -625,6 +625,37 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
     return out or None
 
 
+def backfill_session_id(ident: Any, session_id: str) -> Optional[Dict[str, Any]]:
+    """Record a worker's real cloud session UUID on the ticket it holds.
+
+    A WatchTower worker claims with its non-UUID worker_id, so ``claimed_by`` is
+    e.g. ``ccc-fbbe9e53`` and ``claimed_session_id`` starts empty. The worker's
+    actual session UUID is only knowable once its engine process has started and
+    written its log, so WT backfills it into workers.json later. This propagates
+    that UUID onto the in_progress ticket so any consumer (e.g. CCC's queue
+    health) can resolve the worker to a reachable session instead of treating it
+    as unresolvable ("WAITING"/"STUCK" despite a live worker).
+
+    Only writes when the item is in_progress and the field is empty/different —
+    idempotent and a no-op once set. Returns the item, or None if not found."""
+    real = _coerce_session_uuid(session_id)
+    if not real:
+        return None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                if it.get("status") != "in_progress":
+                    return it
+                if it.get("claimed_session_id") == real:
+                    return it
+                it["claimed_session_id"] = real
+                it["updated_at"] = _now_iso()
+                _save_unlocked(data)
+                return it
+    return None
+
+
 def update_status(
     ident: Any,
     status: str,

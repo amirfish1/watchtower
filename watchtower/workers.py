@@ -652,6 +652,42 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
     return reopened
 
 
+def backfill_claimed_session_ids() -> List[str]:
+    """Write each live worker's cloud session UUID onto the ticket it holds.
+
+    A worker claims with its non-UUID worker_id, so the ticket's
+    ``claimed_session_id`` is empty until its engine process has started and WT
+    has resolved the real UUID into workers.json. This propagates that UUID onto
+    the in_progress ticket so consumers (CCC queue health) can resolve a live
+    worker instead of showing WAITING/STUCK. Idempotent — a no-op once set.
+
+    Returns the refs that were freshly backfilled this pass."""
+    from . import queue as _q
+    backfilled: List[str] = []
+    # worker_id -> cloud session_id for live workers that have a resolved UUID.
+    wid_to_sid = {str(w.get("worker_id", "")): str(w.get("session_id", ""))
+                  for w in list_workers(prune=False)
+                  if w.get("alive") and w.get("session_id")}
+    if not wid_to_sid:
+        return backfilled
+    try:
+        items = _q.list_items()
+    except Exception:
+        return backfilled
+    for it in items:
+        if it.get("status") != "in_progress":
+            continue
+        sid = wid_to_sid.get(str(it.get("claimed_by") or ""))
+        if not sid or it.get("claimed_session_id") == sid:
+            continue
+        try:
+            if _q.backfill_session_id(it.get("ref"), sid):
+                backfilled.append(it.get("ref", ""))
+        except Exception:
+            pass
+    return backfilled
+
+
 def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     """One reconciler tick.
 
@@ -676,7 +712,7 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
         pass
 
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
-                              "reaped": [], "requeued": []}
+                              "reaped": [], "requeued": [], "backfilled": []}
 
     # Reap cold idle workers first (idle past the prompt-cache TTL): waking one
     # would re-read its bloated context uncached. Killing it lets the spawn pass
@@ -693,6 +729,12 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
         try:
             result["requeued"] = [it.get("ref", "")
                                   for it in requeue_orphaned_tickets()]
+        except Exception:
+            pass
+        # Propagate live workers' cloud session UUIDs onto the tickets they hold
+        # so consumers can resolve a reachable worker (no false WAITING/STUCK).
+        try:
+            result["backfilled"] = backfill_claimed_session_ids()
         except Exception:
             pass
 
