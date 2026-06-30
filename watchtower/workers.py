@@ -245,6 +245,9 @@ def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
         if pid:
             try:
                 os.kill(pid, 15)
+                idle_min = int(_worker_idle_s(w) / 60)
+                ttl_min = int(max_idle_s / 60)
+                w["_reap_reason"] = f"idle {idle_min}m (cold cache, >{ttl_min}m TTL)"
                 reaped.append(w)
                 pids.append(pid)
             except OSError:
@@ -722,8 +725,7 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     # below start a fresh, small-context worker instead. Skipped in dry_run.
     if not dry_run:
         try:
-            result["reaped"] = [r.get("worker_id", "")
-                                for r in reap_stale_workers()]
+            result["reaped"] = reap_stale_workers()
         except Exception:
             pass
         # Release tickets stranded in_progress by a dead/reaped/crashed worker so
@@ -770,6 +772,7 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
                 if not dry_run:
                     request_stop(wid)
                 result["stopped"].append({"queue": q_name, "worker_id": wid,
+                                          "reason": "queue drained (0 open)",
                                           "dry_run": dry_run})
             continue
         live = live_by_queue.get(q_name, [])
@@ -797,6 +800,7 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
                 if not dry_run:
                     request_stop(wid)
                 result["stopped"].append({"queue": q_name, "worker_id": wid,
+                                          "reason": f"surplus ({actual}>{desired} desired)",
                                           "dry_run": dry_run})
         else:
             result["skipped"].append(
@@ -814,10 +818,15 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
         for w in result.get("stopped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
             q = (w.get("queue", "") if isinstance(w, dict) else "")
-            _log("STOP", wid + (f" ({q})" if q else ""))
+            reason = (w.get("reason", "") if isinstance(w, dict) else "")
+            detail = wid + (f" ({q})" if q else "")
+            _log("STOP", detail + (f" — {reason}" if reason else ""))
         for w in result.get("reaped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
-            _log("REAP", str(wid))
+            q = (w.get("queue", "") if isinstance(w, dict) else "")
+            reason = (w.get("_reap_reason", "") if isinstance(w, dict) else "")
+            detail = str(wid) + (f" ({q})" if q else "")
+            _log("REAP", detail + (f" — {reason}" if reason else ""))
         for ref in result.get("requeued", []):
             _log("REQUEUE", f"{ref} — worker gone, reopened for re-drain")
     except Exception:
