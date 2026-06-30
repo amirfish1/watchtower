@@ -248,6 +248,12 @@ def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
                 idle_min = int(_worker_idle_s(w) / 60)
                 ttl_min = int(max_idle_s / 60)
                 w["_reap_reason"] = f"idle {idle_min}m (cold cache, >{ttl_min}m TTL)"
+                # Drop any pending stop-signal — the worker is being killed, so the
+                # sentinel would otherwise linger orphaned in the stop-signals dir.
+                try:
+                    (STOP_SIGNALS_DIR / str(w.get("worker_id", ""))).unlink()
+                except OSError:
+                    pass
                 reaped.append(w)
                 pids.append(pid)
             except OSError:
@@ -807,24 +813,62 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     for row in health.all_status():
         depth_by_queue[row["queue"]] = row.get("depth", 0)
 
+    # Claimable depth respects each queue's claim_types restriction. A bug-only
+    # queue (claim_types=['bug']) whose only open tickets are features has ZERO
+    # claimable work: spawning a worker that can never claim them just churns
+    # spawn -> "nothing to do" -> idle -> reap forever. Count open tickets the
+    # worker could actually claim (all open when unrestricted). One list_items
+    # pass, keyed by (queue, type).
+    from . import queue as _q
+    _open_by_q_type: Dict[tuple, int] = {}
+    try:
+        for it in (_q.list_items() or []):
+            if it.get("status") != "open":
+                continue
+            qn = str(it.get("project") or "")
+            ty = str(it.get("type") or it.get("item_type") or "")
+            _open_by_q_type[(qn, ty)] = _open_by_q_type.get((qn, ty), 0) + 1
+    except Exception:
+        _open_by_q_type = {}
+
+    def _claimable_depth(qn: str) -> tuple:
+        """Return (claimable_open, total_open) for a queue, honoring claim_types."""
+        total = sum(v for (q2, _t), v in _open_by_q_type.items() if q2 == qn)
+        types = config.claim_types(qn)
+        if not types:
+            return total, total
+        claimable = sum(v for (q2, t), v in _open_by_q_type.items()
+                        if q2 == qn and t in types)
+        return claimable, total
+
     for q_name in all_cfg:
         auto = config.auto_drain(q_name)
         desired = config.desired_workers(q_name) if auto else 0
-        depth = depth_by_queue.get(q_name, 0)
+        depth, total_open = _claimable_depth(q_name)
         if not auto:
             result["skipped"].append({"queue": q_name, "reason": "auto_drain=off"})
             continue
         if depth == 0:
-            result["skipped"].append({"queue": q_name, "reason": "depth=0"})
+            # Distinguish "truly empty" from "only non-claimable types remain".
+            filtered = total_open - depth
+            reason = (f"0 claimable ({total_open} open filtered by claim_types)"
+                      if filtered > 0 else "depth=0")
+            result["skipped"].append({"queue": q_name, "reason": reason})
             # If there are surplus workers idling on an empty queue, wind them down.
+            # Only signal+log once per worker: an idle worker only consumes the
+            # stop signal on its next `wt claim`, which it never calls while idle,
+            # so re-touching every 30s tick spammed STOP forever. Skip if already
+            # signaled (REAP is what actually removes a persistently-idle worker).
             live = live_by_queue.get(q_name, [])
             for w in live:
                 wid = w.get("worker_id", "")
+                already = (STOP_SIGNALS_DIR / wid).exists()
                 if not dry_run:
                     request_stop(wid)
-                result["stopped"].append({"queue": q_name, "worker_id": wid,
-                                          "reason": "queue drained (0 open)",
-                                          "dry_run": dry_run})
+                if not already:
+                    result["stopped"].append({"queue": q_name, "worker_id": wid,
+                                              "reason": "queue drained (0 open)",
+                                              "dry_run": dry_run})
             continue
         live = live_by_queue.get(q_name, [])
         actual = len(live)
@@ -851,14 +895,17 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             result["spawned"].extend(spawned)
         elif actual > desired:
             # Wind down excess workers (LIFO -- stop the most recently started).
+            # Dedup: only signal+log once per worker (see drained-branch note).
             excess = live[desired:]
             for w in excess:
                 wid = w.get("worker_id", "")
+                already = (STOP_SIGNALS_DIR / wid).exists()
                 if not dry_run:
                     request_stop(wid)
-                result["stopped"].append({"queue": q_name, "worker_id": wid,
-                                          "reason": f"surplus ({actual}>{desired} desired)",
-                                          "dry_run": dry_run})
+                if not already:
+                    result["stopped"].append({"queue": q_name, "worker_id": wid,
+                                              "reason": f"surplus ({actual}>{desired} desired)",
+                                              "dry_run": dry_run})
         else:
             result["skipped"].append(
                 {"queue": q_name, "reason": f"actual={actual}==desired={desired}"}
