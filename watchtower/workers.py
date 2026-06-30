@@ -678,7 +678,7 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
         ref = ref or ""
         if not config.auto_drain(queue):
             reason = "queued — auto_drain off (backlog, no worker)"
-            _log("DISPATCH", f"{ref} — {reason}")
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
         nudge = (
             f"New ticket {ref} filed on {queue}. Claim it with "
@@ -687,7 +687,7 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
         delivered = notify_workers(queue, nudge)
         if delivered:
             reason = f"nudged {delivered} live worker(s) — immediate pickup"
-            _log("DISPATCH", f"{ref} — {reason}")
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
         # No warm worker: reap cold ones, then reconcile to spawn a fresh worker.
         reap_stale_workers(queue=queue)
@@ -696,14 +696,14 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
         if spawned:
             wid = spawned[0].get("worker_id", "?")
             reason = f"spawned worker {wid}"
-            _log("DISPATCH", f"{ref} — {reason}")
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
         # Nothing spawned — surface the reconcile skip reason for this queue.
         skip = next((s for s in result.get("skipped", [])
                      if s.get("queue") == queue), None)
         why = (skip or {}).get("reason", "no live worker accepted and none spawned")
         reason = f"no action — {why}"
-        _log("DISPATCH", f"{ref} — {reason}")
+        _log("DISPATCH", f"{ref} — {reason}", queue=queue)
         return reason
     except Exception:
         return ""
@@ -865,21 +865,20 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             wid = w.get("worker_id", "?")
             q = w.get("queue", "?")
             pid = w.get("pid", "?")
-            _log("SPAWN", f"{wid} ({q}, pid {pid})")
+            _log("SPAWN", f"{wid} (pid {pid})", queue=q)
         for w in result.get("stopped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
             q = (w.get("queue", "") if isinstance(w, dict) else "")
             reason = (w.get("reason", "") if isinstance(w, dict) else "")
-            detail = wid + (f" ({q})" if q else "")
-            _log("STOP", detail + (f" — {reason}" if reason else ""))
+            _log("STOP", str(wid) + (f" — {reason}" if reason else ""), queue=q)
         for w in result.get("reaped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
             q = (w.get("queue", "") if isinstance(w, dict) else "")
             reason = (w.get("_reap_reason", "") if isinstance(w, dict) else "")
-            detail = str(wid) + (f" ({q})" if q else "")
-            _log("REAP", detail + (f" — {reason}" if reason else ""))
+            _log("REAP", str(wid) + (f" — {reason}" if reason else ""), queue=q)
         for ref in result.get("requeued", []):
-            _log("REQUEUE", f"{ref} — worker gone, reopened for re-drain")
+            q = ref.rsplit("-", 1)[0] if "-" in ref else ""
+            _log("REQUEUE", f"{ref} — worker gone, reopened for re-drain", queue=q)
     except Exception:
         pass
 

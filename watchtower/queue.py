@@ -81,14 +81,15 @@ _WT_DEFAULT_STORE = Path.home() / ".watchtower" / "queues.json"
 _ACTIVITY_LOG = Path.home() / ".watchtower" / "activity.log"
 
 
-def _log(verb: str, detail: str) -> None:
+def _log(verb: str, detail: str, queue: str = "") -> None:
     """Append one plain-text line to the unified activity log."""
     try:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        q_col = (queue or "reconciler")
         _ACTIVITY_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(_ACTIVITY_LOG, "a") as f:
-            f.write(f"{now}  {verb:<9}{detail}\n")
+            f.write(f"{now}  {q_col:<14}  {verb:<9}{detail}\n")
     except Exception:
         pass
 
@@ -362,7 +363,7 @@ def enqueue(
         _normalize_items(data["items"])  # assign this item's seq/ref
         _save_unlocked(data)
         saved = next(it for it in data["items"] if it.get("number") == number)
-    _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}")
+    _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
     return saved
 
 
@@ -527,7 +528,7 @@ def claim_next(
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
         _save_unlocked(data)
-    _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}")
+    _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
     return item
 
 
@@ -559,7 +560,7 @@ def claim_by_ref(
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
         _save_unlocked(data)
-    _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}")
+    _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
     return item
 
 
@@ -716,7 +717,7 @@ def update_status(
                     elif isinstance(res, str):
                         summary = res
                 detail = f"{it.get('ref', '?')} — {summary or it.get('title') or it.get('note', '')[:60]}"
-                _log(verb, detail)
+                _log(verb, detail, queue=it.get('project', ''))
                 return it
     return None
 
