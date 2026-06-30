@@ -88,7 +88,7 @@ def _log(verb: str, detail: str) -> None:
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         _ACTIVITY_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(_ACTIVITY_LOG, "a") as f:
-            f.write(f"{now}  {verb:<8}{detail}\n")
+            f.write(f"{now}  {verb:<9}{detail}\n")
     except Exception:
         pass
 

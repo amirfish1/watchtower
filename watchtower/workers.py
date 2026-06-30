@@ -658,6 +658,57 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
     return reopened
 
 
+def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
+    """Decide + act on what a newly-filed ticket needs, and log the decision.
+
+    Called right after an enqueue (CLI `wt add` or the CCC dashboard) so a ticket
+    is handled immediately instead of waiting for the next reconciler tick, and so
+    the activity log explains the outcome rather than going silent after ENQUEUE.
+
+    Disposition, logged as `DISPATCH <ref> — <reason>`:
+      - auto_drain off            → queued as backlog (no worker)
+      - a warm worker is live     → nudged via its FIFO (immediate pickup)
+      - no warm worker            → reap cold + reconcile; spawned a fresh worker
+      - reconcile spawned nothing → no action (with the reconcile skip reason)
+
+    Returns the reason string. Best-effort: never raises."""
+    from . import config, queue as _q
+    from .queue import _log
+    try:
+        ref = ref or ""
+        if not config.auto_drain(queue):
+            reason = "queued — auto_drain off (backlog, no worker)"
+            _log("DISPATCH", f"{ref} — {reason}")
+            return reason
+        nudge = (
+            f"New ticket {ref} filed on {queue}. Claim it with "
+            f"`wt claim -q {queue} --worker <your-id> --json` and drain the queue."
+        )
+        delivered = notify_workers(queue, nudge)
+        if delivered:
+            reason = f"nudged {delivered} live worker(s) — immediate pickup"
+            _log("DISPATCH", f"{ref} — {reason}")
+            return reason
+        # No warm worker: reap cold ones, then reconcile to spawn a fresh worker.
+        reap_stale_workers(queue=queue)
+        result = reconcile_once()
+        spawned = [r for r in result.get("spawned", []) if r.get("queue") == queue]
+        if spawned:
+            wid = spawned[0].get("worker_id", "?")
+            reason = f"spawned worker {wid}"
+            _log("DISPATCH", f"{ref} — {reason}")
+            return reason
+        # Nothing spawned — surface the reconcile skip reason for this queue.
+        skip = next((s for s in result.get("skipped", [])
+                     if s.get("queue") == queue), None)
+        why = (skip or {}).get("reason", "no live worker accepted and none spawned")
+        reason = f"no action — {why}"
+        _log("DISPATCH", f"{ref} — {reason}")
+        return reason
+    except Exception:
+        return ""
+
+
 def backfill_claimed_session_ids() -> List[str]:
     """Write each live worker's cloud session UUID onto the ticket it holds.
 

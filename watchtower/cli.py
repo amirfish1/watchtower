@@ -200,34 +200,15 @@ def cmd_add(args: argparse.Namespace) -> int:
         confidence=getattr(args, "confidence", "") or "",
     )
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
-    # Auto-drain queues: push the new work to a live worker NOW via its
-    # stream-json FIFO (immediate pickup, warm context, no polling). Only if no
-    # live worker accepts do we reconcile to spawn a fresh one. Idempotent and
-    # best-effort -- a hiccup here never fails the enqueue.
+    # Decide + act on the new ticket NOW (nudge a live worker via FIFO, else
+    # reap+spawn) and log the decision to the activity log. Centralized in
+    # workers.dispatch_after_enqueue so the CLI and the CCC dashboard share one
+    # disposition path. Best-effort -- a hiccup here never fails the enqueue.
     try:
-        from . import config, workers
-        if config.auto_drain(args.queue):
-            nudge = (
-                f"New ticket {item['ref']} filed on {args.queue}. "
-                f"Claim it with `wt claim -q {args.queue} --worker <your-id> "
-                f"--json` and drain the queue."
-            )
-            # Push only to WARM workers (idle < cache TTL). If none are warm,
-            # reap any cold idle workers (waking them would re-read a bloated
-            # context uncached) and spawn a fresh, small-context worker.
-            delivered = workers.notify_workers(args.queue, nudge)
-            if delivered:
-                print(f"[watchtower] nudged {delivered} warm worker(s) on "
-                      f"{args.queue}")
-            else:
-                reaped = workers.reap_stale_workers(queue=args.queue)
-                if reaped:
-                    print(f"[watchtower] reaped {len(reaped)} cold worker(s) on "
-                          f"{args.queue}")
-                result = workers.reconcile_once()
-                for rec in result.get("spawned", []):
-                    print(f"[watchtower] spawned worker {rec.get('worker_id','')} "
-                          f"for {rec.get('queue','')}")
+        from . import workers
+        reason = workers.dispatch_after_enqueue(args.queue, item.get("ref", ""))
+        if reason:
+            print(f"[watchtower] {reason}")
     except Exception:
         pass
     return 0
