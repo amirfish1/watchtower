@@ -200,6 +200,20 @@ def cmd_add(args: argparse.Namespace) -> int:
         confidence=getattr(args, "confidence", "") or "",
     )
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
+    # Enqueue-and-claim: file the ticket, then immediately mark it in_progress so
+    # the reconciler (which only spawns for OPEN tickets) leaves it alone. For the
+    # user who's already working the bug they're documenting. Skip the dispatch
+    # entirely -- an already-claimed ticket is in_progress, not open, so nudging
+    # or spawning a worker would be a no-op at best.
+    if getattr(args, "claim", False):
+        worker = args.worker or f"wt-cli-{os.getpid()}"
+        try:
+            q.claim_by_ref(item["ref"], worker)
+            print(f"CLAIMED: {item['ref']} -> {worker}")
+        except Exception as e:
+            # Enqueue already succeeded; a claim hiccup shouldn't fail the file.
+            print(f"[watchtower] could not claim {item['ref']}: {e}", file=sys.stderr)
+        return 0
     # Decide + act on the new ticket NOW (nudge a live worker via FIFO, else
     # reap+spawn) and log the decision to the activity log. Centralized in
     # workers.dispatch_after_enqueue so the CLI and the CCC dashboard share one
@@ -212,6 +226,14 @@ def cmd_add(args: argparse.Namespace) -> int:
     except Exception:
         pass
     return 0
+
+
+def cmd_take(args: argparse.Namespace) -> int:
+    """Shorthand for `add --claim`: file a ticket and immediately claim it, for
+    documenting a bug you're already working on. Delegates to cmd_add so the two
+    share one code path and can't drift."""
+    args.claim = True
+    return cmd_add(args)
 
 
 def cmd_claim(args: argparse.Namespace) -> int:
@@ -271,6 +293,27 @@ def cmd_claim(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_run(args: argparse.Namespace) -> int:
+    """Mark an existing ticket runnable and dispatch its queue."""
+    try:
+        item = q.mark_runnable(args.ref)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"error: {args.ref} not found", file=sys.stderr)
+        return 1
+    print(f"RUNNABLE: {item['ref']}  {item.get('title') or item.get('note','')}")
+    if not getattr(args, "no_dispatch", False):
+        try:
+            reason = workers.dispatch_after_enqueue(item.get("project", ""), item.get("ref", ""))
+            if reason:
+                print(f"[watchtower] {reason}")
+        except Exception:
+            pass
+    return 0
+
+
 def _resolution_from_args(args: argparse.Namespace) -> Optional[dict]:
     """Build a resolution dict from --summary/--caveat/--follow-up/--unresolved.
 
@@ -296,7 +339,11 @@ def cmd_close(args: argparse.Namespace) -> int:
         return 1
     worker = args.worker or f"wt-cli-{os.getpid()}"
     resolution = _resolution_from_args(args)
-    item = q.close(args.ref, worker, resolution=resolution)
+    try:
+        item = q.close(args.ref, worker, resolution=resolution)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
@@ -967,26 +1014,42 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_ls)
 
+    # Shared arg registration so `add` and its `take` shorthand can't drift.
+    def _add_common_ticket_args(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("-q", "--queue", required=True)
+        subparser.add_argument("--title", default="")
+        subparser.add_argument("--note", default="")
+        subparser.add_argument("--text", default="")
+        subparser.add_argument("--url", default="")
+        subparser.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
+        subparser.add_argument("--type", default="", choices=["bug", "feature", ""],
+                               help="item type: bug or feature")
+        subparser.add_argument("--readiness", default="",
+                               choices=["ready", "needs-shaping", "needs-spec", ""],
+                               help="readiness level")
+        subparser.add_argument("--priority", default="",
+                               choices=["p0", "p1", "p2", "p3", "p4", ""],
+                               help="priority: p0 (highest) through p4 (lowest)")
+        subparser.add_argument("--value", default="", choices=["H", "M", "L", ""],
+                               help="business value: H, M, or L")
+        subparser.add_argument("--confidence", default="", choices=["H", "M", "L", ""],
+                               help="confidence: H, M, or L")
+        subparser.add_argument("--worker", default="",
+                               help="worker/owner id to claim under when --claim is "
+                                    "set; defaults to wt-cli-<pid>")
+
     s = sub.add_parser("add", help="file a ticket")
-    s.add_argument("-q", "--queue", required=True)
-    s.add_argument("--title", default="")
-    s.add_argument("--note", default="")
-    s.add_argument("--text", default="")
-    s.add_argument("--url", default="")
-    s.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
-    s.add_argument("--type", default="", choices=["bug", "feature", ""],
-                   help="item type: bug or feature")
-    s.add_argument("--readiness", default="",
-                   choices=["ready", "needs-shaping", "needs-spec", ""],
-                   help="readiness level")
-    s.add_argument("--priority", default="",
-                   choices=["p0", "p1", "p2", "p3", "p4", ""],
-                   help="priority: p0 (highest) through p4 (lowest)")
-    s.add_argument("--value", default="", choices=["H", "M", "L", ""],
-                   help="business value: H, M, or L")
-    s.add_argument("--confidence", default="", choices=["H", "M", "L", ""],
-                   help="confidence: H, M, or L")
+    _add_common_ticket_args(s)
+    s.add_argument("--claim", action="store_true",
+                   help="immediately claim the new ticket (mark in_progress) so no "
+                        "auto-drain worker picks it up; use when you're already working it")
     s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("take",
+                       help="file a ticket and immediately claim it (= add --claim); "
+                            "for documenting a bug you're already working on")
+    _add_common_ticket_args(s)
+    s.set_defaults(func=cmd_take)
 
     s = sub.add_parser("claim", help="claim next open ticket (smart sort: priority + type + age)")
     s.add_argument("-q", "--queue", required=True)
@@ -1003,6 +1066,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="only claim items with this readiness (repeatable)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_claim)
+
+    s = sub.add_parser("run", help="mark an existing GitHub issue runnable and dispatch its queue")
+    s.add_argument("ref", help="ticket ref / GitHub issue ref, e.g. BYM-GH-FINIE-402")
+    s.add_argument("--no-dispatch", action="store_true",
+                   help="only add the WatchTower label; do not nudge/spawn workers")
+    s.set_defaults(func=cmd_run)
 
     s = sub.add_parser("close", help="close a ticket (record how you fixed it)")
     s.add_argument("ref")

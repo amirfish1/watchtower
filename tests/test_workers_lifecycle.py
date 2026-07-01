@@ -532,3 +532,95 @@ def test_ledger_dedupes_and_caps(wt):
     assert len(ids) == wt.workers._WORKER_SESSIONS_CAP
     assert last in ids
     assert sid not in ids  # the very first id was evicted
+
+
+# ==================================================== enqueue-and-claim (add --claim / take)
+def _add_ns(queue, *, claim=False, worker="", note="work"):
+    """Build the argparse-shaped namespace cmd_add reads."""
+    class Ns:
+        pass
+    ns = Ns()
+    ns.queue = queue
+    ns.title = ""
+    ns.note = note
+    ns.text = ""
+    ns.url = ""
+    ns.lane = "normal"
+    ns.type = ""
+    ns.readiness = ""
+    ns.priority = ""
+    ns.value = ""
+    ns.confidence = ""
+    ns.worker = worker
+    ns.claim = claim
+    return ns
+
+
+def _spy_dispatch(wt, monkeypatch):
+    """Replace dispatch_after_enqueue with a call-counting spy; return the list of
+    calls so a test can assert it was (not) invoked."""
+    calls = []
+    monkeypatch.setattr(
+        wt.workers, "dispatch_after_enqueue",
+        lambda queue, ref: calls.append((queue, ref)) or "",
+    )
+    return calls
+
+
+def _only_item(wt, queue):
+    items = wt.q.list_items(project=queue)
+    assert len(items) == 1
+    return items[0]
+
+
+def test_add_claim_marks_in_progress_and_skips_dispatch(wt, monkeypatch):
+    """`add --claim` (no --worker): item is in_progress, claimed by the default
+    wt-cli-<pid> worker, and dispatch_after_enqueue is NOT called."""
+    cli = _reloaded_cli(wt)
+    calls = _spy_dispatch(wt, monkeypatch)
+    rc = cli.cmd_add(_add_ns("Q", claim=True))
+    assert rc == 0
+    it = _only_item(wt, "Q")
+    assert it["status"] == "in_progress"
+    assert it["claimed_by"] == f"wt-cli-{os.getpid()}"
+    assert calls == []  # already claimed -> no worker nudged/spawned
+
+
+def test_add_claim_explicit_worker(wt, monkeypatch):
+    """`add --claim --worker amir`: claimed_by is the explicit worker id."""
+    cli = _reloaded_cli(wt)
+    calls = _spy_dispatch(wt, monkeypatch)
+    rc = cli.cmd_add(_add_ns("Q", claim=True, worker="amir"))
+    assert rc == 0
+    it = _only_item(wt, "Q")
+    assert it["status"] == "in_progress"
+    assert it["claimed_by"] == "amir"
+    assert calls == []
+
+
+def test_add_without_claim_stays_open_and_dispatches(wt, monkeypatch):
+    """Regression: plain `add` leaves the item open and DOES dispatch."""
+    cli = _reloaded_cli(wt)
+    calls = _spy_dispatch(wt, monkeypatch)
+    rc = cli.cmd_add(_add_ns("Q", claim=False))
+    assert rc == 0
+    it = _only_item(wt, "Q")
+    assert it["status"] == "open"
+    assert not it.get("claimed_by")
+    assert len(calls) == 1  # existing contract: worker disposition runs
+
+
+def test_take_is_add_with_claim(wt, monkeypatch):
+    """`take` behaves exactly like `add --claim`: in_progress, claimed, no dispatch.
+    The namespace has no `claim` attr (take doesn't register --claim); cmd_take
+    must set it."""
+    cli = _reloaded_cli(wt)
+    calls = _spy_dispatch(wt, monkeypatch)
+    ns = _add_ns("Q", worker="amir")
+    del ns.claim  # take's subparser never registers --claim
+    rc = cli.cmd_take(ns)
+    assert rc == 0
+    it = _only_item(wt, "Q")
+    assert it["status"] == "in_progress"
+    assert it["claimed_by"] == "amir"
+    assert calls == []
