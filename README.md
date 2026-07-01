@@ -88,6 +88,69 @@ wt dashboard                           # open the night-watch dashboard (non-blo
 wt dashboard --no-open                 # ensure the server is up, don't open a browser
 ```
 
+### Agent engines
+
+WatchTower supports two agent engines. Set the engine per queue with `wt set`:
+
+```bash
+wt set -q MYAPP --engine claude    # default — Claude Code (stream-json, FIFO, live)
+wt set -q MYAPP --engine codex     # OpenAI Codex (one-shot exec)
+```
+
+The engine is stored in `~/.watchtower/queue-config.json` and picked up by the
+reconciler on the next spawn. Existing live workers are unaffected until they
+are reaped and a fresh one is started.
+
+#### `claude` (default)
+
+Requires the [Claude Code CLI](https://claude.ai/code) (`claude` on `$PATH`).
+
+Workers are spawned as:
+
+```
+claude -p --input-format stream-json --output-format stream-json \
+       --verbose --name "<QUEUE> queue worker" --permission-mode bypassPermissions
+```
+
+The drain goal is delivered as the **first stream-json message** on a named pipe
+(FIFO) that is the worker's stdin. This makes the worker a **live, pushable
+process**: when `wt add` files a new ticket while the worker is idle, the
+message arrives on the FIFO immediately — no polling, no sleep loop, warm context
+preserved. The worker's prompt cache stays hot for ~5 minutes after the last
+claim (Anthropic's cache TTL), so tickets that arrive in that window are
+cheaper and faster to handle.
+
+The reconciler reaps workers idle longer than 5 minutes (cold cache) and spawns
+a fresh one on the next tick rather than waking a worker whose context would be
+re-read uncached.
+
+#### `codex`
+
+Requires the [OpenAI Codex CLI](https://github.com/openai/codex) (`codex` on
+`$PATH`).
+
+Workers are spawned as:
+
+```
+codex exec <drain-goal>
+```
+
+The drain goal is passed directly as the command-line argument (one-shot exec).
+There is no FIFO stdin channel and no live push notification: the worker drains
+until the queue is empty, then exits. New tickets filed while it is running are
+picked up on the next `wt claim` loop iteration. `wt add` notifications are not
+delivered to a running codex worker.
+
+#### Comparison
+
+| | `claude` | `codex` |
+|---|---|---|
+| Spawn mode | stream-json over FIFO | `exec <goal>` |
+| Live push (`wt add`) | yes — via FIFO | no |
+| Prompt cache warm wake | yes (~5 min) | no |
+| Multi-ticket session | yes — one process, warm ctx | one process, warm ctx |
+| Requires | Claude Code CLI | OpenAI Codex CLI |
+
 ### GitHub Issues backend (optional)
 
 A queue can use GitHub Issues instead of the local JSON queue file. WatchTower

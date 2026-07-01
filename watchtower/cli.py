@@ -1048,7 +1048,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--repo-path", default=None, dest="repo_path",
                    help="default cwd for workers spawned on this queue")
     s.add_argument("--engine", default=None, choices=["claude", "codex"],
-                   help="agent engine for workers on this queue (default: claude)")
+                   help=(
+                       "agent engine for workers on this queue (default: claude). "
+                       "claude: stream-json mode over a FIFO stdin — live, pushable, "
+                       "prompt-cache warm for ~5 min; requires the Claude Code CLI. "
+                       "codex: one-shot `codex exec <goal>` — no FIFO, no live push; "
+                       "requires the OpenAI Codex CLI."
+                   ))
     s.add_argument("--desired-workers", default=None, type=int, dest="desired_workers",
                    help="number of concurrent workers the reconciler should maintain")
     s.set_defaults(func=cmd_set)

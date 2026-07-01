@@ -79,6 +79,32 @@ A **worker** is a subprocess running a headless agent CLI (`claude -p ...` or
 `codex exec ...`). It is not a user — it is a tool the daemon uses to drain a
 queue. Workers are ephemeral and stateless outside the queue.
 
+### Engines
+
+Each queue has an **engine** setting (default `claude`) that controls how
+workers are spawned. Set it with `wt set -q <QUEUE> --engine <ENGINE>`.
+
+| Engine | Spawn command | Live push | Prompt cache |
+|--------|--------------|-----------|--------------|
+| `claude` | `claude -p --input-format stream-json ...` | yes (FIFO) | ~5 min warm |
+| `codex` | `codex exec <goal>` | no | n/a |
+
+**`claude`** (default) — requires the Claude Code CLI.
+
+The worker's stdin is a named pipe (FIFO). The drain goal arrives as the first
+stream-json user message; subsequent `wt add` notifications push new messages
+on the same channel. The worker stays alive between tickets, so its prompt cache
+(Anthropic's 5-minute TTL) covers tickets filed within that window: they are
+cheaper and faster than a cold start. Workers idle past 5 minutes are reaped and
+replaced with a fresh process on the next reconciler tick.
+
+**`codex`** — requires the OpenAI Codex CLI.
+
+Workers are spawned as `codex exec <drain-goal>`. The goal text is in argv;
+there is no FIFO and no live push channel. The worker drains until the queue is
+empty and then exits. New tickets filed while it is running are picked up on the
+next `wt claim` iteration inside the same process.
+
 ### Normal cycle
 
 ```
