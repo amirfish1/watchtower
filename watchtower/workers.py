@@ -767,12 +767,18 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     queue decides:
       - desired = desired_workers (default 1) if auto_drain AND depth > 0 else 0
       - if actual_live < desired: spawn the delta (or record in dry_run)
-      - if actual_live > desired: call request_stop() on the excess workers
+
+    Wind-down (drain/surplus) is deliberately NOT decided here. Counting only
+    `open` on a busy queue is a bet on the future — a worker that just claimed
+    the last ticket would be STOPped prematurely. The surplus decision is made
+    at claim time (``cli.cmd_claim``: nothing claimable AND live>desired), and
+    REAP is the idle safety net. So ``result["stopped"]`` stays empty from the
+    reconciler; the key + its log rendering remain for other callers.
 
     Returns ``{"spawned": [...], "stopped": [...], "skipped": [...]}``.
-    ``skipped`` entries explain why a queue was left alone (e.g. auto_drain=off
-    or depth=0).  In ``dry_run`` mode no subprocesses are started and no
-    stop-signal files are created; the return value shows what *would* happen.
+    ``skipped`` entries explain why a queue was left alone (e.g. auto_drain=off,
+    depth=0, or surplus resolved elsewhere).  In ``dry_run`` mode no subprocesses
+    are started; the return value shows what *would* happen.
     """
     from . import config, health
     import sys
@@ -863,21 +869,12 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             reason = (f"0 claimable ({total_open} open filtered by claim_types)"
                       if filtered > 0 else "depth=0")
             result["skipped"].append({"queue": q_name, "reason": reason})
-            # If there are surplus workers idling on an empty queue, wind them down.
-            # Only signal+log once per worker: an idle worker only consumes the
-            # stop signal on its next `wt claim`, which it never calls while idle,
-            # so re-touching every 30s tick spammed STOP forever. Skip if already
-            # signaled (REAP is what actually removes a persistently-idle worker).
-            live = live_by_queue.get(q_name, [])
-            for w in live:
-                wid = w.get("worker_id", "")
-                already = (STOP_SIGNALS_DIR / wid).exists()
-                if not dry_run:
-                    request_stop(wid)
-                if not already:
-                    result["stopped"].append({"queue": q_name, "worker_id": wid,
-                                              "reason": "queue drained (0 open)",
-                                              "dry_run": dry_run})
+            # Wind-down is NOT decided here. Counting only `open` on a drained
+            # queue is a bet on the future: the instant a worker claims the last
+            # ticket it flips open->in_progress, depth reads 0, and STOPping the
+            # busy worker is premature. The surplus/idle decision is made at
+            # claim time (cmd_claim, live>desired) when the real current state is
+            # known, and REAP is the idle safety net.
             continue
         live = live_by_queue.get(q_name, [])
         actual = len(live)
@@ -903,18 +900,14 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
                 rec["spawn_reason"] = spawn_reason
             result["spawned"].extend(spawned)
         elif actual > desired:
-            # Wind down excess workers (LIFO -- stop the most recently started).
-            # Dedup: only signal+log once per worker (see drained-branch note).
-            excess = live[desired:]
-            for w in excess:
-                wid = w.get("worker_id", "")
-                already = (STOP_SIGNALS_DIR / wid).exists()
-                if not dry_run:
-                    request_stop(wid)
-                if not already:
-                    result["stopped"].append({"queue": q_name, "worker_id": wid,
-                                              "reason": f"surplus ({actual}>{desired} desired)",
-                                              "dry_run": dry_run})
+            # Surplus is NOT wound down here. A worker discovers it is surplus at
+            # claim time (cmd_claim: nothing claimable AND live>desired) and exits
+            # itself; REAP handles the persistently-idle case. The reconciler no
+            # longer pushes a speculative STOP based on a momentary count.
+            result["skipped"].append(
+                {"queue": q_name,
+                 "reason": f"surplus ({actual}>{desired}) — resolved at claim/reap"}
+            )
         else:
             result["skipped"].append(
                 {"queue": q_name, "reason": f"actual={actual}==desired={desired}"}

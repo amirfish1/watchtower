@@ -140,21 +140,96 @@ def test_reconcile_desired_two_spawns_two(wt):
     assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 2
 
 
-def test_reconcile_excess_workers_stopped(wt):
+def test_reconcile_excess_workers_not_stopped(wt):
+    """New contract: the reconciler no longer STOPs surplus workers — that call
+    is made at claim time (live>desired) with REAP as the safety net. It only
+    records the surplus as a skip reason and spawns nothing."""
     wt.config.set_auto_drain("Q", True)  # desired defaults to 1
     wt.q.enqueue(project="Q", note="work")
     _live_worker(wt, "Q")
     _live_worker(wt, "Q")  # two live, one too many
     r = wt.workers.reconcile_once(dry_run=True)
-    assert len([s for s in r["stopped"] if s["queue"] == "Q"]) == 1
+    assert not [s for s in r["stopped"] if s["queue"] == "Q"]  # no STOP pushed
     assert not r["spawned"]
+    assert any(s["queue"] == "Q" and "surplus" in s["reason"] for s in r["skipped"])
 
 
-def test_reconcile_empty_queue_winds_down_idle_worker(wt):
+def test_reconcile_empty_queue_does_not_wind_down_idle_worker(wt):
+    """New contract: a drained (0 open) queue no longer STOPs its idle worker —
+    it stays warm for the next ticket; REAP kills it if it stays cold."""
     wt.config.set_auto_drain("Q", True)  # drain on, but queue empty
     _live_worker(wt, "Q")
     r = wt.workers.reconcile_once(dry_run=True)
-    assert len([s for s in r["stopped"] if s["queue"] == "Q"]) == 1
+    assert not [s for s in r["stopped"] if s["queue"] == "Q"]
+
+
+# =========================================================== claim-time surplus
+def _claim_ns(queue, worker, *, json_out=False):
+    """Build the argparse-shaped namespace cmd_claim reads for the empty-queue path."""
+    class Ns:
+        pass
+    ns = Ns()
+    ns.queue = queue
+    ns.worker = worker
+    ns.ref = ""
+    ns.oldest = False
+    ns.type = []
+    ns.readiness = []
+    ns.json = json_out
+    return ns
+
+
+def _reloaded_cli(wt):
+    """Reload cli against the sandbox so its module-level workers/queue/config
+    references point at the reloaded (env-bound) modules."""
+    import watchtower.cli as cli
+    importlib.reload(cli)
+    return cli
+
+
+def test_claim_empty_queue_surplus_worker_stops(wt, capsys):
+    """live>desired on an empty queue: the claiming worker is surplus -> stop."""
+    cli = _reloaded_cli(wt)
+    wt.config.set_auto_drain("Q", True)  # desired defaults to 1
+    _live_worker(wt, "Q")
+    _live_worker(wt, "Q")  # two live -> live(2) > desired(1)
+    rc = cli.cmd_claim(_claim_ns("Q", "q-live-0", json_out=True))
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert json.loads(out) == {"stop": True}
+
+
+def test_claim_empty_queue_surplus_worker_stops_text(wt, capsys):
+    cli = _reloaded_cli(wt)
+    wt.config.set_auto_drain("Q", True)
+    _live_worker(wt, "Q")
+    _live_worker(wt, "Q")
+    rc = cli.cmd_claim(_claim_ns("Q", "q-live-0", json_out=False))
+    assert rc == 0
+    assert "STOP: surplus" in capsys.readouterr().out
+
+
+def test_claim_empty_queue_at_desired_stays_warm(wt, capsys):
+    """live<=desired: no surplus -> worker stays warm, no stop emitted."""
+    cli = _reloaded_cli(wt)
+    wt.config.set_auto_drain("Q", True)  # desired 1
+    _live_worker(wt, "Q")  # exactly desired
+    rc = cli.cmd_claim(_claim_ns("Q", "q-live-0", json_out=False))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "nothing open in Q" in out
+    assert "STOP" not in out
+
+
+def test_claim_empty_queue_drain_off_stays_warm(wt, capsys):
+    """auto_drain off -> desired 0, but a lone live worker is still not stopped
+    unless it is actually surplus; here live(1)>desired(0) so it does stop."""
+    cli = _reloaded_cli(wt)
+    wt.config.set_auto_drain("Q", False)  # desired 0
+    _live_worker(wt, "Q")  # live(1) > desired(0) -> surplus
+    rc = cli.cmd_claim(_claim_ns("Q", "q-live-0", json_out=True))
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out.strip()) == {"stop": True}
 
 
 # ====================================================================== FIFO push

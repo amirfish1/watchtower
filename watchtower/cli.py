@@ -236,6 +236,23 @@ def cmd_claim(args: argparse.Namespace) -> int:
             readiness_filters=getattr(args, "readiness", None) or [],
         )
         if not item:
+            # Nothing claimable. Decide surplus HERE, at claim time, when the real
+            # current state is known — not on the reconciler's future-guessing
+            # count. A worker is surplus only if more workers are live than the
+            # queue wants; then it exits itself. Otherwise it stays warm (its next
+            # `wt add` nudge wakes it) and REAP handles a persistently-idle one.
+            from . import config
+            desired = config.desired_workers(args.queue) if config.auto_drain(args.queue) else 0
+            live = workers.live_worker_count(args.queue)
+            if live > desired:
+                from watchtower.queue import _log
+                _log("STOP", f"{worker} — surplus at claim ({live}>{desired} desired)",
+                     queue=args.queue)
+                if args.json:
+                    print(json.dumps({"stop": True}))
+                else:
+                    print("STOP: surplus worker (live>desired); exiting")
+                return 0
             print(f"(nothing open in {args.queue})")
             return 0
         # Stop signal: reconciler asked this worker to wind down.
