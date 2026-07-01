@@ -310,6 +310,19 @@ the queue file alone, with no dependency on any external liveness signal.
 - **Tap-to-act / buttons** — claim, close, or requeue tickets from the dashboard UI.
 - **Cost / token tracking** — per-queue and per-worker spend.
 - **Push notifications** — alert on a queue going stuck or draining.
+- **Cross-queue ticket lookup** (`wt find <ref>`) plus an MCP server built on
+  it, so any agent harness can resolve a ref like `HERMES-20` without first
+  knowing which queue it lives in — see
+  [`docs/agent-discovery.md`](docs/agent-discovery.md) for the full option
+  comparison.
+
+## More docs
+
+- [`docs/worker-lifecycle.md`](docs/worker-lifecycle.md) — vocabulary, service
+  lifecycle, worker lifecycle.
+- [`docs/agent-discovery.md`](docs/agent-discovery.md) — how an agent session
+  (Claude Code, Codex, etc.) outside this repo can discover and query
+  WatchTower; 4 options compared with a recommendation.
 
 ## License
 
