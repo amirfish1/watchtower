@@ -67,6 +67,25 @@ VALID_STATUSES = ("open", "in_progress", "closed")
 VALID_LANES = ("normal", "express")
 
 VALID_ITEM_TYPES = ("bug", "feature", "")
+# An item with no (or unknown) type is a bug by default. A ticket filed without
+# a type must never silently vanish from a type-restricted queue (e.g. a
+# bugs-only queue): the safe default is the actionable one, so untyped work
+# still gets claimed. This is the single source of truth for "effective type".
+DEFAULT_ITEM_TYPE = "bug"
+
+
+def effective_type(it_or_value: Any) -> str:
+    """The effective type of an item (or a raw type value): its declared type
+    if it is a known type, else :data:`DEFAULT_ITEM_TYPE` ("bug").
+
+    Accepts either an item dict or a bare type string so it can be used both
+    on stored tickets and on values being written."""
+    if isinstance(it_or_value, dict):
+        raw = it_or_value.get("item_type") or it_or_value.get("type")
+    else:
+        raw = it_or_value
+    s = str(raw or "").strip().lower()
+    return s if s in ("bug", "feature") else DEFAULT_ITEM_TYPE
 VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "")
 VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
 VALID_VALUES = ("H", "M", "L", "")
@@ -291,8 +310,8 @@ def _prio_rank(it: Dict[str, Any]) -> int:
 
 
 def _type_rank(it: Dict[str, Any]) -> int:
-    """Bugs before features within same priority tier."""
-    return {"bug": 0, "feature": 1}.get(it.get("item_type") or it.get("type", ""), 2)
+    """Bugs before features within same priority tier. Untyped == bug."""
+    return {"bug": 0, "feature": 1}.get(effective_type(it), 2)
 
 
 def _clip(value: Any, max_len: int) -> str:
@@ -345,7 +364,7 @@ def enqueue(
             "selector": _clip(selector, 1000),
             "screenshot_path": str(screenshot_path or ""),
             "repo_path": str(repo_path or ""),
-            "type": _norm_choice(item_type, VALID_ITEM_TYPES),
+            "type": effective_type(item_type),
             "readiness": _norm_choice(readiness, VALID_READINESS),
             "priority": _norm_choice(priority, VALID_PRIORITIES),
             "value": _norm_choice(value, VALID_VALUES),
@@ -505,7 +524,7 @@ def claim_next(
         if item_types:
             candidates = [
                 it for it in candidates
-                if (it.get("item_type") or it.get("type", "")) in item_types
+                if effective_type(it) in item_types
             ]
         # Resolve the stop signal now that we know whether claimable work exists.
         # Either way the signal is consumed (one-shot). If nothing is claimable,

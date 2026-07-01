@@ -110,7 +110,7 @@ def queue_status(
     if claim_types:
         claimable_depth = sum(
             1 for it in open_items
-            if str(it.get("type") or it.get("item_type") or "") in claim_types
+            if q.effective_type(it) in claim_types  # untyped == bug, matches claim filter
         )
     else:
         claimable_depth = depth

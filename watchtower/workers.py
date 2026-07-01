@@ -829,7 +829,7 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             if it.get("status") != "open":
                 continue
             qn = str(it.get("project") or "")
-            ty = str(it.get("type") or it.get("item_type") or "")
+            ty = _q.effective_type(it)  # untyped == bug, matches claim filter
             _open_by_q_type[(qn, ty)] = _open_by_q_type.get((qn, ty), 0) + 1
     except Exception:
         _open_by_q_type = {}
