@@ -749,6 +749,28 @@ def _daemon_loop(args: argparse.Namespace) -> None:
 
 def cmd_start(args: argparse.Namespace) -> int:
     dry_run = getattr(args, "dry_run", False)
+    # Prefer launchd supervision: if a plist exists, start THROUGH launchd so
+    # there is exactly ONE supervised daemon (KeepAlive relaunches it on crash).
+    # A manual background `wt start` would create a second, unsupervised daemon,
+    # which is exactly the bug that made the live service unreliable. Guard: the
+    # --foreground path is what the plist itself invokes, so it must run the loop
+    # directly and NOT re-enter launchctl (that would recurse forever); likewise
+    # --dry-run stays a pure in-process run.
+    if not args.foreground and not dry_run and _LAUNCHAGENT_PLIST.exists():
+        target = _launchd_domain_target()
+        if _launchagent_loaded():
+            # Already bootstrapped: (re)start the existing service in place.
+            rc = os.system(f"launchctl kickstart -k '{target}' 2>/dev/null") >> 8
+            action = "restarted"
+        else:
+            rc = os.system(
+                f"launchctl bootstrap gui/{os.getuid()} '{_LAUNCHAGENT_PLIST}' 2>/dev/null"
+            ) >> 8
+            action = "started"
+        if rc == 0:
+            print(f"{action} LaunchAgent {_LAUNCHAGENT_LABEL} (launchd-supervised)")
+            return 0
+        print(f"warning: launchctl exited {rc}; falling back to manual start")
     if not dry_run and DAEMON_PID_FILE.exists():
         try:
             pid = int(DAEMON_PID_FILE.read_text().strip())
@@ -803,6 +825,20 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
+    # With KeepAlive=true, a raw SIGTERM to the pid is immediately undone by
+    # launchd (it relaunches the daemon). So an INTENTIONAL stop of a launchd-
+    # supervised daemon must tell launchd to stop-and-stay-stopped via `bootout`.
+    # Only fall back to the pidfile+SIGTERM path for a manually-started daemon
+    # (dev machines that never ran `wt install`).
+    if _LAUNCHAGENT_PLIST.exists() and _launchagent_loaded():
+        rc = _launchctl_bootout()
+        if rc == 0:
+            print(f"stopped LaunchAgent {_LAUNCHAGENT_LABEL} (launchd will not relaunch)")
+            # The launchd-owned daemon owns the pidfile; clear it so a later
+            # `wt start`/status doesn't see a stale pid.
+            DAEMON_PID_FILE.unlink(missing_ok=True)
+            return 0
+        print(f"warning: launchctl bootout exited {rc}; falling back to signal")
     if not DAEMON_PID_FILE.exists():
         print("watcher not running")
         return 0
@@ -827,20 +863,80 @@ _LAUNCHAGENT_LABEL = "ai.watchtower.watcher"
 _LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
 
 
+def _launchd_path() -> str:
+    """Build a PATH the launchd-spawned daemon can actually use.
+
+    launchd starts LaunchAgents with a minimal PATH (roughly /usr/bin:/bin:
+    /usr/sbin:/sbin). The daemon shells out to gh/git/claude/codex (e.g. the
+    GitHub backend runs `gh issue list`), so with the minimal PATH those tools
+    are not found and the worker crashes. We capture the INSTALLING shell's real
+    PATH (which already contains the user's tool locations) and additionally
+    guarantee the usual Homebrew and user-local bins are present, then ensure the
+    system dirs are on the tail. De-duped, order preserved."""
+    prepend = [
+        os.path.expanduser("~/.local/bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ]
+    current = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p]
+    system = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+    ordered: List[str] = []
+    seen = set()
+    for p in prepend + current + system:
+        if p and p not in seen:
+            seen.add(p)
+            ordered.append(p)
+    return os.pathsep.join(ordered)
+
+
+def _launchd_domain_target() -> str:
+    """The modern launchctl service target: gui/<uid>/<label>."""
+    return f"gui/{os.getuid()}/{_LAUNCHAGENT_LABEL}"
+
+
+def _launchagent_loaded() -> bool:
+    """Best-effort check for whether the LaunchAgent is bootstrapped.
+
+    `launchctl print gui/<uid>/<label>` exits 0 when the service is known to the
+    domain and nonzero otherwise. Never raises: if launchctl is absent we treat
+    the agent as not loaded so callers fall back to the manual path."""
+    rc = os.system(f"launchctl print '{_launchd_domain_target()}' >/dev/null 2>&1")
+    return rc == 0
+
+
+def _launchctl_bootout() -> int:
+    """Stop-and-stay-stopped: remove the service from the gui domain.
+
+    Returns the launchctl exit status (0 = success). Uses `bootout` rather than
+    the deprecated `unload` so it composes with `bootstrap`/`kickstart`."""
+    return os.system(
+        f"launchctl bootout 'gui/{os.getuid()}/{_LAUNCHAGENT_LABEL}' 2>/dev/null"
+    ) >> 8
+
+
 def cmd_install(args: argparse.Namespace) -> int:
     """Write a LaunchAgent plist so the WT service starts automatically on login.
 
     Writes the plist unconditionally (so it's ready), but only loads it into
     launchctl if at least one queue has auto-drain enabled — otherwise the
-    service would start for no reason."""
+    service would start for no reason.
+
+    The generated plist is HARDENED against three production failures we hit:
+      1. ProgramArguments used a bare `wt` shim, but launchd's minimal PATH could
+         not resolve it, so the spawn failed (exit 78) and launchd's copy of the
+         daemon never ran. We now use `sys.executable -m watchtower.cli`, i.e. an
+         absolute interpreter path that has watchtower installed, no shim needed.
+      2. KeepAlive was false, so launchd never relaunched a dead or killed
+         daemon. It is now true; launchd supervises and restarts on crash/kill.
+      3. No PATH env, so once running the daemon could not find gh/git/claude/
+         codex. We now inject a real PATH via EnvironmentVariables (see
+         _launchd_path)."""
     from . import config as _cfg
-    import shutil
-    python = shutil.which("wt") or sys.executable
-    if shutil.which("wt"):
-        program_args = ["wt", "start", "--foreground", "--auto-spawn"]
-    else:
-        program_args = [sys.executable, "-m", "watchtower.cli", "start",
-                        "--foreground", "--auto-spawn"]
+    # Robust invocation: an absolute interpreter path plus the module form means
+    # there is no dependence on a `wt` shim being on launchd's minimal PATH.
+    program_args = [sys.executable, "-m", "watchtower.cli",
+                    "start", "--foreground", "--auto-spawn"]
+    launchd_path = _launchd_path()
     plist = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -855,7 +951,12 @@ def cmd_install(args: argparse.Namespace) -> int:
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <false/>
+  <true/>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{launchd_path}</string>
+  </dict>
   <key>StandardOutPath</key>
   <string>{Path.home()}/.watchtower/watcher.log</string>
   <key>StandardErrorPath</key>
