@@ -197,6 +197,13 @@ def all_status(
     """
     now = now or datetime.now(timezone.utc)
     by_queue: Dict[str, List[Dict[str, Any]]] = {}
+    configured = config.all_queues()
+    if project:
+        if project in configured:
+            by_queue.setdefault(project, [])
+    else:
+        for name in configured:
+            by_queue.setdefault(name, [])
     for it in q.list_items(project=project):
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
     rows = [

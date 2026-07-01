@@ -148,6 +148,24 @@ def test_auto_drain_config(tmp_path, monkeypatch):
     assert config.auto_drain("BACKLOG") is False
 
 
+def test_configured_empty_queue_appears_in_status(tmp_path, monkeypatch):
+    """A queue with config but zero tickets should still show in wt status."""
+    monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "queue.json"))
+    monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "qc.json"))
+    import watchtower.config as config
+    import watchtower.health as health
+    import watchtower.queue as q
+    importlib.reload(config)
+    importlib.reload(q)
+    importlib.reload(health)
+
+    config.set_repo_path("EMPTYCFG", "/tmp/emptycfg")
+
+    row = {r["queue"]: r for r in health.all_status()}["EMPTYCFG"]
+    assert row["depth"] == 0
+    assert row["state"] == "clear"
+
+
 def test_cli_enqueue_and_status(store, capsys):
     from watchtower.cli import main
 
