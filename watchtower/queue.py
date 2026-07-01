@@ -674,6 +674,7 @@ def update_status(
     session_id: str = "",
     session_uuid: str = "",
     resolution: Any = None,
+    quiet: bool = False,
 ) -> Optional[Dict[str, Any]]:
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {VALID_STATUSES}")
@@ -728,7 +729,12 @@ def update_status(
                     elif isinstance(res, str):
                         summary = res
                 detail = f"{it.get('ref', '?')} — {summary or it.get('title') or it.get('note', '')[:60]}"
-                _log(verb, detail, queue=it.get('project', ''))
+                # ``quiet`` suppresses this primitive transition line when the
+                # caller emits its own higher-level log for the same event (e.g.
+                # the orphan sweep logs REQUEUE and owns the single line — see
+                # requeue_orphaned_tickets), avoiding a duplicate REOPEN.
+                if not quiet:
+                    _log(verb, detail, queue=it.get('project', ''))
                 return it
     return None
 

@@ -656,7 +656,10 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
                 pass
         ref = it.get("ref")
         try:
-            item = _q.update_status(ref, "open")
+            # quiet=True: the reconciler emits the single REQUEUE line for this
+            # event, so suppress update_status's primitive REOPEN to avoid a
+            # duplicate log entry at the same timestamp.
+            item = _q.update_status(ref, "open", quiet=True)
             if item:
                 reopened.append(item)
         except Exception:
