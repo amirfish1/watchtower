@@ -87,6 +87,7 @@ def queue_status(
     stuck_minutes: int = STUCK_MINUTES,
     drain_window_minutes: int = DRAIN_WINDOW_MINUTES,
     auto_drain: bool = True,
+    claim_types: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Compute the status row for a single queue from its items.
 
@@ -94,13 +95,25 @@ def queue_status(
     the raw ``stuck`` ground-truth: a queue that's opted out of auto-drain
     (a prioritization backlog) reports ``state="backlog"`` — calm, expected —
     instead of ``state="stuck"`` (alarm), so a parking lot isn't mistaken for a
-    fire. ``stuck`` itself stays true to the queue so nothing is hidden."""
+    fire. ``stuck`` itself stays true to the queue so nothing is hidden.
+
+    ``claim_types`` (the queue's type restriction, e.g. ``['bug']``) gates
+    ``stuck`` on *claimable* depth, not raw depth: a bug-only queue whose open
+    tickets are all features has open work but ZERO claimable work, so the
+    drainer sitting idle is correct — ``state="backlog"``, never ``stuck``."""
     now = now or datetime.now(timezone.utc)
     open_items = [it for it in items if it.get("status") == "open"]
     in_progress = [it for it in items if it.get("status") == "in_progress"]
     closed = [it for it in items if it.get("status") == "closed"]
 
     depth = len(open_items)
+    if claim_types:
+        claimable_depth = sum(
+            1 for it in open_items
+            if str(it.get("type") or it.get("item_type") or "") in claim_types
+        )
+    else:
+        claimable_depth = depth
     oldest_created = min(
         (it.get("created_at") for it in open_items if it.get("created_at")),
         default=None,
@@ -117,7 +130,7 @@ def queue_status(
     since_progress = _age_seconds(progress_ref, now)
 
     stuck = bool(
-        depth > 0
+        claimable_depth > 0
         and since_progress is not None
         and since_progress >= stuck_minutes * 60
     )
@@ -143,6 +156,8 @@ def queue_status(
     # Display state, derived from raw `stuck` + the queue's auto_drain policy.
     if depth == 0:
         state = "clear"
+    elif claimable_depth == 0:
+        state = "backlog"   # open items exist but all filtered out by claim_types — parked
     elif stuck and not auto_drain:
         state = "backlog"   # opted out: non-empty is normal, not an alarm
     elif stuck:
@@ -153,6 +168,7 @@ def queue_status(
     return {
         "queue": project,
         "depth": depth,
+        "claimable_depth": claimable_depth,
         "in_progress": len(in_progress),
         "closed": len(closed),
         "oldest_open_age_s": oldest_open_age,
@@ -191,6 +207,7 @@ def all_status(
             stuck_minutes=stuck_minutes,
             drain_window_minutes=drain_window_minutes,
             auto_drain=config.auto_drain(name),
+            claim_types=config.claim_types(name),
         )
         for name, items in by_queue.items()
     ]
