@@ -310,9 +310,11 @@ the queue file alone, with no dependency on any external liveness signal.
 - **Tap-to-act / buttons** — claim, close, or requeue tickets from the dashboard UI.
 - **Cost / token tracking** — per-queue and per-worker spend.
 - **Push notifications** — alert on a queue going stuck or draining.
-- **Cross-queue ticket lookup** (`wt find <ref>`) plus an MCP server built on
-  it, so any agent harness can resolve a ref like `HERMES-20` without first
-  knowing which queue it lives in — see
+- **Cross-queue ticket lookup** (`wt find <ref>`) plus a `watchtower` skill
+  for Claude Code and Codex (both harnesses, one source), so any agent
+  session can resolve a ref like `HERMES-20` — regardless of which repo
+  it's rooted in — without first knowing which queue it lives in. An MCP
+  server is the longer-term structured-API follow-up. See
   [`docs/agent-discovery.md`](docs/agent-discovery.md) for the full option
   comparison.
 
