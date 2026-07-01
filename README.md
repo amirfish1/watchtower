@@ -88,6 +88,26 @@ wt dashboard                           # open the night-watch dashboard (non-blo
 wt dashboard --no-open                 # ensure the server is up, don't open a browser
 ```
 
+### GitHub Issues backend (optional)
+
+A queue can use GitHub Issues instead of the local JSON queue file. WatchTower
+still exposes the same commands; behind the scenes `wt add` creates an issue,
+`wt claim` assigns it, and `wt close` closes it with a resolution comment.
+
+```bash
+gh auth login
+wt set -q MYAPP --backend github --github-repo owner/repo
+
+wt add -q MYAPP --title "Fix checkout" --text "Steps to reproduce..."
+wt claim -q MYAPP --worker worker-1
+wt close MYAPP-123 --worker worker-1 --summary "fixed the null state"
+```
+
+GitHub-backed refs use the issue number (`MYAPP-123` is issue `#123`). The
+backend creates and uses the `watchtower:<QUEUE>` label to identify that queue's
+issues. Claims assign the issue to `@me` by default; override with
+`wt set -q MYAPP --github-assignee USERNAME`.
+
 `wt status` shows, per queue, depth (open) / WIP / done, oldest-open age, idle
 time, a `WORKERS` column (`total (n live)`), and a STUCK/draining/ok flag,
 followed by a **drain readout** (`~3/min · empty in ~20m`, or `stalled` when no

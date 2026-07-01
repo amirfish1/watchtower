@@ -236,6 +236,50 @@ def _project_for(source: str = "", repo_path: str = "", project: str = "") -> st
     return src or "GEN"
 
 
+def _project_from_ident(ident: Any) -> str:
+    """Extract the queue prefix from a human ref like ``WT-20``."""
+    s = str(ident or "").strip()
+    m = _re.match(r"^([A-Za-z0-9_-]+)-\d+$", s)
+    return _norm_project(m.group(1)) if m else ""
+
+
+def _github_backend_for_project(project: Any):
+    """Return a GitHub backend for ``project`` when that queue is configured.
+
+    The file-backed JSON store remains the default. A queue opts into GitHub via
+    config.backend(queue) == "github"; then this module's public API delegates
+    add/list/get/claim/close to GitHub Issues.
+    """
+    proj = _norm_project(project)
+    if not proj:
+        return None
+    try:
+        from . import config
+        if config.backend(proj) != "github":
+            return None
+        from .github_backend import GitHubIssuesBackend
+        return GitHubIssuesBackend(
+            proj,
+            repo=config.github_repo(proj),
+            repo_path=config.repo_path(proj),
+            assignee=config.github_assignee(proj),
+        )
+    except Exception:
+        raise
+
+
+def _github_projects() -> List[str]:
+    try:
+        from . import config
+        return [
+            _norm_project(name)
+            for name in config.all_queues()
+            if config.backend(name) == "github"
+        ]
+    except Exception:
+        return []
+
+
 def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Ensure every item has project/seq/ref. Deterministic + idempotent: refs
     are assigned per-queue in global-number order, so they stay stable as long
@@ -345,6 +389,27 @@ def enqueue(
         raise ValueError("note or text is required")
     lane = lane if lane in VALID_LANES else "normal"
     proj = _project_for(source, repo_path, project)
+    backend = _github_backend_for_project(proj)
+    if backend is not None:
+        saved = backend.enqueue(
+            note=note,
+            text=text,
+            source=source,
+            annotation_id=annotation_id,
+            url=url,
+            title=title,
+            selector=selector,
+            screenshot_path=screenshot_path,
+            repo_path=repo_path,
+            lane=lane,
+            item_type=item_type,
+            readiness=readiness,
+            priority=priority,
+            value=value,
+            confidence=confidence,
+        )
+        _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
+        return saved
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         data["counter"] = int(data.get("counter", 0)) + 1
@@ -391,8 +456,18 @@ def list_items(
     lane: Optional[str] = None,
     project: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
+    if project:
+        backend = _github_backend_for_project(project)
+        if backend is not None:
+            return backend.list_items(status=status, lane=lane)
     data = _load_unlocked()
     items = data.get("items", [])
+    github_projects = set(_github_projects()) if not project else set()
+    if github_projects:
+        items = [
+            it for it in items
+            if _norm_project(it.get("project") or "") not in github_projects
+        ]
     if status:
         items = [it for it in items if it.get("status") == status]
     if lane:
@@ -400,13 +475,18 @@ def list_items(
     if project:
         proj = _norm_project(project)
         items = [it for it in items if it.get("project") == proj]
+    if not project:
+        for gh_project in github_projects:
+            backend = _github_backend_for_project(gh_project)
+            if backend is not None:
+                items.extend(backend.list_items(status=status, lane=lane))
     return items
 
 
 def queues() -> Dict[str, Dict[str, int]]:
     """Per-queue counts: ``{queue: {open, in_progress, closed, total}}``."""
     out: Dict[str, Dict[str, int]] = {}
-    for it in _load_unlocked().get("items", []):
+    for it in list_items():
         proj = it.get("project") or "GEN"
         row = out.setdefault(
             proj, {"open": 0, "in_progress": 0, "closed": 0, "total": 0}
@@ -419,6 +499,9 @@ def queues() -> Dict[str, Dict[str, int]]:
 
 
 def get(ident: Any) -> Optional[Dict[str, Any]]:
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        return backend.get(ident)
     for it in _load_unlocked().get("items", []):
         if _matches(it, ident):
             return it
@@ -439,6 +522,9 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     ``item_type`` and ``"type"`` are aliases — both are stored as ``"type"``.
     Returns the updated item, or None if not found.
     """
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        return backend.update(ident, **fields)
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "title", "url", "selector", "screenshot_path", "repo_path",
@@ -490,6 +576,20 @@ def claim_next(
     """
     if not session_id:
         raise ValueError("session_id is required")
+    backend = _github_backend_for_project(project)
+    if backend is not None:
+        item = backend.claim_next(
+            session_id,
+            lane=lane,
+            session_uuid=session_uuid,
+            shaping=shaping,
+            oldest=oldest,
+            item_types=item_types,
+            readiness_filters=readiness_filters,
+        )
+        if item and not item.get("stop"):
+            _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
+        return item
 
     # A reconciler stop signal means "wind down — you're not needed". But it is
     # only honored when there is genuinely nothing for this worker to claim:
@@ -574,6 +674,12 @@ def claim_by_ref(
     """
     if not session_id:
         raise ValueError("session_id is required")
+    backend = _github_backend_for_project(_project_from_ident(ref))
+    if backend is not None:
+        item = backend.claim_by_ref(ref, session_id, session_uuid=session_uuid)
+        if item:
+            _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
+        return item
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
@@ -602,6 +708,9 @@ def peek_next(
 
     Uses the same smart sort as claim_next (priority → type → age).
     Returns None when nothing is open and claimable."""
+    backend = _github_backend_for_project(project)
+    if backend is not None:
+        return backend.peek_next(lane=lane)
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
         data = _load_unlocked()
@@ -697,6 +806,29 @@ def update_status(
 ) -> Optional[Dict[str, Any]]:
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {VALID_STATUSES}")
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        item = backend.update_status(
+            ident,
+            status,
+            session_id=session_id,
+            session_uuid=session_uuid,
+            resolution=resolution,
+        )
+        if item:
+            verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
+            verb = verbs.get(status, status.upper())
+            summary = ""
+            if status == "closed":
+                res = item.get("resolution") or {}
+                if isinstance(res, dict):
+                    summary = res.get("summary", "")
+                elif isinstance(res, str):
+                    summary = res
+            detail = f"{item.get('ref', '?')} — {summary or item.get('title') or item.get('note', '')[:60]}"
+            if not quiet:
+                _log(verb, detail, queue=item.get('project', ''))
+        return item
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
@@ -877,9 +1009,12 @@ def last_progress_iso(project: Optional[str] = None) -> Optional[str]:
 
     This is the ground-truth "did a worker make progress" signal that drives
     the stuck-queue health check — no dependency on any external liveness."""
+    backend = _github_backend_for_project(project)
+    if backend is not None:
+        return backend.last_progress_iso()
     proj = _norm_project(project) if project else None
     latest: Optional[str] = None
-    for it in _load_unlocked().get("items", []):
+    for it in list_items(project=project):
         if proj and it.get("project") != proj:
             continue
         ca = it.get("closed_at")

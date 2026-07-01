@@ -17,6 +17,8 @@ import os
 from pathlib import Path
 from typing import Any, Dict
 
+VALID_BACKENDS = ("file", "github")
+
 CONFIG_FILE = Path(
     os.environ.get("WATCHTOWER_CONFIG_FILE")
     or (Path.home() / ".watchtower" / "queue-config.json")
@@ -42,6 +44,57 @@ def _save(data: Dict[str, Any]) -> None:
 
 def get_queue_config(queue: str) -> Dict[str, Any]:
     return dict(_load().get(queue, {}))
+
+
+def set_backend(queue: str, backend: str) -> Dict[str, Any]:
+    backend = str(backend or "file").strip().lower()
+    if backend not in VALID_BACKENDS:
+        raise ValueError(f"backend must be one of {VALID_BACKENDS}")
+    data = _load()
+    q = data.setdefault(queue, {})
+    if backend == "file":
+        q.pop("backend", None)
+    else:
+        q["backend"] = backend
+    _save(data)
+    return q
+
+
+def backend(queue: str) -> str:
+    value = str(_load().get(queue, {}).get("backend") or "file").strip().lower()
+    return value if value in VALID_BACKENDS else "file"
+
+
+def set_github_repo(queue: str, repo: str) -> Dict[str, Any]:
+    data = _load()
+    q = data.setdefault(queue, {})
+    repo = str(repo or "").strip()
+    if repo:
+        q["github_repo"] = repo
+    else:
+        q.pop("github_repo", None)
+    _save(data)
+    return q
+
+
+def github_repo(queue: str) -> str:
+    return str(_load().get(queue, {}).get("github_repo") or "")
+
+
+def set_github_assignee(queue: str, assignee: str) -> Dict[str, Any]:
+    data = _load()
+    q = data.setdefault(queue, {})
+    assignee = str(assignee or "").strip()
+    if assignee:
+        q["github_assignee"] = assignee
+    else:
+        q.pop("github_assignee", None)
+    _save(data)
+    return q
+
+
+def github_assignee(queue: str) -> str:
+    return str(_load().get(queue, {}).get("github_assignee") or "@me")
 
 
 def set_auto_drain(queue: str, enabled: bool) -> Dict[str, Any]:
@@ -156,7 +209,10 @@ def migrate_from_registry() -> int:
     count = 0
     for name, rec in reg.items():
         entry = data.setdefault(name, {})
-        for key in ("auto_drain", "engine", "desired_workers", "repo_path"):
+        for key in (
+            "auto_drain", "engine", "desired_workers", "repo_path",
+            "backend", "github_repo", "github_assignee",
+        ):
             if key in rec and key not in entry:
                 entry[key] = rec[key]
         count += 1

@@ -504,6 +504,19 @@ def cmd_set(args: argparse.Namespace) -> int:
     """Set queue-level config (repo_path, engine, desired_workers, etc.)."""
     from . import config
     changed = []
+    if args.backend is not None:
+        try:
+            config.set_backend(args.queue, args.backend)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        changed.append(f"backend={config.backend(args.queue)}")
+    if args.github_repo is not None:
+        config.set_github_repo(args.queue, args.github_repo)
+        changed.append(f"github_repo={args.github_repo}")
+    if args.github_assignee is not None:
+        config.set_github_assignee(args.queue, args.github_assignee)
+        changed.append(f"github_assignee={config.github_assignee(args.queue)}")
     if args.repo_path is not None:
         config.set_repo_path(args.queue, args.repo_path)
         changed.append(f"repo_path={args.repo_path}")
@@ -1026,6 +1039,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("set", help="set queue-level config (repo_path, engine, workers)")
     s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--backend", default=None, choices=["file", "github"],
+                   help="queue backing store: file (default) or github")
+    s.add_argument("--github-repo", default=None, dest="github_repo",
+                   help="GitHub repo for --backend github, as OWNER/REPO")
+    s.add_argument("--github-assignee", default=None, dest="github_assignee",
+                   help="assignee used by GitHub-backed claims (default: @me)")
     s.add_argument("--repo-path", default=None, dest="repo_path",
                    help="default cwd for workers spawned on this queue")
     s.add_argument("--engine", default=None, choices=["claude", "codex"],

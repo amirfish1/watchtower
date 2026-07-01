@@ -235,10 +235,12 @@ def test_request_stop_makes_claim_return_stop(wt):
     wt.q.enqueue(project="Q", note="work")
     wt.workers.request_stop("w-stopme")
     item = wt.q.claim_next("w-stopme", project="Q")
-    assert item.get("stop") is True
-    # Signal is consumed: a second claim now returns the real ticket.
-    nxt = wt.q.claim_next("w-stopme", project="Q")
-    assert nxt and nxt.get("ref")
+    assert item and item.get("ref") == "Q-1"
+    # Signal is consumed but ignored because work was claimable; this avoids
+    # orphaning a ticket filed just after a drained-window STOP was dropped.
+    assert not (wt.workers.STOP_SIGNALS_DIR / "w-stopme").exists()
+    wt.workers.request_stop("w-stopme")
+    assert wt.q.claim_next("w-stopme", project="Q") == {"stop": True}
 
 
 # =========================================================== tracking & cleanup

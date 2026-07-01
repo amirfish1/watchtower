@@ -765,7 +765,7 @@ def test_priority_sort_in_claim(store):
 
 def test_stop_signal_file(store, tmp_path, monkeypatch):
     """request_stop(worker_id) creates a sentinel file; claim_next for that
-    worker_id deletes the file and returns {"stop": True} instead of a ticket."""
+    worker_id consumes stale STOP only after deciding if work is claimable."""
     import importlib
 
     monkeypatch.setenv("WATCHTOWER_STOP_SIGNALS_DIR", str(tmp_path / "stop-signals"))
@@ -780,13 +780,19 @@ def test_stop_signal_file(store, tmp_path, monkeypatch):
     # The file must exist immediately after request_stop().
     assert signal_path.exists(), "stop signal file was not created"
 
-    # Queue has an open ticket, but the stop signal takes priority.
+    # Queue has an open ticket, so a stale STOP must be consumed but ignored:
+    # otherwise a ticket filed just after a drain window can be orphaned.
     q.enqueue(project="STOPQ", note="pending work")
     result = q.claim_next(worker_id, project="STOPQ")
 
-    assert result == {"stop": True}, f"expected stop sentinel, got {result}"
+    assert result["ref"] == "STOPQ-1"
+    assert result["status"] == "in_progress"
     # File must have been consumed (deleted) by claim_next.
     assert not signal_path.exists(), "stop signal file was not cleaned up"
-    # The ticket must still be open (not claimed).
     item = q.get("STOPQ-1")
-    assert item["status"] == "open"
+    assert item["status"] == "in_progress"
+
+    # With no claimable work, STOP is honored.
+    signal_path = workers.request_stop(worker_id)
+    assert q.claim_next(worker_id, project="STOPQ") == {"stop": True}
+    assert not signal_path.exists(), "stop signal file was not cleaned up"
