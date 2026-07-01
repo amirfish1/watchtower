@@ -836,11 +836,15 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     # pass, keyed by (queue, type).
     from . import queue as _q
     _open_by_q_type: Dict[tuple, int] = {}
+    _total_open_by_q: Dict[str, int] = {}
     try:
         for it in (_q.list_items() or []):
             if it.get("status") != "open":
                 continue
             qn = str(it.get("project") or "")
+            _total_open_by_q[qn] = _total_open_by_q.get(qn, 0) + 1
+            if not it.get("claimable", True):
+                continue
             ty = _q.effective_type(it)  # untyped == bug, matches claim filter
             _open_by_q_type[(qn, ty)] = _open_by_q_type.get((qn, ty), 0) + 1
     except Exception:
@@ -848,10 +852,11 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
 
     def _claimable_depth(qn: str) -> tuple:
         """Return (claimable_open, total_open) for a queue, honoring claim_types."""
-        total = sum(v for (q2, _t), v in _open_by_q_type.items() if q2 == qn)
+        total = _total_open_by_q.get(qn, 0)
         types = config.claim_types(qn)
         if not types:
-            return total, total
+            claimable = sum(v for (q2, _t), v in _open_by_q_type.items() if q2 == qn)
+            return claimable, total
         claimable = sum(v for (q2, t), v in _open_by_q_type.items()
                         if q2 == qn and t in types)
         return claimable, total

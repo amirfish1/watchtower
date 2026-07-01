@@ -264,11 +264,12 @@ class GitHubIssuesBackend:
         body, meta = _split_body(str(issue.get("body") or ""))
         labels = _label_names(issue.get("labels"))
         assignees = _assignee_logins(issue.get("assignees"))
+        queue_member = self.queue_label in labels
         number = int(issue.get("number") or 0)
         state = str(issue.get("state") or "").upper()
         if state == "CLOSED":
             status = "closed"
-        elif assignees or self.in_progress_label in labels:
+        elif queue_member and (meta.get("claimed_by") or self.in_progress_label in labels):
             status = "in_progress"
         else:
             status = "open"
@@ -303,13 +304,21 @@ class GitHubIssuesBackend:
             "confidence": _norm_choice(meta.get("confidence", ""), VALID_CONFIDENCES),
             "needs_input": bool(meta.get("needs_input", False)),
             "block_question": str(meta.get("block_question") or ""),
-            "claimed_by": meta.get("claimed_by") or (",".join(assignees) if assignees else None),
+            "claimed_by": (
+                meta.get("claimed_by")
+                or (",".join(assignees) if queue_member and status == "in_progress" and assignees else None)
+            ),
             "claimed_at": meta.get("claimed_at"),
             "closed_at": issue.get("closedAt") or meta.get("closed_at"),
             "claimed_session_id": meta.get("claimed_session_id"),
             "created_at": issue.get("createdAt") or _now_iso(),
             "updated_at": issue.get("updatedAt") or issue.get("createdAt") or _now_iso(),
             "github_repo": self.repo,
+            "github_labels": labels,
+            "github_assignees": assignees,
+            "watchtower_label": self.queue_label,
+            "watchtower_runnable": bool(queue_member),
+            "claimable": bool(queue_member and status == "open"),
             "_github_body": str(issue.get("body") or ""),
         }
         if status == "closed":
@@ -318,12 +327,11 @@ class GitHubIssuesBackend:
             item["resolution"] = resolution
         return item
 
-    def _list_issues(self, state: str = "all") -> List[Dict[str, Any]]:
+    def _list_issues(self, state: str = "open") -> List[Dict[str, Any]]:
         raw = self._run([
             "issue", "list",
             *self._repo_args(),
             "--state", state,
-            "--label", self.queue_label,
             "--json", "number,title,body,state,url,assignees,labels,createdAt,updatedAt,closedAt",
             "--limit", "1000",
         ])
@@ -408,17 +416,28 @@ class GitHubIssuesBackend:
         status: Optional[str] = None,
         lane: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        gh_state = "all"
         if status == "closed":
-            gh_state = "closed"
-        elif status in ("open", "in_progress"):
-            gh_state = "open"
-        items = [self._issue_to_item(issue) for issue in self._list_issues(gh_state)]
+            return []
+        items = [self._issue_to_item(issue) for issue in self._list_issues("open")]
         if status:
             items = [it for it in items if it.get("status") == status]
         if lane:
             items = [it for it in items if it.get("lane") == lane]
         return sorted(items, key=lambda it: int(it.get("number", 0)))
+
+    def mark_runnable(self, ident: Any) -> Optional[Dict[str, Any]]:
+        item = self.get(ident)
+        if item is None:
+            return None
+        if item.get("status") == "closed":
+            raise ValueError(f"{item.get('ref', ident)} is closed")
+        self._ensure_labels()
+        self._run([
+            "issue", "edit", str(item["number"]),
+            *self._repo_args(),
+            "--add-label", self.queue_label,
+        ])
+        return self.get(ident)
 
     def get(self, ident: Any) -> Optional[Dict[str, Any]]:
         number = self._issue_number(ident)
@@ -455,7 +474,10 @@ class GitHubIssuesBackend:
         item_types: Optional[List[str]] = None,
         readiness_filters: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
-        candidates = self.list_items(status="open", lane=lane)
+        candidates = [
+            it for it in self.list_items(status="open", lane=lane)
+            if it.get("claimable", True)
+        ]
         if readiness_filters:
             candidates = [
                 it for it in candidates
@@ -535,6 +557,11 @@ class GitHubIssuesBackend:
         status = item.get("status", "open")
         if status != "open":
             raise ValueError(f"{ref} is not open (status={status})")
+        if not item.get("claimable", True):
+            raise ValueError(
+                f"{ref} is missing label {self.queue_label}; "
+                f"run `wt run {ref}` before claiming it"
+            )
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         meta.update({
@@ -573,6 +600,11 @@ class GitHubIssuesBackend:
         item = self.get(ident)
         if item is None:
             return None
+        if status == "closed" and not item.get("watchtower_runnable", True):
+            raise ValueError(
+                f"{ident} is missing label {self.queue_label}; "
+                f"run `wt run {ident}` before closing it"
+            )
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
 

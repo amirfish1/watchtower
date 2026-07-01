@@ -107,13 +107,14 @@ def queue_status(
     closed = [it for it in items if it.get("status") == "closed"]
 
     depth = len(open_items)
+    claimable_open = [it for it in open_items if it.get("claimable", True)]
     if claim_types:
         claimable_depth = sum(
-            1 for it in open_items
+            1 for it in claimable_open
             if q.effective_type(it) in claim_types  # untyped == bug, matches claim filter
         )
     else:
-        claimable_depth = depth
+        claimable_depth = len(claimable_open)
     oldest_created = min(
         (it.get("created_at") for it in open_items if it.get("created_at")),
         default=None,

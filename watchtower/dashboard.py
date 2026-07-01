@@ -13,6 +13,7 @@ Routes:
     GET  /api/status                {"queues": [...health rows + workers...], "workers": [...]}
     GET  /api/queues                raw per-queue counts (mirrors `wt queues`)
     GET  /api/queue/<name>          active + closed tickets (closed carry resolution)
+    POST /api/ticket/<ref>/run      mark an existing GitHub issue runnable and dispatch
     POST /api/queue/<name>/add      ingest a ticket — {"note": "...", "url": "...",
                                       "selector": "...", "repo_path": "...",
                                       "title": "...", "source": "...", "text": "..."}
@@ -251,7 +252,7 @@ _STYLE = """
     .tickets { display: flex; flex-direction: column; gap: 0; }
     .trow {
       display: grid;
-      grid-template-columns: minmax(0,.7fr) minmax(0,.7fr) minmax(0,1fr) minmax(0,2.4fr);
+      grid-template-columns: minmax(0,.7fr) minmax(0,.7fr) minmax(0,1fr) minmax(0,2.4fr) minmax(72px,.4fr);
       gap: 12px; align-items: baseline;
       padding: 13px 4px; border-bottom: 1px solid var(--line);
     }
@@ -265,6 +266,19 @@ _STYLE = """
                text-overflow: ellipsis; }
     .ttitle { font-size: 13.5px; color: var(--ink); }
     .tstatus.closed { color: var(--muted); }
+    .run-btn {
+      justify-self: end;
+      border: 1px solid rgba(111,179,255,.35);
+      background: rgba(111,179,255,.12);
+      color: var(--beam);
+      border-radius: 6px;
+      padding: 5px 10px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .run-btn:hover { border-color: var(--beam); }
+    .run-spacer { min-width: 1px; min-height: 1px; }
 
     /* ---- closed tickets + resolution ---- */
     .closed-head {
@@ -761,7 +775,7 @@ def render_queue(
 
     trows = [
         '      <div class="trow thead">\n'
-        '        <span>ref</span><span>status</span><span>worker</span><span>title</span>\n'
+        '        <span>ref</span><span>status</span><span>worker</span><span>title</span><span></span>\n'
         "      </div>"
     ]
     for it in tickets:
@@ -771,16 +785,31 @@ def render_queue(
             str(it.get("claimed_by") or it.get("claimed_session_id") or "—")[:28]
         )
         title = html.escape(str(it.get("title") or it.get("note") or "")[:120])
+        action = '<span class="run-spacer"></span>'
+        if status == "open" and not it.get("watchtower_runnable", True):
+            action = (
+                f'<button class="run-btn" title="Mark runnable" '
+                f'onclick="wtRun(\'{ref}\')">Run</button>'
+            )
         trows.append(
             f'      <div class="trow">\n'
             f'        <span class="tref mono">{ref}</span>\n'
             f'        <span class="tstatus {status} mono">{html.escape(status)}</span>\n'
             f'        <span class="tworker mono">{worker}</span>\n'
             f'        <span class="ttitle">{title}</span>\n'
+            f'        {action}\n'
             f"      </div>"
         )
     tickets_block = '    <div class="tickets">\n' + "\n".join(trows) + "\n    </div>\n"
-    return _page(f"{name} · WatchTower", header + tickets_block + closed_block)
+    script = (
+        "    <script>\n"
+        "    async function wtRun(ref) {\n"
+        "      await fetch('/api/ticket/' + encodeURIComponent(ref) + '/run', {method: 'POST'});\n"
+        "      location.reload();\n"
+        "    }\n"
+        "    </script>\n"
+    )
+    return _page(f"{name} · WatchTower", header + tickets_block + closed_block + script)
 
 
 # Back-compat shim: the old single entry point. Tests + any caller that asked for
@@ -844,6 +873,24 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/")
+        if path.startswith("/api/ticket/") and path.endswith("/run"):
+            ref = urllib.parse.unquote(path[len("/api/ticket/"):-len("/run")])
+            try:
+                item = q.mark_runnable(ref)
+                if item is None:
+                    self._json(404, {"error": f"{ref} not found"})
+                    return
+                reason = workers.dispatch_after_enqueue(
+                    item.get("project", ""), item.get("ref", "")
+                )
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"error": str(exc)})
+                return
+            self._json(200, {"ok": True, "ticket": item, "dispatch": reason})
+            return
         # POST /api/queue/<name>/add  — ingest a ticket
         if path.startswith("/api/queue/") and path.endswith("/add"):
             name = path[len("/api/queue/"):-len("/add")]

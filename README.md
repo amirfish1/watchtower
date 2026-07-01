@@ -69,6 +69,7 @@ wt add -q DEMO --title "Fix nav" \
 
 wt claim  -q DEMO                      # claim the next open ticket (smart sort)
 wt claim  -q DEMO DEMO-1               # claim a specific ticket by ref
+wt run    DEMO-1                       # mark an existing GitHub issue runnable
 wt close  DEMO-1                       # close a ticket by ref
 wt close  DEMO-1 --summary "fixed the overlap" \
           --caveat "only tested on iOS" --follow-up "add a regression test"
@@ -162,14 +163,18 @@ gh auth login
 wt set -q MYAPP --backend github --github-repo owner/repo
 
 wt add -q MYAPP --title "Fix checkout" --text "Steps to reproduce..."
+wt run MYAPP-123                       # opt an existing issue into automation
 wt claim -q MYAPP --worker worker-1
 wt close MYAPP-123 --worker worker-1 --summary "fixed the null state"
 ```
 
-GitHub-backed refs use the issue number (`MYAPP-123` is issue `#123`). The
-backend creates and uses the `watchtower:<QUEUE>` label to identify that queue's
-issues. Claims assign the issue to `@me` by default; override with
-`wt set -q MYAPP --github-assignee USERNAME`.
+GitHub-backed refs use the issue number (`MYAPP-123` is issue `#123`). A
+GitHub-backed queue lists open issues from the configured repository so GitHub is
+the visible storage layer. The `watchtower:<QUEUE>` label is the automation gate:
+unlabeled open issues are visible in `wt ls`, `wt status`, and the dashboard, but
+workers will not claim them. Use `wt run MYAPP-123` (or the dashboard Run action)
+to add that label and dispatch the queue. Claims assign the issue to `@me` by
+default; override with `wt set -q MYAPP --github-assignee USERNAME`.
 
 `wt status` shows, per queue, depth (open) / WIP / done, oldest-open age, idle
 time, a `WORKERS` column (`total (n live)`), and a STUCK/draining/ok flag,

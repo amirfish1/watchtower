@@ -10,6 +10,8 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import threading
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -214,6 +216,28 @@ def _reload_isolated(tmp_path: Path, monkeypatch):
     return config, q
 
 
+def _write_fake_issues(state: Path, issues):
+    state.write_text(json.dumps({"next": 1 + len(issues), "issues": issues, "commands": []}, indent=2))
+
+
+def _fake_issue(number: int, title: str, labels=None, assignees=None, body: str = ""):
+    labels = labels or []
+    assignees = assignees or []
+    return {
+        "number": number,
+        "title": title,
+        "body": body,
+        "state": "OPEN",
+        "url": f"https://github.com/owner/repo/issues/{number}",
+        "assignees": assignees,
+        "labels": labels,
+        "createdAt": "2026-07-01T12:00:00Z",
+        "updatedAt": "2026-07-01T12:00:00Z",
+        "closedAt": None,
+        "comments": [],
+    }
+
+
 def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
@@ -290,3 +314,113 @@ def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys)
     assert any(c.startswith("issue create") for c in commands)
     assert any(c.startswith("issue edit 1") and "--add-assignee @me" in c for c in commands)
     assert any(c.startswith("issue close 1") for c in commands)
+
+
+def test_github_backend_lists_all_open_issues_but_claims_only_queue_labeled(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    _write_fake_issues(state, [
+        _fake_issue(1, "Plain GitHub issue"),
+        _fake_issue(2, "Runnable WatchTower issue", labels=["watchtower:GHI"]),
+    ])
+
+    items = q.list_items(project="GHI")
+    assert [it["ref"] for it in items] == ["GHI-1", "GHI-2"]
+    assert {it["ref"]: it["claimable"] for it in items} == {
+        "GHI-1": False,
+        "GHI-2": True,
+    }
+
+    claimed = q.claim_next("worker-1", project="GHI")
+    assert claimed["ref"] == "GHI-2"
+    assert q.claim_next("worker-2", project="GHI") is None
+
+
+def test_github_backend_refuses_direct_claim_until_issue_is_marked_runnable(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
+
+    with pytest.raises(ValueError, match="missing label watchtower:GHI"):
+        q.claim_by_ref("GHI-1", "worker-1")
+
+    marked = q.mark_runnable("GHI-1")
+    assert marked["claimable"] is True
+    assert "watchtower:GHI" in json.loads(state.read_text())["issues"][0]["labels"]
+
+    claimed = q.claim_by_ref("GHI-1", "worker-1")
+    assert claimed["status"] == "in_progress"
+
+
+def test_github_unlabeled_issues_count_as_visible_but_not_claimable_for_health_and_reconcile(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.health as health
+    import watchtower.workers as workers
+
+    importlib.reload(health)
+    importlib.reload(workers)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    config.set_auto_drain("GHI", True)
+    _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
+
+    row = {r["queue"]: r for r in health.all_status()}["GHI"]
+    assert row["depth"] == 1
+    assert row["claimable_depth"] == 0
+    assert row["state"] == "backlog"
+
+    result = workers.reconcile_once(dry_run=True)
+    assert result["spawned"] == []
+    assert any(
+        skip["queue"] == "GHI" and "0 claimable" in skip["reason"]
+        for skip in result["skipped"]
+    )
+
+
+def test_cli_run_marks_existing_github_issue_runnable(tmp_path, monkeypatch, capsys):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
+    from watchtower.cli import main
+
+    assert main(["run", "GHI-1", "--no-dispatch"]) == 0
+    out = capsys.readouterr().out
+    assert "RUNNABLE: GHI-1" in out
+    assert "watchtower:GHI" in json.loads(state.read_text())["issues"][0]["labels"]
+
+
+def test_dashboard_run_api_marks_existing_github_issue_runnable(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
+    import watchtower.dashboard as dashboard
+
+    importlib.reload(dashboard)
+    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/ticket/GHI-1/run",
+            data=b"{}",
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode())
+    finally:
+        t.join(timeout=5)
+        httpd.server_close()
+
+    assert payload["ok"] is True
+    assert payload["ticket"]["claimable"] is True
+    assert "watchtower:GHI" in json.loads(state.read_text())["issues"][0]["labels"]
