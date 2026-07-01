@@ -640,6 +640,12 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
     for it in items:
         if it.get("status") != "in_progress":
             continue
+        # Skip tickets parked for human input — a worker exiting after `wt block`
+        # is intentional. Continuity lives in claimed_session_id; `wt answer`
+        # resumes the original session. Reopening would hand it to a different
+        # worker that lacks the original context.
+        if it.get("needs_input"):
+            continue
         claimer = str(it.get("claimed_by") or "")
         if claimer and claimer in live_ids:
             continue  # its worker is alive — leave it
