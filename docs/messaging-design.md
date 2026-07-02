@@ -49,7 +49,12 @@ Targets are resolved in order:
    `wt agent register <name> --session <uuid> [--engine claude] [--cwd path]`.
 3. Raw session UUID (or unique prefix >= 8 chars).
 
-`wt agents` lists the registry with liveness where known.
+`wt agents` lists the registry plus live WT workers, with liveness where
+known. It is an address book, not a session browser: it never scans the
+transcript archive, so the thousands of dormant sessions on disk stay out of
+it unless explicitly registered (browsing history remains CCC / Total Recall
+territory). `wt agent set-name` is accepted as an alias for `register`, and
+re-registering an existing name just repoints it.
 
 ## Delivery adapters (ordered fall-through)
 
@@ -199,7 +204,11 @@ decisions here defer to that matrix.
 
 Cross-machine federation (delegate URL is the seam, nothing more), an MCP
 server (skill-first per docs/agent-discovery.md), LLM-driven chat moderation
-(targeting stays deterministic), porting the AppleScript transport into WT.
+(targeting stays deterministic), and a native macOS keystroke (AppleScript)
+adapter. That last one is deferred, not rejected: there is no architectural
+reason WT cannot inject into a live terminal the way CCC does; the hard part
+is session-to-tty discovery, and busy-hold covers the need in v1. When built,
+it slots into the adapter chain between resume and delegate.
 
 ## Test plan
 
