@@ -129,6 +129,8 @@ def _print_status(rows: List[dict]) -> None:
         if ref:
             since = w.get("active_since_human")
             activity = f"-> {ref}" + (f" ({since})" if since else "")
+        elif w.get("last_closed_ref"):
+            activity = f"idle (last: {w['last_closed_ref']})"
         else:
             activity = "idle"
         print(

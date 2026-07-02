@@ -531,26 +531,64 @@ def _age_human(claimed_at: Optional[str]) -> Optional[str]:
     return f"{days}d{hours % 24:02d}h"
 
 
+def _display_name(row: Dict[str, Any], last_closed: Optional[Dict[str, Any]]) -> str:
+    """A human-readable label for one worker row, e.g. for a session-list UI.
+
+    The underlying engine session name (``--name`` at spawn, see
+    ``build_drain_command``) is fixed for the process's lifetime -- no CLI
+    exists to rename a running/finished session -- so this field exists to
+    give any renderer (dashboard, ``wt agents``) a friendlier overlay that
+    updates as the worker claims and closes tickets, without touching the
+    immutable engine-level name."""
+    queue = row.get("queue") or "WT"
+    ref = row.get("active_ref")
+    if ref:
+        return f"{queue} worker: {ref}"
+    if last_closed:
+        ref = last_closed.get("ref")
+        summary = ((last_closed.get("resolution") or {}).get("summary") or "").strip()
+        if summary:
+            return f"{queue} worker: {ref} - {_clip(summary, 60)}"
+        if ref:
+            return f"{queue} worker: {ref}"
+    return f"{queue} worker"
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
 def annotate_activity(
     rows: List[Dict[str, Any]], items: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """Join each worker row to the in-progress ticket it currently holds.
+    """Join each worker row to the ticket it currently (or most recently) held.
 
-    One pass over ``items`` builds the lookup (by ``claimed_session_id`` and by
-    ``claimed_by``), then one pass over ``rows`` attaches ``active_ref`` /
-    ``active_since`` / ``active_since_human`` (None when the worker is idle).
+    One pass over ``items`` builds two lookups (by ``claimed_session_id`` and
+    by ``claimed_by``): the current in-progress ticket, and -- for workers
+    idle right now -- their most recently closed one (by ``closed_at``). A
+    second pass over ``rows`` attaches ``active_ref`` / ``active_since`` /
+    ``active_since_human`` (None when the worker is idle), ``last_closed_ref``
+    / ``last_closed_summary`` (None when the worker has never closed a
+    ticket), and ``display_name`` -- a friendlier label than the raw
+    worker/session id, meant for session-list UIs (see ``_display_name``).
     O(items + workers), consistent with ``worker_counts``.
     """
-    by_key: Dict[str, Dict[str, Any]] = {}
+    active_by_key: Dict[str, Dict[str, Any]] = {}
+    last_closed_by_key: Dict[str, Dict[str, Any]] = {}
     for it in items:
-        if it.get("status") != "in_progress":
-            continue
-        for key in (it.get("claimed_session_id"), it.get("claimed_by")):
-            if key:
-                by_key.setdefault(str(key), it)
+        status = it.get("status")
+        keys = [k for k in (it.get("claimed_session_id"), it.get("claimed_by")) if k]
+        if status == "in_progress":
+            for key in keys:
+                active_by_key.setdefault(str(key), it)
+        elif status == "closed":
+            for key in keys:
+                prior = last_closed_by_key.get(str(key))
+                if prior is None or (it.get("closed_at") or "") > (prior.get("closed_at") or ""):
+                    last_closed_by_key[str(key)] = it
     for row in rows:
         wid = str(row.get("worker_id", ""))
-        active = by_key.get(wid)
+        active = active_by_key.get(wid)
         if active:
             row["active_ref"] = active.get("ref")
             row["active_since"] = active.get("claimed_at")
@@ -559,6 +597,14 @@ def annotate_activity(
             row["active_ref"] = None
             row["active_since"] = None
             row["active_since_human"] = None
+        last_closed = last_closed_by_key.get(wid)
+        if last_closed:
+            row["last_closed_ref"] = last_closed.get("ref")
+            row["last_closed_summary"] = (last_closed.get("resolution") or {}).get("summary")
+        else:
+            row["last_closed_ref"] = None
+            row["last_closed_summary"] = None
+        row["display_name"] = _display_name(row, last_closed)
     return rows
 
 

@@ -634,6 +634,35 @@ def test_worker_activity_join_idle_when_unclaimed(store):
     workers.annotate_activity(rows, q.list_items())
     assert rows[0]["active_ref"] is None
     assert rows[0]["active_since_human"] is None
+    assert rows[0]["display_name"] == "IDLEQ worker"
+
+
+def test_worker_display_name_reflects_lifecycle(store):
+    """WT-49: display_name updates from generic -> in-progress -> closed
+    summary, since the engine's own session name (set once at spawn) can't
+    be renamed after the fact."""
+    import watchtower.queue as q
+    import watchtower.workers as workers
+
+    item = q.enqueue(project="NAMEQ", note="fix the thing")
+    rows = [{"worker_id": "namer-1", "queue": "NAMEQ"}]
+
+    # Never claimed anything yet: generic label.
+    workers.annotate_activity(rows, q.list_items())
+    assert rows[0]["display_name"] == "NAMEQ worker"
+
+    # Holding an in-progress ticket: label carries the ref.
+    q.claim_next("namer-1", project="NAMEQ")
+    workers.annotate_activity(rows, q.list_items())
+    assert rows[0]["display_name"] == f"NAMEQ worker: {item['ref']}"
+
+    # After close, idle again but the label now carries the outcome.
+    q.close(item["ref"], "namer-1", resolution="fixed the thing")
+    workers.annotate_activity(rows, q.list_items())
+    assert rows[0]["active_ref"] is None
+    assert rows[0]["last_closed_ref"] == item["ref"]
+    assert rows[0]["last_closed_summary"] == "fixed the thing"
+    assert rows[0]["display_name"] == f"NAMEQ worker: {item['ref']} - fixed the thing"
 
 
 # WT-27: reconciler, stop-signal, and mandatory-summary tests

@@ -620,6 +620,11 @@ def render_index(payload: Dict[str, Any]) -> str:
                     if since else ""
                 )
                 act = f'<span class="arrow">→</span> {html.escape(str(ref))}{ago}'
+            elif w.get("last_closed_ref"):
+                act = (
+                    '<span style="opacity:.5">idle (last: '
+                    f'{html.escape(str(w["last_closed_ref"]))})</span>'
+                )
             else:
                 act = '<span style="opacity:.5">idle</span>'
             wk_rows += (
