@@ -309,6 +309,19 @@ def test_claim_empty_queue_at_desired_stays_warm(wt, capsys):
     assert "STOP" not in out
 
 
+def test_claim_empty_queue_at_desired_stays_warm_json(wt, capsys):
+    """--json on a drained-but-warm queue must print nothing, per the
+    documented claim contract (ticket JSON / empty / {"stop": true}) -- not
+    the human-readable "(nothing open in Q)" sentinel (WT-73)."""
+    cli = _reloaded_cli(wt)
+    wt.config.set_auto_drain("Q", True)  # desired 1
+    _live_worker(wt, "Q")  # exactly desired
+    rc = cli.cmd_claim(_claim_ns("Q", "q-live-0", json_out=True))
+    assert rc == 0
+    out = capsys.readouterr().out.strip()
+    assert out == ""
+
+
 def test_claim_empty_queue_drain_off_stays_warm(wt, capsys):
     """auto_drain off -> desired 0, but a lone live worker is still not stopped
     unless it is actually surplus; here live(1)>desired(0) so it does stop."""

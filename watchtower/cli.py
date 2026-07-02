@@ -353,7 +353,8 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 else:
                     print("STOP: surplus worker (live>desired); exiting")
                 return 0
-            print(f"(nothing open in {args.queue})")
+            if not args.json:
+                print(f"(nothing open in {args.queue})")
             return 0
         # Stop signal: reconciler asked this worker to wind down.
         if item.get("stop"):
