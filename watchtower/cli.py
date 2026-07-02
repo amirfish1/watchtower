@@ -671,10 +671,17 @@ def cmd_agents(args: argparse.Namespace) -> int:
     print(f"{'NAME':<24}{'KIND':<8}{'STATE':<8}{'ENGINE':<8}{'SESSION':<38}CWD/QUEUE")
     print("-" * 98)
     for a in agents:
+        kind = a.get("kind") or "agent"
+        if kind == "recent":
+            name = str(a.get("session_id") or "")[:8]
+            cwd = a.get("cwd_slug", "")
+        else:
+            name = f"@{a.get('name','')}"
+            cwd = a.get("cwd", "")
         print(
-            f"@{a.get('name',''):<23}{'agent':<8}{a.get('state',''):<8}"
+            f"{name:<24}{kind:<8}{a.get('state',''):<8}"
             f"{a.get('engine',''):<8}"
-            f"{a.get('session_id',''):<38}{a.get('cwd','')}"
+            f"{a.get('session_id',''):<38}{cwd}"
         )
     for w in live:
         print(

@@ -804,6 +804,21 @@ def test_cli_agents_human_output_has_state_column(wt, capsys):
     assert "busy" in out
 
 
+def test_cli_agents_human_output_labels_recent_rows(wt, capsys):
+    import watchtower.cli as cli
+    importlib.reload(cli)
+    _write_transcript(wt, SID_A, age_s=60)  # no registry entry: auto-discovered "recent"
+
+    rc = cli.main(["agents"])
+
+    assert rc == 0
+    lines = capsys.readouterr().out.splitlines()
+    row = next(l for l in lines if SID_A in l)
+    assert row.split()[0] == SID_A[:8]
+    assert "recent" in row
+    assert "@" not in row
+
+
 def test_cli_outbox_ls_retry_and_rm(wt, capsys):
     import watchtower.cli as cli
     importlib.reload(cli)
