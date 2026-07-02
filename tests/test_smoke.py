@@ -22,13 +22,17 @@ def store(tmp_path, monkeypatch):
     path = tmp_path / "wt-test.json"
     monkeypatch.setenv("WATCHTOWER_STORE", str(path))
     monkeypatch.setenv("WATCHTOWER_WORKERS_FILE", str(tmp_path / "workers.json"))
+    monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "config.json"))
     # Re-import so module-level paths (if any) pick up the env.
     import watchtower.queue as q
     import watchtower.health as health
+    import watchtower.config as config
     import watchtower.workers as workers
     importlib.reload(q)
+    importlib.reload(config)
     importlib.reload(health)
     importlib.reload(workers)
+    monkeypatch.setattr(config, "_REGISTRY_FILE", tmp_path / "no-registry.json")
     try:
         import watchtower.dashboard as dashboard
         importlib.reload(dashboard)
