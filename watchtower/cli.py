@@ -327,12 +327,31 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 print("STOP: reconciler requested shutdown; exiting")
             return 0
 
+    _rename_claiming_session(item)
+
     if args.json:
         _print_item(item)
     else:
         print(f"CLAIMED: {item['ref']} -> {worker}")
         print(item.get("text") or item.get("note") or "")
     return 0
+
+
+def _rename_claiming_session(item: dict, summary: str = "") -> None:
+    """Best-effort: rename the claiming session's engine transcript to
+    reflect the ticket it now holds, or -- once ``summary`` is given --
+    what it closed with (WT-49). No-ops silently when there's no real
+    session id or no transcript on disk yet; never blocks a claim/close
+    over cosmetics. See ``docs/session-naming.md``."""
+    sid = item.get("claimed_session_id")
+    if not sid:
+        return
+    try:
+        from . import messages
+        name = workers.display_name(item.get("project", ""), item.get("ref"), summary)
+        messages.set_session_title(str(sid), name)
+    except Exception:
+        pass
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -392,6 +411,8 @@ def cmd_close(args: argparse.Namespace) -> int:
     res = item.get("resolution") or {}
     summary = res.get("summary", "")
     print(f"CLOSED: {item['ref']}" + (f" — {summary}" if summary else ""))
+
+    _rename_claiming_session(item, summary)
 
     # STRETCH (opt-in): file each follow-up / unresolved item as a new open
     # ticket in the same queue so nothing falls through the cracks.

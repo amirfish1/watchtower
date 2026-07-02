@@ -445,6 +445,32 @@ def _find_transcript(sid: str) -> Optional[Path]:
     return None
 
 
+def set_session_title(sid: str, name: str) -> bool:
+    """Rename a claude session by appending a ``custom-title`` event to its
+    own transcript -- the exact event shape Claude writes for the in-session
+    ``/rename`` command (verified against ``claude-command-center``'s
+    ``rename_session``/``_append_custom_title``, which docstrings this as
+    "the exact shape Claude writes when you run /rename" and confirms
+    ``claude --resume``'s picker reads it back). No CCC dependency: this is a
+    plain, atomic (``O_APPEND``) file write, safe even while the target
+    session is live and writing its own turns to the same file.
+
+    Returns False (no-op) when the session has no transcript on disk yet --
+    e.g. a non-claude engine, or a session id that hasn't flushed its first
+    turn -- so callers (``wt claim``/``wt close``) can treat this as
+    best-effort and never fail the ticket operation over it."""
+    path = _find_transcript(sid)
+    if path is None or not name:
+        return False
+    event = {"type": "custom-title", "customTitle": name, "sessionId": sid}
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n" + json.dumps(event) + "\n")
+    except OSError:
+        return False
+    return True
+
+
 def _session_busy(sid: str) -> bool:
     """True when the session's transcript was written within the busy window,
     meaning the session is actively mid-turn: forking a parallel resume would

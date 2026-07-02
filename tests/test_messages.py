@@ -850,3 +850,65 @@ def test_cli_outbox_ls_retry_and_rm(wt, capsys):
     assert cli.main(["outbox", "rm", pending["id"]]) == 0
     capsys.readouterr()
     assert pending["id"] not in {m["id"] for m in wt.messages.outbox_list()}
+
+
+# ------------------------------------------------------------- WT-49: renaming
+def test_set_session_title_appends_custom_title_event(wt):
+    """set_session_title writes the exact event shape Claude Code's own
+    /rename command writes, verified against claude-command-center's
+    rename_session/_append_custom_title (see docs/session-naming.md)."""
+    p = _write_transcript(wt, SID_A)
+    assert wt.messages.set_session_title(SID_A, "WT worker: WT-1") is True
+    lines = [l for l in p.read_text().splitlines() if l.strip()]
+    assert json.loads(lines[-1]) == {
+        "type": "custom-title", "customTitle": "WT worker: WT-1", "sessionId": SID_A,
+    }
+
+
+def test_set_session_title_no_transcript_is_noop(wt):
+    """No transcript on disk yet (e.g. non-claude engine) -> False, no crash."""
+    assert wt.messages.set_session_title(SID_B, "anything") is False
+
+
+def test_backfill_renames_session_once_uuid_resolves(wt):
+    """A fresh `wt claim` fires before WT knows the worker's real session
+    UUID (claimed_by is the non-UUID worker_id), so cli.cmd_claim's own
+    rename is usually a no-op. backfill_claimed_session_ids is the moment
+    the UUID becomes known -- confirm it renames the transcript there."""
+    p = _write_transcript(wt, SID_A)
+    rec = _live_worker(wt, "NAMEQ", session_id=SID_A)
+    item = wt.q.enqueue(project="NAMEQ", note="do a thing")
+    wt.q.claim_next(rec["worker_id"], project="NAMEQ")
+
+    backfilled = wt.workers.backfill_claimed_session_ids()
+    assert backfilled == [item["ref"]]
+
+    lines = [l for l in p.read_text().splitlines() if l.strip()]
+    assert json.loads(lines[-1]) == {
+        "type": "custom-title",
+        "customTitle": f"NAMEQ worker: {item['ref']}",
+        "sessionId": SID_A,
+    }
+
+
+def test_cli_close_renames_session_with_summary(wt):
+    """wt close renames the claiming session's transcript to carry the
+    outcome, when its claimed_session_id is already known (e.g. it was
+    backfilled earlier in the ticket's lifetime, as in practice it always
+    is by close time)."""
+    import watchtower.cli as cli
+    importlib.reload(cli)
+
+    p = _write_transcript(wt, SID_A)
+    item = wt.q.enqueue(project="NAMEQ", note="do a thing")
+    wt.q.claim_next("w1", project="NAMEQ")
+    wt.q.backfill_session_id(item["ref"], SID_A)
+
+    assert cli.main(["close", item["ref"], "--summary", "fixed the thing"]) == 0
+
+    lines = [l for l in p.read_text().splitlines() if l.strip()]
+    assert json.loads(lines[-1]) == {
+        "type": "custom-title",
+        "customTitle": f"NAMEQ worker: {item['ref']} - fixed the thing",
+        "sessionId": SID_A,
+    }

@@ -566,27 +566,37 @@ def _age_human(claimed_at: Optional[str]) -> Optional[str]:
     return f"{days}d{hours % 24:02d}h"
 
 
-def _display_name(row: Dict[str, Any], last_closed: Optional[Dict[str, Any]]) -> str:
-    """A human-readable label for one worker row, e.g. for a session-list UI.
+def display_name(queue: str, ref: Optional[str] = None, summary: Optional[str] = None) -> str:
+    """The canonical human-readable label for a worker at some point in its
+    claim/close lifecycle, e.g. for a session title or a session-list UI.
 
-    The underlying engine session name (``--name`` at spawn, see
-    ``build_drain_command``) is fixed for the process's lifetime -- no CLI
-    exists to rename a running/finished session -- so this field exists to
-    give any renderer (dashboard, ``wt agents``) a friendlier overlay that
-    updates as the worker claims and closes tickets, without touching the
-    immutable engine-level name."""
-    queue = row.get("queue") or "WT"
-    ref = row.get("active_ref")
-    if ref:
-        return f"{queue} worker: {ref}"
+    ``ref``/``summary`` absent -> never claimed anything: ``"<queue> worker"``.
+    ``ref`` given, no ``summary`` -> holding it (or just claimed it):
+    ``"<queue> worker: <ref>"``. Both given -> closed it:
+    ``"<queue> worker: <ref> - <summary, clipped>"``.
+
+    This is also fed to ``messages.set_session_title`` to actually rename the
+    engine session (append a ``custom-title`` event to its transcript) -- see
+    ``docs/session-naming.md`` for how that was verified against a live
+    session and against CCC's own ``rename_session``."""
+    queue = queue or "WT"
+    if not ref:
+        return f"{queue} worker"
+    summary = (summary or "").strip()
+    if summary:
+        return f"{queue} worker: {ref} - {_clip(summary, 60)}"
+    return f"{queue} worker: {ref}"
+
+
+def _display_name(row: Dict[str, Any], last_closed: Optional[Dict[str, Any]]) -> str:
+    """``display_name`` fed from a worker row + its most recent closed item."""
+    active_ref = row.get("active_ref")
+    if active_ref:
+        return display_name(row.get("queue", ""), active_ref)
     if last_closed:
-        ref = last_closed.get("ref")
-        summary = ((last_closed.get("resolution") or {}).get("summary") or "").strip()
-        if summary:
-            return f"{queue} worker: {ref} - {_clip(summary, 60)}"
-        if ref:
-            return f"{queue} worker: {ref}"
-    return f"{queue} worker"
+        res = last_closed.get("resolution") or {}
+        return display_name(row.get("queue", ""), last_closed.get("ref"), res.get("summary"))
+    return display_name(row.get("queue", ""))
 
 
 def _clip(text: str, limit: int) -> str:
@@ -814,6 +824,13 @@ def backfill_claimed_session_ids() -> List[str]:
     the in_progress ticket so consumers (CCC queue health) can resolve a live
     worker instead of showing WAITING/STUCK. Idempotent — a no-op once set.
 
+    This is also the reliable trigger point for the WT-49 session rename: a
+    fresh ``wt claim`` almost always fires before WT has resolved the
+    worker's real UUID (the worker_id is a non-UUID label like
+    ``wt-f8470ec0``), so ``cli.cmd_claim``'s own best-effort rename is
+    usually a no-op — this is the moment the UUID (and therefore a
+    renameable transcript) first becomes known.
+
     Returns the refs that were freshly backfilled this pass."""
     from . import queue as _q
     backfilled: List[str] = []
@@ -836,6 +853,12 @@ def backfill_claimed_session_ids() -> List[str]:
         try:
             if _q.backfill_session_id(it.get("ref"), sid):
                 backfilled.append(it.get("ref", ""))
+                try:
+                    from . import messages as _messages
+                    name = display_name(it.get("project", ""), it.get("ref"))
+                    _messages.set_session_title(sid, name)
+                except Exception:
+                    pass
         except Exception:
             pass
     return backfilled
