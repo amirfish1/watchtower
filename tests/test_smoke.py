@@ -57,7 +57,10 @@ def test_help_shows_git_style_grouped_sections(capsys):
     assert exc.value.code == 0
     out = capsys.readouterr().out
 
-    for header in ("Tickets:", "Queues:", "Fleet:", "Messaging:", "Service:"):
+    for header in (
+        "Tickets:", "Worker protocol:", "Queues:", "Fleet:",
+        "Messaging:", "Service:",
+    ):
         assert header in out
 
     # No brace-list dump of every subcommand.

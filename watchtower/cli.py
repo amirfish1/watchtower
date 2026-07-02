@@ -1519,16 +1519,16 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "add"),
     ("Tickets", "take"),
-    ("Tickets", "claim"),
-    ("Tickets", "close"),
-    ("Tickets", "block"),
-    ("Tickets", "blocked"),
-    ("Tickets", "answer"),
-    ("Tickets", "discuss"),
     ("Tickets", "run"),
     ("Tickets", "find"),
     ("Tickets", "ls"),
+    ("Tickets", "blocked"),
+    ("Tickets", "answer"),
+    ("Tickets", "discuss"),
     ("Tickets", "dedup"),
+    ("Worker protocol", "claim"),
+    ("Worker protocol", "close"),
+    ("Worker protocol", "block"),
     ("Queues", "status"),
     ("Queues", "set"),
     ("Queues", "drain"),
@@ -1580,7 +1580,11 @@ COMMAND_HELP: Dict[str, str] = {
     "skills": "sync the bundled watchtower skill into installed agent harnesses",
 }
 
-_SECTION_ORDER = ["Tickets", "Queues", "Fleet", "Messaging", "Service"]
+# "Worker protocol" = the claim/close/block loop agent workers run; humans
+# rarely type these (a human closing a ticket by hand still can).
+_SECTION_ORDER = [
+    "Tickets", "Worker protocol", "Queues", "Fleet", "Messaging", "Service",
+]
 
 
 def _build_command_epilog() -> str:
