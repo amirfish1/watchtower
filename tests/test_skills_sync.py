@@ -1,10 +1,12 @@
 """Tests for watchtower/skills_sync.py: the symlink-based skill distribution
-that keeps the bundled `watchtower` skill in sync across every installed
+that keeps bundled skills in sync across every installed
 agent harness (Claude Code, Codex, ...) without a separate re-sync step."""
 
 from __future__ import annotations
 
 from watchtower import skills_sync
+
+EXPECTED_SKILLS = ("watchtower", "group-chat-checkin")
 
 
 def _homes(tmp_path, present=("claude", "codex")):
@@ -17,23 +19,46 @@ def _homes(tmp_path, present=("claude", "codex")):
     return homes
 
 
+def _actions(results):
+    return {(r.engine, r.target.name): r.action for r in results}
+
+
 def test_sync_links_into_every_present_harness(tmp_path):
     homes = _homes(tmp_path)
     results = skills_sync.sync(engine_homes=homes)
-    actions = {r.engine: r.action for r in results}
-    assert actions == {"claude": "linked", "codex": "linked"}
+    actions = _actions(results)
+    assert actions == {
+        ("claude", "watchtower"): "linked",
+        ("claude", "group-chat-checkin"): "linked",
+        ("codex", "watchtower"): "linked",
+        ("codex", "group-chat-checkin"): "linked",
+    }
     for engine, home in homes.items():
-        target = home / "skills" / skills_sync.SKILL_NAME
-        assert target.is_symlink()
-        assert target.resolve() == skills_sync.source_dir().resolve()
+        for skill_name in EXPECTED_SKILLS:
+            target = home / "skills" / skill_name
+            assert target.is_symlink()
+            assert target.resolve() == skills_sync.source_dir(skill_name).resolve()
+
+
+def test_sync_links_all_bundled_skills_into_every_present_harness(tmp_path):
+    homes = _homes(tmp_path)
+    results = skills_sync.sync(engine_homes=homes)
+    actions = _actions(results)
+    assert actions == {
+        ("claude", "watchtower"): "linked",
+        ("claude", "group-chat-checkin"): "linked",
+        ("codex", "watchtower"): "linked",
+        ("codex", "group-chat-checkin"): "linked",
+    }
 
 
 def test_sync_skips_harness_with_no_home(tmp_path):
     homes = _homes(tmp_path, present=("claude",))
     results = skills_sync.sync(engine_homes=homes)
-    actions = {r.engine: r.action for r in results}
-    assert actions["claude"] == "linked"
-    assert actions["codex"] == "skipped-not-installed"
+    actions = _actions(results)
+    for skill_name in EXPECTED_SKILLS:
+        assert actions[("claude", skill_name)] == "linked"
+        assert actions[("codex", skill_name)] == "skipped-not-installed"
     assert not (homes["codex"] / "skills").exists()
 
 
@@ -41,7 +66,9 @@ def test_sync_is_idempotent(tmp_path):
     homes = _homes(tmp_path, present=("claude",))
     skills_sync.sync(engine_homes=homes)
     results = skills_sync.sync(engine_homes=homes)
-    assert results[0].action == "up-to-date"
+    actions = _actions(results)
+    for skill_name in EXPECTED_SKILLS:
+        assert actions[("claude", skill_name)] == "up-to-date"
 
 
 def test_sync_relinks_a_stale_symlink(tmp_path):
@@ -53,7 +80,7 @@ def test_sync_relinks_a_stale_symlink(tmp_path):
     target.symlink_to(stale, target_is_directory=True)
 
     results = skills_sync.sync(engine_homes=homes)
-    assert results[0].action == "relinked"
+    assert _actions(results)[("claude", skills_sync.SKILL_NAME)] == "relinked"
     assert target.resolve() == skills_sync.source_dir().resolve()
 
 
@@ -64,7 +91,7 @@ def test_sync_never_clobbers_a_real_directory(tmp_path):
     (target / "mine.txt").write_text("user-owned content")
 
     results = skills_sync.sync(engine_homes=homes)
-    assert results[0].action == "skipped-exists"
+    assert _actions(results)[("claude", skills_sync.SKILL_NAME)] == "skipped-exists"
     assert not target.is_symlink()
     assert (target / "mine.txt").read_text() == "user-owned content"
 
@@ -72,16 +99,20 @@ def test_sync_never_clobbers_a_real_directory(tmp_path):
 def test_sync_dry_run_makes_no_changes(tmp_path):
     homes = _homes(tmp_path, present=("claude",))
     results = skills_sync.sync(dry_run=True, engine_homes=homes)
-    assert results[0].action == "linked"
-    assert not (homes["claude"] / "skills" / skills_sync.SKILL_NAME).exists()
+    actions = _actions(results)
+    for skill_name in EXPECTED_SKILLS:
+        assert actions[("claude", skill_name)] == "linked"
+        assert not (homes["claude"] / "skills" / skill_name).exists()
 
 
 def test_remove_undoes_a_managed_symlink(tmp_path):
     homes = _homes(tmp_path, present=("claude",))
     skills_sync.sync(engine_homes=homes)
     results = skills_sync.remove(engine_homes=homes)
-    assert results[0].action == "removed"
-    assert not (homes["claude"] / "skills" / skills_sync.SKILL_NAME).exists()
+    actions = _actions(results)
+    for skill_name in EXPECTED_SKILLS:
+        assert actions[("claude", skill_name)] == "removed"
+        assert not (homes["claude"] / "skills" / skill_name).exists()
 
 
 def test_remove_never_touches_a_real_directory(tmp_path):
@@ -91,5 +122,5 @@ def test_remove_never_touches_a_real_directory(tmp_path):
     (target / "mine.txt").write_text("user-owned content")
 
     results = skills_sync.remove(engine_homes=homes)
-    assert results[0].action == "skipped-exists"
+    assert _actions(results)[("claude", skills_sync.SKILL_NAME)] == "skipped-exists"
     assert (target / "mine.txt").exists()
