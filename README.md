@@ -93,6 +93,8 @@ wt find DEMO-1                         # look up one ticket by ref, no -q needed
 wt add -q DEMO --title "Fix nav" \
        --text "navbar overlaps on mobile" --type bug
 
+wt edit   DEMO-1 --priority p0 --type feature  # patch fields on an existing ticket
+
 wt claim  -q DEMO                      # claim the next open ticket (smart sort)
 wt claim  -q DEMO DEMO-1               # claim a specific ticket by ref
 wt run    DEMO-1                       # mark an existing GitHub issue runnable

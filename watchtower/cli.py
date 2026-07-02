@@ -5,6 +5,7 @@
     wt ls -q Q [--status ..]  list the tickets in one queue
     wt find <ref>             look up one ticket by ref, across all queues
     wt add -q Q --title..     file a ticket
+    wt edit <ref> --priority..  patch fields on an existing ticket
     wt claim -q Q             claim next ticket (smart: priority → type → age)
     wt claim -q Q CCC-42      claim a specific ticket by ref
     wt claim -q Q --oldest    claim oldest ticket (pure FIFO)
@@ -223,6 +224,41 @@ def cmd_find(args: argparse.Namespace) -> int:
     res = item.get("resolution") if item.get("status") == "closed" else None
     if res and res.get("summary"):
         print(f"  resolution: {res['summary']}")
+    return 0
+
+
+def cmd_edit(args: argparse.Namespace) -> int:
+    """Patch fields (title/priority/type/readiness/...) on an existing
+    ticket, in place -- no refile/close churn (WT-71). Only flags the
+    caller actually passed are touched; everything else is left as-is."""
+    fields = {}
+    for name in (
+        "title", "note", "text", "url", "type", "readiness", "priority",
+        "value", "confidence", "selector", "screenshot_path", "repo_path",
+    ):
+        value = getattr(args, name, None)
+        if value is not None:
+            fields[name] = value
+    if not fields:
+        print(
+            "error: no fields to edit -- pass at least one of "
+            "--title/--note/--text/--url/--type/--readiness/--priority/"
+            "--value/--confidence/--selector/--screenshot-path/--repo-path",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        item = q.update(args.ref, **fields)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_item(item)
+    else:
+        print(f"EDITED: {item['ref']}  {item.get('title') or item.get('note','')}")
     return 0
 
 
@@ -1652,6 +1688,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Queues", "workers"),
     ("Tickets", "add"),
     ("Tickets", "take"),
+    ("Tickets", "edit"),
     ("Tickets", "run"),
     ("Tickets", "find"),
     ("Tickets", "ls"),
@@ -1676,6 +1713,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
 COMMAND_HELP: Dict[str, str] = {
     "add": "file a ticket",
     "take": "file a ticket and immediately claim it (= add --claim)",
+    "edit": "patch fields (title/priority/type/readiness/...) on an existing ticket",
     "claim": "claim next open ticket (smart sort: priority + type + age)",
     "close": "close a ticket (record how you fixed it)",
     "block": "park a ticket that needs a human decision",
@@ -1820,6 +1858,30 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("take")
     _add_common_ticket_args(s)
     s.set_defaults(func=cmd_take)
+
+    s = sub.add_parser("edit")
+    s.add_argument("ref", help="ticket ref (e.g. WT-48) or bare number")
+    s.add_argument("--title", default=None)
+    s.add_argument("--note", default=None)
+    s.add_argument("--text", default=None)
+    s.add_argument("--url", default=None)
+    s.add_argument("--type", default=None, choices=["bug", "feature"],
+                   help="item type: bug or feature")
+    s.add_argument("--readiness", default=None,
+                   choices=["ready", "needs-shaping", "needs-spec"],
+                   help="readiness level")
+    s.add_argument("--priority", default=None,
+                   choices=["p0", "p1", "p2", "p3", "p4"],
+                   help="priority: p0 (highest) through p4 (lowest)")
+    s.add_argument("--value", default=None, choices=["H", "M", "L"],
+                   help="business value: H, M, or L")
+    s.add_argument("--confidence", default=None, choices=["H", "M", "L"],
+                   help="confidence: H, M, or L")
+    s.add_argument("--selector", default=None)
+    s.add_argument("--screenshot-path", default=None, dest="screenshot_path")
+    s.add_argument("--repo-path", default=None, dest="repo_path")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_edit)
 
     s = sub.add_parser("claim")
     s.add_argument("-q", "--queue", required=True)

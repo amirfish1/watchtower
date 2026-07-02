@@ -308,6 +308,52 @@ def test_cli_enqueue_and_status(store, capsys):
     assert "CLOSED: CLI-1" in out
 
 
+def test_cli_edit_patches_fields_without_refiling(store, capsys):
+    import watchtower.queue as q
+    from watchtower.cli import main
+
+    assert main(["add", "-q", "EDT", "--title", "orig", "--type", "bug"]) == 0
+    capsys.readouterr()
+
+    assert main([
+        "edit", "EDT-1",
+        "--priority", "p0", "--type", "feature",
+        "--title", "new title", "--readiness", "ready",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "EDITED: EDT-1" in out
+
+    item = q.get("EDT-1")
+    assert item["priority"] == "p0"
+    assert item["type"] == "feature"
+    assert item["title"] == "new title"
+    assert item["readiness"] == "ready"
+    # Untouched fields and status/ref/number are left alone -- no refile churn.
+    assert item["status"] == "open"
+    assert item["ref"] == "EDT-1"
+
+
+def test_cli_edit_requires_at_least_one_field(store, capsys):
+    from watchtower.cli import main
+
+    assert main(["add", "-q", "EDT2", "--title", "orig"]) == 0
+    capsys.readouterr()
+
+    rc = main(["edit", "EDT2-1"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "no fields to edit" in err
+
+
+def test_cli_edit_unknown_ref(store, capsys):
+    from watchtower.cli import main
+
+    rc = main(["edit", "NOPE-1", "--priority", "p0"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "NOPE-1" in err
+
+
 def test_status_includes_workers(store, capsys):
     import watchtower.queue as q
     import watchtower.workers as workers
