@@ -12,6 +12,8 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import stat
+import sys
 import threading
 import time
 import uuid as _uuid
@@ -23,6 +25,9 @@ import pytest
 SID_A = "7f72634b-b0bd-4c78-b931-3d877ed84187"
 SID_B = "c44f96bc-d720-49d3-a5e6-115426939f82"
 SID_C = "12345678-aaaa-4bbb-8ccc-1234567890ab"
+# A codex thread id, addressed the same way as a claude session_id (WT-54:
+# session_id maps 1:1 onto the codex thread id, see messages.py docstring).
+SID_D = "9c1f5a3e-6b2d-4e11-9a77-2f6c8b0d4e55"
 # Two UUIDs sharing the same first 8 hex chars, for ambiguity tests.
 SID_AMB1 = "aaaaaaaa-1111-4111-8111-111111111111"
 SID_AMB2 = "aaaaaaaa-2222-4222-8222-222222222222"
@@ -48,23 +53,32 @@ def wt(tmp_path, monkeypatch):
         "WATCHTOWER_CLAUDE_PROJECTS_DIR", str(tmp_path / "claude-projects")
     )
 
+    # No codex binary by default: is_available() must read False so the
+    # codex-app-server adapter is a clean no-op miss in every test that
+    # doesn't explicitly opt in (see test_deliver_codex_target below).
+    monkeypatch.delenv("WATCHTOWER_CODEX_BIN", raising=False)
+
     import watchtower.queue as q
     import watchtower.config as config
     import watchtower.workers as workers
     import watchtower.messages as messages
+    import watchtower.codex_rpc as codex_rpc
     importlib.reload(q)
     importlib.reload(config)
     importlib.reload(workers)
     importlib.reload(messages)
+    importlib.reload(codex_rpc)
     monkeypatch.setattr(config, "_REGISTRY_FILE", tmp_path / "no-registry.json")
 
     class Ns:
         pass
     ns = Ns()
     ns.q, ns.config, ns.workers, ns.messages = q, config, workers, messages
+    ns.codex_rpc = codex_rpc
     ns.tmp = tmp_path
     ns._readers = []
     yield ns
+    codex_rpc.shutdown()
     for fd in ns._readers:
         try:
             os.close(fd)
@@ -360,6 +374,70 @@ def test_no_delegate_is_a_working_configuration(wt, monkeypatch):
     res = wt.messages.send(rec["worker_id"], "native only")
     assert res["ok"] is True and res["transport"] == "fifo"
     assert wt.messages._delegate_base() == ""
+
+
+# ======================================================= codex app-server delivery
+def _write_fake_codex_bin(tmp_path):
+    """A minimal fake codex app-server: answers initialize, thread/resume
+    (always idle, no active turn), and turn/start. Enough to prove
+    messages.deliver reaches watchtower.codex_rpc end to end without a real
+    codex binary anywhere in this test."""
+    script = tmp_path / "fake_codex.py"
+    script.write_text(
+        f"#!{sys.executable}\n"
+        + '''
+import json
+import sys
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method = req.get("method")
+    req_id = req.get("id")
+    if method == "initialize":
+        result = {}
+    elif method == "thread/resume":
+        result = {"thread": {"status": {"type": "idle"}, "turns": []}}
+    elif method == "turn/start":
+        result = {"turn": {"id": "turn-integration"}}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}) + "\\n")
+    sys.stdout.flush()
+'''
+    )
+    script.chmod(script.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return script
+
+
+def test_deliver_codex_target_via_app_server(wt, monkeypatch):
+    """A registered codex agent with no live worker and no delegate still
+    gets delivered natively through WT's own codex app-server subprocess
+    (WT-54), never touching the delegate adapter."""
+    script = _write_fake_codex_bin(wt.tmp)
+    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(script))
+    _disable_resume(wt, monkeypatch)
+    wt.messages.register_agent("codexer", SID_D, engine="codex", cwd="/repo")
+
+    res = wt.messages.send("codexer", "hello from wt")
+
+    assert res == {"ok": True, "transport": "codex-app-server"}
+
+
+def test_deliver_codex_falls_through_when_binary_missing(wt, monkeypatch):
+    """No codex binary on this machine: the codex adapter misses cleanly and
+    the message still lands in the outbox (no delegate configured either)."""
+    monkeypatch.delenv("WATCHTOWER_CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", "/nonexistent-bin-dir")
+    _disable_resume(wt, monkeypatch)
+    wt.messages.register_agent("codexer", SID_D, engine="codex", cwd="/repo")
+
+    res = wt.messages.send("codexer", "hello from wt")
+
+    assert res["ok"] is False and res["queued"] is True
+    assert "codex" in res["error"]
 
 
 # ===================================================== outbox backoff/dead-letter

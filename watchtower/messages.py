@@ -16,7 +16,16 @@ This module gives WatchTower its conversational primitives (see
          ``$WATCHTOWER_BUSY_WINDOW_S`` seconds (default 120), the session is
          actively mid-turn, so we do NOT fork a parallel resume; the message
          is held in the outbox and delivered once the transcript goes quiet.
-      3. ``delegate`` (optional, last): POST to a delegate HTTP endpoint
+      3. ``codex-app-server`` (codex targets only): WT's own ``codex
+         app-server`` JSON-RPC subprocess (see ``watchtower.codex_rpc``),
+         ``thread/resume`` then ``turn/steer``-if-active else ``turn/start``.
+         Only attempted when the resolved target's ``engine`` is ``codex``;
+         a lazy guarded import + ``codex_rpc.is_available()`` means a machine
+         without the codex binary just falls through unaffected. The target's
+         ``session_id`` is used as the codex thread id 1:1 (see WT-54: an
+         ``engine=codex`` registry/worker entry's ``session_id`` IS the codex
+         thread id, there is no separate mapping table).
+      4. ``delegate`` (optional, last): POST to a delegate HTTP endpoint
          (CCC's ``/api/inject-input``) for transports WT cannot do natively.
          ``$WATCHTOWER_DELEGATE_URL`` overrides; ``off`` disables even when
          ``~/.claude/command-center/port.txt`` exists. No delegate configured
@@ -529,6 +538,43 @@ def _post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str,
     return data if isinstance(data, dict) else {}
 
 
+def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Adapter 3 (codex only): native delivery via WT's own codex app-server.
+
+    Only called for targets whose resolved ``engine`` is ``codex``. Import is
+    lazy and guarded so a machine with no codex binary (or a stripped-down WT
+    install) never pays an import cost or hard-fails; any failure here just
+    falls through to the delegate adapter like every other adapter miss.
+
+    Session-id-to-thread-id mapping: WT treats ``resolved["session_id"]`` as
+    the codex thread id directly, 1:1. This holds for how codex targets get
+    into the registry today (workers.spawn_workers records a codex worker's
+    own thread id as its session_id; ``agents register --engine codex``
+    expects the same). If a future addressing scheme needs codex targets
+    keyed by something other than the thread id, this is the seam to update.
+    """
+    sid = str(resolved.get("session_id") or "")
+    if not sid:
+        return {"ok": False, "error": "codex app-server needs a thread/session id"}
+    try:
+        from . import codex_rpc
+    except ImportError:
+        return {"ok": False, "error": "codex_rpc module unavailable"}
+    if not codex_rpc.is_available():
+        return {"ok": False, "error": "codex binary not found"}
+    result = codex_rpc.deliver(sid, text)
+    if result.get("ok"):
+        return {
+            "ok": True,
+            "transport": "codex-app-server",
+            "turn_id": result.get("turn_id"),
+        }
+    return {
+        "ok": False,
+        "error": result.get("error") or "codex app-server delivery failed",
+    }
+
+
 def _deliver_delegate(
     resolved: Dict[str, Any], text: str, mode: str
 ) -> Dict[str, Any]:
@@ -555,7 +601,8 @@ def _deliver_delegate(
 def deliver(
     resolved: Dict[str, Any], text: str, mode: str = "send"
 ) -> Dict[str, Any]:
-    """Try each adapter in order: fifo, resume (with busy check), delegate.
+    """Try each adapter in order: fifo, resume (with busy check), codex
+    app-server (codex targets only), delegate.
 
     Returns the first success (``{"ok": True, "transport": ...}``), else
     ``{"ok": False, "busy": bool, "error": "<joined adapter errors>"}``."""
@@ -571,6 +618,11 @@ def deliver(
     if r.get("busy"):
         busy = True
     errors.append(f"resume: {r.get('error', 'failed')}")
+    if resolved.get("engine") == "codex":
+        r = _deliver_codex_app_server(resolved, text)
+        if r.get("ok"):
+            return r
+        errors.append(f"codex: {r.get('error', 'failed')}")
     r = _deliver_delegate(resolved, text, mode)
     if r.get("ok"):
         return r
