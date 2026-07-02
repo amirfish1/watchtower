@@ -55,6 +55,12 @@ DASHBOARD_PID_FILE = Path(
 
 
 # --------------------------------------------------------------------------- fmt
+def _oneline(s: str) -> str:
+    """Collapse embedded newlines so a title/note can't break table rows or
+    single-line output (multi-line ticket notes are common — see WT-51)."""
+    return " ".join(s.split())
+
+
 def _eta_note(r: dict) -> str:
     """Drain-rate + ETA readout for a queue row, e.g. '~3/min · empty in ~20m'.
 
@@ -176,7 +182,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
     print("-" * 72)
     for it in items[:limit]:
         worker = str(it.get("claimed_by") or it.get("claimed_session_id") or "")[:20]
-        title = (it.get("title") or it.get("note") or "")[:56]
+        title = _oneline(it.get("title") or it.get("note") or "")[:56]
         line = f"{str(it.get('ref','')):<14}{str(it.get('status','')):<12}{worker:<22}{title}"
         res = it.get("resolution") if it.get("status") == "closed" else None
         if res and res.get("summary"):
@@ -208,7 +214,7 @@ def cmd_find(args: argparse.Namespace) -> int:
         print(json.dumps(item, indent=2))
         return 0
     worker = str(item.get("claimed_by") or item.get("claimed_session_id") or "")
-    title = item.get("title") or item.get("note") or ""
+    title = _oneline(item.get("title") or item.get("note") or "")
     print(f"{item.get('ref',''):<14}[{item.get('status',''):<11}] {title}")
     if worker:
         print(f"  claimed_by: {worker}")
