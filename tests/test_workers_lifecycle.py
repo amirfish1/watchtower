@@ -20,6 +20,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import select
 import subprocess
 import time
 
@@ -192,6 +193,62 @@ def test_reconcile_nudges_live_worker_on_orphan_requeue(wt):
     data = os.read(fd, 65536).decode()
     msg = json.loads(data.strip())
     assert "Q" in msg["message"]["content"][0]["text"]
+
+
+def test_reconcile_nudges_live_worker_on_stuck_queue(wt):
+    """WT-53: a queue can be fully staffed (actual==desired, no crash, no
+    orphan) yet make zero progress -- e.g. a live worker's turn errored out on
+    a transient API/connectivity fault and it's sitting idle mid-session. The
+    reconciler must detect this via the queue's own stuck ground truth (no
+    close in stuck_minutes despite claimable work) and nudge the live
+    worker(s) to retry, even though actual==desired would otherwise skip
+    silently."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    item = wt.q.enqueue(project="Q", note="work")
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == item["ref"]:
+            it["created_at"] = "2000-01-01T00:00:00Z"  # long past stuck_minutes
+    wt.q._save_unlocked(data)
+
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S - 30)  # warm: nudge, don't reap
+
+    r = wt.workers.reconcile_once(dry_run=False)
+    assert not r["spawned"]  # actual==desired -- this isn't the spawn path
+
+    fd = wt._readers[-1]
+    data = os.read(fd, 65536).decode()
+    msg = json.loads(data.strip())
+    assert "Q" in msg["message"]["content"][0]["text"]
+
+
+def test_reconcile_stuck_nudge_has_cooldown(wt):
+    """A queue that stays stuck across many reconcile ticks must not be
+    re-nudged every tick -- that would spam the worker's FIFO once per
+    reconciler interval for as long as it stays stuck."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    item = wt.q.enqueue(project="Q", note="work")
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == item["ref"]:
+            it["created_at"] = "2000-01-01T00:00:00Z"
+    wt.q._save_unlocked(data)
+
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S - 30)
+
+    wt.workers.reconcile_once(dry_run=False)
+    fd = wt._readers[-1]
+    first = os.read(fd, 65536)
+    assert first  # first tick nudged
+
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S - 30)  # stays warm
+    wt.workers.reconcile_once(dry_run=False)  # second tick, still stuck
+    readable, _, _ = select.select([fd], [], [], 0.2)
+    assert not readable  # nothing new written -- on cooldown
 
 
 # =========================================================== claim-time surplus

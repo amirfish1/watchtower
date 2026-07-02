@@ -224,6 +224,34 @@ def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) ->
     return n
 
 
+# Cooldown between stuck-queue nudges to the same queue. A queue's `stuck`
+# flag stays true every reconcile tick until progress resumes, so without a
+# cooldown a persistently stuck queue would get re-nudged (and re-write to
+# every live worker's FIFO) once per tick. Matches WARM_TTL_S: no point
+# nudging more often than a worker's prompt cache stays warm anyway.
+_STUCK_NUDGE_COOLDOWN_S = WARM_TTL_S
+_last_stuck_nudge: Dict[str, float] = {}
+
+
+def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
+    """Nudge live workers on a stuck-but-staffed queue to retry/continue.
+
+    Rate-limited to once per ``_STUCK_NUDGE_COOLDOWN_S`` per queue. Returns
+    the number of workers notified (0 if on cooldown or none warm)."""
+    now = time.time()
+    if now - _last_stuck_nudge.get(queue, 0.0) < _STUCK_NUDGE_COOLDOWN_S:
+        return 0
+    _last_stuck_nudge[queue] = now
+    nudge = (
+        f"No ticket has closed on {queue} in a while despite {live_count} live "
+        "worker(s) here. This can happen when a turn errors out on a transient "
+        "API/connectivity fault and gets stuck instead of continuing. If your "
+        f"last turn errored, retry now: `wt claim -q {queue} --worker <your-id> "
+        "--json` and keep draining."
+    )
+    return notify_workers(queue, nudge)
+
+
 def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
                        queue: Optional[str] = None) -> List[Dict[str, Any]]:
     """Kill live workers idle past ``max_idle_s`` (cold cache).
@@ -887,10 +915,10 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             q_name = w.get("queue", "")
             live_by_queue.setdefault(q_name, []).append(w)
 
-    # Use health for queue depth -- one call covers all queues.
-    depth_by_queue: Dict[str, int] = {}
-    for row in health.all_status():
-        depth_by_queue[row["queue"]] = row.get("depth", 0)
+    # Use health for queue depth + stuck ground-truth -- one call covers all queues.
+    health_by_queue: Dict[str, Dict[str, Any]] = {
+        row["queue"]: row for row in health.all_status()
+    }
 
     # Claimable depth respects each queue's claim_types restriction. A bug-only
     # queue (claim_types=['bug']) whose only open tickets are features has ZERO
@@ -947,6 +975,17 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
             continue
         live = live_by_queue.get(q_name, [])
         actual = len(live)
+
+        # A queue can be fully staffed (actual > 0) yet show zero progress --
+        # e.g. every live worker's last turn errored out on a transient API or
+        # connectivity fault and it's sitting idle mid-session rather than
+        # crashed (a crash is caught by the reap+requeue pass above, which
+        # frees the slot for a fresh spawn). Detect via the queue's own stuck
+        # ground truth (no ticket closed in stuck_minutes despite claimable
+        # work) and nudge the live worker(s) to retry/continue.
+        if not dry_run and actual > 0 and (health_by_queue.get(q_name) or {}).get("stuck"):
+            _maybe_nudge_stuck_queue(q_name, actual)
+
         if actual < desired:
             to_spawn = desired - actual
             from . import queue as _q
