@@ -47,6 +47,42 @@ def test_package_imports():
     assert watchtower.__version__
 
 
+def test_help_shows_git_style_grouped_sections(capsys):
+    """`wt --help` groups commands under section headers instead of
+    argparse's default flat {a,b,c,...} brace listing."""
+    import watchtower.cli as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+
+    for header in ("Tickets:", "Queues:", "Fleet:", "Messaging:", "Service:"):
+        assert header in out
+
+    # No brace-list dump of every subcommand.
+    assert "{status," not in out
+    assert "{add," not in out
+
+    # Spot-check: a command still shows up with its one-line help.
+    assert "status" in out
+    assert "per-queue depth / age / stuck flag" in out
+
+    # Closing hint line.
+    assert "wt <command> --help" in out
+
+
+def test_bare_command_prints_grouped_help(capsys):
+    """A bare `wt` invocation prints the same grouped help, not a traceback."""
+    import watchtower.cli as cli
+
+    rc = cli.main([])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Tickets:" in out
+    assert "{status," not in out
+
+
 def test_enqueue_claim_close_status(store):
     import watchtower.queue as q
     import watchtower.health as health

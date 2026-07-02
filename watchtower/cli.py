@@ -38,7 +38,7 @@ import signal
 import sys
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from . import __version__
 from . import health, queue as q, workers
@@ -1505,19 +1505,112 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     return 0 if started else 0
 
 
+# --------------------------------------------------------------------------- help sections
+# Single source of truth for the top-level command listing: (name, section,
+# one-line help). Used to build the grouped --help epilog below; the
+# individual add_parser() calls in build_parser() no longer pass help= so
+# argparse doesn't also render its own flat {a,b,c,...} listing.
+COMMAND_SECTIONS: List[Tuple[str, str]] = [
+    ("Tickets", "add"),
+    ("Tickets", "take"),
+    ("Tickets", "claim"),
+    ("Tickets", "close"),
+    ("Tickets", "block"),
+    ("Tickets", "blocked"),
+    ("Tickets", "answer"),
+    ("Tickets", "discuss"),
+    ("Tickets", "run"),
+    ("Tickets", "find"),
+    ("Tickets", "ls"),
+    ("Tickets", "dedup"),
+    ("Queues", "status"),
+    ("Queues", "set"),
+    ("Queues", "drain"),
+    ("Queues", "wait"),
+    ("Queues", "monitor"),
+    ("Fleet", "workers"),
+    ("Fleet", "agents"),
+    ("Fleet", "agent"),
+    ("Messaging", "send"),
+    ("Messaging", "ask"),
+    ("Messaging", "chat"),
+    ("Service", "start"),
+    ("Service", "stop"),
+    ("Service", "install"),
+    ("Service", "uninstall"),
+    ("Service", "dashboard"),
+    ("Service", "skills"),
+]
+
+COMMAND_HELP: Dict[str, str] = {
+    "add": "file a ticket",
+    "take": "file a ticket and immediately claim it (= add --claim)",
+    "claim": "claim next open ticket (smart sort: priority + type + age)",
+    "close": "close a ticket (record how you fixed it)",
+    "block": "park a ticket that needs a human decision",
+    "blocked": "list tickets parked for a human",
+    "answer": "answer a blocked ticket; auto-resumes its session",
+    "discuss": "attach to a blocked ticket's session (claude --resume)",
+    "run": "mark an existing GitHub issue runnable and dispatch its queue",
+    "find": "look up one ticket by ref across all queues (no -q needed)",
+    "ls": "list the tickets in one queue",
+    "dedup": "close exact-duplicate open tickets",
+    "status": "per-queue depth / age / stuck flag",
+    "set": "set queue-level config (repo_path, engine, workers)",
+    "drain": "enable or disable auto-drain for a queue",
+    "wait": "block until the queue is drained",
+    "monitor": "run a check; file a ticket if it fails",
+    "workers": "list workers this CLI started",
+    "agents": "agents registry + live workers, merged view",
+    "agent": "manage the agents registry",
+    "send": "push a message to a worker/agent/session",
+    "ask": "ask a target and wait for its reply",
+    "chat": "group chats: multi-agent conversations",
+    "start": "start service (watcher, reconciler, dashboard, HTTP API)",
+    "stop": "stop service (watcher, reconciler, dashboard, HTTP API)",
+    "install": "install LaunchAgent so service starts on login",
+    "uninstall": "remove LaunchAgent (stop auto-start on login)",
+    "dashboard": "open the night-watch dashboard (background server + browser)",
+    "skills": "sync the bundled watchtower skill into installed agent harnesses",
+}
+
+_SECTION_ORDER = ["Tickets", "Queues", "Fleet", "Messaging", "Service"]
+
+
+def _build_command_epilog() -> str:
+    """Git-style grouped command listing for the top-level --help epilog."""
+    name_width = max(len(name) for _, name in COMMAND_SECTIONS)
+    lines = ["commands:"]
+    for section in _SECTION_ORDER:
+        lines.append(f"\n  {section}:")
+        for sec, name in COMMAND_SECTIONS:
+            if sec != section:
+                continue
+            helptext = COMMAND_HELP[name]
+            lines.append(f"    {name:<{name_width}}  {helptext}")
+    lines.append("\nRun 'wt <command> --help' for details on any command.")
+    return "\n".join(lines)
+
+
 # --------------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="wt", description="WatchTower queue CLI")
+    p = argparse.ArgumentParser(
+        prog="wt",
+        usage="wt <command> [options]",
+        description="WatchTower queue CLI",
+        epilog=_build_command_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument("--version", action="version", version=f"wt {__version__}")
-    sub = p.add_subparsers(dest="command")
+    sub = p.add_subparsers(dest="command", metavar="<command>", help=argparse.SUPPRESS)
 
-    s = sub.add_parser("status", help="per-queue depth / age / stuck flag")
+    s = sub.add_parser("status")
     s.add_argument("-q", "--queue", default=None)
     s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_status)
 
-    s = sub.add_parser("ls", help="list the tickets in one queue")
+    s = sub.add_parser("ls")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument(
         "--status",
@@ -1529,7 +1622,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_ls)
 
-    s = sub.add_parser("find", help="look up one ticket by ref across all queues (no -q needed)")
+    s = sub.add_parser("find")
     s.add_argument("ref", help="ticket ref (e.g. WT-48) or bare number")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_find)
@@ -1558,20 +1651,18 @@ def build_parser() -> argparse.ArgumentParser:
                                help="worker/owner id to claim under when --claim is "
                                     "set; defaults to wt-cli-<pid>")
 
-    s = sub.add_parser("add", help="file a ticket")
+    s = sub.add_parser("add")
     _add_common_ticket_args(s)
     s.add_argument("--claim", action="store_true",
                    help="immediately claim the new ticket (mark in_progress) so no "
                         "auto-drain worker picks it up; use when you're already working it")
     s.set_defaults(func=cmd_add)
 
-    s = sub.add_parser("take",
-                       help="file a ticket and immediately claim it (= add --claim); "
-                            "for documenting a bug you're already working on")
+    s = sub.add_parser("take")
     _add_common_ticket_args(s)
     s.set_defaults(func=cmd_take)
 
-    s = sub.add_parser("claim", help="claim next open ticket (smart sort: priority + type + age)")
+    s = sub.add_parser("claim")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("ref", nargs="?", default="",
                    help="claim a specific ticket by ref (e.g. CCC-42); omit to claim next")
@@ -1587,13 +1678,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_claim)
 
-    s = sub.add_parser("run", help="mark an existing GitHub issue runnable and dispatch its queue")
+    s = sub.add_parser("run")
     s.add_argument("ref", help="ticket ref / GitHub issue ref, e.g. BYM-GH-FINIE-402")
     s.add_argument("--no-dispatch", action="store_true",
                    help="only add the WatchTower label; do not nudge/spawn workers")
     s.set_defaults(func=cmd_run)
 
-    s = sub.add_parser("close", help="close a ticket (record how you fixed it)")
+    s = sub.add_parser("close")
     s.add_argument("ref")
     s.add_argument("--worker", default="")
     s.add_argument("--summary", default="",
@@ -1609,7 +1700,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="also file each follow-up/unresolved as a new open ticket")
     s.set_defaults(func=cmd_close)
 
-    s = sub.add_parser("block", help="park a ticket that needs a human decision")
+    s = sub.add_parser("block")
     s.add_argument("ref")
     s.add_argument("--worker", default="", help="your session/worker id")
     s.add_argument("--question", default="", help="the specific decision you need")
@@ -1617,13 +1708,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="analysis-so-far note (backstop if the session is lost)")
     s.set_defaults(func=cmd_block)
 
-    s = sub.add_parser("blocked", help="list tickets parked for a human")
+    s = sub.add_parser("blocked")
     s.add_argument("-q", "--queue", default=None)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_blocked)
 
-    s = sub.add_parser("answer",
-                       help="answer a blocked ticket; auto-resumes its session")
+    s = sub.add_parser("answer")
     s.add_argument("ref")
     s.add_argument("text", help="your answer")
     s.add_argument("--worker", default="")
@@ -1631,19 +1721,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="engine to resume the blocked session with")
     s.set_defaults(func=cmd_answer)
 
-    s = sub.add_parser("discuss",
-                       help="attach to a blocked ticket's session (claude --resume)")
+    s = sub.add_parser("discuss")
     s.add_argument("ref")
     s.add_argument("--engine", default="claude", choices=["claude", "codex"])
     s.add_argument("--print", action="store_true", dest="print",
                    help="print the resume command instead of running it")
     s.set_defaults(func=cmd_discuss)
 
-    s = sub.add_parser("workers", help="list workers this CLI started")
+    s = sub.add_parser("workers")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
 
-    s = sub.add_parser("send", help="push a message to a worker/agent/session")
+    s = sub.add_parser("send")
     s.add_argument("target", help="worker id, @agent name, or session UUID/prefix")
     s.add_argument("text", help="the message")
     s.add_argument("--mode", default="send", choices=["send", "steer"],
@@ -1653,7 +1742,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_send)
 
-    s = sub.add_parser("ask", help="ask a target and wait for its reply")
+    s = sub.add_parser("ask")
     s.add_argument("target", help="worker id, @agent name, or session UUID/prefix")
     s.add_argument("text", help="the question")
     s.add_argument("--timeout", type=float, default=30.0,
@@ -1661,11 +1750,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_ask)
 
-    s = sub.add_parser("agents", help="agents registry + live workers, merged view")
+    s = sub.add_parser("agents")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_agents)
 
-    s = sub.add_parser("agent", help="manage the agents registry")
+    s = sub.add_parser("agent")
     s.set_defaults(func=cmd_agent, agent_command=None)
     asub = s.add_subparsers(dest="agent_command")
     for alias in ("register", "set-name"):
@@ -1680,7 +1769,7 @@ def build_parser() -> argparse.ArgumentParser:
     sa = asub.add_parser("rm", help="remove a name from the registry")
     sa.add_argument("name")
 
-    s = sub.add_parser("chat", help="group chats: multi-agent conversations")
+    s = sub.add_parser("chat")
     s.set_defaults(func=cmd_chat, chat_command=None)
     csub = s.add_subparsers(dest="chat_command")
 
@@ -1727,7 +1816,7 @@ def build_parser() -> argparse.ArgumentParser:
     sc = csub.add_parser("close", help="close a chat")
     sc.add_argument("ref")
 
-    s = sub.add_parser("set", help="set queue-level config (repo_path, engine, workers)")
+    s = sub.add_parser("set")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("--backend", default=None, choices=["file", "github"],
                    help="queue backing store: file (default) or github")
@@ -1749,21 +1838,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="number of concurrent workers the reconciler should maintain")
     s.set_defaults(func=cmd_set)
 
-    s = sub.add_parser("drain", help="enable or disable auto-drain for a queue")
+    s = sub.add_parser("drain")
     s.add_argument("onoff", choices=["on", "off"], help="on = auto-spawn workers; off = backlog mode")
     s.add_argument("queue", metavar="QUEUE", help="queue name (e.g. CCC, WT)")
     s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
                    help="restrict auto-drain workers to these ticket types (repeatable); omit to clear")
     s.set_defaults(func=cmd_drain)
 
-    s = sub.add_parser("monitor", help="run a check; file a ticket if it fails")
+    s = sub.add_parser("monitor")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("--cmd", required=True, help="shell command; non-zero exit = fail")
     s.add_argument("--title", default="", help="ticket title on failure")
     s.add_argument("--note", default="", help="ticket note on failure")
     s.set_defaults(func=cmd_monitor)
 
-    s = sub.add_parser("dedup", help="close exact-duplicate open tickets")
+    s = sub.add_parser("dedup")
     s.add_argument("-q", "--queue", default=None)
     s.add_argument("--apply", action="store_true", help="close dupes (default: dry-run)")
     s.set_defaults(func=cmd_dedup)
@@ -1771,7 +1860,7 @@ def build_parser() -> argparse.ArgumentParser:
     # No `wt spawn-worker`: workers are spawned by the watcher (`wt start`) from
     # per-queue auto_drain policy + depth, not by hand. See workers.spawn_workers.
 
-    s = sub.add_parser("wait", help="block until the queue is drained")
+    s = sub.add_parser("wait")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("--timeout", type=float, default=0.0, help="seconds; 0 = forever")
     s.add_argument("--interval", type=float, default=5.0)
@@ -1780,7 +1869,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="POST JSON to this URL when the queue drains (async reply)")
     s.set_defaults(func=cmd_wait)
 
-    s = sub.add_parser("start", help="start service (watcher, reconciler, dashboard, HTTP API)")
+    s = sub.add_parser("start")
     s.add_argument("--interval", type=int, default=30,
                    help="reconciler tick interval in seconds (default 30)")
     s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
@@ -1798,30 +1887,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--foreground", action="store_true", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_start)
 
-    s = sub.add_parser("stop", help="stop service (watcher, reconciler, dashboard, HTTP API)")
+    s = sub.add_parser("stop")
     s.set_defaults(func=cmd_stop)
 
-    s = sub.add_parser("install", help="install LaunchAgent so service starts on login")
+    s = sub.add_parser("install")
     s.set_defaults(func=cmd_install)
 
-    s = sub.add_parser("uninstall", help="remove LaunchAgent (stop auto-start on login)")
+    s = sub.add_parser("uninstall")
     s.set_defaults(func=cmd_uninstall)
 
-    s = sub.add_parser(
-        "skills",
-        help="sync the bundled watchtower skill into installed agent harnesses",
-    )
+    s = sub.add_parser("skills")
     s.set_defaults(func=cmd_skills, skills_command=None)
     ssub = s.add_subparsers(dest="skills_command")
     ssub.add_parser("sync", help="symlink into every present harness (default; also runs on `wt install`)")
     ssub.add_parser("status", help="show sync state without changing anything")
     ssub.add_parser("remove", help="remove the managed symlinks")
 
-    s = sub.add_parser(
-        "dashboard",
-        aliases=["serve"],
-        help="open the night-watch dashboard (background server + browser)",
-    )
+    s = sub.add_parser("dashboard", aliases=["serve"])
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8787)
     s.add_argument("--no-open", action="store_true",
