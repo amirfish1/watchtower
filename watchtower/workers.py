@@ -245,6 +245,7 @@ def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
 
     Rate-limited to once per ``_STUCK_NUDGE_COOLDOWN_S`` per queue. Returns
     the number of workers notified (0 if on cooldown or none warm)."""
+    from .queue import _log
     now = time.time()
     if now - _last_stuck_nudge.get(queue, 0.0) < _STUCK_NUDGE_COOLDOWN_S:
         return 0
@@ -256,7 +257,10 @@ def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
         f"last turn errored, retry now: `wt claim -q {queue} --worker <your-id> "
         "--json` and keep draining."
     )
-    return notify_workers(queue, nudge)
+    delivered = notify_workers(queue, nudge)
+    _log("NUDGE", f"stuck queue — nudged {delivered}/{live_count} live worker(s)",
+         queue=queue)
+    return delivered
 
 
 def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
