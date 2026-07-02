@@ -22,6 +22,7 @@ import pytest
 
 SID_A = "7f72634b-b0bd-4c78-b931-3d877ed84187"
 SID_B = "c44f96bc-d720-49d3-a5e6-115426939f82"
+SID_C = "12345678-aaaa-4bbb-8ccc-1234567890ab"
 # Two UUIDs sharing the same first 8 hex chars, for ambiguity tests.
 SID_AMB1 = "aaaaaaaa-1111-4111-8111-111111111111"
 SID_AMB2 = "aaaaaaaa-2222-4222-8222-222222222222"
@@ -225,19 +226,86 @@ def test_resolve_short_unknown_prefix_raises(wt):
         wt.messages.resolve_target("not/a/target")
 
 
-def test_resolve_and_list_never_touch_transcripts(wt, monkeypatch):
-    """Guarantee: the agents view (registry + workers) and resolve_target never
-    scan the claude projects dir; only the resume adapter's busy check does."""
+def test_exact_resolution_and_plain_listing_never_touch_projects_dir(wt, monkeypatch):
+    """Exact worker-id / agent-name resolution and list_agents(include_recent=
+    False) never touch the claude projects dir at all."""
     def boom():
-        raise AssertionError("transcript archive must not be scanned here")
+        raise AssertionError("projects dir must not be touched here")
     monkeypatch.setattr(wt.messages, "_claude_projects_root", boom)
     rec = _live_worker(wt, "Q", session_id=SID_A)
     wt.messages.register_agent("planner", SID_B)
-    wt.messages.list_agents()
-    wt.messages.resolve_target(rec["worker_id"])
-    wt.messages.resolve_target("@planner")
-    wt.messages.resolve_target(SID_B[:10])
-    wt.messages.resolve_target(SID_A)
+    assert [r["name"] for r in wt.messages.list_agents(include_recent=False)] \
+        == ["planner"]
+    assert wt.messages.resolve_target(rec["worker_id"])["kind"] == "worker"
+    assert wt.messages.resolve_target("@planner")["kind"] == "agent"
+
+
+def test_deliver_and_drain_never_enumerate_projects_dir(wt, monkeypatch):
+    """Boundary: deliver() and drain_outbox() must never run the recent-session
+    scan. The resume busy check's targeted <sid>.jsonl lookup stays the only
+    transcript touch on those paths."""
+    def boom(*a, **k):
+        raise AssertionError("recent-session scan is not allowed on this path")
+    monkeypatch.setattr(wt.messages, "recent_sessions", boom)
+    # Busy transcript so the resume adapter defers instead of spawning claude;
+    # a Popen here would mean the busy check was skipped, so make it fatal too.
+    _write_transcript(wt, SID_C, age_s=0)
+    def no_spawn(*a, **k):
+        raise AssertionError("no spawn expected on a busy session")
+    monkeypatch.setattr(wt.messages.subprocess, "Popen", no_spawn)
+    resolved = wt.messages.resolve_target(SID_C, include_recent=False)
+    r = wt.messages.deliver(resolved, "hi")
+    assert r["ok"] is False and r["busy"] is True
+    wt.messages.outbox_add(SID_C, "queued", now=time.time() - 60)
+    out = wt.messages.drain_outbox()  # resolves with include_recent=False
+    assert out["retried"]  # attempted (busy again), and no scan happened
+
+
+# ========================================================= recent-session window
+def test_recent_sessions_window_and_fields(wt):
+    _write_transcript(wt, SID_A, age_s=60)            # fresh: in window
+    _write_transcript(wt, SID_B, age_s=5 * 86400)     # 5 days old: out (3d default)
+    rows = wt.messages.recent_sessions()
+    assert [r["session_id"] for r in rows] == [SID_A]
+    assert rows[0]["cwd_slug"] == "some-project"
+    assert abs(rows[0]["last_active_epoch"] - (time.time() - 60)) < 5
+
+
+def test_recent_sessions_env_override(wt, monkeypatch):
+    _write_transcript(wt, SID_B, age_s=5 * 86400)
+    assert wt.messages.recent_sessions() == []        # 5d old, default 3d window
+    monkeypatch.setenv("WATCHTOWER_AGENTS_WINDOW_DAYS", "10")
+    assert [r["session_id"] for r in wt.messages.recent_sessions()] == [SID_B]
+    assert wt.messages.recent_sessions(window_days=1) == []  # arg beats env
+
+
+def test_recent_sessions_ignores_non_uuid_files(wt):
+    d = Path(os.environ["WATCHTOWER_CLAUDE_PROJECTS_DIR"]) / "some-project"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "notes.jsonl").write_text("{}\n")
+    (d / f"{SID_A}.txt").write_text("{}\n")
+    assert wt.messages.recent_sessions() == []
+
+
+def test_list_agents_merges_and_dedupes_recent(wt):
+    wt.messages.register_agent("planner", SID_A)
+    _live_worker(wt, "Q", session_id=SID_B)
+    _write_transcript(wt, SID_A, age_s=60)   # deduped: registered
+    _write_transcript(wt, SID_B, age_s=60)   # deduped: live worker session
+    _write_transcript(wt, SID_C, age_s=60)   # genuinely new: listed as recent
+    rows = wt.messages.list_agents()
+    assert [(r.get("kind"), r.get("name") or r.get("session_id")) for r in rows] \
+        == [("agent", "planner"), ("recent", SID_C)]
+
+
+def test_resolve_prefix_of_recent_session(wt):
+    _write_transcript(wt, SID_C, age_s=60)
+    r = wt.messages.resolve_target(SID_C[:8])
+    assert r["kind"] == "session" and r["session_id"] == SID_C
+    assert r["engine"] == "claude" and r["worker"] is None
+    # The daemon-path variant does not see the recent window.
+    with pytest.raises(ValueError):
+        wt.messages.resolve_target(SID_C[:8], include_recent=False)
 
 
 # ================================================================== fifo delivery

@@ -36,6 +36,17 @@ This module gives WatchTower its conversational primitives (see
     ``~/.watchtower/agents.json``): friendly names for session UUIDs, schema
     ``{name: {session_id, engine, cwd, registered_at, last_seen}}``.
 
+  * Discovery: reachability and listing are two different questions. ANY
+    session transcript on disk is reachable by UUID (the resume adapter can
+    wake a dormant session), but ``list_agents`` shows the useful working
+    set: the registry plus auto-discovered recent sessions, transcripts whose
+    mtime falls within the last ``$WATCHTOWER_AGENTS_WINDOW_DAYS`` days
+    (default 3). The window scan is stat-only (no transcript contents are
+    read) and runs ONLY from ``list_agents(include_recent=True)`` and from
+    UUID-prefix resolution, never from the daemon tick or delivery paths
+    (``deliver`` / ``drain_outbox``), so thousands of older transcripts cost
+    nothing.
+
 All state-file paths are resolved at call time (never import-time constants)
 so tests can override them via the environment. Writes are atomic
 (tmp + ``os.replace``) and outbox/registry mutations are serialised with the
@@ -230,14 +241,76 @@ def remove_agent(name: str) -> bool:
     return True
 
 
-def list_agents() -> List[Dict[str, Any]]:
-    """Registry entries as a list of rows, each with its name included."""
+def _recent_window_days() -> float:
+    raw = os.environ.get("WATCHTOWER_AGENTS_WINDOW_DAYS", "")
+    try:
+        return float(raw) if raw else 3.0
+    except ValueError:
+        return 3.0
+
+
+def recent_sessions(window_days: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Auto-discover recently active sessions: a stat-only pass over the
+    transcript archive (``<projects dir>/*/<uuid>.jsonl``).
+
+    Returns ``[{"session_id", "cwd_slug", "last_active_epoch"}]`` for every
+    transcript whose mtime is within the last ``window_days`` days (default
+    3, ``$WATCHTOWER_AGENTS_WINDOW_DAYS``), newest first. No file contents
+    are ever read; this is directory listing + stat only. Callers on hot or
+    daemon paths must NOT use this (see the module docstring boundary)."""
+    if window_days is None:
+        window_days = _recent_window_days()
+    cutoff = time.time() - float(window_days) * 86400.0
+    root = _claude_projects_root()
+    out: List[Dict[str, Any]] = []
+    try:
+        project_dirs = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        return []
+    for d in project_dirs:
+        try:
+            entries = list(d.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            if p.suffix != ".jsonl" or not _UUID_RE.match(p.stem):
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                continue
+            if mtime >= cutoff:
+                out.append({
+                    "session_id": p.stem,
+                    "cwd_slug": d.name,
+                    "last_active_epoch": mtime,
+                })
+    out.sort(key=lambda r: -float(r["last_active_epoch"]))
+    return out
+
+
+def list_agents(include_recent: bool = True) -> List[Dict[str, Any]]:
+    """The addressable working set: registry entries (kind ``agent``), plus,
+    when ``include_recent`` is set, auto-discovered recent sessions (kind
+    ``recent``) deduped against registry session_ids and live workers'
+    session_ids. Callers merge live workers themselves (``wt agents``)."""
     agents = _load_agents()
     out: List[Dict[str, Any]] = []
     for name in sorted(agents):
         rec = agents[name]
         if isinstance(rec, dict):
-            out.append({"name": name, **rec})
+            out.append({"name": name, "kind": "agent", **rec})
+    if not include_recent:
+        return out
+    known = {str(r.get("session_id") or "") for r in out}
+    for w in workers.list_workers(prune=False):
+        if w.get("alive") and w.get("session_id"):
+            known.add(str(w["session_id"]))
+    for r in recent_sessions():
+        if r["session_id"] in known:
+            continue
+        known.add(r["session_id"])
+        out.append({"kind": "recent", **r})
     return out
 
 
@@ -267,7 +340,7 @@ def _known_sessions(
     return known
 
 
-def resolve_target(target: str) -> Dict[str, Any]:
+def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
     """Resolve a target string to a delivery descriptor.
 
     Returns ``{"kind": "worker"|"agent"|"session", "session_id": str|None,
@@ -277,6 +350,11 @@ def resolve_target(target: str) -> Dict[str, Any]:
       2. agents registry name (a leading ``@`` is allowed),
       3. raw session UUID, or a unique hex prefix (>= 8 chars) of a known
          session; an unknown value is accepted only as a full 36-char UUID.
+
+    Known sessions for prefix matching are live workers + the registry, plus
+    (when ``include_recent``, the default) the recent-transcript window from
+    ``recent_sessions``. Daemon paths pass ``include_recent=False`` so the
+    tick never enumerates the transcript archive.
 
     Raises ``ValueError`` for empty, ambiguous, or unresolvable targets."""
     t = str(target or "").strip()
@@ -304,6 +382,9 @@ def resolve_target(target: str) -> Dict[str, Any]:
         }
     if _HEX_PREFIX_RE.match(t):
         known = _known_sessions(live, agents)
+        if include_recent:
+            for r in recent_sessions():
+                known.setdefault(str(r["session_id"]), "claude")
         matches = sorted(
             {sid for sid in known if sid.lower().startswith(t.lower())}
         )
@@ -583,7 +664,10 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
     outcomes: Dict[str, Dict[str, Any]] = {}
     for m in due:
         try:
-            resolved = resolve_target(str(m.get("to") or ""))
+            # include_recent=False: the daemon tick must never enumerate the
+            # transcript archive; outbox targets are already resolved sids
+            # (or exact worker ids / names), so the window adds nothing here.
+            resolved = resolve_target(str(m.get("to") or ""), include_recent=False)
             outcomes[str(m.get("id"))] = deliver(
                 resolved, str(m.get("text") or ""), str(m.get("mode") or "send")
             )
