@@ -49,12 +49,22 @@ Targets are resolved in order:
    `wt agent register <name> --session <uuid> [--engine claude] [--cwd path]`.
 3. Raw session UUID (or unique prefix >= 8 chars).
 
-`wt agents` lists the registry plus live WT workers, with liveness where
-known. It is an address book, not a session browser: it never scans the
-transcript archive, so the thousands of dormant sessions on disk stay out of
-it unless explicitly registered (browsing history remains CCC / Total Recall
-territory). `wt agent set-name` is accepted as an alias for `register`, and
-re-registering an existing name just repoints it.
+Reachability vs listing are two different questions:
+
+- Reachable (send/ask targets): ANY session on disk, by UUID or unique
+  prefix. Process liveness is irrelevant; the resume adapter can wake any
+  dormant transcript, and busy-hold handles the mid-turn case.
+- Listed (`wt agents`): the useful working set, not all of history. Three
+  sources merged: (1) the named registry, always; (2) WT workers; (3)
+  auto-discovered recent sessions, transcripts under ~/.claude/projects whose
+  mtime is within the last 3 days ($WATCHTOWER_AGENTS_WINDOW_DAYS). The
+  window scan is a stat-only pass, run only inside the `wt agents` command
+  (and UUID-prefix resolution), never in the daemon tick, so the
+  thousands of older transcripts cost nothing. Full-history browsing remains
+  CCC / Total Recall territory.
+
+`wt agent set-name` is accepted as an alias for `register`, and re-registering
+an existing name just repoints it.
 
 ## Delivery adapters (ordered fall-through)
 
