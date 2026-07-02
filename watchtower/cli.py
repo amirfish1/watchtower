@@ -14,6 +14,10 @@
     wt workers                list workers the watcher started
     wt block / blocked        park a ticket needing a human / list parked
     wt answer / discuss       answer a blocked ticket / attach to its session
+    wt send <target> "text"   push a message to a worker/agent/session
+    wt ask <target> "q"       ask a target and wait for its reply
+    wt agents                 agents registry + live workers, merged view
+    wt agent register|rm      name a session UUID / drop a name
     wt wait -q Q [--cmd ..]   block until the queue is drained, then run --cmd
     wt start / wt stop        start/stop service (watcher, reconciler, dashboard, HTTP API)
     wt dashboard              phone-first HTTP dashboard (queues + workers)
@@ -510,6 +514,102 @@ def cmd_workers(args: argparse.Namespace) -> int:
 
 
 
+def cmd_send(args: argparse.Namespace) -> int:
+    """Push a message to a worker/agent/session via the adapter chain; on
+    delivery failure the message is parked in the durable outbox (unless
+    --no-queue) for the daemon to retry."""
+    from . import messages
+    res = messages.send(
+        args.target, args.text, mode=args.mode,
+        queue_on_fail=not args.no_queue,
+    )
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if (res.get("ok") or res.get("queued")) else 1
+    if res.get("ok"):
+        extra = f"  (log: {res['log']})" if res.get("log") else ""
+        print(f"SENT: {args.target} via {res.get('transport', '?')}{extra}")
+        return 0
+    if res.get("queued"):
+        why = res.get("error", "")
+        print(f"QUEUED: {res.get('id', '?')} for {args.target}"
+              + (f"  ({why})" if why else ""))
+        return 0
+    print(f"error: {res.get('error', 'send failed')}", file=sys.stderr)
+    return 1
+
+
+def cmd_ask(args: argparse.Namespace) -> int:
+    """Ask a target a question and wait for the reply. Prints the answer text;
+    exits 1 on timeout (partial text, if any, goes to stdout after the error)."""
+    from . import messages
+    res = messages.ask(
+        args.target, args.text, timeout_ms=int(args.timeout * 1000)
+    )
+    if args.json:
+        print(json.dumps(res, indent=2))
+        return 0 if res.get("ok") else 1
+    if res.get("ok"):
+        print(res.get("answer") or "")
+        return 0
+    print(f"error: {res.get('error', 'ask failed')}", file=sys.stderr)
+    if res.get("partial"):
+        print(res["partial"])
+    return 1
+
+
+def cmd_agents(args: argparse.Namespace) -> int:
+    """Merged view: registered agent names plus live WT workers."""
+    from . import messages
+    agents = messages.list_agents()
+    live = [w for w in workers.list_workers() if w.get("alive")]
+    if args.json:
+        print(json.dumps({"agents": agents, "workers": live}, indent=2))
+        return 0
+    if not agents and not live:
+        print("(no agents registered, no live workers)")
+        return 0
+    print(f"{'NAME':<24}{'KIND':<8}{'ENGINE':<8}{'SESSION':<38}CWD/QUEUE")
+    print("-" * 90)
+    for a in agents:
+        print(
+            f"@{a.get('name',''):<23}{'agent':<8}{a.get('engine',''):<8}"
+            f"{a.get('session_id',''):<38}{a.get('cwd','')}"
+        )
+    for w in live:
+        print(
+            f"{w.get('worker_id',''):<24}{'worker':<8}{w.get('engine',''):<8}"
+            f"{w.get('session_id','') or '-':<38}{w.get('queue','')}"
+        )
+    return 0
+
+
+def cmd_agent(args: argparse.Namespace) -> int:
+    """Manage the agents registry: register/set-name a session UUID, rm a name."""
+    from . import messages
+    sub = getattr(args, "agent_command", None)
+    if sub in ("register", "set-name"):
+        try:
+            rec = messages.register_agent(
+                args.name, args.session, engine=args.engine, cwd=args.cwd,
+            )
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        print(f"REGISTERED: @{rec['name']} -> {rec['session_id']} "
+              f"({rec['engine']})")
+        return 0
+    if sub == "rm":
+        if messages.remove_agent(args.name):
+            print(f"REMOVED: @{str(args.name).lstrip('@')}")
+            return 0
+        print(f"(no agent {args.name})", file=sys.stderr)
+        return 1
+    print("usage: wt agent register|set-name <name> --session <uuid> | "
+          "wt agent rm <name>", file=sys.stderr)
+    return 1
+
+
 def cmd_monitor(args: argparse.Namespace) -> int:
     """Monitor-as-a-job (WT-FEATURES-20): run a check command; if it fails
     (non-zero exit), file a ticket into the queue so a worker drains it. Pair
@@ -709,6 +809,13 @@ def _daemon_loop(args: argparse.Namespace) -> None:
         print(f"[watchtower] dashboard already running; skipping HTTP bind", flush=True)
     while True:
         result = workers.reconcile_once(dry_run=dry_run)
+        # Drain queued cross-agent messages each tick. Best-effort: a messaging
+        # hiccup must never kill the reconcile loop.
+        try:
+            from . import messages
+            messages.drain_outbox()
+        except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+            print(f"[watchtower] drain_outbox failed: {e}", flush=True)
         for rec in result.get("spawned", []):
             tag = " (dry-run)" if rec.get("dry_run") else ""
             print(
@@ -1223,6 +1330,43 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("workers", help="list workers this CLI started")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
+
+    s = sub.add_parser("send", help="push a message to a worker/agent/session")
+    s.add_argument("target", help="worker id, @agent name, or session UUID/prefix")
+    s.add_argument("text", help="the message")
+    s.add_argument("--mode", default="send", choices=["send", "steer"],
+                   help="delivery mode hint (delegate transports honor steer)")
+    s.add_argument("--no-queue", action="store_true", dest="no_queue",
+                   help="fail immediately instead of parking in the outbox")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_send)
+
+    s = sub.add_parser("ask", help="ask a target and wait for its reply")
+    s.add_argument("target", help="worker id, @agent name, or session UUID/prefix")
+    s.add_argument("text", help="the question")
+    s.add_argument("--timeout", type=float, default=30.0,
+                   help="seconds to wait for the reply (default 30)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_ask)
+
+    s = sub.add_parser("agents", help="agents registry + live workers, merged view")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_agents)
+
+    s = sub.add_parser("agent", help="manage the agents registry")
+    s.set_defaults(func=cmd_agent, agent_command=None)
+    asub = s.add_subparsers(dest="agent_command")
+    for alias in ("register", "set-name"):
+        sa = asub.add_parser(
+            alias,
+            help="name a session UUID (re-registering a name repoints it)",
+        )
+        sa.add_argument("name", help="agent name (a leading @ is allowed)")
+        sa.add_argument("--session", required=True, help="the session UUID")
+        sa.add_argument("--engine", default="claude", help="engine (default claude)")
+        sa.add_argument("--cwd", default="", help="working directory hint")
+    sa = asub.add_parser("rm", help="remove a name from the registry")
+    sa.add_argument("name")
 
     s = sub.add_parser("set", help="set queue-level config (repo_path, engine, workers)")
     s.add_argument("-q", "--queue", required=True)
