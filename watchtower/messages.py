@@ -449,13 +449,20 @@ def _session_busy(sid: str) -> bool:
     """True when the session's transcript was written within the busy window,
     meaning the session is actively mid-turn: forking a parallel resume would
     race it, so the caller must hold the message for a later retry."""
+    return session_state(sid) == "busy"
+
+
+def session_state(sid: str, now: Optional[float] = None) -> str:
+    """Return busy, idle, or unknown from one targeted transcript stat."""
     p = _find_transcript(sid)
     if p is None:
-        return False
+        return "unknown"
     try:
-        return (time.time() - p.stat().st_mtime) < _busy_window_s()
+        mtime = p.stat().st_mtime
     except OSError:
-        return False
+        return "unknown"
+    now = time.time() if now is None else float(now)
+    return "busy" if (now - mtime) < _busy_window_s() else "idle"
 
 
 def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:

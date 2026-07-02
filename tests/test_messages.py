@@ -608,6 +608,16 @@ def test_busy_window_env_override(wt, monkeypatch):
     assert wt.messages._session_busy(SID_B) is False  # 30s old > 10s window
 
 
+def test_session_state_reports_busy_idle_unknown(wt, monkeypatch):
+    _write_transcript(wt, SID_A, age_s=30)
+    _write_transcript(wt, SID_B, age_s=600)
+    monkeypatch.setenv("WATCHTOWER_BUSY_WINDOW_S", "120")
+
+    assert wt.messages.session_state(SID_A) == "busy"
+    assert wt.messages.session_state(SID_B) == "idle"
+    assert wt.messages.session_state(SID_C) == "unknown"
+
+
 def test_drain_delivers_after_transcript_goes_quiet(wt, monkeypatch):
     p = _write_transcript(wt, SID_B, age_s=0)
     calls = []
@@ -759,6 +769,39 @@ def test_cli_agent_register_and_agents_view(wt, capsys):
     payload = json.loads(out[out.index("{"):])
     assert payload["agents"][0]["name"] == "planner"
     assert len(payload["workers"]) == 1
+
+
+def test_cli_agents_json_includes_busy_idle_unknown_state(wt, capsys):
+    import watchtower.cli as cli
+    importlib.reload(cli)
+    wt.messages.register_agent("busy", SID_A)
+    wt.messages.register_agent("idle", SID_B)
+    _write_transcript(wt, SID_A, age_s=0)
+    _write_transcript(wt, SID_B, age_s=600)
+    worker = _live_worker(wt, "Q", session_id=SID_C)
+
+    rc = cli.main(["agents", "--json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    states = {a["name"]: a["state"] for a in payload["agents"]}
+    assert states == {"busy": "busy", "idle": "idle"}
+    assert payload["workers"][0]["worker_id"] == worker["worker_id"]
+    assert payload["workers"][0]["state"] == "unknown"
+
+
+def test_cli_agents_human_output_has_state_column(wt, capsys):
+    import watchtower.cli as cli
+    importlib.reload(cli)
+    wt.messages.register_agent("planner", SID_A)
+    _write_transcript(wt, SID_A, age_s=0)
+
+    rc = cli.main(["agents"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "STATE" in out.splitlines()[0]
+    assert "busy" in out
 
 
 def test_cli_outbox_ls_retry_and_rm(wt, capsys):

@@ -652,24 +652,34 @@ def cmd_outbox(args: argparse.Namespace) -> int:
 def cmd_agents(args: argparse.Namespace) -> int:
     """Merged view: registered agent names plus live WT workers."""
     from . import messages
-    agents = messages.list_agents()
-    live = [w for w in workers.list_workers() if w.get("alive")]
+    now = time.time()
+
+    def with_state(row: dict) -> dict:
+        out = dict(row)
+        sid = str(out.get("session_id") or "")
+        out["state"] = messages.session_state(sid, now=now) if sid else "unknown"
+        return out
+
+    agents = [with_state(a) for a in messages.list_agents()]
+    live = [with_state(w) for w in workers.list_workers() if w.get("alive")]
     if args.json:
         print(json.dumps({"agents": agents, "workers": live}, indent=2))
         return 0
     if not agents and not live:
         print("(no agents registered, no live workers)")
         return 0
-    print(f"{'NAME':<24}{'KIND':<8}{'ENGINE':<8}{'SESSION':<38}CWD/QUEUE")
-    print("-" * 90)
+    print(f"{'NAME':<24}{'KIND':<8}{'STATE':<8}{'ENGINE':<8}{'SESSION':<38}CWD/QUEUE")
+    print("-" * 98)
     for a in agents:
         print(
-            f"@{a.get('name',''):<23}{'agent':<8}{a.get('engine',''):<8}"
+            f"@{a.get('name',''):<23}{'agent':<8}{a.get('state',''):<8}"
+            f"{a.get('engine',''):<8}"
             f"{a.get('session_id',''):<38}{a.get('cwd','')}"
         )
     for w in live:
         print(
-            f"{w.get('worker_id',''):<24}{'worker':<8}{w.get('engine',''):<8}"
+            f"{w.get('worker_id',''):<24}{'worker':<8}{w.get('state',''):<8}"
+            f"{w.get('engine',''):<8}"
             f"{w.get('session_id','') or '-':<38}{w.get('queue','')}"
         )
     return 0
