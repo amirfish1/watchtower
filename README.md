@@ -54,6 +54,26 @@ wt stop     # stop it
 wt status   # check service + queue health
 ```
 
+### Agent skill (Claude Code + Codex)
+
+`wt install` also syncs a bundled `watchtower` skill into every agent harness
+present on the machine (`~/.claude/skills/watchtower`,
+`~/.codex/skills/watchtower`, ...) so any session — regardless of which repo
+it's rooted in — knows how to look up a ticket by ref (`wt find HERMES-20`),
+check queue health, and file/claim/close tickets, without being told about
+`wt` first. It's a symlink to the copy inside the installed package, so a
+`git pull` (editable install) or package upgrade updates it everywhere
+instantly — no separate re-sync step.
+
+```bash
+wt skills sync      # same sync `wt install` runs; safe to re-run anytime
+wt skills status    # show what's linked, without changing anything
+wt skills remove    # undo — removes only the symlinks wt manages
+```
+
+See [`docs/agent-discovery.md`](docs/agent-discovery.md) for the design
+rationale (why a skill, not just a repo convention or an MCP server).
+
 ### Browser annotation widget (optional)
 
 Drop `contrib/annotate-widget.js` into your project to let users file tickets directly from the browser with a single click. See [`contrib/annotate-widget.md`](contrib/annotate-widget.md).
@@ -63,6 +83,7 @@ Drop `contrib/annotate-widget.js` into your project to let users file tickets di
 ```bash
 wt status                              # per-queue depth, oldest-open age, stuck flag
 wt ls -q DEMO                          # list tickets in a queue
+wt find DEMO-1                         # look up one ticket by ref, no -q needed
 
 wt add -q DEMO --title "Fix nav" \
        --text "navbar overlaps on mobile" --type bug
@@ -87,6 +108,7 @@ wt install                             # install the watcher as a LaunchAgent (a
 wt uninstall                           # remove the LaunchAgent
 wt dashboard                           # open the night-watch dashboard (non-blocking)
 wt dashboard --no-open                 # ensure the server is up, don't open a browser
+wt skills sync                         # (re-)sync the agent skill into Claude/Codex
 ```
 
 ### Agent engines
@@ -354,13 +376,11 @@ the queue file alone, with no dependency on any external liveness signal.
 - **Tap-to-act / buttons** — claim, close, or requeue tickets from the dashboard UI.
 - **Cost / token tracking** — per-queue and per-worker spend.
 - **Push notifications** — alert on a queue going stuck or draining.
-- **Cross-queue ticket lookup** (`wt find <ref>`) plus a `watchtower` skill
-  for Claude Code and Codex (both harnesses, one source), so any agent
-  session can resolve a ref like `HERMES-20` — regardless of which repo
-  it's rooted in — without first knowing which queue it lives in. An MCP
-  server is the longer-term structured-API follow-up. See
+- **MCP server** — a structured, versioned tool API (`wt_find`, `wt_status`,
+  `wt_claim`, ...) as the longer-term follow-up to the CLI + skill combo
+  above, for harnesses without shell access. See
   [`docs/agent-discovery.md`](docs/agent-discovery.md) for the full option
-  comparison.
+  comparison and why the skill (now shipped) was the right near-term move.
 
 ## More docs
 

@@ -1,5 +1,12 @@
 # Cross-harness agent discovery of WatchTower
 
+**Status: implemented.** `wt find <ref>` ships (`watchtower/cli.py`), and the
+`watchtower` skill (`watchtower/skills/watchtower/SKILL.md`) is synced into
+every installed harness by `wt install` / `wt skills sync`
+(`watchtower/skills_sync.py`) — see the README's "Agent skill" section. The
+repo-convention (Option 1) and MCP server (Option 3) below remain unbuilt;
+this doc's option comparison and reasoning are kept as the design record.
+
 **Problem:** a session (Claude Code, Codex, or any other agent harness) is
 asked to look up an existing ticket (e.g. "check HERMES-20") and has no
 reliable way to know that WatchTower exists, that the `wt` CLI can answer

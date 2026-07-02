@@ -28,3 +28,6 @@ dev = ["pytest>=7"]
 
 [tool.setuptools.packages.find]
 include = ["watchtower*"]
+
+[tool.setuptools.package-data]
+watchtower = ["skills/**/*"]

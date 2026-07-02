@@ -3,6 +3,7 @@
 
     wt status                 per-queue depth / age / drain / stuck flag
     wt ls -q Q [--status ..]  list the tickets in one queue
+    wt find <ref>             look up one ticket by ref, across all queues
     wt add -q Q --title..     file a ticket
     wt claim -q Q             claim next ticket (smart: priority → type → age)
     wt claim -q Q CCC-42      claim a specific ticket by ref
@@ -24,6 +25,7 @@
     wt wait -q Q [--cmd ..]   block until the queue is drained, then run --cmd
     wt start / wt stop        start/stop service (watcher, reconciler, dashboard, HTTP API)
     wt dashboard              phone-first HTTP dashboard (queues + workers)
+    wt skills [sync|status|remove]  sync the bundled skill into Claude/Codex
 """
 
 from __future__ import annotations
@@ -1352,6 +1354,12 @@ def cmd_install(args: argparse.Namespace) -> int:
     _LAUNCHAGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
     _LAUNCHAGENT_PLIST.write_text(plist)
     print(f"wrote {_LAUNCHAGENT_PLIST}")
+    # Keep the bundled watchtower skill in sync with every installed agent
+    # harness on every `wt install`, independent of LaunchAgent activation
+    # below -- so re-running install after a `git pull` always refreshes it.
+    from . import skills_sync
+    for r in skills_sync.sync():
+        print(skills_sync.format_result(r))
     # Only activate if some queue has auto-drain on — no point starting the
     # service when there's nothing to drain.
     drain_queues = [q for q in (_cfg._load().keys()) if _cfg.auto_drain(q)]
@@ -1375,6 +1383,25 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
         print(f"removed {_LAUNCHAGENT_PLIST} and unloaded from launchctl")
     else:
         print("not installed")
+    from . import skills_sync
+    for r in skills_sync.remove():
+        print(skills_sync.format_result(r))
+    return 0
+
+
+def cmd_skills(args: argparse.Namespace) -> int:
+    """Sync/check/remove the bundled `watchtower` skill in every installed
+    agent harness's skills dir (~/.claude/skills, ~/.codex/skills, ...).
+    Symlinked, not copied, so once synced it never goes stale; `wt install`
+    also calls this on every run."""
+    from . import skills_sync
+    sub = getattr(args, "skills_command", None) or "sync"
+    if sub == "remove":
+        results = skills_sync.remove()
+    else:
+        results = skills_sync.sync(dry_run=(sub == "status"))
+    for r in results:
+        print(skills_sync.format_result(r))
     return 0
 
 
@@ -1777,6 +1804,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("uninstall", help="remove LaunchAgent (stop auto-start on login)")
     s.set_defaults(func=cmd_uninstall)
+
+    s = sub.add_parser(
+        "skills",
+        help="sync the bundled watchtower skill into installed agent harnesses",
+    )
+    s.set_defaults(func=cmd_skills, skills_command=None)
+    ssub = s.add_subparsers(dest="skills_command")
+    ssub.add_parser("sync", help="symlink into every present harness (default; also runs on `wt install`)")
+    ssub.add_parser("status", help="show sync state without changing anything")
+    ssub.add_parser("remove", help="remove the managed symlinks")
 
     s = sub.add_parser(
         "dashboard",

@@ -24,6 +24,7 @@ def installed_plist(tmp_path, monkeypatch):
     written plist text."""
     from watchtower import cli
     from watchtower import config
+    from watchtower import skills_sync
 
     plist_path = tmp_path / "ai.watchtower.watcher.plist"
     monkeypatch.setattr(cli, "_LAUNCHAGENT_PLIST", plist_path)
@@ -32,6 +33,9 @@ def installed_plist(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "no-config.json")
     # Make PATH deterministic and include a homebrew-like dir to assert on.
     monkeypatch.setenv("PATH", "/opt/homebrew/bin:/usr/bin:/bin")
+    # cmd_install also syncs the bundled skill -- point it at a scratch
+    # "harness home" so the test never touches the real ~/.claude or ~/.codex.
+    monkeypatch.setattr(skills_sync, "ENGINE_HOMES", {"claude": tmp_path / "claude-home"})
 
     rc = cli.cmd_install(argparse.Namespace())
     assert rc == 0
