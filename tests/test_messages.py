@@ -484,6 +484,81 @@ def test_drain_outbox_delivers_once_delegate_comes_up(wt, delegate, monkeypatch)
     assert srv.requests[-1][1]["text"] == "queued hello"
 
 
+def test_send_ttl_is_stored_on_queued_outbox_entry(wt, monkeypatch):
+    _disable_resume(wt, monkeypatch)
+    t0 = 1_200_000.0
+    monkeypatch.setattr(wt.messages.time, "time", lambda: t0)
+
+    res = wt.messages.send(SID_B, "expires later", ttl_s=45)
+
+    assert res["ok"] is False and res["queued"] is True
+    m = wt.messages.outbox_list(status="pending")[0]
+    assert wt.messages._parse_iso(m["expires_at"]) == t0 + 45
+
+
+def test_drain_outbox_marks_expired_pending_message_dead(wt, monkeypatch):
+    t0 = 1_300_000.0
+    msg = wt.messages.outbox_add(SID_B, "too old", delay_s=0, ttl_s=5, now=t0)
+
+    def no_delivery(*a, **k):
+        raise AssertionError("expired message must not be delivered")
+
+    monkeypatch.setattr(wt.messages, "deliver", no_delivery)
+    out = wt.messages.drain_outbox(now=t0 + 6)
+
+    assert out["dead"] == [msg["id"]]
+    m = wt.messages.outbox_list()[0]
+    assert m["status"] == "dead"
+    assert m["last_error"] == "expired"
+    assert m["attempts"] == 0
+
+
+def test_outbox_retry_and_remove_helpers(wt):
+    t0 = 1_400_000.0
+    msg = wt.messages.outbox_add(SID_B, "retry me", now=t0)
+    data = wt.messages._load_outbox()
+    data["messages"][0].update({
+        "status": "dead",
+        "attempts": 7,
+        "next_attempt_at": wt.messages._iso(t0 + 600),
+        "last_error": "failed",
+    })
+    wt.messages._save_outbox(data)
+
+    retried = wt.messages.outbox_retry(msg["id"], now=t0 + 10)
+
+    assert retried["id"] == msg["id"]
+    assert retried["status"] == "pending"
+    assert retried["attempts"] == 0
+    assert wt.messages._parse_iso(retried["next_attempt_at"]) == t0 + 10
+    assert wt.messages.outbox_remove(msg["id"]) is True
+    assert wt.messages.outbox_remove("missing") is False
+
+
+def test_outbox_retry_all_dead_only_resets_dead_messages(wt):
+    t0 = 1_500_000.0
+    dead = wt.messages.outbox_add(SID_A, "dead", now=t0)
+    pending = wt.messages.outbox_add(SID_B, "pending", now=t0)
+    data = wt.messages._load_outbox()
+    data["messages"][0].update({
+        "status": "dead",
+        "attempts": 9,
+        "last_error": "failed",
+    })
+    data["messages"][1]["attempts"] = 3
+    wt.messages._save_outbox(data)
+
+    rows = wt.messages.outbox_retry_all_dead(now=t0 + 20)
+
+    assert [r["id"] for r in rows] == [dead["id"]]
+    by_id = {m["id"]: m for m in wt.messages.outbox_list()}
+    assert by_id[dead["id"]]["status"] == "pending"
+    assert by_id[dead["id"]]["attempts"] == 0
+    assert wt.messages._parse_iso(by_id[dead["id"]]["next_attempt_at"]) == t0 + 20
+    assert by_id[pending["id"]]["status"] == "pending"
+    assert by_id[pending["id"]]["attempts"] == 3
+
+
 # ======================================================== resume adapter + busy check
 def _fake_popen(calls):
     class FakeProc:
@@ -645,10 +720,23 @@ def test_cli_parsers_wired(wt):
     import watchtower.cli as cli
     importlib.reload(cli)
     p = cli.build_parser()
-    a = p.parse_args(["send", "@x", "hi", "--mode", "steer", "--no-queue"])
+    a = p.parse_args([
+        "send", "@x", "hi", "--mode", "steer", "--no-queue", "--ttl", "45",
+    ])
     assert a.func is cli.cmd_send and a.no_queue is True and a.mode == "steer"
+    assert a.ttl == 45.0
     a = p.parse_args(["ask", "@x", "hi", "--timeout", "5"])
     assert a.func is cli.cmd_ask and a.timeout == 5.0
+    a = p.parse_args(["outbox", "ls", "--all", "--json"])
+    assert a.func is cli.cmd_outbox and a.outbox_command == "ls"
+    assert a.all is True and a.json is True
+    a = p.parse_args(["outbox", "retry", "msg-123"])
+    assert a.func is cli.cmd_outbox and a.outbox_command == "retry"
+    assert a.id == "msg-123" and a.all_dead is False
+    a = p.parse_args(["outbox", "retry", "--all-dead"])
+    assert a.id is None and a.all_dead is True
+    a = p.parse_args(["outbox", "rm", "msg-123"])
+    assert a.func is cli.cmd_outbox and a.outbox_command == "rm"
     a = p.parse_args(["agents", "--json"])
     assert a.func is cli.cmd_agents
     a = p.parse_args(["agent", "register", "planner", "--session", SID_A])
@@ -671,3 +759,36 @@ def test_cli_agent_register_and_agents_view(wt, capsys):
     payload = json.loads(out[out.index("{"):])
     assert payload["agents"][0]["name"] == "planner"
     assert len(payload["workers"]) == 1
+
+
+def test_cli_outbox_ls_retry_and_rm(wt, capsys):
+    import watchtower.cli as cli
+    importlib.reload(cli)
+    t0 = 1_600_000.0
+    pending = wt.messages.outbox_add(SID_A, "pending", now=t0)
+    dead = wt.messages.outbox_add(SID_B, "dead", now=t0)
+    data = wt.messages._load_outbox()
+    data["messages"][1].update({
+        "status": "dead",
+        "attempts": 4,
+        "last_error": "failed",
+    })
+    wt.messages._save_outbox(data)
+
+    assert cli.main(["outbox", "ls", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [m["id"] for m in payload["messages"]] == [pending["id"]]
+
+    assert cli.main(["outbox", "ls", "--all", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert {m["id"] for m in payload["messages"]} == {pending["id"], dead["id"]}
+
+    assert cli.main(["outbox", "retry", "--all-dead"]) == 0
+    capsys.readouterr()
+    by_id = {m["id"]: m for m in wt.messages.outbox_list()}
+    assert by_id[dead["id"]]["status"] == "pending"
+    assert by_id[dead["id"]]["attempts"] == 0
+
+    assert cli.main(["outbox", "rm", pending["id"]]) == 0
+    capsys.readouterr()
+    assert pending["id"] not in {m["id"] for m in wt.messages.outbox_list()}

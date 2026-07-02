@@ -34,7 +34,8 @@ This module gives WatchTower its conversational primitives (see
   * Outbox (``$WATCHTOWER_OUTBOX_FILE``, default ``~/.watchtower/outbox.json``):
     durable at-least-once store for messages that could not be delivered. The
     daemon drains it each tick with exponential backoff (30s base, 10 min
-    cap); after 20 attempts a message goes ``dead`` and is logged (DEADMSG).
+    cap); after 20 attempts or optional TTL expiry a message goes ``dead`` and
+    is logged (DEADMSG).
 
   * ``ask(target, text)``: synchronous question. Correlation is byte-offset
     tailing: snapshot the log size before delivery, then read only the new
@@ -666,6 +667,7 @@ def outbox_add(
     mode: str = "send",
     error: str = "",
     delay_s: float = BACKOFF_BASE_S,
+    ttl_s: Optional[float] = None,
     now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Append a pending message to the durable outbox. Locked + atomic."""
@@ -681,6 +683,8 @@ def outbox_add(
         "last_error": str(error or ""),
         "status": "pending",
     }
+    if ttl_s is not None:
+        msg["expires_at"] = _iso(now + float(ttl_s))
     with queue_mod._FileLock(_outbox_lock()):
         data = _load_outbox()
         data["messages"].append(msg)
@@ -695,23 +699,84 @@ def outbox_list(status: Optional[str] = None) -> List[Dict[str, Any]]:
     return msgs
 
 
+def _reset_outbox_message(m: Dict[str, Any], now: float) -> Dict[str, Any]:
+    m["attempts"] = 0
+    m["status"] = "pending"
+    m["next_attempt_at"] = _iso(now)
+    m["last_error"] = ""
+    m.pop("delivered_at", None)
+    m.pop("expires_at", None)
+    return m
+
+
+def outbox_retry(message_id: str, now: Optional[float] = None) -> Dict[str, Any]:
+    """Reset one outbox message so the next drain tick retries it now."""
+    now = time.time() if now is None else float(now)
+    target = str(message_id or "")
+    with queue_mod._FileLock(_outbox_lock()):
+        data = _load_outbox()
+        for m in data["messages"]:
+            if str(m.get("id")) == target:
+                out = dict(_reset_outbox_message(m, now))
+                _save_outbox(data)
+                return out
+    raise KeyError(target)
+
+
+def outbox_retry_all_dead(now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Reset every dead outbox message so drain retries them now."""
+    now = time.time() if now is None else float(now)
+    rows: List[Dict[str, Any]] = []
+    with queue_mod._FileLock(_outbox_lock()):
+        data = _load_outbox()
+        for m in data["messages"]:
+            if m.get("status") == "dead":
+                rows.append(dict(_reset_outbox_message(m, now)))
+        if rows:
+            _save_outbox(data)
+    return rows
+
+
+def outbox_remove(message_id: str) -> bool:
+    """Remove one outbox message by id."""
+    target = str(message_id or "")
+    with queue_mod._FileLock(_outbox_lock()):
+        data = _load_outbox()
+        kept = [m for m in data["messages"] if str(m.get("id")) != target]
+        if len(kept) == len(data["messages"]):
+            return False
+        data["messages"] = kept
+        _save_outbox(data)
+    return True
+
+
 def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
     """One daemon tick over the outbox: retry due pending messages.
 
     Delivery attempts run OUTSIDE the file lock (a delegate POST can take
     seconds), then results are folded back in under the lock. Backoff is
-    30 * 2^attempts capped at 600s; after ``MAX_ATTEMPTS`` a message goes
-    ``dead`` and is logged as DEADMSG. Returns id lists per outcome."""
+    30 * 2^attempts capped at 600s; after ``MAX_ATTEMPTS`` or TTL expiry a
+    message goes ``dead`` and is logged as DEADMSG. Returns id lists per
+    outcome."""
     now = time.time() if now is None else float(now)
     with queue_mod._FileLock(_outbox_lock()):
+        data = _load_outbox()
+        expired_ids = {
+            str(m.get("id"))
+            for m in data["messages"]
+            if m.get("status") == "pending"
+            and m.get("expires_at")
+            and _parse_iso(m.get("expires_at")) <= now
+        }
         due = [
             dict(m)
-            for m in _load_outbox()["messages"]
+            for m in data["messages"]
             if m.get("status") == "pending"
+            and str(m.get("id")) not in expired_ids
             and _parse_iso(m.get("next_attempt_at")) <= now
         ]
     result: Dict[str, List[str]] = {"delivered": [], "retried": [], "dead": []}
-    if not due:
+    if not due and not expired_ids:
         return result
     outcomes: Dict[str, Dict[str, Any]] = {}
     for m in due:
@@ -728,6 +793,16 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
     with queue_mod._FileLock(_outbox_lock()):
         data = _load_outbox()
         for m in data["messages"]:
+            msg_id = str(m.get("id"))
+            if msg_id in expired_ids and m.get("status") == "pending":
+                m["status"] = "dead"
+                m["last_error"] = "expired"
+                result["dead"].append(msg_id)
+                queue_mod._log(
+                    "DEADMSG",
+                    f"{m.get('id','?')} to {m.get('to','?')}: expired",
+                )
+                continue
             res = outcomes.get(str(m.get("id")))
             if res is None or m.get("status") != "pending":
                 continue
@@ -766,6 +841,7 @@ def send(
     text: str,
     mode: str = "send",
     queue_on_fail: bool = True,
+    ttl_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
@@ -794,7 +870,7 @@ def send(
     to = str(resolved.get("session_id") or target)
     msg = outbox_add(
         to, text, mode=mode,
-        error=str(result.get("error") or ""), delay_s=delay,
+        error=str(result.get("error") or ""), delay_s=delay, ttl_s=ttl_s,
     )
     return {
         "ok": False,

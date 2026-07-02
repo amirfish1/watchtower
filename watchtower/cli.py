@@ -17,6 +17,7 @@
     wt answer / discuss       answer a blocked ticket / attach to its session
     wt send <target> "text"   push a message to a worker/agent/session
     wt ask <target> "q"       ask a target and wait for its reply
+    wt outbox ls|retry|rm     inspect and manage undelivered messages
     wt agents                 address book: registered agents + live workers
     wt agents register|rm     name a session UUID / drop a name (set-name is
                                an alias for register)
@@ -559,6 +560,7 @@ def cmd_send(args: argparse.Namespace) -> int:
     res = messages.send(
         args.target, args.text, mode=args.mode,
         queue_on_fail=not args.no_queue,
+        ttl_s=args.ttl,
     )
     if args.json:
         print(json.dumps(res, indent=2))
@@ -592,6 +594,58 @@ def cmd_ask(args: argparse.Namespace) -> int:
     print(f"error: {res.get('error', 'ask failed')}", file=sys.stderr)
     if res.get("partial"):
         print(res["partial"])
+    return 1
+
+
+def cmd_outbox(args: argparse.Namespace) -> int:
+    """Inspect and manage messages parked in the durable outbox."""
+    from . import messages
+
+    sub = getattr(args, "outbox_command", None)
+    if sub == "ls":
+        rows = messages.outbox_list(status=None if args.all else "pending")
+        if args.json:
+            print(json.dumps({"messages": rows}, indent=2))
+            return 0
+        if not rows:
+            print("(no outbox messages)")
+            return 0
+        print(f"{'ID':<17}{'STATUS':<10}{'ATTEMPTS':>8}  {'NEXT':<20}{'TO':<38}ERROR")
+        print("-" * 105)
+        for m in rows:
+            print(
+                f"{str(m.get('id','')):<17}{str(m.get('status','')):<10}"
+                f"{int(m.get('attempts', 0)):>8}  "
+                f"{str(m.get('next_attempt_at','')):<20}"
+                f"{str(m.get('to','')):<38}"
+                f"{str(m.get('last_error',''))}"
+            )
+        return 0
+
+    if sub == "retry":
+        if args.all_dead:
+            rows = messages.outbox_retry_all_dead()
+            print(f"RETRY: {len(rows)} dead message(s)")
+            return 0
+        if not args.id:
+            print("error: retry requires <id> or --all-dead", file=sys.stderr)
+            return 1
+        try:
+            row = messages.outbox_retry(args.id)
+        except KeyError:
+            print(f"error: no outbox message {args.id}", file=sys.stderr)
+            return 1
+        print(f"RETRY: {row.get('id')}")
+        return 0
+
+    if sub == "rm":
+        if messages.outbox_remove(args.id):
+            print(f"REMOVED: {args.id}")
+            return 0
+        print(f"error: no outbox message {args.id}", file=sys.stderr)
+        return 1
+
+    print("usage: wt outbox ls|retry|rm", file=sys.stderr)
     return 1
 
 
@@ -1569,6 +1623,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "dedup"),
     ("Agent messaging", "send"),
     ("Agent messaging", "ask"),
+    ("Agent messaging", "outbox"),
     ("Agent messaging", "agents"),
     ("Agent messaging", "chat"),
     ("Worker protocol", "claim"),
@@ -1602,6 +1657,7 @@ COMMAND_HELP: Dict[str, str] = {
     "agents": "address book: list reachable agents; register/set-name/rm to name them",
     "send": "push a message to a worker/agent/session",
     "ask": "ask a target and wait for its reply",
+    "outbox": "inspect and manage undelivered messages",
     "chat": "group chats: multi-agent conversations",
     "start": "start the service (installs the LaunchAgent on first run)",
     "stop": "stop service (watcher, reconciler, dashboard, HTTP API)",
@@ -1804,6 +1860,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="delivery mode hint (delegate transports honor steer)")
     s.add_argument("--no-queue", action="store_true", dest="no_queue",
                    help="fail immediately instead of parking in the outbox")
+    s.add_argument("--ttl", type=float, default=None,
+                   help="seconds before a queued outbox message expires")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_send)
 
@@ -1814,6 +1872,26 @@ def build_parser() -> argparse.ArgumentParser:
                    help="seconds to wait for the reply (default 30)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_ask)
+
+    s = sub.add_parser("outbox")
+    s.set_defaults(func=cmd_outbox, outbox_command=None)
+    osub = s.add_subparsers(dest="outbox_command")
+
+    so = osub.add_parser("ls", help="list pending outbox messages")
+    so.add_argument("--json", action="store_true")
+    so.add_argument("--all", action="store_true",
+                    help="include delivered and dead messages")
+    so.set_defaults(func=cmd_outbox)
+
+    so = osub.add_parser("retry", help="retry one message or all dead messages")
+    so.add_argument("id", nargs="?", help="outbox message id")
+    so.add_argument("--all-dead", action="store_true",
+                    help="retry every dead message")
+    so.set_defaults(func=cmd_outbox)
+
+    so = osub.add_parser("rm", help="remove an outbox message")
+    so.add_argument("id", help="outbox message id")
+    so.set_defaults(func=cmd_outbox)
 
     # `wt agents` is the single address-book command (git-remote pattern):
     # bare `wt agents [--json]` lists; `register`/`set-name`/`rm` are nested
