@@ -163,6 +163,37 @@ def test_reconcile_empty_queue_does_not_wind_down_idle_worker(wt):
     assert not [s for s in r["stopped"] if s["queue"] == "Q"]
 
 
+def test_reconcile_nudges_live_worker_on_orphan_requeue(wt):
+    """WT-50: a ticket orphaned by its dead claimer and reopened by the sweep
+    must nudge any OTHER already-live worker on that queue right away.
+
+    Without this, pickup only happens if the spawn pass separately decides
+    actual<desired (it won't when a same-queue worker is already live and
+    just busy elsewhere) or whenever that worker's own next unrelated poll
+    happens to occur — leaving a visibly "open" ticket unworked in between."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    item = wt.q.enqueue(project="Q", note="work")
+    ref = item["ref"]
+    wt.q.claim_next("q-dead-claimer", project="Q")  # claimer never registered as alive
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == ref:
+            it["claimed_at"] = "2000-01-01T00:00:00Z"  # past the orphan grace window
+    wt.q._save_unlocked(data)
+
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S - 30)  # warm: nudge, don't reap
+
+    r = wt.workers.reconcile_once(dry_run=False)
+    assert ref in r["requeued"]
+
+    fd = wt._readers[-1]
+    data = os.read(fd, 65536).decode()
+    msg = json.loads(data.strip())
+    assert "Q" in msg["message"]["content"][0]["text"]
+
+
 # =========================================================== claim-time surplus
 def _claim_ns(queue, worker, *, json_out=False):
     """Build the argparse-shaped namespace cmd_claim reads for the empty-queue path."""

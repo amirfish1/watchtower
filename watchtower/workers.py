@@ -854,6 +854,24 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
                                   for it in requeue_orphaned_tickets()]
         except Exception:
             pass
+        # Nudge any live worker already on an affected queue so the reopened
+        # ticket is re-claimed right away. Without this, a requeue only gets
+        # picked up when the spawn pass below decides actual<desired (it won't,
+        # if a same-queue worker is already live and busy elsewhere) or when an
+        # existing worker happens to poll again on its own — leaving the ticket
+        # visibly "open" but unworked for however long that takes.
+        try:
+            requeued_queues = {ref.rsplit("-", 1)[0]
+                               for ref in result["requeued"] if ref}
+            for q_name in requeued_queues:
+                nudge = (
+                    f"A ticket on {q_name} was reopened after its previous "
+                    f"worker died mid-claim. Claim it with `wt claim -q {q_name} "
+                    "--worker <your-id> --json` and keep draining."
+                )
+                notify_workers(q_name, nudge)
+        except Exception:
+            pass
         # Propagate live workers' cloud session UUIDs onto the tickets they hold
         # so consumers can resolve a reachable worker (no false WAITING/STUCK).
         try:
