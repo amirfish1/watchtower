@@ -18,10 +18,15 @@ with portable ones, no CLI). WT extracts the portable core.
 
 WatchTower owns the data plane and the brain: message outbox, chat files,
 delivery retries, and nudge policy, all durable on disk and driven by the
-launchd-supervised daemon. CCC keeps what only CCC can do: the browser UI and
-the macOS TTY transport (AppleScript keystroke injection), reachable by WT as
-a delegate. Everything CCC currently duplicates (chat watcher thread, pending
-inputs queue, targeting logic) migrates to WT behind a flag.
+launchd-supervised daemon. WT is fully standalone: without CCC installed,
+every claude session is reachable natively (fifo for WT workers, headless
+resume for everything else, with a busy-hold so a session that is actively
+mid-turn gets its message when it goes idle). CCC, when present, is an
+optional accelerator delegate: instant injection into live TTY tabs via its
+AppleScript transport, and reach into foreign engines (codex, gemini, cursor)
+whose resume machinery lives in CCC today. Everything CCC currently
+duplicates (chat watcher thread, pending inputs queue, targeting logic)
+migrates to WT behind a flag.
 
 ## New modules
 
@@ -53,15 +58,25 @@ Targets are resolved in order:
 2. `resume`: `claude -p --resume <sid> --input-format stream-json
    --output-format stream-json` headless, FIFO stdin, log to
    `~/.watchtower/logs/msg-<sid8>-<ts>.log`. Port of the `wt answer`
-   machinery, generalized.
-3. `delegate`: POST to a delegate HTTP endpoint for sessions WT cannot reach
-   natively (live TTY sessions needing AppleScript, codex/gemini/cursor
-   engines). Default delegate: CCC at `http://127.0.0.1:<port>/api/inject-input`
-   with the port read from `~/.claude/command-center/port.txt` when present.
-   Override via `$WATCHTOWER_DELEGATE_URL`. The delegate seam is also the
-   future federation point (remote WT instances).
+   machinery, generalized. Guarded by a busy check: if the target session
+   looks actively mid-turn (its transcript `.jsonl` under
+   `~/.claude/projects/*/<sid>.jsonl` was modified within the last 120s,
+   `$WATCHTOWER_BUSY_WINDOW_S`), do NOT fork a parallel resume; hold the
+   message in the outbox and let the daemon deliver it once the transcript
+   goes quiet. This is the native, CCC-free path for live TTY sessions:
+   delivery on idle instead of keystroke injection.
+3. `delegate` (optional, only when configured or auto-detected): POST to a
+   delegate HTTP endpoint for instant delivery WT cannot do natively
+   (keystroke injection into a live TTY tab, codex/gemini/cursor engines).
+   Default delegate: CCC at `http://127.0.0.1:<port>/api/inject-input` with
+   the port read from `~/.claude/command-center/port.txt` when present.
+   Override via `$WATCHTOWER_DELEGATE_URL`; disable via
+   `$WATCHTOWER_DELEGATE_URL=off`. WT must behave correctly with no delegate
+   at all; the delegate only upgrades latency and engine reach. The seam is
+   also the future federation point (remote WT instances).
 
-If every adapter fails, the message lands in the outbox.
+If every adapter fails or is deferred by the busy check, the message lands in
+the outbox.
 
 ## Outbox (durable, at-least-once)
 
@@ -159,12 +174,14 @@ delegate), and codex sessions (via delegate).
 | Engine | send/ask | chat member |
 |---|---|---|
 | claude (WT worker) | native fifo | yes |
-| claude (any session) | native resume | yes |
-| claude (live TTY) | delegate (CCC) | yes |
-| codex / gemini / cursor / antigravity / hermes | delegate (CCC) | yes via delegate |
+| claude (idle session) | native resume | yes |
+| claude (live TTY, no CCC) | native busy-hold, resume on idle | yes (nudge lands on idle) |
+| claude (live TTY, CCC present) | delegate upgrade: instant keystroke inject | yes, instant |
+| codex / gemini / cursor / antigravity / hermes | delegate only (v1); native adapters later | yes via delegate |
 
 Codex one-shot workers cannot receive mid-run messages; sends to them queue in
-the outbox until a live channel exists or go through the delegate.
+the outbox until a live channel exists or go through the delegate. Without any
+delegate, WT covers 100% of claude sessions with at-most-idle-lag delivery.
 
 ## Explicitly out of scope (v1)
 
