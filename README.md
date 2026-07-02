@@ -17,7 +17,7 @@ cd watchtower && pip install -e .
 
 # 2. Create a queue, point it at your repo
 wt set -q MYAPP --repo-path /path/to/your/repo --engine claude
-wt drain on MYAPP      # enable auto-drain + install the service
+wt drain on MYAPP      # enable auto-drain + start the service
 
 # 3. File your first ticket
 wt add -q MYAPP --title "Fix the login page" --type bug
@@ -41,23 +41,28 @@ wt --version
 ### Service (background watcher + reconciler)
 
 ```bash
-wt install      # install as a macOS LaunchAgent — auto-starts on login
-wt uninstall    # remove it
+wt start        # starts the service; installs the LaunchAgent on first run
+wt uninstall    # remove the LaunchAgent
 ```
 
-After `wt install`, the watcher starts on every login and restarts on crash. No need to run `wt start` manually.
+There's no separate install step: the first `wt start` (or `wt drain on`,
+which starts the service too) writes and loads a macOS LaunchAgent so the
+watcher starts on every login and restarts on crash. Re-running `wt start`
+later just (re)starts the already-installed service.
 
-Manual start (without LaunchAgent):
 ```bash
-wt start    # foreground-detached; survives the shell
 wt stop     # stop it
 wt status   # check service + queue health
 ```
 
+If you'd rather write the LaunchAgent without starting it, `wt install` still
+works, but it's a hidden command now: `wt start` is the path everyone should
+use.
+
 ### Agent skill (Claude Code + Codex)
 
-`wt install` also syncs a bundled `watchtower` skill into every agent harness
-present on the machine (`~/.claude/skills/watchtower`,
+The first `wt start` also syncs a bundled `watchtower` skill into every agent
+harness present on the machine (`~/.claude/skills/watchtower`,
 `~/.codex/skills/watchtower`, ...) so any session — regardless of which repo
 it's rooted in — knows how to look up a ticket by ref (`wt find HERMES-20`),
 check queue health, and file/claim/close tickets, without being told about
@@ -102,9 +107,8 @@ wt set -q DEMO --repo-path /path/to/repo --engine claude
 wt workers                             # list workers the watcher started
 wt wait   -q DEMO --timeout 600 --cmd "say done" # block until drained, then run cmd
 
-wt start                               # start the background watcher + reconciler
+wt start                               # start the watcher; installs the LaunchAgent on first run
 wt stop                                # stop the watcher
-wt install                             # install the watcher as a LaunchAgent (auto-start on login)
 wt uninstall                           # remove the LaunchAgent
 wt dashboard                           # open the night-watch dashboard (non-blocking)
 wt dashboard --no-open                 # ensure the server is up, don't open a browser

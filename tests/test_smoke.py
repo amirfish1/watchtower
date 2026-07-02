@@ -49,7 +49,10 @@ def test_package_imports():
 
 def test_help_shows_git_style_grouped_sections(capsys):
     """`wt --help` groups commands under section headers instead of
-    argparse's default flat {a,b,c,...} brace listing."""
+    argparse's default flat {a,b,c,...} brace listing, ordered by user
+    journey: get the service running, check queue health, work tickets, talk
+    to other agents, then the low-level worker protocol. "Fleet" was
+    dissolved (workers -> Queues, agents/agent folded into Agent messaging)."""
     import watchtower.cli as cli
 
     with pytest.raises(SystemExit) as exc:
@@ -57,11 +60,15 @@ def test_help_shows_git_style_grouped_sections(capsys):
     assert exc.value.code == 0
     out = capsys.readouterr().out
 
-    for header in (
-        "Tickets:", "Worker protocol:", "Queues:", "Fleet:",
-        "Messaging:", "Service:",
-    ):
+    headers = ["Service:", "Queues:", "Tickets:", "Agent messaging:", "Worker protocol:"]
+    for header in headers:
         assert header in out
+    # Order matters: this is the intended user-journey ordering.
+    positions = [out.index(h) for h in headers]
+    assert positions == sorted(positions)
+
+    assert "Fleet:" not in out
+    assert "Messaging:" not in out
 
     # No brace-list dump of every subcommand.
     assert "{status," not in out
@@ -71,8 +78,23 @@ def test_help_shows_git_style_grouped_sections(capsys):
     assert "status" in out
     assert "per-queue depth / age / stuck flag" in out
 
+    # `install` is a hidden alias folded into `wt start`'s first-run
+    # auto-install; it must not appear in the top-level listing.
+    assert "\n    install " not in out
+    assert "installs the LaunchAgent on first run" in out  # start's help text
+
     # Closing hint line.
     assert "wt <command> --help" in out
+
+
+def test_install_hidden_but_still_works(capsys):
+    """`wt install` stays registered as a hidden alias (Change 1): it doesn't
+    show up in the grouped listing, but `wt install --help` still exits 0."""
+    import watchtower.cli as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["install", "--help"])
+    assert exc.value.code == 0
 
 
 def test_bare_command_prints_grouped_help(capsys):
@@ -82,7 +104,7 @@ def test_bare_command_prints_grouped_help(capsys):
     rc = cli.main([])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "Tickets:" in out
+    assert "Service:" in out
     assert "{status," not in out
 
 

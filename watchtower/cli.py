@@ -1144,6 +1144,18 @@ def _daemon_loop(args: argparse.Namespace) -> None:
 
 def cmd_start(args: argparse.Namespace) -> int:
     dry_run = getattr(args, "dry_run", False)
+    # First-time auto-install: `wt start` is the normal user entry point, so a
+    # user should never have to run a separate `wt install` first. If the
+    # LaunchAgent has never been written, write it now (same plist + skill
+    # sync as `wt install`) and fall through to the launchd-start branch
+    # below, which always loads it -- this is an explicit `wt start`, so the
+    # cmd_install "only load if some queue has auto_drain" gate does not
+    # apply here. Guard: --foreground is what the plist itself execs (no user
+    # session, must never recurse into installing itself); --dry-run must not
+    # write anything either.
+    if not args.foreground and not dry_run and not _LAUNCHAGENT_PLIST.exists():
+        _write_launchagent_plist()
+        print(f"first start: installed LaunchAgent {_LAUNCHAGENT_LABEL} (auto-starts on login)")
     # Prefer launchd supervision: if a plist exists, start THROUGH launchd so
     # there is exactly ONE supervised daemon (KeepAlive relaunches it on crash).
     # A manual background `wt start` would create a second, unsupervised daemon,
@@ -1309,12 +1321,11 @@ def _launchctl_bootout() -> int:
     ) >> 8
 
 
-def cmd_install(args: argparse.Namespace) -> int:
-    """Write a LaunchAgent plist so the WT service starts automatically on login.
-
-    Writes the plist unconditionally (so it's ready), but only loads it into
-    launchctl if at least one queue has auto-drain enabled — otherwise the
-    service would start for no reason.
+def _write_launchagent_plist() -> None:
+    """Write the LaunchAgent plist (creating/refreshing it) and sync the
+    bundled skill into every installed agent harness. Shared by `wt install`
+    and the first-run auto-install inside `wt start` (see cmd_start); callers
+    decide whether/how to load the result into launchctl.
 
     The generated plist is HARDENED against three production failures we hit:
       1. ProgramArguments used a bare `wt` shim, but launchd's minimal PATH could
@@ -1326,7 +1337,6 @@ def cmd_install(args: argparse.Namespace) -> int:
       3. No PATH env, so once running the daemon could not find gh/git/claude/
          codex. We now inject a real PATH via EnvironmentVariables (see
          _launchd_path)."""
-    from . import config as _cfg
     # Robust invocation: an absolute interpreter path plus the module form means
     # there is no dependence on a `wt` shim being on launchd's minimal PATH.
     program_args = [sys.executable, "-m", "watchtower.cli",
@@ -1363,11 +1373,27 @@ def cmd_install(args: argparse.Namespace) -> int:
     _LAUNCHAGENT_PLIST.write_text(plist)
     print(f"wrote {_LAUNCHAGENT_PLIST}")
     # Keep the bundled watchtower skill in sync with every installed agent
-    # harness on every `wt install`, independent of LaunchAgent activation
-    # below -- so re-running install after a `git pull` always refreshes it.
+    # harness on every install/auto-install, independent of LaunchAgent
+    # activation -- so re-running always refreshes it.
     from . import skills_sync
     for r in skills_sync.sync():
         print(skills_sync.format_result(r))
+
+
+def cmd_install(args: argparse.Namespace) -> int:
+    """Write a LaunchAgent plist so the WT service starts automatically on login.
+
+    Writes the plist unconditionally (so it's ready), but only loads it into
+    launchctl if at least one queue has auto-drain enabled — otherwise the
+    service would start for no reason.
+
+    Hidden alias: the normal user path is `wt start`, which auto-installs on
+    first run (see cmd_start) and always loads, since starting the service is
+    an explicit user action there. `wt install` stays registered for anyone
+    who wants to install without starting, but it's no longer in the help
+    listing (see COMMAND_SECTIONS)."""
+    from . import config as _cfg
+    _write_launchagent_plist()
     # Only activate if some queue has auto-drain on — no point starting the
     # service when there's nothing to drain.
     drain_queues = [q for q in (_cfg._load().keys()) if _cfg.auto_drain(q)]
@@ -1517,6 +1543,17 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
 # individual add_parser() calls in build_parser() no longer pass help= so
 # argparse doesn't also render its own flat {a,b,c,...} listing.
 COMMAND_SECTIONS: List[Tuple[str, str]] = [
+    ("Service", "start"),
+    ("Service", "stop"),
+    ("Service", "dashboard"),
+    ("Service", "skills"),
+    ("Service", "uninstall"),
+    ("Queues", "status"),
+    ("Queues", "set"),
+    ("Queues", "drain"),
+    ("Queues", "wait"),
+    ("Queues", "monitor"),
+    ("Queues", "workers"),
     ("Tickets", "add"),
     ("Tickets", "take"),
     ("Tickets", "run"),
@@ -1526,27 +1563,17 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "answer"),
     ("Tickets", "discuss"),
     ("Tickets", "dedup"),
+    ("Agent messaging", "send"),
+    ("Agent messaging", "ask"),
+    ("Agent messaging", "agents"),
+    ("Agent messaging", "agent"),
+    ("Agent messaging", "chat"),
     ("Worker protocol", "claim"),
     ("Worker protocol", "close"),
     ("Worker protocol", "block"),
-    ("Queues", "status"),
-    ("Queues", "set"),
-    ("Queues", "drain"),
-    ("Queues", "wait"),
-    ("Queues", "monitor"),
-    ("Fleet", "workers"),
-    ("Fleet", "agents"),
-    ("Fleet", "agent"),
-    ("Messaging", "send"),
-    ("Messaging", "ask"),
-    ("Messaging", "chat"),
-    ("Service", "start"),
-    ("Service", "stop"),
-    ("Service", "install"),
-    ("Service", "uninstall"),
-    ("Service", "dashboard"),
-    ("Service", "skills"),
 ]
+# `install` is intentionally absent: it's a hidden alias folded into `wt start`
+# (see cmd_start's first-time auto-install), not a command users need to type.
 
 COMMAND_HELP: Dict[str, str] = {
     "add": "file a ticket",
@@ -1572,18 +1599,19 @@ COMMAND_HELP: Dict[str, str] = {
     "send": "push a message to a worker/agent/session",
     "ask": "ask a target and wait for its reply",
     "chat": "group chats: multi-agent conversations",
-    "start": "start service (watcher, reconciler, dashboard, HTTP API)",
+    "start": "start the service (installs the LaunchAgent on first run)",
     "stop": "stop service (watcher, reconciler, dashboard, HTTP API)",
-    "install": "install LaunchAgent so service starts on login",
     "uninstall": "remove LaunchAgent (stop auto-start on login)",
     "dashboard": "open the night-watch dashboard (background server + browser)",
     "skills": "sync the bundled watchtower skill into installed agent harnesses",
 }
 
 # "Worker protocol" = the claim/close/block loop agent workers run; humans
-# rarely type these (a human closing a ticket by hand still can).
+# rarely type these (a human closing a ticket by hand still can). Ordered by
+# user journey: get the service running, look at queue health, work tickets,
+# talk to other agents, and only then the low-level worker protocol.
 _SECTION_ORDER = [
-    "Tickets", "Worker protocol", "Queues", "Fleet", "Messaging", "Service",
+    "Service", "Queues", "Tickets", "Agent messaging", "Worker protocol",
 ]
 
 

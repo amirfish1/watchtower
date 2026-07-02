@@ -104,3 +104,89 @@ def test_launchd_path_prepends_and_dedupes(monkeypatch):
     # user-local bin should be prepended (appears before the custom entry).
     home_local = f"{cli.os.path.expanduser('~/.local/bin')}"
     assert parts.index(home_local) < parts.index("/some/custom/bin")
+
+
+# --------------------------------------------------------- wt start auto-install
+# `wt start` folds `wt install` into itself on first run (Change 1): a plain
+# `wt start` with no plist installs it, then continues into the launchd-start
+# path. `--foreground` (what the plist itself execs) and `--dry-run` must
+# never install, since neither has a real user session / should touch disk.
+
+
+class _StartArgs:
+    """Minimal cmd_start Namespace stand-in; override per test."""
+    foreground = False
+    dry_run = False
+    interval = 30
+    stuck_minutes = 20
+    engine = "claude"
+    auto_spawn = False
+    host = "127.0.0.1"
+    port = 8787
+
+
+@pytest.fixture()
+def start_env(tmp_path, monkeypatch):
+    """Same plist-test isolation pattern as `installed_plist` above, extended
+    to the daemon/dashboard pidfiles `wt start` touches."""
+    from watchtower import cli
+    from watchtower import config
+    from watchtower import skills_sync
+
+    plist_path = tmp_path / "ai.watchtower.watcher.plist"
+    monkeypatch.setattr(cli, "_LAUNCHAGENT_PLIST", plist_path)
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "no-config.json")
+    monkeypatch.setenv("PATH", "/opt/homebrew/bin:/usr/bin:/bin")
+    monkeypatch.setattr(skills_sync, "ENGINE_HOMES", {"claude": tmp_path / "claude-home"})
+    monkeypatch.setattr(cli, "DAEMON_PID_FILE", tmp_path / "daemon.pid")
+    monkeypatch.setattr(cli, "DASHBOARD_PID_FILE", tmp_path / "dashboard.pid")
+    return cli, plist_path
+
+
+def test_start_installs_plist_when_missing(start_env, monkeypatch, capsys):
+    """A plain `wt start` with no LaunchAgent installed writes the plist (and
+    prints a one-line notice) before continuing into the launchd-start path.
+    launchctl itself is stubbed out -- this test only asserts the install."""
+    cli, plist_path = start_env
+    assert not plist_path.exists()
+    monkeypatch.setattr(cli.os, "system", lambda cmd: 0)
+
+    rc = cli.cmd_start(_StartArgs())
+
+    assert rc == 0
+    assert plist_path.exists()
+    out = capsys.readouterr().out
+    assert "first start: installed LaunchAgent ai.watchtower.watcher" in out
+
+
+def test_start_foreground_never_installs(start_env, monkeypatch):
+    """`--foreground` is what the plist itself execs (no user session); it
+    must never try to install, or a first boot would recurse forever."""
+    cli, plist_path = start_env
+    monkeypatch.setattr(cli, "_daemon_loop", lambda args: None)
+
+    class Args(_StartArgs):
+        foreground = True
+
+    assert not plist_path.exists()
+    rc = cli.cmd_start(Args())
+
+    assert rc == 0
+    assert not plist_path.exists()
+
+
+def test_start_dry_run_writes_nothing(start_env, monkeypatch):
+    """`--dry-run` is a pure in-process run; it must not write the plist or
+    any other state."""
+    cli, plist_path = start_env
+    monkeypatch.setattr(cli, "_daemon_loop", lambda args: None)
+
+    class Args(_StartArgs):
+        dry_run = True
+
+    assert not plist_path.exists()
+    rc = cli.cmd_start(Args())
+
+    assert rc == 0
+    assert not plist_path.exists()
+    assert not cli.DAEMON_PID_FILE.exists()
