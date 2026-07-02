@@ -19,9 +19,17 @@ Routes:
                                       "title": "...", "source": "...", "text": "..."}
                                     → {"ok": true, "ref": "MYAPP-7", "number": 7,
                                        "project": "MYAPP"}
+    POST /api/send                  {"to", "text", "mode"}: messages.send
+    POST /api/ask                   {"to", "text", "timeout_ms"}: messages.ask
+    POST /api/chat/create           {"topic", "participants", "include_human"}
+    POST /api/chat/post             {"ref", "body", "author"}
+    GET  /api/chats                 chats.list_chats (open chats)
+    GET  /api/chat/<ref>            chats.read_chat
 
 It reuses :mod:`watchtower.health` for the stuck computation and
-:mod:`watchtower.workers` for liveness — neither is duplicated here.
+:mod:`watchtower.workers` for liveness — neither is duplicated here. The
+messaging endpoints reuse :mod:`watchtower.messages` and :mod:`watchtower.chats`
+the same way (see docs/messaging-design.md).
 """
 
 from __future__ import annotations
@@ -30,11 +38,36 @@ import html
 import json
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from . import health, queue as q, workers
 
 REFRESH_SECONDS = 5
+
+
+def _check_same_origin(handler: BaseHTTPRequestHandler) -> bool:
+    """True when the request's ``Origin`` header, if present, is localhost.
+
+    No ``Origin`` header at all (curl, server-to-server calls, `wt` itself)
+    is allowed through; a foreign ``Origin`` is rejected with 403 by the
+    caller. This guard is applied ONLY to the new messaging endpoints
+    (``/api/send``, ``/api/ask``, ``/api/chat/create``, ``/api/chat/post``,
+    see ``do_POST``): sending a message or posting to a chat is an action
+    a random web page should not be able to trigger cross-origin.
+
+    Deliberately NOT applied to ``/api/queue/<name>/add`` or
+    ``/api/ticket/<ref>/run``: the annotate widget
+    (``contrib/annotate-widget.js``) intentionally POSTs to those from
+    arbitrary third-party pages so a user can file a ticket with one click.
+    That asymmetry is on purpose; do not "fix" it into consistency."""
+    origin = handler.headers.get("Origin")
+    if not origin:
+        return True
+    try:
+        host = urllib.parse.urlparse(origin).hostname or ""
+    except ValueError:
+        return False
+    return host in ("localhost", "127.0.0.1")
 
 
 # --------------------------------------------------------------------------- data
@@ -837,6 +870,17 @@ class _Handler(BaseHTTPRequestHandler):
     def _html(self, code: int, page: str) -> None:
         self._send(code, page.encode(), "text/html; charset=utf-8")
 
+    def _read_json_body(self) -> Optional[Any]:
+        """Parse the POST body as JSON. Returns None on malformed JSON (the
+        caller turns that into a 400); a non-dict payload is still returned
+        so the caller can report the right shape mismatch."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            raw = self.rfile.read(length) if length > 0 else b"{}"
+            return json.loads(raw)
+        except (ValueError, json.JSONDecodeError):
+            return None
+
     def do_GET(self) -> None:  # noqa: N802 (http.server contract)
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path == "/":
@@ -866,6 +910,18 @@ class _Handler(BaseHTTPRequestHandler):
                 "tickets": queue_tickets(name),
                 "closed": closed_tickets(name),
             })
+        elif path == "/api/chats":
+            from . import chats
+            self._json(200, {"chats": chats.list_chats(include_archived=False)})
+        elif path.startswith("/api/chat/"):
+            from . import chats
+            ref = urllib.parse.unquote(path[len("/api/chat/"):])
+            try:
+                data = chats.read_chat(ref)
+            except ValueError as exc:
+                self._json(404, {"error": str(exc)})
+            else:
+                self._json(200, data)
         else:
             self._json(404, {"error": "not found", "path": path})
 
@@ -891,7 +947,101 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._json(200, {"ok": True, "ticket": item, "dispatch": reason})
             return
+        # POST /api/send: {"to", "text", "mode"} -> messages.send
+        if path == "/api/send":
+            if not _check_same_origin(self):
+                self._json(403, {"error": "cross-origin request rejected"})
+                return
+            data = self._read_json_body()
+            if not isinstance(data, dict):
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            to = str(data.get("to") or "")
+            text = str(data.get("text") or "")
+            if not to or not text:
+                self._json(400, {"error": "to and text are required"})
+                return
+            from . import messages
+            res = messages.send(to, text, mode=str(data.get("mode") or "send"))
+            self._json(200, res)
+            return
+        # POST /api/ask: {"to", "text", "timeout_ms"} -> messages.ask
+        if path == "/api/ask":
+            if not _check_same_origin(self):
+                self._json(403, {"error": "cross-origin request rejected"})
+                return
+            data = self._read_json_body()
+            if not isinstance(data, dict):
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            to = str(data.get("to") or "")
+            text = str(data.get("text") or "")
+            if not to or not text:
+                self._json(400, {"error": "to and text are required"})
+                return
+            from . import messages
+            timeout_ms = int(data.get("timeout_ms") or 30000)
+            res = messages.ask(to, text, timeout_ms=timeout_ms)
+            self._json(200 if res.get("ok") else 504, res)
+            return
+        # POST /api/chat/create: {"topic", "participants", "include_human"}
+        if path == "/api/chat/create":
+            if not _check_same_origin(self):
+                self._json(403, {"error": "cross-origin request rejected"})
+                return
+            data = self._read_json_body()
+            if not isinstance(data, dict):
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            topic = str(data.get("topic") or "")
+            if not topic:
+                self._json(400, {"error": "topic is required"})
+                return
+            participants = data.get("participants")
+            if not isinstance(participants, list):
+                self._json(400, {"error": "participants must be a list"})
+                return
+            from . import chats
+            try:
+                info = chats.create_chat(
+                    topic, participants,
+                    include_human=bool(data.get("include_human", True)),
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"error": str(exc)})
+                return
+            self._json(200, {"ok": True, **info})
+            return
+        # POST /api/chat/post: {"ref", "body", "author"}
+        if path == "/api/chat/post":
+            if not _check_same_origin(self):
+                self._json(403, {"error": "cross-origin request rejected"})
+                return
+            data = self._read_json_body()
+            if not isinstance(data, dict):
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            ref = str(data.get("ref") or "")
+            body_text = str(data.get("body") or "")
+            if not ref or not body_text:
+                self._json(400, {"error": "ref and body are required"})
+                return
+            from . import chats
+            author = str(data.get("author") or "")
+            try:
+                res = chats.post(ref, body_text, author_name=author or "Human")
+            except ValueError as exc:
+                self._json(404, {"error": str(exc)})
+                return
+            self._json(200, {"ok": True, **res})
+            return
         # POST /api/queue/<name>/add  — ingest a ticket
+        # NOTE: no same-origin check below (or on /api/ticket/<ref>/run above),
+        # unlike the messaging endpoints above them. That is deliberate, not an
+        # oversight: contrib/annotate-widget.js is designed to POST here from
+        # any third-party page a user has it embedded on. See
+        # _check_same_origin's docstring for the full rationale; do not
+        # "fix" this into consistency.
         if path.startswith("/api/queue/") and path.endswith("/add"):
             name = path[len("/api/queue/"):-len("/add")]
             # Read and parse the JSON body.

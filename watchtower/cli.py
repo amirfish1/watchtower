@@ -18,6 +18,9 @@
     wt ask <target> "q"       ask a target and wait for its reply
     wt agents                 agents registry + live workers, merged view
     wt agent register|rm      name a session UUID / drop a name
+    wt chat new|post|read|ls  group chats: create/post/read/list
+    wt chat nudge|add|leave   manual nudge / membership changes
+    wt chat archive|close     lifecycle: archive or close a chat
     wt wait -q Q [--cmd ..]   block until the queue is drained, then run --cmd
     wt start / wt stop        start/stop service (watcher, reconciler, dashboard, HTTP API)
     wt dashboard              phone-first HTTP dashboard (queues + workers)
@@ -185,6 +188,29 @@ def cmd_ls(args: argparse.Namespace) -> int:
         print(line)
     if len(items) > limit:
         print(f"... and {len(items) - limit} more (raise --limit)")
+    return 0
+
+
+def cmd_find(args: argparse.Namespace) -> int:
+    """Look up one ticket by ref or number, searching every queue -- the CLI
+    surface for queue.get(), which already matches globally. No -q needed,
+    so an agent (or a skill) that only has a bare ref like 'HERMES-20' can
+    resolve it without knowing which queue it lives in."""
+    item = q.get(args.ref)
+    if not item:
+        print(f"not found: {args.ref}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
+    worker = str(item.get("claimed_by") or item.get("claimed_session_id") or "")
+    title = item.get("title") or item.get("note") or ""
+    print(f"{item.get('ref',''):<14}[{item.get('status',''):<11}] {title}")
+    if worker:
+        print(f"  claimed_by: {worker}")
+    res = item.get("resolution") if item.get("status") == "closed" else None
+    if res and res.get("summary"):
+        print(f"  resolution: {res['summary']}")
     return 0
 
 
@@ -610,6 +636,244 @@ def cmd_agent(args: argparse.Namespace) -> int:
     return 1
 
 
+def _resolve_chat_participant(target: str) -> dict:
+    """Resolve a `wt chat new --with` / `wt chat add` target to a
+    participant dict (``{"session_id", "name"}``) for chats.create_chat /
+    chats.add_participant.
+
+    Name preference (docs/messaging-design.md addressing rules): the
+    registered agent name, else the live worker id, else an 8-char short
+    session id. Raises ``ValueError`` when the target cannot be resolved."""
+    from . import messages
+    resolved = messages.resolve_target(target)
+    sid = str(resolved.get("session_id") or target)
+    kind = resolved.get("kind")
+    if kind == "worker":
+        worker = resolved.get("worker") or {}
+        name = str(worker.get("worker_id") or target)
+    elif kind == "agent":
+        name = str(target).lstrip("@")
+    else:
+        name = sid[:8]
+    return {"session_id": sid, "name": name}
+
+
+def _resolve_chat_author(ref: str, value: str) -> tuple:
+    """Match a `wt chat post --as` / `nudge --target` / `leave` value
+    against a chat's existing participants: session id, sid8 prefix, or
+    display name (case-insensitive). Returns ``(session_id, name)``."""
+    from . import chats
+    _, sidecar = chats.find_chat(ref)
+    session_ids = [str(s) for s in (sidecar.get("session_ids") or [])]
+    name_map = {str(k): str(v) for k, v in (sidecar.get("name_map") or {}).items()}
+    v = str(value).lstrip("@")
+    for sid in session_ids:
+        if sid == value or sid[:8].lower() == v.lower():
+            return sid, name_map.get(sid, sid[:8])
+    for sid, name in name_map.items():
+        if name.lower() == v.lower():
+            return sid, name
+    raise ValueError(f"{value!r} is not a participant in chat {ref!r}")
+
+
+def cmd_chat_new(args: argparse.Namespace) -> int:
+    """Create a chat and send each `--with` target an initial check-in.
+
+    Resolves every target via messages.resolve_target, creates the chat
+    (chats.create_chat), then delivers one check-in message per participant
+    through messages.send, using chats.build_nudge_text for the body."""
+    from . import chats, messages
+    targets = [t.strip() for t in (args.with_targets or "").split(",") if t.strip()]
+    if not targets:
+        print("error: --with requires at least one target", file=sys.stderr)
+        return 1
+    participants = []
+    for t in targets:
+        try:
+            participants.append(_resolve_chat_participant(t))
+        except ValueError as e:
+            print(f"error: could not resolve {t!r}: {e}", file=sys.stderr)
+            return 1
+    info = chats.create_chat(args.topic, participants, include_human=args.include_human)
+    sent = []
+    for part in participants:
+        text = chats.build_nudge_text(info["path"], args.topic, "topic", part["session_id"])
+        res = messages.send(part["session_id"], text)
+        sent.append({"target": part["session_id"], "name": part["name"],
+                      "ok": bool(res.get("ok")), "queued": bool(res.get("queued"))})
+    if args.json:
+        print(json.dumps({**info, "sent": sent}, indent=2))
+        return 0
+    print(f"CHAT CREATED: {info['path']}")
+    print(f"  ref: {info['uuid']}")
+    for s in sent:
+        status = "sent" if s["ok"] else ("queued" if s["queued"] else "failed")
+        print(f"  check-in -> {s['name']} ({s['target'][:8]}): {status}")
+    return 0
+
+
+def cmd_chat_post(args: argparse.Namespace) -> int:
+    """Post a message; --as resolves to a participant, default author Human."""
+    from . import chats
+    author_sid = None
+    author_name = "Human"
+    if args.as_target:
+        try:
+            author_sid, author_name = _resolve_chat_author(args.ref, args.as_target)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+    try:
+        res = chats.post(args.ref, args.message, author_sid=author_sid, author_name=author_name)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"POSTED: {res['heading']}")
+    return 0
+
+
+def cmd_chat_read(args: argparse.Namespace) -> int:
+    """Print a chat transcript (speaker + message), or --json for the parsed dict."""
+    from . import chats
+    try:
+        data = chats.read_chat(args.ref, tail=(args.tail or None))
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(data, indent=2))
+        return 0
+    print(f"# {data['topic']}  (mode={data['mode']})"
+          + ("  [archived]" if data.get("archived") else "")
+          + ("  [closed]" if data.get("closed_at") else ""))
+    if not data["messages"]:
+        print("(no messages yet)")
+        return 0
+    for m in data["messages"]:
+        speaker = m.get("author_name") or "Human"
+        print(f"[{m.get('ts', '')}] {speaker}: {m.get('body', '')}")
+    return 0
+
+
+def cmd_chat_ls(args: argparse.Namespace) -> int:
+    """List chats; --archived includes archived ones (matches chats.list_chats)."""
+    from . import chats
+    rows = chats.list_chats(include_archived=args.archived)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("(no chats)")
+        return 0
+    for r in rows:
+        state = "archived" if r.get("archived") else ("closed" if r.get("closed_at") else "open")
+        print(f"{r['path']}  [{state}]  {r.get('topic', '')}")
+    return 0
+
+
+def cmd_chat_nudge(args: argparse.Namespace) -> int:
+    """Manual nudge: --target picks one participant, else the same
+    deterministic targeting the daemon uses (chats.pick_nudge_targets)."""
+    from . import chats, messages
+    try:
+        md_path, sidecar = chats.find_chat(args.ref)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if args.target:
+        try:
+            sid, _name = _resolve_chat_author(args.ref, args.target)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        targets = [sid]
+    else:
+        try:
+            md_text = md_path.read_text()
+        except OSError:
+            md_text = ""
+        targets = chats.pick_nudge_targets(md_text, sidecar)
+    if not targets:
+        print("(no targets to nudge)")
+        return 0
+    ok = 0
+    for sid in targets:
+        text = chats.build_nudge_text(
+            str(md_path), sidecar.get("topic", ""), sidecar.get("mode", "topic"), sid
+        )
+        res = messages.send(sid, text)
+        ok += 1 if res.get("ok") else 0
+        status = "sent" if res.get("ok") else ("queued" if res.get("queued") else "failed")
+        print(f"  nudge -> {sid[:8]}: {status}")
+    print(f"NUDGED: {ok}/{len(targets)}")
+    return 0
+
+
+def cmd_chat_add(args: argparse.Namespace) -> int:
+    """Add a participant to a chat (wraps chats.add_participant)."""
+    from . import chats
+    try:
+        part = _resolve_chat_participant(args.target)
+        chats.add_participant(args.ref, part["session_id"], part["name"])
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"ADDED: {part['name']} ({part['session_id'][:8]}) -> {args.ref}")
+    return 0
+
+
+def cmd_chat_leave(args: argparse.Namespace) -> int:
+    """Remove a participant from a chat (wraps chats.remove_participant)."""
+    from . import chats
+    try:
+        sid, name = _resolve_chat_author(args.ref, args.target)
+        chats.remove_participant(args.ref, sid)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"REMOVED: {name} ({sid[:8]}) from {args.ref}")
+    return 0
+
+
+def cmd_chat_archive(args: argparse.Namespace) -> int:
+    """Archive a chat (wraps chats.set_archived)."""
+    from . import chats
+    try:
+        chats.set_archived(args.ref, True)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"ARCHIVED: {args.ref}")
+    return 0
+
+
+def cmd_chat_close(args: argparse.Namespace) -> int:
+    """Close a chat (wraps chats.close_chat)."""
+    from . import chats
+    try:
+        chats.close_chat(args.ref)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"CLOSED: {args.ref}")
+    return 0
+
+
+def cmd_chat(args: argparse.Namespace) -> int:
+    """Dispatch `wt chat <subcommand>` (same pattern as cmd_agent)."""
+    handlers = {
+        "new": cmd_chat_new, "post": cmd_chat_post, "read": cmd_chat_read,
+        "ls": cmd_chat_ls, "nudge": cmd_chat_nudge, "add": cmd_chat_add,
+        "leave": cmd_chat_leave, "archive": cmd_chat_archive, "close": cmd_chat_close,
+    }
+    fn = handlers.get(getattr(args, "chat_command", None))
+    if fn is None:
+        print("usage: wt chat new|post|read|ls|nudge|add|leave|archive|close ...",
+              file=sys.stderr)
+        return 1
+    return fn(args)
+
+
 def cmd_monitor(args: argparse.Namespace) -> int:
     """Monitor-as-a-job (WT-FEATURES-20): run a check command; if it fails
     (non-zero exit), file a ticket into the queue so a worker drains it. Pair
@@ -816,6 +1080,20 @@ def _daemon_loop(args: argparse.Namespace) -> None:
             messages.drain_outbox()
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] drain_outbox failed: {e}", flush=True)
+        # Group-chat nudge scheduler: same never-kill-the-loop contract as the
+        # outbox drain above. deliver() wraps messages.send so chats.py never
+        # touches transports directly; a chats.py bug must not take down
+        # message draining or reconciliation.
+        try:
+            from . import chats
+
+            def _chat_deliver(sid: str, text: str) -> bool:
+                from . import messages as _messages
+                return bool(_messages.send(sid, text).get("ok"))
+
+            chats.nudge_tick(deliver=_chat_deliver)
+        except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+            print(f"[watchtower] nudge_tick failed: {e}", flush=True)
         for rec in result.get("spawned", []):
             tag = " (dry-run)" if rec.get("dry_run") else ""
             print(
@@ -1222,6 +1500,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_ls)
 
+    s = sub.add_parser("find", help="look up one ticket by ref across all queues (no -q needed)")
+    s.add_argument("ref", help="ticket ref (e.g. WT-48) or bare number")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_find)
+
     # Shared arg registration so `add` and its `take` shorthand can't drift.
     def _add_common_ticket_args(subparser: argparse.ArgumentParser) -> None:
         subparser.add_argument("-q", "--queue", required=True)
@@ -1367,6 +1650,53 @@ def build_parser() -> argparse.ArgumentParser:
         sa.add_argument("--cwd", default="", help="working directory hint")
     sa = asub.add_parser("rm", help="remove a name from the registry")
     sa.add_argument("name")
+
+    s = sub.add_parser("chat", help="group chats: multi-agent conversations")
+    s.set_defaults(func=cmd_chat, chat_command=None)
+    csub = s.add_subparsers(dest="chat_command")
+
+    sc = csub.add_parser("new", help="create a chat and check in with participants")
+    sc.add_argument("topic")
+    sc.add_argument("--with", dest="with_targets", required=True,
+                    help="comma-separated targets (worker id, @agent, session UUID/prefix)")
+    sc.add_argument("--include-human", action="store_true", dest="include_human",
+                    help="list a human participant in the header/participants list")
+    sc.add_argument("--json", action="store_true")
+
+    sc = csub.add_parser("post", help="post a message to a chat")
+    sc.add_argument("ref", help="chat path, filename, slug prefix, or sidecar uuid prefix")
+    sc.add_argument("message")
+    sc.add_argument("--as", dest="as_target", default="",
+                    help="post as this participant (name or sid8); default Human")
+
+    sc = csub.add_parser("read", help="print a chat transcript")
+    sc.add_argument("ref")
+    sc.add_argument("--tail", type=int, default=0, help="only the last N messages")
+    sc.add_argument("--json", action="store_true")
+
+    sc = csub.add_parser("ls", help="list chats")
+    sc.add_argument("--archived", action="store_true", help="include archived chats")
+    sc.add_argument("--json", action="store_true")
+
+    sc = csub.add_parser("nudge", help="manually nudge a chat's targets")
+    sc.add_argument("ref")
+    sc.add_argument("--target", default="",
+                    help="nudge only this participant (name or sid8); default: "
+                         "the same deterministic targeting the daemon uses")
+
+    sc = csub.add_parser("add", help="add a participant to a chat")
+    sc.add_argument("ref")
+    sc.add_argument("target", help="worker id, @agent, or session UUID/prefix")
+
+    sc = csub.add_parser("leave", help="remove a participant from a chat")
+    sc.add_argument("ref")
+    sc.add_argument("target", help="existing participant (name or sid8)")
+
+    sc = csub.add_parser("archive", help="archive a chat")
+    sc.add_argument("ref")
+
+    sc = csub.add_parser("close", help="close a chat")
+    sc.add_argument("ref")
 
     s = sub.add_parser("set", help="set queue-level config (repo_path, engine, workers)")
     s.add_argument("-q", "--queue", required=True)

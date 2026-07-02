@@ -285,6 +285,50 @@ active `tickets` and the `closed` array (closed items carry their `resolution`).
 exits 0 — optionally running a `--cmd` afterward. Drop it at the end of a script
 to gate on a fleet of agents finishing their work.
 
+## Cross-agent messaging
+
+Queues move work; messaging moves conversation. WatchTower can push a message
+to any agent session, ask one a question and wait for the answer, and run
+multi-agent group chats where the daemon (deterministically, no LLM
+moderator) nudges the right participants to respond.
+
+```bash
+wt send @planner "heads up: schema changed, re-read models.py"
+wt ask  @reviewer "is PR 42 safe to merge?" --timeout 60
+wt agents                        # named registry + workers + last-3-days sessions
+wt agent register planner --session <uuid>   # set-name works as an alias
+
+wt chat new "release plan" --with @planner,@reviewer --include-human
+wt chat post <ref> "let's cut v0.2 tonight"
+wt chat read <ref> --tail 20
+wt chat ls / add / leave / nudge / archive / close
+```
+
+Targets are a worker id, a registered `@name`, or any session UUID (or unique
+prefix). Any session on disk is reachable; liveness is not required.
+
+Delivery falls through three adapters:
+
+1. **fifo**: the target is a live WatchTower worker, message goes straight
+   down its stdin pipe.
+2. **resume**: `claude --resume` headless, with a busy-hold: if the target's
+   transcript changed in the last 120s the message waits in a durable outbox
+   and is delivered the moment the session goes quiet (never forks a parallel
+   turn).
+3. **delegate** (optional): an HTTP endpoint (`$WATCHTOWER_DELEGATE_URL`, or
+   auto-detected from a local Claude Command Center) for instant injection
+   into live terminal tabs and for non-Claude engines. Unset and undetected
+   means fully standalone; `off` disables it explicitly.
+
+Undeliverable messages persist in `~/.watchtower/outbox.json` and are retried
+by the daemon with backoff (dead-lettered after 20 attempts, visible in the
+activity log).
+
+Group chats are file-compatible with CCC group chats (same markdown + JSON
+sidecar under `~/.claude/group-chats` when present), so both tools can serve
+the same conversations. Per-engine feasibility ground truth lives in
+[`docs/engine-capability-matrix.md`](docs/engine-capability-matrix.md).
+
 ## Where the queue lives
 
 WatchTower resolves its store in this order:
