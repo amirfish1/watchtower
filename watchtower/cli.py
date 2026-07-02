@@ -17,8 +17,9 @@
     wt answer / discuss       answer a blocked ticket / attach to its session
     wt send <target> "text"   push a message to a worker/agent/session
     wt ask <target> "q"       ask a target and wait for its reply
-    wt agents                 agents registry + live workers, merged view
-    wt agent register|rm      name a session UUID / drop a name
+    wt agents                 address book: registered agents + live workers
+    wt agents register|rm     name a session UUID / drop a name (set-name is
+                               an alias for register)
     wt chat new|post|read|ls  group chats: create/post/read/list
     wt chat nudge|add|leave   manual nudge / membership changes
     wt chat archive|close     lifecycle: archive or close a chat
@@ -621,7 +622,10 @@ def cmd_agents(args: argparse.Namespace) -> int:
 
 
 def cmd_agent(args: argparse.Namespace) -> int:
-    """Manage the agents registry: register/set-name a session UUID, rm a name."""
+    """Manage the agents registry: register/set-name a session UUID, rm a name.
+
+    Reached via `wt agents register|set-name|rm` (the address-book pattern,
+    git-remote style) or the hidden `wt agent ...` compat alias."""
     from . import messages
     sub = getattr(args, "agent_command", None)
     if sub in ("register", "set-name"):
@@ -641,8 +645,8 @@ def cmd_agent(args: argparse.Namespace) -> int:
             return 0
         print(f"(no agent {args.name})", file=sys.stderr)
         return 1
-    print("usage: wt agent register|set-name <name> --session <uuid> | "
-          "wt agent rm <name>", file=sys.stderr)
+    print("usage: wt agents register|set-name <name> --session <uuid> | "
+          "wt agents rm <name>", file=sys.stderr)
     return 1
 
 
@@ -1566,7 +1570,6 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Agent messaging", "send"),
     ("Agent messaging", "ask"),
     ("Agent messaging", "agents"),
-    ("Agent messaging", "agent"),
     ("Agent messaging", "chat"),
     ("Worker protocol", "claim"),
     ("Worker protocol", "close"),
@@ -1574,6 +1577,8 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
 ]
 # `install` is intentionally absent: it's a hidden alias folded into `wt start`
 # (see cmd_start's first-time auto-install), not a command users need to type.
+# `agent` is intentionally absent too: it's a hidden compat alias folded into
+# `wt agents` (register/set-name/rm now live there; see _add_agent_subcommands).
 
 COMMAND_HELP: Dict[str, str] = {
     "add": "file a ticket",
@@ -1594,8 +1599,7 @@ COMMAND_HELP: Dict[str, str] = {
     "wait": "block until the queue is drained",
     "monitor": "run a check; file a ticket if it fails",
     "workers": "list workers this CLI started",
-    "agents": "agents registry + live workers, merged view",
-    "agent": "manage the agents registry",
+    "agents": "address book: list reachable agents; register/set-name/rm to name them",
     "send": "push a message to a worker/agent/session",
     "ask": "ask a target and wait for its reply",
     "chat": "group chats: multi-agent conversations",
@@ -1628,6 +1632,29 @@ def _build_command_epilog() -> str:
             lines.append(f"    {name:<{name_width}}  {helptext}")
     lines.append("\nRun 'wt <command> --help' for details on any command.")
     return "\n".join(lines)
+
+
+def _add_agent_subcommands(parser: argparse.ArgumentParser) -> None:
+    """Wire the register/set-name/rm management verbs onto `parser`.
+
+    Shared by `wt agents` (the address-book command) and the hidden
+    `wt agent` compat alias, so both expose the identical nested structure.
+    Each leaf sets its own `func=cmd_agent`, overriding whatever the parent
+    parser defaulted `func` to (e.g. `cmd_agents` for bare `wt agents`)."""
+    asub = parser.add_subparsers(dest="agent_command")
+    for alias in ("register", "set-name"):
+        sa = asub.add_parser(
+            alias,
+            help="name a session UUID (re-registering a name repoints it)",
+        )
+        sa.add_argument("name", help="agent name (a leading @ is allowed)")
+        sa.add_argument("--session", required=True, help="the session UUID")
+        sa.add_argument("--engine", default="claude", help="engine (default claude)")
+        sa.add_argument("--cwd", default="", help="working directory hint")
+        sa.set_defaults(func=cmd_agent)
+    sa = asub.add_parser("rm", help="remove a name from the registry")
+    sa.add_argument("name")
+    sa.set_defaults(func=cmd_agent)
 
 
 # --------------------------------------------------------------------------- main
@@ -1788,24 +1815,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_ask)
 
+    # `wt agents` is the single address-book command (git-remote pattern):
+    # bare `wt agents [--json]` lists; `register`/`set-name`/`rm` are nested
+    # management verbs. `wt agent ...` stays wired below as a hidden compat
+    # alias with the identical nested structure via _add_agent_subcommands.
     s = sub.add_parser("agents")
     s.add_argument("--json", action="store_true")
-    s.set_defaults(func=cmd_agents)
+    s.set_defaults(func=cmd_agents, agent_command=None)
+    _add_agent_subcommands(s)
 
-    s = sub.add_parser("agent")
+    s = sub.add_parser("agent")  # hidden alias, not in COMMAND_SECTIONS
     s.set_defaults(func=cmd_agent, agent_command=None)
-    asub = s.add_subparsers(dest="agent_command")
-    for alias in ("register", "set-name"):
-        sa = asub.add_parser(
-            alias,
-            help="name a session UUID (re-registering a name repoints it)",
-        )
-        sa.add_argument("name", help="agent name (a leading @ is allowed)")
-        sa.add_argument("--session", required=True, help="the session UUID")
-        sa.add_argument("--engine", default="claude", help="engine (default claude)")
-        sa.add_argument("--cwd", default="", help="working directory hint")
-    sa = asub.add_parser("rm", help="remove a name from the registry")
-    sa.add_argument("name")
+    _add_agent_subcommands(s)
 
     s = sub.add_parser("chat")
     s.set_defaults(func=cmd_chat, chat_command=None)

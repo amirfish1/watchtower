@@ -97,6 +97,70 @@ def test_install_hidden_but_still_works(capsys):
     assert exc.value.code == 0
 
 
+def test_agents_is_the_single_address_book_command(store, tmp_path, monkeypatch, capsys):
+    """`wt agents` consolidates the old `wt agents` (list) / `wt agent`
+    (manage) pair, git-remote style: bare `wt agents [--json]` lists,
+    `register`/`set-name`/`rm` are nested management verbs, and `wt agent
+    ...` keeps working as a hidden compat alias with the identical nested
+    structure."""
+    import importlib
+
+    monkeypatch.setenv("WATCHTOWER_AGENTS_FILE", str(tmp_path / "agents.json"))
+    monkeypatch.setenv(
+        "WATCHTOWER_CLAUDE_PROJECTS_DIR", str(tmp_path / "claude-projects")
+    )
+    import watchtower.cli as cli
+    importlib.reload(cli)
+
+    sid_a = "7f72634b-b0bd-4c78-b931-3d877ed84187"
+    sid_b = "c44f96bc-d720-49d3-a5e6-115426939f82"
+
+    # Bare `wt agents --json` still lists (empty registry, no live workers).
+    rc = cli.main(["agents", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {"agents": [], "workers": []}
+
+    # `wt agents register x --session <uuid>` names a session; `wt agents
+    # --json` then shows it.
+    rc = cli.main(["agents", "register", "x", "--session", sid_a])
+    assert rc == 0
+    capsys.readouterr()
+    rc = cli.main(["agents", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [a["name"] for a in payload["agents"]] == ["x"]
+    assert payload["agents"][0]["session_id"] == sid_a
+
+    # `wt agents rm x` removes it.
+    rc = cli.main(["agents", "rm", "x"])
+    assert rc == 0
+    capsys.readouterr()
+    rc = cli.main(["agents", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["agents"] == []
+
+    # Hidden `wt agent register ...` alias still works.
+    rc = cli.main(["agent", "register", "y", "--session", sid_b])
+    assert rc == 0
+    capsys.readouterr()
+    rc = cli.main(["agents", "--json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert [a["name"] for a in payload["agents"]] == ["y"]
+
+    # `agent` is folded into `agents`; it must not appear as a top-level row
+    # (careful to match the row form, since "agent" appears inside other
+    # help text such as "push a message to a worker/agent/session").
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr().out
+    assert "\n    agent " not in out
+    assert "\n    agents " in out
+
+
 def test_bare_command_prints_grouped_help(capsys):
     """A bare `wt` invocation prints the same grouped help, not a traceback."""
     import watchtower.cli as cli

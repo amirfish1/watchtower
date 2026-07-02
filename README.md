@@ -322,7 +322,7 @@ moderator) nudges the right participants to respond.
 wt send @planner "heads up: schema changed, re-read models.py"
 wt ask  @reviewer "is PR 42 safe to merge?" --timeout 60
 wt agents                        # named registry + workers + last-3-days sessions
-wt agent register planner --session <uuid>   # set-name works as an alias
+wt agents register planner --session <uuid>  # set-name is an alias for register
 
 wt chat new "release plan" --with @planner,@reviewer --include-human
 wt chat post <ref> "let's cut v0.2 tonight"
