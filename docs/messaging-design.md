@@ -46,7 +46,7 @@ Targets are resolved in order:
    (`$WATCHTOWER_AGENTS_FILE`), schema
    `{name: {session_id, engine, cwd, registered_at, last_seen}}`.
    WT workers auto-register under their worker id; anyone can
-   `wt agent register <name> --session <uuid> [--engine claude] [--cwd path]`.
+   `wt agents register <name> --session <uuid> [--engine claude] [--cwd path]`.
 3. Raw session UUID (or unique prefix >= 8 chars).
 
 Reachability vs listing are two different questions:
@@ -63,8 +63,8 @@ Reachability vs listing are two different questions:
   thousands of older transcripts cost nothing. Full-history browsing remains
   CCC / Total Recall territory.
 
-`wt agent set-name` is accepted as an alias for `register`, and re-registering
-an existing name just repoints it.
+`wt agents set-name` is accepted as an alias for `register`, and re-registering
+an existing name just repoints it (`wt agent ...` survives as a hidden alias).
 
 ## Delivery adapters (ordered fall-through)
 
@@ -113,7 +113,7 @@ Activity log gains verbs: `SEND`, `ASK`, `POST`, `NUDGE`, `DEADMSG`.
 ```
 wt send <target> "text" [--mode send|steer] [--now|--queue]
 wt ask  <target> "question" [--timeout 30] [--json]
-wt agents / wt agent register|rm
+wt agents [--json] / wt agents register|set-name|rm <name>
 wt chat new "topic" --with <target>[,<target>...] [--include-human]
 wt chat post <chat> "message" [--as <name>]
 wt chat read <chat> [--tail N] [--json]
