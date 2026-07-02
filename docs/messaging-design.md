@@ -179,9 +179,21 @@ delegate), and codex sessions (via delegate).
 | claude (live TTY, CCC present) | delegate upgrade: instant keystroke inject | yes, instant |
 | codex / gemini / cursor / antigravity / hermes | delegate only (v1); native adapters later | yes via delegate |
 
-Codex one-shot workers cannot receive mid-run messages; sends to them queue in
-the outbox until a live channel exists or go through the delegate. Without any
-delegate, WT covers 100% of claude sessions with at-most-idle-lag delivery.
+Codex nuance (per the canonical engine study, see below): `codex exec`
+one-shots, which is how WT spawns codex workers today, run with stdin closed
+and cannot receive mid-run input; sends to them hold in the outbox or go via
+delegate. But codex the engine IS steerable mid-run through its app-server
+(JSON-RPC over stdio: `thread/resume`, `turn/start`, `turn/steer`, and an
+experimental native `thread/inject`). A WT-owned `codex app-server` subprocess
+is therefore the designated future native codex adapter, removing the delegate
+dependency for codex entirely. Without any delegate, WT covers 100% of claude
+sessions with at-most-idle-lag delivery.
+
+Shared knowledge: the cross-engine feasibility ground truth (headless vs
+terminal vs app-server, inject/steer/reap per engine) is maintained as
+`docs/engine-capability-matrix.md` in this repo, distilled from the CCC
+session-states study. Update it when an engine's surface changes; design
+decisions here defer to that matrix.
 
 ## Explicitly out of scope (v1)
 
