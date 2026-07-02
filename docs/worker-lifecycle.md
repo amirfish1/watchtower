@@ -170,6 +170,30 @@ paying a cold start. A wind-down STOP bypasses the warm window.
 
 ---
 
+## Logs
+
+`~/.watchtower/logs/` is one shared directory for every queue's process
+output — not just WT's. Three kinds of file land there, all raw stdout+stderr
+(stream-json for `claude` engine workers, plain text for `codex`):
+
+| Pattern | Written by | What it is |
+|---------|-----------|------------|
+| `<queue>-<worker8>.log` | `spawn_workers()` (`workers.py`) | A drain worker's full session output — every claim, tool call, and message from spawn to exit. Named `<queue-lower>-<uuid8>`, e.g. `wt-1dcf03a0.log`, `ccc-4b9bd8cf.log`. |
+| `<queue>-<worker8>.log.stdin` | `_make_stdin_fifo()` (`workers.py`) | The paired FIFO used to push follow-up messages into a live `claude` worker's stdin (keeps it resumable instead of one-shot). Not a real log — a named pipe, size 0. |
+| `msg-<sid8>-<ts>.log` | `send_message()` (`messages.py`) | Output from a resume-adapter message delivered to an existing session (`wt agents`/message routing). |
+| `resume-<sid>.log` | `_resume_session_headless()` (`cli.py`) | Output from waking a blocked session with `claude --resume` after `wt answer`. |
+
+There is **no rotation, size cap, or pruning** for any of these today — files
+accumulate for as long as the queue has been in use. As of 2026-07-02 the
+directory was ~403MB across 147 files; the bulk (~340MB) was `ccc-*` worker
+logs, since `claude` engine workers emit full stream-json (every tool-call
+payload, not just prose) and CCC has run the most worker-sessions historically.
+Safe to delete individual `<queue>-<worker8>.log` files for workers that are no
+longer live (check `wt workers` / `~/.watchtower/workers.json` for liveness
+first) — nothing reads old logs except a human debugging a dead worker.
+
+---
+
 ## INTERNAL — implementation details (ignore unless debugging)
 
 These are not user commands. They are Python functions and file conventions.
