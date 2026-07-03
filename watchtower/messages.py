@@ -75,6 +75,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import time
 import urllib.request
@@ -136,6 +137,16 @@ def _logs_dir() -> Path:
     """Resume-adapter logs live next to the outbox (~/.watchtower/logs by
     default), which keeps tests fully sandboxed via $WATCHTOWER_OUTBOX_FILE."""
     return _outbox_file().parent / "logs"
+
+
+def _resume_ledger_file() -> Path:
+    """Ledger of resume children wt itself spawned (WT-82). Lives next to the
+    outbox so tests sandbox it via $WATCHTOWER_OUTBOX_FILE."""
+    return _outbox_file().parent / "resume-children.json"
+
+
+def _resume_ledger_lock() -> Path:
+    return _resume_ledger_file().with_suffix(".lock")
 
 
 def _claude_projects_root() -> Path:
@@ -571,6 +582,10 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
         proc.stdin.close()
     except (BrokenPipeError, OSError):
         return {"ok": False, "error": "resume stdin write failed"}
+    # WT-82: record the child in the wt-owned ledger so the daemon's reap
+    # pass can terminate it if it ever outlives its completed turn. The EOF
+    # above is the primary exit mechanism; the ledger is defense-in-depth.
+    _resume_ledger_add(proc.pid, sid, str(log_path))
     # Boot verification: a resume that can't load the session (wrong cwd,
     # missing transcript) exits within a second or two. Reporting ok on a
     # dead child silently drops the message — watch the verify window and
@@ -657,6 +672,175 @@ def _resume_verify_window_s() -> float:
         return float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
     except ValueError:
         return 2.0
+
+
+# ------------------------------------------------------ resume-child reaper
+# WT-82: post-6ab1aaf resume children exit via stdin EOF once their turn
+# completes, so under normal operation this whole section is a no-op — the
+# liveness check just clears dead pids from the ledger. It exists because the
+# pre-fix failure mode (a lingering idle child squatting on a session as a
+# foreign live writer, silently swallowing every later delivery) is exactly
+# the kind of regression that would otherwise soak unnoticed again.
+#
+# Hard rule: NEVER signal a pid outside the ledger. CCC legitimately keeps
+# ITS resume children alive for reuse and they are indistinguishable from
+# ours in ps — ledger membership is the only safe ownership proof.
+
+def _reap_idle_s() -> float:
+    """How long a finished child's log must sit untouched before SIGTERM."""
+    try:
+        return float(os.environ.get("WATCHTOWER_REAP_IDLE_S", "600"))
+    except ValueError:
+        return 600.0
+
+
+def _load_resume_ledger() -> List[Dict[str, Any]]:
+    try:
+        with open(_resume_ledger_file(), "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _save_resume_ledger(entries: List[Dict[str, Any]]) -> None:
+    path = _resume_ledger_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(entries, f, indent=2)
+    os.replace(tmp, path)
+
+
+def _resume_ledger_add(pid: int, sid: str, log_path: str) -> None:
+    """Best-effort: a ledger write failure must never fail the delivery."""
+    try:
+        with queue_mod._FileLock(_resume_ledger_lock()):
+            entries = _load_resume_ledger()
+            entries.append({
+                "pid": int(pid),
+                "sid": sid,
+                "log": log_path,
+                "spawned_at": _now_iso(),
+            })
+            _save_resume_ledger(entries)
+    except OSError:
+        pass
+
+
+def _pid_command(pid: int) -> str:
+    """argv of a live pid via ps, '' on any failure. Uses the import-time
+    Popen binding (tty module) so tests faking subprocess.Popen module-wide
+    don't intercept — and can fake this helper directly instead."""
+    proc = None
+    try:
+        proc = tty_mod._REAL_POPEN(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        out, _ = proc.communicate(timeout=2)
+        return (out or "").strip()
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+            proc.communicate(timeout=1)
+        except Exception:  # noqa: BLE001 - best-effort reap
+            pass
+        return ""
+    except (FileNotFoundError, OSError):
+        return ""
+
+
+def _log_shows_terminal(log_path: str) -> bool:
+    """True when the child's stream-json log contains a completed turn: a
+    ``result`` record or a terminal ``stop_reason``."""
+    try:
+        with open(log_path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return False
+    for raw in data.splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            rec = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("type") == "result":
+            return True
+        msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+        if msg.get("stop_reason") in _TERMINAL_STOP_REASONS:
+            return True
+    return False
+
+
+def reap_resume_children(now: Optional[float] = None) -> Dict[str, Any]:
+    """Daemon-tick backstop: SIGTERM ledgered resume children that outlived a
+    completed turn (log shows a terminal record AND has been idle past the
+    reap window). Every kill is triple-gated: ledger membership, pid still
+    alive, and ps identity (argv still ``claude ... <sid>``) so a reused pid
+    is cleared from the ledger, never signalled."""
+    now = time.time() if now is None else float(now)
+    idle_s = _reap_idle_s()
+    reaped: List[Dict[str, Any]] = []
+    cleared = 0
+    with queue_mod._FileLock(_resume_ledger_lock()):
+        remaining: List[Dict[str, Any]] = []
+        for e in _load_resume_ledger():
+            if not isinstance(e, dict):
+                cleared += 1
+                continue
+            try:
+                pid = int(e.get("pid") or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            sid = str(e.get("sid") or "")
+            log = str(e.get("log") or "")
+            if pid <= 0 or not sid:
+                cleared += 1
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                cleared += 1  # exited on its own — the normal EOF path
+                continue
+            except PermissionError:
+                cleared += 1  # pid reused by another user's process
+                continue
+            except OSError:
+                remaining.append(e)
+                continue
+            cmd = _pid_command(pid)
+            if "claude" not in cmd or sid not in cmd:
+                cleared += 1  # pid reused — clear the entry, never signal
+                continue
+            if not _log_shows_terminal(log):
+                remaining.append(e)  # mid-turn (or log unreadable): hands off
+                continue
+            try:
+                log_idle = now - os.path.getmtime(log)
+            except OSError:
+                remaining.append(e)
+                continue
+            if log_idle < idle_s:
+                remaining.append(e)
+                continue
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                remaining.append(e)
+                continue
+            reaped.append({"pid": pid, "sid": sid[:8], "log": log})
+        _save_resume_ledger(remaining)
+    for r in reaped:
+        queue_mod._log(
+            "REAP", f"resume child pid={r['pid']} sid={r['sid']} "
+                    "outlived its completed turn"
+        )
+    return {"reaped": reaped, "cleared": cleared, "kept_count": len(remaining)}
 
 
 def _post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:

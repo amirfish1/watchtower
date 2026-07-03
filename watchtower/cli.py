@@ -1379,6 +1379,20 @@ def _daemon_loop(args: argparse.Namespace) -> None:
             receipts.sweep()
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] receipts sweep failed: {e}", flush=True)
+        # Resume-child reaper (WT-82): SIGTERM wt-spawned resume children that
+        # outlived a completed turn. Ledger-scoped — never touches pids wt did
+        # not spawn (CCC keeps its own resume children alive on purpose).
+        try:
+            from . import messages as _msgs
+            reap = _msgs.reap_resume_children()
+            if reap.get("reaped"):
+                print(
+                    f"[watchtower] reaped {len(reap['reaped'])} stale "
+                    "resume children",
+                    flush=True,
+                )
+        except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+            print(f"[watchtower] resume reap failed: {e}", flush=True)
         # Log retention (WT-74): throttled internally to ~1/hour via a stamp
         # file; same never-kill-the-loop contract as the outbox drain.
         try:
