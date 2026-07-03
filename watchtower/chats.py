@@ -236,6 +236,43 @@ def find_chat(ref: str) -> Tuple[Path, Dict[str, Any]]:
     return md, _load_json(md.with_suffix(".json"))
 
 
+# ------------------------------------------------------------------- policy
+POLICY_KEYS = {
+    "nudge_interval_s": DEFAULT_NUDGE_INTERVAL_S,
+    "idle_close_s": DEFAULT_IDLE_CLOSE_S,
+    "max_auto_nudges_per_hour": DEFAULT_MAX_AUTO_NUDGES_PER_HOUR,
+}
+
+
+def get_chat_policy(ref: str) -> Dict[str, int]:
+    """Effective nudge-policy for a chat: sidecar override or default."""
+    _, sidecar = find_chat(ref)
+    return {k: int(sidecar.get(k, d)) for k, d in POLICY_KEYS.items()}
+
+
+def set_chat_policy(ref: str, **knobs: Optional[int]) -> Dict[str, int]:
+    """Persist nudge-policy overrides into the chat's sidecar (WT-61).
+
+    Only keys in ``POLICY_KEYS`` are accepted; a ``None`` value is skipped
+    so callers can pass CLI args straight through. Values must be positive
+    integers. Returns the new effective policy."""
+    md_path, sidecar = find_chat(ref)
+    changed = False
+    for key, value in knobs.items():
+        if value is None:
+            continue
+        if key not in POLICY_KEYS:
+            raise ValueError(f"unknown policy key {key!r}")
+        value = int(value)
+        if value <= 0:
+            raise ValueError(f"{key} must be a positive integer")
+        sidecar[key] = value
+        changed = True
+    if changed:
+        _save_json(md_path.with_suffix(".json"), sidecar)
+    return {k: int(sidecar.get(k, d)) for k, d in POLICY_KEYS.items()}
+
+
 # ------------------------------------------------------------------- create
 def create_chat(
     topic: str,

@@ -1094,6 +1094,35 @@ def cmd_chat_leave(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_chat_set(args: argparse.Namespace) -> int:
+    """Get/set per-chat nudge-policy knobs (WT-61).
+
+    With no knob flags, prints the current effective policy
+    (chats.get_chat_policy: sidecar override or module default). With any
+    knob flag, persists the override via chats.set_chat_policy and prints
+    the new effective policy."""
+    from . import chats
+    knobs = {
+        "nudge_interval_s": args.nudge_interval_s,
+        "idle_close_s": args.idle_close_s,
+        "max_auto_nudges_per_hour": args.max_auto_nudges_per_hour,
+    }
+    try:
+        if any(v is not None for v in knobs.values()):
+            policy = chats.set_chat_policy(args.ref, **knobs)
+        else:
+            policy = chats.get_chat_policy(args.ref)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(policy, indent=2))
+        return 0
+    for k, v in policy.items():
+        print(f"  {k} = {v}")
+    return 0
+
+
 def cmd_chat_archive(args: argparse.Namespace) -> int:
     """Archive a chat (wraps chats.set_archived)."""
     from . import chats
@@ -1124,10 +1153,11 @@ def cmd_chat(args: argparse.Namespace) -> int:
         "new": cmd_chat_new, "post": cmd_chat_post, "read": cmd_chat_read,
         "ls": cmd_chat_ls, "nudge": cmd_chat_nudge, "add": cmd_chat_add,
         "leave": cmd_chat_leave, "archive": cmd_chat_archive, "close": cmd_chat_close,
+        "set": cmd_chat_set,
     }
     fn = handlers.get(getattr(args, "chat_command", None))
     if fn is None:
-        print("usage: wt chat new|post|read|ls|nudge|add|leave|archive|close ...",
+        print("usage: wt chat new|post|read|ls|nudge|add|leave|archive|close|set ...",
               file=sys.stderr)
         return 1
     return fn(args)
@@ -2225,6 +2255,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     sc = csub.add_parser("close", help="close a chat")
     sc.add_argument("ref")
+
+    sc = csub.add_parser("set", help="get/set per-chat nudge-policy knobs")
+    sc.add_argument("ref")
+    sc.add_argument("--nudge-interval-s", type=int, default=None, dest="nudge_interval_s",
+                    help="seconds between auto-nudges for this chat")
+    sc.add_argument("--idle-close-s", type=int, default=None, dest="idle_close_s",
+                    help="seconds of inactivity before this chat auto-closes")
+    sc.add_argument("--max-auto-nudges-per-hour", type=int, default=None,
+                    dest="max_auto_nudges_per_hour",
+                    help="per-chat auto-nudge rate cap")
+    sc.add_argument("--json", action="store_true")
 
     s = sub.add_parser("set")
     s.add_argument("-q", "--queue", required=True)
