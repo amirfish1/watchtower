@@ -379,7 +379,7 @@ _STYLE = """
 
     @media (prefers-reduced-motion: reduce) {
       body { animation: none; }
-      .beacon.alert, .card.stuck { animation: none; }
+      .beacon.alert, .card.stuck, .queue-group.is-stuck, .qh-state.stuck { animation: none; }
       .card:hover { transform: none; }
     }
 
@@ -389,7 +389,17 @@ _STYLE = """
 
     .queue-list { display: flex; flex-direction: column; gap: 2px; }
     .queue-group { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; margin-bottom: 8px; }
-    .queue-group.is-stuck { border-color: rgba(255,176,32,.5); box-shadow: 0 0 18px -4px rgba(255,176,32,.35); animation: glow 2.6s ease-in-out infinite; }
+    /* WT-26: alarm red (not warn amber) to match .qh-state.stuck and read as
+       higher-contrast/higher-urgency than the ordinary "backlog" amber. */
+    .queue-group.is-stuck {
+      border: 2px solid rgba(255,92,92,.6);
+      box-shadow: 0 0 0 1px rgba(255,92,92,.2), 0 0 30px -4px rgba(255,92,92,.55);
+      animation: stuckglow 2.2s ease-in-out infinite;
+    }
+    @keyframes stuckglow {
+      0%, 100% { box-shadow: 0 0 0 1px rgba(255,92,92,.2), 0 0 24px -6px rgba(255,92,92,.4); }
+      50% { box-shadow: 0 0 0 1px rgba(255,92,92,.42), 0 0 40px -2px rgba(255,92,92,.75); }
+    }
     .queue-header { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--line); text-decoration: none; color: inherit; cursor: pointer; transition: background .12s; }
     .queue-header:hover { background: var(--panel-2); }
     .qh-name { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--ink); flex-shrink: 0; }
@@ -474,6 +484,59 @@ _STYLE = """
       margin: 0; font-family: inherit; font-size: 13.5px; color: var(--ink);
       white-space: pre-wrap; word-break: break-word; line-height: 1.55;
     }
+
+    /* ---- mobile pane (WT-26): phone-width viewers ----
+       The grid/layout already collapse to one column below 620-700px; this
+       block is about the two things a narrower breakpoint still needs:
+       (1) rows built from multi-column CSS grid (.trow/.wrow/.crow-top/
+       .chat-row/.queue-header) reflow to stacked flex so nothing forces
+       horizontal scroll, and (2) every tappable element grows to a >=44px
+       touch target. */
+    @media (max-width: 480px) {
+      .wrap { padding: 14px 12px 48px; }
+      header { gap: 10px; }
+      .wordmark { font-size: 22px; }
+      .fleet { text-align: left; font-size: 12.5px; }
+
+      .queue-header {
+        flex-wrap: wrap; row-gap: 6px;
+        padding: 12px; min-height: 44px;
+      }
+      .qh-meta { flex-basis: 100%; order: 3; }
+      .qh-state { order: 2; }
+
+      .wk-row { padding: 10px 12px 10px 18px; flex-wrap: wrap; row-gap: 4px; }
+      .wk-id { max-width: 100%; }
+
+      .trow {
+        display: flex; flex-direction: column; align-items: flex-start;
+        gap: 4px; padding: 14px 8px; min-height: 44px;
+      }
+      .trow.thead { display: none; }
+      .run-btn { align-self: flex-end; padding: 10px 16px; min-height: 44px; }
+
+      .crow-top {
+        display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+      }
+
+      .chat-row {
+        display: flex; flex-direction: column; align-items: flex-start;
+        gap: 8px; min-height: 44px; padding: 14px;
+      }
+      .chat-status { align-self: flex-start; }
+
+      .add-btn { padding: 12px; min-height: 44px; }
+      .add-panel select, .add-panel input, .add-panel textarea { padding: 10px; }
+
+      .back { padding: 8px 0; min-height: 44px; }
+
+      .msg-head { flex-wrap: wrap; }
+
+      .wrow {
+        display: flex; flex-direction: column; align-items: flex-start;
+        gap: 4px; padding: 12px 4px;
+      }
+    }
 """
 
 _FONT_LINK = (
@@ -509,6 +572,10 @@ def _page(title: str, body: str, refresh: bool = True) -> str:
         '<html lang="en">\n<head>\n'
         '  <meta charset="utf-8">\n'
         '  <meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        '  <meta name="mobile-web-app-capable" content="yes">\n'
+        '  <meta name="apple-mobile-web-app-capable" content="yes">\n'
+        '  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">\n'
+        '  <meta name="apple-mobile-web-app-title" content="WatchTower">\n'
         f"  <title>{html.escape(title)}</title>\n"
         f"  {_FONT_LINK}\n"
         f"  <style>{_STYLE}</style>\n"
@@ -652,7 +719,15 @@ def _chat_group_section(chat_rows: List[Dict[str, Any]]) -> str:
 
 
 def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any]]] = None) -> str:
-    rows: List[Dict[str, Any]] = payload["queues"]
+    # Triage-first (WT-26): STUCK queues always render at the top of the grid
+    # so a phone-width glance surfaces the alarm first. `health.all_status`
+    # already sorts stuck-first for its own callers, but the dashboard must
+    # not depend on the payload arriving pre-sorted (tests, future callers) —
+    # a stable sort here is cheap and makes the ordering a render-time
+    # guarantee rather than an incidental upstream side effect.
+    rows: List[Dict[str, Any]] = sorted(
+        payload["queues"], key=lambda r: r.get("state") != "stuck"
+    )
     wkrs: List[Dict[str, Any]] = payload["workers"]
 
     any_stuck = any(r.get("state") == "stuck" for r in rows)
@@ -866,7 +941,11 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
 
     chats_section = _chat_group_section(chat_rows or [])
 
-    return _page("WatchTower", header + layout + chats_section + foot)
+    # WT-26: prefix the <title> with the stuck count so a pinned phone tab
+    # surfaces trouble without opening the page ("2 STUCK — WatchTower").
+    title = f"{stuck_n} STUCK — WatchTower" if stuck_n else "WatchTower"
+
+    return _page(title, header + layout + chats_section + foot)
 
 
 def _resolution_chips(res: Dict[str, Any]) -> str:
