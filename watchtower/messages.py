@@ -9,14 +9,21 @@ This module gives WatchTower its conversational primitives (see
 
       1. ``fifo``: the target is a live WT worker with a stream-json FIFO
          stdin; reuse ``workers.write_to_worker_fifo``. Cheapest path.
-      2. ``resume``: headless ``claude -p --resume <sid>`` with a fresh FIFO
+      2. ``tty`` (claude targets only, WT-55): the target session's TUI is
+         LIVE in a terminal — a running ``claude --resume <sid>`` process on
+         a real tty — so type the message into that tty via AppleScript
+         (``watchtower.tty``, iTerm2/Terminal.app). Must sit BEFORE resume:
+         a parallel headless resume against a live TUI would fork the
+         conversation, and the resume busy-check would otherwise park these
+         messages in the outbox (a live TUI keeps its transcript mtime hot).
+      3. ``resume``: headless ``claude -p --resume <sid>`` with a fresh FIFO
          stdin, output logged to ``~/.watchtower/logs/msg-<sid8>-<ts>.log``.
          Guarded by a busy check: if the target session's transcript under
          ``~/.claude/projects/*/<sid>.jsonl`` was modified within the last
          ``$WATCHTOWER_BUSY_WINDOW_S`` seconds (default 120), the session is
          actively mid-turn, so we do NOT fork a parallel resume; the message
          is held in the outbox and delivered once the transcript goes quiet.
-      3. ``codex-app-server`` (codex targets only): WT's own ``codex
+      4. ``codex-app-server`` (codex targets only): WT's own ``codex
          app-server`` JSON-RPC subprocess (see ``watchtower.codex_rpc``),
          ``thread/resume`` then ``turn/steer``-if-active else ``turn/start``.
          Only attempted when the resolved target's ``engine`` is ``codex``;
@@ -25,7 +32,7 @@ This module gives WatchTower its conversational primitives (see
          ``session_id`` is used as the codex thread id 1:1 (see WT-54: an
          ``engine=codex`` registry/worker entry's ``session_id`` IS the codex
          thread id, there is no separate mapping table).
-      4. ``delegate`` (optional, last): POST to a delegate HTTP endpoint
+      5. ``delegate`` (optional, last): POST to a delegate HTTP endpoint
          (CCC's ``/api/inject-input``) for transports WT cannot do natively.
          ``$WATCHTOWER_DELEGATE_URL`` overrides; ``off`` disables even when
          ``~/.claude/command-center/port.txt`` exists. No delegate configured
@@ -77,6 +84,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import queue as queue_mod
+from . import tty as tty_mod
 from . import workers
 
 # Retry policy for the durable outbox.
@@ -771,6 +779,11 @@ def _deliver_unreceipted(
     if r.get("ok"):
         return r
     errors.append(f"fifo: {r.get('error', 'failed')}")
+    if resolved.get("engine") == "claude":
+        r = tty_mod.deliver_tty(resolved, text)
+        if r.get("ok"):
+            return r
+        errors.append(f"tty: {r.get('error', 'failed')}")
     r = _deliver_resume(resolved, text)
     if r.get("ok"):
         return r
