@@ -736,7 +736,26 @@ def deliver(
     app-server (codex targets only), delegate.
 
     Returns the first success (``{"ok": True, "transport": ...}``), else
-    ``{"ok": False, "busy": bool, "error": "<joined adapter errors>"}``."""
+    ``{"ok": False, "busy": bool, "error": "<joined adapter errors>"}``.
+
+    Every success is recorded as a delivery receipt (WT-77) so "delivered"
+    can later be verified against the target transcript — the result
+    carries ``receipt_id``."""
+    result = _deliver_unreceipted(resolved, text, mode)
+    sid = str(resolved.get("session_id") or "")
+    if result.get("ok") and sid:
+        try:
+            from . import receipts
+            rec = receipts.record(sid, text, str(result.get("transport") or "?"))
+            result["receipt_id"] = rec["id"]
+        except Exception:  # noqa: BLE001 - receipts must never fail delivery
+            pass
+    return result
+
+
+def _deliver_unreceipted(
+    resolved: Dict[str, Any], text: str, mode: str = "send"
+) -> Dict[str, Any]:
     errors: List[str] = []
     busy = False
     r = _deliver_fifo(resolved, text)
@@ -989,6 +1008,8 @@ def send(
         out = {"ok": True, "transport": result.get("transport", "?")}
         if result.get("log"):
             out["log"] = result["log"]
+        if result.get("receipt_id"):
+            out["receipt_id"] = result["receipt_id"]
         queue_mod._log(
             "SEND", f"{target} via {out['transport']}: {str(text)[:60]}"
         )

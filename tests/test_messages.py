@@ -435,7 +435,9 @@ def test_deliver_codex_target_via_app_server(wt, monkeypatch):
 
     res = wt.messages.send("codexer", "hello from wt")
 
-    assert res == {"ok": True, "transport": "codex-app-server"}
+    assert res["ok"] is True and res["transport"] == "codex-app-server"
+    # WT-77: every ok delivery also carries a verification receipt.
+    assert res.get("receipt_id", "").startswith("rcpt-")
 
 
 def test_deliver_codex_falls_through_when_binary_missing(wt, monkeypatch):

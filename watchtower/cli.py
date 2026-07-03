@@ -672,6 +672,49 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_receipts(args: argparse.Namespace) -> int:
+    """Delivery receipts (WT-77): ledger of verified deliveries.
+
+    ``wt receipts``           list (sweeps pending first)
+    ``wt receipts get <id>``  one receipt
+    ``wt receipts stats``     soak-gate counts (landed/advanced/pending/lost)
+    """
+    from . import receipts
+
+    sub = getattr(args, "receipts_command", None)
+    if sub == "get":
+        rec = receipts.get(args.id)
+        if rec is None:
+            print(f"not found: {args.id}", file=sys.stderr)
+            return 1
+        print(json.dumps(rec, indent=2))
+        return 0
+    if sub == "stats":
+        s = receipts.stats(window_s=float(args.window_days) * 86400.0)
+        if getattr(args, "json", False):
+            print(json.dumps(s, indent=2))
+        else:
+            print(
+                f"last {s['window_days']}d: {s['landed']} landed, "
+                f"{s['advanced']} advanced, {s['pending']} pending, "
+                f"{s['lost']} LOST of {s['total']}"
+            )
+        return 1 if s["lost"] else 0
+    receipts.sweep()
+    rows = receipts.list_receipts(status=getattr(args, "status", None) or None)
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2))
+        return 0
+    for r in rows[-50:]:
+        print(
+            f"{r['id']}  {r.get('status','?'):9}  {r.get('transport','?'):9}  "
+            f"{str(r.get('sid',''))[:8]}  {time.strftime('%m-%d %H:%M', time.localtime(r.get('sent_at') or 0))}"
+        )
+    if not rows:
+        print("no receipts")
+    return 0
+
+
 def cmd_logs(args: argparse.Namespace) -> int:
     """Log-dir maintenance (WT-74): `wt logs prune [--dry-run] [--json]`."""
     from . import logmaint
@@ -1264,6 +1307,13 @@ def _daemon_loop(args: argparse.Namespace) -> None:
             messages.drain_outbox()
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] drain_outbox failed: {e}", flush=True)
+        # Receipt verification (WT-77): move pending receipts to
+        # landed/advanced/lost against transcript ground truth.
+        try:
+            from . import receipts
+            receipts.sweep()
+        except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+            print(f"[watchtower] receipts sweep failed: {e}", flush=True)
         # Log retention (WT-74): throttled internally to ~1/hour via a stamp
         # file; same never-kill-the-loop contract as the outbox drain.
         try:
@@ -2055,6 +2105,19 @@ def build_parser() -> argparse.ArgumentParser:
     so = osub.add_parser("rm", help="remove an outbox message")
     so.add_argument("id", help="outbox message id")
     so.set_defaults(func=cmd_outbox)
+
+    s = sub.add_parser("receipts")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--status", choices=["pending", "landed", "advanced", "lost"])
+    s.set_defaults(func=cmd_receipts, receipts_command=None)
+    rsub = s.add_subparsers(dest="receipts_command")
+    sr = rsub.add_parser("get", help="show one receipt (verifies it first)")
+    sr.add_argument("id")
+    sr.set_defaults(func=cmd_receipts)
+    sr = rsub.add_parser("stats", help="soak-gate delivery counts")
+    sr.add_argument("--window-days", default=7.0, type=float)
+    sr.add_argument("--json", action="store_true")
+    sr.set_defaults(func=cmd_receipts)
 
     s = sub.add_parser("logs")
     s.set_defaults(func=cmd_logs, logs_command=None)
