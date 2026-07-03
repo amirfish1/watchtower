@@ -24,6 +24,9 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_WORKERS_FILE", str(tmp_path / "workers.json"))
     monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "config.json"))
     monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
+    monkeypatch.setenv(
+        "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(tmp_path / "no-ccc-spawn-defaults.json")
+    )
     # Re-import so module-level paths (if any) pick up the env.
     import watchtower.queue as q
     import watchtower.health as health
@@ -311,6 +314,36 @@ def test_spawn_worker_queue_model(store):
         assert "--model" not in spawned[0]["argv"]
     finally:
         config.set_model("DEMO", "")
+
+
+def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeypatch):
+    """A queue with no explicit `wt set --model` falls back to CCC's shared
+    spawn-defaults.json for its engine (see config.CCC_SPAWN_DEFAULTS_FILE) --
+    not to whichever ambient default the bare CLI happens to have. An
+    explicit per-queue override still wins over CCC's default."""
+    import json
+    import importlib
+    import watchtower.config as config
+    import watchtower.workers as workers
+
+    ccc_file = tmp_path / "ccc-spawn-defaults.json"
+    ccc_file.write_text(json.dumps({"engine": "claude", "models": {"claude": "sonnet-5"}}))
+    monkeypatch.setenv("WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(ccc_file))
+    importlib.reload(config)
+    importlib.reload(workers)
+    try:
+        assert config.model("DEMO") == "sonnet-5"
+        spawned = workers.spawn_workers("DEMO", n=1, engine="claude", dry_run=True)
+        argv = spawned[0]["argv"]
+        assert argv[argv.index("--model") + 1] == "sonnet-5"
+
+        # An explicit per-queue override still wins over CCC's default.
+        config.set_model("DEMO", "claude-opus-4-8")
+        assert config.model("DEMO") == "claude-opus-4-8"
+    finally:
+        config.set_model("DEMO", "")
+        importlib.reload(config)
+        importlib.reload(workers)
 
 
 def test_auto_drain_config(tmp_path, monkeypatch):

@@ -24,6 +24,17 @@ CONFIG_FILE = Path(
     or (Path.home() / ".watchtower" / "queue-config.json")
 )
 
+# CCC (Claude Command Center) keeps its own per-engine default model at this
+# path. WT and CCC are separate systems, but sharing this one file means a
+# queue with no explicit `wt set --model` falls back to whatever CCC's own
+# workers default to, instead of silently inheriting the bare CLI's ambient
+# default (which drifts independently of either system's intent -- e.g. a
+# machine-wide `/model` change unexpectedly re-flavoring every WT worker).
+CCC_SPAWN_DEFAULTS_FILE = Path(
+    os.environ.get("WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE")
+    or (Path.home() / ".claude" / "command-center" / "spawn-defaults.json")
+)
+
 
 def _load() -> Dict[str, Any]:
     try:
@@ -172,9 +183,29 @@ def set_model(queue: str, m: str) -> Dict[str, Any]:
     return q
 
 
+def _ccc_default_model(eng: str) -> str:
+    """CCC's own default model for `eng`, read from its spawn-defaults.json
+    (``{"models": {"claude": "sonnet-5", ...}}``). Returns "" if the file is
+    missing, unreadable, or has no entry for this engine -- a fresh install
+    or a machine without CCC installed just gets the pre-existing "" (ambient
+    CLI default) behavior."""
+    try:
+        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
+            data = json.load(f)
+        return str((data.get("models") or {}).get(eng) or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
 def model(queue: str) -> str:
-    """Return the configured worker model for a queue, or "" (engine's own default)."""
-    return _load().get(queue, {}).get("model", "")
+    """Return the worker model for a queue: an explicit `wt set --model`
+    override if one is configured, else CCC's shared default for this
+    queue's engine (see CCC_SPAWN_DEFAULTS_FILE), else "" (the engine's own
+    ambient default, e.g. the bare `claude` CLI's configured default)."""
+    explicit = _load().get(queue, {}).get("model", "")
+    if explicit:
+        return explicit
+    return _ccc_default_model(engine(queue))
 
 
 def set_desired_workers(queue: str, n: int) -> Dict[str, Any]:

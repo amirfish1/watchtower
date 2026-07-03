@@ -39,6 +39,9 @@ def wt(tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_DASHBOARD_PID", str(tmp_path / "dashboard.pid"))
     monkeypatch.setenv("WATCHTOWER_DAEMON_PID", str(tmp_path / "daemon.pid"))
     monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
+    monkeypatch.setenv(
+        "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(tmp_path / "no-ccc-spawn-defaults.json")
+    )
     # No delegate: WT standalone must be exercised, and tests must never hit a
     # real CCC via ~/.claude/command-center/port.txt.
     monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")

@@ -209,6 +209,9 @@ def _reload_isolated(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "queue.json"))
     monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "config.json"))
     monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
+    monkeypatch.setenv(
+        "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(tmp_path / "no-ccc-spawn-defaults.json")
+    )
     import watchtower.config as config
     import watchtower.queue as q
 
