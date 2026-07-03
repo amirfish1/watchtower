@@ -192,9 +192,17 @@ def _ccc_default_model(eng: str) -> str:
     try:
         with open(CCC_SPAWN_DEFAULTS_FILE) as f:
             data = json.load(f)
-        return str((data.get("models") or {}).get(eng) or "")
+        m = str((data.get("models") or {}).get(eng) or "")
     except (OSError, ValueError, AttributeError):
         return ""
+    # CCC's stored aliases (e.g. "sonnet-5") are bare short-forms meant for its
+    # own UI/its `/model` picker, not `--model` flag values -- the claude CLI
+    # spawn path needs the full `claude-` prefixed id (see build_drain_command
+    # in workers.py). Only claude's aliases need this; other engines' ids are
+    # used as-is.
+    if eng == "claude" and m and not m.startswith("claude-"):
+        m = f"claude-{m}"
+    return m
 
 
 def model(queue: str) -> str:

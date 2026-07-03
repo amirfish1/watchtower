@@ -320,7 +320,12 @@ def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeyp
     """A queue with no explicit `wt set --model` falls back to CCC's shared
     spawn-defaults.json for its engine (see config.CCC_SPAWN_DEFAULTS_FILE) --
     not to whichever ambient default the bare CLI happens to have. An
-    explicit per-queue override still wins over CCC's default."""
+    explicit per-queue override still wins over CCC's default.
+
+    CCC stores bare short aliases for claude (e.g. "sonnet-5") meant for its
+    own UI/`/model` picker, not as a `--model` flag value -- WT must expand
+    them to the full `claude-` prefixed id before spawning (WT-84), same as
+    CCC's own spawn path does internally."""
     import json
     import importlib
     import watchtower.config as config
@@ -332,10 +337,10 @@ def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeyp
     importlib.reload(config)
     importlib.reload(workers)
     try:
-        assert config.model("DEMO") == "sonnet-5"
+        assert config.model("DEMO") == "claude-sonnet-5"
         spawned = workers.spawn_workers("DEMO", n=1, engine="claude", dry_run=True)
         argv = spawned[0]["argv"]
-        assert argv[argv.index("--model") + 1] == "sonnet-5"
+        assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
 
         # An explicit per-queue override still wins over CCC's default.
         config.set_model("DEMO", "claude-opus-4-8")
