@@ -672,6 +672,30 @@ def cmd_ask(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_logs(args: argparse.Namespace) -> int:
+    """Log-dir maintenance (WT-74): `wt logs prune [--dry-run] [--json]`."""
+    from . import logmaint
+
+    sub = getattr(args, "logs_command", None)
+    if sub != "prune":
+        print("usage: wt logs prune [--dry-run] [--json]", file=sys.stderr)
+        return 2
+    report = logmaint.prune(dry_run=getattr(args, "dry_run", False))
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2))
+        return 0
+    tag = " (dry-run)" if report.get("dry_run") else ""
+    print(
+        f"pruned {len(report.get('pruned', []))} logs, "
+        f"{len(report.get('fifos_removed', []))} orphan fifos, "
+        f"freed {report.get('freed_bytes', 0) / 1048576:.1f} MB, "
+        f"kept {report.get('kept', 0)}{tag}"
+    )
+    if report.get("error"):
+        print(f"warning: {report['error']}", file=sys.stderr)
+    return 0
+
+
 def cmd_outbox(args: argparse.Namespace) -> int:
     """Inspect and manage messages parked in the durable outbox."""
     from . import messages
@@ -1240,6 +1264,19 @@ def _daemon_loop(args: argparse.Namespace) -> None:
             messages.drain_outbox()
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] drain_outbox failed: {e}", flush=True)
+        # Log retention (WT-74): throttled internally to ~1/hour via a stamp
+        # file; same never-kill-the-loop contract as the outbox drain.
+        try:
+            from . import logmaint
+            pruned = logmaint.maybe_prune()
+            if pruned and (pruned.get("pruned") or pruned.get("fifos_removed")):
+                print(
+                    f"[watchtower] logs pruned: {len(pruned['pruned'])} files, "
+                    f"{pruned.get('freed_bytes', 0) / 1048576:.1f} MB freed",
+                    flush=True,
+                )
+        except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+            print(f"[watchtower] logs prune failed: {e}", flush=True)
         # Group-chat nudge scheduler: same never-kill-the-loop contract as the
         # outbox drain above. deliver() wraps messages.send so chats.py never
         # touches transports directly; a chats.py bug must not take down
@@ -2018,6 +2055,16 @@ def build_parser() -> argparse.ArgumentParser:
     so = osub.add_parser("rm", help="remove an outbox message")
     so.add_argument("id", help="outbox message id")
     so.set_defaults(func=cmd_outbox)
+
+    s = sub.add_parser("logs")
+    s.set_defaults(func=cmd_logs, logs_command=None)
+    lsub = s.add_subparsers(dest="logs_command")
+    sl = lsub.add_parser(
+        "prune", help="apply the log retention policy to ~/.watchtower/logs"
+    )
+    sl.add_argument("--dry-run", action="store_true", dest="dry_run")
+    sl.add_argument("--json", action="store_true")
+    sl.set_defaults(func=cmd_logs)
 
     # `wt agents` is the single address-book command (git-remote pattern):
     # bare `wt agents [--json]` lists; `register`/`set-name`/`rm` are nested
