@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +30,22 @@ _META_END = "-->"
 
 class GitHubBackendError(RuntimeError):
     """Raised when the configured ``gh`` backend cannot complete an operation."""
+
+
+# `_list_issues` is on the hot path of a live dashboard (CCC polls
+# list_items() every few seconds per open conversation-list refresh) but each
+# GitHubIssuesBackend is a fresh, state-less instance per call (see
+# `_github_backend_for_project`), so per-instance caching would do nothing --
+# the cache has to live at module level, keyed by repo. Without it, a
+# rate-limited repo got re-hit on every single poll, which never let the
+# limit recover and flooded the activity log with an identical ERROR line
+# every couple of seconds (WT-87). `_LIST_CACHE_TTL` reuses a recent good
+# result instead of re-listing; `_LIST_ERROR_BACKOFF` throttles how often a
+# failing repo is retried at all, and falls back to the last known-good list
+# (silently, if we have one) rather than re-raising the same error forever.
+_LIST_CACHE: Dict[str, Dict[str, Any]] = {}
+_LIST_CACHE_TTL = 20.0
+_LIST_ERROR_BACKOFF = 60.0
 
 
 def _now_iso() -> str:
@@ -329,21 +346,42 @@ class GitHubIssuesBackend:
             item["resolution"] = resolution
         return item
 
-    def _list_issues(self, state: str = "open") -> List[Dict[str, Any]]:
-        raw = self._run([
-            "issue", "list",
-            *self._repo_args(),
-            "--state", state,
-            "--json", "number,title,body,state,url,assignees,labels,createdAt,updatedAt,closedAt",
-            "--limit", "1000",
-        ])
+    def _list_issues(self, state: str = "open", *, fresh: bool = False) -> List[Dict[str, Any]]:
+        key = f"{self.repo}:{state}"
+        now = time.time()
+        cached = _LIST_CACHE.get(key)
+        if cached is not None and not fresh:
+            age = now - cached["at"]
+            if cached.get("error") is not None:
+                if age < _LIST_ERROR_BACKOFF:
+                    if cached.get("data") is not None:
+                        return cached["data"]
+                    raise cached["error"]
+            elif age < _LIST_CACHE_TTL:
+                return cached["data"]
         try:
-            data = json.loads(raw or "[]")
-        except json.JSONDecodeError as exc:
-            raise GitHubBackendError("gh issue list returned invalid JSON") from exc
-        if not isinstance(data, list):
-            raise GitHubBackendError("gh issue list returned a non-list JSON value")
-        return [issue for issue in data if isinstance(issue, dict)]
+            raw = self._run([
+                "issue", "list",
+                *self._repo_args(),
+                "--state", state,
+                "--json", "number,title,body,state,url,assignees,labels,createdAt,updatedAt,closedAt",
+                "--limit", "1000",
+            ])
+            try:
+                data = json.loads(raw or "[]")
+            except json.JSONDecodeError as exc:
+                raise GitHubBackendError("gh issue list returned invalid JSON") from exc
+            if not isinstance(data, list):
+                raise GitHubBackendError("gh issue list returned a non-list JSON value")
+            result = [issue for issue in data if isinstance(issue, dict)]
+        except GitHubBackendError as exc:
+            prev_data = cached.get("data") if cached else None
+            _LIST_CACHE[key] = {"at": now, "data": prev_data, "error": exc}
+            if prev_data is not None:
+                return prev_data
+            raise
+        _LIST_CACHE[key] = {"at": now, "data": result, "error": None}
+        return result
 
     def enqueue(
         self,
@@ -417,10 +455,12 @@ class GitHubIssuesBackend:
         self,
         status: Optional[str] = None,
         lane: Optional[str] = None,
+        *,
+        fresh: bool = False,
     ) -> List[Dict[str, Any]]:
         if status == "closed":
             return []
-        items = [self._issue_to_item(issue) for issue in self._list_issues("open")]
+        items = [self._issue_to_item(issue) for issue in self._list_issues("open", fresh=fresh)]
         if status:
             items = [it for it in items if it.get("status") == status]
         if lane:
@@ -476,8 +516,11 @@ class GitHubIssuesBackend:
         item_types: Optional[List[str]] = None,
         readiness_filters: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
+        # fresh=True: claiming must see the current claimed/open state, not a
+        # cached snapshot up to _LIST_CACHE_TTL stale -- otherwise two workers
+        # could both pick a ticket that was already claimed moments ago.
         candidates = [
-            it for it in self.list_items(status="open", lane=lane)
+            it for it in self.list_items(status="open", lane=lane, fresh=True)
             if it.get("claimable", True)
         ]
         if readiness_filters:

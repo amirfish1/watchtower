@@ -213,9 +213,14 @@ def _reload_isolated(tmp_path: Path, monkeypatch):
         "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(tmp_path / "no-ccc-spawn-defaults.json")
     )
     import watchtower.config as config
+    import watchtower.github_backend as github_backend
     import watchtower.queue as q
 
     importlib.reload(config)
+    # Reset github_backend's module-level `_list_issues` cache (WT-87): every
+    # test here reuses the same "owner/repo" placeholder, so a stale entry
+    # from a prior test would otherwise leak into this one within its TTL.
+    importlib.reload(github_backend)
     importlib.reload(q)
     return config, q
 
@@ -428,3 +433,61 @@ def test_dashboard_run_api_marks_existing_github_issue_runnable(tmp_path, monkey
     assert payload["ok"] is True
     assert payload["ticket"]["claimable"] is True
     assert "watchtower:GHI" in json.loads(state.read_text())["issues"][0]["labels"]
+
+
+def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
+    """WT-87: a live dashboard calling list_items() every few seconds must not
+    re-hit `gh issue list` on every single call -- especially once that repo
+    is already rate-limited, which never gave the limit a chance to recover
+    and flooded the activity log with one identical ERROR per poll."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.05)
+    monkeypatch.setattr(github_backend, "_LIST_ERROR_BACKOFF", 0.2)
+    github_backend._LIST_CACHE.clear()
+
+    backend = github_backend.GitHubIssuesBackend("T", repo="acme/cache-test")
+    calls = {"n": 0}
+    good_issue = {
+        "number": 1, "title": "t", "body": "", "state": "OPEN",
+        "url": "https://github.com/acme/cache-test/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+
+    def fake_run(args, *, check=True):
+        calls["n"] += 1
+        return json.dumps([good_issue])
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+
+    # Two calls within the TTL window share one cached result.
+    first = backend._list_issues()
+    second = backend._list_issues()
+    assert first == second == [good_issue]
+    assert calls["n"] == 1
+
+    # Once the repo starts failing (e.g. rate-limited), a call within the
+    # error backoff window reuses the last known-good list instead of
+    # re-hitting `gh` and re-raising on every poll.
+    def failing_run(args, *, check=True):
+        calls["n"] += 1
+        raise github_backend.GitHubBackendError("API rate limit already exceeded")
+
+    monkeypatch.setattr(backend, "_run", failing_run)
+    import time as _time
+    _time.sleep(0.06)  # expire the TTL so the next call actually attempts gh
+    third = backend._list_issues()
+    assert third == [good_issue]  # stale-but-good data, served silently
+    assert calls["n"] == 2  # exactly one real attempt, not one per call
+
+    fourth = backend._list_issues()  # still within the error backoff window
+    assert fourth == [good_issue]
+    assert calls["n"] == 2  # no new `gh` invocation while backed off
+
+    # A cold backend with no prior good data still surfaces the error --
+    # there's nothing safe to fall back to.
+    cold = github_backend.GitHubIssuesBackend("T", repo="acme/cache-test-cold")
+    monkeypatch.setattr(cold, "_run", failing_run)
+    with pytest.raises(github_backend.GitHubBackendError):
+        cold._list_issues()
