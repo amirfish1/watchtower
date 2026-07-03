@@ -100,6 +100,33 @@ DRAIN_GOAL_TEMPLATE = (
     "next message wakes you. Do not push unless explicitly asked."
 )
 
+# Bounded, single-ticket variant of DRAIN_GOAL_TEMPLATE (CCC-437's per-row
+# "drain once" button): claim exactly one ref, resolve it, then stop -- no
+# re-poll loop, no idling on stdin for the next ticket.
+RUN_ONCE_GOAL_TEMPLATE = (
+    "Fix ticket {ref} on the {queue} WatchTower queue. This is a ONE-OFF run, "
+    "not a drain loop -- handle exactly this one ticket and then stop. "
+    "Work in the git repo at {repo}. Your worker id is {worker_id}. "
+    "Claim it with `wt claim -q {queue} {ref} --worker {worker_id} --json` "
+    "(if it returns nothing or an error, the ticket was already claimed or "
+    "closed by someone else in the meantime -- just exit, that's fine). "
+    "Read the ticket's note/text and, if present, open its screenshot_path and "
+    "resolve its selector. Make the change in the relevant repo and verify it. "
+    "Commit only the paths you changed (never `git add -A`/`.`/`-a`). "
+    "RESOLUTION IS MANDATORY: NEVER close a ticket without `--summary`. "
+    "When you close it: `wt close {ref} --worker {worker_id} --summary "
+    "\"what you changed\"`. Add `--caveat \"...\"` for anything to watch out "
+    "for, `--follow-up \"...\"` for notable next steps, and `--unresolved "
+    "\"...\"` for anything you could not fix (each flag is repeatable). "
+    "If it genuinely cannot be resolved without a human decision, do NOT "
+    "close it and do NOT guess: run `wt block {ref} --worker {worker_id} "
+    "--question \"the specific decision you need\" --progress \"what you've "
+    "figured out so far\"`. "
+    "Either way -- closed or blocked -- STOP once this one ticket is "
+    "resolved. Do NOT claim another ticket, do NOT poll, do NOT wait for new "
+    "work. End your turn. Do not push unless explicitly asked."
+)
+
 _ENGINE_BIN = {"claude": "claude", "codex": "codex"}
 
 # Fable is a creative/story model — not suited for code work.  Spawning a
@@ -714,7 +741,8 @@ def drain_goal(queue: str, worker_id: str, repo_path: str = "") -> str:
 
 
 def build_drain_command(
-    queue: str, engine: str, worker_id: str, repo_path: str = "", model: str = ""
+    queue: str, engine: str, worker_id: str, repo_path: str = "", model: str = "",
+    goal: str = "",
 ) -> List[str]:
     """Construct the argv for one worker subprocess.
 
@@ -732,13 +760,18 @@ def build_drain_command(
     means no ``--model`` flag, i.e. the CLI's own configured default. For
     claude, versioned ids need the full ``claude-`` prefix (``claude-sonnet-5``);
     bare family names (``sonnet``) also work.
+
+    ``goal`` overrides the codex argv goal text (e.g. ``run_once_goal`` for a
+    single-ticket spawn, CCC-437) instead of the default drain-loop goal.
+    Claude workers ignore it here -- their goal always ships over the stdin
+    FIFO after spawn, not in argv.
     """
     bin_name = _ENGINE_BIN.get(engine, engine)
     if engine == "codex":
         argv = [bin_name, "exec"]
         if model:
             argv += ["--model", model]
-        argv.append(drain_goal(queue, worker_id, repo_path))
+        argv.append(goal or drain_goal(queue, worker_id, repo_path))
         return argv
     argv = [
         bin_name, "-p",
@@ -1386,3 +1419,73 @@ def spawn_workers(
         rec["argv"] = argv
         spawned.append(rec)
     return spawned
+
+
+def run_once_goal(queue: str, worker_id: str, ref: str, repo_path: str = "") -> str:
+    """The bounded, single-ticket goal for a "drain once" spawn (CCC-437):
+    claim exactly ``ref``, resolve it, then stop -- no re-poll drain loop."""
+    return RUN_ONCE_GOAL_TEMPLATE.format(
+        queue=queue, worker_id=worker_id, ref=ref, repo=repo_path or os.getcwd(),
+    )
+
+
+def spawn_run_once_worker(
+    queue: str, ref: str, *, repo_path: str = "", engine: str = "", model: str = "",
+) -> Dict[str, Any]:
+    """Spawn exactly one worker scoped to a single ticket.
+
+    CCC-437's per-row "drain once" play button on non-auto-drain queue rows.
+    Unlike ``spawn_workers``/``dispatch_after_enqueue``, this deliberately
+    ignores ``config.auto_drain`` -- a one-click action on a backlog queue is
+    the whole point (an auto-drain queue already has, or will get, a worker
+    for any open ticket, so the caller only offers this button there). The
+    spawned worker gets ``run_once_goal`` instead of ``drain_goal``, so it
+    exits after this one ticket instead of looping. Reuses the same
+    subprocess/FIFO/log-file plumbing as ``spawn_workers`` so the worker is
+    tracked in ``workers.json`` like any other.
+    """
+    from . import config
+    repo_path = repo_path or config.repo_path(queue) or os.getcwd()
+    engine = engine or config.engine(queue) or "claude"
+    if not model:
+        model = config.model(queue)
+    if _is_fable_model(model):
+        model = ""
+    worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
+    goal = run_once_goal(queue, worker_id, ref, repo_path)
+    argv = build_drain_command(queue, engine, worker_id, repo_path, model, goal=goal)
+    log_dir = WORKERS_FILE.parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / f"{worker_id}.log"
+    logf = open(log_path, "ab")
+    fifo_path = None
+    child_stdin_fd = None
+    if engine != "codex":
+        fifo_path, child_stdin_fd = _make_stdin_fifo(log_path)
+    stdin_arg = child_stdin_fd if child_stdin_fd is not None else subprocess.DEVNULL
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=stdin_arg,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=repo_path,
+        )
+    finally:
+        logf.close()
+        _close_fd_quiet(child_stdin_fd)
+    if fifo_path is not None:
+        if not write_to_worker_fifo(fifo_path, goal):
+            try:
+                os.kill(proc.pid, 15)
+            except OSError:
+                pass
+            _close_fd_quiet(None)
+    rec = record_worker(
+        proc.pid, queue, engine, worker_id, repo_path, str(log_path),
+        fifo=fifo_path or "", model=model,
+    )
+    rec["argv"] = argv
+    rec["ref"] = ref
+    return rec
