@@ -211,6 +211,31 @@ def test_enqueue_claim_close_status(store):
     assert rows["DEMO"]["stuck"] is False
 
 
+def test_close_unclaimed_backfills_claimed_by(store):
+    """Closing a never-claimed ticket with a worker id must not drop
+    attribution: claimed_by is backfilled from the closer (WT-81)."""
+    import watchtower.queue as q
+
+    item = q.enqueue(project="DEMO", note="drive-by fix")
+    assert item["claimed_by"] is None
+
+    closed = q.close(item["ref"], "worker-9")
+    assert closed["closed_by"] == "worker-9"
+    assert closed["claimed_by"] == "worker-9"
+
+
+def test_close_keeps_original_claimant(store):
+    """A different closer credits the close but never overwrites the
+    original claimant."""
+    import watchtower.queue as q
+
+    q.enqueue(project="DEMO", note="claimed work")
+    claimed = q.claim_next("worker-1", project="DEMO")
+    closed = q.close(claimed["ref"], "worker-2")
+    assert closed["closed_by"] == "worker-2"
+    assert closed["claimed_by"] == "worker-1"
+
+
 def test_queues_counts(store):
     import watchtower.queue as q
 

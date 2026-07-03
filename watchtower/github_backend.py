@@ -630,6 +630,11 @@ class GitHubIssuesBackend:
         meta["closed_at"] = now
         if session_id:
             meta["closed_by"] = str(session_id)
+            # Backfill claimed_by on a never-claimed issue so attribution
+            # isn't dropped when a worker closes by ref without claiming
+            # first (WT-81). Never overwrites a real claimant.
+            if not meta.get("claimed_by"):
+                meta["claimed_by"] = str(session_id)
         if norm:
             meta["resolution_summary"] = norm.get("summary", "")
             meta["resolution_caveats"] = norm.get("caveats", [])

@@ -865,6 +865,14 @@ def update_status(
                     # (without a prior claim) still gets credited.
                     if session_id:
                         it["closed_by"] = str(session_id)
+                        # Backfill claimed_by on a never-claimed ticket so
+                        # consumers that attribute by claimant (wt find, the
+                        # dashboard's in-progress column) don't show a blank.
+                        # Never overwrites a real claimant (WT-81).
+                        if not it.get("claimed_by"):
+                            it["claimed_by"] = str(session_id)
+                            if real_sid and not it.get("claimed_session_id"):
+                                it["claimed_session_id"] = real_sid
                     elif it.get("claimed_by"):
                         it["closed_by"] = it["claimed_by"]
                     # Record HOW it was fixed — the trust-layer signal. Optional:
