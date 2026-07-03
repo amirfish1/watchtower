@@ -38,6 +38,7 @@ import json
 import os
 import shlex
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -655,11 +656,42 @@ def cmd_send(args: argparse.Namespace) -> int:
 
 def cmd_ask(args: argparse.Namespace) -> int:
     """Ask a target a question and wait for the reply. Prints the answer text;
-    exits 1 on timeout (partial text, if any, goes to stdout after the error)."""
+    exits 1 on timeout (partial text, if any, goes to stdout after the error).
+
+    With --notify-webhook (WT-59, the async half — mirrors wt wait's): the
+    CLI returns immediately and a detached child does the blocking ask, then
+    POSTs {event, target, ok, answer|error} to the webhook."""
     from . import messages
+    webhook = getattr(args, "notify_webhook", "") or ""
+    if webhook and not getattr(args, "_notify_child", False):
+        cmd = [
+            sys.executable, "-m", "watchtower.cli", "ask",
+            args.target, args.text,
+            "--timeout", str(args.timeout),
+            "--notify-webhook", webhook, "--_notify-child",
+        ]
+        subprocess.Popen(
+            cmd, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        print(f"accepted: answer will POST to {webhook}")
+        return 0
     res = messages.ask(
         args.target, args.text, timeout_ms=int(args.timeout * 1000)
     )
+    if webhook:
+        payload = {
+            "event": "ask-answered" if res.get("ok") else "ask-failed",
+            "target": args.target,
+            "ok": bool(res.get("ok")),
+            "answer": res.get("answer") or "",
+        }
+        if not res.get("ok"):
+            payload["error"] = res.get("error", "ask failed")
+            if res.get("partial"):
+                payload["partial"] = res["partial"]
+        _post_webhook(webhook, payload)
+        return 0 if res.get("ok") else 1
     if args.json:
         print(json.dumps(res, indent=2))
         return 0 if res.get("ok") else 1
@@ -2084,6 +2116,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--timeout", type=float, default=30.0,
                    help="seconds to wait for the reply (default 30)")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--notify-webhook", default="", dest="notify_webhook",
+                   help="don't block: POST the answer to this URL when it "
+                        "arrives (mirrors wt wait --notify-webhook)")
+    s.add_argument("--_notify-child", action="store_true",
+                   dest="_notify_child", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_ask)
 
     s = sub.add_parser("outbox")
