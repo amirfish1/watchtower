@@ -378,6 +378,7 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
                 "session_id": str(w.get("session_id") or "") or None,
                 "worker": w,
                 "engine": str(w.get("engine") or "claude"),
+                "cwd": str(w.get("cwd") or ""),
             }
     agents = _load_agents()
     name = t.lstrip("@")
@@ -389,6 +390,7 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
             "session_id": sid,
             "worker": _worker_for_session(live, sid),
             "engine": str(rec.get("engine") or "claude"),
+            "cwd": str(rec.get("cwd") or ""),
         }
     if _HEX_PREFIX_RE.match(t):
         known = _known_sessions(live, agents)
@@ -526,15 +528,21 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
         "--output-format", "stream-json",
         "--permission-mode", "bypassPermissions",
     ]
+    # Spawn in the session's own project directory: claude scopes --resume
+    # lookups to the cwd's project bucket, so any other cwd fails the resume.
+    cwd = _session_cwd_from_transcript(sid) or str(resolved.get("cwd") or "")
+    if cwd and not os.path.isdir(cwd):
+        cwd = ""
     try:
         logf = open(log_path, "ab")
         try:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 argv,
                 stdin=rdwr_fd,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                cwd=cwd or None,
             )
         finally:
             logf.close()
@@ -551,7 +559,58 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     workers._close_fd_quiet(rdwr_fd)
     if not delivered:
         return {"ok": False, "error": "resume fifo write failed"}
+    # Boot verification: a resume that can't load the session (wrong cwd,
+    # missing transcript) exits within a second or two. Reporting ok on a
+    # dead child silently drops the message — watch the verify window and
+    # surface the death so send() parks the text for retry instead.
+    deadline = time.time() + _resume_verify_window_s()
+    poll = getattr(proc, "poll", None)
+    while callable(poll) and time.time() < deadline:
+        rc = poll()
+        if rc is not None:
+            return {
+                "ok": False,
+                "error": f"claude resume exited rc={rc} at boot "
+                         f"(see {log_path})",
+            }
+        time.sleep(0.1)
     return {"ok": True, "transport": "resume", "log": str(log_path)}
+
+
+def _session_cwd_from_transcript(sid: str) -> Optional[str]:
+    """Read the session's working directory out of its own transcript.
+
+    ``claude --resume`` only finds a session when run from that session's
+    project directory; spawned from an unrelated cwd it dies instantly with
+    "No conversation found with session ID". Transcript events carry the
+    authoritative ``cwd`` field, so scan the first lines for one."""
+    p = _find_transcript(sid)
+    if p is None:
+        return None
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            for _ in range(50):
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    ev = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                cwd = ev.get("cwd") if isinstance(ev, dict) else None
+                if cwd and os.path.isdir(str(cwd)):
+                    return str(cwd)
+    except OSError:
+        return None
+    return None
+
+
+def _resume_verify_window_s() -> float:
+    """How long to watch a fresh resume child for boot-time death."""
+    try:
+        return float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
+    except ValueError:
+        return 2.0
 
 
 def _post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
