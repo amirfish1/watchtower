@@ -280,6 +280,29 @@ def test_reconcile_nudges_live_worker_on_orphan_requeue(wt):
     assert "Q" in msg["message"]["content"][0]["text"]
 
 
+def test_requeue_orphaned_tickets_wont_clobber_a_concurrent_close(wt, monkeypatch):
+    """OPS-72 regression: the sweep decides which tickets are orphaned from a
+    ``list_items()`` snapshot taken once up front, then writes "open" per item
+    afterward. If the real worker closes its ticket for real in the gap
+    between that snapshot and the sweep's write (worker finishes right as a
+    reconcile tick starts), a plain reopen used to clobber the close back to
+    open/in_progress -- reported live as a closed ticket briefly reappearing
+    as open/in_progress right after `wt close`. Reproduce the race directly:
+    the store already holds "closed" but list_items() still reports a stale
+    "in_progress" snapshot, and assert the sweep's write becomes a no-op."""
+    item = wt.q.enqueue(project="Q", note="work")
+    ref = item["ref"]
+    claimed = wt.q.claim_next("q-dead-claimer", project="Q")  # never registered as alive
+    stale_snapshot = dict(claimed, claimed_at="2000-01-01T00:00:00Z")  # past grace window
+
+    wt.q.close(ref, session_id="q-dead-claimer", resolution="done")  # real close lands first
+    monkeypatch.setattr(wt.q, "list_items", lambda *a, **k: [stale_snapshot])
+
+    reopened = wt.workers.requeue_orphaned_tickets()
+    assert ref not in [it["ref"] for it in reopened]
+    assert wt.q.get(ref)["status"] == "closed"
+
+
 def test_reconcile_nudges_live_worker_on_stuck_queue(wt):
     """WT-53: a queue can be fully staffed (actual==desired, no crash, no
     orphan) yet make zero progress -- e.g. a live worker's turn errored out on

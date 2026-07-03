@@ -907,7 +907,15 @@ def update_status(
     session_uuid: str = "",
     resolution: Any = None,
     quiet: bool = False,
+    require_status: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
+    """``require_status``, when set, makes this a compare-and-swap: the
+    transition is only applied if the item's *current* status (read fresh,
+    inside the lock) still matches. Without it, a caller that decided to
+    transition an item based on a stale snapshot (e.g. the orphan-ticket
+    reconciler, which reads ``list_items()`` before deciding) can clobber a
+    legitimate concurrent transition — e.g. reopening a ticket that was
+    closed a moment after the snapshot was taken (OPS-72)."""
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {VALID_STATUSES}")
     backend = _github_backend_for_project(_project_from_ident(ident))
@@ -938,6 +946,8 @@ def update_status(
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
+                if require_status is not None and it.get("status") != require_status:
+                    return None
                 it["status"] = status
                 now = _now_iso()
                 it["updated_at"] = now

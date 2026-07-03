@@ -808,7 +808,14 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
             # quiet=True: the reconciler emits the single REQUEUE line for this
             # event, so suppress update_status's primitive REOPEN to avoid a
             # duplicate log entry at the same timestamp.
-            item = _q.update_status(ref, "open", quiet=True)
+            # require_status="in_progress": the eligibility decision above was
+            # made from a `list_items()` snapshot taken before this loop ran.
+            # If the ticket was closed in the meantime (worker finished right
+            # as this sweep started), a plain update_status would clobber that
+            # close back to "open" — this ticket briefly (and wrongly)
+            # reappearing as open/in_progress right after a real close was
+            # reported as OPS-72. The guard makes the write a no-op instead.
+            item = _q.update_status(ref, "open", quiet=True, require_status="in_progress")
             if item:
                 reopened.append(item)
         except Exception:
