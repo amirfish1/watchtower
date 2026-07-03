@@ -100,14 +100,25 @@ _WT_DEFAULT_STORE = Path.home() / ".watchtower" / "queues.json"
 _ACTIVITY_LOG = Path.home() / ".watchtower" / "activity.log"
 
 
+def _resolve_activity_log_path() -> Path:
+    """Resolve the active activity-log path. Read fresh each call, mirroring
+    ``_resolve_store_path``, so tests can isolate it via $WATCHTOWER_ACTIVITY_LOG
+    instead of appending synthetic events to the real shared log."""
+    env = os.environ.get("WATCHTOWER_ACTIVITY_LOG")
+    if env:
+        return Path(env).expanduser()
+    return _ACTIVITY_LOG
+
+
 def _log(verb: str, detail: str, queue: str = "") -> None:
     """Append one plain-text line to the unified activity log."""
     try:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         q_col = (queue or "reconciler")
-        _ACTIVITY_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(_ACTIVITY_LOG, "a") as f:
+        log_path = _resolve_activity_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a") as f:
             f.write(f"{now}  {q_col:<14}  {verb:<9}{detail}\n")
     except Exception:
         pass
@@ -479,7 +490,15 @@ def list_items(
         for gh_project in github_projects:
             backend = _github_backend_for_project(gh_project)
             if backend is not None:
-                items.extend(backend.list_items(status=status, lane=lane))
+                try:
+                    items.extend(backend.list_items(status=status, lane=lane))
+                except Exception as e:
+                    import sys
+                    print(
+                        f"Warning: failed to list items for GitHub-backed queue {gh_project}: {e}",
+                        file=sys.stderr,
+                    )
+                    _log("ERROR", f"GitHub list failed: {e}", queue=gh_project)
     return items
 
 
