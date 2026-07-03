@@ -100,14 +100,25 @@ def queue_status(
     ``claim_types`` (the queue's type restriction, e.g. ``['bug']``) gates
     ``stuck`` on *claimable* depth, not raw depth: a bug-only queue whose open
     tickets are all features has open work but ZERO claimable work, so the
-    drainer sitting idle is correct — ``state="backlog"``, never ``stuck``."""
+    drainer sitting idle is correct — ``state="backlog"``, never ``stuck``.
+
+    Readiness gates the same way: tickets marked ``needs-shaping``/``needs-spec``
+    are excluded from ``claimable_depth`` because ``claim_next`` won't hand them
+    to a default worker either (mirrors the exclusion in ``queue.claim_next``) —
+    otherwise a queue whose only open work needs human scoping reports
+    ``claimable_depth > 0`` and the reconciler spawns workers that can never
+    claim anything, forever."""
     now = now or datetime.now(timezone.utc)
     open_items = [it for it in items if it.get("status") == "open"]
     in_progress = [it for it in items if it.get("status") == "in_progress"]
     closed = [it for it in items if it.get("status") == "closed"]
 
     depth = len(open_items)
-    claimable_open = [it for it in open_items if it.get("claimable", True)]
+    claimable_open = [
+        it for it in open_items
+        if it.get("claimable", True)
+        and it.get("readiness", "") not in ("needs-shaping", "needs-spec")
+    ]
     if claim_types:
         claimable_depth = sum(
             1 for it in claimable_open

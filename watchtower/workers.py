@@ -1152,6 +1152,12 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     # spawn -> "nothing to do" -> idle -> reap forever. Count open tickets the
     # worker could actually claim (all open when unrestricted). One list_items
     # pass, keyed by (queue, type).
+    #
+    # Same logic applies to readiness: needs-shaping/needs-spec tickets are
+    # excluded here too, mirroring claim_next's default exclusion (queue.py) --
+    # otherwise a queue whose only open work needs human scoping still counts
+    # as claimable and the reconciler spawns a worker every cycle that finds
+    # nothing to claim, idles, gets reaped, and repeats indefinitely.
     from . import queue as _q
     _open_by_q_type: Dict[tuple, int] = {}
     _total_open_by_q: Dict[str, int] = {}
@@ -1162,6 +1168,8 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             qn = str(it.get("project") or "")
             _total_open_by_q[qn] = _total_open_by_q.get(qn, 0) + 1
             if not it.get("claimable", True):
+                continue
+            if it.get("readiness", "") in ("needs-shaping", "needs-spec"):
                 continue
             ty = _q.effective_type(it)  # untyped == bug, matches claim filter
             _open_by_q_type[(qn, ty)] = _open_by_q_type.get((qn, ty), 0) + 1
@@ -1187,9 +1195,10 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             result["skipped"].append({"queue": q_name, "reason": "auto_drain=off"})
             continue
         if depth == 0:
-            # Distinguish "truly empty" from "only non-claimable types remain".
+            # Distinguish "truly empty" from "only non-claimable items remain"
+            # (wrong claim_type, or needs-shaping/needs-spec readiness).
             filtered = total_open - depth
-            reason = (f"0 claimable ({total_open} open filtered by claim_types)"
+            reason = (f"0 claimable ({total_open} open, filtered by claim_types/readiness)"
                       if filtered > 0 else "depth=0")
             result["skipped"].append({"queue": q_name, "reason": reason})
             # Wind-down is NOT decided here. Counting only `open` on a drained

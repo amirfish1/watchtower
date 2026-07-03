@@ -125,6 +125,33 @@ def test_reconcile_empty_queue_skips(wt):
     assert any(s["queue"] == "Q" and s["reason"] == "depth=0" for s in r["skipped"])
 
 
+def test_reconcile_needs_shaping_only_skips_no_spawn(wt):
+    """A queue whose only open tickets need human shaping/spec has ZERO
+    claimable work -- claim_next won't hand them to a default worker, so
+    spawning one just churns spawn -> idle -> reap forever (the bug this
+    guards against)."""
+    wt.config.set_auto_drain("Q", True)
+    wt.q.enqueue(project="Q", note="needs shaping", readiness="needs-shaping")
+    wt.q.enqueue(project="Q", note="needs spec", readiness="needs-spec")
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert not r["spawned"]
+    assert any(
+        s["queue"] == "Q" and s["reason"].startswith("0 claimable")
+        for s in r["skipped"]
+    )
+
+
+def test_reconcile_ready_ticket_alongside_needs_spec_still_spawns(wt):
+    """A queue with one ready + one needs-spec ticket has real claimable work,
+    so it should still spawn -- readiness gating must not zero out the whole
+    queue, only the non-claimable tickets within it."""
+    wt.config.set_auto_drain("Q", True)
+    wt.q.enqueue(project="Q", note="ready work", readiness="ready")
+    wt.q.enqueue(project="Q", note="needs spec", readiness="needs-spec")
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert [s["queue"] for s in r["spawned"]] == ["Q"]
+
+
 def test_reconcile_live_equals_desired_skips(wt):
     wt.config.set_auto_drain("Q", True)
     wt.q.enqueue(project="Q", note="work")
