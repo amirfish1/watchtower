@@ -618,14 +618,25 @@ def _age_human(claimed_at: Optional[str]) -> Optional[str]:
     return f"{days}d{hours % 24:02d}h"
 
 
+def _compact_ref(queue: str, ref: str) -> str:
+    prefix = queue or "WT"
+    raw = (ref or "").strip()
+    if raw:
+        head, sep, tail = raw.rpartition("-")
+        if sep and tail.isdigit():
+            return f"{head or prefix}#{tail}"
+        return raw.replace("-", "#", 1)
+    return prefix
+
+
 def display_name(queue: str, ref: Optional[str] = None, summary: Optional[str] = None) -> str:
     """The canonical human-readable label for a worker at some point in its
     claim/close lifecycle, e.g. for a session title or a session-list UI.
 
-    ``ref``/``summary`` absent -> never claimed anything: ``"<queue> worker"``.
-    ``ref`` given, no ``summary`` -> holding it (or just claimed it):
-    ``"<queue> worker: <ref>"``. Both given -> closed it:
-    ``"<queue> worker: <ref> - <summary, clipped>"``.
+    ``ref``/``summary`` absent -> never claimed anything:
+    ``"<queue> Queue worker"``. ``ref`` given, no ``summary`` -> holding it
+    (or just claimed it): ``"<queue>#<seq>"``. Both given -> closed it:
+    ``"<queue>#<seq>: <summary, clipped>"``.
 
     This is also fed to ``messages.set_session_title`` to actually rename the
     engine session (append a ``custom-title`` event to its transcript) -- see
@@ -633,11 +644,12 @@ def display_name(queue: str, ref: Optional[str] = None, summary: Optional[str] =
     session and against CCC's own ``rename_session``."""
     queue = queue or "WT"
     if not ref:
-        return f"{queue} worker"
+        return f"{queue} Queue worker"
     summary = (summary or "").strip()
+    label = _compact_ref(queue, ref)
     if summary:
-        return f"{queue} worker: {ref} - {_clip(summary, 60)}"
-    return f"{queue} worker: {ref}"
+        return f"{label}: {_clip(summary, 60)}"
+    return label
 
 
 def ticket_context(item: Dict[str, Any], summary: str = "") -> str:
@@ -680,6 +692,25 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
+def _closed_at_key(item: Dict[str, Any]) -> str:
+    """Comparable key for ``closed_at``, robust to mixed types.
+
+    Modern items store ``closed_at`` as an ISO string, but legacy/imported
+    records can carry an int epoch (observed once as CCC-236). Comparing an int
+    against a str raises ``TypeError`` and used to crash ``wt status`` (WT-93).
+    Normalize both to ISO strings so ordering stays chronological.
+    """
+    raw = item.get("closed_at")
+    if isinstance(raw, (int, float)):
+        try:
+            return datetime.fromtimestamp(raw, tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        except (ValueError, OverflowError, OSError):
+            return ""
+    return raw or ""
+
+
 def annotate_activity(
     rows: List[Dict[str, Any]], items: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
@@ -706,7 +737,7 @@ def annotate_activity(
         elif status == "closed":
             for key in keys:
                 prior = last_closed_by_key.get(str(key))
-                if prior is None or (it.get("closed_at") or "") > (prior.get("closed_at") or ""):
+                if prior is None or _closed_at_key(it) > _closed_at_key(prior):
                     last_closed_by_key[str(key)] = it
     for row in rows:
         wid = str(row.get("worker_id", ""))
@@ -988,13 +1019,13 @@ def _latest_worker_item(
 
     closed = [it for it in items if it.get("status") == "closed" and _matches(it)]
     if closed:
-        return max(closed, key=lambda it: str(it.get("closed_at") or ""))
+        return max(closed, key=_item_activity_key)
     active = [
         it for it in items
         if it.get("status") == "in_progress" and _matches(it)
     ]
     if active:
-        return max(active, key=lambda it: str(it.get("claimed_at") or ""))
+        return max(active, key=_item_activity_key)
     return None
 
 
@@ -1008,6 +1039,14 @@ def _item_activity_ts(item: Dict[str, Any]) -> float:
         ).timestamp()
     except (ValueError, TypeError):
         return 0.0
+
+
+def _item_activity_key(item: Dict[str, Any]) -> tuple:
+    try:
+        seq = int(item.get("seq") or 0)
+    except (TypeError, ValueError):
+        seq = 0
+    return (_item_activity_ts(item), seq)
 
 
 def _session_title_backfill_row(
@@ -1060,7 +1099,14 @@ def backfill_recent_session_titles(
     except Exception:
         items = []
     out: List[Dict[str, Any]] = []
-    seen: set = set()
+    candidates: Dict[str, tuple] = {}
+
+    def _offer(worker_id: str, session_id: str, item: Dict[str, Any]) -> None:
+        key = _item_activity_key(item)
+        current = candidates.get(session_id)
+        if current is None or key > current[0]:
+            candidates[session_id] = (key, worker_id, session_id, item)
+
     for path in logs:
         try:
             if path.stat().st_mtime < cutoff:
@@ -1074,29 +1120,20 @@ def backfill_recent_session_titles(
         item = _latest_worker_item(worker_id, sid, items)
         if not item:
             continue
-        row = _session_title_backfill_row(
-            worker_id=worker_id,
-            session_id=sid,
-            item=item,
-            dry_run=dry_run,
-        )
-        seen.add((row["session_id"], row["ref"]))
-        out.append(row)
+        _offer(worker_id, sid, item)
     for item in sorted(items, key=_item_activity_ts):
         sid = str(item.get("claimed_session_id") or "")
         if not sid or _item_activity_ts(item) < cutoff:
             continue
         worker_id = str(item.get("claimed_by") or item.get("closed_by") or sid)
-        key = (sid, item.get("ref", ""))
-        if key in seen:
-            continue
+        _offer(worker_id, sid, item)
+    for _, worker_id, sid, item in candidates.values():
         row = _session_title_backfill_row(
             worker_id=worker_id,
             session_id=sid,
             item=item,
             dry_run=dry_run,
         )
-        seen.add(key)
         out.append(row)
     return out
 
@@ -1144,7 +1181,8 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         pass
 
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
-                              "reaped": [], "requeued": [], "backfilled": []}
+                              "reaped": [], "requeued": [], "backfilled": [],
+                              "session_title_backfilled": []}
 
     # Reap cold idle workers first (idle past the prompt-cache TTL): waking one
     # would re-read its bloated context uncached. Killing it lets the spawn pass
@@ -1184,6 +1222,13 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         # so consumers can resolve a reachable worker (no false WAITING/STUCK).
         try:
             result["backfilled"] = backfill_claimed_session_ids()
+        except Exception:
+            pass
+        # Repair transcript titles for recent workers whose ticket/session link
+        # was missed before close. The title writer is idempotent, so this can
+        # safely run on every reconciler tick.
+        try:
+            result["session_title_backfilled"] = backfill_recent_session_titles()
         except Exception:
             pass
 

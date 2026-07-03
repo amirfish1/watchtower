@@ -998,7 +998,7 @@ def test_worker_activity_join_idle_when_unclaimed(store):
     workers.annotate_activity(rows, q.list_items())
     assert rows[0]["active_ref"] is None
     assert rows[0]["active_since_human"] is None
-    assert rows[0]["display_name"] == "IDLEQ worker"
+    assert rows[0]["display_name"] == "IDLEQ Queue worker"
 
 
 def test_worker_display_name_reflects_lifecycle(store):
@@ -1013,12 +1013,12 @@ def test_worker_display_name_reflects_lifecycle(store):
 
     # Never claimed anything yet: generic label.
     workers.annotate_activity(rows, q.list_items())
-    assert rows[0]["display_name"] == "NAMEQ worker"
+    assert rows[0]["display_name"] == "NAMEQ Queue worker"
 
     # Holding an in-progress ticket: label carries the ref.
     q.claim_next("namer-1", project="NAMEQ")
     workers.annotate_activity(rows, q.list_items())
-    assert rows[0]["display_name"] == f"NAMEQ worker: {item['ref']} - fix the thing"
+    assert rows[0]["display_name"] == f"NAMEQ#{item['seq']}: fix the thing"
 
     # After close, idle again but the label now carries the outcome.
     q.close(item["ref"], "namer-1", resolution="fixed the thing")
@@ -1026,7 +1026,32 @@ def test_worker_display_name_reflects_lifecycle(store):
     assert rows[0]["active_ref"] is None
     assert rows[0]["last_closed_ref"] == item["ref"]
     assert rows[0]["last_closed_summary"] == "fixed the thing"
-    assert rows[0]["display_name"] == f"NAMEQ worker: {item['ref']} - fixed the thing"
+    assert rows[0]["display_name"] == f"NAMEQ#{item['seq']}: fixed the thing"
+
+
+def test_worker_activity_join_mixed_closed_at_types(store):
+    """WT-93: a legacy int-epoch ``closed_at`` must not crash the by-worker
+    "most recent close" comparison against modern ISO-string closes."""
+    import watchtower.queue as q
+    import watchtower.workers as workers
+
+    a = q.enqueue(project="MIXQ", note="first")
+    b = q.enqueue(project="MIXQ", note="second")
+    q.claim_next("mix-w", project="MIXQ")  # claims `a`
+    q.close(a["ref"], "mix-w", resolution="closed a (iso)")
+    q.claim_next("mix-w", project="MIXQ")  # claims `b`
+    q.close(b["ref"], "mix-w", resolution="closed b (iso)")
+
+    # Simulate an imported/legacy record whose closed_at is an int epoch.
+    items = q.list_items()
+    for it in items:
+        if it["ref"] == a["ref"]:
+            it["closed_at"] = 1782608895  # int, not ISO string
+
+    rows = [{"worker_id": "mix-w", "queue": "MIXQ"}]
+    workers.annotate_activity(rows, items)  # must not raise TypeError
+    # `b` (ISO 2026) is more recent than the int-epoch `a`.
+    assert rows[0]["last_closed_ref"] == b["ref"]
 
 
 # WT-27: reconciler, stop-signal, and mandatory-summary tests
