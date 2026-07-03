@@ -703,7 +703,7 @@ def drain_goal(queue: str, worker_id: str, repo_path: str = "") -> str:
 
 
 def build_drain_command(
-    queue: str, engine: str, worker_id: str, repo_path: str = ""
+    queue: str, engine: str, worker_id: str, repo_path: str = "", model: str = ""
 ) -> List[str]:
     """Construct the argv for one worker subprocess.
 
@@ -716,11 +716,20 @@ def build_drain_command(
 
     **codex**: one-shot ``codex exec <goal>`` (no stream-json input channel);
     the goal carries in argv and the worker drains until its turn ends.
+
+    ``model`` (queue config, ``wt set --model``) pins the agent's model; empty
+    means no ``--model`` flag, i.e. the CLI's own configured default. For
+    claude, versioned ids need the full ``claude-`` prefix (``claude-sonnet-5``);
+    bare family names (``sonnet``) also work.
     """
     bin_name = _ENGINE_BIN.get(engine, engine)
     if engine == "codex":
-        return [bin_name, "exec", drain_goal(queue, worker_id, repo_path)]
-    return [
+        argv = [bin_name, "exec"]
+        if model:
+            argv += ["--model", model]
+        argv.append(drain_goal(queue, worker_id, repo_path))
+        return argv
+    argv = [
         bin_name, "-p",
         "--input-format", "stream-json",
         "--output-format", "stream-json",
@@ -729,6 +738,9 @@ def build_drain_command(
         # ticket-derived titles WT sets later via the custom-title event.
         "--permission-mode", "bypassPermissions",
     ]
+    if model:
+        argv += ["--model", model]
+    return argv
 
 
 def request_stop(worker_id: str) -> Path:
@@ -1269,6 +1281,7 @@ def spawn_workers(
     engine: str = "claude",
     *,
     repo_path: str = "",
+    model: str = "",
     dry_run: bool = False,
 ) -> List[Dict[str, Any]]:
     """Launch ``n`` worker subprocesses draining ``queue``.
@@ -1281,11 +1294,14 @@ def spawn_workers(
     ``dry_run`` builds + records the command without spawning (tests).
     """
     repo_path = repo_path or os.getcwd()
+    if not model:
+        from . import config
+        model = config.model(queue)
     log_dir = WORKERS_FILE.parent / "logs"
     spawned: List[Dict[str, Any]] = []
     for _ in range(max(1, n)):
         worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
-        argv = build_drain_command(queue, engine, worker_id, repo_path)
+        argv = build_drain_command(queue, engine, worker_id, repo_path, model)
         goal = drain_goal(queue, worker_id, repo_path)
         if dry_run:
             spawned.append(

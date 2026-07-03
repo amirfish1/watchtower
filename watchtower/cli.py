@@ -1240,6 +1240,9 @@ def cmd_set(args: argparse.Namespace) -> int:
     if args.engine is not None:
         config.set_engine(args.queue, args.engine)
         changed.append(f"engine={args.engine}")
+    if args.model is not None:
+        config.set_model(args.queue, args.model)
+        changed.append(f"model={args.model or '(engine default)'}")
     if args.desired_workers is not None:
         config.set_desired_workers(args.queue, args.desired_workers)
         changed.append(f"desired_workers={args.desired_workers}")
@@ -1892,7 +1895,7 @@ COMMAND_HELP: Dict[str, str] = {
     "ls": "list the tickets in one queue",
     "dedup": "close exact-duplicate open tickets",
     "status": "per-queue depth / age / stuck flag",
-    "set": "set queue-level config (repo_path, engine, workers)",
+    "set": "set queue-level config (repo_path, engine, model, workers)",
     "drain": "enable or disable auto-drain for a queue",
     "wait": "block until the queue is drained",
     "monitor": "run a check; file a ticket if it fails",
@@ -2284,6 +2287,12 @@ def build_parser() -> argparse.ArgumentParser:
                        "prompt-cache warm for ~5 min; requires the Claude Code CLI. "
                        "codex: one-shot `codex exec <goal>` — no FIFO, no live push; "
                        "requires the OpenAI Codex CLI."
+                   ))
+    s.add_argument("--model", default=None, dest="model",
+                   help=(
+                       "model workers on this queue are spawned with (passed as the "
+                       "engine's --model flag), e.g. claude-sonnet-5 or gpt-5.5. "
+                       "Empty string clears it (workers use the CLI's own default)."
                    ))
     s.add_argument("--desired-workers", default=None, type=int, dest="desired_workers",
                    help="number of concurrent workers the reconciler should maintain")

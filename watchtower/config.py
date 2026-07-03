@@ -160,6 +160,23 @@ def engine(queue: str) -> str:
     return _load().get(queue, {}).get("engine", "claude")
 
 
+def set_model(queue: str, m: str) -> Dict[str, Any]:
+    """Set (or clear, with "") the model workers on this queue are spawned with."""
+    data = _load()
+    q = data.setdefault(queue, {})
+    if m:
+        q["model"] = str(m)
+    else:
+        q.pop("model", None)
+    _save(data)
+    return q
+
+
+def model(queue: str) -> str:
+    """Return the configured worker model for a queue, or "" (engine's own default)."""
+    return _load().get(queue, {}).get("model", "")
+
+
 def set_desired_workers(queue: str, n: int) -> Dict[str, Any]:
     data = _load()
     q = data.setdefault(queue, {})

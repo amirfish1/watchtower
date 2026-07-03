@@ -287,6 +287,29 @@ def test_spawn_worker_dry_run(store):
         assert "stream-json" in s["argv"]
         assert "DEMO" in workers.drain_goal("DEMO", s["worker_id"])
         assert "bypassPermissions" in s["argv"]  # autonomous drain
+        # No queue model configured -> no --model flag; the CLI's own
+        # configured default applies (the pre-`wt set --model` behavior).
+        assert "--model" not in s["argv"]
+
+
+def test_spawn_worker_queue_model(store):
+    import watchtower.config as config
+    import watchtower.workers as workers
+
+    config.set_model("DEMO", "claude-sonnet-5")
+    try:
+        spawned = workers.spawn_workers("DEMO", n=1, engine="claude", dry_run=True)
+        argv = spawned[0]["argv"]
+        assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
+        codex_argv = workers.build_drain_command(
+            "DEMO", "codex", "demo-w1", model="gpt-5.5")
+        assert codex_argv[:4] == ["codex", "exec", "--model", "gpt-5.5"]
+        # Clearing restores the no-flag default.
+        config.set_model("DEMO", "")
+        spawned = workers.spawn_workers("DEMO", n=1, engine="claude", dry_run=True)
+        assert "--model" not in spawned[0]["argv"]
+    finally:
+        config.set_model("DEMO", "")
 
 
 def test_auto_drain_config(tmp_path, monkeypatch):
