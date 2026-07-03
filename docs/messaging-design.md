@@ -182,7 +182,38 @@ delegate), and codex sessions (via delegate).
    same chat files. Default off.
 2. Stage 2: CCC `/api/ask` and `/api/inject-input` optionally proxy to `wt`
    for headless-reachable sessions; CCC remains the delegate for TTY.
-3. Stage 3: delete CCC's duplicated watcher/queue code once Stage 1+2 soak.
+3. Stage 3: delete CCC's duplicated watcher/queue code once Stage 1+2 soak —
+   gated by the soak gate below. Not before.
+
+### Stage 3 soak gate (WT-57)
+
+Stage 2 once soaked *broken* for a full day (2026-07-02): wt's resume adapter
+spawned `claude --resume` without the session cwd, every delegated delivery
+died at boot with "No conversation found" while the outbox reported ok, and
+CCC's native path was the only recovery (fixed in watchtower `13a2de6` +
+CCC `58ca751`). "It ran for a while with no complaints" is therefore not
+soak. The deletion is authorized only when ALL of:
+
+1. **Receipts are the ground truth (WT-77 — shipped).** "Delivered" means
+   *verified landed* against the target transcript, not "the adapter said
+   ok". Instrument: `wt receipts stats` (7-day window by default).
+2. **7 consecutive days of verified wt-mediated delivery**: CCC running with
+   `CCC_MESSAGING_BACKEND=wt` the whole time, and `wt receipts stats` for
+   that window showing `landed >= 50` and `lost == 0` (silent loss is the
+   failure mode that motivated this gate).
+3. **Explicit owner sign-off** recorded on the Stage 3 ticket. Meeting the
+   numbers does not self-authorize the deletion.
+
+Prerequisites before the clock can even start: WT-76 (rebucket) and WT-78
+(delegate origin-marker) — wt must own delivery end-to-end for the window to
+measure the right thing.
+
+What Stage 3 deletes when the gate opens (CCC `server.py`, by name — line
+numbers drift): `_register_coordination`, `_coordination_watcher`,
+`_start_coordination_watcher` (the `CCC_CHAT_ORCHESTRATOR=wt` gate),
+`_group_chat_nudge` targeting logic, the pending-inputs drain
+(`PENDING_INPUTS_FILE`, `_load_pending_inputs`/`_save_pending_inputs`,
+`_get_queued_events_for_session`), leaving CCC pure client + TTY delegate.
 
 ## Engine matrix (honest, v1)
 
