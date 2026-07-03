@@ -82,3 +82,39 @@ def test_resume_reports_failure_when_claude_dies_at_boot(wt, monkeypatch):
     assert res["ok"] is False and res["queued"] is True
     assert "exited" in res["error"]
     assert wt.messages.outbox_list(status="pending")
+
+
+# ================================================================== rebucket
+def test_resume_rebuckets_transcript_into_cwd_project_bucket(wt, monkeypatch):
+    """claude --resume only sees transcripts in the cwd's own project bucket
+    (~/.claude/projects/<slug-of-cwd>/). A session launched from "/" (or any
+    mismatched dir) has its jsonl in the wrong bucket — resume fails even
+    with the right cwd until the file is moved. Port of CCC's
+    _ensure_session_jsonl_for_cwd."""
+    proj = wt.tmp / "real-project"
+    proj.mkdir()
+    src = _write_transcript_with_cwd(wt, SID_B, proj)  # lands in "some-project"
+    calls = []
+    monkeypatch.setattr(wt.messages.subprocess, "Popen", _fake_popen(calls))
+    res = wt.messages.send(SID_B, "resume me")
+    assert res["ok"] is True
+    slug = wt.messages._encode_project_slug(str(proj.resolve()))
+    dest = Path(os.environ["WATCHTOWER_CLAUDE_PROJECTS_DIR"]) / slug / f"{SID_B}.jsonl"
+    assert dest.is_file() and not src.exists()
+    assert calls[0][1].get("cwd") == str(proj)
+
+
+def test_resume_rebucket_noop_when_already_in_right_bucket(wt, monkeypatch):
+    proj = wt.tmp / "real-project"
+    proj.mkdir()
+    slug_dir = Path(os.environ["WATCHTOWER_CLAUDE_PROJECTS_DIR"]) / \
+        __import__("re").sub(r"[^A-Za-z0-9]", "-", str(proj.resolve()))
+    slug_dir.mkdir(parents=True, exist_ok=True)
+    p = slug_dir / f"{SID_B}.jsonl"
+    p.write_text(json.dumps({"type": "user", "cwd": str(proj)}) + "\n")
+    old = time.time() - 600
+    os.utime(p, (old, old))
+    calls = []
+    monkeypatch.setattr(wt.messages.subprocess, "Popen", _fake_popen(calls))
+    res = wt.messages.send(SID_B, "resume me")
+    assert res["ok"] is True and p.is_file()

@@ -533,6 +533,10 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     cwd = _session_cwd_from_transcript(sid) or str(resolved.get("cwd") or "")
     if cwd and not os.path.isdir(cwd):
         cwd = ""
+    if cwd:
+        # WT-76: resume also requires the transcript to live in the cwd's
+        # project bucket — move it there if it's stranded elsewhere.
+        _ensure_transcript_in_cwd_bucket(sid, cwd)
     try:
         logf = open(log_path, "ab")
         try:
@@ -603,6 +607,40 @@ def _session_cwd_from_transcript(sid: str) -> Optional[str]:
     except OSError:
         return None
     return None
+
+
+def _encode_project_slug(path: str) -> str:
+    """Encode an absolute path the way claude-code names its project buckets
+    under ~/.claude/projects/ (every non-alphanumeric character becomes '-')."""
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
+
+
+def _ensure_transcript_in_cwd_bucket(sid: str, cwd: str) -> None:
+    """Move the session transcript into the project bucket `claude --resume`
+    will search from ``cwd`` (port of CCC's _ensure_session_jsonl_for_cwd).
+
+    A session accidentally launched from "/" (or whose repo moved) keeps its
+    jsonl in a bucket that doesn't match its real working directory — resume
+    then fails with "No conversation found" even when spawned in the right
+    cwd. Best-effort: any failure leaves the transcript where it was."""
+    try:
+        slug = _encode_project_slug(str(Path(cwd).expanduser().resolve()))
+    except (OSError, ValueError, RuntimeError):
+        return
+    dest = _claude_projects_root() / slug / f"{sid}.jsonl"
+    try:
+        if dest.is_file():
+            return
+    except OSError:
+        return
+    src = _find_transcript(sid)
+    if src is None or src == dest:
+        return
+    try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.rename(src, dest)
+    except OSError:
+        return
 
 
 def _resume_verify_window_s() -> float:
