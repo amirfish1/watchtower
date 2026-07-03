@@ -126,6 +126,18 @@ def _write_transcript(wt, sid, age_s=0.0):
     return p
 
 
+def _write_worker_log(wt, worker_id, sid, age_s=0.0):
+    """Drop a worker stream-json log where WT's log scanner expects it."""
+    d = wt.workers.WORKERS_FILE.parent / "logs"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{worker_id}.log"
+    p.write_text(json.dumps({"type": "system", "session_id": sid}) + "\n")
+    if age_s:
+        old = time.time() - age_s
+        os.utime(p, (old, old))
+    return p
+
+
 class _DelegateHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0) or 0)
@@ -886,7 +898,7 @@ def test_backfill_renames_session_once_uuid_resolves(wt):
     lines = [l for l in p.read_text().splitlines() if l.strip()]
     assert json.loads(lines[-1]) == {
         "type": "custom-title",
-        "customTitle": f"NAMEQ worker: {item['ref']}",
+        "customTitle": f"NAMEQ worker: {item['ref']} - do a thing",
         "sessionId": SID_A,
     }
 
@@ -912,3 +924,106 @@ def test_cli_close_renames_session_with_summary(wt):
         "customTitle": f"NAMEQ worker: {item['ref']} - fixed the thing",
         "sessionId": SID_A,
     }
+
+
+def test_recent_session_title_backfill_dry_run_uses_latest_ticket_context(wt):
+    recent_worker = "nameq-recent"
+    stale_worker = "nameq-stale"
+    _write_worker_log(wt, recent_worker, SID_A)
+    _write_worker_log(wt, stale_worker, SID_B, age_s=25 * 3600)
+
+    recent = wt.q.enqueue(project="NAMEQ", title="Add useful titles", note="fallback")
+    wt.q.claim_next(recent_worker, project="NAMEQ")
+    wt.q.close(recent["ref"], recent_worker, resolution="added durable titles")
+
+    stale = wt.q.enqueue(project="NAMEQ", title="Old work", note="body")
+    wt.q.claim_next(stale_worker, project="NAMEQ")
+    wt.q.close(stale["ref"], stale_worker, resolution="old summary")
+
+    result = wt.workers.backfill_recent_session_titles(hours=24, dry_run=True)
+
+    assert result == [
+        {
+            "worker_id": recent_worker,
+            "session_id": SID_A,
+            "ref": recent["ref"],
+            "title": f"NAMEQ worker: {recent['ref']} - added durable titles",
+            "updated": False,
+        }
+    ]
+
+
+def test_recent_session_title_backfill_appends_custom_title(wt):
+    worker_id = "nameq-recent"
+    _write_worker_log(wt, worker_id, SID_A)
+    p = _write_transcript(wt, SID_A)
+
+    item = wt.q.enqueue(project="NAMEQ", title="Add useful titles", note="body")
+    wt.q.claim_next(worker_id, project="NAMEQ")
+
+    result = wt.workers.backfill_recent_session_titles(hours=24)
+
+    assert result == [
+        {
+            "worker_id": worker_id,
+            "session_id": SID_A,
+            "ref": item["ref"],
+            "title": f"NAMEQ worker: {item['ref']} - Add useful titles",
+            "updated": True,
+        }
+    ]
+    lines = [l for l in p.read_text().splitlines() if l.strip()]
+    assert json.loads(lines[-1]) == {
+        "type": "custom-title",
+        "customTitle": f"NAMEQ worker: {item['ref']} - Add useful titles",
+        "sessionId": SID_A,
+    }
+
+
+def test_recent_session_title_backfill_uses_queue_session_when_log_is_gone(wt):
+    p = _write_transcript(wt, SID_A)
+    item = wt.q.enqueue(project="NAMEQ", title="Log already pruned", note="body")
+    wt.q.claim_next("nameq-pruned", project="NAMEQ")
+    wt.q.backfill_session_id(item["ref"], SID_A)
+    wt.q.close(item["ref"], "nameq-pruned", resolution="renamed without log")
+
+    result = wt.workers.backfill_recent_session_titles(hours=24)
+
+    assert result == [
+        {
+            "worker_id": "nameq-pruned",
+            "session_id": SID_A,
+            "ref": item["ref"],
+            "title": f"NAMEQ worker: {item['ref']} - renamed without log",
+            "updated": True,
+        }
+    ]
+    lines = [l for l in p.read_text().splitlines() if l.strip()]
+    assert json.loads(lines[-1]) == {
+        "type": "custom-title",
+        "customTitle": f"NAMEQ worker: {item['ref']} - renamed without log",
+        "sessionId": SID_A,
+    }
+
+
+def test_session_names_backfill_cli_dry_run(wt, capsys):
+    import watchtower.cli as cli
+    importlib.reload(cli)
+
+    worker_id = "nameq-recent"
+    _write_worker_log(wt, worker_id, SID_A)
+    item = wt.q.enqueue(project="NAMEQ", title="Add useful titles", note="body")
+    wt.q.claim_next(worker_id, project="NAMEQ")
+
+    assert cli.main(["session-names", "backfill", "--hours", "24", "--dry-run"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+
+    assert rows == [
+        {
+            "worker_id": worker_id,
+            "session_id": SID_A,
+            "ref": item["ref"],
+            "title": f"NAMEQ worker: {item['ref']} - Add useful titles",
+            "updated": False,
+        }
+    ]

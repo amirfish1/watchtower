@@ -382,6 +382,12 @@ def _add_worker_session_id(sid: str) -> None:
 _SESSION_ID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
+_CODEX_SESSION_ID_LINE_RE = re.compile(
+    r"^\s*session id:\s*("
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r")\s*$",
+    re.IGNORECASE,
+)
 
 
 def resolve_session_id_from_log(log_path: str) -> str:
@@ -389,9 +395,10 @@ def resolve_session_id_from_log(log_path: str) -> str:
 
     A ``claude -p --output-format stream-json`` worker emits an init/system event
     carrying ``session_id`` (the UUID Claude/cloud assigns -- WatchTower does NOT
-    mint it). We scan the first lines of the captured output log for it. Returns
-    "" until the event has been written (the worker must have started its first
-    turn). Mirrors CCC's extract_session_id."""
+    mint it). ``codex exec`` prints the same UUID as a plain ``session id:``
+    startup line. We scan the first lines of the captured output log for either
+    shape. Returns "" until the event has been written (the worker must have
+    started its first turn)."""
     if not log_path:
         return ""
     try:
@@ -405,6 +412,9 @@ def resolve_session_id_from_log(log_path: str) -> str:
                 try:
                     ev = json.loads(line)
                 except (json.JSONDecodeError, ValueError):
+                    m = _CODEX_SESSION_ID_LINE_RE.match(line)
+                    if m:
+                        return m.group(1)
                     continue
                 sid = ev.get("session_id") or ev.get("sessionId")
                 if sid and _SESSION_ID_RE.fullmatch(str(sid)):
@@ -592,14 +602,39 @@ def display_name(queue: str, ref: Optional[str] = None, summary: Optional[str] =
     return f"{queue} worker: {ref}"
 
 
-def _display_name(row: Dict[str, Any], last_closed: Optional[Dict[str, Any]]) -> str:
+def ticket_context(item: Dict[str, Any], summary: str = "") -> str:
+    """Short human context for a worker title.
+
+    Close summaries are the best description of what happened. Before close,
+    prefer the ticket title, then note, then text so the session is useful as
+    soon as a worker claims work.
+    """
+    res = item.get("resolution") if isinstance(item, dict) else {}
+    if isinstance(res, str) and not summary:
+        summary = res
+    elif isinstance(res, dict) and not summary:
+        summary = str(res.get("summary") or "")
+    for value in (summary, item.get("title"), item.get("note"), item.get("text")):
+        text = str(value or "").strip()
+        if text:
+            return _clip(" ".join(text.split()), 60)
+    return ""
+
+
+def _display_name(
+    row: Dict[str, Any],
+    active: Optional[Dict[str, Any]],
+    last_closed: Optional[Dict[str, Any]],
+) -> str:
     """``display_name`` fed from a worker row + its most recent closed item."""
-    active_ref = row.get("active_ref")
-    if active_ref:
-        return display_name(row.get("queue", ""), active_ref)
+    if active:
+        return display_name(row.get("queue", ""), active.get("ref"), ticket_context(active))
     if last_closed:
-        res = last_closed.get("resolution") or {}
-        return display_name(row.get("queue", ""), last_closed.get("ref"), res.get("summary"))
+        return display_name(
+            row.get("queue", ""),
+            last_closed.get("ref"),
+            ticket_context(last_closed),
+        )
     return display_name(row.get("queue", ""))
 
 
@@ -653,7 +688,7 @@ def annotate_activity(
         else:
             row["last_closed_ref"] = None
             row["last_closed_summary"] = None
-        row["display_name"] = _display_name(row, last_closed)
+        row["display_name"] = _display_name(row, active, last_closed)
     return rows
 
 
@@ -690,7 +725,8 @@ def build_drain_command(
         "--input-format", "stream-json",
         "--output-format", "stream-json",
         "--verbose",
-        "--name", f"{queue} queue worker",
+        # No --name: a generic "<queue> queue worker" label would overwrite the
+        # ticket-derived titles WT sets later via the custom-title event.
         "--permission-mode", "bypassPermissions",
     ]
 
@@ -859,13 +895,144 @@ def backfill_claimed_session_ids() -> List[str]:
                 backfilled.append(it.get("ref", ""))
                 try:
                     from . import messages as _messages
-                    name = display_name(it.get("project", ""), it.get("ref"))
+                    name = display_name(
+                        it.get("project", ""),
+                        it.get("ref"),
+                        ticket_context(it),
+                    )
                     _messages.set_session_title(sid, name)
                 except Exception:
                     pass
         except Exception:
             pass
     return backfilled
+
+
+def _latest_worker_item(
+    worker_id: str, session_id: str, items: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """Most useful ticket for a worker session: latest closed, else active."""
+    keys = {k for k in (worker_id, session_id) if k}
+    if not keys:
+        return None
+
+    def _matches(it: Dict[str, Any]) -> bool:
+        return any(str(it.get(field) or "") in keys
+                   for field in ("claimed_by", "claimed_session_id"))
+
+    closed = [it for it in items if it.get("status") == "closed" and _matches(it)]
+    if closed:
+        return max(closed, key=lambda it: str(it.get("closed_at") or ""))
+    active = [
+        it for it in items
+        if it.get("status") == "in_progress" and _matches(it)
+    ]
+    if active:
+        return max(active, key=lambda it: str(it.get("claimed_at") or ""))
+    return None
+
+
+def _item_activity_ts(item: Dict[str, Any]) -> float:
+    raw = item.get("closed_at") or item.get("claimed_at") or item.get("updated_at")
+    if not raw:
+        return 0.0
+    try:
+        return datetime.strptime(str(raw), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        ).timestamp()
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _session_title_backfill_row(
+    *,
+    worker_id: str,
+    session_id: str,
+    item: Dict[str, Any],
+    dry_run: bool,
+) -> Dict[str, Any]:
+    title = display_name(
+        str(item.get("project") or ""),
+        str(item.get("ref") or ""),
+        ticket_context(item),
+    )
+    updated = False
+    if not dry_run:
+        try:
+            from . import messages as _messages
+            updated = _messages.set_session_title(session_id, title)
+        except Exception:
+            updated = False
+    return {
+        "worker_id": worker_id,
+        "session_id": session_id,
+        "ref": item.get("ref", ""),
+        "title": title,
+        "updated": updated,
+    }
+
+
+def backfill_recent_session_titles(
+    hours: float = 24.0,
+    dry_run: bool = False,
+) -> List[Dict[str, Any]]:
+    """Rename recent WT worker transcripts from their latest ticket context.
+
+    Scans worker logs modified within ``hours`` under ``~/.watchtower/logs``,
+    resolves each log's Claude session id, finds the worker's latest closed
+    ticket (or active ticket), and appends the canonical ``custom-title`` event.
+    """
+    from . import queue as _q
+    cutoff = time.time() - max(0.0, float(hours)) * 3600.0
+    log_dir = WORKERS_FILE.parent / "logs"
+    try:
+        logs = sorted(log_dir.glob("*.log"))
+    except OSError:
+        return []
+    try:
+        items = _q.list_items()
+    except Exception:
+        items = []
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    for path in logs:
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        worker_id = path.stem
+        sid = resolve_session_id_from_log(str(path))
+        if not sid:
+            continue
+        item = _latest_worker_item(worker_id, sid, items)
+        if not item:
+            continue
+        row = _session_title_backfill_row(
+            worker_id=worker_id,
+            session_id=sid,
+            item=item,
+            dry_run=dry_run,
+        )
+        seen.add((row["session_id"], row["ref"]))
+        out.append(row)
+    for item in sorted(items, key=_item_activity_ts):
+        sid = str(item.get("claimed_session_id") or "")
+        if not sid or _item_activity_ts(item) < cutoff:
+            continue
+        worker_id = str(item.get("claimed_by") or item.get("closed_by") or sid)
+        key = (sid, item.get("ref", ""))
+        if key in seen:
+            continue
+        row = _session_title_backfill_row(
+            worker_id=worker_id,
+            session_id=sid,
+            item=item,
+            dry_run=dry_run,
+        )
+        seen.add(key)
+        out.append(row)
+    return out
 
 
 def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
@@ -887,7 +1054,20 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     ``skipped`` entries explain why a queue was left alone (e.g. auto_drain=off,
     depth=0, or surplus resolved elsewhere).  In ``dry_run`` mode no subprocesses
     are started; the return value shows what *would* happen.
+
+    Passes are serialized under a cross-process file lock. The daemon tick and
+    ``dispatch_after_enqueue`` (``wt add``) can reconcile concurrently; without
+    the lock both read the same live count and each spawns the full desired
+    delta, over-spawning the queue (WT-75: 4 spawned for desired=2).
+    ``spawn_workers`` persists every worker via ``record_worker()`` before the
+    lock is released, so a blocked pass sees the fresh workers and skips.
     """
+    from .queue import _FileLock
+    with _FileLock(WORKERS_FILE.parent / "reconcile.lock"):
+        return _reconcile_once_locked(dry_run)
+
+
+def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     from . import config, health
     import sys
 

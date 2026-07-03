@@ -255,6 +255,8 @@ def test_spawn_worker_dry_run(store):
         assert s["pid"] == 0
         assert s["argv"][0] == "claude"
         assert "-p" in s["argv"]  # headless print mode, not interactive
+        assert "--name" not in s["argv"]  # generic names overwrite later WT titles
+        assert f"{s['queue']} queue worker" not in " ".join(s["argv"])
         # claude workers run in stream-json mode; the goal is delivered on the
         # FIFO, not in argv. The queue name lives in the drain goal text.
         assert "stream-json" in s["argv"]
@@ -829,7 +831,7 @@ def test_worker_display_name_reflects_lifecycle(store):
     # Holding an in-progress ticket: label carries the ref.
     q.claim_next("namer-1", project="NAMEQ")
     workers.annotate_activity(rows, q.list_items())
-    assert rows[0]["display_name"] == f"NAMEQ worker: {item['ref']}"
+    assert rows[0]["display_name"] == f"NAMEQ worker: {item['ref']} - fix the thing"
 
     # After close, idle again but the label now carries the outcome.
     q.close(item["ref"], "namer-1", resolution="fixed the thing")

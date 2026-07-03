@@ -141,6 +141,60 @@ def test_reconcile_desired_two_spawns_two(wt):
     assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 2
 
 
+def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
+    """WT-75: the daemon tick and dispatch_after_enqueue (`wt add`) can
+    reconcile the same queue concurrently. Without serialization both read the
+    same live count and each spawns the full desired delta (4 spawned for
+    desired=2). reconcile_once holds a cross-process file lock and
+    spawn_workers registers workers before releasing it, so the racing pass
+    sees them and skips — `desired` workers TOTAL across both passes."""
+    import threading
+
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 2)
+    wt.q.enqueue(project="Q", note="work")
+
+    real_record = wt.workers.record_worker
+    spawn_calls = []
+
+    def fake_spawn(queue, n=1, engine="claude", *, repo_path="", dry_run=False):
+        # Real spawn minus the subprocess: linger inside the critical section
+        # (so an unserialized second pass would count live=0 meanwhile), then
+        # register n live (this-pid) workers exactly like spawn_workers does.
+        time.sleep(0.2)
+        recs = []
+        for i in range(max(1, n)):
+            wid = f"{queue.lower()}-fake-{len(spawn_calls)}-{i}"
+            log = wt.tmp / f"{wid}.log"
+            log.write_text("")
+            recs.append(
+                real_record(os.getpid(), queue, engine, wid, str(wt.tmp), str(log))
+            )
+        spawn_calls.append((queue, n))
+        return recs
+
+    monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
+
+    results = [None, None]
+
+    def run(i):
+        results[i] = wt.workers.reconcile_once(dry_run=False)
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert all(r is not None for r in results), "a reconcile pass deadlocked"
+    total = sum(len(r["spawned"]) for r in results)
+    assert total == 2, (results, spawn_calls)
+    assert wt.workers.live_worker_count("Q") == 2
+    # The losing pass must have skipped with the fully-staffed reason.
+    skips = [s for r in results for s in r["skipped"] if s["queue"] == "Q"]
+    assert any("actual=2==desired=2" in s["reason"] for s in skips)
+
+
 def test_reconcile_excess_workers_not_stopped(wt):
     """New contract: the reconciler no longer STOPs surplus workers — that call
     is made at claim time (live>desired) with REAP as the safety net. It only
@@ -560,6 +614,19 @@ def test_resolve_session_id_from_log(wt):
             == "c44f96bc-d720-49d3-a5e6-115426939f82")
 
 
+def test_resolve_session_id_from_codex_exec_log(wt):
+    """Codex exec logs print the session id as text, not stream JSON."""
+    log = wt.tmp / "codex.log"
+    log.write_text(
+        "OpenAI Codex v0.142.5\n"
+        "--------\n"
+        "session id: 019f23e3-ba0e-7ec1-949d-d72d3f590ad2\n"
+        "--------\n"
+    )
+    assert (wt.workers.resolve_session_id_from_log(str(log))
+            == "019f23e3-ba0e-7ec1-949d-d72d3f590ad2")
+
+
 def test_resolve_session_id_absent_returns_empty(wt):
     log = wt.tmp / "noinit.log"
     log.write_text('{"type":"assistant","message":{}}\n')
@@ -584,6 +651,26 @@ def test_list_workers_backfills_and_persists_session_id(wt):
     again = next(r for r in wt.workers.list_workers(prune=False)
                  if r["worker_id"] == "q-bf")
     assert again["session_id"] == "c44f96bc-d720-49d3-a5e6-115426939f82"
+
+
+def test_backfill_claimed_session_id_from_codex_worker_log(wt):
+    """Codex WT workers claim with worker_id, then expose the real UUID in logs."""
+    sid = "019f23e3-ba0e-7ec1-949d-d72d3f590ad2"
+    worker_id = "throughput-eb3f49da"
+    log = wt.tmp / f"{worker_id}.log"
+    log.write_text(f"session id: {sid}\n")
+    wt.workers.record_worker(
+        os.getpid(), "THROUGHPUT", "codex", worker_id, str(wt.tmp), str(log), fifo="",
+    )
+    item = wt.q.enqueue(
+        project="THROUGHPUT", title="Native Codex usage", note="usage work",
+    )
+    wt.q.claim_next(worker_id, project="THROUGHPUT")
+
+    wt.workers.list_workers(prune=False)
+    assert wt.workers.backfill_claimed_session_ids() == [item["ref"]]
+    found = wt.q.get(item["ref"])
+    assert found["claimed_session_id"] == sid
 
 
 # ============================== persistent worker-session ledger (survives prune)

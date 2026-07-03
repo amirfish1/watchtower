@@ -385,7 +385,11 @@ def _rename_claiming_session(item: dict, summary: str = "") -> None:
         return
     try:
         from . import messages
-        name = workers.display_name(item.get("project", ""), item.get("ref"), summary)
+        name = workers.display_name(
+            item.get("project", ""),
+            item.get("ref"),
+            workers.ticket_context(item, summary),
+        )
         messages.set_session_title(str(sid), name)
     except Exception:
         pass
@@ -606,6 +610,19 @@ def cmd_workers(args: argparse.Namespace) -> int:
             f"{w.get('queue',''):<12}{w.get('engine',''):<8}"
             f"{'yes' if w.get('alive') else 'no':<6}{w.get('started_at','')}"
         )
+    return 0
+
+
+def cmd_session_names(args: argparse.Namespace) -> int:
+    """Maintenance helpers for worker session display names."""
+    if args.session_names_command != "backfill":
+        print("error: session-names requires a subcommand", file=sys.stderr)
+        return 1
+    rows = workers.backfill_recent_session_titles(
+        hours=args.hours,
+        dry_run=args.dry_run,
+    )
+    print(json.dumps(rows, indent=2))
     return 0
 
 
@@ -1953,6 +1970,14 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("workers")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
+
+    s = sub.add_parser("session-names", help=argparse.SUPPRESS)
+    s.set_defaults(func=cmd_session_names)
+    snub = s.add_subparsers(dest="session_names_command")
+    b = snub.add_parser("backfill")
+    b.add_argument("--hours", type=float, default=24.0)
+    b.add_argument("--dry-run", action="store_true")
+    b.set_defaults(func=cmd_session_names)
 
     s = sub.add_parser("send")
     s.add_argument("target", help="worker id, @agent name, or session UUID/prefix")

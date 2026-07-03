@@ -1,18 +1,22 @@
 # Friendlier worker session names (WT-49)
 
-**Status: implemented and verified live.** WT now actually renames the
-claiming session (not just a WT-side display field) at the two points in a
-ticket's lifecycle where the rename is possible, and the mechanism has been
-confirmed end-to-end against a real session (this doc's own history — see
-"Live verification" below), not just read from source.
+**Status: implemented, corrected, and backfillable.** WT now renames the
+claiming session (not just a WT-side display field), includes ticket context
+while work is in progress, and has a maintenance backfill path for recent
+worker sessions.
 
-**Problem:** every spawned worker gets the same static engine session name —
-`"<queue> queue worker"`, set once via `--name` at spawn
-(`workers.py:build_drain_command`). That makes a session list (CCC's, or
-`claude --resume`'s own picker) show a wall of identical labels, especially
-unhelpful *after* a worker closes its ticket, when a human scanning the list
-wants to know "what did this one actually do" (e.g. `WT worker: CCC-123 -
-CPU load fixed`).
+**Original problem:** every spawned worker used to get the same static engine
+session name — `"<queue> queue worker"`, set via `--name` at spawn
+(`workers.py:build_drain_command`). That made session lists show a wall of
+identical labels.
+
+**Durability correction (2026-07-02):** the first WT-49 implementation did
+append useful `custom-title` events, but live transcripts showed Claude later
+appended `custom-title` / `agent-name` events that reset the title back to the
+spawn-time `--name` value (`WT queue worker`, `OPS queue worker`, etc.). The
+fix is to stop passing `--name` for WT-spawned Claude workers and let WT own
+the title through transcript rename events. That removes the source of generic
+title resets.
 
 **Correction to an earlier version of this doc:** the first pass concluded
 there was "no rename primitive" because `claude --help` has no rename flag
@@ -68,10 +72,10 @@ works:**
    itself was reclaimed). At `close` time this is reliable in practice: by
    then the backfill above has almost certainly already run.
 
-Both paths funnel through one pure helper, `workers.display_name(queue,
-ref=None, summary=None)`:
+Those paths funnel through `workers.display_name(queue, ref=None,
+summary=None)` plus `workers.ticket_context(item, summary="")`:
 - never claimed anything: `"<queue> worker"`
-- holding a ticket: `"<queue> worker: <ref>"`
+- holding a ticket: `"<queue> worker: <ref> - <ticket title/note>"`
 - closed one: `"<queue> worker: <ref> - <summary, clipped to 60 chars>"`
 
 and one primitive, `messages.set_session_title(session_id, name)`, which
@@ -80,6 +84,21 @@ by the messaging adapters) and appends the event. Both no-op silently
 (return `False`) when there's no session id or no transcript yet, so a
 non-claude engine or a session that hasn't flushed its first turn never
 blocks a claim/close over cosmetics.
+
+For recent history, run:
+
+```bash
+wt session-names backfill --hours 24 --dry-run
+wt session-names backfill --hours 24
+```
+
+The backfill scans recent `~/.watchtower/logs/<worker-id>.log` files, resolves
+their session ids, finds the worker's latest closed ticket (or current active
+ticket), and appends the canonical title to the matching Claude transcript.
+For Codex workers, the same scan resolves the plain-text startup line
+`session id: <uuid>` and backfills the ticket's `claimed_session_id`; Codex has
+no Claude `custom-title` transcript, but the session id lets CCC associate the
+WT worker row with the Codex conversation and ticket badge.
 
 `workers.annotate_activity` also still attaches `last_closed_ref` /
 `last_closed_summary` / `display_name` to worker rows for WT's own `wt
