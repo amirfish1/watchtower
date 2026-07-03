@@ -1464,9 +1464,12 @@ def _daemon_loop(args: argparse.Namespace) -> None:
             print(f"[watchtower] nudge_tick failed: {e}", flush=True)
         for rec in result.get("spawned", []):
             tag = " (dry-run)" if rec.get("dry_run") else ""
+            eng = rec.get("engine", "claude")
+            mdl = rec.get("model", "")
+            engine_label = f"{eng}:{mdl}" if mdl else eng
             print(
                 f"[watchtower] spawned worker {rec.get('worker_id','')} "
-                f"for {rec.get('queue','')}{tag}",
+                f"for {rec.get('queue','')} [{engine_label}]{tag}",
                 flush=True,
             )
         for rec in result.get("stopped", []):

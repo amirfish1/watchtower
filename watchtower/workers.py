@@ -102,6 +102,14 @@ DRAIN_GOAL_TEMPLATE = (
 
 _ENGINE_BIN = {"claude": "claude", "codex": "codex"}
 
+# Fable is a creative/story model — not suited for code work.  Spawning a
+# worker with it produces poor results; guard against accidental selection.
+_FABLE_PATTERN = re.compile(r"^(claude-)?fable(-\d+)?$", re.IGNORECASE)
+
+
+def _is_fable_model(m: str) -> bool:
+    return bool(_FABLE_PATTERN.match(m.strip()))
+
 
 # ── stream-json FIFO input channel ──────────────────────────────────────────
 # A claude worker is spawned as `claude -p --input-format stream-json` reading
@@ -468,6 +476,7 @@ def record_worker(
     log: str = "",
     fifo: str = "",
     session_id: str = "",
+    model: str = "",
 ) -> Dict[str, Any]:
     data = _load()
     rec = {
@@ -480,6 +489,8 @@ def record_worker(
         "fifo": fifo,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+    if model:
+        rec["model"] = model
     if session_id:
         rec["session_id"] = session_id
     data["workers"].append(rec)
@@ -1257,7 +1268,10 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             q = w.get("queue", "?")
             pid = w.get("pid", "?")
             reason = w.get("spawn_reason", "")
-            _log("SPAWN", f"{wid} (pid {pid})" + (f" — {reason}" if reason else ""), queue=q)
+            eng = w.get("engine", "claude")
+            mdl = w.get("model", "")
+            engine_label = f"{eng}:{mdl}" if mdl else eng
+            _log("SPAWN", f"{wid} (pid {pid}) [{engine_label}]" + (f" — {reason}" if reason else ""), queue=q)
         for w in result.get("stopped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
             q = (w.get("queue", "") if isinstance(w, dict) else "")
@@ -1299,6 +1313,14 @@ def spawn_workers(
     if not model:
         from . import config
         model = config.model(queue)
+    if _is_fable_model(model):
+        import sys
+        print(
+            f"[watchtower] warning: refusing fable model {model!r} for {queue} worker"
+            " — not a coding model; falling back to CLI default",
+            file=sys.stderr, flush=True,
+        )
+        model = ""
     log_dir = WORKERS_FILE.parent / "logs"
     spawned: List[Dict[str, Any]] = []
     for _ in range(max(1, n)):
@@ -1306,17 +1328,18 @@ def spawn_workers(
         argv = build_drain_command(queue, engine, worker_id, repo_path, model)
         goal = drain_goal(queue, worker_id, repo_path)
         if dry_run:
-            spawned.append(
-                {
-                    "worker_id": worker_id,
-                    "pid": 0,
-                    "queue": queue,
-                    "engine": engine,
-                    "repo_path": repo_path,
-                    "argv": argv,
-                    "dry_run": True,
-                }
-            )
+            rec = {
+                "worker_id": worker_id,
+                "pid": 0,
+                "queue": queue,
+                "engine": engine,
+                "repo_path": repo_path,
+                "argv": argv,
+                "dry_run": True,
+            }
+            if model:
+                rec["model"] = model
+            spawned.append(rec)
             continue
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{worker_id}.log"
@@ -1356,7 +1379,7 @@ def spawn_workers(
                 _close_fd_quiet(None)
         rec = record_worker(
             proc.pid, queue, engine, worker_id, repo_path, str(log_path),
-            fifo=fifo_path or "",
+            fifo=fifo_path or "", model=model,
         )
         rec["argv"] = argv
         spawned.append(rec)

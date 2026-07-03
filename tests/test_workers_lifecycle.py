@@ -606,6 +606,47 @@ def test_repo_path_config_priority(wt):
     assert spawned and spawned[0]["repo_path"] == "/configured/path"
 
 
+# ============================================ fable-model guard (WT-89)
+def test_is_fable_model_matches_variants(wt):
+    f = wt.workers._is_fable_model
+    assert f("fable")
+    assert f("Fable")
+    assert f("fable-5")
+    assert f("claude-fable-5")
+    assert f("CLAUDE-FABLE-5")
+    assert not f("sonnet-5")
+    assert not f("claude-sonnet-5")
+    assert not f("opus")
+    assert not f("")
+
+
+def test_spawn_workers_rejects_fable_model(wt, capsys):
+    """spawn_workers strips a fable model and warns on stderr."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_model("Q", "claude-fable-5")
+    wt.q.enqueue(project="Q", note="work")
+    r = wt.workers.reconcile_once(dry_run=True)
+    spawned = [s for s in r["spawned"] if s["queue"] == "Q"]
+    assert spawned
+    assert spawned[0].get("model", "") == "", "fable model should be stripped from spawned record"
+    assert "--model" not in spawned[0].get("argv", []), "fable model must not appear in argv"
+    err = capsys.readouterr().err
+    assert "fable" in err.lower() and "refusing" in err.lower()
+
+
+def test_spawn_workers_includes_engine_and_model_in_record(wt):
+    """spawn_workers dry-run records carry engine and model (when non-fable)."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_model("Q", "claude-sonnet-5")
+    wt.q.enqueue(project="Q", note="work")
+    r = wt.workers.reconcile_once(dry_run=True)
+    spawned = [s for s in r["spawned"] if s["queue"] == "Q"]
+    assert spawned
+    rec = spawned[0]
+    assert rec.get("engine") == "claude"
+    assert rec.get("model") == "claude-sonnet-5"
+
+
 # ============================================ cache-TTL staleness (warm vs cold)
 def _age_worker_log(wt, rec, seconds):
     """Backdate a worker's log mtime so it reads as idle for `seconds`."""
