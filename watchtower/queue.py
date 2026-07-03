@@ -132,6 +132,13 @@ def _log(verb: str, detail: str, queue: str = "") -> None:
         q_col = (queue or "reconciler")
         log_path = _resolve_activity_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Append [sid:xxxx] for session-initiated commands so the log shows
+        # WHICH worker session triggered each operation.  ENQUEUE and CLAIM
+        # are excluded: enqueue is user/tool-initiated and needs no extra
+        # context; CLAIM already encodes the session_id in its detail field.
+        sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        if sid and verb.upper() not in ("ENQUEUE", "CLAIM"):
+            detail = f"{detail} [sid:{sid[:8]}]"
         with open(log_path, "a") as f:
             f.write(f"{now}  {q_col:<14}  {verb:<9}{detail}\n")
     except Exception:

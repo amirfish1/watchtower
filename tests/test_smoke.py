@@ -1248,3 +1248,52 @@ def test_stop_signal_file(store, tmp_path, monkeypatch):
     signal_path = workers.request_stop(worker_id)
     assert q.claim_next(worker_id, project="STOPQ") == {"stop": True}
     assert not signal_path.exists(), "stop signal file was not cleaned up"
+
+
+# ========================================== activity-log session ID (WT-90)
+def test_activity_log_includes_session_id_for_non_ticket_verbs(store, tmp_path, monkeypatch):
+    """Non-ticket verbs log [sid:xxxx] when CLAUDE_CODE_SESSION_ID is set."""
+    import watchtower.queue as q
+    import importlib
+    importlib.reload(q)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-id-abc123")
+    activity_log = tmp_path / "activity.log"
+    monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(activity_log))
+
+    q.enqueue(project="SID", note="test ticket")
+    item = q.claim_next("w1", project="SID")
+    q.close(item["ref"], "w1", resolution="done it")
+
+    log_text = activity_log.read_text()
+    lines = [l for l in log_text.splitlines() if l.strip()]
+    enqueue_lines = [l for l in lines if "ENQUEUE" in l]
+    claim_lines = [l for l in lines if "CLAIM" in l]
+    close_lines = [l for l in lines if "CLOSE" in l]
+
+    assert enqueue_lines, "Expected ENQUEUE log line"
+    assert claim_lines, "Expected CLAIM log line"
+    assert close_lines, "Expected CLOSE log line"
+
+    # ENQUEUE excluded: no [sid:...] suffix
+    assert "[sid:" not in enqueue_lines[0], f"ENQUEUE should NOT have sid: {enqueue_lines[0]}"
+    # CLAIM excluded (already encodes session_id in detail): no [sid:...] suffix
+    assert "[sid:" not in claim_lines[0], f"CLAIM should NOT have sid: {claim_lines[0]}"
+    # CLOSE is a non-ticket command: should have [sid:test-ses] (first 8 chars)
+    assert "[sid:test-ses]" in close_lines[0], f"CLOSE should have sid: {close_lines[0]}"
+
+
+def test_activity_log_no_session_id_when_env_unset(store, tmp_path, monkeypatch):
+    """When CLAUDE_CODE_SESSION_ID is absent, no [sid:...] appears in the log."""
+    import watchtower.queue as q
+    import importlib
+    importlib.reload(q)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    activity_log = tmp_path / "activity.log"
+    monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(activity_log))
+
+    q.enqueue(project="NOSID", note="ticket")
+    item = q.claim_next("w1", project="NOSID")
+    q.close(item["ref"], "w1", resolution="done")
+
+    log_text = activity_log.read_text()
+    assert "[sid:" not in log_text, "No session ID should appear when env is unset"
