@@ -25,6 +25,12 @@ Routes:
     POST /api/chat/post             {"ref", "body", "author"}
     GET  /api/chats                 chats.list_chats (open chats)
     GET  /api/chat/<ref>            chats.read_chat
+    GET  /chat/<ref>                group-chat transcript page (WT-60): messages,
+                                     participants, effective nudge policy when available
+
+The index page (``GET /``) also renders a "Group chats" section below the
+queue grid, listing active (non-archived) chats with a link to their
+transcript page, reusing :func:`watchtower.chats.list_chats`.
 
 It reuses :mod:`watchtower.health` for the stuck computation and
 :mod:`watchtower.workers` for liveness — neither is duplicated here. The
@@ -38,8 +44,10 @@ import hmac
 import html
 import json
 import os
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import health, queue as q, workers
@@ -424,6 +432,48 @@ _STYLE = """
     .add-msg { margin-top: 10px; font-size: 12px; padding: 7px 10px; border-radius: 7px; display: none; }
     .add-msg.ok { background: rgba(56,211,159,.14); color: var(--calm); display: block; }
     .add-msg.err { background: rgba(255,92,92,.14); color: var(--alarm); display: block; }
+
+    /* ---- group chats (WT-60) ---- */
+    .chat-list { display: flex; flex-direction: column; gap: 0; }
+    .chat-row {
+      display: grid; grid-template-columns: minmax(0,1.4fr) minmax(0,1.6fr) auto;
+      gap: 12px; align-items: center;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+      padding: 12px 14px; margin-bottom: 8px;
+      text-decoration: none; color: inherit;
+      transition: transform .16s ease, box-shadow .16s ease, border-color .16s ease;
+    }
+    .chat-row:hover { transform: translateY(-2px); box-shadow: 0 8px 24px rgba(0,0,0,.35); border-color: var(--beam); }
+    .chat-row:focus-visible { outline: 2px solid var(--beam); outline-offset: 2px; }
+    .chat-topic {
+      font-size: 14px; font-weight: 600; color: var(--ink);
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .chat-meta { font-size: 11.5px; color: var(--muted); display: flex; align-items: center; gap: 5px; overflow: hidden; }
+    .chat-status {
+      font-size: 9.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+      padding: 2px 8px; border-radius: 999px; white-space: nowrap;
+    }
+    .chat-status.open { background: rgba(56,211,159,.14); color: var(--calm); }
+    .chat-status.closed { background: rgba(126,144,174,.16); color: var(--muted); }
+    .chat-status.archived { background: rgba(126,144,174,.16); color: var(--muted); }
+
+    /* ---- chat transcript page ---- */
+    .chat-participant {
+      padding: 5px 0; font-size: 12.5px; color: var(--ink);
+      display: flex; align-items: center; gap: 6px;
+    }
+    .chat-transcript { display: flex; flex-direction: column; gap: 12px; }
+    .msg { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }
+    .msg-head {
+      font-size: 11.5px; color: var(--muted); margin-bottom: 6px;
+      display: flex; gap: 8px; align-items: baseline;
+    }
+    .msg-author { color: var(--beam); font-weight: 600; }
+    .msg-body {
+      margin: 0; font-family: inherit; font-size: 13.5px; color: var(--ink);
+      white-space: pre-wrap; word-break: break-word; line-height: 1.55;
+    }
 """
 
 _FONT_LINK = (
@@ -523,7 +573,85 @@ def _drain_bar(row: Dict[str, Any]) -> str:
     return f'<div class="bar"><span class="calm" style="width:{pct}%"></span></div>'
 
 
-def render_index(payload: Dict[str, Any]) -> str:
+def _epoch_age_human(epoch: Optional[float], now: Optional[float] = None) -> str:
+    """Compact age string for an epoch timestamp (e.g. '4m', '2h05m'), same
+    shorthand as :func:`watchtower.workers._age_human` but for an epoch float
+    (``list_chats``' ``last_post_at``/``started_at``) rather than an ISO
+    string. Returns ``"—"`` for a missing/zero timestamp."""
+    if not epoch:
+        return "—"
+    secs = max(0, int((now if now is not None else time.time()) - float(epoch)))
+    if secs < 60:
+        return f"{secs}s"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m"
+    hours = mins // 60
+    if hours < 24:
+        return f"{hours}h{mins % 60:02d}m"
+    days = hours // 24
+    return f"{days}d{hours % 24:02d}h"
+
+
+def _chat_ref(chat_row: Dict[str, Any]) -> str:
+    """The short ref used in ``/chat/<ref>`` links: the transcript filename's
+    stem (a slug, resolvable by ``chats.find_chat`` as an exact-name match),
+    not the full on-disk path."""
+    path = str(chat_row.get("path") or "")
+    return Path(path).stem if path else ""
+
+
+def _chat_group_section(chat_rows: List[Dict[str, Any]]) -> str:
+    """The index page's "Group chats" section (WT-60): active (non-archived)
+    chats, each linking to its ``/chat/<ref>`` transcript page. Message count
+    is read per-chat (the chat directory is small compared to the
+    conversation/session universe the perf-budget rules guard, so a per-row
+    read here is fine; see CLAUDE.md's Performance gates)."""
+    if not chat_rows:
+        return (
+            '    <h2>Group chats</h2>\n'
+            '    <div class="empty" style="padding:28px 20px;">\n'
+            '      <div class="line disp" style="font-size:15px;">No active chats</div>\n'
+            '      <div class="sub mono">wt chat new "&lt;topic&gt;" --with @agent to start one.</div>\n'
+            "    </div>\n"
+        )
+    from . import chats as _chats
+    now = time.time()
+    rows_html = []
+    for row in chat_rows:
+        ref = _chat_ref(row)
+        href = "/chat/" + urllib.parse.quote(ref, safe="")
+        topic = html.escape(str(row.get("topic") or ref or "untitled")[:120])
+        names = [str(p.get("name") or "") for p in (row.get("participants") or [])]
+        names_safe = html.escape(", ".join(n for n in names if n) or "—")
+        try:
+            msg_count = len((_chats.read_chat(row.get("path")) or {}).get("messages") or [])
+        except Exception:
+            msg_count = 0
+        age = _epoch_age_human(row.get("last_post_at"), now=now)
+        closed = row.get("closed_at")
+        status_cls = "closed" if closed else "open"
+        status_lbl = "closed" if closed else "open"
+        rows_html.append(
+            f'      <a class="chat-row" href="{href}">\n'
+            f'        <span class="chat-topic">{topic}</span>\n'
+            f'        <span class="chat-meta mono">\n'
+            f'          <span>{names_safe}</span>\n'
+            f'          <span class="qh-sep">·</span>\n'
+            f'          <span>{msg_count} msg{"" if msg_count == 1 else "s"}</span>\n'
+            f'          <span class="qh-sep">·</span>\n'
+            f'          <span>{html.escape(age)} ago</span>\n'
+            f'        </span>\n'
+            f'        <span class="chat-status {status_cls}">{status_lbl}</span>\n'
+            f'      </a>\n'
+        )
+    return (
+        '    <h2>Group chats</h2>\n'
+        '    <div class="chat-list">\n' + "".join(rows_html) + "    </div>\n"
+    )
+
+
+def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any]]] = None) -> str:
     rows: List[Dict[str, Any]] = payload["queues"]
     wkrs: List[Dict[str, Any]] = payload["workers"]
 
@@ -736,7 +864,9 @@ def render_index(payload: Dict[str, Any]) -> str:
         '    </div>\n'
     )
 
-    return _page("WatchTower", header + layout + foot)
+    chats_section = _chat_group_section(chat_rows or [])
+
+    return _page("WatchTower", header + layout + chats_section + foot)
 
 
 def _resolution_chips(res: Dict[str, Any]) -> str:
@@ -873,6 +1003,115 @@ def render_queue(
     return _page(f"{name} · WatchTower", header + tickets_block + closed_block + script)
 
 
+def _chat_not_found_page(ref: str) -> str:
+    body = (
+        '    <a class="back" href="/">&larr; dashboard</a>\n'
+        '    <div class="empty">\n'
+        '      <div class="beacon dim" aria-hidden="true"></div>\n'
+        '      <div class="line disp">Chat not found</div>\n'
+        f'      <div class="sub mono">No chat matches {html.escape(str(ref))}</div>\n'
+        "    </div>\n"
+    )
+    return _page("Not found · WatchTower", body, refresh=False)
+
+
+def render_chat(
+    ref: str,
+    data: Dict[str, Any],
+    policy: Optional[Dict[str, int]] = None,
+) -> str:
+    """The ``/chat/<ref>`` transcript page (WT-60): messages, participants,
+    and the effective nudge policy when available. ``data`` is the dict
+    returned by :func:`watchtower.chats.read_chat`; every value from it that
+    reaches the page is escaped, chat bodies included (they may contain
+    markdown, rendered here as plain escaped text, never interpreted)."""
+    topic_raw = str(data.get("topic") or ref)
+    topic = html.escape(topic_raw[:160])
+    mode = html.escape(str(data.get("mode") or "topic"))
+    participants = data.get("participants") or []
+    messages = data.get("messages") or []
+    archived = bool(data.get("archived"))
+    closed_at = data.get("closed_at")
+
+    if closed_at:
+        status_cls, status_lbl = "closed", "CLOSED"
+    elif archived:
+        status_cls, status_lbl = "archived", "ARCHIVED"
+    else:
+        status_cls, status_lbl = "open", "OPEN"
+
+    header = (
+        '    <a class="back" href="/">&larr; dashboard</a>\n'
+        '    <header>\n'
+        '      <div class="brand">\n'
+        f'        <span class="wordmark disp">{topic}</span>\n'
+        "      </div>\n"
+        f'      <div class="fleet mono"><span class="chat-status {status_cls}">{status_lbl}</span></div>\n'
+        "    </header>\n"
+        '    <hr class="divider">\n'
+    )
+
+    part_items = []
+    for p in participants:
+        name = html.escape(str(p.get("name") or p.get("session_id") or "")[:40])
+        sid = str(p.get("session_id") or "")
+        sid8 = html.escape(sid[:8]) if sid else ""
+        tail = f' <span style="opacity:.5">({sid8})</span>' if sid8 else ""
+        part_items.append(
+            f'      <div class="chat-participant mono"><span class="wk-dot">●</span> {name}{tail}</div>\n'
+        )
+    participants_html = (
+        '    <div class="add-panel">\n'
+        '      <h3>Participants</h3>\n'
+        + ("".join(part_items) if part_items else '      <div class="sub mono">none</div>\n')
+        + f'      <label style="margin-top:16px;">Mode</label>\n      <div class="mono">{mode}</div>\n'
+    )
+    if policy:
+        participants_html += (
+            '      <label style="margin-top:16px;">Nudge policy</label>\n'
+            '      <div class="mono" style="font-size:12px; line-height:1.7;">\n'
+            f'        interval: {int(policy.get("nudge_interval_s", 0))}s<br>\n'
+            f'        idle close: {int(policy.get("idle_close_s", 0))}s<br>\n'
+            f'        max/hr: {int(policy.get("max_auto_nudges_per_hour", 0))}\n'
+            '      </div>\n'
+        )
+    participants_html += '    </div>\n'
+
+    if not messages:
+        transcript_html = (
+            '    <div class="empty">\n'
+            '      <div class="line disp">No messages yet</div>\n'
+            '      <div class="sub mono">This chat is empty.</div>\n'
+            "    </div>\n"
+        )
+    else:
+        msg_rows = []
+        for m in messages:
+            author = html.escape(str(m.get("author_name") or m.get("author_sid8") or "unknown")[:60])
+            ts = html.escape(str(m.get("ts") or ""))
+            # Markdown-safe: escaped plain text in a <pre>, never rendered as
+            # markdown/HTML (no markdown library, no innerHTML). XSS discipline
+            # applies here in particular: message bodies are the one field on
+            # this page a chat participant fully controls.
+            body = html.escape(str(m.get("body") or ""))
+            msg_rows.append(
+                '      <div class="msg">\n'
+                f'        <div class="msg-head mono"><span class="msg-author">{author}</span>'
+                f' <span class="msg-ts">{ts}</span></div>\n'
+                f'        <pre class="msg-body">{body}</pre>\n'
+                '      </div>\n'
+            )
+        transcript_html = '    <div class="chat-transcript">\n' + "".join(msg_rows) + "    </div>\n"
+
+    layout = (
+        '    <div class="layout">\n'
+        f'      <div>\n{transcript_html}      </div>\n'
+        f'      <div>\n{participants_html}      </div>\n'
+        '    </div>\n'
+    )
+    return _page(f"{topic_raw} · WatchTower", header + layout)
+
+
 # Back-compat shim: the old single entry point. Tests + any caller that asked for
 # the index HTML still work.
 def render_html(payload: Dict[str, Any]) -> str:
@@ -912,7 +1151,28 @@ class _Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802 (http.server contract)
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path == "/":
-            self._html(200, render_index(status_payload()))
+            from . import chats
+            try:
+                chat_rows = chats.list_chats(include_archived=False)
+            except Exception:
+                chat_rows = []
+            self._html(200, render_index(status_payload(), chat_rows))
+        elif path.startswith("/chat/"):
+            from . import chats
+            ref = urllib.parse.unquote(path[len("/chat/"):])
+            try:
+                data = chats.read_chat(ref)
+            except ValueError:
+                self._html(404, _chat_not_found_page(ref))
+                return
+            policy_fn = getattr(chats, "get_chat_policy", None)
+            policy = None
+            if policy_fn is not None:
+                try:
+                    policy = policy_fn(ref)
+                except Exception:
+                    policy = None
+            self._html(200, render_chat(ref, data, policy))
         elif path.startswith("/q/"):
             name = urllib.parse.unquote(path[len("/q/"):])
             norm = q._norm_project(name)
@@ -1142,6 +1402,7 @@ def serve(
         print(f"WatchTower dashboard on http://{bound_host}:{bound_port}")
         print("  GET /            the night-watch console")
         print("  GET /q/<queue>   per-queue drill-down")
+        print("  GET /chat/<ref>  group-chat transcript")
         print("  GET /api/status  queues + workers (JSON)")
         print("  GET /api/queues  per-queue counts (JSON)")
     try:
