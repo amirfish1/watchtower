@@ -94,6 +94,7 @@ wt add -q DEMO --title "Fix nav" \
        --text "navbar overlaps on mobile" --type bug
 
 wt edit   DEMO-1 --priority p0 --type feature  # patch fields on an existing ticket
+wt edit   DEMO-1 --queue OTHER                 # move to a different queue in place (reassigns ref)
 
 wt claim  -q DEMO                      # claim the next open ticket (smart sort)
 wt claim  -q DEMO DEMO-1               # claim a specific ticket by ref

@@ -426,6 +426,30 @@ def test_cli_edit_patches_fields_without_refiling(store, capsys):
     assert item["ref"] == "EDT-1"
 
 
+def test_cli_edit_moves_queue_without_refiling(store, capsys):
+    import watchtower.queue as q
+    from watchtower.cli import main
+
+    assert main(["add", "-q", "MVSRC", "--title", "orig"]) == 0
+    capsys.readouterr()
+
+    assert main(["edit", "MVSRC-1", "--queue", "MVDST"]) == 0
+    out = capsys.readouterr().out
+    assert "EDITED: MVDST-1 (moved MVSRC-1 -> MVDST-1)" in out
+
+    assert q.get("MVSRC-1") is None
+    moved = q.get("MVDST-1")
+    assert moved["title"] == "orig"
+    assert moved["status"] == "open"
+
+    # --queue combined with a field edit applies both in one call.
+    assert main(["edit", "MVDST-1", "--queue", "MVDST2", "--priority", "p0"]) == 0
+    out = capsys.readouterr().out
+    assert "EDITED: MVDST2-1 (moved MVDST-1 -> MVDST2-1)" in out
+    combined = q.get("MVDST2-1")
+    assert combined["priority"] == "p0"
+
+
 def test_cli_edit_requires_at_least_one_field(store, capsys):
     from watchtower.cli import main
 
@@ -1052,6 +1076,47 @@ def test_update_patches_fields(store):
 
     # Returns None for unknown ident.
     assert q.update("DOES-NOT-EXIST", priority="p0") is None
+
+
+def test_move_reassigns_ref_and_preserves_history(store):
+    """move() moves a ticket to another queue in place (WT-83) -- no
+    refile/close churn. Its ref is reassigned within the target queue
+    (refs are derived from project+number) but everything else survives."""
+    import watchtower.queue as q
+
+    other = q.enqueue(project="BYM", note="already here")
+    item = q.enqueue(project="BYMPROD", note="move me", title="t", priority="p1")
+    assert item["ref"] == "BYMPROD-1"
+
+    moved = q.move(item["ref"], "bym")  # lowercase input, normalized to BYM
+    assert moved is not None
+    assert moved["project"] == "BYM"
+    assert moved["ref"] == "BYM-2"  # appended after the existing BYM-1
+    assert moved["title"] == "t"
+    assert moved["priority"] == "p1"
+    assert moved["note"] == "move me"
+    assert moved["status"] == "open"
+
+    # Old ref is gone; ticket is now only reachable via its new ref.
+    assert q.get("BYMPROD-1") is None
+    assert q.get("BYM-2")["ref"] == "BYM-2"
+    assert q.get(other["ref"])["ref"] == "BYM-1"  # sibling ticket untouched
+
+    # Unknown ident / empty target queue -> None / ValueError.
+    assert q.move("NOPE-1", "BYM") is None
+    with pytest.raises(ValueError):
+        q.move(other["ref"], "")
+
+
+def test_move_rejects_github_backed_queues(store):
+    import watchtower.queue as q
+    import watchtower.config as config
+
+    item = q.enqueue(project="FILEQ", note="stays local")
+    config.set_backend("GHQ", "github")
+
+    with pytest.raises(ValueError):
+        q.move(item["ref"], "GHQ")
 
 
 def test_priority_sort_in_claim(store):

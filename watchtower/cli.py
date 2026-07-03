@@ -6,6 +6,7 @@
     wt find <ref>             look up one ticket by ref, across all queues
     wt add -q Q --title..     file a ticket
     wt edit <ref> --priority..  patch fields on an existing ticket
+    wt edit <ref> --queue Q    move ticket to a different queue in place
     wt claim -q Q             claim next ticket (smart: priority → type → age)
     wt claim -q Q CCC-42      claim a specific ticket by ref
     wt claim -q Q --oldest    claim oldest ticket (pure FIFO)
@@ -231,7 +232,10 @@ def cmd_find(args: argparse.Namespace) -> int:
 def cmd_edit(args: argparse.Namespace) -> int:
     """Patch fields (title/priority/type/readiness/...) on an existing
     ticket, in place -- no refile/close churn (WT-71). Only flags the
-    caller actually passed are touched; everything else is left as-is."""
+    caller actually passed are touched; everything else is left as-is.
+    --queue moves the ticket to a different queue in place (WT-83), also
+    without refile/close churn -- its ref is reassigned within the target
+    queue since refs are derived from project+number."""
     fields = {}
     for name in (
         "title", "note", "text", "url", "type", "readiness", "priority",
@@ -240,26 +244,42 @@ def cmd_edit(args: argparse.Namespace) -> int:
         value = getattr(args, name, None)
         if value is not None:
             fields[name] = value
-    if not fields:
+    new_queue = getattr(args, "queue", None)
+    if not fields and new_queue is None:
         print(
             "error: no fields to edit -- pass at least one of "
             "--title/--note/--text/--url/--type/--readiness/--priority/"
-            "--value/--confidence/--selector/--screenshot-path/--repo-path",
+            "--value/--confidence/--selector/--screenshot-path/--repo-path/"
+            "--queue",
             file=sys.stderr,
         )
         return 1
-    try:
-        item = q.update(args.ref, **fields)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
-        return 1
+    ident = args.ref
+    old_ref = None
+    if new_queue is not None:
+        try:
+            item = q.move(ident, new_queue)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if not item:
+            print(f"(no item {ident})", file=sys.stderr)
+            return 1
+        old_ref, ident = ident, item["ref"]
+    if fields:
+        try:
+            item = q.update(ident, **fields)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if not item:
+            print(f"(no item {ident})", file=sys.stderr)
+            return 1
     if args.json:
         _print_item(item)
     else:
-        print(f"EDITED: {item['ref']}  {item.get('title') or item.get('note','')}")
+        moved = f" (moved {old_ref} -> {item['ref']})" if old_ref else ""
+        print(f"EDITED: {item['ref']}{moved}  {item.get('title') or item.get('note','')}")
     return 0
 
 
@@ -2064,6 +2084,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--selector", default=None)
     s.add_argument("--screenshot-path", default=None, dest="screenshot_path")
     s.add_argument("--repo-path", default=None, dest="repo_path")
+    s.add_argument("--queue", default=None,
+                   help="move the ticket to a different queue in place, "
+                        "reassigning its ref (WT-83); file-backed queues only")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_edit)
 

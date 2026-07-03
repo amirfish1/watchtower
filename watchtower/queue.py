@@ -590,6 +590,43 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def move(ident: Any, new_project: str) -> Optional[Dict[str, Any]]:
+    """Move a ticket to a different queue in place (WT-83): reassigns its ref
+    within the target queue (refs are derived from project+number, see
+    _normalize_items) but preserves status/claim state/notes/history. Avoids
+    the refile-new-ticket + close-original workaround, which churns refs and
+    inflates the closed count.
+
+    Only supported between file-backed queues -- a GitHub-backed queue's
+    tickets are GitHub issues living in that queue's configured repo, so
+    there's no in-place move across backends.
+    """
+    from . import config
+    new_project = _norm_project(new_project)
+    if not new_project:
+        raise ValueError("new queue name is required")
+    if config.backend(new_project) == "github":
+        raise ValueError(
+            f"{new_project} is a GitHub-backed queue; cross-backend moves aren't supported"
+        )
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        raise ValueError(
+            f"{ident} is in a GitHub-backed queue; cross-backend moves aren't supported"
+        )
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                old_ref = it.get("ref", "")
+                it["project"] = new_project
+                it["updated_at"] = _now_iso()
+                _normalize_items(data["items"])
+                _save_unlocked(data)
+                _log("MOVE", f"{old_ref} -> {it.get('ref', '?')}", queue=new_project)
+                return it
+    return None
+
+
 def _claim_candidates(
     items: List[Dict[str, Any]],
     *,
