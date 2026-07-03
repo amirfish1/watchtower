@@ -354,7 +354,8 @@ def test_delegate_delivery_payload(wt, delegate, monkeypatch):
     assert res["ok"] is True and res["transport"] == "delegate"
     path, body = srv.requests[0]
     assert path == "/api/inject-input"
-    assert body == {"session_id": SID_B, "text": "over http", "mode": "steer"}
+    assert body == {"session_id": SID_B, "text": "over http", "mode": "steer",
+                    "origin": "wt"}
 
 
 def test_delegate_500_falls_to_outbox(wt, delegate, monkeypatch):

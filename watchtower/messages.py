@@ -719,7 +719,11 @@ def _deliver_delegate(
     try:
         data = _post_json(
             base + "/api/inject-input",
-            {"session_id": sid, "text": text, "mode": mode},
+            # origin=wt (WT-78): tells the delegate this request came from
+            # wt's own adapter chain, so it must not call back into
+            # `wt send` — the protocol-level guard against the
+            # CCC -> wt -> CCC delegation loop.
+            {"session_id": sid, "text": text, "mode": mode, "origin": "wt"},
             timeout_s=5,
         )
     except Exception as e:  # noqa: BLE001 - any transport failure means fall through
