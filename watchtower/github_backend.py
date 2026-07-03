@@ -183,7 +183,17 @@ def _assignee_logins(raw: Any) -> List[str]:
 
 
 class GitHubIssuesBackend:
-    """A WatchTower queue backed by GitHub Issues via ``gh``."""
+    """A WatchTower queue backed by GitHub Issues via ``gh``.
+
+    ``get()`` reads a single issue via ``gh issue view`` (the REST endpoint,
+    strongly consistent), while ``list_items()``/``_list_issues()`` read via
+    ``gh issue list`` (GitHub's search index). The search index lags the REST
+    state by a few seconds, so a ticket just closed with ``update_status``
+    can still show up as open/in_progress in ``wt ls``/``wt find`` briefly
+    before settling. This is GitHub-side eventual consistency, not a
+    WatchTower race — no local fix; it self-resolves on the next poll
+    (OPS-72).
+    """
 
     def __init__(
         self,
