@@ -1023,6 +1023,18 @@ def close(
     return update_status(ident, "closed", session_id, resolution=resolution)
 
 
+def release(ident: Any, session_id: str = "") -> Optional[Dict[str, Any]]:
+    """Give up a claim without closing it, e.g. a ticket claimed defensively
+    (to stop other workers grabbing it mid-investigation) that turns out
+    better left for the normal worker pool to pick up and fix.
+
+    ``require_status="in_progress"`` is a compare-and-swap guard so a stale
+    ref that's already closed or reopened by someone else is left alone
+    rather than clobbered (WT-86, same pattern as the OPS-72 orphan-reopen
+    guard)."""
+    return update_status(ident, "open", session_id, require_status="in_progress")
+
+
 def block(
     ident: Any,
     session_id: str = "",

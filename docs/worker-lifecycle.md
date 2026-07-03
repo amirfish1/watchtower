@@ -43,6 +43,7 @@ prevents agents from using it as a comfortable parking lot for hard tickets.
 |------|---------|-------------|---------|
 | Enqueue | `wt enqueue` | Human / CI | File a new ticket. |
 | Claim | `wt claim` | Worker | Atomically take the oldest open ticket. |
+| Release | `wt release <ref>` | Worker | Give up a claim without closing it -- back to `open` for the pool. No-op if the ticket isn't `in_progress`. |
 | Block | `wt block <ref>` | Worker | Park a ticket that needs a human decision. Sets `needs_input` + `block_question`. |
 | Answer | `wt answer <ref> "..."` | Human | Provide input to unblock a blocked ticket. Clears `needs_input`. |
 | Discuss | `wt discuss <ref>` | Human | Resume the blocked ticket's worker session (`claude --resume <sid>`). |

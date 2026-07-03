@@ -894,6 +894,41 @@ def test_block_answer_resume_flow(store):
     assert closed["needs_input"] is False
 
 
+def test_release_returns_claim_to_open(store, capsys):
+    """WT-86: `wt release <ref>` gives up a claim without closing it, so the
+    ticket is reclaimable by another worker."""
+    import watchtower.queue as q
+    from watchtower.cli import build_parser
+
+    q.enqueue(project="REL", note="claimed defensively, better left for the pool")
+    claimed = q.claim_next("worker-1", project="REL")
+    assert claimed["status"] == "in_progress"
+
+    parser = build_parser()
+    args = parser.parse_args(["release", claimed["ref"], "--worker", "worker-1"])
+    rc = args.func(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "RELEASED" in out
+
+    item = q.get(claimed["ref"])
+    assert item["status"] == "open"
+    assert item["claimed_by"] is None
+    assert item["claimed_at"] is None
+
+    # Now reclaimable by another worker.
+    reclaimed = q.claim_next("worker-2", project="REL")
+    assert reclaimed["ref"] == claimed["ref"]
+    assert reclaimed["claimed_by"] == "worker-2"
+
+    # Releasing a ticket that isn't in_progress is a no-op error, not a crash.
+    args2 = parser.parse_args(["release", reclaimed["ref"], "--worker", "worker-1"])
+    q.close(reclaimed["ref"], "worker-2", resolution="done")
+    rc2 = args2.func(args2)
+    assert rc2 == 1
+    assert "not in_progress" in capsys.readouterr().err
+
+
 def test_discuss_command_prints_resume(store, capsys):
     """`wt discuss <ref> --print` resolves the session + repo into a
     `claude --resume` command without executing it."""

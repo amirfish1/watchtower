@@ -490,6 +490,28 @@ def cmd_close(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_release(args: argparse.Namespace) -> int:
+    """Give up a claim without closing it, returning the ticket to the open
+    pool (WT-86) -- e.g. it was claimed defensively to stop other workers
+    grabbing it mid-investigation, and turns out better left for the normal
+    pool to pick up."""
+    worker = args.worker or f"wt-cli-{os.getpid()}"
+    item = q.release(args.ref, session_id=worker)
+    if not item:
+        existing = q.get(args.ref)
+        if existing is None:
+            print(f"(no item {args.ref})", file=sys.stderr)
+        else:
+            print(
+                f"error: {args.ref} is {existing.get('status')}, not in_progress "
+                "-- nothing to release",
+                file=sys.stderr,
+            )
+        return 1
+    print(f"RELEASED: {item['ref']} -> open")
+    return 0
+
+
 def cmd_block(args: argparse.Namespace) -> int:
     """A worker parks a ticket that needs a human decision (WT-28). Stays
     in_progress, bound to its session; flagged needs_input with a question."""
@@ -1906,6 +1928,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Agent messaging", "agents"),
     ("Agent messaging", "chat"),
     ("Worker protocol", "claim"),
+    ("Worker protocol", "release"),
     ("Worker protocol", "close"),
     ("Worker protocol", "block"),
 ]
@@ -1919,6 +1942,7 @@ COMMAND_HELP: Dict[str, str] = {
     "take": "file a ticket and immediately claim it (= add --claim)",
     "edit": "patch fields (title/priority/type/readiness/...) on an existing ticket",
     "claim": "claim next open ticket (smart sort: priority + type + age)",
+    "release": "give up a claim without closing it; returns the ticket to open",
     "close": "close a ticket (record how you fixed it)",
     "block": "park a ticket that needs a human decision",
     "blocked": "list tickets parked for a human",
@@ -2127,6 +2151,11 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="enqueue_follow_ups",
                    help="also file each follow-up/unresolved as a new open ticket")
     s.set_defaults(func=cmd_close)
+
+    s = sub.add_parser("release")
+    s.add_argument("ref")
+    s.add_argument("--worker", default="", help="your session/worker id")
+    s.set_defaults(func=cmd_release)
 
     s = sub.add_parser("block")
     s.add_argument("ref")
