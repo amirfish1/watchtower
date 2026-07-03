@@ -136,11 +136,37 @@ hazard in the first place, not to recover from it after the fact.
 | Adapter | Status | Covers |
 |---|---|---|
 | `fifo` | implemented | live WT workers (Claude, stream-json stdin) |
-| `resume` with busy-hold | implemented | any dormant/idle Claude session by UUID; holds in the outbox instead of racing a session that looks mid-turn |
-| `delegate` (optional) | implemented | anything WT cannot do natively today: live-terminal keystroke injection, and codex/cursor/antigravity engines, via a configured HTTP delegate |
-| native codex app-server adapter (`turn/steer`, `thread/inject`) | future | true mid-run codex injection without a delegate |
-| native tty keystroke adapter | future, deferred not rejected | live-terminal Claude sessions without a delegate; the hard part is session-to-tty discovery, which the busy-hold `resume` path already covers for the common case |
+| `resume` with busy-hold | implemented | any dormant/idle Claude session by UUID; spawns in the session's own cwd with the transcript rebucketed (WT-76), verifies the child boots, and holds in the outbox instead of racing a session that looks mid-turn |
+| native codex app-server adapter (`turn/steer` / `turn/start`) | **implemented** (WT-54, `watchtower/codex_rpc.py`) | true mid-run codex injection without a delegate |
+| native tty keystroke adapter | **implemented** (WT-55, `watchtower/tty.py`) | live-terminal Claude sessions (iTerm2/Terminal.app) whose process carries `--resume <sid>`; sits before `resume` so a live TUI is typed into, never forked |
+| `delegate` (optional, last) | implemented | anything WT cannot do natively: gemini/cursor/antigravity engines, and live terminals the tty adapter cannot map, via a configured HTTP delegate (requests stamped `origin=wt`, WT-78) |
 
-Building either future row removes that engine's dependency on the delegate
-without changing the adapter chain's shape: both slot in as an additional
-adapter, in the same ordered fall-through `deliver()` already uses.
+## 7. Per-engine adapter decisions (WT-66, decided 2026-07-02)
+
+The ticket asked: decide + implement, or explicitly close as wontfix, per
+engine. Decisions, grounded in sections 2-4:
+
+- **Codex — DONE (native).** The WT-owned `codex app-server` adapter shipped
+  as WT-54 (`watchtower/codex_rpc.py`); the "future" row above was stale.
+  Codex no longer depends on the delegate.
+- **Antigravity — DEFERRED (native feasible, needs spec).** Group 3 shows a
+  real path: HTTPS RPC to the localhost port the app's language server
+  listens on (`SendUserCascadeMessage`). Not wontfix — but the RPC surface
+  (port discovery, auth/cert, exact params) is empirically unverified, so
+  it's parked as a follow-up ticket with readiness `needs-spec` rather than
+  built on guesses. Delegate-only until then.
+- **Cursor — WONTFIX (native), delegate-only by design.** No RPC path into
+  Cursor.app exists (Group 3), no confirmed interactive TUI to type into
+  (Group 2), and the one-shot `cursor --print` CLI cannot take mid-run input
+  (Group 1). There is nothing to build against; revisit only if Cursor ships
+  an automation API.
+- **Gemini — DEFERRED (native feasible, needs shaping).** Gemini is a
+  headless-CLI-shaped engine like Claude: a resume-style adapter (spawn the
+  gemini CLI against the session, hand it the text — the pattern CCC's
+  `resume_session_gemini` already proves out) fits WT's existing `resume`
+  adapter shape. Parked as a follow-up with readiness `needs-shaping`;
+  delegate-only until then.
+
+Net: the delegate remains the correct *permanent* home only for Cursor;
+antigravity and gemini have concrete native paths waiting on spec/shaping
+tickets, and codex/claude (headless + terminal) are already native.
