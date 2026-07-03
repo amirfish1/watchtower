@@ -275,11 +275,18 @@ def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     assert claimed["status"] == "in_progress"
     assert claimed["claimed_by"] == "worker-1"
     assert q.claim_next("worker-2", project="GHI") is None
+    # WT-87: claim/close append to an embedded, append-only history trail
+    # (stored in the issue-body metadata block) instead of only overwriting
+    # the latest claimed_by/closed_by snapshot.
+    assert [e["event"] for e in claimed["history"]] == ["claim"]
+    assert claimed["history"][0]["worker"] == "worker-1"
 
     closed = q.close("GHI-1", "worker-1", resolution={"summary": "fixed it"})
     assert closed["status"] == "closed"
     assert closed["closed_by"] == "worker-1"
     assert closed["resolution"]["summary"] == "fixed it"
+    assert [e["event"] for e in closed["history"]] == ["claim", "close"]
+    assert closed["history"][1]["resolution"]["summary"] == "fixed it"
 
     gh_state = json.loads(state.read_text())
     issue = gh_state["issues"][0]

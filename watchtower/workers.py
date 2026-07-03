@@ -815,7 +815,8 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
             # close back to "open" — this ticket briefly (and wrongly)
             # reappearing as open/in_progress right after a real close was
             # reported as OPS-72. The guard makes the write a no-op instead.
-            item = _q.update_status(ref, "open", quiet=True, require_status="in_progress")
+            item = _q.update_status(ref, "open", quiet=True, require_status="in_progress",
+                                     reason="worker gone")
             if item:
                 reopened.append(item)
         except Exception:

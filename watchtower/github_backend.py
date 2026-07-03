@@ -58,6 +58,21 @@ def _clip(value: Any, max_len: int) -> str:
     return s if len(s) <= max_len else s[:max_len].rstrip() + "..."
 
 
+def _append_history(meta: Dict[str, Any], event: str, **fields: Any) -> None:
+    """Append-only lifecycle trail (WT-87), mirroring the local backend's
+    ``queue._append_history`` — stored in the issue-body metadata block so it
+    survives round-trips through ``_split_body``/``_body_with_metadata``."""
+    hist = meta.get("history")
+    if not isinstance(hist, list):
+        hist = []
+    entry: Dict[str, Any] = {"event": event, "at": _now_iso()}
+    for key, value in fields.items():
+        if value:
+            entry[key] = value
+    hist.append(entry)
+    meta["history"] = hist
+
+
 def _norm_choice(value: Any, valid_values: tuple, default: str = "") -> str:
     s = str(value or "").strip()
     if s in valid_values:
@@ -344,6 +359,9 @@ class GitHubIssuesBackend:
             item["closed_by"] = meta.get("closed_by") or item.get("claimed_by")
         if resolution:
             item["resolution"] = resolution
+        history = meta.get("history")
+        if isinstance(history, list):
+            item["history"] = history
         return item
 
     def _list_issues(self, state: str = "open", *, fresh: bool = False) -> List[Dict[str, Any]]:
@@ -615,6 +633,7 @@ class GitHubIssuesBackend:
         })
         if session_uuid:
             meta["claimed_session_id"] = str(session_uuid)
+        _append_history(meta, "claim", session_id=str(session_uuid or ""), worker=str(session_id))
         self._ensure_labels()
         self._run([
             "issue", "edit", number,
@@ -636,6 +655,7 @@ class GitHubIssuesBackend:
         session_id: str = "",
         session_uuid: str = "",
         resolution: Any = None,
+        reason: str = "",
     ) -> Optional[Dict[str, Any]]:
         if status not in ("open", "in_progress", "closed"):
             raise ValueError("status must be one of ('open', 'in_progress', 'closed')")
@@ -661,6 +681,7 @@ class GitHubIssuesBackend:
                 "needs_input", "block_question",
             ):
                 meta.pop(key, None)
+            _append_history(meta, "reopen", reason=reason)
             self._run([
                 "issue", "edit", number,
                 *self._repo_args(),
@@ -685,6 +706,9 @@ class GitHubIssuesBackend:
             meta["resolution_caveats"] = norm.get("caveats", [])
             meta["resolution_follow_ups"] = norm.get("follow_ups", [])
             meta["resolution_unresolved"] = norm.get("unresolved", [])
+        _append_history(meta, "close", session_id=str(session_uuid or ""),
+                         worker=str(session_id or meta.get("closed_by") or ""),
+                         resolution=norm)
         self._run([
             "issue", "edit", number,
             *self._repo_args(),

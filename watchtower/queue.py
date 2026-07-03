@@ -41,6 +41,11 @@ Item shape::
         "summary": "...",                # the main one-liner
         "caveats": [...], "follow_ups": [...], "unresolved": [...]
       },
+      "history": [                       # append-only lifecycle trail (WT-87):
+        {"event": "claim", "session_id": "...", "worker": "...", "at": "..."},
+        {"event": "reopen", "reason": "worker gone", "at": "..."},
+        {"event": "close", "session_id": "...", "resolution": {...}, "at": "..."}
+      ],
       "created_at": "2026-06-25T20:05:00Z",
       "updated_at": "2026-06-25T20:05:00Z"
     }
@@ -382,6 +387,23 @@ def _clip(value: Any, max_len: int) -> str:
     s = "" if value is None else str(value)
     s = " ".join(s.split()) if max_len <= 240 else s  # keep prompts multi-line
     return s if len(s) <= max_len else s[:max_len].rstrip() + "…"
+
+
+def _append_history(it: Dict[str, Any], event: str, **fields: Any) -> None:
+    """Append-only lifecycle trail (WT-87): unlike ``claimed_by``/``closed_at``
+    etc, which are overwritten on every transition and only ever show the
+    latest snapshot, ``history`` accumulates every claim/reopen/close/block so
+    "which sessions ever touched this ticket" is a direct read of the ticket
+    instead of a best-effort activity-log grep."""
+    hist = it.get("history")
+    if not isinstance(hist, list):
+        hist = []
+    entry: Dict[str, Any] = {"event": event, "at": _now_iso()}
+    for key, value in fields.items():
+        if value:
+            entry[key] = value
+    hist.append(entry)
+    it["history"] = hist
 
 
 def enqueue(
@@ -778,6 +800,7 @@ def claim_next(
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
+        _append_history(item, "claim", session_id=real_sid, worker=str(session_id))
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
     return item
@@ -816,6 +839,7 @@ def claim_by_ref(
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
+        _append_history(item, "claim", session_id=real_sid, worker=str(session_id))
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
     return item
@@ -908,6 +932,7 @@ def update_status(
     resolution: Any = None,
     quiet: bool = False,
     require_status: Optional[str] = None,
+    reason: str = "",
 ) -> Optional[Dict[str, Any]]:
     """``require_status``, when set, makes this a compare-and-swap: the
     transition is only applied if the item's *current* status (read fresh,
@@ -915,7 +940,10 @@ def update_status(
     transition an item based on a stale snapshot (e.g. the orphan-ticket
     reconciler, which reads ``list_items()`` before deciding) can clobber a
     legitimate concurrent transition — e.g. reopening a ticket that was
-    closed a moment after the snapshot was taken (OPS-72)."""
+    closed a moment after the snapshot was taken (OPS-72).
+
+    ``reason`` (optional) is recorded on the appended ``history`` entry, e.g.
+    the orphan-ticket sweep passes "worker gone" for a reopen."""
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {VALID_STATUSES}")
     backend = _github_backend_for_project(_project_from_ident(ident))
@@ -926,6 +954,7 @@ def update_status(
             session_id=session_id,
             session_uuid=session_uuid,
             resolution=resolution,
+            reason=reason,
         )
         if item:
             verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
@@ -956,6 +985,7 @@ def update_status(
                     it["claimed_at"] = now
                     if real_sid:
                         it["claimed_session_id"] = real_sid
+                    _append_history(it, "claim", session_id=real_sid, worker=str(session_id))
                 if status == "closed":
                     it["closed_at"] = now
                     it["needs_input"] = False  # a closed ticket isn't waiting
@@ -978,6 +1008,9 @@ def update_status(
                     norm = _normalize_resolution(resolution)
                     if norm is not None:
                         it["resolution"] = norm
+                    _append_history(it, "close", session_id=real_sid,
+                                     worker=str(session_id or it.get("closed_by") or ""),
+                                     resolution=norm)
                 if status == "open":
                     it["claimed_by"] = None
                     it["claimed_at"] = None
@@ -991,6 +1024,7 @@ def update_status(
                     it["needs_input"] = False
                     it["block_question"] = ""
                     it["blocked_at"] = None
+                    _append_history(it, "reopen", reason=reason)
                 _save_unlocked(data)
                 verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
                 verb = verbs.get(status, status.upper())
@@ -1032,7 +1066,8 @@ def release(ident: Any, session_id: str = "") -> Optional[Dict[str, Any]]:
     ref that's already closed or reopened by someone else is left alone
     rather than clobbered (WT-86, same pattern as the OPS-72 orphan-reopen
     guard)."""
-    return update_status(ident, "open", session_id, require_status="in_progress")
+    return update_status(ident, "open", session_id, require_status="in_progress",
+                          reason="released")
 
 
 def block(
@@ -1075,6 +1110,8 @@ def block(
                         notes = []
                     notes.append({"at": now, "text": _clip(progress, 24000)})
                     it["progress_notes"] = notes
+                _append_history(it, "block", session_id=_coerce_session_uuid(session_id),
+                                 worker=str(session_id), question=_clip(question, 4000))
                 _save_unlocked(data)
                 return it
     return None

@@ -929,6 +929,47 @@ def test_release_returns_claim_to_open(store, capsys):
     assert "not in_progress" in capsys.readouterr().err
 
 
+def test_ticket_history_records_full_lifecycle(store):
+    """WT-87: each claim/reopen/close/block is appended to ``history``, not
+    just overwritten as the latest snapshot — so a ticket that was claimed by
+    A, released, reclaimed by B, blocked, and finally closed by B keeps every
+    intermediate event, not only B's final close."""
+    import watchtower.queue as q
+
+    q.enqueue(project="HIST", note="track my whole life")
+    claimed_a = q.claim_next("worker-a", project="HIST")
+    ref = claimed_a["ref"]
+    assert [e["event"] for e in claimed_a["history"]] == ["claim"]
+    assert claimed_a["history"][0]["worker"] == "worker-a"
+
+    released = q.release(ref, session_id="worker-a")
+    events = [e["event"] for e in released["history"]]
+    assert events == ["claim", "reopen"]
+    assert released["history"][1]["reason"] == "released"
+
+    claimed_b = q.claim_next("worker-b", project="HIST")
+    assert claimed_b["ref"] == ref
+    events = [e["event"] for e in claimed_b["history"]]
+    assert events == ["claim", "reopen", "claim"]
+    assert claimed_b["history"][2]["worker"] == "worker-b"
+
+    blocked = q.block(ref, session_id="worker-b", question="ship it?")
+    events = [e["event"] for e in blocked["history"]]
+    assert events == ["claim", "reopen", "claim", "block"]
+    assert blocked["history"][3]["question"] == "ship it?"
+
+    q.answer(ref, "yes", session_id="human")
+    closed = q.close(ref, "worker-b", resolution="shipped")
+    events = [e["event"] for e in closed["history"]]
+    assert events == ["claim", "reopen", "claim", "block", "close"]
+    assert closed["history"][4]["worker"] == "worker-b"
+    assert closed["history"][4]["resolution"]["summary"] == "shipped"
+
+    # Every entry from worker-a's original claim is still readable off the
+    # ticket itself — not just recoverable from activity.log.
+    assert claimed_a["history"][0]["at"] <= closed["history"][4]["at"]
+
+
 def test_discuss_command_prints_resume(store, capsys):
     """`wt discuss <ref> --print` resolves the session + repo into a
     `claude --resume` command without executing it."""
