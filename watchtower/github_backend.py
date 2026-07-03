@@ -13,6 +13,8 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from .queue import UNCLAIMABLE_READINESS
+
 VALID_LANES = ("normal", "express")
 VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "")
 VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
@@ -486,7 +488,7 @@ class GitHubIssuesBackend:
         elif not shaping:
             candidates = [
                 it for it in candidates
-                if it.get("readiness", "") not in ("needs-shaping", "needs-spec")
+                if it.get("readiness", "") not in UNCLAIMABLE_READINESS
             ]
         if item_types:
             candidates = [
@@ -689,9 +691,21 @@ class GitHubIssuesBackend:
         self,
         *,
         lane: Optional[str] = None,
+        item_types: Optional[List[str]] = None,
     ) -> Optional[Dict[str, Any]]:
-        candidates = self._claim_candidates(lane=lane)
+        candidates = self._claim_candidates(lane=lane, item_types=item_types)
         return dict(candidates[0]) if candidates else None
+
+    def count_claimable(
+        self,
+        *,
+        lane: Optional[str] = None,
+        item_types: Optional[List[str]] = None,
+    ) -> int:
+        """How many tickets claim_next() would currently pick from — the
+        reconciler's single source of truth for spawn-worthy depth on a
+        GitHub-backed queue (see queue.count_claimable)."""
+        return len(self._claim_candidates(lane=lane, item_types=item_types))
 
     def last_progress_iso(self) -> Optional[str]:
         latest: Optional[str] = None

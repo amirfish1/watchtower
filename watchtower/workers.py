@@ -1146,20 +1146,9 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         row["queue"]: row for row in health.all_status()
     }
 
-    # Claimable depth respects each queue's claim_types restriction. A bug-only
-    # queue (claim_types=['bug']) whose only open tickets are features has ZERO
-    # claimable work: spawning a worker that can never claim them just churns
-    # spawn -> "nothing to do" -> idle -> reap forever. Count open tickets the
-    # worker could actually claim (all open when unrestricted). One list_items
-    # pass, keyed by (queue, type).
-    #
-    # Same logic applies to readiness: needs-shaping/needs-spec tickets are
-    # excluded here too, mirroring claim_next's default exclusion (queue.py) --
-    # otherwise a queue whose only open work needs human scoping still counts
-    # as claimable and the reconciler spawns a worker every cycle that finds
-    # nothing to claim, idles, gets reaped, and repeats indefinitely.
+    # Raw open depth per queue, for the "N open" figure in skip/spawn messages
+    # (unfiltered -- just how big the backlog is, regardless of claimability).
     from . import queue as _q
-    _open_by_q_type: Dict[tuple, int] = {}
     _total_open_by_q: Dict[str, int] = {}
     try:
         for it in (_q.list_items() or []):
@@ -1167,24 +1156,20 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 continue
             qn = str(it.get("project") or "")
             _total_open_by_q[qn] = _total_open_by_q.get(qn, 0) + 1
-            if not it.get("claimable", True):
-                continue
-            if it.get("readiness", "") in ("needs-shaping", "needs-spec"):
-                continue
-            ty = _q.effective_type(it)  # untyped == bug, matches claim filter
-            _open_by_q_type[(qn, ty)] = _open_by_q_type.get((qn, ty), 0) + 1
     except Exception:
-        _open_by_q_type = {}
+        _total_open_by_q = {}
 
     def _claimable_depth(qn: str) -> tuple:
-        """Return (claimable_open, total_open) for a queue, honoring claim_types."""
+        """(claimable_open, total_open) for a queue. claimable_open comes from
+        queue.count_claimable(), the exact same candidate filter claim_next()
+        itself uses (claim_types restriction + readiness gating, e.g.
+        needs-shaping/needs-spec) -- so the reconciler can never think a
+        ticket is spawn-worthy when a worker wouldn't actually be able to
+        claim it. That drift is what caused WT's SPAWN -> idle -> REAP churn:
+        a hand-rolled copy of the filter here disagreed with claim_next's."""
         total = _total_open_by_q.get(qn, 0)
-        types = config.claim_types(qn)
-        if not types:
-            claimable = sum(v for (q2, _t), v in _open_by_q_type.items() if q2 == qn)
-            return claimable, total
-        claimable = sum(v for (q2, t), v in _open_by_q_type.items()
-                        if q2 == qn and t in types)
+        types = config.claim_types(qn) or None
+        claimable = _q.count_claimable(project=qn, item_types=types)
         return claimable, total
 
     for q_name in all_cfg:

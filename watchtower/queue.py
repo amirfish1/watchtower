@@ -87,6 +87,15 @@ def effective_type(it_or_value: Any) -> str:
     s = str(raw or "").strip().lower()
     return s if s in ("bug", "feature") else DEFAULT_ITEM_TYPE
 VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "")
+# Readiness values claim_next() excludes by default (a worker gets these only
+# by passing shaping=True or an explicit readiness_filters whitelist). Single
+# source of truth shared by claim_next/peek_next/count_claimable below, the
+# GitHub backend's mirror, and health.queue_status's claimable_depth -- so
+# "is this ticket claimable" can never drift between what a worker would
+# actually claim and what the reconciler thinks is spawn-worthy (see WT's
+# SPAWN/REAP churn bug: needs-spec tickets counted as claimable depth even
+# though claim_next would never hand them to a default worker).
+UNCLAIMABLE_READINESS = ("needs-shaping", "needs-spec")
 VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
 VALID_VALUES = ("H", "M", "L", "")
 VALID_CONFIDENCES = ("H", "M", "L", "")
@@ -581,6 +590,70 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _claim_candidates(
+    items: List[Dict[str, Any]],
+    *,
+    project: Optional[str] = None,
+    lane: Optional[str] = None,
+    shaping: bool = False,
+    oldest: bool = False,
+    item_types: Optional[List[str]] = None,
+    readiness_filters: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Return ``items`` filtered + sorted exactly as claim_next() would pick
+    from them — the single source of truth for "is this ticket claimable
+    right now", shared by claim_next, peek_next, and count_claimable. Any
+    caller that needs to know what a worker COULD claim (without claiming it)
+    goes through here instead of re-implementing the filter, so it can never
+    silently drift out of sync (``project`` is expected pre-normalized).
+    """
+    candidates = [it for it in items if it.get("status") == "open"]
+    if project:
+        candidates = [it for it in candidates if it.get("project") == project]
+    if lane:
+        candidates = [it for it in candidates if it.get("lane") == lane]
+    if readiness_filters:
+        candidates = [it for it in candidates if it.get("readiness", "") in readiness_filters]
+    elif not shaping:
+        candidates = [it for it in candidates if it.get("readiness", "") not in UNCLAIMABLE_READINESS]
+    if item_types:
+        candidates = [it for it in candidates if effective_type(it) in item_types]
+    if oldest:
+        candidates = sorted(candidates, key=lambda it: int(it.get("number", 0)))
+    else:
+        candidates = sorted(
+            candidates,
+            key=lambda it: (
+                0 if it.get("lane") == "express" else 1,
+                _prio_rank(it),
+                _type_rank(it),
+                int(it.get("number", 0)),
+            ),
+        )
+    return candidates
+
+
+def count_claimable(
+    project: Optional[str] = None,
+    lane: Optional[str] = None,
+    item_types: Optional[List[str]] = None,
+) -> int:
+    """How many tickets claim_next() would currently pick from for ``project``,
+    in default (non-shaping) mode. Used by the reconciler to decide whether a
+    queue has real, claimable work before spawning a worker for it — reusing
+    claim_next's exact candidate filter instead of a hand-rolled copy means it
+    can never think a ticket is spawn-worthy when a worker couldn't actually
+    claim it (the WT SPAWN/REAP churn bug: needs-spec tickets counted as
+    claimable depth even though claim_next excludes them by default)."""
+    backend = _github_backend_for_project(project)
+    if backend is not None:
+        return backend.count_claimable(lane=lane, item_types=item_types)
+    proj = _norm_project(project) if project else None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        return len(_claim_candidates(data["items"], project=proj, lane=lane, item_types=item_types))
+
+
 def claim_next(
     session_id: str,
     lane: Optional[str] = None,
@@ -644,23 +717,10 @@ def claim_next(
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
         data = _load_unlocked()
-        candidates = [it for it in data["items"] if it.get("status") == "open"]
-        if proj:
-            candidates = [it for it in candidates if it.get("project") == proj]
-        if lane:
-            candidates = [it for it in candidates if it.get("lane") == lane]
-        if readiness_filters:
-            candidates = [it for it in candidates if it.get("readiness", "") in readiness_filters]
-        elif not shaping:
-            candidates = [
-                it for it in candidates
-                if it.get("readiness", "") not in ("needs-shaping", "needs-spec")
-            ]
-        if item_types:
-            candidates = [
-                it for it in candidates
-                if effective_type(it) in item_types
-            ]
+        candidates = _claim_candidates(
+            data["items"], project=proj, lane=lane, shaping=shaping, oldest=oldest,
+            item_types=item_types, readiness_filters=readiness_filters,
+        )
         # Resolve the stop signal now that we know whether claimable work exists.
         # Either way the signal is consumed (one-shot). If nothing is claimable,
         # honor it and exit; if there IS work, the signal's premise is void —
@@ -674,17 +734,6 @@ def claim_next(
                 return {"stop": True}
         if not candidates:
             return None
-        if oldest:
-            candidates.sort(key=lambda it: int(it.get("number", 0)))
-        else:
-            candidates.sort(
-                key=lambda it: (
-                    0 if it.get("lane") == "express" else 1,
-                    _prio_rank(it),
-                    _type_rank(it),
-                    int(it.get("number", 0)),
-                )
-            )
         item = candidates[0]
         item["status"] = "in_progress"
         item["claimed_by"] = str(session_id)
@@ -738,6 +787,7 @@ def claim_by_ref(
 def peek_next(
     project: Optional[str] = None,
     lane: Optional[str] = None,
+    item_types: Optional[List[str]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a copy of the next claimable open item without claiming it.
 
@@ -745,30 +795,12 @@ def peek_next(
     Returns None when nothing is open and claimable."""
     backend = _github_backend_for_project(project)
     if backend is not None:
-        return backend.peek_next(lane=lane)
+        return backend.peek_next(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
         data = _load_unlocked()
-        candidates = [it for it in data["items"] if it.get("status") == "open"]
-        if proj:
-            candidates = [it for it in candidates if it.get("project") == proj]
-        if lane:
-            candidates = [it for it in candidates if it.get("lane") == lane]
-        candidates = [
-            it for it in candidates
-            if it.get("readiness", "") not in ("needs-shaping", "needs-spec")
-        ]
-        if not candidates:
-            return None
-        candidates.sort(
-            key=lambda it: (
-                0 if it.get("lane") == "express" else 1,
-                _prio_rank(it),
-                _type_rank(it),
-                int(it.get("number", 0)),
-            )
-        )
-        return dict(candidates[0])
+        candidates = _claim_candidates(data["items"], project=proj, lane=lane, item_types=item_types)
+        return dict(candidates[0]) if candidates else None
 
 
 def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:

@@ -117,7 +117,7 @@ def queue_status(
     claimable_open = [
         it for it in open_items
         if it.get("claimable", True)
-        and it.get("readiness", "") not in ("needs-shaping", "needs-spec")
+        and it.get("readiness", "") not in q.UNCLAIMABLE_READINESS
     ]
     if claim_types:
         claimable_depth = sum(

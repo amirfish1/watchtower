@@ -53,6 +53,7 @@ def wt(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "WATCHTOWER_CLAUDE_PROJECTS_DIR", str(tmp_path / "claude-projects")
     )
+    monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
 
     import watchtower.queue as q
     import watchtower.config as config

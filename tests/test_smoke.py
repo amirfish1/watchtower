@@ -23,6 +23,7 @@ def store(tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_STORE", str(path))
     monkeypatch.setenv("WATCHTOWER_WORKERS_FILE", str(tmp_path / "workers.json"))
     monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "config.json"))
+    monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
     # Re-import so module-level paths (if any) pick up the env.
     import watchtower.queue as q
     import watchtower.health as health

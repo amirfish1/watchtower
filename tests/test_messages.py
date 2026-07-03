@@ -52,6 +52,7 @@ def wt(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "WATCHTOWER_CLAUDE_PROJECTS_DIR", str(tmp_path / "claude-projects")
     )
+    monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
 
     # No codex binary by default: is_available() must read False so the
     # codex-app-server adapter is a clean no-op miss in every test that

@@ -13,6 +13,7 @@ import pytest
 @pytest.fixture()
 def wt(tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "queue.json"))
+    monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
 
     import watchtower.queue as q
     import watchtower.cli as cli
