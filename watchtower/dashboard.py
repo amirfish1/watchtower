@@ -34,8 +34,10 @@ the same way (see docs/messaging-design.md).
 
 from __future__ import annotations
 
+import hmac
 import html
 import json
+import os
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional
@@ -68,6 +70,27 @@ def _check_same_origin(handler: BaseHTTPRequestHandler) -> bool:
     except ValueError:
         return False
     return host in ("localhost", "127.0.0.1")
+
+
+def _check_bearer_token(handler: BaseHTTPRequestHandler) -> bool:
+    """WT-65: bearer-token gate for the messaging endpoints.
+
+    With ``WATCHTOWER_API_TOKEN`` unset (the default) this is a no-op and
+    the posture stays what it always was: bind 127.0.0.1 + same-origin.
+    Once the token is set, every messaging POST must carry
+    ``Authorization: Bearer <token>`` — the prerequisite for ever pointing
+    ``WATCHTOWER_DELEGATE_URL`` off-box (remote-WT federation): the moment
+    the server is reachable from another machine, "anyone who can connect
+    can make agents do things" stops being acceptable.
+
+    Constant-time compare; applied on top of (not instead of) the
+    same-origin check."""
+    token = (os.environ.get("WATCHTOWER_API_TOKEN") or "").strip()
+    if not token:
+        return True
+    auth = (handler.headers.get("Authorization") or "").strip()
+    supplied = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    return bool(supplied) and hmac.compare_digest(supplied, token)
 
 
 # --------------------------------------------------------------------------- data
@@ -957,6 +980,9 @@ class _Handler(BaseHTTPRequestHandler):
             if not _check_same_origin(self):
                 self._json(403, {"error": "cross-origin request rejected"})
                 return
+            if not _check_bearer_token(self):
+                self._json(401, {"error": "missing or invalid bearer token"})
+                return
             data = self._read_json_body()
             if not isinstance(data, dict):
                 self._json(400, {"error": "invalid JSON body"})
@@ -974,6 +1000,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/ask":
             if not _check_same_origin(self):
                 self._json(403, {"error": "cross-origin request rejected"})
+                return
+            if not _check_bearer_token(self):
+                self._json(401, {"error": "missing or invalid bearer token"})
                 return
             data = self._read_json_body()
             if not isinstance(data, dict):
@@ -993,6 +1022,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/chat/create":
             if not _check_same_origin(self):
                 self._json(403, {"error": "cross-origin request rejected"})
+                return
+            if not _check_bearer_token(self):
+                self._json(401, {"error": "missing or invalid bearer token"})
                 return
             data = self._read_json_body()
             if not isinstance(data, dict):
@@ -1021,6 +1053,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/chat/post":
             if not _check_same_origin(self):
                 self._json(403, {"error": "cross-origin request rejected"})
+                return
+            if not _check_bearer_token(self):
+                self._json(401, {"error": "missing or invalid bearer token"})
                 return
             data = self._read_json_body()
             if not isinstance(data, dict):

@@ -654,10 +654,15 @@ def _resume_verify_window_s() -> float:
 def _post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
     """POST JSON, return the parsed JSON response. Raises on transport/HTTP
     errors (urlopen raises HTTPError for any non-2xx status)."""
+    headers = {"Content-Type": "application/json"}
+    # WT-65: a remote delegate (federated WT) requires its bearer token.
+    token = (os.environ.get("WATCHTOWER_DELEGATE_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
