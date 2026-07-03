@@ -68,8 +68,19 @@ def test_resume_reports_failure_when_claude_dies_at_boot(wt, monkeypatch):
     message. Honest failure lets send() park it for retry instead."""
     _write_transcript(wt, SID_B, age_s=600)
 
+    class DeadStdin:
+        def write(self, b):
+            return None
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
     class DeadProc:
         pid = 424243
+        stdin = DeadStdin()
 
         def poll(self):
             return 1
@@ -118,3 +129,21 @@ def test_resume_rebucket_noop_when_already_in_right_bucket(wt, monkeypatch):
     monkeypatch.setattr(wt.messages.subprocess, "Popen", _fake_popen(calls))
     res = wt.messages.send(SID_B, "resume me")
     assert res["ok"] is True and p.is_file()
+
+
+# ============================================================ one-shot stdin
+def test_resume_child_gets_eof_after_the_message(wt, monkeypatch):
+    """The resume adapter is fire-and-forget: it must write the stream-json
+    line and CLOSE the child's stdin so the child exits after its turn. A
+    kept-open stdin left the child alive indefinitely, squatting on the
+    session as a foreign live writer that blocked every later delivery
+    (observed 2026-07-02: user text swallowed behind an hours-old idle
+    resume child)."""
+    _write_transcript(wt, SID_B, age_s=600)
+    calls = []
+    monkeypatch.setattr(wt.messages.subprocess, "Popen", _fake_popen(calls))
+    res = wt.messages.send(SID_B, "one-shot please")
+    assert res["ok"] is True
+    proc = calls[0][2]
+    assert b"one-shot please" in proc.stdin.data
+    assert proc.stdin.closed is True

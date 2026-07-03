@@ -576,12 +576,33 @@ def test_outbox_retry_all_dead_only_resets_dead_messages(wt):
 
 # ======================================================== resume adapter + busy check
 def _fake_popen(calls):
+    class FakeStdin:
+        """Captures the one-shot resume delivery: the adapter must write the
+        stream-json line and then CLOSE stdin (EOF) so the child exits after
+        its turn instead of squatting on the session as a foreign writer."""
+        def __init__(self):
+            self.data = b""
+            self.closed = False
+
+        def write(self, b):
+            self.data += b
+
+        def flush(self):
+            pass
+
+        def close(self):
+            self.closed = True
+
     class FakeProc:
         pid = 424242
 
+        def __init__(self):
+            self.stdin = FakeStdin()
+
     def popen(argv, **kw):
-        calls.append((argv, kw))
-        return FakeProc()
+        proc = FakeProc()
+        calls.append((argv, kw, proc))
+        return proc
     return popen
 
 

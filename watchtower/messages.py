@@ -526,9 +526,6 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
         return {"ok": False, "error": f"cannot create log dir: {e}"}
     ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     log_path = log_dir / f"msg-{sid[:8]}-{ts}.log"
-    fifo_path, rdwr_fd = workers._make_stdin_fifo(log_path)
-    if fifo_path is None:
-        return {"ok": False, "error": "could not create stdin fifo"}
     argv = [
         "claude", "-p", "--verbose",
         "--resume", sid,
@@ -550,7 +547,7 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
         try:
             proc = subprocess.Popen(
                 argv,
-                stdin=rdwr_fd,
+                stdin=subprocess.PIPE,
                 stdout=logf,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
@@ -559,18 +556,21 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
         finally:
             logf.close()
     except OSError as e:
-        workers._close_fd_quiet(rdwr_fd)
-        try:
-            Path(fifo_path).unlink()
-        except OSError:
-            pass
         return {"ok": False, "error": f"claude resume spawn failed: {e}"}
-    # Write the message while our RDWR fd still holds the FIFO open, then drop
-    # our copy; the child's inherited stdin fd keeps the pipe alive.
-    delivered = workers.write_to_worker_fifo(fifo_path, text)
-    workers._close_fd_quiet(rdwr_fd)
-    if not delivered:
-        return {"ok": False, "error": "resume fifo write failed"}
+    # One-shot delivery: write the message, then CLOSE stdin so the child
+    # sees EOF and exits once its turn completes. This is deliberately NOT
+    # the workers' keep-alive FIFO pattern: wt never reuses a resume child,
+    # and a lingering idle child squats on the session as a foreign live
+    # writer — observed 2026-07-02, when a resume child from hours earlier
+    # sat holding its stdin open and every subsequent CCC/wt delivery to
+    # that session was parked "until it finishes" (i.e. never), swallowing
+    # user text.
+    try:
+        proc.stdin.write(workers._stream_json_user_line(text))
+        proc.stdin.flush()
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        return {"ok": False, "error": "resume stdin write failed"}
     # Boot verification: a resume that can't load the session (wrong cwd,
     # missing transcript) exits within a second or two. Reporting ok on a
     # dead child silently drops the message — watch the verify window and
