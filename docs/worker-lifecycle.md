@@ -171,6 +171,38 @@ paying a cold start. A wind-down STOP bypasses the warm window.
 
 ---
 
+## Activity log — SPAWN vs DISPATCH
+
+The activity log at `~/.watchtower/activity.log` records two related but distinct
+events when a new ticket is filed:
+
+| Verb | Who emits it | What it means |
+|------|-------------|---------------|
+| **SPAWN** | `reconcile_once()` / reconciler | A new worker *process* was created (one line per process). Detail: `<worker-id> (pid <PID>) [engine] — <N> open, <A> live < <D> desired`. |
+| **DISPATCH** | `dispatch_after_enqueue()` | The routing decision for *this ticket* — what happened to ensure it gets worked. One line per ticket, one of: nudged an existing worker, spawned new worker(s), or queued as backlog. |
+
+**Why do I see two SPAWN lines for one ticket?**  
+The queue's `desired_workers` setting controls how many workers the reconciler
+keeps running at all times. If the queue has `desired_workers=2` and there are
+0 live workers, `reconcile_once()` spawns 2 regardless of how many tickets are
+open — it's provisioning to capacity, not one-for-one. The DISPATCH line then
+records which of those workers the ticket was routed to.
+
+To reduce to 1 worker per queue: `wt set -q <QUEUE> --desired-workers 1`.
+
+**Example sequence** for a queue with `desired_workers=2`, 0 live workers, 1 ticket:
+```
+ENQUEUE   CCC-461   Command Center ticket
+SPAWN     ccc-abc1  (pid 4928) [claude] — 1 open, 0 live < 2 desired
+SPAWN     ccc-def2  (pid 4929) [claude] — 1 open, 0 live < 2 desired
+DISPATCH  CCC-461   spawned 2 worker(s): ccc-abc1, ccc-def2
+```
+
+The extra worker sits warm until another ticket arrives (cheaper: reuses the
+prompt cache) or is reaped after the 5-minute idle TTL.
+
+---
+
 ## Logs
 
 `~/.watchtower/logs/` is one shared directory for every queue's process

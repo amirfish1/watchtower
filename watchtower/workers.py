@@ -871,8 +871,10 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
         result = reconcile_once()
         spawned = [r for r in result.get("spawned", []) if r.get("queue") == queue]
         if spawned:
-            wid = spawned[0].get("worker_id", "?")
-            reason = f"spawned worker {wid}"
+            wids = ", ".join(r.get("worker_id", "?") for r in spawned)
+            count = len(spawned)
+            reason = (f"spawned {count} worker(s): {wids}" if count > 1
+                      else f"spawned worker {wids}")
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
         # Nothing spawned — surface the reconcile skip reason for this queue.
