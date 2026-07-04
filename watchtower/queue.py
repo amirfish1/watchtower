@@ -396,21 +396,188 @@ def _clip(value: Any, max_len: int) -> str:
     return s if len(s) <= max_len else s[:max_len].rstrip() + "…"
 
 
-def _append_history(it: Dict[str, Any], event: str, **fields: Any) -> None:
-    """Append-only lifecycle trail (WT-87): unlike ``claimed_by``/``closed_at``
-    etc, which are overwritten on every transition and only ever show the
-    latest snapshot, ``history`` accumulates every claim/reopen/close/block so
-    "which sessions ever touched this ticket" is a direct read of the ticket
-    instead of a best-effort activity-log grep."""
+def _by(kind: str = "system", worker: str = "", session_id: str = "") -> Dict[str, str]:
+    kind = kind if kind in ("worker", "human", "system") else "system"
+    out = {"kind": kind}
+    if worker:
+        out["worker"] = str(worker)
+    if session_id:
+        out["session_id"] = str(session_id)
+    return out
+
+
+def _normalize_by(value: Any = None, *, worker: Any = "", session_id: Any = "", event: str = "") -> Dict[str, str]:
+    if isinstance(value, dict):
+        kind = str(value.get("kind") or "").strip()
+        out = _by(kind if kind else "system")
+        w = value.get("worker") or worker
+        sid = value.get("session_id") or session_id
+        if w:
+            out["worker"] = str(w)
+        if sid:
+            out["session_id"] = str(sid)
+        return out
+    if isinstance(value, str) and value in ("worker", "human", "system"):
+        return _by(value, str(worker or ""), str(session_id or ""))
+    if worker or session_id:
+        kind = "human" if event in ("answer", "comment") else "worker"
+        return _by(kind, str(worker or ""), str(session_id or ""))
+    if event in ("answer", "comment"):
+        return _by("human")
+    return _by("system")
+
+
+def _append_history(
+    it: Dict[str, Any],
+    event: str,
+    *,
+    by: Any = None,
+    at: str = "",
+    text: str = "",
+    **fields: Any,
+) -> None:
+    """Append one canonical ticket event."""
     hist = it.get("history")
     if not isinstance(hist, list):
         hist = []
-    entry: Dict[str, Any] = {"event": event, "at": _now_iso()}
+    entry: Dict[str, Any] = {
+        "event": event,
+        "at": str(at or _now_iso()),
+        "by": _normalize_by(by, event=event),
+    }
+    if text:
+        entry["text"] = text
     for key, value in fields.items():
-        if value:
+        if value is not None and value != "":
             entry[key] = value
     hist.append(entry)
     it["history"] = hist
+
+
+def _timeline_event(raw: Dict[str, Any], default_at: str = "") -> Optional[Dict[str, Any]]:
+    event = str(raw.get("event") or "").strip()
+    if not event:
+        return None
+    at = str(raw.get("at") or default_at or "")
+    out: Dict[str, Any] = {
+        "event": event,
+        "at": at,
+        "by": _normalize_by(
+            raw.get("by"),
+            worker=raw.get("worker") or "",
+            session_id=raw.get("session_id") or "",
+            event=event,
+        ),
+    }
+    for key, value in raw.items():
+        if key in ("event", "at", "by", "worker", "session_id"):
+            continue
+        if value is not None and value != "":
+            out[key] = value
+    return out
+
+
+def _add_timeline_event(events: List[Dict[str, Any]], raw: Dict[str, Any], *, synthesized: bool = False) -> None:
+    ev = _timeline_event(raw)
+    if ev is None:
+        return
+    if synthesized and any(e.get("event") == ev.get("event") and e.get("at") == ev.get("at") for e in events):
+        return
+    events.append(ev)
+
+
+def timeline(item: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Return the canonical chronological activity stream for any ticket shape.
+
+    New tickets store this directly in ``history``. Old tickets may still have
+    append-only ``answers``/``progress_notes`` or only snapshot fields; those
+    are normalized here at read time without mutating the item.
+    """
+    events: List[Dict[str, Any]] = []
+
+    hist = item.get("history")
+    if isinstance(hist, list):
+        for raw in hist:
+            if isinstance(raw, dict):
+                _add_timeline_event(events, raw)
+
+    notes = item.get("progress_notes")
+    if isinstance(notes, list):
+        for note in notes:
+            if not isinstance(note, dict):
+                continue
+            by = str(note.get("by") or "")
+            text = _clip(note.get("text", ""), 24000)
+            if by == "human-comment":
+                _add_timeline_event(events, {
+                    "event": "comment",
+                    "at": note.get("at") or "",
+                    "by": _by("human"),
+                    "text": text,
+                })
+            elif by == "human-reopen":
+                _add_timeline_event(events, {
+                    "event": "reopen",
+                    "at": note.get("at") or "",
+                    "by": _by("human"),
+                    "reason": text,
+                })
+            else:
+                _add_timeline_event(events, {
+                    "event": "progress",
+                    "at": note.get("at") or "",
+                    "by": _normalize_by(note.get("by"), event="progress"),
+                    "text": text,
+                })
+
+    answers = item.get("answers")
+    if isinstance(answers, list):
+        for ans in answers:
+            if not isinstance(ans, dict):
+                continue
+            by_raw = ans.get("by") or ""
+            _add_timeline_event(events, {
+                "event": "answer",
+                "at": ans.get("at") or "",
+                "by": _by("human", str(by_raw or "")),
+                "text": _clip(ans.get("text", ""), 24000),
+            })
+
+    created_at = str(item.get("created_at") or "")
+    if created_at and not any(e.get("event") == "filed" for e in events):
+        _add_timeline_event(events, {
+            "event": "filed",
+            "at": created_at,
+            "by": _by("system"),
+            "source": item.get("source") or "",
+            "project": item.get("project") or "",
+        }, synthesized=True)
+
+    if item.get("claimed_at") and not any(e.get("event") == "claim" for e in events):
+        _add_timeline_event(events, {
+            "event": "claim",
+            "at": item.get("claimed_at"),
+            "by": _by("worker", str(item.get("claimed_by") or ""), str(item.get("claimed_session_id") or "")),
+        }, synthesized=True)
+
+    if item.get("block_question") and item.get("blocked_at") and not any(e.get("event") == "block" for e in events):
+        _add_timeline_event(events, {
+            "event": "block",
+            "at": item.get("blocked_at"),
+            "by": _by("worker", str(item.get("claimed_by") or ""), str(item.get("claimed_session_id") or "")),
+            "question": _clip(item.get("block_question"), 4000),
+        }, synthesized=True)
+
+    if item.get("closed_at") and not any(e.get("event") == "close" for e in events):
+        norm = _normalize_resolution(item.get("resolution"))
+        _add_timeline_event(events, {
+            "event": "close",
+            "at": item.get("closed_at"),
+            "by": _by("worker", str(item.get("closed_by") or item.get("claimed_by") or ""), str(item.get("claimed_session_id") or "")),
+            "resolution": norm,
+        }, synthesized=True)
+
+    return sorted(events, key=lambda e: str(e.get("at") or ""))
 
 
 def enqueue(
@@ -492,6 +659,7 @@ def enqueue(
             "created_at": now,
             "updated_at": now,
         }
+        _append_history(item, "filed", by=_by("system"), at=now, source=item["source"], project=proj)
         data["items"].append(item)
         _normalize_items(data["items"])  # assign this item's seq/ref
         _save_unlocked(data)
@@ -613,6 +781,13 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                         # "item_type" and "type" are aliases — store as "type"
                         key = "type" if k == "item_type" else k
                         it[key] = v
+                changed = {
+                    ("type" if k == "item_type" else k): v
+                    for k, v in fields.items()
+                    if k in ALLOWED
+                }
+                if changed:
+                    _append_history(it, "edit", by=_by("system"), at=now, fields=changed)
                 it["updated_at"] = now
                 _save_unlocked(data)
                 return it
@@ -647,9 +822,21 @@ def move(ident: Any, new_project: str) -> Optional[Dict[str, Any]]:
         for it in data["items"]:
             if _matches(it, ident):
                 old_ref = it.get("ref", "")
+                old_project = it.get("project", "")
                 it["project"] = new_project
-                it["updated_at"] = _now_iso()
+                now = _now_iso()
+                it["updated_at"] = now
                 _normalize_items(data["items"])
+                _append_history(
+                    it,
+                    "move",
+                    by=_by("system"),
+                    at=now,
+                    from_ref=old_ref,
+                    to_ref=it.get("ref", ""),
+                    from_project=old_project,
+                    to_project=new_project,
+                )
                 _save_unlocked(data)
                 _log("MOVE", f"{old_ref} -> {it.get('ref', '?')}", queue=new_project)
                 return it
@@ -807,7 +994,7 @@ def claim_next(
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
-        _append_history(item, "claim", session_id=real_sid, worker=str(session_id))
+        _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
     return item
@@ -846,7 +1033,7 @@ def claim_by_ref(
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
-        _append_history(item, "claim", session_id=real_sid, worker=str(session_id))
+        _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
     return item
@@ -992,7 +1179,7 @@ def update_status(
                     it["claimed_at"] = now
                     if real_sid:
                         it["claimed_session_id"] = real_sid
-                    _append_history(it, "claim", session_id=real_sid, worker=str(session_id))
+                    _append_history(it, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=now)
                 if status == "closed":
                     it["closed_at"] = now
                     it["needs_input"] = False  # a closed ticket isn't waiting
@@ -1015,9 +1202,13 @@ def update_status(
                     norm = _normalize_resolution(resolution)
                     if norm is not None:
                         it["resolution"] = norm
-                    _append_history(it, "close", session_id=real_sid,
-                                     worker=str(session_id or it.get("closed_by") or ""),
-                                     resolution=norm)
+                    _append_history(
+                        it,
+                        "close",
+                        by=_by("worker", str(session_id or it.get("closed_by") or ""), str(real_sid or "")),
+                        at=now,
+                        resolution=norm,
+                    )
                 if status == "open":
                     it["claimed_by"] = None
                     it["claimed_at"] = None
@@ -1031,7 +1222,7 @@ def update_status(
                     it["needs_input"] = False
                     it["block_question"] = ""
                     it["blocked_at"] = None
-                    _append_history(it, "reopen", reason=reason)
+                    _append_history(it, "reopen", by=_by("worker", str(session_id or ""), str(real_sid or "")), at=now, reason=_clip(reason, 4000))
                 _save_unlocked(data)
                 verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
                 verb = verbs.get(status, status.upper())
@@ -1111,14 +1302,10 @@ def block(
                     real = _coerce_session_uuid(session_id)
                     if real and not it.get("claimed_session_id"):
                         it["claimed_session_id"] = real
+                actor = _by("worker", str(session_id), str(_coerce_session_uuid(session_id) or ""))
                 if progress:
-                    notes = it.get("progress_notes")
-                    if not isinstance(notes, list):
-                        notes = []
-                    notes.append({"at": now, "text": _clip(progress, 24000)})
-                    it["progress_notes"] = notes
-                _append_history(it, "block", session_id=_coerce_session_uuid(session_id),
-                                 worker=str(session_id), question=_clip(question, 4000))
+                    _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
+                _append_history(it, "block", by=actor, at=now, question=_clip(question, 4000))
                 _save_unlocked(data)
                 return it
     return None
@@ -1134,15 +1321,37 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
         for it in data["items"]:
             if _matches(it, ident):
                 now = _now_iso()
-                ans = it.get("answers")
-                if not isinstance(ans, list):
-                    ans = []
-                ans.append({"at": now, "text": _clip(text, 24000),
-                            "by": str(session_id or "human")})
-                it["answers"] = ans
                 it["needs_input"] = False
                 it["answered_at"] = now
                 it["updated_at"] = now
+                _append_history(
+                    it,
+                    "answer",
+                    by=_by("human", str(session_id or "")),
+                    at=now,
+                    text=_clip(text, 24000),
+                )
+                _save_unlocked(data)
+                return it
+    return None
+
+
+def comment(ident: Any, text: str, by: str = "human", session_id: str = "") -> Optional[Dict[str, Any]]:
+    """Append a plain ticket activity comment without changing ticket state."""
+    actor_kind = by if by in ("worker", "human", "system") else "human"
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                now = _now_iso()
+                it["updated_at"] = now
+                _append_history(
+                    it,
+                    "comment",
+                    by=_by(actor_kind, str(session_id or "")),
+                    at=now,
+                    text=_clip(text, 24000),
+                )
                 _save_unlocked(data)
                 return it
     return None
