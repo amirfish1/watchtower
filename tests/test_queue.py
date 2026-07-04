@@ -171,3 +171,26 @@ def test_find_json_includes_timeline(wt, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["ref"] == item["ref"]
     assert _events(out["timeline"]) == ["filed", "comment"]
+
+
+def test_timeline_same_timestamp_precedence(wt):
+    """filed (synthesized) must sort before claim (real history) at same timestamp.
+
+    The WT-95/WT-96 bug: wt take files+claims within one second, so
+    created_at == claimed_at. Old/current tickets that store only 'claim' in
+    history (not 'filed') synthesize 'filed' from created_at. Without the
+    precedence tier the stable sort leaves claim first.
+    """
+    ts = "2026-07-04T12:00:00Z"
+    item = {
+        "created_at": ts,
+        "claimed_at": ts,
+        "claimed_by": "w-test",
+        "claimed_session_id": None,
+        # history has only claim — filed is absent and will be synthesized
+        "history": [
+            {"event": "claim", "at": ts, "by": {"kind": "worker", "worker": "w-test"}},
+        ],
+    }
+    tl = wt.q.timeline(item)
+    assert _events(tl) == ["filed", "claim"]

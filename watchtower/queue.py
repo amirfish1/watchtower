@@ -477,12 +477,20 @@ def _timeline_event(raw: Dict[str, Any], default_at: str = "") -> Optional[Dict[
     return out
 
 
+_EVENT_PRECEDENCE = {
+    "filed": 0, "claim": 1, "block": 2, "progress": 2,
+    "answer": 3, "comment": 4, "close": 5, "reopen": 6,
+}
+
+
 def _add_timeline_event(events: List[Dict[str, Any]], raw: Dict[str, Any], *, synthesized: bool = False) -> None:
     ev = _timeline_event(raw)
     if ev is None:
         return
     if synthesized and any(e.get("event") == ev.get("event") and e.get("at") == ev.get("at") for e in events):
         return
+    ev["_synthesized"] = synthesized
+    ev["_idx"] = len(events)
     events.append(ev)
 
 
@@ -577,7 +585,21 @@ def timeline(item: Dict[str, Any]) -> List[Dict[str, Any]]:
             "resolution": norm,
         }, synthesized=True)
 
-    return sorted(events, key=lambda e: str(e.get("at") or ""))
+    def _sort_key(e: Dict[str, Any]) -> tuple:
+        ts = str(e.get("at") or "")
+        if e.get("_synthesized"):
+            # Synthesized events (from snapshot fields) sort BEFORE real history
+            # events at the same timestamp, ordered by causal precedence.
+            return (ts, 0, _EVENT_PRECEDENCE.get(str(e.get("event") or ""), 99), 0)
+        # Real history events sort after synthesized ones at the same timestamp,
+        # preserving their original insertion order (causal ground truth).
+        return (ts, 1, 0, e.get("_idx", 0))
+
+    result = sorted(events, key=_sort_key)
+    for e in result:
+        e.pop("_synthesized", None)
+        e.pop("_idx", None)
+    return result
 
 
 def enqueue(
