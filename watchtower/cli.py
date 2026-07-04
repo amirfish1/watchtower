@@ -157,6 +157,37 @@ def _print_item(it: Optional[dict]) -> None:
     print(json.dumps(it, indent=2))
 
 
+def _with_timeline(item: dict) -> dict:
+    out = dict(item)
+    out["timeline"] = q.timeline(item)
+    return out
+
+
+def _event_summary(event: dict) -> str:
+    name = str(event.get("event") or "")
+    if name == "filed":
+        return f"filed from {event.get('source') or 'unknown'}"
+    if name == "claim":
+        by = event.get("by") or {}
+        return f"claimed by {by.get('worker') or by.get('session_id') or by.get('kind') or 'unknown'}"
+    if name == "block":
+        return f"blocked: {event.get('question') or ''}".rstrip()
+    if name in ("answer", "comment", "progress"):
+        return f"{name}: {event.get('text') or ''}".rstrip()
+    if name == "reopen":
+        return f"reopened: {event.get('reason') or ''}".rstrip()
+    if name == "close":
+        res = event.get("resolution") or {}
+        summary = res.get("summary") if isinstance(res, dict) else ""
+        return f"closed: {summary or ''}".rstrip()
+    if name == "edit":
+        fields = event.get("fields") or {}
+        return "edited: " + ", ".join(sorted(fields)) if fields else "edited"
+    if name == "move":
+        return f"moved {event.get('from_ref') or ''} -> {event.get('to_ref') or ''}".strip()
+    return name or "event"
+
+
 # ----------------------------------------------------------------------- commands
 def cmd_status(args: argparse.Namespace) -> int:
     rows = health.all_status(project=args.queue, stuck_minutes=args.stuck_minutes)
@@ -215,8 +246,9 @@ def cmd_find(args: argparse.Namespace) -> int:
     if not item:
         print(f"not found: {args.ref}", file=sys.stderr)
         return 1
+    item_with_timeline = _with_timeline(item)
     if args.json:
-        print(json.dumps(item, indent=2))
+        print(json.dumps(item_with_timeline, indent=2))
         return 0
     worker = str(item.get("claimed_by") or item.get("claimed_session_id") or "")
     title = _oneline(item.get("title") or item.get("note") or "")
@@ -226,6 +258,11 @@ def cmd_find(args: argparse.Namespace) -> int:
     res = item.get("resolution") if item.get("status") == "closed" else None
     if res and res.get("summary"):
         print(f"  resolution: {res['summary']}")
+    timeline = item_with_timeline.get("timeline") or []
+    if timeline:
+        print("  activity:")
+        for event in timeline:
+            print(f"    {event.get('at') or '-'}  {_event_summary(event)}")
     return 0
 
 
@@ -609,6 +646,15 @@ def cmd_answer(args: argparse.Namespace) -> int:
     else:
         print(f"ANSWERED: {item['ref']} — needs_input cleared, but auto-resume "
               f"failed to start. Resume manually: wt discuss {item['ref']}")
+    return 0
+
+
+def cmd_comment(args: argparse.Namespace) -> int:
+    item = q.comment(args.ref, args.text, by=args.by, session_id=args.worker)
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    print(f"COMMENTED: {item['ref']}")
     return 0
 
 
@@ -1923,6 +1969,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "ls"),
     ("Tickets", "blocked"),
     ("Tickets", "answer"),
+    ("Tickets", "comment"),
     ("Tickets", "discuss"),
     ("Tickets", "dedup"),
     ("Agent messaging", "send"),
@@ -1950,6 +1997,7 @@ COMMAND_HELP: Dict[str, str] = {
     "block": "park a ticket that needs a human decision",
     "blocked": "list tickets parked for a human",
     "answer": "answer a blocked ticket; auto-resumes its session",
+    "comment": "append a ticket activity comment",
     "discuss": "attach to a blocked ticket's session (claude --resume)",
     "run": "mark an existing GitHub issue runnable and dispatch its queue",
     "find": "look up one ticket by ref across all queues (no -q needed)",
@@ -2180,6 +2228,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--engine", default="claude", choices=["claude", "codex"],
                    help="engine to resume the blocked session with")
     s.set_defaults(func=cmd_answer)
+
+    s = sub.add_parser("comment")
+    s.add_argument("ref")
+    s.add_argument("text", help="comment text")
+    s.add_argument("--worker", default="")
+    s.add_argument("--by", default="human", choices=["human", "worker", "system"])
+    s.set_defaults(func=cmd_comment)
 
     s = sub.add_parser("discuss")
     s.add_argument("ref")
