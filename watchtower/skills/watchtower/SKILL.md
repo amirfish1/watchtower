@@ -10,6 +10,17 @@ queues and the agent workers draining them. Tickets are refs like `WT-48` or
 `HERMES-20` (`<PROJECT>-<N>`). If `wt` isn't on `$PATH`, WatchTower isn't
 installed here — say so rather than guessing at ticket state.
 
+## Scope: what WatchTower is (and isn't)
+
+WatchTower is a **ticket + worker tracker**. It answers "what's in queue X",
+"is a queue stuck", and files/claims/closes tickets. That's all `wt` does.
+
+It does **not** message, ping, spawn, or inject into a running session. A bare
+session UUID like `e1588ce4-…` is a CCC conversation, not a WatchTower object,
+and `wt` has no command that reaches it. If asked to "ping / message / ask /
+inject into session `<uuid>`", that's Claude Command Center — use the
+`ccc-orchestration` skill instead, not this one.
+
 ## Look up a ticket by ref
 
 You don't need to know which queue a ref belongs to:
