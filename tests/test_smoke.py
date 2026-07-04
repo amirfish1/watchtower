@@ -877,7 +877,9 @@ def test_block_answer_resume_flow(store):
     assert blocked["status"] == "in_progress"  # never bounces back to open
     assert blocked["block_question"] == "ship A or B?"
     assert blocked["claimed_session_id"] == sid  # resumable
-    assert blocked["progress_notes"][0]["text"] == "A is safer"
+    assert "progress_notes" not in blocked
+    assert [e["event"] for e in blocked["history"]][-2:] == ["progress", "block"]
+    assert blocked["history"][-2]["text"] == "A is safer"
 
     # A blocked ticket is NOT reclaimable by another worker.
     assert q.claim_next("worker-2", project="BLK") is None
@@ -885,7 +887,9 @@ def test_block_answer_resume_flow(store):
 
     answered = q.answer(blocked["ref"], "go with A", session_id="human")
     assert answered["needs_input"] is False
-    assert answered["answers"][0]["text"] == "go with A"
+    assert "answers" not in answered
+    assert answered["history"][-1]["event"] == "answer"
+    assert answered["history"][-1]["text"] == "go with A"
     assert q.list_blocked(project="BLK") == []
 
     # Closing clears any lingering block flag.
@@ -939,35 +943,35 @@ def test_ticket_history_records_full_lifecycle(store):
     q.enqueue(project="HIST", note="track my whole life")
     claimed_a = q.claim_next("worker-a", project="HIST")
     ref = claimed_a["ref"]
-    assert [e["event"] for e in claimed_a["history"]] == ["claim"]
-    assert claimed_a["history"][0]["worker"] == "worker-a"
+    assert [e["event"] for e in claimed_a["history"]] == ["filed", "claim"]
+    assert claimed_a["history"][1]["by"]["worker"] == "worker-a"
 
     released = q.release(ref, session_id="worker-a")
     events = [e["event"] for e in released["history"]]
-    assert events == ["claim", "reopen"]
-    assert released["history"][1]["reason"] == "released"
+    assert events == ["filed", "claim", "reopen"]
+    assert released["history"][2]["reason"] == "released"
 
     claimed_b = q.claim_next("worker-b", project="HIST")
     assert claimed_b["ref"] == ref
     events = [e["event"] for e in claimed_b["history"]]
-    assert events == ["claim", "reopen", "claim"]
-    assert claimed_b["history"][2]["worker"] == "worker-b"
+    assert events == ["filed", "claim", "reopen", "claim"]
+    assert claimed_b["history"][3]["by"]["worker"] == "worker-b"
 
     blocked = q.block(ref, session_id="worker-b", question="ship it?")
     events = [e["event"] for e in blocked["history"]]
-    assert events == ["claim", "reopen", "claim", "block"]
-    assert blocked["history"][3]["question"] == "ship it?"
+    assert events == ["filed", "claim", "reopen", "claim", "block"]
+    assert blocked["history"][4]["question"] == "ship it?"
 
     q.answer(ref, "yes", session_id="human")
     closed = q.close(ref, "worker-b", resolution="shipped")
     events = [e["event"] for e in closed["history"]]
-    assert events == ["claim", "reopen", "claim", "block", "close"]
-    assert closed["history"][4]["worker"] == "worker-b"
-    assert closed["history"][4]["resolution"]["summary"] == "shipped"
+    assert events == ["filed", "claim", "reopen", "claim", "block", "answer", "close"]
+    assert closed["history"][6]["by"]["worker"] == "worker-b"
+    assert closed["history"][6]["resolution"]["summary"] == "shipped"
 
     # Every entry from worker-a's original claim is still readable off the
     # ticket itself — not just recoverable from activity.log.
-    assert claimed_a["history"][0]["at"] <= closed["history"][4]["at"]
+    assert claimed_a["history"][1]["at"] <= closed["history"][6]["at"]
 
 
 def test_discuss_command_prints_resume(store, capsys):
