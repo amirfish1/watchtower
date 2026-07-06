@@ -898,11 +898,26 @@ def test_set_session_title_appends_custom_title_event(wt):
     /rename command writes, verified against claude-command-center's
     rename_session/_append_custom_title (see docs/session-naming.md)."""
     p = _write_transcript(wt, SID_A)
-    assert wt.messages.set_session_title(SID_A, "WT worker: WT-1") is True
+    assert wt.messages.set_session_title(SID_A, "WT#1: repair title") is True
     lines = [l for l in p.read_text().splitlines() if l.strip()]
     assert json.loads(lines[-1]) == {
-        "type": "custom-title", "customTitle": "WT worker: WT-1", "sessionId": SID_A,
+        "type": "custom-title", "customTitle": "WT#1: repair title", "sessionId": SID_A,
     }
+
+
+def test_set_session_title_is_idempotent(wt):
+    """A reconciler tick may retry the same repair many times; exact repeats
+    must not append unbounded duplicate custom-title events."""
+    p = _write_transcript(wt, SID_A)
+
+    assert wt.messages.set_session_title(SID_A, "WT#1: repair title") is True
+    assert wt.messages.set_session_title(SID_A, "WT#1: repair title") is False
+
+    lines = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    title_events = [ev for ev in lines if ev.get("type") == "custom-title"]
+    assert title_events == [
+        {"type": "custom-title", "customTitle": "WT#1: repair title", "sessionId": SID_A}
+    ]
 
 
 def test_set_session_title_no_transcript_is_noop(wt):
@@ -926,7 +941,7 @@ def test_backfill_renames_session_once_uuid_resolves(wt):
     lines = [l for l in p.read_text().splitlines() if l.strip()]
     assert json.loads(lines[-1]) == {
         "type": "custom-title",
-        "customTitle": f"NAMEQ worker: {item['ref']} - do a thing",
+        "customTitle": f"NAMEQ#{item['seq']}: do a thing",
         "sessionId": SID_A,
     }
 
@@ -949,7 +964,7 @@ def test_cli_close_renames_session_with_summary(wt):
     lines = [l for l in p.read_text().splitlines() if l.strip()]
     assert json.loads(lines[-1]) == {
         "type": "custom-title",
-        "customTitle": f"NAMEQ worker: {item['ref']} - fixed the thing",
+        "customTitle": f"NAMEQ#{item['seq']}: fixed the thing",
         "sessionId": SID_A,
     }
 
@@ -975,7 +990,7 @@ def test_recent_session_title_backfill_dry_run_uses_latest_ticket_context(wt):
             "worker_id": recent_worker,
             "session_id": SID_A,
             "ref": recent["ref"],
-            "title": f"NAMEQ worker: {recent['ref']} - added durable titles",
+            "title": f"NAMEQ#{recent['seq']}: added durable titles",
             "updated": False,
         }
     ]
@@ -996,14 +1011,14 @@ def test_recent_session_title_backfill_appends_custom_title(wt):
             "worker_id": worker_id,
             "session_id": SID_A,
             "ref": item["ref"],
-            "title": f"NAMEQ worker: {item['ref']} - Add useful titles",
+            "title": f"NAMEQ#{item['seq']}: Add useful titles",
             "updated": True,
         }
     ]
     lines = [l for l in p.read_text().splitlines() if l.strip()]
     assert json.loads(lines[-1]) == {
         "type": "custom-title",
-        "customTitle": f"NAMEQ worker: {item['ref']} - Add useful titles",
+        "customTitle": f"NAMEQ#{item['seq']}: Add useful titles",
         "sessionId": SID_A,
     }
 
@@ -1022,14 +1037,82 @@ def test_recent_session_title_backfill_uses_queue_session_when_log_is_gone(wt):
             "worker_id": "nameq-pruned",
             "session_id": SID_A,
             "ref": item["ref"],
-            "title": f"NAMEQ worker: {item['ref']} - renamed without log",
+            "title": f"NAMEQ#{item['seq']}: renamed without log",
             "updated": True,
         }
     ]
     lines = [l for l in p.read_text().splitlines() if l.strip()]
     assert json.loads(lines[-1]) == {
         "type": "custom-title",
-        "customTitle": f"NAMEQ worker: {item['ref']} - renamed without log",
+        "customTitle": f"NAMEQ#{item['seq']}: renamed without log",
+        "sessionId": SID_A,
+    }
+
+
+def test_recent_session_title_backfill_keeps_one_latest_title_per_session(wt):
+    worker_id = "nameq-recent"
+    _write_worker_log(wt, worker_id, SID_A)
+    p = _write_transcript(wt, SID_A)
+
+    old = wt.q.enqueue(project="NAMEQ", title="Old work", note="body")
+    wt.q.claim_next(worker_id, project="NAMEQ")
+    wt.q.backfill_session_id(old["ref"], SID_A)
+    wt.q.close(old["ref"], worker_id, resolution="older title")
+
+    new = wt.q.enqueue(project="NAMEQ", title="New work", note="body")
+    wt.q.claim_next(worker_id, project="NAMEQ")
+    wt.q.backfill_session_id(new["ref"], SID_A)
+    wt.q.close(new["ref"], worker_id, resolution="newest title")
+
+    result = wt.workers.backfill_recent_session_titles(hours=24)
+
+    assert result == [
+        {
+            "worker_id": worker_id,
+            "session_id": SID_A,
+            "ref": new["ref"],
+            "title": f"NAMEQ#{new['seq']}: newest title",
+            "updated": True,
+        }
+    ]
+    lines = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+    title_events = [ev for ev in lines if ev.get("type") == "custom-title"]
+    assert title_events == [
+        {
+            "type": "custom-title",
+            "customTitle": f"NAMEQ#{new['seq']}: newest title",
+            "sessionId": SID_A,
+        }
+    ]
+
+
+def test_reconcile_backfills_recent_session_titles(wt):
+    """Closed tickets can miss claimed_session_id if the worker UUID was never
+    propagated before close. Reconcile should repair the transcript from logs
+    instead of waiting for a hidden manual command."""
+    worker_id = "nameq-recent"
+    _write_worker_log(wt, worker_id, SID_A)
+    p = _write_transcript(wt, SID_A)
+
+    item = wt.q.enqueue(project="NAMEQ", title="Log-known close", note="body")
+    wt.q.claim_next(worker_id, project="NAMEQ")
+    wt.q.close(item["ref"], worker_id, resolution="renamed from reconcile")
+
+    result = wt.workers.reconcile_once(dry_run=False)
+
+    assert result["session_title_backfilled"] == [
+        {
+            "worker_id": worker_id,
+            "session_id": SID_A,
+            "ref": item["ref"],
+            "title": f"NAMEQ#{item['seq']}: renamed from reconcile",
+            "updated": True,
+        }
+    ]
+    lines = [l for l in p.read_text().splitlines() if l.strip()]
+    assert json.loads(lines[-1]) == {
+        "type": "custom-title",
+        "customTitle": f"NAMEQ#{item['seq']}: renamed from reconcile",
         "sessionId": SID_A,
     }
 
@@ -1051,7 +1134,7 @@ def test_session_names_backfill_cli_dry_run(wt, capsys):
             "worker_id": worker_id,
             "session_id": SID_A,
             "ref": item["ref"],
-            "title": f"NAMEQ worker: {item['ref']} - Add useful titles",
+            "title": f"NAMEQ#{item['seq']}: Add useful titles",
             "updated": False,
         }
     ]

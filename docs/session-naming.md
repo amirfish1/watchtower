@@ -74,18 +74,23 @@ works:**
 
 Those paths funnel through `workers.display_name(queue, ref=None,
 summary=None)` plus `workers.ticket_context(item, summary="")`:
-- never claimed anything: `"<queue> worker"`
-- holding a ticket: `"<queue> worker: <ref> - <ticket title/note>"`
-- closed one: `"<queue> worker: <ref> - <summary, clipped to 60 chars>"`
+- never claimed anything: `"<queue> Queue worker"`
+- holding a ticket: `"<queue>#<seq>: <ticket title/note>"`
+- closed one: `"<queue>#<seq>: <summary, clipped to 60 chars>"`
 
 and one primitive, `messages.set_session_title(session_id, name)`, which
 locates the transcript (`messages._find_transcript`, the same lookup used
-by the messaging adapters) and appends the event. Both no-op silently
-(return `False`) when there's no session id or no transcript yet, so a
-non-claude engine or a session that hasn't flushed its first turn never
-blocks a claim/close over cosmetics.
+by the messaging adapters) and appends the event. It first checks the latest
+explicit `custom-title` / `agent-name` event and no-ops when the requested
+title is already current, so repeated repair passes do not append duplicate
+title events. It also no-ops silently (return `False`) when there's no session
+id or no transcript yet, so a non-claude engine or a session that hasn't
+flushed its first turn never blocks a claim/close over cosmetics.
 
-For recent history, run:
+Recent-history title repair now also runs from the reconciler tick. This covers
+workers like `bym-9af5138c`/`BYM-96`, where the worker log contained the real
+session id but the ticket closed before `claimed_session_id` was written. The
+maintenance command remains available for inspection or explicit repair:
 
 ```bash
 wt session-names backfill --hours 24 --dry-run

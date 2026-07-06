@@ -466,6 +466,27 @@ def _find_transcript(sid: str) -> Optional[Path]:
     return None
 
 
+def _latest_session_title(path: Path) -> str:
+    """Return the last explicit Claude title/agent-name in a transcript."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if ev.get("type") == "custom-title":
+            return str(ev.get("customTitle") or "")
+        if ev.get("type") == "agent-name":
+            return str(ev.get("agentName") or "")
+    return ""
+
+
 def set_session_title(sid: str, name: str) -> bool:
     """Rename a claude session by appending a ``custom-title`` event to its
     own transcript -- the exact event shape Claude writes for the in-session
@@ -482,6 +503,8 @@ def set_session_title(sid: str, name: str) -> bool:
     best-effort and never fail the ticket operation over it."""
     path = _find_transcript(sid)
     if path is None or not name:
+        return False
+    if _latest_session_title(path) == name:
         return False
     event = {"type": "custom-title", "customTitle": name, "sessionId": sid}
     try:
