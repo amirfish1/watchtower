@@ -1439,7 +1439,7 @@ def _daemon_loop(args: argparse.Namespace) -> None:
     # Always host the HTTP server alongside the watcher.
     import threading
 
-    from . import dashboard
+    from . import dashboard, queue as _q
 
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 8787)
@@ -1451,6 +1451,12 @@ def _daemon_loop(args: argparse.Namespace) -> None:
         print(f"[watchtower] HTTP server on http://{host}:{port}", flush=True)
     else:
         print(f"[watchtower] dashboard already running; skipping HTTP bind", flush=True)
+    # Log daemon start to activity log.
+    try:
+        auto_spawn_status = "auto-spawn on" if getattr(args, "auto_spawn", False) else "auto-spawn off"
+        _q._log("DAEMON_START", f"(pid {os.getpid()}) {auto_spawn_status}")
+    except Exception:
+        pass
     while True:
         result = workers.reconcile_once(dry_run=dry_run)
         # Drain queued cross-agent messages each tick. Best-effort: a messaging
@@ -1602,7 +1608,13 @@ def cmd_start(args: argparse.Namespace) -> int:
         except KeyboardInterrupt:
             print("\n[watchtower] interrupted, stopping", file=sys.stderr)
         finally:
+            # Log daemon stop to activity log.
             if not dry_run:
+                try:
+                    from . import queue as _q
+                    _q._log("DAEMON_STOP", f"(pid {os.getpid()})")
+                except Exception:
+                    pass
                 DAEMON_PID_FILE.unlink(missing_ok=True)
         return 0
     # Re-exec ourselves in the background in foreground-mode.
@@ -1648,6 +1660,12 @@ def cmd_stop(args: argparse.Namespace) -> int:
         rc = _launchctl_bootout()
         if rc == 0:
             print(f"stopped LaunchAgent {_LAUNCHAGENT_LABEL} (launchd will not relaunch)")
+            # Log stop to activity log before clearing pidfile.
+            try:
+                from . import queue as _q
+                _q._log("DAEMON_STOP", "via launchctl bootout")
+            except Exception:
+                pass
             # The launchd-owned daemon owns the pidfile; clear it so a later
             # `wt start`/status doesn't see a stale pid.
             DAEMON_PID_FILE.unlink(missing_ok=True)
@@ -1665,6 +1683,12 @@ def cmd_stop(args: argparse.Namespace) -> int:
     try:
         os.kill(pid, signal.SIGTERM)
         print(f"stopped watcher (pid {pid})")
+        # Log stop to activity log.
+        try:
+            from . import queue as _q
+            _q._log("DAEMON_STOP", f"via SIGTERM (pid {pid})")
+        except Exception:
+            pass
     except ProcessLookupError:
         print("watcher process already gone")
     finally:
