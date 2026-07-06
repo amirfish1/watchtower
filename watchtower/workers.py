@@ -1306,7 +1306,8 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             _maybe_nudge_stuck_queue(q_name, actual)
 
         if actual < desired:
-            to_spawn = desired - actual
+            # Never spawn more workers than there are tickets to work on.
+            to_spawn = min(desired - actual, depth)
             from . import queue as _q
             # Peek at the next ticket to get its repo_path; fall back to queue config.
             peeked = _q.peek_next(project=q_name)
@@ -1320,8 +1321,9 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 repo_path=repo_path, dry_run=dry_run,
             )
             # Why this spawn happened: open depth + how short of desired we were.
+            # Note: to_spawn is capped at depth (don't spawn more workers than tickets).
             spawn_reason = (
-                f"{depth} open, {actual} live < {desired} desired"
+                f"{depth} open, {actual} live < {desired} desired, spawn min({desired - actual}, {depth})"
             )
             for rec in spawned:
                 rec["spawn_reason"] = spawn_reason

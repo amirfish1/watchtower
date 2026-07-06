@@ -168,8 +168,20 @@ def test_reconcile_desired_two_spawns_two(wt):
     wt.config.set_auto_drain("Q", True)
     wt.config.set_desired_workers("Q", 2)
     wt.q.enqueue(project="Q", note="work")
+    wt.q.enqueue(project="Q", note="work")
     r = wt.workers.reconcile_once(dry_run=True)
     assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 2
+
+
+def test_reconcile_caps_spawn_at_depth(wt):
+    """Never spawn more workers than there are tickets. Even if desired=2 and
+    there's only 1 ticket, spawn only 1 worker. (WT-98)"""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 2)
+    wt.q.enqueue(project="Q", note="work")
+    r = wt.workers.reconcile_once(dry_run=True)
+    # Desired is 2, but we only have 1 ticket, so spawn only 1.
+    assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1
 
 
 def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
@@ -183,6 +195,7 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
 
     wt.config.set_auto_drain("Q", True)
     wt.config.set_desired_workers("Q", 2)
+    wt.q.enqueue(project="Q", note="work")
     wt.q.enqueue(project="Q", note="work")
 
     real_record = wt.workers.record_worker
