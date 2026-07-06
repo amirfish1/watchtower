@@ -184,6 +184,19 @@ def test_reconcile_caps_spawn_at_depth(wt):
     assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1
 
 
+def test_reconcile_does_not_overspawn_while_claiming(wt):
+    """When 1 live worker exists and 1 ticket is open, don't spawn more workers
+    while the live worker is claiming. Cap spawn at unclaimed tickets. (WT-98)"""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 2)
+    wt.q.enqueue(project="Q", note="work")
+    # Simulate: 1 live worker (hasn't claimed yet), 1 open ticket, desired=2
+    _live_worker(wt, "Q")
+    r = wt.workers.reconcile_once(dry_run=True)
+    # Even though desired=2 and actual=1, spawn 0 because 1 live can claim the 1 open.
+    assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 0
+
+
 def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
     """WT-75: the daemon tick and dispatch_after_enqueue (`wt add`) can
     reconcile the same queue concurrently. Without serialization both read the

@@ -1306,8 +1306,11 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             _maybe_nudge_stuck_queue(q_name, actual)
 
         if actual < desired:
-            # Never spawn more workers than there are tickets to work on.
-            to_spawn = min(desired - actual, depth)
+            # Never spawn more workers than unclaimed tickets. Don't assume a live
+            # worker will fail to claim: cap at (depth - actual) to avoid overspawning
+            # while workers are still claiming. E.g., 1 ticket + 1 live worker should
+            # spawn 0 more, not 1.
+            to_spawn = min(desired - actual, max(0, depth - actual))
             from . import queue as _q
             # Peek at the next ticket to get its repo_path; fall back to queue config.
             peeked = _q.peek_next(project=q_name)
@@ -1321,9 +1324,9 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 repo_path=repo_path, dry_run=dry_run,
             )
             # Why this spawn happened: open depth + how short of desired we were.
-            # Note: to_spawn is capped at depth (don't spawn more workers than tickets).
+            unclaimed = max(0, depth - actual)
             spawn_reason = (
-                f"{depth} open, {actual} live < {desired} desired, spawn min({desired - actual}, {depth})"
+                f"{depth} open, {actual} live < {desired} desired, {unclaimed} unclaimed, spawn {to_spawn}"
             )
             for rec in spawned:
                 rec["spawn_reason"] = spawn_reason
@@ -1405,7 +1408,7 @@ def spawn_workers(
         model = ""
     log_dir = WORKERS_FILE.parent / "logs"
     spawned: List[Dict[str, Any]] = []
-    for _ in range(max(1, n)):
+    for _ in range(n):
         worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
         argv = build_drain_command(queue, engine, worker_id, repo_path, model)
         goal = drain_goal(queue, worker_id, repo_path)
