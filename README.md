@@ -124,7 +124,7 @@ wt stop                                # stop the watcher
 wt uninstall                           # remove the LaunchAgent
 wt dashboard                           # open the night-watch dashboard (non-blocking)
 wt dashboard --no-open                 # ensure the server is up, don't open a browser
-wt skills sync                         # (re-)sync the agent skill into Claude/Codex
+wt skills sync                         # (re-)sync the bundled skills into installed harnesses
 ```
 
 ### Agent engines

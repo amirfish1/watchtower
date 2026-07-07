@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import time
@@ -1722,7 +1723,13 @@ def spawn_adhoc(
         )
         model = ""
     if report_to:
-        prompt = prompt + ADHOC_REPORT_FOOTER.format(report_to=report_to)
+        # shlex.quote: the target is interpolated into a shell command the
+        # agent runs verbatim -- a resolvable but hostile target ("x; rm ...")
+        # must arrive as one inert token, not as shell syntax. Normal targets
+        # (UUIDs, @names, worker ids) are unchanged by quoting.
+        prompt = prompt + ADHOC_REPORT_FOOTER.format(
+            report_to=shlex.quote(report_to)
+        )
     label = re.sub(r"[^a-z0-9]+", "-", (name or "adhoc").lower()).strip("-") or "adhoc"
     worker_id = f"{label}-{engine}-{uuid.uuid4().hex[:8]}"
     log_dir = WORKERS_FILE.parent / "logs"

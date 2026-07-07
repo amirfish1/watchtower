@@ -730,10 +730,14 @@ def cmd_send(args: argparse.Namespace) -> int:
     from . import messages
     text = args.text
     if text == "-":
-        text = sys.stdin.read().strip()
-        if not text:
+        raw = sys.stdin.read()
+        if not raw.strip():
             print("error: empty message on stdin", file=sys.stderr)
             return 1
+        # Preserve the body verbatim (leading blank lines, indentation --
+        # "the complete report text" means text-for-text). Only the single
+        # newline every heredoc/echo appends is dropped.
+        text = raw.removesuffix("\n")
     res = messages.send(
         args.target, text, mode=args.mode,
         queue_on_fail=not args.no_queue,
@@ -990,6 +994,27 @@ def cmd_critique(args: argparse.Namespace) -> int:
         report_to, rnote = _default_report_to()
         if rnote:
             print(rnote, file=sys.stderr)
+    elif family != "claude":
+        # An unknown bare UUID resolves with engine=claude *by assumption*
+        # (messages.resolve_target). A non-claude caller passing their own
+        # session UUID would get replies routed down the claude transports,
+        # which can never deliver to them -- say so before it happens.
+        from . import messages
+        try:
+            resolved = messages.resolve_target(report_to)
+        except ValueError:
+            pass  # spawn_adhoc fail-fasts on this with its own error
+        else:
+            if resolved.get("known") is False:
+                print(
+                    f"warning: --report-to {report_to} is an unknown session "
+                    "UUID, so replies will be delivered via the *claude* "
+                    f"transport. If that UUID is a {family} session, register "
+                    f"it first (`wt agents register <name> --session "
+                    f"{report_to} --engine {family}`) and pass @<name> "
+                    "instead.",
+                    file=sys.stderr,
+                )
     if not report_to and not args.dry_run:
         print(
             "warning: no --report-to and no session detected in the "

@@ -108,6 +108,7 @@ _UUID_RE = re.compile(
 _WORKER_ID_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_-]*-[0-9a-f]{8}$")
 # A candidate session-id prefix: hex plus dashes, at least 8 chars.
 _HEX_PREFIX_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,}$")
+_AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 # ------------------------------------------------------------------ path helpers
@@ -227,10 +228,18 @@ def register_agent(
     """Register (or re-register) a friendly name for a session UUID.
 
     Names must not look like a WT worker id (``<queue>-<8hex>``) or a UUID,
-    since those shapes are claimed by earlier resolve_target steps."""
+    since those shapes are claimed by earlier resolve_target steps. Names are
+    restricted to a shell-safe charset: registered names end up interpolated
+    into shell commands (e.g. the adhoc report footer's `wt send @name`), so
+    a name with spaces or shell metacharacters is an injection foothold."""
     name = str(name or "").lstrip("@").strip()
     if not name:
         raise ValueError("agent name is required")
+    if not _AGENT_NAME_RE.match(name):
+        raise ValueError(
+            f"agent name {name!r} has characters outside [A-Za-z0-9._-]; "
+            "pick a shell-safe name"
+        )
     if _WORKER_ID_SHAPE.match(name):
         raise ValueError(
             f"agent name {name!r} collides with the worker-id shape "
@@ -432,8 +441,11 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
             }
         if _UUID_RE.match(t):
             # Nothing known matches, but a full UUID is a valid address as-is.
+            # "known": False marks that the engine is an assumption (claude),
+            # not a fact -- callers holding a non-claude UUID should register
+            # it with its real engine instead of trusting this default.
             return {"kind": "session", "session_id": t, "worker": None,
-                    "engine": "claude"}
+                    "engine": "claude", "known": False}
     raise ValueError(
         f"unknown target {t!r}: not a live worker id, registered agent name, "
         "or known/full session UUID"

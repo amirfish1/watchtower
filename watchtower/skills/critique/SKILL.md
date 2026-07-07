@@ -59,16 +59,27 @@ Other flags:
   transport. **From Antigravity or any other undetected harness, pass
   `--report-to` explicitly — without it the reports only land in the
   critics' log files** (a loud warning is printed if that's about to
-  happen).
+  happen). Don't pass a raw non-Claude session UUID: an unknown UUID is
+  delivered via the *claude* transport, which can't reach you. Register it
+  first and pass the name:
+
+  ```bash
+  wt agents register me --session <your-uuid> --engine antigravity
+  wt critique "..." --family antigravity --report-to @me
+  ```
 - `--cwd <path>` — repo/dir the critique agents work in (default: the
   current directory). Applied at spawn time; it won't show inside the
   `--dry-run` argv, but the record's `repo_path` field reflects it.
-- `--dry-run` — show what would be spawned without launching anything
-  (availability preflight still runs, so a dry-run that passes will spawn).
+- `--dry-run` — show what would be spawned without launching anything.
+  Availability preflight still runs, so a selection that passes dry should
+  also pass when re-run without `--dry-run` (environment unchanged).
 - `--json` — machine-readable `[{ok, worker_id, engine, argv, error}, ...]`.
 
 `--model1`/`--model2` still work as deprecated aliases for
-`--engine1`/`--engine2`.
+`--engine1`/`--engine2` — they pick *engines*, not models. `wt critique`
+intentionally has no per-critic model pinning (each engine CLI uses its
+configured default); if you need a pinned model, spawn that critic yourself
+with `wt spawn "<goal>" --engine <e> --model <m> --report-to <you>`.
 
 For a single ad-hoc agent on any goal (the primitive critique builds on),
 use `wt spawn "<goal>" [--engine claude|codex|antigravity] [--report-to t]`.

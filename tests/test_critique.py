@@ -421,7 +421,67 @@ def test_spawn_antigravity_passes_model_through(wt, monkeypatch, tmp_path, capsy
     assert "--model" in argv and "gemini-3-pro" in argv
 
 
+def test_spawn_footer_shell_quotes_hostile_report_target(wt, monkeypatch, capsys):
+    """The footer interpolates report_to into a shell command the critic
+    runs verbatim; a resolvable-but-hostile target (worker id with shell
+    metacharacters) must arrive as one inert quoted token."""
+    cli = _cli(wt)
+    workers = _workers(wt)
+    _stub_bins(monkeypatch, workers)
+    hostile = "bad; touch pwned"
+    workers.record_worker(
+        os.getpid(), "Q", "claude", hostile, str(wt.tmp), str(wt.tmp / "w.log"),
+    )
+    rc = cli.main(["spawn", "goal", "--report-to", hostile,
+                   "--dry-run", "--json"])
+    assert rc == 0
+    prompt = json.loads(capsys.readouterr().out)["argv"][-1]
+    assert "wt send 'bad; touch pwned' - <<'WT_REPORT'" in prompt
+    assert "send bad;" not in prompt  # never the raw, splittable form
+
+
+def test_register_agent_rejects_shell_unsafe_names(wt):
+    """Registered names end up inside shell commands (report footer); names
+    outside [A-Za-z0-9._-] are an injection foothold and must be refused."""
+    for bad in ("x; touch /tmp/nope", "a b", "who`ami`", "$(x)", "it's"):
+        with pytest.raises(ValueError):
+            wt.messages.register_agent(bad, PARENT_SID)
+
+
+def test_critique_warns_when_nonclaude_family_reports_to_unknown_uuid(wt, monkeypatch, capsys):
+    """An unknown bare UUID resolves as engine=claude by assumption; a
+    non-claude caller pointing replies at their own session UUID would
+    never receive them -- must warn with the register recipe."""
+    cli = _cli(wt)
+    workers = _workers(wt)
+    _stub_bins(monkeypatch, workers)
+    monkeypatch.setattr(workers, "engine_available", lambda e: True)
+
+    rc = cli.main(["critique", "goal", "--family", "antigravity",
+                   "--report-to", PARENT_SID, "--dry-run", "--json"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "claude" in err and "wt agents register" in err
+
+
 # ------------------------------------------------------------------ wt send -
+def test_send_preserves_body_verbatim_except_one_trailing_newline(wt, monkeypatch, capsys):
+    """The footer promises delivery of "the complete report text": leading
+    blank lines and indentation must survive; only the single newline a
+    heredoc appends is dropped."""
+    cli = _cli(wt)
+    raw = "\n    indented code\n\ntail line\n\n"
+    sent = {}
+    monkeypatch.setattr(
+        wt.messages, "send",
+        lambda target, text, **kw: sent.update(text=text) or {"ok": True},
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(raw))
+    rc = cli.main(["send", "@amir", "-"])
+    assert rc == 0
+    assert sent["text"] == "\n    indented code\n\ntail line\n"
+
+
 def test_send_reads_body_from_stdin_with_dash(wt, monkeypatch, capsys):
     """`wt send <t> -` is the quote-safe delivery path the report footer
     uses: bodies full of "quotes", $vars and `backticks` arrive verbatim."""
