@@ -13,11 +13,13 @@ session when done.
 
 ## Requirements
 
-`wt critique` needs `wt` on `$PATH` and a local Claude Command Center (CCC)
-running (it delegates the actual spawn to CCC — same delegate bridge
-`wt send`/`wt ask` already use). If `wt critique` errors with "no delegate
-configured", CCC isn't running here; say so rather than guessing at a
-workaround.
+`wt critique` needs `wt` on `$PATH` plus the engine CLIs it spawns (`claude`,
+`codex`, `agy`). Spawning is WT-native — no CCC required: each critic runs as
+a local one-shot process tracked in `wt workers` (kind `adhoc`), and the
+report comes back via `wt send` (parking in the WT outbox if the target is
+unreachable). If a default engine's CLI is missing, that critic falls back to
+your own family with a printed note; an explicitly requested engine that is
+missing errors instead.
 
 ## Usage
 
@@ -40,11 +42,16 @@ wt critique "review this diff" --model1 codex --model2 antigravity
 ```
 
 Other flags:
-- `--report-to <session-id>` — who the critics report back to (default
+- `--report-to <target>` — who the critics report back to via `wt send`: a
+  worker id, `@agent` name, or session UUID (default
   `$CLAUDE_CODE_SESSION_ID`, i.e. you).
-- `--cwd <path>` — repo/dir the critique agents start in (default: CCC's own
-  default, usually the current repo).
-- `--json` — machine-readable `[{ok, session_id, engine, error}, ...]`.
+- `--cwd <path>` — repo/dir the critique agents work in (default: the
+  current directory).
+- `--dry-run` — show what would be spawned without launching anything.
+- `--json` — machine-readable `[{ok, worker_id, engine, argv, error}, ...]`.
+
+For a single ad-hoc agent on any goal (the primitive critique builds on),
+use `wt spawn "<goal>" [--engine claude|codex|antigravity] [--report-to t]`.
 
 ## What the goal text should contain
 

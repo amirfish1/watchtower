@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import time
 import uuid
@@ -142,6 +143,29 @@ RUN_ONCE_GOAL_TEMPLATE = (
 )
 
 _ENGINE_BIN = {"claude": "claude", "codex": "codex"}
+
+
+def _resolve_antigravity_bin() -> str:
+    """Locate the Antigravity AGY CLI. Env override first (nonstandard
+    installs), then `agy`/`antigravity` on PATH. Empty string when absent."""
+    env_bin = os.environ.get("WATCHTOWER_ANTIGRAVITY_BIN")
+    if env_bin:
+        expanded = os.path.expanduser(env_bin)
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
+        return ""
+    for cmd in ("agy", "antigravity"):
+        found = shutil.which(cmd)
+        if found:
+            return found
+    return ""
+
+
+def engine_available(engine: str) -> bool:
+    """True if the engine's CLI binary is resolvable on this machine."""
+    if engine == "antigravity":
+        return bool(_resolve_antigravity_bin())
+    return bool(shutil.which(_ENGINE_BIN.get(engine, engine)))
 
 # Fable is a creative/story model — not suited for code work.  Spawning a
 # worker with it produces poor results; guard against accidental selection.
@@ -339,6 +363,12 @@ def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
     for w in list_workers(prune=False):
         if not w.get("alive"):
             continue
+        # Ad-hoc one-shot agents (wt spawn / wt critique) run in print mode:
+        # their stdout is buffered until the end, so the log-mtime idle clock
+        # reads "stale" while they are actively thinking. They exit on their
+        # own and get pruned as dead records -- never reap them.
+        if w.get("kind") == "adhoc":
+            continue
         if queue and w.get("queue") != queue:
             continue
         if _worker_idle_s(w) < max_idle_s:
@@ -532,6 +562,7 @@ def record_worker(
     fifo: str = "",
     session_id: str = "",
     model: str = "",
+    kind: str = "",
 ) -> Dict[str, Any]:
     data = _load()
     rec = {
@@ -546,6 +577,8 @@ def record_worker(
     }
     if model:
         rec["model"] = model
+    if kind:
+        rec["kind"] = kind
     if session_id:
         rec["session_id"] = session_id
     data["workers"].append(rec)
@@ -1571,4 +1604,128 @@ def spawn_run_once_worker(
     )
     rec["argv"] = argv
     rec["ref"] = ref
+    return rec
+
+
+# --------------------------------------------------------------- ad-hoc spawns
+# `wt spawn` / `wt critique` (WT-100): one-shot agents with an arbitrary goal,
+# spawned natively (no CCC dependency) and tracked in workers.json like any
+# other worker, but marked kind="adhoc" so queue machinery (reap, reconcile
+# nudges) leaves them alone. Reply-to is WT-native: the goal gets a footer
+# telling the agent to deliver its report with `wt send <report_to>` -- the
+# same delivery path (and outbox fallback) every other WT message uses.
+
+ADHOC_ENGINES = ("claude", "codex", "antigravity")
+
+ADHOC_REPORT_FOOTER = (
+    "\n\nWHEN DONE: deliver your full findings (the complete report text, not "
+    "a pointer to a file or session) back to your dispatcher with "
+    "`wt send {report_to} \"<your full report>\"`. If the send fails it parks "
+    "in the WT outbox for later delivery -- do not retry in a loop. Then end "
+    "your turn."
+)
+
+
+def build_adhoc_command(
+    engine: str, prompt: str, *, model: str = "", repo_path: str = "",
+    log_path: str = "",
+) -> List[str]:
+    """Argv for a one-shot ad-hoc agent. All engines run in print/exec mode
+    with the goal in argv -- no FIFO, no drain loop; the process exits when
+    the goal is done. Raises ValueError for an engine we can't build."""
+    if engine == "codex":
+        argv = [_ENGINE_BIN["codex"], "exec"]
+        if model:
+            argv += ["--model", model]
+        argv.append(prompt)
+        return argv
+    if engine == "antigravity":
+        bin_path = _resolve_antigravity_bin()
+        if not bin_path:
+            raise ValueError(
+                "antigravity CLI not found (install agy or set "
+                "WATCHTOWER_ANTIGRAVITY_BIN)"
+            )
+        argv = [bin_path, "--dangerously-skip-permissions"]
+        if repo_path:
+            argv += ["--add-dir", repo_path]
+        if log_path:
+            argv += ["--log-file", log_path + ".agy.log"]
+        # Model override needs AGY's settings-file dance (see CCC's
+        # _set_antigravity_cli_model); unsupported here -- AGY's configured
+        # default is used.
+        argv += ["-p", prompt]
+        return argv
+    if engine == "claude":
+        argv = [_ENGINE_BIN["claude"], "-p",
+                "--permission-mode", "bypassPermissions"]
+        if model:
+            argv += ["--model", model]
+        argv.append(prompt)
+        return argv
+    raise ValueError(
+        f"unsupported engine {engine!r} (supported: {', '.join(ADHOC_ENGINES)})"
+    )
+
+
+def spawn_adhoc(
+    prompt: str,
+    engine: str = "claude",
+    *,
+    model: str = "",
+    repo_path: str = "",
+    name: str = "",
+    report_to: str = "",
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """Spawn one one-shot ad-hoc agent on ``prompt`` and return its record.
+
+    ``report_to`` (worker id, @agent name, or session UUID) appends the
+    WT-native reply-to footer so the agent reports back via `wt send`.
+    ``dry_run`` builds + returns the record without spawning (tests)."""
+    repo_path = repo_path or os.getcwd()
+    if _is_fable_model(model):
+        import sys
+        print(
+            f"[watchtower] warning: refusing fable model {model!r} for ad-hoc"
+            " agent -- not a coding model; falling back to CLI default",
+            file=sys.stderr, flush=True,
+        )
+        model = ""
+    if report_to:
+        prompt = prompt + ADHOC_REPORT_FOOTER.format(report_to=report_to)
+    label = re.sub(r"[^a-z0-9]+", "-", (name or "adhoc").lower()).strip("-") or "adhoc"
+    worker_id = f"{label}-{engine}-{uuid.uuid4().hex[:8]}"
+    log_dir = WORKERS_FILE.parent / "logs"
+    log_path = log_dir / f"{worker_id}.log"
+    argv = build_adhoc_command(
+        engine, prompt, model=model, repo_path=repo_path, log_path=str(log_path),
+    )
+    if dry_run:
+        rec = {
+            "worker_id": worker_id, "pid": 0, "queue": label.upper(),
+            "engine": engine, "repo_path": repo_path, "argv": argv,
+            "kind": "adhoc", "dry_run": True,
+        }
+        if model:
+            rec["model"] = model
+        return rec
+    log_dir.mkdir(parents=True, exist_ok=True)
+    logf = open(log_path, "ab")
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            cwd=repo_path,
+        )
+    finally:
+        logf.close()
+    rec = record_worker(
+        proc.pid, label.upper(), engine, worker_id, repo_path, str(log_path),
+        model=model, kind="adhoc",
+    )
+    rec["argv"] = argv
     return rec

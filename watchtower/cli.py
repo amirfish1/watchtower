@@ -21,6 +21,7 @@
     wt ask <target> "q"       ask a target and wait for its reply
     wt outbox ls|retry|rm     inspect and manage undelivered messages
     wt critique "goal"        spawn 2 cross-family critique agents on a goal
+    wt spawn "goal"           spawn one ad-hoc one-shot agent (WT Spawn)
     wt agents                 address book: registered agents + live workers
     wt agents register|rm     name a session UUID / drop a name (set-name is
                                an alias for register)
@@ -820,46 +821,48 @@ def _critique_prompt(goal: str) -> str:
 def cmd_critique(args: argparse.Namespace) -> int:
     """Spawn two independent critique agents on a goal (WT-100).
 
-    Reuses the same CCC delegate `wt send`/`wt ask` already bridge through
-    (messages._delegate_base / _post_json) but targets CCC's session-spawn
-    endpoint instead of inject-input, since this creates new sessions rather
-    than messaging existing ones. Each spawned agent is given --report-to (or
-    $CLAUDE_CODE_SESSION_ID) as its reply-to address via CCC's existing
-    report_to spawn param, so it reports back when done without any new
-    delivery plumbing.
+    Spawns natively via workers.spawn_adhoc -- no CCC dependency. The two
+    engines default to the families OTHER than yours (--family, default
+    claude); --model1/--model2 override them explicitly. Each critic's goal
+    carries a WT-native reply-to footer (`wt send <report_to>`), so the
+    report comes back over the same delivery path (and outbox fallback)
+    every other WT message uses.
     """
-    from . import messages
-
-    base = messages._delegate_base()
-    if not base:
-        print(
-            "error: no delegate configured -- critique needs a local CCC to "
-            "spawn agents (set $WATCHTOWER_DELEGATE_URL or run CCC so "
-            "~/.claude/command-center/port.txt exists)",
-            file=sys.stderr,
-        )
-        return 1
+    from . import workers
 
     family = (args.family or "claude").strip().lower()
     others = [f for f in _CRITIQUE_FAMILIES if f != family]
-    engine1 = (args.model1 or others[0]).strip().lower()
-    engine2 = (args.model2 or others[1]).strip().lower()
+    explicit = [e.strip().lower() for e in (args.model1, args.model2) if e.strip()]
+    if explicit:
+        engines = ([args.model1.strip().lower() or others[0],
+                    args.model2.strip().lower() or others[1]])
+    else:
+        # Availability fallback: a default pick whose CLI is missing gets
+        # substituted with the spawner's own family rather than failing --
+        # a same-family critic beats one fewer critic. Explicit overrides
+        # never fall back (the user asked for that engine by name).
+        engines = []
+        for eng in others:
+            if workers.engine_available(eng):
+                engines.append(eng)
+            else:
+                print(f"note: {eng} CLI not found -- falling back to {family} "
+                      f"(your own family) for this critic", file=sys.stderr)
+                engines.append(family)
 
     report_to = args.report_to or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
     prompt = _critique_prompt(args.goal)
 
     results = []
-    for engine in (engine1, engine2):
-        payload: Dict[str, object] = {"prompt": prompt, "engine": engine}
-        if report_to:
-            payload["report_to"] = report_to
-        if args.cwd:
-            payload["cwd"] = args.cwd
+    for engine in engines:
         try:
-            data = messages._post_json(base + "/api/sessions/spawn", payload, timeout_s=15)
-        except Exception as e:  # noqa: BLE001 - report and move to the next spawn
-            data = {"ok": False, "error": str(e)}
-        data.setdefault("engine", engine)
+            rec = workers.spawn_adhoc(
+                prompt, engine, repo_path=args.cwd, name="critique",
+                report_to=report_to, dry_run=args.dry_run,
+            )
+            data: Dict[str, object] = {"ok": True, **rec}
+        except (ValueError, OSError) as e:
+            data = {"ok": False, "engine": engine, "error": str(e)}
         results.append(data)
 
     ok_all = all(r.get("ok") for r in results)
@@ -868,10 +871,45 @@ def cmd_critique(args: argparse.Namespace) -> int:
         return 0 if ok_all else 1
     for r in results:
         if r.get("ok"):
-            print(f"spawned {r['engine']}: {r.get('session_id', '?')}")
+            what = "would spawn" if r.get("dry_run") else "spawned"
+            print(f"{what} {r['engine']}: {r.get('worker_id', '?')} "
+                  f"(log {r.get('log', '-')})")
         else:
             print(f"error spawning {r['engine']}: {r.get('error', 'spawn failed')}", file=sys.stderr)
+    if report_to and not args.dry_run and ok_all:
+        print(f"critics will report back to {report_to} via `wt send` when done")
     return 0 if ok_all else 1
+
+
+def cmd_spawn(args: argparse.Namespace) -> int:
+    """Spawn one ad-hoc one-shot agent on an arbitrary goal (WT Spawn).
+
+    The native primitive `wt critique` builds on: any of claude / codex /
+    antigravity, tracked in workers.json (kind=adhoc, exempt from reap), with
+    an optional WT-native reply-to footer."""
+    from . import workers
+
+    try:
+        rec = workers.spawn_adhoc(
+            args.goal, (args.engine or "claude").strip().lower(),
+            model=args.model, repo_path=args.repo, name=args.name,
+            report_to=args.report_to, dry_run=args.dry_run,
+        )
+    except (ValueError, OSError) as e:
+        if args.json:
+            print(json.dumps({"ok": False, "error": str(e)}))
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps({"ok": True, **rec}, indent=2))
+        return 0
+    what = "would spawn" if rec.get("dry_run") else "spawned"
+    print(f"{what} {rec['engine']} agent {rec['worker_id']} "
+          f"(pid {rec.get('pid', 0)}, log {rec.get('log', '-')})")
+    if args.report_to and not args.dry_run:
+        print(f"it will report back to {args.report_to} via `wt send` when done")
+    return 0
 
 
 def cmd_receipts(args: argparse.Namespace) -> int:
@@ -2081,6 +2119,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Agent messaging", "send"),
     ("Agent messaging", "ask"),
     ("Agent messaging", "critique"),
+    ("Agent messaging", "spawn"),
     ("Agent messaging", "outbox"),
     ("Agent messaging", "agents"),
     ("Agent messaging", "chat"),
@@ -2119,7 +2158,8 @@ COMMAND_HELP: Dict[str, str] = {
     "agents": "address book: list reachable agents; register/set-name/rm to name them",
     "send": "push a message to a worker/agent/session",
     "ask": "ask a target and wait for its reply",
-    "critique": "spawn 2 cross-family critique agents on a goal (via CCC)",
+    "critique": "spawn 2 cross-family critique agents on a goal",
+    "spawn": "spawn one ad-hoc one-shot agent on a goal (WT Spawn)",
     "outbox": "inspect and manage undelivered messages",
     "chat": "group chats: multi-agent conversations",
     "start": "start the service (installs the LaunchAgent on first run)",
@@ -2399,11 +2439,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model1", default="", help="override the first critique engine")
     s.add_argument("--model2", default="", help="override the second critique engine")
     s.add_argument("--report-to", default="", dest="report_to",
-                   help="session id the critique agents report back to "
+                   help="worker id, @agent, or session UUID the critique agents "
+                        "report back to via `wt send` "
                         "(default $CLAUDE_CODE_SESSION_ID)")
     s.add_argument("--cwd", default="", help="repo/dir the critique agents start in")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="build the spawn commands without launching anything")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_critique)
+
+    s = sub.add_parser("spawn")
+    s.add_argument("goal", help="the task for the ad-hoc agent")
+    s.add_argument("--engine", default="claude",
+                   help="claude (default) | codex | antigravity")
+    s.add_argument("--model", default="",
+                   help="model override (claude/codex only; antigravity uses "
+                        "its configured default)")
+    s.add_argument("--repo", default="", help="repo/dir the agent works in "
+                                              "(default: cwd)")
+    s.add_argument("--name", default="", help="label for the worker id/log")
+    s.add_argument("--report-to", default="", dest="report_to",
+                   help="worker id, @agent, or session UUID to report back to "
+                        "via `wt send` when done")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="build the spawn command without launching")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_spawn)
 
     s = sub.add_parser("outbox")
     s.set_defaults(func=cmd_outbox, outbox_command=None)
