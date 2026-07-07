@@ -702,6 +702,29 @@ def test_spawn_workers_includes_engine_and_model_in_record(wt):
     assert rec.get("model") == "claude-sonnet-5"
 
 
+def test_spawn_run_once_worker_logs_spawn(wt, monkeypatch):
+    """WT-103: the "drain once" play button's spawn must land a SPAWN row in
+    the activity log, same as a reconcile-driven spawn -- otherwise the
+    action leaves no trace at all."""
+    wt.config.set_auto_drain("Q", False)
+    item = wt.q.enqueue(project="Q", note="work")
+    ref = item["ref"]
+
+    class FakeProc:
+        pid = 999999
+
+    monkeypatch.setattr(wt.workers.subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(wt.workers, "write_to_worker_fifo", lambda *a, **k: True)
+
+    rec = wt.workers.spawn_run_once_worker("Q", ref)
+    assert rec["queue"] == "Q"
+    assert rec["ref"] == ref
+
+    log_content = (wt.tmp / "activity.log").read_text()
+    assert "SPAWN" in log_content
+    assert f"run-once for {ref}" in log_content
+
+
 # ============================================ cache-TTL staleness (warm vs cold)
 def _age_worker_log(wt, rec, seconds):
     """Backdate a worker's log mtime so it reads as idle for `seconds`."""

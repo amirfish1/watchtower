@@ -1605,6 +1605,15 @@ def spawn_run_once_worker(
     )
     rec["argv"] = argv
     rec["ref"] = ref
+    # WT-103: run-once spawns bypass reconcile(), which is the only other
+    # place that writes a SPAWN row -- without this, the "drain once" play
+    # button leaves no trace in the activity log at all.
+    try:
+        from watchtower.queue import _log
+        engine_label = f"{engine}:{model}" if model else engine
+        _log("SPAWN", f"{worker_id} (pid {proc.pid}) [{engine_label}] — run-once for {ref}", queue=queue)
+    except Exception:
+        pass
     return rec
 
 
