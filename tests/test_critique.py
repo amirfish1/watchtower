@@ -203,6 +203,8 @@ def test_critique_unavailable_default_falls_back_to_own_family(wt, monkeypatch, 
     monkeypatch.setattr(
         workers, "engine_available", lambda e: e != "antigravity"
     )
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", PARENT_SID)
 
     rc = cli.main(["critique", "goal", "--dry-run", "--json"])
     assert rc == 0
