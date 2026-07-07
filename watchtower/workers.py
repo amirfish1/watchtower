@@ -274,6 +274,20 @@ def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) ->
 _STUCK_NUDGE_COOLDOWN_S = WARM_TTL_S
 _last_stuck_nudge: Dict[str, float] = {}
 
+# Grace period after a worker comes alive before it's eligible for a
+# stuck-queue nudge. A ticket that sat unclaimed for a long time (no live
+# worker to claim it) reads `stuck=True` the instant the queue gets staffed --
+# before the fresh worker has had any chance to start up and run its first
+# `wt claim`. Without this grace, a reconcile tick landing in that startup
+# window nudges a worker that's had zero time to make progress (WT-101).
+_NUDGE_STARTUP_GRACE_S = 45
+
+
+def _all_workers_within_startup_grace(workers: List[Dict[str, Any]]) -> bool:
+    """True if every live worker is too freshly started to plausibly have
+    claimed a ticket yet -- a spawn/dispatch race, not real staleness."""
+    return all(_worker_idle_s(w) < _NUDGE_STARTUP_GRACE_S for w in workers)
+
 
 def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
     """Nudge live workers on a stuck-but-staffed queue to retry/continue.
@@ -1301,8 +1315,13 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         # crashed (a crash is caught by the reap+requeue pass above, which
         # frees the slot for a fresh spawn). Detect via the queue's own stuck
         # ground truth (no ticket closed in stuck_minutes despite claimable
-        # work) and nudge the live worker(s) to retry/continue.
-        if not dry_run and actual > 0 and (health_by_queue.get(q_name) or {}).get("stuck"):
+        # work) and nudge the live worker(s) to retry/continue -- unless every
+        # live worker just started (startup grace, WT-101): a ticket that sat
+        # unclaimed for a while reads `stuck` the moment it's staffed, before
+        # the fresh worker has had any chance to run its first `wt claim`.
+        if (not dry_run and actual > 0
+                and (health_by_queue.get(q_name) or {}).get("stuck")
+                and not _all_workers_within_startup_grace(live)):
             _maybe_nudge_stuck_queue(q_name, actual)
 
         if actual < desired:

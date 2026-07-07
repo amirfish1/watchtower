@@ -358,6 +358,31 @@ def test_reconcile_nudges_live_worker_on_stuck_queue(wt):
     assert "Q" in msg["message"]["content"][0]["text"]
 
 
+def test_reconcile_does_not_nudge_freshly_spawned_worker(wt):
+    """WT-101: a ticket that sat unclaimed for a long time (no live worker to
+    claim it) reads `stuck=True` the instant the queue gets staffed -- before
+    the fresh worker has had any chance to start up and run its first
+    `wt claim`. A reconcile tick landing in that startup window must not
+    nudge a worker that's had zero time to make progress."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    item = wt.q.enqueue(project="Q", note="work")
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == item["ref"]:
+            it["created_at"] = "2000-01-01T00:00:00Z"  # long past stuck_minutes
+    wt.q._save_unlocked(data)
+
+    _live_worker(wt, "Q")  # freshly recorded -- log mtime is "now", not aged
+
+    r = wt.workers.reconcile_once(dry_run=False)
+    assert not r["spawned"]  # actual==desired -- this isn't the spawn path
+
+    fd = wt._readers[-1]
+    readable, _, _ = select.select([fd], [], [], 0.2)
+    assert not readable  # no nudge -- worker hasn't had a fair chance yet
+
+
 def test_reconcile_stuck_nudge_has_cooldown(wt):
     """A queue that stays stuck across many reconcile ticks must not be
     re-nudged every tick -- that would spam the worker's FIFO once per
