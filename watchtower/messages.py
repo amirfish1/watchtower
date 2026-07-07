@@ -535,6 +535,67 @@ def session_state(sid: str, now: Optional[float] = None) -> str:
     return "busy" if (now - mtime) < _busy_window_s() else "idle"
 
 
+def _displaced_claim_for_session(sid: str) -> Optional[Dict[str, str]]:
+    """If ``sid`` was a worker that got reaped mid-ticket and its claim was
+    taken over, return ``{"ref", "reason"}`` describing the displacement; else
+    None. Used to guard a headless resume so a revived worker does not silently
+    resume onto -- and re-commit -- work another worker already redrained.
+
+    Signal (false-positive-free by construction): the ticket still records this
+    session as owner (``claimed_session_id == sid``) AND its history carries a
+    ``reopen`` event with reason "worker gone" (the reaper's mark -- a normally
+    closed ticket never has one) AND it is no longer actively in_progress under
+    this session (status is ``open`` = reopened, or ``closed`` = reassigned and
+    closed by another). A worker that finished its own ticket has no reopen
+    event, so it is never flagged; one that was reaped-then-legitimately
+    reclaimed by ITSELF is back to in_progress, so it is not flagged either.
+
+    Best-effort: any lookup failure returns None -- the guard must never break
+    delivery."""
+    if not sid:
+        return None
+    try:
+        from . import queue as _q
+        items = _q.list_items()
+    except Exception:
+        return None
+    for it in items:
+        if str(it.get("claimed_session_id") or "") != sid:
+            continue
+        status = it.get("status")
+        if status not in ("open", "closed"):
+            continue  # in_progress under this session -> still legitimately theirs
+        reaped = any(
+            e.get("event") == "reopen"
+            and "worker gone" in str(e.get("reason") or "").lower()
+            for e in (it.get("history") or [])
+        )
+        if not reaped:
+            continue  # closed/released normally, not taken away
+        reason = ("reopened after you were reaped for idling"
+                  if status == "open"
+                  else "reassigned and closed by another worker after you were reaped")
+        return {"ref": str(it.get("ref") or "?"), "reason": reason}
+    return None
+
+
+def _stale_claim_stop_prefix(sid: str) -> str:
+    """A hard STOP directive to prepend to a resumed worker's message when its
+    ticket was taken from it (see ``_displaced_claim_for_session``). Empty when
+    the session holds no displaced claim."""
+    d = _displaced_claim_for_session(sid)
+    if not d:
+        return ""
+    ref = d["ref"]
+    return (
+        f"[WATCHTOWER] STOP before you continue. Your ticket {ref} is no longer "
+        f"yours: {d['reason']}. Another worker has taken it over. Do NOT resume "
+        f"that work, do NOT commit, and do NOT close {ref} (a duplicate close is "
+        f"rejected). Discard any uncommitted changes for {ref}, then go back to "
+        f"`wt claim` for fresh work.\n\n"
+    )
+
+
 def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     """Adapter 2: wake an idle claude session headless and hand it the message.
 
@@ -546,6 +607,16 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     sid = str(resolved.get("session_id") or "")
     if resolved.get("engine") != "claude" or not sid:
         return {"ok": False, "error": "resume needs a claude session_id"}
+    # Reap-displacement guard: if this session was a worker reaped mid-ticket
+    # and its claim was taken over, waking it back into that half-done work is
+    # how the same ticket gets fixed and committed twice (the reaped session
+    # resumes with warm context that predates the takeover). Prepend a hard STOP
+    # so the revived worker drops the stale work and re-claims instead. We still
+    # deliver -- the worker must wake to act on the STOP. Never blocks a normal
+    # (non-displaced) resume, so human/chat/orchestrator messages pass through.
+    _stop_prefix = _stale_claim_stop_prefix(sid)
+    if _stop_prefix:
+        text = _stop_prefix + text
     if _session_busy(sid):
         return {
             "ok": False,

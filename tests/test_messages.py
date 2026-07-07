@@ -672,6 +672,90 @@ def test_drain_delivers_after_transcript_goes_quiet(wt, monkeypatch):
     assert wt.messages.outbox_list()[0]["status"] == "delivered"
 
 
+# ============================== reap-displacement guard on resume (dup-work fix)
+def _claim(wt, ref, *, worker, sid=""):
+    """Force a ticket into in_progress under (worker, sid) without a real spawn."""
+    wt.q.update_status(ref, "in_progress", session_id=worker, session_uuid=sid)
+
+
+def test_displaced_claim_detected_when_reopened(wt):
+    ref = wt.q.enqueue(project="Q", note="fix a thing", source="test")["ref"]
+    _claim(wt, ref, worker="worker-a", sid=SID_A)
+    wt.q.update_status(ref, "open", reason="worker gone")  # reaper takes it back
+    d = wt.messages._displaced_claim_for_session(SID_A)
+    assert d and d["ref"] == ref and "reaped" in d["reason"]
+    assert "[WATCHTOWER] STOP" in wt.messages._stale_claim_stop_prefix(SID_A)
+    assert ref in wt.messages._stale_claim_stop_prefix(SID_A)
+
+
+def test_displaced_claim_detected_when_reassigned_and_closed(wt):
+    # The exact CCC-502 shape: reaped, reopened, then a DIFFERENT worker closed
+    # it while claimed_session_id still points at the reaped session.
+    ref = wt.q.enqueue(project="Q", note="fix a thing", source="test")["ref"]
+    _claim(wt, ref, worker="worker-a", sid=SID_A)
+    wt.q.update_status(ref, "open", reason="worker gone")
+    wt.q.close(ref, "worker-b", resolution={"summary": "done by b"})
+    d = wt.messages._displaced_claim_for_session(SID_A)
+    assert d and d["ref"] == ref and "another worker" in d["reason"]
+
+
+def test_no_guard_for_normally_finished_worker(wt):
+    # Claimed and closed by the same session, no reap: must NOT be flagged, or
+    # every worker resumed for its NEXT ticket would be falsely nagged.
+    ref = wt.q.enqueue(project="Q", note="fix a thing", source="test")["ref"]
+    _claim(wt, ref, worker="worker-a", sid=SID_A)
+    wt.q.close(ref, "worker-a", resolution={"summary": "done"})
+    assert wt.messages._displaced_claim_for_session(SID_A) is None
+    assert wt.messages._stale_claim_stop_prefix(SID_A) == ""
+
+
+def test_no_guard_while_still_in_progress(wt):
+    ref = wt.q.enqueue(project="Q", note="fix a thing", source="test")["ref"]
+    _claim(wt, ref, worker="worker-a", sid=SID_A)
+    assert wt.messages._displaced_claim_for_session(SID_A) is None
+
+
+def test_no_guard_for_self_reclaim_after_reap(wt):
+    # Reaped, reopened, then the SAME session legitimately reclaimed it: it is
+    # back in_progress under this session, so no STOP.
+    ref = wt.q.enqueue(project="Q", note="fix a thing", source="test")["ref"]
+    _claim(wt, ref, worker="worker-a", sid=SID_A)
+    wt.q.update_status(ref, "open", reason="worker gone")
+    _claim(wt, ref, worker="worker-a", sid=SID_A)
+    assert wt.messages._displaced_claim_for_session(SID_A) is None
+
+
+def test_no_guard_for_non_claimant_session(wt):
+    # A plain chat/orchestrator target that never held a claim passes through.
+    wt.q.enqueue(project="Q", note="fix a thing", source="test")
+    assert wt.messages._displaced_claim_for_session(SID_B) is None
+
+
+def test_resume_prepends_stop_prefix_for_displaced_worker(wt, monkeypatch):
+    _write_transcript(wt, SID_B, age_s=600)  # idle -> resume adapter runs
+    ref = wt.q.enqueue(project="Q", note="fix a thing", source="test")["ref"]
+    _claim(wt, ref, worker="worker-a", sid=SID_B)
+    wt.q.update_status(ref, "open", reason="worker gone")
+    calls = []
+    monkeypatch.setattr(wt.messages.subprocess, "Popen", _fake_popen(calls))
+    res = wt.messages.send(SID_B, "here is your next ticket")
+    assert res["ok"] is True and res["transport"] == "resume"
+    delivered = calls[0][2].stdin.data.decode()
+    assert "[WATCHTOWER] STOP" in delivered and ref in delivered
+    assert "here is your next ticket" in delivered  # original text preserved
+
+
+def test_resume_no_prefix_for_normal_session(wt, monkeypatch):
+    _write_transcript(wt, SID_B, age_s=600)
+    calls = []
+    monkeypatch.setattr(wt.messages.subprocess, "Popen", _fake_popen(calls))
+    res = wt.messages.send(SID_B, "just a normal message")
+    assert res["ok"] is True and res["transport"] == "resume"
+    delivered = calls[0][2].stdin.data.decode()
+    assert "[WATCHTOWER] STOP" not in delivered
+    assert "just a normal message" in delivered
+
+
 # ============================================================ ask (byte-offset)
 def test_ask_correlation_reads_only_new_bytes(wt):
     rec = _live_worker(wt, "Q")
