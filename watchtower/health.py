@@ -132,13 +132,21 @@ def queue_status(
     )
     oldest_open_age = _age_seconds(oldest_created, now)
 
-    # Most recent progress = most recent close. If never closed, fall back to
-    # the oldest open item's creation time (so a never-touched queue ages).
+    # Most recent progress = most recent close OR claim (a fresh claim means a
+    # worker just started on previously-idle work, which resets the clock --
+    # otherwise a ticket that sat open for a while before being claimed makes
+    # the queue read "stuck" the instant a worker picks it up, before it's had
+    # any chance to work). If neither ever happened, fall back to the oldest
+    # open item's creation time (so a never-touched queue still ages).
     last_close = max(
         (str(it["closed_at"]) for it in closed if it.get("closed_at") and isinstance(it.get("closed_at"), str)),
         default=None,
     )
-    progress_ref = last_close or oldest_created
+    last_claim = max(
+        (str(it["claimed_at"]) for it in in_progress if it.get("claimed_at") and isinstance(it.get("claimed_at"), str)),
+        default=None,
+    )
+    progress_ref = max((r for r in (last_close, last_claim) if r), default=None) or oldest_created
     since_progress = _age_seconds(progress_ref, now)
 
     stuck = bool(
