@@ -629,6 +629,10 @@ def test_drain_goal_content(wt):
     assert "end" in goal.lower()
     # Per-queue learnings: read at spawn, update at drain-completion.
     assert "learnings/Q.md" in goal
+    # Resume guard: a reaped worker resumed mid-work must re-verify ownership
+    # before editing/committing/closing, so it can't redo a reassigned ticket.
+    assert "RESUME CHECK" in goal
+    assert "wt find" in goal and "claimed_by" in goal
 
 
 def test_config_is_reconcile_source_and_default_off(wt):
