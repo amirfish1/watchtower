@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from watchtower import skills_sync
 
-EXPECTED_SKILLS = ("watchtower", "group-chat-checkin")
+EXPECTED_SKILLS = ("watchtower", "group-chat-checkin", "critique")
 
 
 def _homes(tmp_path, present=("claude", "codex")):
@@ -30,8 +30,10 @@ def test_sync_links_into_every_present_harness(tmp_path):
     assert actions == {
         ("claude", "watchtower"): "linked",
         ("claude", "group-chat-checkin"): "linked",
+        ("claude", "critique"): "linked",
         ("codex", "watchtower"): "linked",
         ("codex", "group-chat-checkin"): "linked",
+        ("codex", "critique"): "linked",
     }
     for engine, home in homes.items():
         for skill_name in EXPECTED_SKILLS:
@@ -47,8 +49,10 @@ def test_sync_links_all_bundled_skills_into_every_present_harness(tmp_path):
     assert actions == {
         ("claude", "watchtower"): "linked",
         ("claude", "group-chat-checkin"): "linked",
+        ("claude", "critique"): "linked",
         ("codex", "watchtower"): "linked",
         ("codex", "group-chat-checkin"): "linked",
+        ("codex", "critique"): "linked",
     }
 
 

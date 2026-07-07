@@ -20,6 +20,7 @@
     wt send <target> "text"   push a message to a worker/agent/session
     wt ask <target> "q"       ask a target and wait for its reply
     wt outbox ls|retry|rm     inspect and manage undelivered messages
+    wt critique "goal"        spawn 2 cross-family critique agents on a goal
     wt agents                 address book: registered agents + live workers
     wt agents register|rm     name a session UUID / drop a name (set-name is
                                an alias for register)
@@ -791,6 +792,86 @@ def cmd_ask(args: argparse.Namespace) -> int:
     if res.get("partial"):
         print(res["partial"])
     return 1
+
+
+# WT-100: the three agent families /critique picks its two spawns from.
+# Fixed and small on purpose -- CCC supports more engines (gemini, cursor,
+# kilo, hermes) but the spec asks for "the other 2 of 3", not "every engine
+# but mine".
+_CRITIQUE_FAMILIES: Tuple[str, ...] = ("claude", "codex", "antigravity")
+
+
+def _critique_prompt(goal: str) -> str:
+    """Wrap a user-supplied goal with the baked-in critique ground rules from
+    WT-100's answered spec: contrarian, no priors, comprehensive, scored,
+    concrete resolutions with the score delta each would buy."""
+    return (
+        f"{goal.strip()}\n\n"
+        "Critique the above. Ground rules:\n"
+        "- Be contrarian: look for reasons this is wrong, not reasons to agree.\n"
+        "- Ignore any priors from your own past work on this -- assess it fresh.\n"
+        "- Be comprehensive: don't stop at the first issue you find.\n"
+        "- Give an overall score out of 10 for the current state.\n"
+        "- For each issue, give a concrete resolution and the score improvement "
+        "it would buy (e.g. \"fixes X: 6 -> 8\").\n"
+    )
+
+
+def cmd_critique(args: argparse.Namespace) -> int:
+    """Spawn two independent critique agents on a goal (WT-100).
+
+    Reuses the same CCC delegate `wt send`/`wt ask` already bridge through
+    (messages._delegate_base / _post_json) but targets CCC's session-spawn
+    endpoint instead of inject-input, since this creates new sessions rather
+    than messaging existing ones. Each spawned agent is given --report-to (or
+    $CLAUDE_CODE_SESSION_ID) as its reply-to address via CCC's existing
+    report_to spawn param, so it reports back when done without any new
+    delivery plumbing.
+    """
+    from . import messages
+
+    base = messages._delegate_base()
+    if not base:
+        print(
+            "error: no delegate configured -- critique needs a local CCC to "
+            "spawn agents (set $WATCHTOWER_DELEGATE_URL or run CCC so "
+            "~/.claude/command-center/port.txt exists)",
+            file=sys.stderr,
+        )
+        return 1
+
+    family = (args.family or "claude").strip().lower()
+    others = [f for f in _CRITIQUE_FAMILIES if f != family]
+    engine1 = (args.model1 or others[0]).strip().lower()
+    engine2 = (args.model2 or others[1]).strip().lower()
+
+    report_to = args.report_to or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    prompt = _critique_prompt(args.goal)
+
+    results = []
+    for engine in (engine1, engine2):
+        payload: Dict[str, object] = {"prompt": prompt, "engine": engine}
+        if report_to:
+            payload["report_to"] = report_to
+        if args.cwd:
+            payload["cwd"] = args.cwd
+        try:
+            data = messages._post_json(base + "/api/sessions/spawn", payload, timeout_s=15)
+        except Exception as e:  # noqa: BLE001 - report and move to the next spawn
+            data = {"ok": False, "error": str(e)}
+        data.setdefault("engine", engine)
+        results.append(data)
+
+    ok_all = all(r.get("ok") for r in results)
+    if args.json:
+        print(json.dumps(results, indent=2))
+        return 0 if ok_all else 1
+    for r in results:
+        if r.get("ok"):
+            print(f"spawned {r['engine']}: {r.get('session_id', '?')}")
+        else:
+            print(f"error spawning {r['engine']}: {r.get('error', 'spawn failed')}", file=sys.stderr)
+    return 0 if ok_all else 1
 
 
 def cmd_receipts(args: argparse.Namespace) -> int:
@@ -1999,6 +2080,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "dedup"),
     ("Agent messaging", "send"),
     ("Agent messaging", "ask"),
+    ("Agent messaging", "critique"),
     ("Agent messaging", "outbox"),
     ("Agent messaging", "agents"),
     ("Agent messaging", "chat"),
@@ -2037,6 +2119,7 @@ COMMAND_HELP: Dict[str, str] = {
     "agents": "address book: list reachable agents; register/set-name/rm to name them",
     "send": "push a message to a worker/agent/session",
     "ask": "ask a target and wait for its reply",
+    "critique": "spawn 2 cross-family critique agents on a goal (via CCC)",
     "outbox": "inspect and manage undelivered messages",
     "chat": "group chats: multi-agent conversations",
     "start": "start the service (installs the LaunchAgent on first run)",
@@ -2307,6 +2390,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--_notify-child", action="store_true",
                    dest="_notify_child", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_ask)
+
+    s = sub.add_parser("critique")
+    s.add_argument("goal", help="what to critique / the context to critique it against")
+    s.add_argument("--family", default="",
+                   help="your own agent family (claude|codex|antigravity, "
+                        "default claude) -- excluded from the 2 picked to critique")
+    s.add_argument("--model1", default="", help="override the first critique engine")
+    s.add_argument("--model2", default="", help="override the second critique engine")
+    s.add_argument("--report-to", default="", dest="report_to",
+                   help="session id the critique agents report back to "
+                        "(default $CLAUDE_CODE_SESSION_ID)")
+    s.add_argument("--cwd", default="", help="repo/dir the critique agents start in")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_critique)
 
     s = sub.add_parser("outbox")
     s.set_defaults(func=cmd_outbox, outbox_command=None)
