@@ -207,6 +207,8 @@ def cmd_ls(args: argparse.Namespace) -> int:
     want = args.status
     if want == "active":
         items = [i for i in items if i.get("status") in ("open", "in_progress")]
+    elif want == "blocked":
+        items = [i for i in items if i.get("needs_input")]
     elif want != "all":
         items = [i for i in items if i.get("status") == want]
     if args.json:
@@ -460,7 +462,10 @@ def _rename_claiming_session(item: dict, summary: str = "") -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> int:
-    """Mark an existing ticket runnable and dispatch its queue."""
+    """Mark an existing ticket runnable and dispatch its queue.
+
+    Alias: ``wt ready`` (more descriptive name — 'run' implies 'execute now'
+    but the command actually marks a ticket drainable by workers)."""
     try:
         item = q.mark_runnable(args.ref)
     except ValueError as e:
@@ -478,6 +483,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         except Exception:
             pass
     return 0
+
+
+cmd_ready = cmd_run  # preferred alias: 'wt ready' reads as "mark this ticket ready for workers"
 
 
 def _resolution_from_args(args: argparse.Namespace) -> Optional[dict]:
@@ -1680,6 +1688,80 @@ def cmd_drain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config(args: argparse.Namespace) -> int:
+    """Unified queue configuration — combines ``wt set`` + ``wt drain`` (WT-97).
+
+    ``wt set`` and ``wt drain`` are kept as-is; this command is the single-stop
+    alternative for the common case of configuring a queue from scratch."""
+    from . import config
+    changed = []
+    # Delegate drain-related flags first so enabling auto-drain also auto-starts.
+    auto_drain = getattr(args, "auto_drain", None)
+    if auto_drain is not None:
+        enabled = auto_drain == "on"
+        config.set_auto_drain(args.queue, enabled)
+        types = (getattr(args, "type", None) or []) if enabled else []
+        config.set_claim_types(args.queue, types)
+        state = "on" if enabled else "off"
+        changed.append(f"auto_drain={state}")
+        if enabled:
+            if _LAUNCHAGENT_PLIST.exists():
+                rc = os.system(f"launchctl load '{_LAUNCHAGENT_PLIST}' 2>/dev/null")
+                if rc == 0:
+                    print("LaunchAgent activated (survives reboots)")
+            daemon_live = False
+            if DAEMON_PID_FILE.exists():
+                try:
+                    pid = int(DAEMON_PID_FILE.read_text().strip())
+                    os.kill(pid, 0)
+                    daemon_live = True
+                except (ValueError, ProcessLookupError, OSError):
+                    pass
+            if not daemon_live:
+                import subprocess
+                log_path = Path.home() / ".watchtower" / "watcher.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(log_path, "a") as log_f:
+                    subprocess.Popen(
+                        [sys.executable, "-m", "watchtower.cli", "start", "--auto-spawn"],
+                        stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
+                        start_new_session=True,
+                    )
+                print(f"service auto-started (log: {log_path})")
+    # Set-type flags (all optional).
+    if getattr(args, "backend", None) is not None:
+        try:
+            config.set_backend(args.queue, args.backend)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        changed.append(f"backend={config.backend(args.queue)}")
+    if getattr(args, "github_repo", None) is not None:
+        config.set_github_repo(args.queue, args.github_repo)
+        changed.append(f"github_repo={args.github_repo}")
+    if getattr(args, "github_assignee", None) is not None:
+        config.set_github_assignee(args.queue, args.github_assignee)
+        changed.append(f"github_assignee={config.github_assignee(args.queue)}")
+    if getattr(args, "workers_local_path", None) is not None:
+        config.set_repo_path(args.queue, args.workers_local_path)
+        changed.append(f"workers_local_path={args.workers_local_path}")
+    if getattr(args, "engine", None) is not None:
+        config.set_engine(args.queue, args.engine)
+        changed.append(f"engine={args.engine}")
+    if getattr(args, "model", None) is not None:
+        config.set_model(args.queue, args.model)
+        changed.append(f"model={args.model or '(engine default)'}")
+    if getattr(args, "workers", None) is not None:
+        config.set_desired_workers(args.queue, args.workers)
+        changed.append(f"workers={args.workers}")
+    if not changed:
+        cfg = config.get_queue_config(args.queue)
+        print(f"{args.queue}: {cfg if cfg else '(no config)'}")
+    else:
+        print(f"{args.queue}: {', '.join(changed)}")
+    return 0
+
+
 # NOTE: there is intentionally no user-facing `wt spawn-worker` command. Workers
 # are a function of policy (per-queue auto_drain) + queue depth, spawned by the
 # watcher/reconciler (`wt start`) via workers.spawn_workers(), not by hand. See
@@ -2281,6 +2363,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Service", "skills"),
     ("Service", "uninstall"),
     ("Queues", "status"),
+    ("Queues", "config"),
     ("Queues", "set"),
     ("Queues", "drain"),
     ("Queues", "wait"),
@@ -2289,7 +2372,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "add"),
     ("Tickets", "take"),
     ("Tickets", "edit"),
-    ("Tickets", "run"),
+    ("Tickets", "ready"),
     ("Tickets", "find"),
     ("Tickets", "ls"),
     ("Tickets", "blocked"),
@@ -2326,11 +2409,13 @@ COMMAND_HELP: Dict[str, str] = {
     "answer": "answer a blocked ticket; auto-resumes its session",
     "comment": "append a ticket activity comment",
     "discuss": "attach to a blocked ticket's session (claude --resume)",
-    "run": "mark an existing GitHub issue runnable and dispatch its queue",
+    "ready": "mark a ticket ready for workers (dispatch its queue); 'wt run' is an alias",
+    "run": "mark an existing GitHub issue runnable and dispatch its queue (alias: wt ready)",
     "find": "look up one ticket by ref across all queues (no -q needed)",
     "ls": "list the tickets in one queue",
     "dedup": "close exact-duplicate open tickets",
     "status": "per-queue depth / age / stuck flag",
+    "config": "configure a queue: auto-drain, worker count, path, engine (unified wt set + wt drain)",
     "set": "set queue-level config (repo_path, engine, model, workers)",
     "drain": "enable or disable auto-drain for a queue",
     "wait": "block until the queue is drained",
@@ -2420,8 +2505,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--status",
         default="active",
-        choices=["active", "open", "in_progress", "closed", "all"],
-        help="which tickets to show (default: active = open + in_progress)",
+        choices=["active", "open", "in_progress", "blocked", "closed", "all"],
+        help="which tickets to show (default: active = open + in_progress; "
+             "blocked = parked for human input)",
     )
     s.add_argument("--limit", type=int, default=0, help="max rows (0 = all)")
     s.add_argument("--json", action="store_true")
@@ -2510,10 +2596,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_claim)
 
-    s = sub.add_parser("run")
-    s.add_argument("ref", help="ticket ref / GitHub issue ref, e.g. BYM-GH-FINIE-402")
-    s.add_argument("--no-dispatch", action="store_true",
-                   help="only add the WatchTower label; do not nudge/spawn workers")
+    def _add_ready_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("ref", help="ticket ref / GitHub issue ref, e.g. BYM-GH-FINIE-402")
+        p.add_argument("--no-dispatch", action="store_true",
+                       help="only add the WatchTower label; do not nudge/spawn workers")
+
+    s = sub.add_parser("ready", help="mark an existing ticket ready for workers")
+    _add_ready_args(s)
+    s.set_defaults(func=cmd_ready)
+
+    s = sub.add_parser("run")  # backward-compat alias for 'wt ready'
+    _add_ready_args(s)
     s.set_defaults(func=cmd_run)
 
     s = sub.add_parser("close")
@@ -2800,6 +2893,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
                    help="restrict auto-drain workers to these ticket types (repeatable); omit to clear")
     s.set_defaults(func=cmd_drain)
+
+    s = sub.add_parser("config",
+                       help="configure a queue (unified wt set + wt drain, WT-97)")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--auto-drain", default=None, choices=["on", "off"],
+                   dest="auto_drain",
+                   help="on = auto-spawn workers; off = backlog mode")
+    s.add_argument("--workers", default=None, type=int,
+                   help="number of concurrent workers the reconciler should maintain")
+    s.add_argument("--workers-local-path", default=None, dest="workers_local_path",
+                   help="local repo path workers operate in (cwd for spawned workers)")
+    s.add_argument("--backend", default=None, choices=["file", "github"],
+                   help="queue backing store: file (default) or github")
+    s.add_argument("--github-repo", default=None, dest="github_repo",
+                   help="GitHub repo for --backend github, as OWNER/REPO")
+    s.add_argument("--github-assignee", default=None, dest="github_assignee",
+                   help="assignee used by GitHub-backed claims (default: @me)")
+    s.add_argument("--engine", default=None, choices=["claude", "codex"],
+                   help="agent engine for workers on this queue")
+    s.add_argument("--model", default=None,
+                   help="model workers are spawned with (e.g. claude-sonnet-5)")
+    s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
+                   help="restrict auto-drain to these ticket types (requires --auto-drain on)")
+    s.set_defaults(func=cmd_config)
 
     s = sub.add_parser("monitor")
     s.add_argument("-q", "--queue", required=True)
