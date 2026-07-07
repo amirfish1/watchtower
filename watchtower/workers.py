@@ -64,6 +64,13 @@ _LAUNCH_FAILURE_DEFAULT_COOLDOWN_S = float(
     os.environ.get("WATCHTOWER_LAUNCH_FAILURE_COOLDOWN_S", "300")
 )
 
+# Shared, queue-agnostic runbook (WT-101): DRAIN_GOAL_TEMPLATE keeps only a
+# one-line trigger for the Resume Check / Idle Protocol steps; the how-to
+# lives in docs/worker-runbook.md so the spawn prompt itself stays lean. Path
+# is absolute and independent of {repo} -- the runbook ships with the wt
+# package, not with whatever repo a given queue's tickets live in.
+_WORKER_RUNBOOK_PATH = Path(__file__).resolve().parent.parent / "docs" / "worker-runbook.md"
+
 # Drain goal adapted from CCC's docs/ux-fixes-worker-brief.md canonical /goal.
 # Generalized: no CCC paths, no shared-clone assumptions. The worker drains one
 # queue via the `wt` CLI it was spawned by and idles when empty.
@@ -96,34 +103,18 @@ DRAIN_GOAL_TEMPLATE = (
     "close it and do NOT guess: run `wt block <ref> --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
     "figured out so far\"`, then move on to the next ticket. "
-    "IDLE: when `wt claim` reports the queue is drained, FIRST update the "
-    "learnings file at ~/.watchtower/learnings/{queue}.md with anything the next "
-    "worker should know from this session -- infra changes, recurring ticket "
-    "patterns, gotchas, env quirks. The ~60-line cap is on the WHOLE FILE, not "
-    "per-edit: read the current file before editing and prune, don't just "
-    "append. Keep a 'Recent fixes' section (if any) to the last 2-3 entries, "
-    "dropping the oldest when you add a new one -- old fixes are recoverable "
-    "from `git log`/`wt close` summaries, so they aren't worth permanent space. "
-    "Durable design reasoning (why something is structured a certain way, "
-    "multi-paragraph gotchas) belongs in docs/*.md with just a one-line pointer "
-    "left in the learnings file, not inlined in full. EDIT it to stay concise "
-    "-- do not append unboundedly. (Do this now, at drain-completion -- not "
-    "later: a cold worker gets killed while idle and cannot write then.) THEN "
-    "STOP and simply end "
-    "your turn. Do NOT poll, do NOT sleep-loop, do NOT exit the process on your "
-    "own. Your stdin is a live input channel: when a new ticket is filed, a "
-    "fresh instruction message arrives and you resume automatically with your "
-    "full warm context. Ending your turn on an empty queue is correct -- the "
-    "next message wakes you. "
-    "RESUME CHECK (do this FIRST whenever you wake and your warm context says "
-    "you were mid-work on a ticket): before you edit, commit, or close anything, "
-    "re-verify you still own that ticket -- run `wt find <ref> --json` and "
-    "confirm `claimed_by` == {worker_id} AND `status` == in_progress. If it was "
-    "reassigned or is already closed, you were reaped for idling while you "
-    "worked and another worker took it over: STOP -- discard any uncommitted "
-    "changes for that ticket, do NOT commit and do NOT close (a duplicate close "
-    "is rejected anyway), and go back to `wt claim` for fresh work. Skipping "
-    "this check is how the same ticket gets fixed and committed twice. "
+    "IDLE: when `wt claim` reports the queue is drained, follow the Idle "
+    "Protocol in {runbook} BEFORE ending your turn (it has you update the "
+    "queue's learnings file -- a cold worker gets killed while idle and "
+    "cannot write then). Do NOT poll, do NOT sleep-loop, do NOT exit the "
+    "process on your own -- your stdin is a live input channel: when a new "
+    "ticket is filed, a fresh instruction message arrives and you resume "
+    "automatically with your full warm context. Ending your turn on an "
+    "empty queue is correct -- the next message wakes you. "
+    "RESUME CHECK: whenever you wake and your warm context says you were "
+    "mid-work on a ticket, follow the Resume Check protocol in {runbook} "
+    "before you edit, commit, or close anything -- skipping this is how the "
+    "same ticket gets fixed and committed twice. "
     "Push or publish exactly when the claimed ticket's worker instructions tell "
     "you to. If the claimed ticket has no explicit push/publish instruction, "
     "leave commits local unless the user explicitly asks you to push."
@@ -1131,7 +1122,7 @@ def drain_goal(queue: str, worker_id: str, repo_path: str = "") -> str:
     claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
     return DRAIN_GOAL_TEMPLATE.format(
         queue=queue, worker_id=worker_id, repo=repo_path or os.getcwd(),
-        claim_filter=claim_filter,
+        claim_filter=claim_filter, runbook=str(_WORKER_RUNBOOK_PATH),
     )
 
 

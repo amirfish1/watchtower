@@ -753,10 +753,12 @@ def test_drain_goal_content(wt):
     assert "end" in goal.lower()
     # Per-queue learnings: read at spawn, update at drain-completion.
     assert "learnings/Q.md" in goal
-    # Resume guard: a reaped worker resumed mid-work must re-verify ownership
-    # before editing/committing/closing, so it can't redo a reassigned ticket.
+    # WT-101: Resume Check / Idle Protocol detail moved to the shared runbook
+    # -- the prompt keeps only a one-line trigger pointing at it by path.
     assert "RESUME CHECK" in goal
-    assert "wt find" in goal and "claimed_by" in goal
+    assert "IDLE" in goal
+    runbook = str(wt.workers._WORKER_RUNBOOK_PATH)
+    assert goal.count(runbook) == 2  # one trigger each for Resume Check + Idle
     # Push policy must not override queue-specific ticket instructions such as
     # CHUCK's "commit and push main" workflow.
     assert "Do not push unless explicitly asked" not in goal
@@ -770,6 +772,13 @@ def test_run_once_goal_uses_ticket_push_policy(wt):
     assert "Do not push unless explicitly asked" not in goal
     assert "claimed ticket's worker instructions" in goal
     assert "leave commits local" in goal
+
+
+def test_worker_runbook_exists_and_covers_both_protocols(wt):
+    text = wt.workers._WORKER_RUNBOOK_PATH.read_text()
+    assert "## Resume Check" in text and "## Idle Protocol" in text
+    assert "wt find" in text and "claimed_by" in text  # Resume Check detail
+    assert "60 lines" in text or "~60" in text  # Idle Protocol detail
 
 
 def test_config_is_reconcile_source_and_default_off(wt):
