@@ -544,6 +544,43 @@ def test_deliver_codex_falls_through_when_binary_missing(wt, monkeypatch):
     assert "codex" in res["error"]
 
 
+# ========================================================= gemini delivery (WT-80)
+def _write_fake_gemini_bin(tmp_path):
+    """A minimal fake gemini binary: exits 0 immediately (accepts any argv)."""
+    import stat as _stat
+    script = tmp_path / "fake_gemini.sh"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(script.stat().st_mode | _stat.S_IEXEC | _stat.S_IXGRP | _stat.S_IXOTH)
+    return script
+
+
+def test_deliver_gemini_target_via_resume(wt, monkeypatch):
+    """A registered gemini agent with no live FIFO gets delivered natively
+    via _deliver_gemini_resume (WT-80): gemini --resume <sid> -p <text>."""
+    bin_path = _write_fake_gemini_bin(wt.tmp)
+    monkeypatch.setenv("WT_GEMINI_BIN", str(bin_path))
+    _disable_resume(wt, monkeypatch)
+    wt.messages.register_agent("gemineer", SID_D, engine="gemini", cwd="/repo")
+
+    res = wt.messages.send("gemineer", "hello from wt")
+
+    assert res["ok"] is True and res["transport"] == "gemini-resume"
+    assert res.get("receipt_id", "").startswith("rcpt-")
+
+
+def test_deliver_gemini_falls_through_when_binary_missing(wt, monkeypatch):
+    """No gemini binary: adapter misses cleanly and the message parks in outbox."""
+    monkeypatch.delenv("WT_GEMINI_BIN", raising=False)
+    monkeypatch.setenv("PATH", "/nonexistent-bin-dir")
+    _disable_resume(wt, monkeypatch)
+    wt.messages.register_agent("gemineer", SID_D, engine="gemini", cwd="/repo")
+
+    res = wt.messages.send("gemineer", "hello from wt")
+
+    assert res["ok"] is False and res["queued"] is True
+    assert "gemini" in res["error"]
+
+
 # ===================================================== outbox backoff/dead-letter
 def test_outbox_backoff_schedule_and_dead_letter(wt, monkeypatch):
     _disable_resume(wt, monkeypatch)

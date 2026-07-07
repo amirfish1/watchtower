@@ -1046,6 +1046,58 @@ def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, 
     }
 
 
+def _gemini_bin() -> str:
+    """Return the Gemini CLI binary path, or empty string if not found.
+
+    Priority: ``WT_GEMINI_BIN`` env var (explicit path) → ``gemini`` on PATH.
+    Empty string means the CLI is absent; callers must fall through."""
+    import shutil
+    env = os.environ.get("WT_GEMINI_BIN", "")
+    if env:
+        expanded = os.path.expanduser(env)
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
+    return shutil.which("gemini") or ""
+
+
+def _deliver_gemini_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Adapter for Gemini sessions: ``gemini --resume <sid> -p <text>``.
+
+    Mirrors the shape of ``_deliver_resume`` (Claude) but for Gemini CLI
+    targets (engine == 'gemini').  No FIFO or stream-json stdin needed —
+    Gemini resume takes the prompt via ``-p`` and runs one-shot, so this is
+    simpler than the Claude path.  No busy-check either: Gemini has no local
+    transcript file to probe for mid-turn state."""
+    if resolved.get("engine") != "gemini":
+        return {"ok": False, "error": "gemini-resume needs engine=gemini"}
+    sid = str(resolved.get("session_id") or "")
+    if not sid:
+        return {"ok": False, "error": "gemini-resume needs a session_id"}
+    bin_path = _gemini_bin()
+    if not bin_path:
+        return {"ok": False, "error": "Gemini CLI not found (install gemini or set WT_GEMINI_BIN)"}
+    log_dir = _logs_dir()
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return {"ok": False, "error": f"cannot create log dir: {e}"}
+    ts = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    log_path = log_dir / f"msg-gemini-{sid[:8]}-{ts}.log"
+    argv = [bin_path, "--approval-mode", "yolo", "--resume", sid, "-p", text]
+    try:
+        with open(log_path, "ab") as logf:
+            subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=logf,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError as e:
+        return {"ok": False, "error": f"gemini resume spawn failed: {e}"}
+    return {"ok": True, "transport": "gemini-resume", "log": str(log_path)}
+
+
 def _deliver_delegate(
     resolved: Dict[str, Any], text: str, mode: str
 ) -> Dict[str, Any]:
@@ -1138,6 +1190,11 @@ def _deliver_unreceipted(
         if r.get("ok"):
             return r
         errors.append(f"codex: {r.get('error', 'failed')}")
+    if resolved.get("engine") == "gemini":
+        r = _deliver_gemini_resume(resolved, text)
+        if r.get("ok"):
+            return r
+        errors.append(f"gemini: {r.get('error', 'failed')}")
     if not delegate_tried:
         r = _deliver_delegate(resolved, text, mode)
         if r.get("ok"):
