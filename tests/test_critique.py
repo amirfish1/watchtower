@@ -26,11 +26,14 @@ def _workers(wt):
 
 
 # ------------------------------------------------------------------ critique
+PARENT_SID = "aaaaaaaa-bbbb-4ccc-8ddd-000000000001"
+
+
 def test_critique_spawns_the_two_other_families(wt, monkeypatch, capsys):
     cli = _cli(wt)
     workers = _workers(wt)
     monkeypatch.setattr(workers, "engine_available", lambda e: True)
-    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "parent-sid")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", PARENT_SID)
 
     rc = cli.main(["critique", "does this design hold up?", "--dry-run", "--json"])
     assert rc == 0
@@ -44,7 +47,7 @@ def test_critique_spawns_the_two_other_families(wt, monkeypatch, capsys):
         assert "does this design hold up?" in prompt
         assert "contrarian" in prompt
         # WT-native reply-to footer targets the parent session via wt send
-        assert "wt send parent-sid" in prompt
+        assert f"wt send {PARENT_SID}" in prompt
 
 
 def test_critique_family_excludes_itself(wt, monkeypatch, capsys):
@@ -144,11 +147,26 @@ def test_spawn_dry_run_codex_argv(wt, capsys):
 
 def test_spawn_report_to_appends_wt_send_footer(wt, capsys):
     cli = _cli(wt)
+    wt.messages.register_agent("amir", PARENT_SID)
     rc = cli.main(["spawn", "goal", "--report-to", "@amir",
                    "--dry-run", "--json"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert "wt send @amir" in out["argv"][-1]
+
+
+def test_spawn_report_to_unresolvable_errors_before_spawn(wt, capsys):
+    """An unresolvable --report-to (typo, unregistered name) must fail fast
+    at spawn time -- if it only failed inside the spawned agent's own `wt
+    send`, the report would be silently lost (unresolvable targets don't
+    park in the outbox) (OPS-89)."""
+    cli = _cli(wt)
+    rc = cli.main(["spawn", "goal", "--report-to", "@nobody",
+                   "--dry-run", "--json"])
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert "unresolvable" in out["error"]
 
 
 def test_spawn_unsupported_engine_fails(wt, capsys):

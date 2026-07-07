@@ -1682,8 +1682,21 @@ def spawn_adhoc(
 
     ``report_to`` (worker id, @agent name, or session UUID) appends the
     WT-native reply-to footer so the agent reports back via `wt send`.
-    ``dry_run`` builds + returns the record without spawning (tests)."""
+    ``dry_run`` builds + returns the record without spawning (tests).
+
+    ``report_to`` is validated up front via ``messages.resolve_target``: an
+    unresolvable target (typo'd worker id, unregistered @agent name) errors
+    here instead of only surfacing minutes later when the spawned agent's own
+    `wt send` fails and silently drops the report -- unresolvable targets
+    don't get parked in the outbox (nothing to retry against), so without
+    this check the report is just lost (OPS-89)."""
     repo_path = repo_path or os.getcwd()
+    if report_to:
+        from . import messages
+        try:
+            messages.resolve_target(report_to)
+        except ValueError as e:
+            raise ValueError(f"--report-to {report_to!r} is unresolvable: {e}") from e
     if _is_fable_model(model):
         import sys
         print(
