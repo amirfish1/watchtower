@@ -388,13 +388,17 @@ def cmd_claim(args: argparse.Namespace) -> int:
             print(f"error: {ref} not found", file=sys.stderr)
             return 1
     else:
-        item = q.claim_next(
-            worker,
-            project=args.queue,
-            oldest=getattr(args, "oldest", False),
-            item_types=getattr(args, "type", None) or [],
-            readiness_filters=getattr(args, "readiness", None) or [],
-        )
+        try:
+            item = q.claim_next(
+                worker,
+                project=args.queue,
+                oldest=getattr(args, "oldest", False),
+                item_types=getattr(args, "type", None) or [],
+                readiness_filters=getattr(args, "readiness", None) or [],
+            )
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         if not item:
             # Nothing claimable. Decide surplus HERE, at claim time, when the real
             # current state is known — not on the reconciler's future-guessing

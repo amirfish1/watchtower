@@ -387,10 +387,13 @@ def test_reconcile_nudges_live_worker_on_orphan_requeue(wt):
     item = wt.q.enqueue(project="Q", note="work")
     ref = item["ref"]
     dead = _dead_worker(wt, "Q")  # registered worker whose pid has since exited
-    wt.q.claim_next(dead["worker_id"], project="Q")
+    # Simulate the "worker was alive, claimed, then died" scenario by writing
+    # the in_progress state directly (claim_next now rejects dead workers loudly).
     data = wt.q._load_unlocked()
     for it in data["items"]:
         if it["ref"] == ref:
+            it["status"] = "in_progress"
+            it["claimed_by"] = dead["worker_id"]
             it["claimed_at"] = "2000-01-01T00:00:00Z"  # past the orphan grace window
     wt.q._save_unlocked(data)
 
@@ -419,7 +422,15 @@ def test_requeue_orphaned_tickets_wont_clobber_a_concurrent_close(wt, monkeypatc
     item = wt.q.enqueue(project="Q", note="work")
     ref = item["ref"]
     dead = _dead_worker(wt, "Q")  # registered worker whose pid has since exited
-    claimed = wt.q.claim_next(dead["worker_id"], project="Q")
+    # Write in_progress directly — dead workers are now rejected by claim_next.
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == ref:
+            it["status"] = "in_progress"
+            it["claimed_by"] = dead["worker_id"]
+            it["claimed_at"] = "2000-01-01T00:00:00Z"
+    wt.q._save_unlocked(data)
+    claimed = wt.q.get(ref)
     stale_snapshot = dict(claimed, claimed_at="2000-01-01T00:00:00Z")  # past grace window
 
     wt.q.close(ref, session_id=dead["worker_id"], resolution="done")  # real close lands first
@@ -450,6 +461,42 @@ def test_requeue_orphaned_tickets_leaves_unregistered_claimer_alone(wt):
     reopened = wt.workers.requeue_orphaned_tickets()
     assert ref not in [it["ref"] for it in reopened]
     assert wt.q.get(ref)["status"] == "in_progress"
+
+
+def test_claim_next_rejects_dead_spawned_worker(wt):
+    """WT-92: claim_next must fail loudly when the session_id is a registered
+    spawned worker that is no longer alive, so the caller gets an immediate
+    error instead of a silent requeue 2 minutes later."""
+    rec = _dead_worker(wt, "Q")
+    dead_id = rec["worker_id"]  # "q-dead" — _dead_worker lowercases the queue name
+    wt.q.enqueue(project="Q", note="work")
+    import pytest
+    with pytest.raises(ValueError, match="not currently alive"):
+        wt.q.claim_next(dead_id, project="Q")
+    # ticket must still be open — claim was rejected
+    items = [it for it in wt.q._load_unlocked()["items"] if it.get("project") == "Q"]
+    assert all(it["status"] == "open" for it in items)
+
+
+def test_claim_by_ref_rejects_dead_spawned_worker(wt):
+    """WT-92: claim_by_ref must also fail loudly for a dead registered worker."""
+    rec = _dead_worker(wt, "Q")
+    dead_id = rec["worker_id"]  # "q-dead"
+    item = wt.q.enqueue(project="Q", note="work")
+    import pytest
+    with pytest.raises(ValueError, match="not currently alive"):
+        wt.q.claim_by_ref(item["ref"], dead_id)
+    assert wt.q.get(item["ref"])["status"] == "open"
+
+
+def test_claim_next_allows_ambient_unregistered_worker(wt):
+    """WT-92: an ambient session_id not in the spawn registry must be allowed
+    through — this preserves the OPS-104 fix (unregistered claimer == unknown
+    liveness == don't block)."""
+    wt.q.enqueue(project="Q", note="work")
+    item = wt.q.claim_next("some-ambient-claude-session", project="Q")
+    assert item is not None
+    assert item["status"] == "in_progress"
 
 
 def test_reconcile_nudges_live_worker_on_stuck_queue(wt):

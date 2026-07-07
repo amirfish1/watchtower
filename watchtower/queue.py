@@ -929,6 +929,34 @@ def count_claimable(
         return len(_claim_candidates(data["items"], project=proj, lane=lane, item_types=item_types))
 
 
+def _verify_worker_live(session_id: str) -> None:
+    """Raise ValueError if session_id is a known-spawned worker that is dead.
+
+    Ambient sessions (wt claim --worker <alias> from a bare Claude session,
+    never launched via spawn_workers) are not in the spawn registry, so their
+    liveness cannot be checked — they are left alone to match the OPS-104 fix
+    in requeue_orphaned_tickets().  Only registered-but-dead workers are
+    rejected: those are exactly the ones the reconciler will silently requeue
+    2 minutes later, so failing loudly at claim time is strictly better UX.
+    """
+    try:
+        from . import workers as _workers
+        known = _workers.list_workers(prune=False)
+        known_ids = {str(w.get("worker_id", "")) for w in known}
+        if session_id not in known_ids:
+            return  # not a tracked spawned worker — can't verify, allow through
+        live_ids = {str(w.get("worker_id", "")) for w in known if w.get("alive")}
+        if session_id not in live_ids:
+            raise ValueError(
+                f"worker {session_id!r} is registered as a spawned worker but is "
+                "not currently alive — claim rejected to prevent a silent requeue"
+            )
+    except ValueError:
+        raise
+    except Exception:
+        pass  # import/I/O failure → do not block the claim
+
+
 def claim_next(
     session_id: str,
     lane: Optional[str] = None,
@@ -959,6 +987,7 @@ def claim_next(
     """
     if not session_id:
         raise ValueError("session_id is required")
+    _verify_worker_live(session_id)
     backend = _github_backend_for_project(project)
     if backend is not None:
         item = backend.claim_next(
@@ -1034,6 +1063,7 @@ def claim_by_ref(
     """
     if not session_id:
         raise ValueError("session_id is required")
+    _verify_worker_live(session_id)
     backend = _github_backend_for_project(_project_from_ident(ref))
     if backend is not None:
         item = backend.claim_by_ref(ref, session_id, session_uuid=session_uuid)
