@@ -4,14 +4,17 @@ agent harness (Claude Code, Codex, ...) without a separate re-sync step."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from watchtower import skills_sync
 
 EXPECTED_SKILLS = ("watchtower", "group-chat-checkin", "critique")
+ALL_ENGINES = ("claude", "codex", "antigravity")
 
 
-def _homes(tmp_path, present=("claude", "codex")):
+def _homes(tmp_path, present=ALL_ENGINES):
     homes = {}
-    for engine in ("claude", "codex"):
+    for engine in ALL_ENGINES:
         home = tmp_path / f"{engine}-home"
         if engine in present:
             home.mkdir()
@@ -28,12 +31,9 @@ def test_sync_links_into_every_present_harness(tmp_path):
     results = skills_sync.sync(engine_homes=homes)
     actions = _actions(results)
     assert actions == {
-        ("claude", "watchtower"): "linked",
-        ("claude", "group-chat-checkin"): "linked",
-        ("claude", "critique"): "linked",
-        ("codex", "watchtower"): "linked",
-        ("codex", "group-chat-checkin"): "linked",
-        ("codex", "critique"): "linked",
+        (engine, skill): "linked"
+        for engine in ALL_ENGINES
+        for skill in EXPECTED_SKILLS
     }
     for engine, home in homes.items():
         for skill_name in EXPECTED_SKILLS:
@@ -42,18 +42,11 @@ def test_sync_links_into_every_present_harness(tmp_path):
             assert target.resolve() == skills_sync.source_dir(skill_name).resolve()
 
 
-def test_sync_links_all_bundled_skills_into_every_present_harness(tmp_path):
-    homes = _homes(tmp_path)
-    results = skills_sync.sync(engine_homes=homes)
-    actions = _actions(results)
-    assert actions == {
-        ("claude", "watchtower"): "linked",
-        ("claude", "group-chat-checkin"): "linked",
-        ("claude", "critique"): "linked",
-        ("codex", "watchtower"): "linked",
-        ("codex", "group-chat-checkin"): "linked",
-        ("codex", "critique"): "linked",
-    }
+def test_default_homes_cover_all_three_harnesses():
+    """Antigravity (agy) reads skills from ~/.gemini -- its omission from
+    ENGINE_HOMES meant `wt skills sync` never distributed skills to it."""
+    assert set(skills_sync.ENGINE_HOMES) == set(ALL_ENGINES)
+    assert skills_sync.ENGINE_HOMES["antigravity"] == Path.home() / ".gemini"
 
 
 def test_sync_skips_harness_with_no_home(tmp_path):
@@ -63,7 +56,9 @@ def test_sync_skips_harness_with_no_home(tmp_path):
     for skill_name in EXPECTED_SKILLS:
         assert actions[("claude", skill_name)] == "linked"
         assert actions[("codex", skill_name)] == "skipped-not-installed"
+        assert actions[("antigravity", skill_name)] == "skipped-not-installed"
     assert not (homes["codex"] / "skills").exists()
+    assert not (homes["antigravity"] / "skills").exists()
 
 
 def test_sync_is_idempotent(tmp_path):

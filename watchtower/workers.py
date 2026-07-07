@@ -1617,12 +1617,19 @@ def spawn_run_once_worker(
 
 ADHOC_ENGINES = ("claude", "codex", "antigravity")
 
+# The footer pipes the report over stdin via a quoted heredoc: a report is
+# multi-paragraph markdown full of double quotes, $variables, and `backticks`,
+# and putting that inside "..." on a shell command line breaks (quote ends the
+# string, $ and ` expand). <<'WT_REPORT' disables all expansion.
 ADHOC_REPORT_FOOTER = (
     "\n\nWHEN DONE: deliver your full findings (the complete report text, not "
-    "a pointer to a file or session) back to your dispatcher with "
-    "`wt send {report_to} \"<your full report>\"`. If the send fails it parks "
-    "in the WT outbox for later delivery -- do not retry in a loop. Then end "
-    "your turn."
+    "a pointer to a file or session) back to your dispatcher over stdin -- "
+    "quote-safe, no shell escaping needed:\n\n"
+    "wt send {report_to} - <<'WT_REPORT'\n"
+    "<your full report>\n"
+    "WT_REPORT\n\n"
+    "If the send fails it parks in the WT outbox for later delivery -- do "
+    "not retry in a loop. Then end your turn."
 )
 
 
@@ -1632,8 +1639,12 @@ def build_adhoc_command(
 ) -> List[str]:
     """Argv for a one-shot ad-hoc agent. All engines run in print/exec mode
     with the goal in argv -- no FIFO, no drain loop; the process exits when
-    the goal is done. Raises ValueError for an engine we can't build."""
+    the goal is done. Raises ValueError for an engine we can't build, and for
+    an engine whose CLI binary isn't installed -- a clean error here beats a
+    FileNotFoundError out of Popen."""
     if engine == "codex":
+        if not shutil.which(_ENGINE_BIN["codex"]):
+            raise ValueError("codex CLI not found on PATH")
         argv = [_ENGINE_BIN["codex"], "exec"]
         if model:
             argv += ["--model", model]
@@ -1650,13 +1661,18 @@ def build_adhoc_command(
         if repo_path:
             argv += ["--add-dir", repo_path]
         if log_path:
-            argv += ["--log-file", log_path + ".agy.log"]
-        # Model override needs AGY's settings-file dance (see CCC's
-        # _set_antigravity_cli_model); unsupported here -- AGY's configured
-        # default is used.
+            # AGY's internal CLI log goes to a sibling file: the .log itself
+            # captures the agent's stdout/stderr (spawn_adhoc redirects it),
+            # and appending would have produced a `.log.agy.log` orphan.
+            agy_log = re.sub(r"\.log$", "", log_path) + ".agy.log"
+            argv += ["--log-file", agy_log]
+        if model:
+            argv += ["--model", model]
         argv += ["-p", prompt]
         return argv
     if engine == "claude":
+        if not shutil.which(_ENGINE_BIN["claude"]):
+            raise ValueError("claude CLI not found on PATH")
         argv = [_ENGINE_BIN["claude"], "-p",
                 "--permission-mode", "bypassPermissions"]
         if model:

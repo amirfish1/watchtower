@@ -59,16 +59,25 @@ If you'd rather write the LaunchAgent without starting it, `wt install` still
 works, but it's a hidden command now: `wt start` is the path everyone should
 use.
 
-### Agent skill (Claude Code + Codex)
+### Agent skills (Claude Code + Codex + Antigravity)
 
-The first `wt start` also syncs a bundled `watchtower` skill into every agent
-harness present on the machine (`~/.claude/skills/watchtower`,
-`~/.codex/skills/watchtower`, ...) so any session — regardless of which repo
-it's rooted in — knows how to look up a ticket by ref (`wt find HERMES-20`),
-check queue health, and file/claim/close tickets, without being told about
-`wt` first. It's a symlink to the copy inside the installed package, so a
-`git pull` (editable install) or package upgrade updates it everywhere
-instantly — no separate re-sync step.
+The first `wt start` also syncs the bundled skills into every agent harness
+present on the machine (`~/.claude/skills/`, `~/.codex/skills/`,
+`~/.gemini/skills/` for Antigravity) so any session — regardless of which
+repo it's rooted in — can use them without being told about `wt` first.
+Each is a symlink to the copy inside the installed package, so a `git pull`
+(editable install) or package upgrade updates it everywhere instantly — no
+separate re-sync step. Three skills ship today:
+
+- **`watchtower`** — look up a ticket by ref (`wt find HERMES-20`), check
+  queue health, file/claim/close tickets.
+- **`critique`** (`/critique` in any synced harness) — spawn two
+  cross-family agents that independently critique a plan/design/diff and
+  report back via `wt send`. Wraps `wt critique`; the reports arrive
+  asynchronously (`wt critique --json` returns the spawned worker records
+  for scripted callers, and each critic's log file holds the raw output).
+- **`group-chat-checkin`** — coordinate parallel sessions for discussion,
+  task execution, and git commits.
 
 ```bash
 wt skills sync      # same sync `wt install` runs; safe to re-run anytime

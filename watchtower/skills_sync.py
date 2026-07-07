@@ -23,6 +23,8 @@ SKILL_NAMES: Tuple[str, ...] = ("watchtower", "group-chat-checkin", "critique")
 ENGINE_HOMES: Dict[str, Path] = {
     "claude": Path.home() / ".claude",
     "codex": Path.home() / ".codex",
+    # Antigravity (the agy CLI) reads skills from Gemini's per-user home.
+    "antigravity": Path.home() / ".gemini",
 }
 
 

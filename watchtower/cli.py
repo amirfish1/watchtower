@@ -722,10 +722,20 @@ def cmd_session_names(args: argparse.Namespace) -> int:
 def cmd_send(args: argparse.Namespace) -> int:
     """Push a message to a worker/agent/session via the adapter chain; on
     delivery failure the message is parked in the durable outbox (unless
-    --no-queue) for the daemon to retry."""
+    --no-queue) for the daemon to retry.
+
+    A text of ``-`` reads the message from stdin: the quote-safe path for
+    multi-paragraph bodies (agent reports full of quotes/$/backticks that
+    would break as a shell argument)."""
     from . import messages
+    text = args.text
+    if text == "-":
+        text = sys.stdin.read().strip()
+        if not text:
+            print("error: empty message on stdin", file=sys.stderr)
+            return 1
     res = messages.send(
-        args.target, args.text, mode=args.mode,
+        args.target, text, mode=args.mode,
         queue_on_fail=not args.no_queue,
         ttl_s=args.ttl,
     )
@@ -802,6 +812,135 @@ def cmd_ask(args: argparse.Namespace) -> int:
 _CRITIQUE_FAMILIES: Tuple[str, ...] = ("claude", "codex", "antigravity")
 
 
+def _detect_family() -> str:
+    """Best-effort detection of the calling agent's family from harness env.
+    Claude Code sets CLAUDE_CODE_SESSION_ID; Codex sets CODEX_THREAD_ID
+    (verified against codex 0.142). Antigravity sets neither that we know of;
+    an AGY caller must pass --family. Empty string when nothing matches."""
+    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
+        return "claude"
+    if os.environ.get("CODEX_THREAD_ID"):
+        return "codex"
+    return ""
+
+
+def _default_report_to() -> Tuple[str, str]:
+    """Default reply target from harness env: ``(target, note)``.
+
+    A Claude session UUID is directly addressable. A Codex thread id is not:
+    resolve_target treats an unknown bare UUID as engine=claude, so delivery
+    would try the wrong transport and never land. Registering it in the
+    agents registry (engine=codex, deterministic per-thread name, idempotent)
+    makes ``wt send @name`` route via the codex app-server transport."""
+    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if sid:
+        return sid, ""
+    tid = os.environ.get("CODEX_THREAD_ID", "").strip()
+    if tid:
+        from . import messages
+        name = f"codex-thread-{tid.replace('-', '')[:12]}"
+        try:
+            messages.register_agent(name, tid, engine="codex", cwd=os.getcwd())
+        except ValueError:
+            return "", ""
+        return f"@{name}", (
+            f"note: registered @{name} -> codex thread {tid[:13]}... so "
+            "replies route via the codex transport"
+        )
+    return "", ""
+
+
+def _select_critique_engines(
+    family: str,
+    model1: str = "",
+    model2: str = "",
+    *,
+    available,
+) -> Tuple[List[str], List[str]]:
+    """Pick the critique engines for a spawner in ``family``.
+
+    Returns ``(engines, notes)``; raises ValueError for anything unusable.
+    The whole selection is preflighted here -- supported AND installed --
+    before the caller spawns anything, so a bad second engine can never
+    strand a half-spawned critique (and --dry-run reflects reality).
+
+    Rules, in order:
+      - explicit --engine1/--engine2 picks are honored exactly: unsupported
+        or not-installed errors out, never falls back (the user asked for
+        that engine by name);
+      - two identical explicit picks are rejected (duplicate critics);
+      - a default slot (the two families other than ``family``) whose CLI is
+        missing -- or which an explicit pick already took -- falls back to
+        the first installed, not-yet-picked family (own family first);
+      - with nothing distinct left to fall back to, the slot is dropped (one
+        good critic beats a duplicate); zero engines is an error."""
+    if family not in _CRITIQUE_FAMILIES:
+        raise ValueError(
+            f"unsupported family {family!r} "
+            f"(supported: {', '.join(_CRITIQUE_FAMILIES)})"
+        )
+    others = [f for f in _CRITIQUE_FAMILIES if f != family]
+    supported = ", ".join(_CRITIQUE_FAMILIES)
+    notes: List[str] = []
+    picks: List[Optional[str]] = [
+        (model1 or "").strip().lower() or None,
+        (model2 or "").strip().lower() or None,
+    ]
+    if picks[0] and picks[0] == picks[1]:
+        raise ValueError(
+            f"--engine1 and --engine2 are both {picks[0]!r}; two identical "
+            "critics duplicate each other -- pick two different engines "
+            "(or run `wt spawn` twice if you really want that)"
+        )
+    for i, eng in enumerate(picks):
+        if eng is None:
+            continue
+        if eng not in _CRITIQUE_FAMILIES:
+            raise ValueError(
+                f"unsupported engine {eng!r} (supported: {supported})"
+            )
+        if not available(eng):
+            raise ValueError(
+                f"{eng} CLI not found -- an explicitly requested engine "
+                f"never falls back; install it or drop --engine{i + 1}"
+            )
+    for i, eng in enumerate(picks):
+        if eng is not None:
+            continue
+        want = others[i]
+        if want not in picks and available(want):
+            picks[i] = want
+            continue
+        fallback = next(
+            (c for c in (family, *_CRITIQUE_FAMILIES)
+             if c not in picks and available(c)),
+            None,
+        )
+        why = (
+            f"{want} already picked for the other critic"
+            if want in picks else f"{want} CLI not found"
+        )
+        if fallback is None:
+            notes.append(
+                f"note: {why} and no distinct installed engine is left -- "
+                "spawning fewer critics"
+            )
+            continue
+        suffix = " (your own family)" if fallback == family else ""
+        notes.append(
+            f"note: {why} -- falling back to {fallback}{suffix} "
+            "for this critic"
+        )
+        picks[i] = fallback
+    engines = [e for e in picks if e]
+    if not engines:
+        raise ValueError(
+            "no critique engine is installed (need at least one of: "
+            f"{supported})"
+        )
+    return engines, notes
+
+
 def _critique_prompt(goal: str) -> str:
     """Wrap a user-supplied goal with the baked-in critique ground rules from
     WT-100's answered spec: contrarian, no priors, comprehensive, scored,
@@ -822,35 +961,43 @@ def cmd_critique(args: argparse.Namespace) -> int:
     """Spawn two independent critique agents on a goal (WT-100).
 
     Spawns natively via workers.spawn_adhoc -- no CCC dependency. The two
-    engines default to the families OTHER than yours (--family, default
-    claude); --model1/--model2 override them explicitly. Each critic's goal
-    carries a WT-native reply-to footer (`wt send <report_to>`), so the
-    report comes back over the same delivery path (and outbox fallback)
-    every other WT message uses.
+    engines default to the families OTHER than yours (--family, auto-detected
+    from harness env when omitted); --engine1/--engine2 override them
+    explicitly. Selection is preflighted in _select_critique_engines before
+    anything spawns. Each critic's goal carries a WT-native reply-to footer
+    (`wt send <report_to> -`), so the report comes back over the same
+    delivery path (and outbox fallback) every other WT message uses.
     """
     from . import workers
 
-    family = (args.family or "claude").strip().lower()
-    others = [f for f in _CRITIQUE_FAMILIES if f != family]
-    explicit = [e.strip().lower() for e in (args.model1, args.model2) if e.strip()]
-    if explicit:
-        engines = ([args.model1.strip().lower() or others[0],
-                    args.model2.strip().lower() or others[1]])
-    else:
-        # Availability fallback: a default pick whose CLI is missing gets
-        # substituted with the spawner's own family rather than failing --
-        # a same-family critic beats one fewer critic. Explicit overrides
-        # never fall back (the user asked for that engine by name).
-        engines = []
-        for eng in others:
-            if workers.engine_available(eng):
-                engines.append(eng)
-            else:
-                print(f"note: {eng} CLI not found -- falling back to {family} "
-                      f"(your own family) for this critic", file=sys.stderr)
-                engines.append(family)
+    family = (args.family or "").strip().lower() or _detect_family() or "claude"
+    try:
+        engines, notes = _select_critique_engines(
+            family, args.model1, args.model2,
+            available=workers.engine_available,
+        )
+    except ValueError as e:
+        if args.json:
+            print(json.dumps([{"ok": False, "error": str(e)}], indent=2))
+        else:
+            print(f"error: {e}", file=sys.stderr)
+        return 1
+    for note in notes:
+        print(note, file=sys.stderr)
 
-    report_to = args.report_to or os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+    report_to = args.report_to
+    if not report_to:
+        report_to, rnote = _default_report_to()
+        if rnote:
+            print(rnote, file=sys.stderr)
+    if not report_to and not args.dry_run:
+        print(
+            "warning: no --report-to and no session detected in the "
+            "environment ($CLAUDE_CODE_SESSION_ID / $CODEX_THREAD_ID) -- "
+            "the critics will run, but their reports will only land in "
+            "their log files below. Pass --report-to <you> to receive them.",
+            file=sys.stderr,
+        )
     prompt = _critique_prompt(args.goal)
 
     results = []
@@ -2166,7 +2313,7 @@ COMMAND_HELP: Dict[str, str] = {
     "stop": "stop service (watcher, reconciler, dashboard, HTTP API)",
     "uninstall": "remove LaunchAgent (stop auto-start on login)",
     "dashboard": "open the night-watch dashboard (background server + browser)",
-    "skills": "sync the bundled watchtower skill into installed agent harnesses",
+    "skills": "sync the bundled skills into installed agent harnesses",
 }
 
 # "Worker protocol" = the claim/close/block loop agent workers run; humans
@@ -2408,7 +2555,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("send")
     s.add_argument("target", help="worker id, @agent name, or session UUID/prefix")
-    s.add_argument("text", help="the message")
+    s.add_argument("text", help="the message, or '-' to read it from stdin "
+                                "(quote-safe for long/multi-line bodies)")
     s.add_argument("--mode", default="send", choices=["send", "steer"],
                    help="delivery mode hint (delegate transports honor steer)")
     s.add_argument("--no-queue", action="store_true", dest="no_queue",
@@ -2433,15 +2581,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("critique")
     s.add_argument("goal", help="what to critique / the context to critique it against")
-    s.add_argument("--family", default="",
-                   help="your own agent family (claude|codex|antigravity, "
-                        "default claude) -- excluded from the 2 picked to critique")
-    s.add_argument("--model1", default="", help="override the first critique engine")
-    s.add_argument("--model2", default="", help="override the second critique engine")
+    s.add_argument("--family", default="", choices=list(_CRITIQUE_FAMILIES),
+                   help="your own agent family -- excluded from the 2 picked "
+                        "to critique (default: auto-detected from harness "
+                        "env, else claude)")
+    s.add_argument("--engine1", "--model1", default="", dest="model1",
+                   help="override the first critique engine "
+                        "(--model1 is a deprecated alias)")
+    s.add_argument("--engine2", "--model2", default="", dest="model2",
+                   help="override the second critique engine "
+                        "(--model2 is a deprecated alias)")
     s.add_argument("--report-to", default="", dest="report_to",
                    help="worker id, @agent, or session UUID the critique agents "
-                        "report back to via `wt send` "
-                        "(default $CLAUDE_CODE_SESSION_ID)")
+                        "report back to via `wt send` (default: auto-detected "
+                        "from $CLAUDE_CODE_SESSION_ID / $CODEX_THREAD_ID)")
     s.add_argument("--cwd", default="", help="repo/dir the critique agents start in")
     s.add_argument("--dry-run", action="store_true", dest="dry_run",
                    help="build the spawn commands without launching anything")
@@ -2453,8 +2606,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--engine", default="claude",
                    help="claude (default) | codex | antigravity")
     s.add_argument("--model", default="",
-                   help="model override (claude/codex only; antigravity uses "
-                        "its configured default)")
+                   help="model override, passed through to the engine CLI")
     s.add_argument("--repo", default="", help="repo/dir the agent works in "
                                               "(default: cwd)")
     s.add_argument("--name", default="", help="label for the worker id/log")
