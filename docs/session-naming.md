@@ -117,3 +117,9 @@ event automatically instead of requiring a user to manually rename via its
 UI — but that's moot now since WT calls the same mechanism directly. The
 remaining CCC-side gap is just the `?all=1` cache staleness noted above, if
 it turns out to matter for a real consumer.
+
+**Known gap (WT-105):** `config.engine()`'s default fell back to `claude`
+until WT-105 changed the unset-queue default to `codex` (guarded by
+`engine_available`). `set_session_title` is claude-transcript-only, so
+Codex workers still don't get this rename and show plainer names once
+claimed — tracked as a follow-up (WT-106), not fixed here.

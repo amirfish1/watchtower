@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 from typing import Any, Dict
 
@@ -179,8 +180,47 @@ def set_engine(queue: str, eng: str) -> Dict[str, Any]:
     return q
 
 
+def _ccc_worker_engine_default() -> str:
+    """CCC's shared *worker*-spawn engine default, read from spawn-defaults.json's
+    ``worker_engine`` field -- a separate key from that file's own top-level
+    ``engine``, which is CCC's "new session" spawn-button default and must
+    stay untouched by WT (WT-105). Returns "" if the file is missing,
+    unreadable, or has no such key."""
+    try:
+        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
+            data = json.load(f)
+        return str(data.get("worker_engine") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
 def engine(queue: str) -> str:
-    return _load().get(queue, {}).get("engine", "claude")
+    """Return the worker engine for a queue (used by both DRAIN and
+    RUN_ONCE spawns): an explicit `wt set --engine` override wins; else
+    CCC's shared `worker_engine` default (see `_ccc_worker_engine_default`);
+    else `codex`.
+
+    The bare `codex` fallback is availability-guarded -- OPS-106 found codex
+    missing from PATH on a VM, so blindly returning it here would hand back
+    an engine no worker could actually spawn with. An explicit per-queue or
+    `worker_engine` choice is honored as-is, with no such guard.
+
+    This intentionally flips the default engine for every currently-unset
+    queue (WT, CCC, BYM, OPS, HERMES) from the old hardcoded `claude` to
+    `codex` (WT-105). Codex workers don't get the WT-49 ticket-context
+    session rename (`messages.set_session_title` is claude-transcript-only)
+    -- accepted tradeoff, tracked as a follow-up."""
+    explicit = _load().get(queue, {}).get("engine", "")
+    if explicit:
+        return explicit
+    worker_default = _ccc_worker_engine_default()
+    if worker_default:
+        return worker_default
+    from . import workers as _workers
+    if _workers.engine_available("codex"):
+        return "codex"
+    print("[config] engine(): codex not on PATH, falling back to claude", file=sys.stderr)
+    return "claude"
 
 
 def set_model(queue: str, m: str) -> Dict[str, Any]:

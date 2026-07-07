@@ -838,6 +838,11 @@ def test_spawn_workers_rejects_fable_model(wt, capsys):
 def test_spawn_workers_includes_engine_and_model_in_record(wt):
     """spawn_workers dry-run records carry engine and model (when non-fable)."""
     wt.config.set_auto_drain("Q", True)
+    # Explicit engine so this doesn't depend on whichever bare default
+    # config.engine() resolves to (WT-105: that default is now
+    # availability-guarded against codex being on PATH, which varies by
+    # machine) -- this test only cares that engine/model land in the record.
+    wt.config.set_engine("Q", "claude")
     wt.config.set_model("Q", "claude-sonnet-5")
     wt.q.enqueue(project="Q", note="work")
     r = wt.workers.reconcile_once(dry_run=True)

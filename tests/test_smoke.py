@@ -327,14 +327,24 @@ def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeyp
     CCC stores bare short aliases for claude (e.g. "sonnet-5") meant for its
     own UI/`/model` picker, not as a `--model` flag value -- WT must expand
     them to the full `claude-` prefixed id before spawning (WT-84), same as
-    CCC's own spawn path does internally."""
+    CCC's own spawn path does internally.
+
+    ``worker_engine`` (not the file's own top-level ``engine``, which is
+    CCC's "new session" spawn-button default and stays untouched by WT) is
+    the shared field config.engine() reads for its own default chain
+    (WT-105) -- set explicitly here so this test doesn't depend on
+    config.engine()'s bare `codex`-if-available fallback."""
     import json
     import importlib
     import watchtower.config as config
     import watchtower.workers as workers
 
     ccc_file = tmp_path / "ccc-spawn-defaults.json"
-    ccc_file.write_text(json.dumps({"engine": "claude", "models": {"claude": "sonnet-5"}}))
+    ccc_file.write_text(json.dumps({
+        "engine": "codex",
+        "worker_engine": "claude",
+        "models": {"claude": "sonnet-5"},
+    }))
     monkeypatch.setenv("WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(ccc_file))
     importlib.reload(config)
     importlib.reload(workers)
@@ -351,6 +361,42 @@ def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeyp
         config.set_model("DEMO", "")
         importlib.reload(config)
         importlib.reload(workers)
+
+
+def test_engine_default_precedence(store, tmp_path, monkeypatch):
+    """WT-105: config.engine() precedence is explicit per-queue override >
+    CCC's shared `worker_engine` default > bare `codex` (guarded by
+    availability) -- and the bare fallback degrades to `claude` when codex
+    isn't on PATH instead of handing back an engine nothing can spawn with.
+    `worker_engine` is a separate field from spawn-defaults.json's own
+    top-level `engine` (CCC's "new session" button default), which WT must
+    not repurpose."""
+    import json
+    import importlib
+    import watchtower.config as config
+    import watchtower.workers as workers
+
+    # Nothing configured at all: bare fallback, guarded by availability.
+    monkeypatch.setattr(workers, "engine_available", lambda eng: eng == "codex")
+    assert config.engine("UNSET") == "codex"
+    monkeypatch.setattr(workers, "engine_available", lambda eng: False)
+    assert config.engine("UNSET") == "claude"
+
+    # CCC's shared `worker_engine` (not its top-level `engine`) wins over the
+    # bare fallback, with no availability guard applied to an explicit choice.
+    ccc_file = tmp_path / "ccc-spawn-defaults.json"
+    ccc_file.write_text(json.dumps({"engine": "codex", "worker_engine": "claude"}))
+    monkeypatch.setenv("WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(ccc_file))
+    importlib.reload(config)
+    try:
+        assert config.engine("UNSET") == "claude"
+
+        # An explicit per-queue override still wins over worker_engine.
+        config.set_engine("UNSET", "codex")
+        assert config.engine("UNSET") == "codex"
+    finally:
+        config.set_engine("UNSET", "")
+        importlib.reload(config)
 
 
 def test_auto_drain_config(tmp_path, monkeypatch):
