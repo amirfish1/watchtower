@@ -500,7 +500,8 @@ def cmd_close(args: argparse.Namespace) -> int:
     worker = args.worker or f"wt-cli-{os.getpid()}"
     resolution = _resolution_from_args(args)
     try:
-        item = q.close(args.ref, worker, resolution=resolution)
+        item = q.close(args.ref, worker, resolution=resolution,
+                       force=getattr(args, "force", False))
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -2225,6 +2226,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--enqueue-follow-ups", action="store_true",
                    dest="enqueue_follow_ups",
                    help="also file each follow-up/unresolved as a new open ticket")
+    s.add_argument("--force", action="store_true",
+                   help="close even if the ticket is already closed or claimed by "
+                        "another worker (bypasses the reap-induced duplicate-close guard)")
     s.set_defaults(func=cmd_close)
 
     s = sub.add_parser("release")

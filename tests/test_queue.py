@@ -71,6 +71,54 @@ def test_mutations_append_canonical_history_and_stop_legacy_lists(wt):
     assert closed["history"][-1]["resolution"] == {"summary": "done"}
 
 
+def test_close_ownership_guard_blocks_reap_duplicate(wt):
+    """A worker reaped mid-ticket, whose claim was re-drained + closed by a
+    fresh worker, must NOT be able to silently re-close and clobber the real
+    resolution (CCC-502 double-close)."""
+    item = wt.q.enqueue(project="OWN", note="dropdown bug", source="test")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    # worker-a is reaped; the reconciler reopens and worker-b re-drains + closes.
+    wt.q.update_status(item["ref"], "open", reason="worker gone")
+    wt.q.claim_by_ref(item["ref"], "worker-b")
+    real = wt.q.close(item["ref"], "worker-b", resolution={"summary": "real fix"})
+    assert real["resolution"] == {"summary": "real fix"}
+
+    # worker-a resumes from stale context and tries to close it too -> rejected.
+    with pytest.raises(ValueError, match="already closed"):
+        wt.q.close(item["ref"], "worker-a", resolution={"summary": "duplicate fix"})
+    # The real resolution is untouched.
+    assert wt.q.get(item["ref"])["resolution"] == {"summary": "real fix"}
+    # A close event was NOT appended for the rejected attempt.
+    assert _events(wt.q.get(item["ref"])["history"]).count("close") == 1
+
+
+def test_close_guard_allows_owner_force_crosscloser_and_unclaimed(wt):
+    """The guard must not break legitimate closes: own in_progress ticket,
+    a different worker closing a still-open claim (intentional cross-closer
+    attribution), --force override of an already-closed ticket, and
+    close-by-ref on a never-claimed ticket (dedup-close path)."""
+    # A different worker closing a *still-open* claim is allowed.
+    x = wt.q.enqueue(project="OWN", note="crossclose", source="test")
+    wt.q.claim_by_ref(x["ref"], "worker-a")
+    crossed = wt.q.close(x["ref"], "worker-b", resolution="closed by b")
+    assert crossed["status"] == "closed"
+    assert crossed["claimed_by"] == "worker-a"  # original claimant preserved
+    assert crossed["closed_by"] == "worker-b"
+
+    # Own in_progress ticket closes normally.
+    a = wt.q.enqueue(project="OWN", note="mine", source="test")
+    wt.q.claim_by_ref(a["ref"], "worker-a")
+    assert wt.q.close(a["ref"], "worker-a", resolution="ok")["status"] == "closed"
+
+    # force lets a human re-close an already-closed ticket.
+    forced = wt.q.close(a["ref"], "human-x", resolution="override", force=True)
+    assert forced["status"] == "closed"
+
+    # dedup-close by ref (no session_id -> expect_owner empty) is unguarded.
+    b = wt.q.enqueue(project="OWN", note="dupe", source="test")
+    assert wt.q.close(b["ref"], resolution="duplicate of OWN-1")["status"] == "closed"
+
+
 def test_timeline_normalizes_old_answers_progress_sentinels_and_snapshot(wt):
     item = {
         "ref": "OLD-1",

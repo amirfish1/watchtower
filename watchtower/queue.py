@@ -1149,6 +1149,7 @@ def update_status(
     quiet: bool = False,
     require_status: Optional[str] = None,
     reason: str = "",
+    expect_owner: str = "",
 ) -> Optional[Dict[str, Any]]:
     """``require_status``, when set, makes this a compare-and-swap: the
     transition is only applied if the item's *current* status (read fresh,
@@ -1157,6 +1158,21 @@ def update_status(
     reconciler, which reads ``list_items()`` before deciding) can clobber a
     legitimate concurrent transition — e.g. reopening a ticket that was
     closed a moment after the snapshot was taken (OPS-72).
+
+    ``expect_owner``, when set (close path only), makes the close refuse to
+    re-close an *already-closed* ticket, raising ``ValueError``. This is the
+    durable stop for reap-induced duplicate work: a worker reaped mid-ticket
+    (idle past the prompt-cache TTL) gets its claim reopened and re-drained by
+    a fresh worker; when the reaped session later resumes from checkpoint with
+    stale context and tries to close, the ticket is already closed by the fresh
+    worker, so this guard refuses and tells it the work is a duplicate — rather
+    than silently re-closing and overwriting the real resolution (observed:
+    CCC-502 closed twice, once by the reaped session after the fresh worker had
+    already fixed and closed it). Closing a *different worker's still-open*
+    claim stays allowed (a close is credited to the closer, the original
+    claimant preserved). ``expect_owner`` is left empty by non-worker closes
+    (e.g. dedup-close by ref) so those are unaffected. Guard is authoritative
+    for local file-backed queues; the GitHub-backed path is unaffected.
 
     ``reason`` (optional) is recorded on the appended ``history`` entry, e.g.
     the orphan-ticket sweep passes "worker gone" for a reopen."""
@@ -1193,6 +1209,27 @@ def update_status(
             if _matches(it, ident):
                 if require_status is not None and it.get("status") != require_status:
                     return None
+                # Ownership guard for close (see expect_owner docstring). Runs
+                # inside the lock against the fresh item, so it's race-free with
+                # a concurrent close by the fresh worker that re-drained the
+                # ticket after a reap. Deliberately scoped to the already-closed
+                # case only: closing a *different worker's still-open* claim is
+                # intentional (a close is credited to whoever closes, the
+                # original claimant is preserved — test_close_keeps_original_claimant).
+                # The reap-duplicate always lands here anyway, because by the
+                # time the reaped session resumes from checkpoint the fresh
+                # worker has already closed the re-drained ticket.
+                if status == "closed" and expect_owner and it.get("status") == "closed":
+                    ref_label = it.get("ref", ident)
+                    closer = str(it.get("closed_by") or it.get("claimed_by") or "?")
+                    when = it.get("closed_at") or "?"
+                    raise ValueError(
+                        f"{ref_label} is already closed (by {closer} at {when}). "
+                        f"You are {expect_owner} — you were likely reaped mid-ticket "
+                        f"and it was re-drained by another worker. Your work may "
+                        f"duplicate theirs: do NOT re-commit; run `wt find {ref_label} "
+                        f"--json` to compare. Pass --force to close anyway."
+                    )
                 it["status"] = status
                 now = _now_iso()
                 it["updated_at"] = now
@@ -1267,14 +1304,25 @@ def update_status(
 
 
 def close(
-    ident: Any, session_id: str = "", resolution: Any = None
+    ident: Any, session_id: str = "", resolution: Any = None, force: bool = False
 ) -> Optional[Dict[str, Any]]:
     """Close a ticket, optionally recording HOW it was fixed.
 
     ``resolution`` may be a bare summary string or a dict with any of
     ``summary`` / ``caveats`` / ``follow_ups`` / ``unresolved``. Absent ->
-    closes with no resolution (back-compatible)."""
-    return update_status(ident, "closed", session_id, resolution=resolution)
+    closes with no resolution (back-compatible).
+
+    When ``session_id`` identifies a worker (and ``force`` is not set), the
+    close is ownership-checked: a ticket already closed, or claimed by a
+    *different* worker, raises ``ValueError`` instead of silently re-closing.
+    This blocks reap-induced duplicate closes (see ``update_status``'s
+    ``expect_owner``). Callers that close by ref without asserting ownership
+    (e.g. dedup-close) pass no ``session_id`` and are unaffected. ``force=True``
+    bypasses the guard for a human deliberately force-closing someone's ticket."""
+    return update_status(
+        ident, "closed", session_id, resolution=resolution,
+        expect_owner="" if force else str(session_id or ""),
+    )
 
 
 def release(ident: Any, session_id: str = "") -> Optional[Dict[str, Any]]:
