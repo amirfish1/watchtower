@@ -902,15 +902,27 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
     stranded as ``in_progress`` forever — ``claim_next`` only picks ``open``, so
     nothing re-drains it and nothing closes it. The queue then reads depth=0
     ("Ready") while work is genuinely unfinished. This sweep is the durable fix:
-    any in_progress ticket whose ``claimed_by`` worker_id is not in the live set
-    (and that was claimed longer ago than ``grace_s``, to avoid a spawn/claim
-    race) is reopened so a fresh worker re-claims it.
+    any in_progress ticket whose ``claimed_by`` worker_id is a KNOWN spawned
+    worker (present in the tracked worker store, dead or alive) but is no
+    longer alive (and that was claimed longer ago than ``grace_s``, to avoid a
+    spawn/claim race) is reopened so a fresh worker re-claims it.
+
+    A ``claimed_by`` id that never appears in the worker store at all — e.g. a
+    plain ``wt claim --worker <alias>`` run from an ambient Claude session that
+    was never launched via ``spawn_workers``/``spawn_run_once_worker`` — has no
+    pid this sweep can check, so "not in the live set" would always be true for
+    it regardless of whether the session is still working. Treating that as
+    orphaned reopened the ticket ~2 minutes after every such claim, handing it
+    to a second worker while the original session kept going — duplicate work
+    (OPS-104). Those ids are left alone; if the claiming session really did
+    die, the ticket just stays in_progress like a `wt block`ed one already does.
 
     Returns the list of reopened items."""
     from . import queue as _q
     import time as _time
-    live_ids = {str(w.get("worker_id", "")) for w in list_workers(prune=False)
-                if w.get("alive")}
+    known_workers = list_workers(prune=False)
+    live_ids = {str(w.get("worker_id", "")) for w in known_workers if w.get("alive")}
+    known_ids = {str(w.get("worker_id", "")) for w in known_workers}
     now = _time.time()
     reopened: List[Dict[str, Any]] = []
     try:
@@ -929,6 +941,8 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
         claimer = str(it.get("claimed_by") or "")
         if claimer and claimer in live_ids:
             continue  # its worker is alive — leave it
+        if claimer and claimer not in known_ids:
+            continue  # never a spawned worker — no evidence it's dead (OPS-104)
         # Grace window guards against a just-claimed ticket whose worker record
         # hasn't been written yet (spawn/claim race).
         claimed_at = it.get("claimed_at")

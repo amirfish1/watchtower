@@ -287,7 +287,8 @@ def test_reconcile_nudges_live_worker_on_orphan_requeue(wt):
     wt.config.set_desired_workers("Q", 1)
     item = wt.q.enqueue(project="Q", note="work")
     ref = item["ref"]
-    wt.q.claim_next("q-dead-claimer", project="Q")  # claimer never registered as alive
+    dead = _dead_worker(wt, "Q")  # registered worker whose pid has since exited
+    wt.q.claim_next(dead["worker_id"], project="Q")
     data = wt.q._load_unlocked()
     for it in data["items"]:
         if it["ref"] == ref:
@@ -318,15 +319,38 @@ def test_requeue_orphaned_tickets_wont_clobber_a_concurrent_close(wt, monkeypatc
     "in_progress" snapshot, and assert the sweep's write becomes a no-op."""
     item = wt.q.enqueue(project="Q", note="work")
     ref = item["ref"]
-    claimed = wt.q.claim_next("q-dead-claimer", project="Q")  # never registered as alive
+    dead = _dead_worker(wt, "Q")  # registered worker whose pid has since exited
+    claimed = wt.q.claim_next(dead["worker_id"], project="Q")
     stale_snapshot = dict(claimed, claimed_at="2000-01-01T00:00:00Z")  # past grace window
 
-    wt.q.close(ref, session_id="q-dead-claimer", resolution="done")  # real close lands first
+    wt.q.close(ref, session_id=dead["worker_id"], resolution="done")  # real close lands first
     monkeypatch.setattr(wt.q, "list_items", lambda *a, **k: [stale_snapshot])
 
     reopened = wt.workers.requeue_orphaned_tickets()
     assert ref not in [it["ref"] for it in reopened]
     assert wt.q.get(ref)["status"] == "closed"
+
+
+def test_requeue_orphaned_tickets_leaves_unregistered_claimer_alone(wt):
+    """OPS-104 regression: a `wt claim --worker <alias>` run from an ambient
+    Claude session (not spawned via spawn_workers/spawn_run_once_worker) never
+    gets a pid entry in the worker store. The old sweep read that absence the
+    same as "the worker died" and reopened the ticket ~2 minutes after every
+    such claim, handing it to a second worker while the original session was
+    still working -- duplicate work. Such an id must be left alone; only a
+    claimer that IS in the worker store (and is no longer alive) is orphaned."""
+    item = wt.q.enqueue(project="Q", note="work")
+    ref = item["ref"]
+    wt.q.claim_next("claude-session-abc123", project="Q")  # never spawned by watchtower
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == ref:
+            it["claimed_at"] = "2000-01-01T00:00:00Z"  # past the orphan grace window
+    wt.q._save_unlocked(data)
+
+    reopened = wt.workers.requeue_orphaned_tickets()
+    assert ref not in [it["ref"] for it in reopened]
+    assert wt.q.get(ref)["status"] == "in_progress"
 
 
 def test_reconcile_nudges_live_worker_on_stuck_queue(wt):
