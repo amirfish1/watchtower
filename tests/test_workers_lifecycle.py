@@ -642,6 +642,7 @@ def test_build_claude_is_stream_json_no_goal(wt):
 def test_build_codex_has_goal_in_argv(wt):
     argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")
     assert argv[:2] == ["codex", "exec"]
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
     assert any("Drain the Q" in a for a in argv)
 
 

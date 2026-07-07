@@ -861,7 +861,14 @@ def build_drain_command(
     """
     bin_name = _ENGINE_BIN.get(engine, engine)
     if engine == "codex":
-        argv = [bin_name, "exec"]
+        argv = [
+            bin_name,
+            "exec",
+            # Match CCC's trusted worker mode. Some Linux hosts cannot run
+            # Codex's default sandbox in a way that still lets workers reach
+            # local queue tooling, so daemon-spawned queue workers bypass it.
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
         if model:
             argv += ["--model", model]
         argv.append(goal or drain_goal(queue, worker_id, repo_path))

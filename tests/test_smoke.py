@@ -307,7 +307,9 @@ def test_spawn_worker_queue_model(store):
         assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
         codex_argv = workers.build_drain_command(
             "DEMO", "codex", "demo-w1", model="gpt-5.5")
-        assert codex_argv[:4] == ["codex", "exec", "--model", "gpt-5.5"]
+        assert codex_argv[:3] == [
+            "codex", "exec", "--dangerously-bypass-approvals-and-sandbox"]
+        assert codex_argv[codex_argv.index("--model") + 1] == "gpt-5.5"
         # Clearing restores the no-flag default.
         config.set_model("DEMO", "")
         spawned = workers.spawn_workers("DEMO", n=1, engine="claude", dry_run=True)

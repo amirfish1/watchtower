@@ -1909,7 +1909,10 @@ def cmd_start(args: argparse.Namespace) -> int:
                     pass
                 DAEMON_PID_FILE.unlink(missing_ok=True)
         return 0
-    # Re-exec ourselves in the background in foreground-mode.
+    # Re-exec ourselves in the background in foreground-mode. This is the only
+    # supervision path on hosts without launchd, so use the same hardened PATH
+    # as the LaunchAgent plist; otherwise the daemon may later fail to find
+    # git/gh/claude/codex while spawning workers.
     import subprocess
 
     cmd = [
@@ -1928,12 +1931,14 @@ def cmd_start(args: argparse.Namespace) -> int:
     if args.auto_spawn:
         cmd.append("--auto-spawn")
     cmd += ["--host", args.host, "--port", str(args.port)]
+    env = dict(os.environ, PATH=_launchd_path())
     proc = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         start_new_session=True,
+        env=env,
     )
     print(
         f"watcher started (pid {proc.pid}); auto-spawn={'on' if args.auto_spawn else 'off'}"

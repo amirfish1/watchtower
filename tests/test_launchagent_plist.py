@@ -190,3 +190,30 @@ def test_start_dry_run_writes_nothing(start_env, monkeypatch):
     assert rc == 0
     assert not plist_path.exists()
     assert not cli.DAEMON_PID_FILE.exists()
+
+
+def test_manual_background_start_uses_hardened_path(start_env, monkeypatch):
+    """On Linux/no-launchd, the background daemon must inherit the same PATH
+    hardening as the plist so worker spawns can find codex/claude/git/gh."""
+    cli, plist_path = start_env
+    plist_path.write_text("<plist/>")
+    monkeypatch.setattr(cli, "_launchagent_loaded", lambda: False)
+    monkeypatch.setattr(cli.os, "system", lambda cmd: 256)
+
+    calls = []
+
+    class FakeProc:
+        pid = 12345
+
+    def fake_popen(*args, **kwargs):
+        calls.append((args, kwargs))
+        return FakeProc()
+
+    monkeypatch.setattr(cli.subprocess, "Popen", fake_popen)
+
+    rc = cli.cmd_start(_StartArgs())
+
+    assert rc == 0
+    assert calls
+    env = calls[0][1]["env"]
+    assert env["PATH"] == cli._launchd_path()
