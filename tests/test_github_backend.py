@@ -421,6 +421,16 @@ def test_dashboard_run_api_marks_existing_github_issue_runnable(tmp_path, monkey
     import watchtower.dashboard as dashboard
 
     importlib.reload(dashboard)
+    spawned = []
+    monkeypatch.setattr(
+        dashboard.workers,
+        "spawn_run_once_worker",
+        lambda queue, ref, **kw: spawned.append((queue, ref, kw)) or {
+            "queue": queue,
+            "ref": ref,
+            "worker_id": "ghi-test",
+        },
+    )
     httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
     port = httpd.server_address[1]
     t = threading.Thread(target=httpd.handle_request, daemon=True)
@@ -439,6 +449,8 @@ def test_dashboard_run_api_marks_existing_github_issue_runnable(tmp_path, monkey
 
     assert payload["ok"] is True
     assert payload["ticket"]["claimable"] is True
+    assert payload["worker"]["ref"] == "GHI-1"
+    assert spawned == [("GHI", "GHI-1", {"repo_path": ""})]
     assert "watchtower:GHI" in json.loads(state.read_text())["issues"][0]["labels"]
 
 

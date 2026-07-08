@@ -13,7 +13,7 @@ Routes:
     GET  /api/status                {"queues": [...health rows + workers...], "workers": [...]}
     GET  /api/queues                raw per-queue counts (mirrors `wt queues`)
     GET  /api/queue/<name>          active + closed tickets (closed carry resolution)
-    POST /api/ticket/<ref>/run      mark an existing GitHub issue runnable and dispatch
+    POST /api/ticket/<ref>/run      mark a ticket runnable and spawn one scoped worker
     POST /api/queue/<name>/add      ingest a ticket — {"note": "...", "url": "...",
                                       "selector": "...", "repo_path": "...",
                                       "title": "...", "source": "...", "text": "..."}
@@ -1074,7 +1074,13 @@ def render_queue(
     script = (
         "    <script>\n"
         "    async function wtRun(ref) {\n"
-        "      await fetch('/api/ticket/' + encodeURIComponent(ref) + '/run', {method: 'POST'});\n"
+        "      const res = await fetch('/api/ticket/' + encodeURIComponent(ref) + '/run', {method: 'POST'});\n"
+        "      if (!res.ok) {\n"
+        "        let msg = 'Run failed';\n"
+        "        try { const data = await res.json(); msg = data.error || msg; } catch (_) {}\n"
+        "        alert(msg);\n"
+        "        return;\n"
+        "      }\n"
         "      location.reload();\n"
         "    }\n"
         "    </script>\n"
@@ -1303,8 +1309,13 @@ class _Handler(BaseHTTPRequestHandler):
                 if item is None:
                     self._json(404, {"error": f"{ref} not found"})
                     return
-                reason = workers.dispatch_after_enqueue(
-                    item.get("project", ""), item.get("ref", "")
+                if item.get("status") != "open":
+                    self._json(400, {"error": f"{item.get('ref', ref)} is not open"})
+                    return
+                worker = workers.spawn_run_once_worker(
+                    item.get("project", ""),
+                    item.get("ref", ""),
+                    repo_path=str(item.get("repo_path") or ""),
                 )
             except ValueError as exc:
                 self._json(400, {"error": str(exc)})
@@ -1312,7 +1323,7 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001
                 self._json(500, {"error": str(exc)})
                 return
-            self._json(200, {"ok": True, "ticket": item, "dispatch": reason})
+            self._json(200, {"ok": True, "ticket": item, "worker": worker})
             return
         # POST /api/send: {"to", "text", "mode"} -> messages.send
         if path == "/api/send":

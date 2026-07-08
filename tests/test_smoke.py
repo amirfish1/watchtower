@@ -675,6 +675,46 @@ def test_dashboard_drilldown_page_and_api(store):
     assert data["tickets"][0]["ref"] == "DRILL-1"
 
 
+def test_dashboard_run_api_spawns_one_worker_for_backlog_queue(store, monkeypatch):
+    """The row-level Run action is a one-ticket spawn, even when auto_drain is off."""
+    import watchtower.config as config
+    import watchtower.queue as q
+    import watchtower.dashboard as dashboard
+
+    config.set_auto_drain("CCC", False)
+    item = q.enqueue(project="CCC", title="run me", note="run me")
+    spawned = []
+    monkeypatch.setattr(
+        dashboard.workers,
+        "spawn_run_once_worker",
+        lambda queue, ref, **kw: spawned.append((queue, ref, kw)) or {
+            "queue": queue,
+            "ref": ref,
+            "worker_id": "ccc-test",
+        },
+    )
+
+    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
+    port = httpd.server_address[1]
+    t = threading.Thread(target=httpd.handle_request, daemon=True)
+    t.start()
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/ticket/{item['ref']}/run",
+            data=b"{}",
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            payload = json.loads(resp.read().decode())
+    finally:
+        t.join(timeout=5)
+        httpd.server_close()
+
+    assert payload["ok"] is True
+    assert payload["worker"]["worker_id"] == "ccc-test"
+    assert spawned == [("CCC", item["ref"], {"repo_path": ""})]
+
+
 def test_dashboard_launch_nonblocking_and_stop(store, tmp_path, monkeypatch, capsys):
     """`wt dashboard --no-open` returns immediately (non-blocking) and writes a
     pidfile; `wt dashboard --stop` tears the background server down."""
