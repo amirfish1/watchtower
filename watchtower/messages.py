@@ -636,6 +636,11 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     sid = str(resolved.get("session_id") or "")
     if resolved.get("engine") != "claude" or not sid:
         return {"ok": False, "error": "resume needs a claude session_id"}
+    if _find_transcript(sid) is None:
+        return {
+            "ok": False,
+            "error": f"resume target transcript not found for session {sid[:8]}",
+        }
     # Reap-displacement guard: if this session was a worker reaped mid-ticket
     # and its claim was taken over, waking it back into that half-done work is
     # how the same ticket gets fixed and committed twice (the reaped session

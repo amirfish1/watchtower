@@ -1123,6 +1123,8 @@ def cmd_receipts(args: argparse.Namespace) -> int:
                 f"{s['advanced']} advanced, {s['pending']} pending, "
                 f"{s['lost']} LOST of {s['total']}"
             )
+            if s["lost"]:
+                print("inspect lost receipts: wt receipts --status lost --json")
         return 1 if s["lost"] else 0
     receipts.sweep()
     rows = receipts.list_receipts(status=getattr(args, "status", None) or None)
