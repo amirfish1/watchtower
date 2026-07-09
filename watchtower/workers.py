@@ -109,7 +109,9 @@ DRAIN_GOAL_TEMPLATE = (
     "changes for that ticket, do NOT commit and do NOT close (a duplicate close "
     "is rejected anyway), and go back to `wt claim` for fresh work. Skipping "
     "this check is how the same ticket gets fixed and committed twice. "
-    "Do not push unless explicitly asked."
+    "Push or publish exactly when the claimed ticket's worker instructions tell "
+    "you to. If the claimed ticket has no explicit push/publish instruction, "
+    "leave commits local unless the user explicitly asks you to push."
 )
 
 # Bounded, single-ticket variant of DRAIN_GOAL_TEMPLATE (CCC-437's per-row
@@ -140,7 +142,10 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "figured out so far\"`. "
     "Either way -- closed or blocked -- STOP once this one ticket is "
     "resolved. Do NOT claim another ticket, do NOT poll, do NOT wait for new "
-    "work. End your turn. Do not push unless explicitly asked."
+    "work. End your turn. Push or publish exactly when the claimed ticket's "
+    "worker instructions tell you to. If the claimed ticket has no explicit "
+    "push/publish instruction, leave commits local unless the user explicitly "
+    "asks you to push."
 )
 
 _ENGINE_BIN = {"claude": "claude", "codex": "codex"}

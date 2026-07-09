@@ -658,6 +658,19 @@ def test_drain_goal_content(wt):
     # before editing/committing/closing, so it can't redo a reassigned ticket.
     assert "RESUME CHECK" in goal
     assert "wt find" in goal and "claimed_by" in goal
+    # Push policy must not override queue-specific ticket instructions such as
+    # CHUCK's "commit and push main" workflow.
+    assert "Do not push unless explicitly asked" not in goal
+    assert "claimed ticket's worker instructions" in goal
+    assert "leave commits local" in goal
+
+
+def test_run_once_goal_uses_ticket_push_policy(wt):
+    goal = wt.workers.run_once_goal("Q", "q-8", "Q-12", "/repo")
+    assert "Q-12" in goal and "q-8" in goal and "/repo" in goal
+    assert "Do not push unless explicitly asked" not in goal
+    assert "claimed ticket's worker instructions" in goal
+    assert "leave commits local" in goal
 
 
 def test_config_is_reconcile_source_and_default_off(wt):
