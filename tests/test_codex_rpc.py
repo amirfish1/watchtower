@@ -135,13 +135,34 @@ def test_handshake_returns_none_without_a_binary(rpc, monkeypatch, tmp_path):
 # --------------------------------------------------------------------- deliver
 def test_deliver_starts_a_fresh_turn_when_idle(rpc):
     result = rpc.deliver("thread-abc", "hello codex")
-    assert result == {"ok": True, "via": "start", "turn_id": "turn-new"}
+    assert result["ok"] is True
+    assert result["via"] == "start"
+    assert result["turn_id"] == "turn-new"
+    assert result["app_server_warm"] is False
+    assert result["resume_ms"] >= 0
+    assert result["turn_ms"] >= 0
+    assert result["latency_ms"] >= result["resume_ms"]
 
 
 def test_deliver_steers_an_active_turn(rpc, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_ACTIVE_TURN", "1")
     result = rpc.deliver("thread-abc", "steer this in")
-    assert result == {"ok": True, "via": "steer", "turn_id": "turn-1"}
+    assert result["ok"] is True
+    assert result["via"] == "steer"
+    assert result["turn_id"] == "turn-1"
+    assert result["app_server_warm"] is False
+    assert result["resume_ms"] >= 0
+    assert result["turn_ms"] >= 0
+    assert result["latency_ms"] >= result["resume_ms"]
+
+
+def test_deliver_reports_warm_state_after_first_delivery(rpc):
+    first = rpc.deliver("thread-abc", "first")
+    second = rpc.deliver("thread-abc", "second")
+    assert first["ok"] is True
+    assert second["ok"] is True
+    assert first["app_server_warm"] is False
+    assert second["app_server_warm"] is True
 
 
 def test_deliver_reports_resume_failure(rpc, monkeypatch):
@@ -154,7 +175,10 @@ def test_deliver_reports_resume_failure(rpc, monkeypatch):
 def test_deliver_without_a_binary_fails_fast(rpc, monkeypatch, tmp_path):
     monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(tmp_path / "missing"))
     result = rpc.deliver("thread-abc", "hi")
-    assert result == {"ok": False, "error": "codex binary not found"}
+    assert result["ok"] is False
+    assert result["error"] == "codex binary not found"
+    assert result["stage"] == "resolve"
+    assert result["latency_ms"] >= 0
 
 
 # ---------------------------------------------------------------------- timeout
@@ -174,7 +198,9 @@ def test_request_timeout_never_hangs_the_caller(rpc, monkeypatch):
 def test_server_crash_then_restart_on_next_deliver(rpc, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_EXIT_AFTER", "turn/start")
     first = rpc.deliver("thread-abc", "first message")
-    assert first == {"ok": True, "via": "start", "turn_id": "turn-new"}
+    assert first["ok"] is True
+    assert first["via"] == "start"
+    assert first["turn_id"] == "turn-new"
 
     dead_proc = rpc._PROC
     # Give the reader thread a moment to notice EOF, though ensure_server()
@@ -185,7 +211,9 @@ def test_server_crash_then_restart_on_next_deliver(rpc, monkeypatch):
     assert dead_proc is None or dead_proc.poll() is not None
 
     second = rpc.deliver("thread-abc", "second message, after respawn")
-    assert second == {"ok": True, "via": "start", "turn_id": "turn-new"}
+    assert second["ok"] is True
+    assert second["via"] == "start"
+    assert second["turn_id"] == "turn-new"
     assert rpc._PROC is not dead_proc
 
 
