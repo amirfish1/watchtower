@@ -22,6 +22,7 @@ import json
 import os
 import select
 import subprocess
+import sys
 import time
 
 import pytest
@@ -37,26 +38,36 @@ def wt(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "WATCHTOWER_WORKER_SESSIONS_FILE", str(tmp_path / "worker-sessions.json")
     )
+    monkeypatch.setenv(
+        "WATCHTOWER_LAUNCH_FAILURES_FILE", str(tmp_path / "launch-failures.json")
+    )
     monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
     monkeypatch.setenv(
         "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(tmp_path / "no-ccc-spawn-defaults.json")
+    )
+    monkeypatch.setenv(
+        "WATCHTOWER_CODEX_THREAD_REGISTRY", str(tmp_path / "codex-thread-registry.json")
     )
 
     import watchtower.queue as q
     import watchtower.health as health
     import watchtower.config as config
     import watchtower.workers as workers
+    import watchtower.codex_registry as codex_registry
     importlib.reload(q)
     importlib.reload(config)
     importlib.reload(health)
     importlib.reload(workers)
+    importlib.reload(codex_registry)
     # Keep registry-migration hermetic: point at a non-existent file.
     monkeypatch.setattr(config, "_REGISTRY_FILE", tmp_path / "no-registry.json")
 
     class Ns:
         pass
     ns = Ns()
-    ns.q, ns.health, ns.config, ns.workers = q, health, config, workers
+    ns.q, ns.health, ns.config = q, health, config
+    ns.workers = workers
+    ns.codex_registry = codex_registry
     ns.tmp = tmp_path
     ns._readers = []  # open reader fds to close at teardown
     yield ns
@@ -214,7 +225,10 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
     real_record = wt.workers.record_worker
     spawn_calls = []
 
-    def fake_spawn(queue, n=1, engine="claude", *, repo_path="", dry_run=False):
+    def fake_spawn(
+        queue, n=1, engine="claude", *, repo_path="", dry_run=False,
+        launch_failures=None,
+    ):
         # Real spawn minus the subprocess: linger inside the critical section
         # (so an unserialized second pass would count live=0 meanwhile), then
         # register n live (this-pid) workers exactly like spawn_workers does.
@@ -250,6 +264,68 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
     # The losing pass must have skipped with the fully-staffed reason.
     skips = [s for r in results for s in r["skipped"] if s["queue"] == "Q"]
     assert any("actual=2==desired=2" in s["reason"] for s in skips)
+
+
+def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
+    """A Codex quota failure exits after creating a session. Reconcile must not
+    create a fresh cloud session every tick while the reset/cooldown is active."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_engine("Q", "codex")
+    wt.q.enqueue(project="Q", note="work")
+    sid = "11111111-1111-1111-1111-111111111111"
+    script = (
+        "print('OpenAI Codex v0.140.0')\n"
+        f"print('session id: {sid}')\n"
+        "print(\"ERROR: You've hit your usage limit. Visit "
+        "https://chatgpt.com/codex/settings/usage to purchase more credits "
+        "or try again at Jul 9th, 2099 12:09 AM.\")\n"
+    )
+
+    monkeypatch.setattr(
+        wt.workers,
+        "build_drain_command",
+        lambda *a, **k: [sys.executable, "-c", script],
+    )
+    monkeypatch.setattr(wt.workers, "_LAUNCH_FAILURE_GRACE_S", 2)
+
+    first = wt.workers.reconcile_once(dry_run=False)
+    assert not first["spawned"]
+    assert len(first["launch_failed"]) == 1
+    assert first["launch_failed"][0]["reason"] == "engine usage limit"
+    assert first["launch_failed"][0]["session_id"] == sid
+
+    ledger = json.loads((wt.tmp / "worker-sessions.json").read_text())
+    assert sid in ledger["session_ids"]
+
+    second = wt.workers.reconcile_once(dry_run=False)
+    assert not second["spawned"]
+    assert not second["launch_failed"]
+    assert any(
+        s["queue"] == "Q" and "launch cooldown" in s["reason"]
+        for s in second["skipped"]
+    )
+
+
+def test_spawn_workers_missing_binary_records_launch_failure(wt, monkeypatch):
+    """A missing engine binary should not bubble out of Popen and kill the
+    daemon; it becomes a launch failure with cooldown."""
+    missing = str(wt.tmp / "missing-codex")
+    monkeypatch.setattr(
+        wt.workers,
+        "build_drain_command",
+        lambda *a, **k: [missing],
+    )
+
+    failures = []
+    spawned = wt.workers.spawn_workers(
+        "Q", engine="codex", repo_path=str(wt.tmp), launch_failures=failures
+    )
+
+    assert spawned == []
+    assert len(failures) == 1
+    assert "engine executable unavailable" in failures[0]["reason"]
+    cooldown = wt.workers.active_launch_failure_cooldown("Q", "codex")
+    assert cooldown and cooldown["worker_id"] == failures[0]["worker_id"]
 
 
 def test_reconcile_excess_workers_not_stopped(wt):
@@ -882,6 +958,18 @@ def test_backfill_claimed_session_id_from_codex_worker_log(wt):
     assert wt.workers.backfill_claimed_session_ids() == [item["ref"]]
     found = wt.q.get(item["ref"])
     assert found["claimed_session_id"] == sid
+    reg = wt.codex_registry.entry(sid)
+    assert reg["thread_id"] == sid
+    assert reg["engine"] == "codex"
+    assert reg["visibility"] == "worker"
+    assert reg["transport_owner"] == "wt-codex-exec"
+    assert reg["transport"] == "codex-exec"
+    assert reg["cwd"] == str(wt.tmp)
+    assert reg["worker_id"] == worker_id
+    assert reg["queue"] == "THROUGHPUT"
+    assert reg["ref"] == item["ref"]
+    assert reg["wt"]["worker_id"] == worker_id
+    assert reg["wt"]["ref"] == item["ref"]
 
 
 # ============================== persistent worker-session ledger (survives prune)
