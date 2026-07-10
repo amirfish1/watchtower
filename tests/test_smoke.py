@@ -368,6 +368,19 @@ def test_auto_drain_config(tmp_path, monkeypatch):
     assert config.auto_drain("BACKLOG") is False
 
 
+def test_auto_drain_on_restores_worker_for_parked_queue(tmp_path, monkeypatch):
+    """Opting a zero-worker queue back into draining must make it runnable."""
+    monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "qc.json"))
+    import watchtower.config as config
+    importlib.reload(config)
+
+    config.set_desired_workers("PARKED", 0)
+    config.set_auto_drain("PARKED", True)
+
+    assert config.auto_drain("PARKED") is True
+    assert config.desired_workers("PARKED") == 1
+
+
 def test_configured_empty_queue_appears_in_status(tmp_path, monkeypatch):
     """A queue with config but zero tickets should still show in wt status."""
     monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "queue.json"))

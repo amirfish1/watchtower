@@ -112,6 +112,18 @@ def set_auto_drain(queue: str, enabled: bool) -> Dict[str, Any]:
     data = _load()
     q = data.setdefault(queue, {})
     q["auto_drain"] = bool(enabled)
+    # ``drain on`` promises that the reconciler will staff the queue.  A queue
+    # may still carry ``desired_workers: 0`` from when it was deliberately
+    # parked; leaving that value in place makes auto-drain visibly on but
+    # operationally inert.  Restore the normal minimum when opting back in,
+    # while preserving explicit parallel-worker settings above zero.
+    if enabled:
+        try:
+            desired = int(q.get("desired_workers", 1))
+        except (TypeError, ValueError):
+            desired = 0
+        if desired < 1:
+            q["desired_workers"] = 1
     _save(data)
     return q
 
