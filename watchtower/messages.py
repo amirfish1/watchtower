@@ -23,15 +23,13 @@ This module gives WatchTower its conversational primitives (see
          ``$WATCHTOWER_BUSY_WINDOW_S`` seconds (default 120), the session is
          actively mid-turn, so we do NOT fork a parallel resume; the message
          is held in the outbox and delivered once the transcript goes quiet.
-      4. ``codex-app-server`` (codex targets only): WT's own ``codex
-         app-server`` JSON-RPC subprocess (see ``watchtower.codex_rpc``),
-         ``thread/resume`` then ``turn/steer``-if-active else ``turn/start``.
-         Only attempted when the resolved target's ``engine`` is ``codex``;
-         a lazy guarded import + ``codex_rpc.is_available()`` means a machine
-         without the codex binary just falls through unaffected. The target's
-         ``session_id`` is used as the codex thread id 1:1 (see WT-54: an
-         ``engine=codex`` registry/worker entry's ``session_id`` IS the codex
-         thread id, there is no separate mapping table).
+      4. Codex broker/private split (codex targets only): if a delegate is
+         configured or auto-detected, WT treats CCC as the local managed Codex
+         broker and delegates first. Only standalone WT starts its own private
+         ``codex app-server`` JSON-RPC subprocess (see ``watchtower.codex_rpc``).
+         This avoids two independent app-server owners resuming the same
+         thread. The target's ``session_id`` is used as the codex thread id 1:1
+         (see WT-54).
       5. ``delegate`` (optional, last): POST to a delegate HTTP endpoint
          (CCC's ``/api/inject-input``) for transports WT cannot do natively.
          ``$WATCHTOWER_DELEGATE_URL`` overrides; ``off`` disables even when
@@ -184,6 +182,11 @@ def _delegate_base() -> str:
         return ""
 
 
+def _codex_delegate_first_enabled() -> bool:
+    raw = os.environ.get("WATCHTOWER_CODEX_DELEGATE_FIRST", "1").strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -264,6 +267,20 @@ def register_agent(
             rec["registered_at"] = prior["registered_at"]
         agents[name] = rec
         _save_agents(agents)
+    if str(rec["engine"]).lower() == "codex":
+        try:
+            from . import codex_registry
+            codex_registry.upsert(
+                sid,
+                source="wt-agents",
+                visibility="registered-agent",
+                cwd=rec.get("cwd") or "",
+                name=name,
+                title=name,
+                wt={"agent_name": name, "registered_at": rec["registered_at"]},
+            )
+        except Exception:
+            pass
     return {"name": name, **rec}
 
 
@@ -973,7 +990,7 @@ def _post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str,
 
 
 def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
-    """Adapter 3 (codex only): native delivery via WT's own codex app-server.
+    """Standalone codex fallback: native delivery via WT's private app-server.
 
     Only called for targets whose resolved ``engine`` is ``codex``. Import is
     lazy and guarded so a machine with no codex binary (or a stripped-down WT
@@ -998,10 +1015,30 @@ def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, 
         return {"ok": False, "error": "codex binary not found"}
     result = codex_rpc.deliver(sid, text)
     if result.get("ok"):
+        try:
+            from . import codex_registry
+            codex_registry.upsert(
+                sid,
+                source="wt-delivery",
+                transport_owner="wt-private-app-server",
+                transport="stdio",
+                cwd=resolved.get("cwd") or "",
+                wt={
+                    "last_delivery_transport": "codex-app-server",
+                    "last_delivery_via": result.get("via"),
+                },
+            )
+        except Exception:
+            pass
         return {
             "ok": True,
             "transport": "codex-app-server",
             "turn_id": result.get("turn_id"),
+            "codex_via": result.get("via"),
+            "codex_app_server_warm": result.get("app_server_warm"),
+            "codex_resume_ms": result.get("resume_ms"),
+            "codex_turn_ms": result.get("turn_ms"),
+            "codex_total_ms": result.get("latency_ms"),
         }
     return {
         "ok": False,
@@ -1039,8 +1076,12 @@ def _deliver_delegate(
 def deliver(
     resolved: Dict[str, Any], text: str, mode: str = "send"
 ) -> Dict[str, Any]:
-    """Try each adapter in order: fifo, resume (with busy check), codex
-    app-server (codex targets only), delegate.
+    """Try each adapter in order.
+
+    For Codex targets, a configured delegate is treated as the CCC/managed
+    app-server broker and is tried before WT's private app-server fallback.
+    The private app-server is standalone-only, so WT does not create a second
+    Codex app-server owner on a machine where CCC is already brokering Codex.
 
     Returns the first success (``{"ok": True, "transport": ...}``), else
     ``{"ok": False, "busy": bool, "error": "<joined adapter errors>"}``.
@@ -1080,15 +1121,28 @@ def _deliver_unreceipted(
     if r.get("busy"):
         busy = True
     errors.append(f"resume: {r.get('error', 'failed')}")
+    delegate_tried = False
+    if (
+        resolved.get("engine") == "codex"
+        and _codex_delegate_first_enabled()
+        and _delegate_base()
+    ):
+        delegate_tried = True
+        r = _deliver_delegate(resolved, text, mode)
+        if r.get("ok"):
+            return r
+        errors.append(f"delegate: {r.get('error', 'failed')}")
+        return {"ok": False, "busy": busy, "error": "; ".join(errors)}
     if resolved.get("engine") == "codex":
         r = _deliver_codex_app_server(resolved, text)
         if r.get("ok"):
             return r
         errors.append(f"codex: {r.get('error', 'failed')}")
-    r = _deliver_delegate(resolved, text, mode)
-    if r.get("ok"):
-        return r
-    errors.append(f"delegate: {r.get('error', 'failed')}")
+    if not delegate_tried:
+        r = _deliver_delegate(resolved, text, mode)
+        if r.get("ok"):
+            return r
+        errors.append(f"delegate: {r.get('error', 'failed')}")
     return {"ok": False, "busy": busy, "error": "; ".join(errors)}
 
 
@@ -1320,6 +1374,11 @@ def send(
         out = {"ok": True, "transport": result.get("transport", "?")}
         if result.get("log"):
             out["log"] = result["log"]
+        if result.get("turn_id"):
+            out["turn_id"] = result["turn_id"]
+        for key, value in result.items():
+            if key.startswith("codex_") and value is not None:
+                out[key] = value
         if result.get("receipt_id"):
             out["receipt_id"] = result["receipt_id"]
         queue_mod._log(
