@@ -14,19 +14,23 @@ decides who gets nudged to respond. CCC has all three today, but locked inside
 its server process (threads die with the server, macOS-only transports mixed
 with portable ones, no CLI). WT extracts the portable core.
 
-## Division of labor (the one-sentence architecture)
+## Division of labor
 
-WatchTower owns the data plane and the brain: message outbox, chat files,
-delivery retries, and nudge policy, all durable on disk and driven by the
-launchd-supervised daemon. WT is fully standalone: without CCC installed,
-every claude session is reachable natively (fifo for WT workers, headless
-resume for everything else, with a busy-hold so a session that is actively
-mid-turn gets its message when it goes idle). CCC, when present, is an
-optional accelerator delegate: instant injection into live TTY tabs via its
-AppleScript transport, and reach into foreign engines (codex, gemini, cursor)
-whose resume machinery lives in CCC today. Everything CCC currently
-duplicates (chat watcher thread, pending inputs queue, targeting logic)
-migrates to WT behind a flag.
+The canonical WT / CCC / Codex integration contract lives in
+`docs/ccc-watchtower-boundary.md`.
+
+In one sentence: WT owns durable control-plane semantics (send/ask, outbox,
+receipts, chats, queue workers, retry policy), while CCC owns local desktop
+transports, the user-facing UI, transcript rendering, and the managed Codex
+app-server broker when CCC is running.
+
+WT is fully standalone: without CCC installed, claude sessions are reachable
+natively (fifo for WT workers, tty where supported, headless resume for
+dormant sessions, with busy-hold so a session that is actively mid-turn gets
+its message when it goes idle), and messages WT cannot deliver are parked in
+the outbox. CCC, when present, is a delegate/broker for local desktop-only
+paths and for managed Codex app-server access. WT -> CCC delegate requests are
+stamped `origin=wt`; CCC must not route those requests back into `wt send`.
 
 ## New modules
 
@@ -81,14 +85,16 @@ an existing name just repoints it (`wt agent ...` survives as a hidden alias).
    goes quiet. This is the native, CCC-free path for live TTY sessions:
    delivery on idle instead of keystroke injection.
 3. `delegate` (optional, only when configured or auto-detected): POST to a
-   delegate HTTP endpoint for instant delivery WT cannot do natively
-   (keystroke injection into a live TTY tab, codex/gemini/cursor engines).
+   delegate HTTP endpoint for instant delivery WT cannot do natively or for
+   brokered local resources (for example CCC's managed Codex app-server).
    Default delegate: CCC at `http://127.0.0.1:<port>/api/inject-input` with
    the port read from `~/.claude/command-center/port.txt` when present.
    Override via `$WATCHTOWER_DELEGATE_URL`; disable via
    `$WATCHTOWER_DELEGATE_URL=off`. WT must behave correctly with no delegate
-   at all; the delegate only upgrades latency and engine reach. The seam is
-   also the future federation point (remote WT instances).
+   at all; the delegate only upgrades latency and engine reach. Every WT
+   delegate request includes `origin=wt`, which is the loop-prevention marker
+   CCC honors by avoiding a callback into `wt send` for the same request. The
+   seam is also the future federation point (remote WT instances).
 
 If every adapter fails or is deferred by the busy check, the message lands in
 the outbox.
@@ -164,8 +170,9 @@ knobs (sidecar, with defaults): `nudge_interval_s` 60, `idle_close_s` 2700
 `max_auto_nudges_per_hour` (default 30) per chat; over cap, log and pause.
 Nudge text is engine-agnostic prose (invoke your group-chat-checkin skill, or
 read the chat file), same wording contract as CCC; delivery goes through the
-adapter chain above, so a chat can mix WT workers, TTY sessions (via
-delegate), and codex sessions (via delegate).
+adapter chain above, so a chat can mix WT workers, TTY sessions, Codex sessions
+(CCC managed broker first, WT private fallback only when standalone), and
+delegate-only engines.
 
 ## HTTP API (dashboard server, 8787)
 
@@ -223,17 +230,20 @@ numbers drift): `_register_coordination`, `_coordination_watcher`,
 | claude (idle session) | native resume | yes |
 | claude (live TTY, no CCC) | native busy-hold, resume on idle | yes (nudge lands on idle) |
 | claude (live TTY, CCC present) | delegate upgrade: instant keystroke inject | yes, instant |
-| codex / gemini / cursor / antigravity / hermes | delegate only (v1); native adapters later | yes via delegate |
+| codex (CCC present) | CCC delegate/broker to managed app-server | yes |
+| codex (standalone WT) | WT private `codex app-server` fallback | yes |
+| gemini / cursor / antigravity / hermes | delegate or engine-specific CCC path | yes via delegate/broker |
 
 Codex nuance (per the canonical engine study, see below): `codex exec`
 one-shots, which is how WT spawns codex workers today, run with stdin closed
-and cannot receive mid-run input; sends to them hold in the outbox or go via
-delegate. But codex the engine IS steerable mid-run through its app-server
-(JSON-RPC over stdio: `thread/resume`, `turn/start`, `turn/steer`, and an
-experimental native `thread/inject`). A WT-owned `codex app-server` subprocess
-is therefore the designated future native codex adapter, removing the delegate
-dependency for codex entirely. Without any delegate, WT covers 100% of claude
-sessions with at-most-idle-lag delivery.
+and cannot receive mid-run input. User-visible Codex threads should be driven
+through the managed app-server broker when CCC is running; WT starts its own
+private stdio app-server only as the standalone fallback. Codex the engine is
+steerable mid-run through app-server JSON-RPC (`thread/resume`, `turn/start`,
+`turn/steer`, and experimental `thread/inject`), but the ownership rule matters
+more than the method list: avoid two app-server owners for one thread.
+Without any delegate, WT covers claude sessions with at-most-idle-lag delivery
+and Codex sessions through its private fallback.
 
 Shared knowledge: the cross-engine feasibility ground truth (headless vs
 terminal vs app-server, inject/steer/reap per engine) is maintained as

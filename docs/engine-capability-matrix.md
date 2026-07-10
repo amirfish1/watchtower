@@ -91,14 +91,13 @@ matching responses read back by id. The methods relevant to messaging:
 - Also present on the schema, not yet exercised anywhere: `thread/rollback`,
   `thread/fork`.
 
-Implication for WT: **a WT-owned `codex app-server` subprocess is the
-designated future native codex adapter.** It removes the need to delegate
-codex sends anywhere else, because `turn/steer` gives WT the one thing the
-one-shot `codex exec` path structurally cannot: injection into an
-already-running turn. Building this adapter slots it into the fall-through
-chain between `resume` and `delegate` (or replaces `delegate` for codex
-entirely), the same seam the deferred native-keystroke adapter is reserved
-for Claude terminals.
+Implication for WT/CCC: `turn/steer` gives Codex the one thing the one-shot
+`codex exec` path structurally cannot: injection into an already-running turn.
+The preferred owner of that app-server transport is the managed CCC broker
+when CCC is running. WT's private stdio app-server is implemented and remains
+the standalone fallback, but it is not the preferred owner on a machine where
+CCC can broker the managed app-server. That rule prevents two independent
+app-server clients from resuming the same thread.
 
 ### Codex process zoo caution
 
@@ -137,7 +136,7 @@ hazard in the first place, not to recover from it after the fact.
 |---|---|---|
 | `fifo` | implemented | live WT workers (Claude, stream-json stdin) |
 | `resume` with busy-hold | implemented | any dormant/idle Claude session by UUID; spawns in the session's own cwd with the transcript rebucketed (WT-76), verifies the child boots, and holds in the outbox instead of racing a session that looks mid-turn |
-| native codex app-server adapter (`turn/steer` / `turn/start`) | **implemented** (WT-54, `watchtower/codex_rpc.py`) | true mid-run codex injection without a delegate |
+| Codex managed broker / private fallback (`turn/steer` / `turn/start`) | **implemented** (CCC managed app-server broker; WT-54 private fallback in `watchtower/codex_rpc.py`) | true mid-run Codex injection while avoiding two app-server owners; WT private stdio only when no delegate/broker is available |
 | native tty keystroke adapter | **implemented** (WT-55, `watchtower/tty.py`) | live-terminal Claude sessions (iTerm2/Terminal.app) whose process carries `--resume <sid>`; sits before `resume` so a live TUI is typed into, never forked |
 | `delegate` (optional, last) | implemented | anything WT cannot do natively: gemini/cursor/antigravity engines, and live terminals the tty adapter cannot map, via a configured HTTP delegate (requests stamped `origin=wt`, WT-78) |
 
@@ -146,9 +145,12 @@ hazard in the first place, not to recover from it after the fact.
 The ticket asked: decide + implement, or explicitly close as wontfix, per
 engine. Decisions, grounded in sections 2-4:
 
-- **Codex — DONE (native).** The WT-owned `codex app-server` adapter shipped
-  as WT-54 (`watchtower/codex_rpc.py`); the "future" row above was stale.
-  Codex no longer depends on the delegate.
+- **Codex — DONE (brokered/native).** CCC owns the managed app-server broker
+  for user-visible Codex sessions when CCC is present. WT's private
+  `codex app-server` adapter shipped as WT-54 (`watchtower/codex_rpc.py`) and
+  remains the standalone fallback. WT delivery tries the configured CCC
+  delegate/broker before starting private stdio; private stdio is no longer
+  documented as the preferred adapter on CCC-managed machines.
 - **Antigravity — DEFERRED (native feasible, needs spec).** Group 3 shows a
   real path: HTTPS RPC to the localhost port the app's language server
   listens on (`SendUserCascadeMessage`). Not wontfix — but the RPC surface
@@ -169,4 +171,5 @@ engine. Decisions, grounded in sections 2-4:
 
 Net: the delegate remains the correct *permanent* home only for Cursor;
 antigravity and gemini have concrete native paths waiting on spec/shaping
-tickets, and codex/claude (headless + terminal) are already native.
+tickets, claude is native, and codex is app-server-native with a CCC-managed
+broker first and WT private fallback for standalone operation.
