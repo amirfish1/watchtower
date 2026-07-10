@@ -328,6 +328,16 @@ def test_spawn_workers_missing_binary_records_launch_failure(wt, monkeypatch):
     assert cooldown and cooldown["worker_id"] == failures[0]["worker_id"]
 
 
+def test_engine_available_uses_codex_env_override(wt, monkeypatch):
+    script = wt.tmp / "fake-codex"
+    script.write_text("#!/bin/sh\nexit 0\n")
+    script.chmod(0o755)
+    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(script))
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+
+    assert wt.workers.engine_available("codex") is True
+
+
 def test_reconcile_excess_workers_not_stopped(wt):
     """New contract: the reconciler no longer STOPs surplus workers — that call
     is made at claim time (live>desired) with REAP as the safety net. It only

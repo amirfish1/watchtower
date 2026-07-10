@@ -166,6 +166,42 @@ RUN_ONCE_GOAL_TEMPLATE = (
 _ENGINE_BIN = {"claude": "claude", "codex": "codex"}
 
 
+def _resolve_engine_bin(engine: str) -> str:
+    """Return an executable path for an agent engine, or "" if unavailable.
+
+    Queue workers may be spawned from a daemon/service environment whose PATH is
+    narrower than an interactive shell. Resolve common user-local installs here
+    so daemon-spawned Codex workers do not depend on shell startup files.
+    """
+    if engine == "antigravity":
+        return _resolve_antigravity_bin()
+
+    bin_name = _ENGINE_BIN.get(engine, engine)
+    env_name = {
+        "claude": "WATCHTOWER_CLAUDE_BIN",
+        "codex": "WATCHTOWER_CODEX_BIN",
+    }.get(engine)
+    if env_name:
+        env_bin = os.environ.get(env_name)
+        if env_bin:
+            expanded = os.path.expanduser(env_bin)
+            found = shutil.which(expanded)
+            if found:
+                return found
+            if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+                return expanded
+            return ""
+
+    found = shutil.which(bin_name)
+    if found:
+        return found
+
+    user_local = Path.home() / ".local" / "bin" / bin_name
+    if user_local.is_file() and os.access(user_local, os.X_OK):
+        return str(user_local)
+    return ""
+
+
 def _resolve_antigravity_bin() -> str:
     """Locate the Antigravity AGY CLI. Env override first (nonstandard
     installs), then `agy`/`antigravity` on PATH. Empty string when absent."""
@@ -184,9 +220,7 @@ def _resolve_antigravity_bin() -> str:
 
 def engine_available(engine: str) -> bool:
     """True if the engine's CLI binary is resolvable on this machine."""
-    if engine == "antigravity":
-        return bool(_resolve_antigravity_bin())
-    return bool(shutil.which(_ENGINE_BIN.get(engine, engine)))
+    return bool(_resolve_engine_bin(engine))
 
 # Fable is a creative/story model — not suited for code work.  Spawning a
 # worker with it produces poor results; guard against accidental selection.
@@ -1794,6 +1828,11 @@ def spawn_workers(
     for _ in range(n):
         worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
         argv = build_drain_command(queue, engine, worker_id, repo_path, model)
+        logical_bin = _ENGINE_BIN.get(engine, engine)
+        if argv and argv[0] == logical_bin:
+            resolved_bin = _resolve_engine_bin(engine)
+            if resolved_bin:
+                argv = [resolved_bin] + argv[1:]
         goal = drain_goal(queue, worker_id, repo_path)
         if dry_run:
             rec = {
