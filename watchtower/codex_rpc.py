@@ -6,9 +6,9 @@ own stdin/stdout: one ``{"jsonrpc":"2.0","id":N,"method":...,"params":...}\\n``
 line in, matching responses read back by id on a background reader thread.
 Unlike the one-shot ``codex exec``, the app-server can steer an already
 running turn (``turn/steer``) — the Codex analog of a FIFO write into a live
-Claude worker — which is why WT owns one directly instead of always routing
-codex sends through the delegate (see ``docs/engine-capability-matrix.md``
-section 4, "The codex app-server in detail").
+Claude worker. WT uses this only as the standalone fallback; when CCC's
+delegate/broker is configured, ``messages.deliver`` routes Codex sends there
+first so one local owner drives user-visible Codex threads.
 
 This module ports the pattern proven in Claude Command Center's
 ``server.py`` (``_ensure_codex_app_server`` / ``_codex_app_server_request_to_proc``
@@ -52,6 +52,10 @@ _INITIALIZED = False
 _INITIALIZING = False
 _NEXT_ID = 1
 _RESPONSES: Dict[int, Dict[str, Any]] = {}
+
+
+def _elapsed_ms(start: float) -> float:
+    return round((time.monotonic() - start) * 1000.0, 1)
 
 
 # --------------------------------------------------------------------- binary
@@ -335,24 +339,42 @@ def deliver(
     ``messages.deliver`` only needs "get this text into the thread", not the
     separate resume-vs-steer decision CCC's UI exposes.
 
-    Returns ``{"ok": True, "via": "steer"|"start", "turn_id": ...}`` or
-    ``{"ok": False, "error": ...}``. Never raises: a dead/unavailable
-    app-server, a resume failure, or a steer/start failure all come back as a
-    plain failed result so ``messages.deliver`` can fall through to the next
-    adapter (delegate or outbox)."""
+    Returns ``{"ok": True, "via": "steer"|"start", "turn_id": ...}`` plus
+    warm/cold and latency fields, or ``{"ok": False, "error": ...}``. Never
+    raises: a dead/unavailable app-server, a resume failure, or a steer/start
+    failure all come back as a plain failed result so ``messages.deliver`` can
+    fall through to the next adapter (delegate or outbox)."""
+    total_start = time.monotonic()
+    app_server_warm = is_running()
     if not is_available():
-        return {"ok": False, "error": "codex binary not found"}
+        return {
+            "ok": False,
+            "error": "codex binary not found",
+            "stage": "resolve",
+            "app_server_warm": app_server_warm,
+            "latency_ms": _elapsed_ms(total_start),
+        }
     resume_params: Dict[str, Any] = {"threadId": thread_id, "excludeTurns": False}
     if cwd:
         resume_params["cwd"] = cwd
+    resume_start = time.monotonic()
     resumed = request("thread/resume", resume_params, timeout=timeout)
+    resume_ms = _elapsed_ms(resume_start)
     if not _response_succeeded(resumed):
-        return {"ok": False, "error": _error_text(resumed) or "thread/resume failed"}
+        return {
+            "ok": False,
+            "error": _error_text(resumed) or "thread/resume failed",
+            "stage": "thread/resume",
+            "app_server_warm": app_server_warm,
+            "resume_ms": resume_ms,
+            "latency_ms": _elapsed_ms(total_start),
+        }
     thread = (resumed.get("result") or {}).get("thread") or {}
     active_turn = _latest_active_turn(thread)
     status = (thread.get("status") or {}).get("type")
 
     if status == "active" and active_turn:
+        turn_start = time.monotonic()
         steered = request(
             "turn/steer",
             {
@@ -362,19 +384,50 @@ def deliver(
             },
             timeout=timeout,
         )
+        turn_ms = _elapsed_ms(turn_start)
         if _response_succeeded(steered):
             return {
                 "ok": True,
                 "via": "steer",
                 "turn_id": (steered.get("result") or {}).get("turnId") or active_turn["id"],
+                "app_server_warm": app_server_warm,
+                "resume_ms": resume_ms,
+                "turn_ms": turn_ms,
+                "latency_ms": _elapsed_ms(total_start),
             }
-        return {"ok": False, "error": _error_text(steered) or "turn/steer failed"}
+        return {
+            "ok": False,
+            "error": _error_text(steered) or "turn/steer failed",
+            "stage": "turn/steer",
+            "app_server_warm": app_server_warm,
+            "resume_ms": resume_ms,
+            "turn_ms": turn_ms,
+            "latency_ms": _elapsed_ms(total_start),
+        }
 
     start_params: Dict[str, Any] = {"threadId": thread_id, "input": _user_input(text)}
     if cwd:
         start_params["cwd"] = cwd
+    turn_start = time.monotonic()
     started = request("turn/start", start_params, timeout=timeout)
+    turn_ms = _elapsed_ms(turn_start)
     if _response_succeeded(started):
         turn = (started.get("result") or {}).get("turn") or {}
-        return {"ok": True, "via": "start", "turn_id": turn.get("id")}
-    return {"ok": False, "error": _error_text(started) or "turn/start failed"}
+        return {
+            "ok": True,
+            "via": "start",
+            "turn_id": turn.get("id"),
+            "app_server_warm": app_server_warm,
+            "resume_ms": resume_ms,
+            "turn_ms": turn_ms,
+            "latency_ms": _elapsed_ms(total_start),
+        }
+    return {
+        "ok": False,
+        "error": _error_text(started) or "turn/start failed",
+        "stage": "turn/start",
+        "app_server_warm": app_server_warm,
+        "resume_ms": resume_ms,
+        "turn_ms": turn_ms,
+        "latency_ms": _elapsed_ms(total_start),
+    }
