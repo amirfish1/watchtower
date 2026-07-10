@@ -22,7 +22,7 @@ import shutil
 import subprocess
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -46,8 +46,23 @@ WORKER_SESSIONS_FILE = Path(
     or (Path.home() / ".watchtower" / "worker-sessions.json")
 )
 
+# Tracks short-lived worker launch failures (quota/auth/API/missing binary) so
+# the reconciler does not create a new cloud session every tick while the engine
+# is unavailable.
+LAUNCH_FAILURES_FILE = Path(
+    os.environ.get("WATCHTOWER_LAUNCH_FAILURES_FILE")
+    or (Path.home() / ".watchtower" / "launch-failures.json")
+)
+
 # Cap to avoid unbounded growth; oldest entries are dropped first.
 _WORKER_SESSIONS_CAP = 500
+
+_LAUNCH_FAILURE_GRACE_S = float(
+    os.environ.get("WATCHTOWER_LAUNCH_FAILURE_GRACE_S", "6")
+)
+_LAUNCH_FAILURE_DEFAULT_COOLDOWN_S = float(
+    os.environ.get("WATCHTOWER_LAUNCH_FAILURE_COOLDOWN_S", "300")
+)
 
 # Drain goal adapted from CCC's docs/ux-fixes-worker-brief.md canonical /goal.
 # Generalized: no CCC paths, no shared-clone assumptions. The worker drains one
@@ -229,6 +244,15 @@ def _close_fd_quiet(fd) -> None:
         return
     try:
         os.close(fd)
+    except OSError:
+        pass
+
+
+def _unlink_path_quiet(path: Optional[str]) -> None:
+    if not path:
+        return
+    try:
+        Path(path).unlink()
     except OSError:
         pass
 
@@ -488,6 +512,204 @@ _CODEX_SESSION_ID_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_USAGE_RETRY_DATE_RE = re.compile(
+    r"try again at\s+([A-Za-z]+ \d{1,2}(?:st|nd|rd|th)?, \d{4} "
+    r"\d{1,2}:\d{2}\s*(?:AM|PM))",
+    re.IGNORECASE,
+)
+_USAGE_RETRY_TIME_RE = re.compile(
+    r"try again at\s+(\d{1,2}:\d{2}\s*(?:AM|PM))",
+    re.IGNORECASE,
+)
+
+
+def _load_launch_failures() -> Dict[str, Any]:
+    try:
+        with open(LAUNCH_FAILURES_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_launch_failures(data: Dict[str, Any]) -> None:
+    try:
+        LAUNCH_FAILURES_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(LAUNCH_FAILURES_FILE) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, LAUNCH_FAILURES_FILE)
+    except OSError:
+        pass
+
+
+def _launch_failure_key(queue: str, engine: str) -> str:
+    return f"{queue}:{engine or 'claude'}"
+
+
+def _iso_from_epoch(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_usage_retry_at(text: str, now: Optional[float] = None) -> Optional[float]:
+    """Parse Codex quota reset copy like "Jul 9th, 2026 12:09 AM"."""
+    now = time.time() if now is None else now
+
+    def _strip_ordinals(s: str) -> str:
+        return re.sub(r"(\d{1,2})(st|nd|rd|th)", r"\1", s, flags=re.IGNORECASE)
+
+    m = _USAGE_RETRY_DATE_RE.search(text)
+    if m:
+        raw = _strip_ordinals(m.group(1))
+        for fmt in ("%b %d, %Y %I:%M %p", "%B %d, %Y %I:%M %p"):
+            try:
+                dt = datetime.strptime(raw, fmt)
+                return dt.replace(tzinfo=timezone.utc).timestamp()
+            except ValueError:
+                continue
+
+    m = _USAGE_RETRY_TIME_RE.search(text)
+    if not m:
+        return None
+    try:
+        parsed = datetime.strptime(m.group(1).upper(), "%I:%M %p")
+    except ValueError:
+        return None
+    base = datetime.fromtimestamp(now, tz=timezone.utc)
+    candidate = base.replace(
+        hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0
+    )
+    if candidate.timestamp() <= now:
+        candidate = candidate + timedelta(days=1)
+    return candidate.timestamp()
+
+
+def _classify_launch_failure_log(
+    log_path: Path, now: Optional[float] = None
+) -> Optional[Dict[str, Any]]:
+    try:
+        text = log_path.read_text(errors="replace")
+    except OSError:
+        return None
+    lower = text.lower()
+    reason = ""
+    retry_at = None
+    if "usage limit" in lower:
+        reason = "engine usage limit"
+        retry_at = _parse_usage_retry_at(text, now=now)
+    elif "http 503" in lower or "upstream connect error" in lower:
+        reason = "engine api unavailable"
+    elif "not logged in" in lower or "please run /login" in lower:
+        reason = "engine authentication required"
+    elif "authentication" in lower and ("failed" in lower or "error" in lower):
+        reason = "engine authentication failed"
+    if not reason:
+        return None
+    return {"reason": reason, "retry_at": retry_at}
+
+
+def _record_launch_failure(
+    *,
+    queue: str,
+    engine: str,
+    worker_id: str,
+    pid: int,
+    log_path: Path,
+    reason: str,
+    retry_at: Optional[float] = None,
+    model: str = "",
+    exit_code: Optional[int] = None,
+) -> Dict[str, Any]:
+    now = time.time()
+    cooldown_until = retry_at if retry_at and retry_at > now else (
+        now + _LAUNCH_FAILURE_DEFAULT_COOLDOWN_S
+    )
+    session_id = resolve_session_id_from_log(str(log_path))
+    _add_worker_session_id(session_id)
+    rec: Dict[str, Any] = {
+        "queue": queue,
+        "engine": engine,
+        "worker_id": worker_id,
+        "pid": pid,
+        "log": str(log_path),
+        "reason": reason,
+        "cooldown_until": cooldown_until,
+        "cooldown_until_human": _iso_from_epoch(cooldown_until),
+        "recorded_at": _iso_from_epoch(now),
+    }
+    if model:
+        rec["model"] = model
+    if exit_code is not None:
+        rec["exit_code"] = exit_code
+    if session_id:
+        rec["session_id"] = session_id
+
+    data = _load_launch_failures()
+    data[_launch_failure_key(queue, engine)] = rec
+    _save_launch_failures(data)
+    try:
+        from watchtower.queue import _log
+        _log(
+            "LAUNCH_FAIL",
+            f"{worker_id} (pid {pid}) [{engine}] — {reason}; cooldown until "
+            f"{rec['cooldown_until_human']}",
+            queue=queue,
+        )
+    except Exception:
+        pass
+    return rec
+
+
+def active_launch_failure_cooldown(
+    queue: str, engine: str
+) -> Optional[Dict[str, Any]]:
+    """Return active launch-failure cooldown for queue/engine, pruning expired."""
+    key = _launch_failure_key(queue, engine)
+    data = _load_launch_failures()
+    rec = data.get(key)
+    if not isinstance(rec, dict):
+        return None
+    try:
+        until = float(rec.get("cooldown_until") or 0)
+    except (TypeError, ValueError):
+        until = 0
+    if until > time.time():
+        return rec
+    data.pop(key, None)
+    _save_launch_failures(data)
+    return None
+
+
+def _wait_for_immediate_launch_failure(
+    proc: subprocess.Popen,
+    *,
+    queue: str,
+    engine: str,
+    worker_id: str,
+    log_path: Path,
+    model: str = "",
+) -> Optional[Dict[str, Any]]:
+    if _LAUNCH_FAILURE_GRACE_S <= 0:
+        return None
+    try:
+        exit_code = proc.wait(timeout=_LAUNCH_FAILURE_GRACE_S)
+    except subprocess.TimeoutExpired:
+        return None
+    classified = _classify_launch_failure_log(log_path)
+    if not classified:
+        return None
+    return _record_launch_failure(
+        queue=queue,
+        engine=engine,
+        worker_id=worker_id,
+        pid=proc.pid,
+        log_path=log_path,
+        reason=str(classified.get("reason") or "worker launch failed"),
+        retry_at=classified.get("retry_at"),
+        model=model,
+        exit_code=exit_code,
+    )
+
 
 def resolve_session_id_from_log(log_path: str) -> str:
     """Extract the cloud-assigned session UUID from a worker's stream-json log.
@@ -521,6 +743,45 @@ def resolve_session_id_from_log(log_path: str) -> str:
     except (OSError, UnicodeDecodeError):
         pass
     return ""
+
+
+def _upsert_codex_worker_registry(
+    worker: Dict[str, Any],
+    *,
+    ref: str = "",
+    title: str = "",
+) -> None:
+    if str((worker or {}).get("engine") or "").lower() != "codex":
+        return
+    sid = str((worker or {}).get("session_id") or "").strip()
+    if not _SESSION_ID_RE.fullmatch(sid):
+        return
+    try:
+        from . import codex_registry
+        wt_meta = {
+            "worker_id": worker.get("worker_id") or "",
+            "queue": worker.get("queue") or "",
+            "ref": ref,
+            "log": worker.get("log") or "",
+            "started_at": worker.get("started_at") or "",
+        }
+        codex_registry.upsert(
+            sid,
+            source="wt-workers",
+            visibility="worker",
+            transport_owner="wt-codex-exec",
+            transport="codex-exec",
+            cwd=worker.get("repo_path") or "",
+            repo_path=worker.get("repo_path") or "",
+            model=worker.get("model") or "",
+            worker_id=worker.get("worker_id") or "",
+            queue=worker.get("queue") or "",
+            ref=ref,
+            title=title,
+            wt=wt_meta,
+        )
+    except Exception:
+        pass
 
 
 def _pid_alive(pid: int) -> bool:
@@ -591,6 +852,7 @@ def record_worker(
     _save(data)
     # If a session_id is somehow known at record time, ledger it (survives prune).
     _add_worker_session_id(rec.get("session_id", ""))
+    _upsert_codex_worker_registry(rec)
     return rec
 
 
@@ -615,6 +877,7 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                 backfilled = True
                 # Ledger it so it survives this worker being pruned later.
                 _add_worker_session_id(sid)
+                _upsert_codex_worker_registry(w)
         alive = _pid_alive(int(w.get("pid", 0)))
         row = dict(w)
         row["alive"] = alive
@@ -1059,10 +1322,14 @@ def backfill_claimed_session_ids() -> List[str]:
     Returns the refs that were freshly backfilled this pass."""
     from . import queue as _q
     backfilled: List[str] = []
+    live_workers = [
+        w for w in list_workers(prune=False)
+        if w.get("alive") and w.get("session_id")
+    ]
     # worker_id -> cloud session_id for live workers that have a resolved UUID.
     wid_to_sid = {str(w.get("worker_id", "")): str(w.get("session_id", ""))
-                  for w in list_workers(prune=False)
-                  if w.get("alive") and w.get("session_id")}
+                  for w in live_workers}
+    wid_to_worker = {str(w.get("worker_id", "")): w for w in live_workers}
     if not wid_to_sid:
         return backfilled
     try:
@@ -1088,6 +1355,11 @@ def backfill_claimed_session_ids() -> List[str]:
                     _messages.set_session_title(sid, name)
                 except Exception:
                     pass
+                _upsert_codex_worker_registry(
+                    wid_to_worker.get(str(it.get("claimed_by") or "")) or {},
+                    ref=str(it.get("ref") or ""),
+                    title=name,
+                )
         except Exception:
             pass
     return backfilled
@@ -1270,7 +1542,8 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
 
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
                               "reaped": [], "requeued": [], "backfilled": [],
-                              "session_title_backfilled": []}
+                              "session_title_backfilled": [],
+                              "launch_failed": []}
 
     # Reap cold idle workers first (idle past the prompt-cache TTL): waking one
     # would re-read its bloated context uncached. Killing it lets the spawn pass
@@ -1412,9 +1685,22 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 or (peeked or {}).get("repo_path", "")
             )
             engine = config.engine(q_name)
+            cooldown = (
+                None if dry_run else active_launch_failure_cooldown(q_name, engine)
+            )
+            if cooldown:
+                until = cooldown.get("cooldown_until_human", "later")
+                reason = cooldown.get("reason", "recent worker launch failure")
+                result["skipped"].append(
+                    {"queue": q_name,
+                     "reason": f"launch cooldown until {until} — {reason}"}
+                )
+                continue
+            launch_failed: List[Dict[str, Any]] = []
             spawned = spawn_workers(
                 q_name, n=to_spawn, engine=engine,
                 repo_path=repo_path, dry_run=dry_run,
+                launch_failures=launch_failed,
             )
             # Why this spawn happened: open depth + how short of desired we were.
             unclaimed = max(0, depth - actual)
@@ -1423,7 +1709,10 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             )
             for rec in spawned:
                 rec["spawn_reason"] = spawn_reason
+            for rec in launch_failed:
+                rec["spawn_reason"] = spawn_reason
             result["spawned"].extend(spawned)
+            result["launch_failed"].extend(launch_failed)
         elif actual > desired:
             # Surplus is NOT wound down here. A worker discovers it is surplus at
             # claim time (cmd_claim: nothing claimable AND live>desired) and exits
@@ -1477,6 +1766,7 @@ def spawn_workers(
     repo_path: str = "",
     model: str = "",
     dry_run: bool = False,
+    launch_failures: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Launch ``n`` worker subprocesses draining ``queue``.
 
@@ -1529,6 +1819,8 @@ def spawn_workers(
         if engine != "codex":
             fifo_path, child_stdin_fd = _make_stdin_fifo(log_path)
         stdin_arg = child_stdin_fd if child_stdin_fd is not None else subprocess.DEVNULL
+        proc = None
+        popen_error = None
         try:
             proc = subprocess.Popen(
                 argv,
@@ -1538,11 +1830,33 @@ def spawn_workers(
                 start_new_session=True,
                 cwd=repo_path,
             )
+        except OSError as e:
+            popen_error = e
+            try:
+                logf.write(f"LAUNCH FAILED: {e}\n".encode("utf-8"))
+                logf.flush()
+            except OSError:
+                pass
         finally:
             logf.close()  # the child holds its own dup'd fd
             # The child inherited a dup of the RDWR fd as its stdin; the parent's
             # copy is no longer needed (the child's keeps the FIFO from EOF).
             _close_fd_quiet(child_stdin_fd)
+        if popen_error is not None or proc is None:
+            _unlink_path_quiet(fifo_path)
+            reason = f"engine executable unavailable: {popen_error}"
+            failure = _record_launch_failure(
+                queue=queue,
+                engine=engine,
+                worker_id=worker_id,
+                pid=0,
+                log_path=log_path,
+                reason=reason,
+                model=model,
+            )
+            if launch_failures is not None:
+                launch_failures.append(failure)
+            continue
         # Deliver the drain goal as the first stream-json user message. The
         # child's inherited RDWR fd is already a reader, so this open + write
         # succeeds immediately and never blocks.
@@ -1555,6 +1869,19 @@ def spawn_workers(
                 except OSError:
                     pass
                 _close_fd_quiet(None)
+        failure = _wait_for_immediate_launch_failure(
+            proc,
+            queue=queue,
+            engine=engine,
+            worker_id=worker_id,
+            log_path=log_path,
+            model=model,
+        )
+        if failure is not None:
+            _unlink_path_quiet(fifo_path)
+            if launch_failures is not None:
+                launch_failures.append(failure)
+            continue
         rec = record_worker(
             proc.pid, queue, engine, worker_id, repo_path, str(log_path),
             fifo=fifo_path or "", model=model,
