@@ -56,6 +56,9 @@ def wt(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(tmp_path / "no-ccc-spawn-defaults.json")
     )
+    monkeypatch.setenv(
+        "WATCHTOWER_CODEX_THREAD_REGISTRY", str(tmp_path / "codex-thread-registry.json")
+    )
 
     # No codex binary by default: is_available() must read False so the
     # codex-app-server adapter is a clean no-op miss in every test that
@@ -67,11 +70,13 @@ def wt(tmp_path, monkeypatch):
     import watchtower.workers as workers
     import watchtower.messages as messages
     import watchtower.codex_rpc as codex_rpc
+    import watchtower.codex_registry as codex_registry
     importlib.reload(q)
     importlib.reload(config)
     importlib.reload(workers)
     importlib.reload(messages)
     importlib.reload(codex_rpc)
+    importlib.reload(codex_registry)
     monkeypatch.setattr(config, "_REGISTRY_FILE", tmp_path / "no-registry.json")
 
     class Ns:
@@ -79,6 +84,7 @@ def wt(tmp_path, monkeypatch):
     ns = Ns()
     ns.q, ns.config, ns.workers, ns.messages = q, config, workers, messages
     ns.codex_rpc = codex_rpc
+    ns.codex_registry = codex_registry
     ns.tmp = tmp_path
     ns._readers = []
     yield ns
@@ -185,6 +191,21 @@ def test_registry_roundtrip(wt):
     assert wt.messages.remove_agent("planner") is True
     assert wt.messages.list_agents() == []
     assert wt.messages.remove_agent("planner") is False
+
+
+def test_register_codex_agent_updates_thread_registry(wt):
+    wt.messages.register_agent("codexer", SID_D, engine="codex", cwd="/repo")
+
+    rec = wt.codex_registry.entry(SID_D)
+
+    assert rec["thread_id"] == SID_D
+    assert rec["engine"] == "codex"
+    assert rec["visibility"] == "registered-agent"
+    assert rec["cwd"] == "/repo"
+    assert rec["name"] == "codexer"
+    assert rec["title"] == "codexer"
+    assert rec["wt"]["agent_name"] == "codexer"
+    assert "wt-agents" in rec["sources"]
 
 
 def test_register_strips_leading_at_and_repoints(wt):
@@ -441,8 +462,72 @@ def test_deliver_codex_target_via_app_server(wt, monkeypatch):
     res = wt.messages.send("codexer", "hello from wt")
 
     assert res["ok"] is True and res["transport"] == "codex-app-server"
+    assert res["turn_id"] == "turn-integration"
+    assert res["codex_via"] == "start"
+    assert res["codex_app_server_warm"] is False
+    assert res["codex_resume_ms"] >= 0
+    assert res["codex_turn_ms"] >= 0
+    assert res["codex_total_ms"] >= res["codex_resume_ms"]
     # WT-77: every ok delivery also carries a verification receipt.
     assert res.get("receipt_id", "").startswith("rcpt-")
+    reg = wt.codex_registry.entry(SID_D)
+    assert reg["transport_owner"] == "wt-private-app-server"
+    assert reg["transport"] == "stdio"
+    assert reg["wt"]["last_delivery_transport"] == "codex-app-server"
+    assert reg["wt"]["last_delivery_via"] == "start"
+
+
+def test_deliver_codex_prefers_delegate_broker_over_private_app_server(wt, delegate, monkeypatch):
+    """When CCC/delegate is available, WT must not start its private codex
+    app-server for the same thread."""
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(_write_fake_codex_bin(wt.tmp)))
+    _disable_resume(wt, monkeypatch)
+    wt.messages.register_agent("codexer", SID_D, engine="codex", cwd="/repo")
+
+    def _private_should_not_run(*_args, **_kwargs):
+        raise AssertionError("private codex app-server should not be used")
+
+    monkeypatch.setattr(wt.codex_rpc, "deliver", _private_should_not_run)
+
+    res = wt.messages.send("codexer", "hello through broker", mode="steer")
+
+    assert res["ok"] is True
+    assert res["transport"] == "delegate"
+    path, body = srv.requests[0]
+    assert path == "/api/inject-input"
+    assert body == {
+        "session_id": SID_D,
+        "text": "hello through broker",
+        "mode": "steer",
+        "origin": "wt",
+    }
+
+
+def test_deliver_codex_delegate_failure_queues_without_private_app_server(wt, delegate, monkeypatch):
+    """A reachable CCC broker failure queues; WT does not create a second
+    private app-server owner as fallback."""
+    srv, url = delegate
+    srv.responses.append((500, {"ok": False}))
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(_write_fake_codex_bin(wt.tmp)))
+    _disable_resume(wt, monkeypatch)
+    wt.messages.register_agent("codexer", SID_D, engine="codex", cwd="/repo")
+
+    def _private_should_not_run(*_args, **_kwargs):
+        raise AssertionError("private codex app-server should not be used")
+
+    monkeypatch.setattr(wt.codex_rpc, "deliver", _private_should_not_run)
+
+    res = wt.messages.send("codexer", "queue if broker fails")
+
+    assert res["ok"] is False and res["queued"] is True
+    assert "delegate:" in res["error"]
+    pending = wt.messages.outbox_list(status="pending")
+    assert len(pending) == 1
+    assert pending[0]["to"] == SID_D
+    assert pending[0]["text"] == "queue if broker fails"
 
 
 def test_deliver_codex_falls_through_when_binary_missing(wt, monkeypatch):
