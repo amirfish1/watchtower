@@ -125,6 +125,19 @@ def test_reconcile_cold_drain_on_spawns(wt):
     assert [s["queue"] for s in r["spawned"]] == ["Q"]
 
 
+def test_reconcile_dry_run_spawn_is_labeled_in_activity(wt):
+    wt.config.set_auto_drain("Q", True)
+    wt.q.enqueue(project="Q", note="work")
+
+    wt.workers.reconcile_once(dry_run=True)
+
+    activity = (wt.tmp / "activity.log").read_text()
+    spawn_line = next(line for line in activity.splitlines() if "SPAWN" in line)
+    assert "(dry-run; no process started)" in spawn_line
+    assert "— plan:" in spawn_line
+    assert "(pid 0)" not in spawn_line
+
+
 def test_reconcile_drain_off_skips(wt):
     wt.config.set_auto_drain("Q", False)
     wt.q.enqueue(project="Q", note="work")
