@@ -1772,7 +1772,15 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             eng = w.get("engine", "claude")
             mdl = w.get("model", "")
             engine_label = f"{eng}:{mdl}" if mdl else eng
-            _log("SPAWN", f"{wid} (pid {pid}) [{engine_label}]" + (f" — {reason}" if reason else ""), queue=q)
+            if w.get("dry_run"):
+                detail = f"{wid} (dry-run; no process started) [{engine_label}]"
+                if reason:
+                    detail += f" — plan: {reason}"
+            else:
+                detail = f"{wid} (pid {pid}) [{engine_label}]"
+                if reason:
+                    detail += f" — {reason}"
+            _log("SPAWN", detail, queue=q)
         for w in result.get("stopped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
             q = (w.get("queue", "") if isinstance(w, dict) else "")
