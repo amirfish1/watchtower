@@ -73,7 +73,9 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import signal
+import ssl
 import subprocess
 import time
 import urllib.request
@@ -1103,6 +1105,143 @@ def _deliver_gemini_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any
     return {"ok": True, "transport": "gemini-resume", "log": str(log_path)}
 
 
+# ------------------------------------------------------- Antigravity LS delivery
+_ANTIGRAVITY_SERVICE = "exa.language_server_pb.LanguageServerService"
+
+
+def _antigravity_listening_port(pid: str) -> str:
+    """Return the loopback TCP listen port owned by one LS pid, if any."""
+    try:
+        out = subprocess.check_output(
+            ["lsof", "-a", "-nP", "-p", pid, "-iTCP", "-sTCP:LISTEN"],
+            stderr=subprocess.DEVNULL, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return ""
+    for line in out.splitlines()[1:]:
+        match = re.search(r"(?:127\.0\.0\.1|\[::1\]):(\d+)\s+\(LISTEN\)", line)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _antigravity_servers() -> List[Dict[str, str]]:
+    """Discover local Antigravity LS processes and their CSRF credentials.
+
+    Antigravity starts the LS with a random HTTPS port (``--https_server_port
+    0``) and provides its CSRF token as a command-line flag.  Both are local
+    process metadata, and the generated endpoint is always pinned to loopback.
+    """
+    try:
+        out = subprocess.check_output(
+            ["ps", "-axww", "-o", "pid=,command="],
+            stderr=subprocess.DEVNULL, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return []
+    servers: List[Dict[str, str]] = []
+    for line in out.splitlines():
+        pid, _, command = line.strip().partition(" ")
+        if not pid or "language_server" not in command:
+            continue
+        try:
+            argv = shlex.split(command)
+            token_idx = argv.index("--csrf_token")
+            token = argv[token_idx + 1]
+        except (ValueError, IndexError):
+            continue
+        port = _antigravity_listening_port(pid)
+        if port:
+            servers.append({
+                "base_url": f"https://127.0.0.1:{port}",
+                "csrf_token": token,
+            })
+    return servers
+
+
+def _antigravity_post(
+    server: Dict[str, str], method: str, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """POST JSON to one local Antigravity Connect endpoint.
+
+    The LS serves a self-signed certificate on localhost, so certificate
+    verification is intentionally disabled only for this fixed 127.0.0.1 URL.
+    """
+    url = f"{server['base_url']}/{_ANTIGRAVITY_SERVICE}/{method}"
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Codeium-Csrf-Token": server["csrf_token"],
+        },
+        method="POST",
+    )
+    context = ssl._create_unverified_context()
+    with urllib.request.urlopen(req, timeout=5, context=context) as response:
+        raw = response.read().decode("utf-8", "replace")
+    data = json.loads(raw) if raw else {}
+    return data if isinstance(data, dict) else {}
+
+
+def _antigravity_requested_model(status: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Pick the LS's recommended advertised cascade model, if present."""
+    configs = (
+        status.get("userStatus", {}).get("cascadeModelConfigData", {})
+        .get("clientModelConfigs", [])
+    )
+    if not isinstance(configs, list):
+        return None
+    for config in configs:
+        if not isinstance(config, dict) or not config.get("isRecommended"):
+            continue
+        model = config.get("modelOrAlias")
+        if isinstance(model, dict) and model:
+            return model
+    return None
+
+
+def _deliver_antigravity_language_server(
+    resolved: Dict[str, Any], text: str
+) -> Dict[str, Any]:
+    """Deliver to a live Antigravity cascade.
+
+    AGY's CLI logs prove its conversation id is the language-server cascade id,
+    so WatchTower uses the registered ``session_id`` directly.  It first asks
+    each discovered LS for that cascade; this prevents routing a message to an
+    unrelated Antigravity instance that happens to be running.
+    """
+    if resolved.get("engine") != "antigravity":
+        return {"ok": False, "error": "antigravity adapter needs engine=antigravity"}
+    sid = str(resolved.get("session_id") or "")
+    if not sid:
+        return {"ok": False, "error": "antigravity adapter needs a session_id"}
+    servers = _antigravity_servers()
+    if not servers:
+        return {"ok": False, "error": "no live Antigravity language server"}
+    last_error = "cascade not found on a live Antigravity language server"
+    for server in servers:
+        try:
+            _antigravity_post(server, "GetCascadeTrajectory", {"cascadeId": sid})
+            status = _antigravity_post(server, "GetUserStatus", {})
+            requested_model = _antigravity_requested_model(status)
+            if requested_model is None:
+                return {"ok": False, "error": "Antigravity exposes no recommended cascade model"}
+            config = {
+                "plannerConfig": {"requestedModel": requested_model, "maxOutputTokens": 8192},
+                "checkpointConfig": {"maxOutputTokens": 8192},
+            }
+            _antigravity_post(server, "SendUserCascadeMessage", {
+                "cascadeId": sid,
+                "items": [{"text": text}],
+                "cascadeConfig": config,
+            })
+            return {"ok": True, "transport": "antigravity-language-server"}
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            last_error = str(exc)
+    return {"ok": False, "error": f"antigravity: {last_error}"}
+
+
 def _deliver_delegate(
     resolved: Dict[str, Any], text: str, mode: str
 ) -> Dict[str, Any]:
@@ -1200,6 +1339,11 @@ def _deliver_unreceipted(
         if r.get("ok"):
             return r
         errors.append(f"gemini: {r.get('error', 'failed')}")
+    if resolved.get("engine") == "antigravity":
+        r = _deliver_antigravity_language_server(resolved, text)
+        if r.get("ok"):
+            return r
+        errors.append(f"antigravity: {r.get('error', 'failed')}")
     if not delegate_tried:
         r = _deliver_delegate(resolved, text, mode)
         if r.get("ok"):

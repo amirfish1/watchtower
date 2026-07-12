@@ -581,6 +581,83 @@ def test_deliver_gemini_falls_through_when_binary_missing(wt, monkeypatch):
     assert "gemini" in res["error"]
 
 
+# ===================================================== antigravity delivery (WT-79)
+def test_deliver_antigravity_target_via_local_language_server(wt, monkeypatch):
+    """An Antigravity conversation UUID is its cascade UUID, so a live local
+    language server can receive the next user message directly."""
+    _disable_resume(wt, monkeypatch)
+    wt.messages.register_agent("antigrav", SID_D, engine="antigravity")
+    calls = []
+
+    monkeypatch.setattr(wt.messages, "_antigravity_servers", lambda: [{
+        "base_url": "https://127.0.0.1:4444", "csrf_token": "csrf",
+    }])
+
+    def post(server, method, payload):
+        calls.append((method, payload))
+        if method == "GetCascadeTrajectory":
+            return {"status": "RUNNING"}
+        if method == "GetUserStatus":
+            return {"userStatus": {"cascadeModelConfigData": {
+                "clientModelConfigs": [{
+                    "isRecommended": True,
+                    "modelOrAlias": {"model": "MODEL_TEST"},
+                }],
+            }}}
+        assert method == "SendUserCascadeMessage"
+        return {}
+
+    monkeypatch.setattr(wt.messages, "_antigravity_post", post)
+
+    res = wt.messages.send("antigrav", "hello from wt")
+
+    assert res["ok"] is True
+    assert res["transport"] == "antigravity-language-server"
+    assert calls[-1] == ("SendUserCascadeMessage", {
+        "cascadeId": SID_D,
+        "items": [{"text": "hello from wt"}],
+        "cascadeConfig": {
+            "plannerConfig": {
+                "requestedModel": {"model": "MODEL_TEST"},
+                "maxOutputTokens": 8192,
+            },
+            "checkpointConfig": {"maxOutputTokens": 8192},
+        },
+    })
+
+
+def test_antigravity_delivery_requires_a_live_matching_cascade(wt, monkeypatch):
+    _disable_resume(wt, monkeypatch)
+    wt.messages.register_agent("antigrav", SID_D, engine="antigravity")
+    monkeypatch.setattr(wt.messages, "_antigravity_servers", lambda: [{
+        "base_url": "https://127.0.0.1:4444", "csrf_token": "csrf",
+    }])
+
+    def missing(*_args):
+        raise OSError("HTTP Error 404: cascade not found")
+
+    monkeypatch.setattr(wt.messages, "_antigravity_post", missing)
+
+    res = wt.messages.send("antigrav", "hello from wt")
+
+    assert res["ok"] is False and res["queued"] is True
+    assert "antigravity" in res["error"]
+
+
+def test_antigravity_server_discovery_reads_random_loopback_port(wt, monkeypatch):
+    def check_output(argv, **_kwargs):
+        if argv[0] == "ps":
+            return "123 /Applications/Antigravity.app/Contents/Resources/bin/language_server --csrf_token csrf-value\n"
+        assert argv[:2] == ["lsof", "-a"]
+        return "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\nlanguage_ 123 me 6u IPv4 0x0 0t0 TCP 127.0.0.1:45678 (LISTEN)\n"
+
+    monkeypatch.setattr(wt.messages.subprocess, "check_output", check_output)
+
+    assert wt.messages._antigravity_servers() == [{
+        "base_url": "https://127.0.0.1:45678", "csrf_token": "csrf-value",
+    }]
+
+
 # ===================================================== outbox backoff/dead-letter
 def test_outbox_backoff_schedule_and_dead_letter(wt, monkeypatch):
     _disable_resume(wt, monkeypatch)
