@@ -1414,8 +1414,9 @@ def block(
 def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, Any]]:
     """Record a human answer on a blocked ticket and clear ``needs_input`` so the
     resumed session can continue. Answers are append-only, preserving a
-    back-and-forth. Does not change ``status`` — the ticket is still
-    ``in_progress`` with its worker; the human just unblocked it."""
+    back-and-forth. A ticket with a resumable worker stays ``in_progress``;
+    without one it reopens so the worker pool can claim it instead of leaving
+    the answer stranded behind an unreclaimable claim."""
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -1431,6 +1432,19 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     at=now,
                     text=_clip(text, 24000),
                 )
+                if it.get("status") == "in_progress" and not it.get("claimed_session_id"):
+                    it["status"] = "open"
+                    it["claimed_by"] = None
+                    it["claimed_at"] = None
+                    it["block_question"] = ""
+                    it["blocked_at"] = None
+                    _append_history(
+                        it,
+                        "reopen",
+                        by=_by("human", str(session_id or "")),
+                        at=now,
+                        reason="answered_without_resumable_session",
+                    )
                 _save_unlocked(data)
                 return it
     return None

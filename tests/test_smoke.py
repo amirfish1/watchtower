@@ -1018,6 +1018,26 @@ def test_block_answer_resume_flow(store):
     assert closed["needs_input"] is False
 
 
+def test_answer_reopens_blocked_ticket_without_resumable_worker(store):
+    """An answer cannot strand a ticket in_progress when no worker can resume."""
+    import watchtower.queue as q
+
+    q.enqueue(project="ANSWER", note="needs a decision")
+    claimed = q.claim_next("ccc-dead-worker", project="ANSWER")
+    blocked = q.block(claimed["ref"], session_id="ccc-dead-worker", question="ship it?")
+    assert not blocked.get("claimed_session_id")
+
+    answered = q.answer(blocked["ref"], "yes", session_id="human")
+
+    assert answered["needs_input"] is False
+    assert answered["status"] == "open"
+    assert answered["claimed_by"] is None
+    assert answered["claimed_at"] is None
+    assert [event["event"] for event in answered["history"]][-2:] == ["answer", "reopen"]
+    reclaimed = q.claim_next("fresh-worker", project="ANSWER")
+    assert reclaimed["ref"] == claimed["ref"]
+
+
 def test_release_returns_claim_to_open(store, capsys):
     """WT-86: `wt release <ref>` gives up a claim without closing it, so the
     ticket is reclaimable by another worker."""
@@ -1082,16 +1102,17 @@ def test_ticket_history_records_full_lifecycle(store):
     assert events == ["filed", "claim", "reopen", "claim", "block"]
     assert blocked["history"][4]["question"] == "ship it?"
 
-    q.answer(ref, "yes", session_id="human")
+    answered = q.answer(ref, "yes", session_id="human")
+    assert answered["status"] == "open"  # no resumable worker id: return it to the pool
     closed = q.close(ref, "worker-b", resolution="shipped")
     events = [e["event"] for e in closed["history"]]
-    assert events == ["filed", "claim", "reopen", "claim", "block", "answer", "close"]
-    assert closed["history"][6]["by"]["worker"] == "worker-b"
-    assert closed["history"][6]["resolution"]["summary"] == "shipped"
+    assert events == ["filed", "claim", "reopen", "claim", "block", "answer", "reopen", "close"]
+    assert closed["history"][7]["by"]["worker"] == "worker-b"
+    assert closed["history"][7]["resolution"]["summary"] == "shipped"
 
     # Every entry from worker-a's original claim is still readable off the
     # ticket itself — not just recoverable from activity.log.
-    assert claimed_a["history"][1]["at"] <= closed["history"][6]["at"]
+    assert claimed_a["history"][1]["at"] <= closed["history"][7]["at"]
 
 
 def test_discuss_command_prints_resume(store, capsys):
