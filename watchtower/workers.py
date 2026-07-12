@@ -402,16 +402,19 @@ def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
 
     Rate-limited to once per ``_STUCK_NUDGE_COOLDOWN_S`` per queue. Returns
     the number of workers notified (0 if on cooldown or none warm)."""
+    from . import config
     from .queue import _log
     now = time.time()
     if now - _last_stuck_nudge.get(queue, 0.0) < _STUCK_NUDGE_COOLDOWN_S:
         return 0
     _last_stuck_nudge[queue] = now
+    claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
     nudge = (
         f"No ticket has closed on {queue} in a while despite {live_count} live "
         "worker(s) here. This can happen when a turn errors out on a transient "
         "API/connectivity fault and gets stuck instead of continuing. If your "
-        f"last turn errored, retry now: `wt claim -q {queue} --worker <your-id> "
+        f"last turn errored, retry now: `wt claim -q {queue} --worker <your-id>"
+        f"{claim_filter} "
         "--json` and keep draining."
     )
     delivered = notify_workers(queue, nudge)
@@ -1361,9 +1364,10 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             reason = "queued — auto_drain off (backlog, no worker)"
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
+        claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
         nudge = (
             f"New ticket {ref} filed on {queue}. Claim it with "
-            f"`wt claim -q {queue} --worker <your-id> --json` and drain the queue."
+            f"`wt claim -q {queue} --worker <your-id>{claim_filter} --json` and drain the queue."
         )
         delivered = notify_workers(queue, nudge)
         if delivered:
@@ -1660,10 +1664,13 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             requeued_queues = {ref.rsplit("-", 1)[0]
                                for ref in result["requeued"] if ref}
             for q_name in requeued_queues:
+                claim_filter = "".join(
+                    f" --type {t}" for t in config.claim_types(q_name)
+                )
                 nudge = (
                     f"A ticket on {q_name} was reopened after its previous "
                     f"worker died mid-claim. Claim it with `wt claim -q {q_name} "
-                    "--worker <your-id> --json` and keep draining."
+                    f"--worker <your-id>{claim_filter} --json` and keep draining."
                 )
                 notify_workers(q_name, nudge)
         except Exception:

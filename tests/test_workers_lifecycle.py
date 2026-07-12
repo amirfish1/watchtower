@@ -562,6 +562,28 @@ def test_reconcile_nudges_live_worker_on_stuck_queue(wt):
     assert "Q" in msg["message"]["content"][0]["text"]
 
 
+def test_reconcile_nudge_preserves_queue_claim_type_filter(wt):
+    """A bug-only queue's retry instruction must not invite feature claims."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_claim_types("Q", ["bug"])
+    item = wt.q.enqueue(project="Q", note="bug work", item_type="bug")
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == item["ref"]:
+            it["created_at"] = "2000-01-01T00:00:00Z"
+    wt.q._save_unlocked(data)
+
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S - 30)
+
+    wt.workers.reconcile_once(dry_run=False)
+
+    msg = json.loads(os.read(wt._readers[-1], 65536).decode().strip())
+    assert "wt claim -q Q --worker <your-id> --type bug --json" in (
+        msg["message"]["content"][0]["text"]
+    )
+
+
 def test_reconcile_does_not_nudge_freshly_spawned_worker(wt):
     """WT-101: a ticket that sat unclaimed for a long time (no live worker to
     claim it) reads `stuck=True` the instant the queue gets staffed -- before
