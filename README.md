@@ -196,6 +196,11 @@ A queue can use GitHub Issues instead of the local JSON queue file. WatchTower
 still exposes the same commands; behind the scenes `wt add` creates an issue,
 `wt claim` assigns it, and `wt close` closes it with a resolution comment.
 
+So yes: closing a GitHub-backed ticket closes the corresponding GitHub Issue.
+The required `--summary` (plus any caveats, follow-ups, or unresolved items)
+is posted as that issue's resolution comment and is also retained in
+WatchTower's metadata for the dashboard and CLI history.
+
 ```bash
 gh auth login
 wt set -q MYAPP --backend github --github-repo owner/repo
