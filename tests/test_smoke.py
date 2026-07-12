@@ -180,6 +180,25 @@ def test_bare_command_prints_grouped_help(capsys):
     assert "{status," not in out
 
 
+def test_queue_configuration_help_identifies_config_as_canonical(capsys):
+    """Avoid presenting the legacy ``set`` subset as a second configuration API."""
+    import watchtower.cli as cli
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["config", "--help"])
+    assert exc.value.code == 0
+    config_help = capsys.readouterr().out
+    assert "recommended queue configuration command" in config_help
+    assert "auto-drain policy" in config_help
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["set", "--help"])
+    assert exc.value.code == 0
+    set_help = capsys.readouterr().out
+    assert "compatibility alias" in set_help.lower()
+    assert "prefer `wt config`" in set_help.lower()
+
+
 def test_enqueue_claim_close_status(store):
     import watchtower.queue as q
     import watchtower.health as health

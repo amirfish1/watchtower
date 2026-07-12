@@ -1612,7 +1612,7 @@ def cmd_dedup(args: argparse.Namespace) -> int:
 
 
 def cmd_set(args: argparse.Namespace) -> int:
-    """Set queue-level config (repo_path, engine, desired_workers, etc.)."""
+    """Compatibility command for the queue settings that predate ``config``."""
     from . import config
     changed = []
     if args.backend is not None:
@@ -2417,8 +2417,8 @@ COMMAND_HELP: Dict[str, str] = {
     "ls": "list the tickets in one queue",
     "dedup": "close exact-duplicate open tickets",
     "status": "per-queue depth / age / stuck flag",
-    "config": "configure a queue: auto-drain, worker count, path, engine (unified wt set + wt drain)",
-    "set": "set queue-level config (repo_path, engine, model, workers)",
+    "config": "recommended queue configuration: settings plus auto-drain policy",
+    "set": "compatibility alias for basic queue settings; prefer `wt config`",
     "drain": "enable or disable auto-drain for a queue",
     "wait": "block until the queue is drained",
     "monitor": "run a check; file a ticket if it fails",
@@ -2861,7 +2861,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="per-chat auto-nudge rate cap")
     sc.add_argument("--json", action="store_true")
 
-    s = sub.add_parser("set")
+    s = sub.add_parser(
+        "set",
+        help="compatibility alias for basic queue settings; prefer `wt config`",
+        description=(
+            "Compatibility alias for the basic queue settings that predate "
+            "`wt config`. Prefer `wt config` for new scripts and interactive "
+            "use: it includes auto-drain policy and uses the current flag names."
+        ),
+    )
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("--backend", default=None, choices=["file", "github"],
                    help="queue backing store: file (default) or github")
@@ -2896,8 +2904,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="restrict auto-drain workers to these ticket types (repeatable); omit to clear")
     s.set_defaults(func=cmd_drain)
 
-    s = sub.add_parser("config",
-                       help="configure a queue (unified wt set + wt drain, WT-97)")
+    s = sub.add_parser(
+        "config",
+        help="recommended queue configuration command (includes auto-drain)",
+        description=(
+            "The recommended queue configuration command. It combines the "
+            "settings available through legacy `wt set` with auto-drain policy "
+            "from `wt drain`."
+        ),
+    )
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("--auto-drain", default=None, choices=["on", "off"],
                    dest="auto_drain",
