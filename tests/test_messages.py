@@ -43,6 +43,9 @@ def wt(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "WATCHTOWER_WORKER_SESSIONS_FILE", str(tmp_path / "worker-sessions.json")
     )
+    monkeypatch.setenv(
+        "WATCHTOWER_WORKER_IDS_FILE", str(tmp_path / "worker-ids.json")
+    )
     monkeypatch.setenv("WATCHTOWER_AGENTS_FILE", str(tmp_path / "agents.json"))
     monkeypatch.setenv("WATCHTOWER_OUTBOX_FILE", str(tmp_path / "outbox.json"))
     # No delegate by default: WT standalone must be a working configuration,

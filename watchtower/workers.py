@@ -46,6 +46,20 @@ WORKER_SESSIONS_FILE = Path(
     or (Path.home() / ".watchtower" / "worker-sessions.json")
 )
 
+# Persistent, append-only ledger of every worker_id WatchTower has ever spawned.
+# workers.json prunes a dead worker's record on the very next read (list_workers
+# defaults to prune=True, and nearly every routine read -- `wt status`, the
+# dashboard poll -- uses that default), often within seconds of it dying. That
+# race meant requeue_orphaned_tickets, which only reopens a ticket when its
+# claimant is a *known* spawned worker (to avoid double-working a still-live
+# session per OPS-104), almost never saw the dead worker in time and left the
+# ticket orphaned in_progress forever. This ledger survives pruning so that
+# check still has the evidence it needs. Shape: {"worker_ids": [...]}.
+WORKER_IDS_FILE = Path(
+    os.environ.get("WATCHTOWER_WORKER_IDS_FILE")
+    or (Path.home() / ".watchtower" / "worker-ids.json")
+)
+
 # Tracks short-lived worker launch failures (quota/auth/API/missing binary) so
 # the reconciler does not create a new cloud session every tick while the engine
 # is unavailable.
@@ -56,6 +70,7 @@ LAUNCH_FAILURES_FILE = Path(
 
 # Cap to avoid unbounded growth; oldest entries are dropped first.
 _WORKER_SESSIONS_CAP = 500
+_WORKER_IDS_CAP = 500
 
 _LAUNCH_FAILURE_GRACE_S = float(
     os.environ.get("WATCHTOWER_LAUNCH_FAILURE_GRACE_S", "6")
@@ -527,6 +542,48 @@ def _add_worker_session_id(sid: str) -> None:
         pass
 
 
+def _load_worker_id_ledger() -> List[str]:
+    """Return the de-duped, ordered list of worker_ids from the ledger.
+
+    Empty list on a missing/unreadable/malformed file. No exceptions escape."""
+    try:
+        with open(WORKER_IDS_FILE, "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    ids = data.get("worker_ids")
+    if not isinstance(ids, list):
+        return []
+    return [str(w) for w in ids if isinstance(w, str)]
+
+
+def _add_worker_id(worker_id: str) -> None:
+    """Append a worker_id to the persistent ledger if not already present.
+
+    Cheap: only writes when a genuinely new id is added. Caps the list to the
+    most recent ``_WORKER_IDS_CAP`` ids (drops oldest). Atomic tmp+replace,
+    mirroring ``_save``. Silently no-ops on a falsy id or write error."""
+    if not worker_id:
+        return
+    worker_id = str(worker_id)
+    ids = _load_worker_id_ledger()
+    if worker_id in ids:
+        return
+    ids.append(worker_id)
+    if len(ids) > _WORKER_IDS_CAP:
+        ids = ids[-_WORKER_IDS_CAP:]
+    try:
+        WORKER_IDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(WORKER_IDS_FILE) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"worker_ids": ids}, f, indent=2)
+        os.replace(tmp, WORKER_IDS_FILE)
+    except OSError:
+        pass
+
+
 _SESSION_ID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
@@ -875,6 +932,9 @@ def record_worker(
         rec["session_id"] = session_id
     data["workers"].append(rec)
     _save(data)
+    # Ledger the worker_id now, at spawn time, so it survives this record being
+    # pruned once the worker dies (see WORKER_IDS_FILE docstring above).
+    _add_worker_id(worker_id)
     # If a session_id is somehow known at record time, ledger it (survives prune).
     _add_worker_session_id(rec.get("session_id", ""))
     _upsert_codex_worker_registry(rec)
@@ -1222,7 +1282,11 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
     import time as _time
     known_workers = list_workers(prune=False)
     live_ids = {str(w.get("worker_id", "")) for w in known_workers if w.get("alive")}
-    known_ids = {str(w.get("worker_id", "")) for w in known_workers}
+    # Union with the persistent ledger, not just the current (prunable) store:
+    # workers.json drops a dead worker's record on the next routine read, often
+    # within seconds, which used to make every genuinely-dead worker look
+    # "unknown" here and permanently orphan its ticket (see WORKER_IDS_FILE).
+    known_ids = {str(w.get("worker_id", "")) for w in known_workers} | set(_load_worker_id_ledger())
     now = _time.time()
     reopened: List[Dict[str, Any]] = []
     try:

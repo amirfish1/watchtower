@@ -39,6 +39,9 @@ def wt(tmp_path, monkeypatch):
         "WATCHTOWER_WORKER_SESSIONS_FILE", str(tmp_path / "worker-sessions.json")
     )
     monkeypatch.setenv(
+        "WATCHTOWER_WORKER_IDS_FILE", str(tmp_path / "worker-ids.json")
+    )
+    monkeypatch.setenv(
         "WATCHTOWER_LAUNCH_FAILURES_FILE", str(tmp_path / "launch-failures.json")
     )
     monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
@@ -461,6 +464,37 @@ def test_requeue_orphaned_tickets_leaves_unregistered_claimer_alone(wt):
     reopened = wt.workers.requeue_orphaned_tickets()
     assert ref not in [it["ref"] for it in reopened]
     assert wt.q.get(ref)["status"] == "in_progress"
+
+
+def test_requeue_orphaned_tickets_survives_claimer_pruned_from_store(wt):
+    """CCC-549: a worker's record in workers.json is pruned (list_workers'
+    default prune=True runs on nearly every routine read -- `wt status`, the
+    dashboard poll -- often within seconds of the worker dying) before the
+    sweep ever inspects it. Before the worker_id ledger, that made a
+    genuinely-dead spawned worker indistinguishable from the OPS-104
+    "never spawned" case above, and the ticket was left orphaned forever.
+    The ledger (populated at record_worker time, unaffected by pruning) must
+    still let the sweep recognize the claimer as a known-dead worker."""
+    item = wt.q.enqueue(project="Q", note="work")
+    ref = item["ref"]
+    dead = _dead_worker(wt, "Q")  # registered worker whose pid has since exited
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == ref:
+            it["status"] = "in_progress"
+            it["claimed_by"] = dead["worker_id"]
+            it["claimed_at"] = "2000-01-01T00:00:00Z"  # past the orphan grace window
+    wt.q._save_unlocked(data)
+
+    # Simulate the eager prune a routine `wt status`/dashboard read triggers.
+    wt.workers.list_workers(prune=True)
+    assert dead["worker_id"] not in {
+        w["worker_id"] for w in wt.workers._load()["workers"]
+    }
+
+    reopened = wt.workers.requeue_orphaned_tickets()
+    assert ref in [it["ref"] for it in reopened]
+    assert wt.q.get(ref)["status"] == "open"
 
 
 def test_claim_next_rejects_dead_spawned_worker(wt):
