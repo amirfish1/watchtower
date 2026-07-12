@@ -301,7 +301,7 @@ def test_spawn_worker_dry_run(store):
     for s in spawned:
         assert s["dry_run"] is True
         assert s["pid"] == 0
-        assert s["argv"][0] == "claude"
+        assert s["argv"][0] == workers._resolve_engine_bin("claude")
         assert "-p" in s["argv"]  # headless print mode, not interactive
         assert "--name" not in s["argv"]  # generic names overwrite later WT titles
         assert f"{s['queue']} queue worker" not in " ".join(s["argv"])
