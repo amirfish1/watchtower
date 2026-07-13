@@ -727,6 +727,36 @@ class GitHubIssuesBackend:
                 closed["resolution"] = norm
         return closed
 
+    def block(
+        self,
+        ident: Any,
+        *,
+        session_id: str = "",
+        question: str = "",
+        progress: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Record a worker's request for input on a GitHub-backed ticket."""
+        item = self.get(ident)
+        if item is None:
+            return None
+        number = str(item["number"])
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        now = _now_iso()
+        meta["needs_input"] = True
+        meta["block_question"] = _clip(question, 4000)
+        meta["blocked_at"] = now
+        if session_id:
+            meta.setdefault("claimed_by", str(session_id))
+        if progress:
+            _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
+        _append_history(meta, "block", worker=str(session_id), question=_clip(question, 4000))
+        self._run([
+            "issue", "edit", number,
+            *self._repo_args(),
+            "--body", _body_with_metadata(body, meta),
+        ])
+        return self.get(ident)
+
     def update(self, ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
         item = self.get(ident)
         if item is None:

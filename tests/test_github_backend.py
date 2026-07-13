@@ -295,6 +295,31 @@ def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     assert any("fixed it" in c for c in issue["comments"])
 
 
+def test_github_backend_blocks_claimed_ticket_by_documented_ref(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+
+    item = q.enqueue(project="GHI", note="needs a decision")
+    q.claim_by_ref(item["ref"], "worker-1")
+
+    blocked = q.block(
+        "GHI-1", session_id="worker-1",
+        question="Which rollout should we use?", progress="Both options verified.",
+    )
+
+    assert blocked["ref"] == "GHI-1"
+    assert blocked["status"] == "in_progress"
+    assert blocked["needs_input"] is True
+    assert blocked["block_question"] == "Which rollout should we use?"
+    assert [event["event"] for event in blocked["history"]] == [
+        "claim", "progress", "block",
+    ]
+    issue = json.loads(state.read_text())["issues"][0]
+    assert "needs_input: true" in issue["body"]
+
+
 def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys):
     state = _install_fake_gh(tmp_path, monkeypatch)
     _reload_isolated(tmp_path, monkeypatch)

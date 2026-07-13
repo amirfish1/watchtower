@@ -1386,6 +1386,11 @@ def block(
     backstop so a fresh worker could resume from notes if the session is ever
     truly gone. Resume-first, notes-as-fallback.
     """
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        return backend.block(
+            ident, session_id=session_id, question=question, progress=progress,
+        )
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
