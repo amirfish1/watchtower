@@ -734,8 +734,9 @@ def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
     """Mark an existing ticket as eligible for WatchTower automation.
 
     For GitHub-backed queues this adds the queue's ``watchtower:<QUEUE>`` label
-    to an existing open issue. File-backed queues are already WatchTower-native,
-    so the item is returned unchanged.
+    to an existing open issue. For file-backed queues, a closed ticket is
+    reopened so that it can be claimed again; open and in-progress tickets are
+    left unchanged.
     """
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
@@ -743,7 +744,10 @@ def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
         if item:
             _log("RUN", f"{item.get('ref', ident)} — marked runnable", queue=item.get("project", ""))
         return item
-    return get(ident)
+    item = get(ident)
+    if item and item.get("status") == "closed":
+        return update_status(ident, "open", reason="marked runnable")
+    return item
 
 
 def queues() -> Dict[str, Dict[str, int]]:

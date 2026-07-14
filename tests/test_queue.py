@@ -119,6 +119,21 @@ def test_close_guard_allows_owner_force_crosscloser_and_unclaimed(wt):
     assert wt.q.close(b["ref"], resolution="duplicate of OWN-1")["status"] == "closed"
 
 
+def test_cli_ready_reopens_a_closed_file_backed_ticket(wt, capsys):
+    """`wt ready` must make a previously closed local ticket claimable again."""
+    item = wt.q.enqueue(project="LOCAL", note="retry this", source="test")
+    wt.q.close(item["ref"], "worker-a", resolution={"summary": "first attempt"})
+
+    assert wt.cli.main(["ready", item["ref"], "--no-dispatch"]) == 0
+    reopened = wt.q.get(item["ref"])
+
+    assert reopened["status"] == "open"
+    assert reopened["claimed_by"] is None
+    assert reopened["closed_at"] is None
+    assert reopened["history"][-1]["event"] == "reopen"
+    assert "RUNNABLE: LOCAL-1" in capsys.readouterr().out
+
+
 def test_timeline_normalizes_old_answers_progress_sentinels_and_snapshot(wt):
     item = {
         "ref": "OLD-1",
