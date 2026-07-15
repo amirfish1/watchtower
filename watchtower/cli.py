@@ -379,10 +379,19 @@ def cmd_take(args: argparse.Namespace) -> int:
 def cmd_claim(args: argparse.Namespace) -> int:
     worker = args.worker or f"wt-cli-{os.getpid()}"
     ref = getattr(args, "ref", None) or None
+    session_uuid = (
+        os.environ.get("CODEX_THREAD_ID", "").strip()
+        or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    )
+    codex_thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
+    if codex_thread_id:
+        continuation_pid = workers._find_engine_ancestor_pid("codex")
+        if continuation_pid:
+            workers.rebind_continued_worker(worker, codex_thread_id, continuation_pid)
 
     if ref:
         try:
-            item = q.claim_by_ref(ref, worker)
+            item = q.claim_by_ref(ref, worker, session_uuid=session_uuid)
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
@@ -394,6 +403,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
             item = q.claim_next(
                 worker,
                 project=args.queue,
+                session_uuid=session_uuid,
                 oldest=getattr(args, "oldest", False),
                 item_types=getattr(args, "type", None) or [],
                 readiness_filters=getattr(args, "readiness", None) or [],

@@ -948,7 +948,9 @@ def _verify_worker_live(session_id: str) -> None:
     try:
         from . import workers as _workers
         known = _workers.list_workers(prune=False)
-        known_ids = {str(w.get("worker_id", "")) for w in known}
+        known_ids = {str(w.get("worker_id", "")) for w in known} | set(
+            _workers._load_worker_id_ledger()
+        )
         if session_id not in known_ids:
             return  # not a tracked spawned worker — can't verify, allow through
         live_ids = {str(w.get("worker_id", "")) for w in known if w.get("alive")}

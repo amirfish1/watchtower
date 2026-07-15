@@ -523,6 +523,75 @@ def test_claim_by_ref_rejects_dead_spawned_worker(wt):
     assert wt.q.get(item["ref"])["status"] == "open"
 
 
+def test_claim_rebinds_continued_codex_worker_to_new_process(wt, monkeypatch, capsys):
+    """A Codex goal continuation keeps its thread id but gets a new process.
+
+    The matching logical session may reclaim its worker alias; an unrelated
+    session must still hit the dead-worker guard.
+    """
+    cli = _reloaded_cli(wt)
+    session_id = "11111111-1111-1111-1111-111111111111"
+    worker_id = "q-codex-dead"
+    wt.workers.record_worker(
+        _dead_pid(),
+        "Q",
+        "codex",
+        worker_id,
+        str(wt.tmp),
+        str(wt.tmp / f"{worker_id}.log"),
+        session_id=session_id,
+    )
+    wt.workers.list_workers()  # routine read returns then prunes the dead PID
+    assert wt.workers.list_workers() == []
+    wt.q.enqueue(project="Q", note="continuation work")
+    monkeypatch.setenv("CODEX_THREAD_ID", session_id)
+    monkeypatch.setattr(
+        cli.workers, "_find_engine_ancestor_pid", lambda engine: os.getpid()
+    )
+
+    rc = cli.cmd_claim(_claim_ns("Q", worker_id, json_out=True))
+
+    assert rc == 0
+    claimed = json.loads(capsys.readouterr().out)
+    assert claimed["claimed_by"] == worker_id
+    assert claimed["claimed_session_id"] == session_id
+    rebound = next(
+        worker for worker in wt.workers.list_workers(prune=False)
+        if worker["worker_id"] == worker_id
+    )
+    assert rebound["pid"] == os.getpid()
+    assert rebound["alive"] is True
+
+
+def test_claim_rejects_pruned_codex_alias_from_unrelated_session(
+    wt, monkeypatch, capsys
+):
+    cli = _reloaded_cli(wt)
+    worker_id = "q-codex-dead"
+    wt.workers.record_worker(
+        _dead_pid(),
+        "Q",
+        "codex",
+        worker_id,
+        str(wt.tmp),
+        str(wt.tmp / f"{worker_id}.log"),
+        session_id="11111111-1111-1111-1111-111111111111",
+    )
+    wt.workers.list_workers()
+    assert wt.workers.list_workers() == []
+    ticket = wt.q.enqueue(project="Q", note="must remain open")
+    monkeypatch.setenv("CODEX_THREAD_ID", "22222222-2222-2222-2222-222222222222")
+    monkeypatch.setattr(
+        cli.workers, "_find_engine_ancestor_pid", lambda engine: os.getpid()
+    )
+
+    rc = cli.cmd_claim(_claim_ns("Q", worker_id, json_out=True))
+
+    assert rc == 1
+    assert "not currently alive" in capsys.readouterr().err
+    assert wt.q.get(ticket["ref"])["status"] == "open"
+
+
 def test_claim_next_allows_ambient_unregistered_worker(wt):
     """WT-92: an ambient session_id not in the spawn registry must be allowed
     through — this preserves the OPS-104 fix (unregistered claimer == unknown

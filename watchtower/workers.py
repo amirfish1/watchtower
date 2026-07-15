@@ -26,6 +26,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+
 WORKERS_FILE = Path(
     os.environ.get("WATCHTOWER_WORKERS_FILE")
     or (Path.home() / ".watchtower" / "workers.json")
@@ -495,6 +500,29 @@ def _load() -> Dict[str, Any]:
     return data
 
 
+class _WorkersFileLock:
+    """Cross-process lock for workers.json read-modify-write operations."""
+
+    def __init__(self):
+        self._file = None
+
+    def __enter__(self):
+        if fcntl is None:
+            return self
+        lock_path = WORKERS_FILE.with_suffix(".lock")
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = open(lock_path, "w")
+        fcntl.flock(self._file.fileno(), fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._file is not None:
+            try:
+                fcntl.flock(self._file.fileno(), fcntl.LOCK_UN)
+            finally:
+                self._file.close()
+
+
 def _save(data: Dict[str, Any]) -> None:
     WORKERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = str(WORKERS_FILE) + ".tmp"
@@ -904,6 +932,111 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def _find_engine_ancestor_pid(engine: str, max_depth: int = 8) -> int:
+    """Return the nearest live agent CLI ancestor of the current process."""
+    expected = str(engine or "").strip().lower()
+    if expected not in _ENGINE_BIN:
+        return 0
+    pid = os.getppid()
+    for _ in range(max_depth):
+        if pid <= 1:
+            break
+        try:
+            result = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "ppid=", "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            fields = result.stdout.strip().split(maxsplit=1)
+            if len(fields) != 2:
+                return 0
+            parent_pid = int(fields[0])
+            command = fields[1]
+            executable_path = (
+                command.lstrip().split(maxsplit=1)[0] if command.strip() else ""
+            )
+            executable = Path(executable_path).name.lower()
+            if executable == _ENGINE_BIN[expected] and _pid_alive(pid):
+                return pid
+            pid = parent_pid
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return 0
+    return 0
+
+
+def rebind_continued_worker(worker_id: str, session_id: str, pid: int) -> bool:
+    """Move a Codex worker record to a continuation process with the same thread.
+
+    Codex goal continuation can replace the original ``codex exec`` process
+    while preserving ``CODEX_THREAD_ID``. Rebinding requires both that stable
+    thread id and a live Codex ancestor discovered by the caller; a different
+    session cannot revive a dead worker alias.
+    """
+    if not worker_id or not _SESSION_ID_RE.fullmatch(str(session_id or "")):
+        return False
+    if not _pid_alive(int(pid or 0)):
+        return False
+
+    with _WorkersFileLock():
+        data = _load()
+        worker = next(
+            (row for row in data["workers"] if row.get("worker_id") == worker_id),
+            None,
+        )
+        if worker is None:
+            try:
+                from . import codex_registry
+                registry_row = codex_registry.entry(session_id) or {}
+            except Exception:
+                registry_row = {}
+            if registry_row.get("worker_id") != worker_id:
+                return False
+            wt_meta = (
+                registry_row.get("wt")
+                if isinstance(registry_row.get("wt"), dict)
+                else {}
+            )
+            worker = {
+                "worker_id": worker_id,
+                "pid": int(pid),
+                "queue": registry_row.get("queue") or wt_meta.get("queue") or "",
+                "engine": "codex",
+                "repo_path": (
+                    registry_row.get("repo_path") or registry_row.get("cwd") or ""
+                ),
+                "log": wt_meta.get("log") or "",
+                "fifo": "",
+                "started_at": (
+                    wt_meta.get("started_at")
+                    or registry_row.get("created_at")
+                    or ""
+                ),
+                "session_id": session_id,
+            }
+            if registry_row.get("model"):
+                worker["model"] = registry_row["model"]
+            data["workers"].append(worker)
+        else:
+            recorded_sid = str(worker.get("session_id") or "")
+            if not recorded_sid and worker.get("log"):
+                recorded_sid = resolve_session_id_from_log(str(worker["log"]))
+            if (
+                str(worker.get("engine") or "").lower() != "codex"
+                or recorded_sid != session_id
+            ):
+                return False
+            if int(worker.get("pid") or 0) == int(pid):
+                return True
+            worker["previous_pid"] = int(worker.get("pid") or 0)
+            worker["pid"] = int(pid)
+
+        worker["rebound_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _save(data)
+    _upsert_codex_worker_registry(worker)
+    return True
+
+
 def record_worker(
     pid: int,
     queue: str,
@@ -916,25 +1049,26 @@ def record_worker(
     model: str = "",
     kind: str = "",
 ) -> Dict[str, Any]:
-    data = _load()
-    rec = {
-        "worker_id": worker_id,
-        "pid": int(pid),
-        "queue": queue,
-        "engine": engine,
-        "repo_path": repo_path,
-        "log": log,
-        "fifo": fifo,
-        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-    }
-    if model:
-        rec["model"] = model
-    if kind:
-        rec["kind"] = kind
-    if session_id:
-        rec["session_id"] = session_id
-    data["workers"].append(rec)
-    _save(data)
+    with _WorkersFileLock():
+        data = _load()
+        rec = {
+            "worker_id": worker_id,
+            "pid": int(pid),
+            "queue": queue,
+            "engine": engine,
+            "repo_path": repo_path,
+            "log": log,
+            "fifo": fifo,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        if model:
+            rec["model"] = model
+        if kind:
+            rec["kind"] = kind
+        if session_id:
+            rec["session_id"] = session_id
+        data["workers"].append(rec)
+        _save(data)
     # Ledger the worker_id now, at spawn time, so it survives this record being
     # pruned once the worker dies (see WORKER_IDS_FILE docstring above).
     _add_worker_id(worker_id)
@@ -949,42 +1083,43 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
 
     When ``prune`` is set, dead workers are dropped from the store.
     """
-    data = _load()
-    out: List[Dict[str, Any]] = []
-    kept: List[Dict[str, Any]] = []
-    backfilled = False
-    for w in data["workers"]:
-        # Backfill the cloud session UUID from the worker's output log once it
-        # appears (the worker has to start its first turn before the init event
-        # is written). Persisted so CCC can resolve worker -> session and link
-        # to its conversation. Parsed at most once per worker (skip if known).
-        if not w.get("session_id") and w.get("log"):
-            sid = resolve_session_id_from_log(w["log"])
-            if sid:
-                w["session_id"] = sid
-                backfilled = True
-                # Ledger it so it survives this worker being pruned later.
-                _add_worker_session_id(sid)
-                _upsert_codex_worker_registry(w)
-        alive = _pid_alive(int(w.get("pid", 0)))
-        row = dict(w)
-        row["alive"] = alive
-        out.append(row)
-        if alive:
-            kept.append(w)
-        else:
-            # Dead worker: unlink its FIFO node so it doesn't linger on disk.
-            fifo = w.get("fifo")
-            if fifo:
-                try:
-                    Path(fifo).unlink()
-                except OSError:
-                    pass
-    if prune and len(kept) != len(data["workers"]):
-        _save({"workers": kept})  # kept holds the same dicts -> backfill persists
-    elif backfilled:
-        _save(data)
-    return out
+    with _WorkersFileLock():
+        data = _load()
+        out: List[Dict[str, Any]] = []
+        kept: List[Dict[str, Any]] = []
+        backfilled = False
+        for w in data["workers"]:
+            # Backfill the cloud session UUID from the worker's output log once
+            # it appears (the worker has to start its first turn before the init
+            # event is written). Persisted so CCC can resolve worker -> session
+            # and link to its conversation. Parsed at most once per worker.
+            if not w.get("session_id") and w.get("log"):
+                sid = resolve_session_id_from_log(w["log"])
+                if sid:
+                    w["session_id"] = sid
+                    backfilled = True
+                    # Ledger it so it survives this worker being pruned later.
+                    _add_worker_session_id(sid)
+                    _upsert_codex_worker_registry(w)
+            alive = _pid_alive(int(w.get("pid", 0)))
+            row = dict(w)
+            row["alive"] = alive
+            out.append(row)
+            if alive:
+                kept.append(w)
+            else:
+                # Dead worker: unlink its FIFO node so it doesn't linger on disk.
+                fifo = w.get("fifo")
+                if fifo:
+                    try:
+                        Path(fifo).unlink()
+                    except OSError:
+                        pass
+        if prune and len(kept) != len(data["workers"]):
+            _save({"workers": kept})  # kept holds the same dicts -> backfill persists
+        elif backfilled:
+            _save(data)
+        return out
 
 
 def live_worker_count(queue: Optional[str] = None) -> int:
