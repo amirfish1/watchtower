@@ -31,6 +31,10 @@ _META_END = "-->"
 class GitHubBackendError(RuntimeError):
     """Raised when the configured ``gh`` backend cannot complete an operation."""
 
+    def __init__(self, message: str, *, cached: bool = False):
+        super().__init__(message)
+        self.cached = cached
+
 
 # `_list_issues` is on the hot path of a live dashboard (CCC polls
 # list_items() every few seconds per open conversation-list refresh) but each
@@ -374,7 +378,7 @@ class GitHubIssuesBackend:
                 if age < _LIST_ERROR_BACKOFF:
                     if cached.get("data") is not None:
                         return cached["data"]
-                    raise cached["error"]
+                    raise GitHubBackendError(str(cached["error"]), cached=True)
             elif not fresh and age < _LIST_CACHE_TTL:
                 return cached["data"]
         try:

@@ -721,6 +721,8 @@ def list_items(
                 try:
                     items.extend(backend.list_items(status=status, lane=lane))
                 except Exception as e:
+                    if getattr(e, "cached", False):
+                        continue
                     import sys
                     print(
                         f"Warning: failed to list items for GitHub-backed queue {gh_project}: {e}",

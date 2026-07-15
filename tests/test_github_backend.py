@@ -561,3 +561,23 @@ def test_list_issues_fresh_request_still_honors_error_backoff(monkeypatch):
         backend._list_issues(fresh=True)
 
     assert calls["n"] == 1
+
+
+def test_cached_github_list_failure_is_logged_only_once(tmp_path, monkeypatch):
+    """Repeated callers must not flood activity.log with one cached failure."""
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+
+    def failing_run(self, args, *, check=True):
+        raise github_backend.GitHubBackendError("gh auth unavailable")
+
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_run", failing_run)
+
+    assert q.list_items() == []
+    assert q.list_items() == []
+
+    activity = (tmp_path / "activity.log").read_text()
+    assert activity.count("GitHub list failed: gh auth unavailable") == 1
