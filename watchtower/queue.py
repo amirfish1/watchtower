@@ -337,17 +337,27 @@ def _matches(it: Dict[str, Any], ident: Any) -> bool:
     return str(it.get("ref", "")).upper() == s.upper()
 
 
-def _load_unlocked() -> Dict[str, Any]:
+def _load_unlocked(*, strict: bool = False) -> Dict[str, Any]:
     try:
         with open(_resolve_store_path(), "r") as f:
             data = json.load(f)
+    except FileNotFoundError:
+        return _empty_store()
     except (OSError, json.JSONDecodeError):
+        if strict:
+            raise
         return _empty_store()
     if not isinstance(data, dict):
+        if strict:
+            raise ValueError("queue store root must be a JSON object")
         return _empty_store()
     data.setdefault("counter", 0)
     items = data.get("items")
-    data["items"] = items if isinstance(items, list) else []
+    if not isinstance(items, list):
+        if strict and items is not None:
+            raise ValueError("queue store items must be a JSON list")
+        items = []
+    data["items"] = items
     _normalize_items(data["items"])
     # WT-2: guard against the stored counter being behind the highest item number
     # already in the file.  This happens when two systems (e.g. CCC's
@@ -694,12 +704,17 @@ def list_items(
     status: Optional[str] = None,
     lane: Optional[str] = None,
     project: Optional[str] = None,
+    *,
+    fresh: bool = False,
+    strict: bool = False,
 ) -> List[Dict[str, Any]]:
     if project:
         backend = _github_backend_for_project(project)
         if backend is not None:
-            return backend.list_items(status=status, lane=lane)
-    data = _load_unlocked()
+            return backend.list_items(
+                status=status, lane=lane, fresh=fresh, strict=strict
+            )
+    data = _load_unlocked(strict=strict)
     items = data.get("items", [])
     github_projects = set(_github_projects()) if not project else set()
     if github_projects:
@@ -719,8 +734,14 @@ def list_items(
             backend = _github_backend_for_project(gh_project)
             if backend is not None:
                 try:
-                    items.extend(backend.list_items(status=status, lane=lane))
+                    items.extend(
+                        backend.list_items(
+                            status=status, lane=lane, fresh=fresh, strict=strict
+                        )
+                    )
                 except Exception as e:
+                    if strict:
+                        raise
                     if getattr(e, "cached", False):
                         continue
                     import sys

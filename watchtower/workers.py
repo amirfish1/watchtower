@@ -436,38 +436,63 @@ def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
     is in flight, so SIGTERM is safe. Killing it frees the queue so the next
     add/reconcile spawns a fresh, small-context worker instead of waking a cold,
     bloated one. Returns the records reaped (after pruning + FIFO cleanup)."""
-    reaped: List[Dict[str, Any]] = []
-    pids: List[int] = []
-    for w in list_workers(prune=False):
-        if not w.get("alive"):
-            continue
-        # Ad-hoc one-shot agents (wt spawn / wt critique) run in print mode:
-        # their stdout is buffered until the end, so the log-mtime idle clock
-        # reads "stale" while they are actively thinking. They exit on their
-        # own and get pruned as dead records -- never reap them.
-        if w.get("kind") == "adhoc":
+    from . import queue as _q
+    worker_rows = list_workers(prune=False)
+    candidates_by_queue: Dict[str, List[Dict[str, Any]]] = {}
+    for w in worker_rows:
+        if not w.get("alive") or w.get("kind") == "adhoc":
             continue
         if queue and w.get("queue") != queue:
             continue
         if _worker_idle_s(w) < max_idle_s:
             continue
-        pid = int(w.get("pid", 0) or 0)
-        if pid:
-            try:
-                os.kill(pid, 15)
-                idle_min = int(_worker_idle_s(w) / 60)
-                ttl_min = int(max_idle_s / 60)
-                w["_reap_reason"] = f"idle {idle_min}m (cold cache, >{ttl_min}m TTL)"
-                # Drop any pending stop-signal — the worker is being killed, so the
-                # sentinel would otherwise linger orphaned in the stop-signals dir.
+        candidates_by_queue.setdefault(str(w.get("queue") or ""), []).append(w)
+
+    reaped: List[Dict[str, Any]] = []
+    pids: List[int] = []
+    for queue_name, candidates in sorted(candidates_by_queue.items()):
+        if not queue_name:
+            continue
+        try:
+            items = _q.list_items(
+                project=queue_name, fresh=True, strict=True
+            )
+        except Exception:
+            # Failing closed per queue is safer than killing a worker whose
+            # active claim could not be authoritatively inspected.
+            continue
+        active_owners = {
+            str(owner)
+            for item in items
+            if item.get("status") == "in_progress" and not item.get("needs_input")
+            for owner in (item.get("claimed_by"), item.get("claimed_session_id"))
+            if owner
+        }
+        for w in candidates:
+            if any(
+                str(w.get(field) or "") in active_owners
+                for field in ("worker_id", "session_id")
+            ):
+                continue
+            pid = int(w.get("pid", 0) or 0)
+            if pid:
                 try:
-                    (STOP_SIGNALS_DIR / str(w.get("worker_id", ""))).unlink()
+                    os.kill(pid, 15)
+                    idle_min = int(_worker_idle_s(w) / 60)
+                    ttl_min = int(max_idle_s / 60)
+                    w["_reap_reason"] = (
+                        f"idle {idle_min}m (cold cache, >{ttl_min}m TTL)"
+                    )
+                    # Drop any pending stop-signal — the worker is being killed,
+                    # so the sentinel would otherwise linger orphaned.
+                    try:
+                        (STOP_SIGNALS_DIR / str(w.get("worker_id", ""))).unlink()
+                    except OSError:
+                        pass
+                    reaped.append(w)
+                    pids.append(pid)
                 except OSError:
                     pass
-                reaped.append(w)
-                pids.append(pid)
-            except OSError:
-                pass
     # SIGTERM is async -- the process keeps answering os.kill(pid, 0) until it
     # actually exits. Wait for death (escalating to SIGKILL) BEFORE returning so
     # a caller that reconciles next sees the slot truly free and spawns fresh.

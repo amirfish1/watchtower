@@ -563,6 +563,42 @@ def test_list_issues_fresh_request_still_honors_error_backoff(monkeypatch):
     assert calls["n"] == 1
 
 
+def test_list_issues_strict_never_uses_cached_or_stale_data(monkeypatch):
+    """Destructive callers need authoritative state, not dashboard fallback."""
+    import watchtower.github_backend as github_backend
+
+    github_backend._LIST_CACHE.clear()
+    backend = github_backend.GitHubIssuesBackend(
+        "T", repo="acme/strict-list-test"
+    )
+    calls = {"n": 0}
+    issue = {
+        "number": 1, "title": "t", "body": "", "state": "OPEN",
+        "url": "https://github.com/acme/strict-list-test/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+
+    def succeed(args, *, check=True):
+        calls["n"] += 1
+        return json.dumps([issue])
+
+    monkeypatch.setattr(backend, "_run", succeed)
+    assert backend._list_issues() == [issue]
+
+    def fail(args, *, check=True):
+        calls["n"] += 1
+        raise github_backend.GitHubBackendError("authoritative read failed")
+
+    monkeypatch.setattr(backend, "_run", fail)
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend._list_issues(fresh=True, strict=True)
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend._list_issues(fresh=True, strict=True)
+
+    assert calls["n"] == 2
+
+
 def test_cached_github_list_failure_is_logged_only_once(tmp_path, monkeypatch):
     """Repeated callers must not flood activity.log with one cached failure."""
     config, q = _reload_isolated(tmp_path, monkeypatch)

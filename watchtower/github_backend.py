@@ -368,7 +368,9 @@ class GitHubIssuesBackend:
             item["history"] = history
         return item
 
-    def _list_issues(self, state: str = "open", *, fresh: bool = False) -> List[Dict[str, Any]]:
+    def _list_issues(
+        self, state: str = "open", *, fresh: bool = False, strict: bool = False
+    ) -> List[Dict[str, Any]]:
         key = f"{self.repo}:{state}"
         now = time.time()
         cached = _LIST_CACHE.get(key)
@@ -376,7 +378,7 @@ class GitHubIssuesBackend:
             age = now - cached["at"]
             if cached.get("error") is not None:
                 if age < _LIST_ERROR_BACKOFF:
-                    if cached.get("data") is not None:
+                    if cached.get("data") is not None and not strict:
                         return cached["data"]
                     raise GitHubBackendError(str(cached["error"]), cached=True)
             elif not fresh and age < _LIST_CACHE_TTL:
@@ -399,7 +401,7 @@ class GitHubIssuesBackend:
         except GitHubBackendError as exc:
             prev_data = cached.get("data") if cached else None
             _LIST_CACHE[key] = {"at": now, "data": prev_data, "error": exc}
-            if prev_data is not None:
+            if prev_data is not None and not strict:
                 return prev_data
             raise
         _LIST_CACHE[key] = {"at": now, "data": result, "error": None}
@@ -479,10 +481,14 @@ class GitHubIssuesBackend:
         lane: Optional[str] = None,
         *,
         fresh: bool = False,
+        strict: bool = False,
     ) -> List[Dict[str, Any]]:
         if status == "closed":
             return []
-        items = [self._issue_to_item(issue) for issue in self._list_issues("open", fresh=fresh)]
+        items = [
+            self._issue_to_item(issue)
+            for issue in self._list_issues("open", fresh=fresh, strict=strict)
+        ]
         if status:
             items = [it for it in items if it.get("status") == status]
         if lane:

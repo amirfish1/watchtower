@@ -1101,6 +1101,129 @@ def test_reap_spares_warm_worker(wt):
     assert wt.workers.reap_stale_workers(queue="Q") == []
 
 
+def test_reap_spares_cold_worker_with_active_ticket(wt):
+    """A stale log is not proof of idleness while the worker owns work."""
+    child = subprocess.Popen(["sleep", "30"])
+    log = wt.tmp / "active-cold.log"
+    log.write_text("")
+    rec = wt.workers.record_worker(
+        child.pid, "Q", "codex", "q-active-cold", str(wt.tmp), str(log)
+    )
+    try:
+        item = wt.q.enqueue(project="Q", note="long-running work")
+        wt.q.claim_by_ref(item["ref"], rec["worker_id"])
+        _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+
+        assert wt.workers.reap_stale_workers(queue="Q") == []
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
+def test_reap_spares_worker_owned_by_claimed_session_id(wt):
+    child = subprocess.Popen(["sleep", "30"])
+    log = wt.tmp / "active-session-cold.log"
+    log.write_text("")
+    session_id = "11111111-1111-1111-1111-111111111111"
+    rec = wt.workers.record_worker(
+        child.pid, "Q", "codex", "q-session-owner", str(wt.tmp), str(log),
+        session_id=session_id,
+    )
+    try:
+        item = wt.q.enqueue(project="Q", note="session-owned work")
+        wt.q.claim_by_ref(item["ref"], "old-worker-alias", session_uuid=session_id)
+        _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+
+        assert wt.workers.reap_stale_workers(queue="Q") == []
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
+def test_reap_still_kills_cold_worker_with_blocked_ticket(wt):
+    child = subprocess.Popen(["sleep", "30"])
+    log = wt.tmp / "blocked-cold.log"
+    log.write_text("")
+    rec = wt.workers.record_worker(
+        child.pid, "Q", "codex", "q-blocked-cold", str(wt.tmp), str(log)
+    )
+    item = wt.q.enqueue(project="Q", note="needs a decision")
+    wt.q.claim_by_ref(item["ref"], rec["worker_id"])
+    wt.q.block(item["ref"], rec["worker_id"], "Which option?", "Investigated")
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+
+    reaped = wt.workers.reap_stale_workers(queue="Q")
+
+    assert [row["worker_id"] for row in reaped] == [rec["worker_id"]]
+    child.wait(timeout=5)
+
+
+def test_global_reap_fails_closed_per_queue(wt, monkeypatch):
+    children = []
+    records = []
+    for queue in ("BROKEN", "HEALTHY"):
+        child = subprocess.Popen(["sleep", "30"])
+        children.append(child)
+        log = wt.tmp / f"{queue.lower()}-cold.log"
+        log.write_text("")
+        rec = wt.workers.record_worker(
+            child.pid, queue, "codex", f"{queue.lower()}-cold",
+            str(wt.tmp), str(log),
+        )
+        records.append(rec)
+        _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+    warm = subprocess.Popen(["sleep", "30"])
+    children.append(warm)
+    warm_log = wt.tmp / "warm.log"
+    warm_log.write_text("")
+    wt.workers.record_worker(
+        warm.pid, "WARM", "codex", "warm-worker", str(wt.tmp), str(warm_log)
+    )
+
+    calls = []
+
+    def strict_items(*, project=None, fresh=False, strict=False, **kwargs):
+        calls.append((project, fresh, strict))
+        if project == "BROKEN":
+            raise RuntimeError("backend unavailable")
+        return []
+
+    monkeypatch.setattr(wt.q, "list_items", strict_items)
+    try:
+        reaped = wt.workers.reap_stale_workers()
+        assert [row["worker_id"] for row in reaped] == ["healthy-cold"]
+        assert children[0].poll() is None
+        assert calls == [
+            ("BROKEN", True, True),
+            ("HEALTHY", True, True),
+        ]
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.terminate()
+            child.wait(timeout=5)
+
+
+def test_reap_fails_closed_when_file_queue_is_corrupt(wt):
+    child = subprocess.Popen(["sleep", "30"])
+    log = wt.tmp / "corrupt-store-cold.log"
+    log.write_text("")
+    rec = wt.workers.record_worker(
+        child.pid, "Q", "codex", "q-corrupt-store", str(wt.tmp), str(log)
+    )
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+    wt.q._resolve_store_path().write_text("{not-json")
+
+    try:
+        assert wt.workers.reap_stale_workers(queue="Q") == []
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
 # ===================================== cloud session-id resolution (WT-38)
 def test_resolve_session_id_from_log(wt):
     """The cloud UUID is parsed from the stream-json init event in the log."""
