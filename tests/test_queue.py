@@ -211,7 +211,10 @@ def test_timeline_synthesizes_snapshot_only_ticket(wt):
 
 def test_timeline_preserves_multi_round_block_answer(wt):
     item = wt.q.enqueue(project="ROUND", note="two rounds")
-    claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
+    claimed = wt.q.claim_by_ref(
+        item["ref"], "worker-a",
+        session_uuid="11111111-2222-3333-4444-555555555555",
+    )
     wt.q.block(claimed["ref"], session_id="worker-a", question="first?")
     wt.q.answer(claimed["ref"], "first answer", session_id="human-a")
     wt.q.block(claimed["ref"], session_id="worker-a", question="second?")
