@@ -326,6 +326,24 @@ def test_spawn_dry_run_claude_argv(wt, monkeypatch, capsys):
     assert out["kind"] == "adhoc"
 
 
+def test_spawn_adhoc_honors_explicit_fable_model(wt, monkeypatch, capsys):
+    """Ad-hoc design work may intentionally request a non-coding model."""
+    cli = _cli(wt)
+    _stub_bins(monkeypatch, _workers(wt))
+
+    rc = cli.main([
+        "spawn", "design a landing page concept", "--model", "FABLE-5",
+        "--dry-run", "--json",
+    ])
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    out = json.loads(captured.out)
+    assert ["--model", "FABLE-5"] == out["argv"][4:6]
+    assert out["model"] == "FABLE-5"
+    assert "refusing fable" not in captured.err.lower()
+
+
 def test_spawn_dry_run_codex_argv(wt, monkeypatch, capsys):
     cli = _cli(wt)
     _stub_bins(monkeypatch, _workers(wt))

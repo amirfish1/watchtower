@@ -2185,14 +2185,6 @@ def spawn_adhoc(
             messages.resolve_target(report_to)
         except ValueError as e:
             raise ValueError(f"--report-to {report_to!r} is unresolvable: {e}") from e
-    if _is_fable_model(model):
-        import sys
-        print(
-            f"[watchtower] warning: refusing fable model {model!r} for ad-hoc"
-            " agent -- not a coding model; falling back to CLI default",
-            file=sys.stderr, flush=True,
-        )
-        model = ""
     if report_to:
         # shlex.quote: the target is interpolated into a shell command the
         # agent runs verbatim -- a resolvable but hostile target ("x; rm ...")
