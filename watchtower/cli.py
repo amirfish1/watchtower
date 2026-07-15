@@ -599,16 +599,29 @@ def cmd_blocked(args: argparse.Namespace) -> int:
     return 0
 
 
-def _resume_session_headless(sid: str, repo: str, prompt: str, engine: str) -> bool:
+def _resume_session_headless(
+    sid: str,
+    repo: str,
+    prompt: str,
+    engine: str,
+    *,
+    queue: str = "",
+    worker_id: str = "",
+) -> bool:
     """Wake a blocked worker's session non-interactively and hand it the answer.
 
-    Spawns `claude --resume <sid> -p <prompt>` (or the codex equivalent)
-    detached, in the ticket's repo, logging to ~/.watchtower/logs. The resumed
-    session has its full original context, applies the answer, finishes the
-    ticket, and closes it. Returns True if the resume process started."""
-    import subprocess
+    Spawns `claude --resume <sid> -p <prompt>` (or the headless Codex
+    equivalent) detached, in the ticket's repo, logging to
+    ~/.watchtower/logs. The resumed process is registered under the original
+    worker id so the orphan sweep cannot reopen its ticket and spawn a second
+    owner while the answer is being applied. Returns True if the resume process
+    started."""
     if engine == "codex":
-        argv = ["codex", "resume", sid, prompt]
+        argv = [
+            "codex", "exec", "resume",
+            "--dangerously-bypass-approvals-and-sandbox",
+            sid, prompt,
+        ]
     else:
         argv = ["claude", "--resume", sid, "-p", prompt,
                 "--permission-mode", "bypassPermissions"]
@@ -618,13 +631,24 @@ def _resume_session_headless(sid: str, repo: str, prompt: str, engine: str) -> b
     try:
         logf = open(log_path, "ab")
         try:
-            subprocess.Popen(
+            proc = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=logf,
                 stderr=subprocess.STDOUT, start_new_session=True,
                 cwd=repo or os.getcwd(),
             )
         finally:
             logf.close()
+        if queue and worker_id:
+            workers.record_worker(
+                proc.pid,
+                queue,
+                engine,
+                worker_id,
+                repo_path=repo,
+                log=str(log_path),
+                session_id=sid,
+                kind="resume",
+            )
         return True
     except (OSError, FileNotFoundError):
         return False
@@ -654,7 +678,14 @@ def cmd_answer(args: argparse.Namespace) -> int:
         f"If it still cannot be resolved, run `wt block` again with the new "
         f"open question."
     )
-    started = _resume_session_headless(sid, repo, prompt, args.engine)
+    started = _resume_session_headless(
+        sid,
+        repo,
+        prompt,
+        args.engine,
+        queue=item.get("project", ""),
+        worker_id=item.get("claimed_by", ""),
+    )
     if started:
         print(f"ANSWERED: {item['ref']} — resuming session {sid} in {repo} "
               f"to apply your answer and close.")
