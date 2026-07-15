@@ -71,6 +71,49 @@ def test_mutations_append_canonical_history_and_stop_legacy_lists(wt):
     assert closed["history"][-1]["resolution"] == {"summary": "done"}
 
 
+def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsys):
+    item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
+    sid = "11111111-2222-3333-4444-555555555555"
+    claimed = wt.q.claim_by_ref(item["ref"], "worker-a", session_uuid=sid)
+    calls = []
+
+    import watchtower.messages as messages
+
+    monkeypatch.setattr(
+        messages,
+        "send",
+        lambda target, text, **kwargs: calls.append((target, text, kwargs))
+        or {"ok": True, "transport": "fifo"},
+    )
+
+    assert wt.cli.main(["comment", claimed["ref"], "Use the safer parser."]) == 0
+
+    assert calls == [
+        (
+            sid,
+            f"[WATCHTOWER] A new comment was added to your claimed ticket "
+            f"{claimed['ref']}:\n\nUse the safer parser.",
+            {"mode": "steer"},
+        )
+    ]
+    assert "injected into claimed worker via fifo" in capsys.readouterr().out
+
+
+def test_cli_comment_on_unclaimed_ticket_does_not_send(wt, monkeypatch, capsys):
+    item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
+
+    import watchtower.messages as messages
+
+    monkeypatch.setattr(
+        messages,
+        "send",
+        lambda *args, **kwargs: pytest.fail("unclaimed comment must not send"),
+    )
+
+    assert wt.cli.main(["comment", item["ref"], "For later."]) == 0
+    assert capsys.readouterr().out.strip() == f"COMMENTED: {item['ref']}"
+
+
 def test_close_ownership_guard_blocks_reap_duplicate(wt):
     """A worker reaped mid-ticket, whose claim was re-drained + closed by a
     fresh worker, must NOT be able to silently re-close and clobber the real

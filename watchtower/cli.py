@@ -710,7 +710,33 @@ def cmd_comment(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
-    print(f"COMMENTED: {item['ref']}")
+    delivery = ""
+    target = item.get("claimed_session_id") or item.get("claimed_by")
+    if item.get("status") == "in_progress" and target:
+        from . import messages
+
+        prompt = (
+            f"[WATCHTOWER] A new comment was added to your claimed ticket "
+            f"{item['ref']}:\n\n{args.text}"
+        )
+        try:
+            sent = messages.send(str(target), prompt, mode="steer")
+        except Exception as e:  # durable ticket comment already succeeded
+            delivery = f" — live injection failed ({e})"
+        else:
+            if sent.get("ok"):
+                delivery = (
+                    " — injected into claimed worker via "
+                    f"{sent.get('transport', '?')}"
+                )
+            elif sent.get("queued"):
+                delivery = f" — live injection queued as {sent.get('id', '?')}"
+            else:
+                delivery = (
+                    " — live injection unavailable"
+                    + (f" ({sent.get('error')})" if sent.get("error") else "")
+                )
+    print(f"COMMENTED: {item['ref']}{delivery}")
     return 0
 
 
