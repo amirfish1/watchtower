@@ -978,6 +978,10 @@ def test_spawn_run_once_worker_logs_spawn(wt, monkeypatch):
     assert "SPAWN" in log_content
     assert f"run-once for {ref}" in log_content
 
+    # WT-116 effort is queue-level policy, not a single-ticket override.
+    with pytest.raises(TypeError):
+        wt.workers.spawn_run_once_worker("Q", ref, effort="low")
+
 
 # ============================================ cache-TTL staleness (warm vs cold)
 def _age_worker_log(wt, rec, seconds):

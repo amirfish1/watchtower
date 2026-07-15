@@ -1191,7 +1191,7 @@ def drain_goal(queue: str, worker_id: str, repo_path: str = "") -> str:
 
 def build_drain_command(
     queue: str, engine: str, worker_id: str, repo_path: str = "", model: str = "",
-    goal: str = "",
+    goal: str = "", effort: str = "",
 ) -> List[str]:
     """Construct the argv for one worker subprocess.
 
@@ -1206,7 +1206,9 @@ def build_drain_command(
     the goal carries in argv and the worker drains until its turn ends.
 
     ``model`` (queue config, ``wt set --model``) pins the agent's model; empty
-    means no ``--model`` flag, i.e. the CLI's own configured default. For
+    means no ``--model`` flag, i.e. the CLI's own configured default. ``effort``
+    (queue config, ``wt config --effort``) sets the reasoning budget; empty
+    leaves the engine's configured default intact. For
     claude, versioned ids need the full ``claude-`` prefix (``claude-sonnet-5``);
     bare family names (``sonnet``) also work.
 
@@ -1227,6 +1229,8 @@ def build_drain_command(
         ]
         if model:
             argv += ["--model", model]
+        if effort:
+            argv += ["--config", f'model_reasoning_effort="{effort}"']
         argv.append(goal or drain_goal(queue, worker_id, repo_path))
         return argv
     argv = [
@@ -1240,6 +1244,8 @@ def build_drain_command(
     ]
     if model:
         argv += ["--model", model]
+    if effort:
+        argv += ["--effort", effort]
     return argv
 
 
@@ -1885,6 +1891,8 @@ def spawn_workers(
     if not model:
         from . import config
         model = config.model(queue)
+    from . import config
+    effort = config.effort(queue)
     if _is_fable_model(model):
         import sys
         print(
@@ -1897,7 +1905,9 @@ def spawn_workers(
     spawned: List[Dict[str, Any]] = []
     for _ in range(n):
         worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
-        argv = build_drain_command(queue, engine, worker_id, repo_path, model)
+        argv = build_drain_command(
+            queue, engine, worker_id, repo_path, model, effort=effort,
+        )
         logical_bin = _ENGINE_BIN.get(engine, engine)
         if argv and argv[0] == logical_bin:
             resolved_bin = _resolve_engine_bin(engine)
@@ -1916,6 +1926,8 @@ def spawn_workers(
             }
             if model:
                 rec["model"] = model
+            if effort:
+                rec["effort"] = effort
             spawned.append(rec)
             continue
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -2028,11 +2040,14 @@ def spawn_run_once_worker(
     engine = engine or config.engine(queue) or "claude"
     if not model:
         model = config.model(queue)
+    effort = config.effort(queue)
     if _is_fable_model(model):
         model = ""
     worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
     goal = run_once_goal(queue, worker_id, ref, repo_path)
-    argv = build_drain_command(queue, engine, worker_id, repo_path, model, goal=goal)
+    argv = build_drain_command(
+        queue, engine, worker_id, repo_path, model, goal=goal, effort=effort,
+    )
     log_dir = WORKERS_FILE.parent / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{worker_id}.log"
@@ -2067,6 +2082,8 @@ def spawn_run_once_worker(
     )
     rec["argv"] = argv
     rec["ref"] = ref
+    if effort:
+        rec["effort"] = effort
     # WT-103: run-once spawns bypass reconcile(), which is the only other
     # place that writes a SPAWN row -- without this, the "drain once" play
     # button leaves no trace in the activity log at all.

@@ -19,6 +19,28 @@ from pathlib import Path
 from typing import Any, Dict
 
 VALID_BACKENDS = ("file", "github")
+VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+STANDARD_EFFORTS = VALID_EFFORTS[:-1]
+
+# WatchTower's explicitly supported worker model identifiers. This is a
+# deployment policy rather than a claim about every model an account may be
+# entitled to: the engine CLIs do not offer a portable, machine-readable model
+# discovery command. Keep this conservative and update it intentionally when a
+# fleet adopts a new model.
+MODEL_EFFORTS = {
+    "codex": (
+        ("gpt-5.6", VALID_EFFORTS),
+        ("gpt-5.6-sol", VALID_EFFORTS),
+        ("gpt-5.6-terra", VALID_EFFORTS),
+        ("gpt-5.6-luna", VALID_EFFORTS),
+        ("gpt-5.5", STANDARD_EFFORTS),
+        ("gpt-5.4", STANDARD_EFFORTS),
+    ),
+    "claude": (
+        ("claude-opus-4-8", VALID_EFFORTS),
+        ("claude-sonnet-5", VALID_EFFORTS),
+    ),
+}
 
 CONFIG_FILE = Path(
     os.environ.get("WATCHTOWER_CONFIG_FILE")
@@ -227,8 +249,9 @@ def set_model(queue: str, m: str) -> Dict[str, Any]:
     """Set (or clear, with "") the model workers on this queue are spawned with."""
     data = _load()
     q = data.setdefault(queue, {})
-    if m:
-        q["model"] = str(m)
+    model_value = str(m or "").strip()
+    if model_value:
+        q["model"] = model_value
     else:
         q.pop("model", None)
     _save(data)
@@ -266,6 +289,68 @@ def model(queue: str) -> str:
     if explicit:
         return explicit
     return _ccc_default_model(engine(queue))
+
+
+def set_effort(queue: str, value: str) -> Dict[str, Any]:
+    """Set (or clear, with "") a queue worker's reasoning effort."""
+    effort_value = str(value or "").strip().lower()
+    if effort_value and effort_value not in VALID_EFFORTS:
+        raise ValueError(f"effort must be one of {VALID_EFFORTS}")
+    data = _load()
+    q = data.setdefault(queue, {})
+    if effort_value:
+        q["effort"] = effort_value
+    else:
+        q.pop("effort", None)
+    _save(data)
+    return q
+
+
+def effort(queue: str) -> str:
+    """Return a queue's explicit reasoning effort, or "" for engine default."""
+    value = str(_load().get(queue, {}).get("effort") or "").strip().lower()
+    return value if value in VALID_EFFORTS else ""
+
+
+def approved_models(eng: str) -> tuple[str, ...]:
+    """Return the intentionally supported model identifiers for one engine."""
+    return tuple(model for model, _ in MODEL_EFFORTS.get(
+        str(eng or "").strip().lower(), ()
+    ))
+
+
+def is_approved_model(eng: str, value: str) -> bool:
+    """Whether ``value`` is empty or is an approved model for ``eng``.
+
+    The lower-level :func:`set_model` deliberately remains permissive so old
+    configuration and programmatic callers remain readable. User-facing CLI
+    commands use this predicate before persisting a new model selection.
+    """
+    model_value = str(value or "").strip()
+    return not model_value or model_value in approved_models(eng)
+
+
+def approved_efforts(eng: str, model: str = "") -> tuple[str, ...]:
+    """Return supported explicit effort levels for a catalogued model.
+
+    An unpinned model leaves effort to the engine default; allow the complete
+    CLI vocabulary in that case because a local default can legitimately vary.
+    """
+    model_value = str(model or "").strip()
+    if not model_value:
+        return VALID_EFFORTS
+    for candidate, efforts in MODEL_EFFORTS.get(
+        str(eng or "").strip().lower(), ()
+    ):
+        if candidate == model_value:
+            return efforts
+    return ()
+
+
+def is_approved_effort(eng: str, model: str, value: str) -> bool:
+    """Whether ``value`` is empty or supported by the selected model."""
+    effort_value = str(value or "").strip().lower()
+    return not effort_value or effort_value in approved_efforts(eng, model)
 
 
 def set_desired_workers(queue: str, n: int) -> Dict[str, Any]:

@@ -1645,6 +1645,8 @@ def cmd_dedup(args: argparse.Namespace) -> int:
 def cmd_set(args: argparse.Namespace) -> int:
     """Compatibility command for the queue settings that predate ``config``."""
     from . import config
+    if not _validate_queue_worker_settings(args, config):
+        return 1
     changed = []
     if args.backend is not None:
         try:
@@ -1667,7 +1669,10 @@ def cmd_set(args: argparse.Namespace) -> int:
         changed.append(f"engine={args.engine}")
     if args.model is not None:
         config.set_model(args.queue, args.model)
-        changed.append(f"model={args.model or '(engine default)'}")
+        changed.append(f"model={str(args.model or '').strip() or '(engine default)'}")
+    if args.effort is not None:
+        config.set_effort(args.queue, args.effort)
+        changed.append(f"effort={args.effort or '(engine default)'}")
     if args.desired_workers is not None:
         config.set_desired_workers(args.queue, args.desired_workers)
         changed.append(f"desired_workers={args.desired_workers}")
@@ -1727,6 +1732,8 @@ def cmd_config(args: argparse.Namespace) -> int:
     ``wt set`` and ``wt drain`` are kept as-is; this command is the single-stop
     alternative for the common case of configuring a queue from scratch."""
     from . import config
+    if not _validate_queue_worker_settings(args, config):
+        return 1
     changed = []
     # Delegate drain-related flags first so enabling auto-drain also auto-starts.
     auto_drain = getattr(args, "auto_drain", None)
@@ -1783,7 +1790,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         changed.append(f"engine={args.engine}")
     if getattr(args, "model", None) is not None:
         config.set_model(args.queue, args.model)
-        changed.append(f"model={args.model or '(engine default)'}")
+        changed.append(f"model={str(args.model or '').strip() or '(engine default)'}")
+    if getattr(args, "effort", None) is not None:
+        config.set_effort(args.queue, args.effort)
+        changed.append(f"effort={args.effort or '(engine default)'}")
     if getattr(args, "workers", None) is not None:
         config.set_desired_workers(args.queue, args.workers)
         changed.append(f"workers={args.workers}")
@@ -1792,6 +1802,49 @@ def cmd_config(args: argparse.Namespace) -> int:
         print(f"{args.queue}: {cfg if cfg else '(no config)'}")
     else:
         print(f"{args.queue}: {', '.join(changed)}")
+    return 0
+
+
+def _validate_queue_worker_settings(args: argparse.Namespace, config: Any) -> bool:
+    """Reject incompatible model/effort combinations before queue mutation."""
+    engine = getattr(args, "engine", None) or config.engine(args.queue)
+    existing = config.get_queue_config(args.queue)
+    model_arg = getattr(args, "model", None)
+    model = existing.get("model", "") if model_arg is None else model_arg
+    if not config.is_approved_model(engine, model):
+        choices = ", ".join(config.approved_models(engine))
+        print(
+            f"error: {model!r} is not approved for {engine}; "
+            f"run `wt models --engine {engine}` (approved: {choices})",
+            file=sys.stderr,
+        )
+        return False
+
+    effort_arg = getattr(args, "effort", None)
+    effort = existing.get("effort", "") if effort_arg is None else effort_arg
+    if config.is_approved_effort(engine, model, effort):
+        return True
+    choices = ", ".join(config.approved_efforts(engine, model))
+    print(
+        f"error: {model or f'{engine} default model'} does not support effort "
+        f"{effort!r}; supported: {choices}",
+        file=sys.stderr,
+    )
+    return False
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    """List model identifiers WatchTower intentionally supports per engine."""
+    from . import config
+
+    models = list(config.approved_models(args.engine))
+    payload = {"engine": args.engine, "models": models}
+    if args.json:
+        print(json.dumps(payload, indent=2))
+    else:
+        print(f"{args.engine} approved models:")
+        for model in models:
+            print(f"  {model}")
     return 0
 
 
@@ -2396,6 +2449,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Service", "skills"),
     ("Service", "uninstall"),
     ("Queues", "status"),
+    ("Queues", "models"),
     ("Queues", "config"),
     ("Queues", "set"),
     ("Queues", "drain"),
@@ -2448,6 +2502,7 @@ COMMAND_HELP: Dict[str, str] = {
     "ls": "list the tickets in one queue",
     "dedup": "close exact-duplicate open tickets",
     "status": "per-queue depth / age / stuck flag",
+    "models": "list WatchTower-approved model identifiers per engine",
     "config": "recommended queue configuration: settings plus auto-drain policy",
     "set": "compatibility alias for basic queue settings; prefer `wt config`",
     "drain": "enable or disable auto-drain for a queue",
@@ -2532,6 +2587,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("models")
+    s.add_argument("--engine", required=True, choices=["claude", "codex"],
+                   help="engine whose supported worker model identifiers to list")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_models)
 
     s = sub.add_parser("ls")
     s.add_argument("-q", "--queue", required=True)
@@ -2924,6 +2985,9 @@ def build_parser() -> argparse.ArgumentParser:
                        "engine's --model flag), e.g. claude-sonnet-5 or gpt-5.5. "
                        "Empty string clears it (workers use the CLI's own default)."
                    ))
+    s.add_argument("--effort", default=None,
+                   choices=["low", "medium", "high", "xhigh", "max"],
+                   help="reasoning effort for queue workers; omit for the engine default")
     s.add_argument("--desired-workers", default=None, type=int, dest="desired_workers",
                    help="number of concurrent workers the reconciler should maintain")
     s.set_defaults(func=cmd_set)
@@ -2962,6 +3026,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="agent engine for workers on this queue")
     s.add_argument("--model", default=None,
                    help="model workers are spawned with (e.g. claude-sonnet-5)")
+    s.add_argument("--effort", default=None,
+                   choices=["low", "medium", "high", "xhigh", "max"],
+                   help="reasoning effort for queue workers; omit for the engine default")
     s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
                    help="restrict auto-drain to these ticket types (requires --auto-drain on)")
     s.set_defaults(func=cmd_config)

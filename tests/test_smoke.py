@@ -337,6 +337,100 @@ def test_spawn_worker_queue_model(store):
         config.set_model("DEMO", "")
 
 
+def test_queue_effort_reaches_codex_and_claude_workers(store):
+    """WT-116: a queue's reasoning setting must survive into each engine argv."""
+    import watchtower.config as config
+    import watchtower.workers as workers
+
+    config.set_effort("DEMO", "high")
+    try:
+        assert config.effort("DEMO") == "high"
+        claude_argv = workers.spawn_workers(
+            "DEMO", n=1, engine="claude", dry_run=True,
+        )[0]["argv"]
+        assert claude_argv[claude_argv.index("--effort") + 1] == "high"
+
+        codex_argv = workers.spawn_workers(
+            "DEMO", n=1, engine="codex", dry_run=True,
+        )[0]["argv"]
+        assert codex_argv[codex_argv.index("--config") + 1] == (
+            'model_reasoning_effort="high"'
+        )
+    finally:
+        config.set_effort("DEMO", "")
+
+
+def test_config_command_persists_queue_effort(store, capsys):
+    """WT-116: the canonical queue-config command exposes effort control."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+
+    assert cli.main(["config", "-q", "DEMO", "--effort", "high"]) == 0
+    assert config.effort("DEMO") == "high"
+    assert "effort=high" in capsys.readouterr().out
+
+
+def test_set_command_persists_queue_effort(store, capsys):
+    """WT-116: the legacy queue-settings command keeps effort support."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+
+    assert cli.main(["set", "-q", "DEMO", "--effort", "high"]) == 0
+    assert config.effort("DEMO") == "high"
+    assert "effort=high" in capsys.readouterr().out
+
+
+def test_models_command_lists_watchtower_approved_catalog(store, capsys):
+    """WT-116: callers can discover the identifiers WT approves per engine."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+
+    assert cli.main(["models", "--engine", "codex", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "engine": "codex",
+        "models": list(config.approved_models("codex")),
+    }
+    assert "gpt-5.6" in payload["models"]
+
+
+def test_config_command_rejects_model_outside_approved_catalog(store, capsys):
+    """WT-116: model discovery must prevent a bad worker configuration."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+
+    assert cli.main([
+        "config", "-q", "DEMO", "--engine", "codex", "--model", "not-a-model",
+    ]) == 1
+    assert config.model("DEMO") == ""
+    assert "not approved for codex" in capsys.readouterr().err
+
+
+def test_config_command_rejects_effort_unsupported_by_selected_model(store, capsys):
+    """WT-116: an accepted model must not receive an invalid effort value."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+
+    assert cli.main([
+        "config", "-q", "DEMO", "--engine", "codex", "--model", "gpt-5.5",
+        "--effort", "max",
+    ]) == 1
+    assert config.get_queue_config("DEMO") == {}
+    assert "does not support effort 'max'" in capsys.readouterr().err
+
+
+def test_config_command_normalizes_an_approved_model(store, capsys):
+    """WT-116: validated model IDs must be stored in their usable form."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+
+    assert cli.main([
+        "config", "-q", "DEMO", "--engine", "codex", "--model", " gpt-5.5 ",
+    ]) == 0
+    assert config.model("DEMO") == "gpt-5.5"
+    assert "model=gpt-5.5" in capsys.readouterr().out
+
+
 def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeypatch):
     """A queue with no explicit `wt set --model` falls back to CCC's shared
     spawn-defaults.json for its engine (see config.CCC_SPAWN_DEFAULTS_FILE) --
