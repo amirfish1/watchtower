@@ -535,3 +535,29 @@ def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
     monkeypatch.setattr(cold, "_run", failing_run)
     with pytest.raises(github_backend.GitHubBackendError):
         cold._list_issues()
+
+
+def test_list_issues_fresh_request_still_honors_error_backoff(monkeypatch):
+    """Reconciler freshness must not retry a known GitHub failure per call."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setattr(github_backend, "_LIST_ERROR_BACKOFF", 60.0)
+    github_backend._LIST_CACHE.clear()
+
+    backend = github_backend.GitHubIssuesBackend(
+        "T", repo="acme/fresh-error-backoff-test"
+    )
+    calls = {"n": 0}
+
+    def failing_run(args, *, check=True):
+        calls["n"] += 1
+        raise github_backend.GitHubBackendError("gh auth unavailable")
+
+    monkeypatch.setattr(backend, "_run", failing_run)
+
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend._list_issues(fresh=True)
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend._list_issues(fresh=True)
+
+    assert calls["n"] == 1

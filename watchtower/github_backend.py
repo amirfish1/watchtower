@@ -368,14 +368,14 @@ class GitHubIssuesBackend:
         key = f"{self.repo}:{state}"
         now = time.time()
         cached = _LIST_CACHE.get(key)
-        if cached is not None and not fresh:
+        if cached is not None:
             age = now - cached["at"]
             if cached.get("error") is not None:
                 if age < _LIST_ERROR_BACKOFF:
                     if cached.get("data") is not None:
                         return cached["data"]
                     raise cached["error"]
-            elif age < _LIST_CACHE_TTL:
+            elif not fresh and age < _LIST_CACHE_TTL:
                 return cached["data"]
         try:
             raw = self._run([
