@@ -864,13 +864,12 @@ def test_reopen_preserves_session_id_drops_lock(wt):
 def test_request_stop_makes_claim_return_stop(wt):
     wt.q.enqueue(project="Q", note="work")
     wt.workers.request_stop("w-stopme")
-    item = wt.q.claim_next("w-stopme", project="Q")
-    assert item and item.get("ref") == "Q-1"
-    # Signal is consumed but ignored because work was claimable; this avoids
-    # orphaning a ticket filed just after a drained-window STOP was dropped.
-    assert not (wt.workers.STOP_SIGNALS_DIR / "w-stopme").exists()
-    wt.workers.request_stop("w-stopme")
     assert wt.q.claim_next("w-stopme", project="Q") == {"stop": True}
+    # A release wins over a racing enqueue. The ticket stays open for the
+    # replacement worker; the released session cannot claim from Q again.
+    assert not (wt.workers.STOP_SIGNALS_DIR / "w-stopme").exists()
+    item = wt.q.claim_next("w-replacement", project="Q")
+    assert item and item.get("ref") == "Q-1"
 
 
 # =========================================================== tracking & cleanup
@@ -1067,19 +1066,101 @@ def test_notify_pushes_to_warm_worker(wt):
     assert wt.workers.notify_workers("Q", "wake warm") == 1
 
 
-def test_notify_skips_cold_worker(wt):
-    """A worker idle PAST the cache TTL is cold -> not woken (would re-read a
-    bloated context uncached); caller must reap+respawn instead."""
+def test_notify_still_pushes_worker_after_cache_ttl(wt):
+    """Cache coldness does not strand new queue work before release eligibility."""
     rec = _live_worker(wt, "Q")
     _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)  # cold
-    assert wt.workers.notify_workers("Q", "do not wake") == 0
+    assert wt.workers.notify_workers("Q", "new work") == 1
 
 
-def test_reap_kills_cold_idle_worker(wt):
-    """reap_stale_workers SIGTERMs a cold idle worker so a fresh one can spawn.
+def test_notify_skips_worker_already_released_from_queue(wt):
+    rec = _live_worker(wt, "Q")
+    wt.workers.request_stop(rec["worker_id"])
 
-    Uses a real short-lived child process as the 'worker' so the kill is
-    observable without touching this test process."""
+    assert wt.workers.notify_workers("Q", "new work") == 0
+
+
+def test_release_floor_is_30_minutes_for_claude(wt):
+    """Losing Claude's five-minute cache is not permission to release it."""
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+
+
+def test_release_idle_claude_worker_without_killing_session(wt):
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    released = wt.workers.release_idle_workers(queue="Q")
+
+    assert [row["worker_id"] for row in released] == [rec["worker_id"]]
+    assert (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+    assert wt.workers._pid_alive(os.getpid())
+    assert wt.workers.live_worker_count("Q") == 0
+    assert wt.workers.worker_counts()["Q"] == {"total": 1, "live": 0}
+    payload = json.loads(os.read(wt._readers[-1], 65536).decode())
+    text = payload["message"]["content"][0]["text"]
+    assert "no longer a WatchTower worker for Q" in text
+    assert "continue any unrelated work" in text
+    assert wt.q.claim_next(rec["worker_id"], project="Q") == {"stop": True}
+    assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+    # The one-shot signal is gone, but durable detachment keeps this live
+    # conversation out of queue staffing while unrelated work continues.
+    assert wt.workers.live_worker_count("Q") == 0
+    assert wt.workers.worker_counts()["Q"] == {"total": 1, "live": 0}
+
+
+def test_reconcile_replaces_released_staffing_without_killing_old_session(wt, monkeypatch):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    wt.q.enqueue(project="Q", note="new work")
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    spawned = []
+
+    def fake_spawn(queue, n=1, **kwargs):
+        row = {
+            "worker_id": "q-replacement", "queue": queue, "pid": 12345,
+            "engine": kwargs.get("engine", "claude"),
+        }
+        spawned.append(row)
+        return [row]
+
+    monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
+
+    result = wt.workers.reconcile_once()
+
+    assert [row["worker_id"] for row in result["released"]] == [rec["worker_id"]]
+    assert [row["worker_id"] for row in result["spawned"]] == ["q-replacement"]
+    assert spawned and wt.workers._pid_alive(os.getpid())
+
+
+def test_release_spares_claude_worker_with_fresh_transcript_activity(wt, monkeypatch):
+    """A stale spawn log is not idle proof when Claude's transcript is live."""
+    sid = "22222222-2222-2222-2222-222222222222"
+    claude_home = wt.tmp / "claude-home"
+    transcript_dir = claude_home / "projects" / "-tmp-project"
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / f"{sid}.jsonl").write_text('{"type":"user"}\n')
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    log = wt.tmp / "claude-silent.log"
+    log.write_text("")
+    fifo, fd = wt.workers._make_stdin_fifo(log)
+    wt._readers.append(fd)
+    rec = wt.workers.record_worker(
+        os.getpid(), "Q", "claude", "q-claude-silent", str(wt.tmp), str(log),
+        fifo=fifo or "", session_id=sid,
+    )
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+
+
+def test_release_marks_idle_worker_without_killing_process(wt):
+    """Lifecycle release preserves the conversation and operating process."""
     child = subprocess.Popen(["sleep", "30"])
     log = wt.tmp / "cold.log"
     log.write_text("")
@@ -1088,11 +1169,15 @@ def test_reap_kills_cold_idle_worker(wt):
     rec = wt.workers.record_worker(
         child.pid, "Q", "claude", "q-cold", str(wt.tmp), str(log), fifo=fifo or "",
     )
-    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)  # cold
-    reaped = wt.workers.reap_stale_workers(queue="Q")
-    assert any(r["worker_id"] == "q-cold" for r in reaped)
-    child.wait(timeout=5)  # it was terminated
-    assert child.poll() is not None
+    try:
+        _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+        released = wt.workers.release_idle_workers(queue="Q")
+        assert any(r["worker_id"] == "q-cold" for r in released)
+        assert child.poll() is None
+        assert (wt.workers.STOP_SIGNALS_DIR / "q-cold").exists()
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
 
 
 def test_reap_spares_warm_worker(wt):
@@ -1118,13 +1203,38 @@ def test_reap_spares_codex_worker_with_fresh_rollout_activity(wt, monkeypatch):
         session_id=sid,
     )
     try:
-        _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+        _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
 
         assert wt.workers.reap_stale_workers(queue="Q") == []
         assert child.poll() is None
     finally:
         child.terminate()
         child.wait(timeout=5)
+
+
+def test_release_injects_queue_scoped_instruction_into_codex_session(wt, monkeypatch):
+    import watchtower.messages as messages
+
+    sent = []
+    monkeypatch.setattr(
+        messages, "send",
+        lambda target, text: sent.append((target, text)) or {"ok": True},
+    )
+    sid = "33333333-3333-3333-3333-333333333333"
+    log = wt.tmp / "codex-idle.log"
+    log.write_text("")
+    rec = wt.workers.record_worker(
+        os.getpid(), "Q", "codex", "q-codex-idle", str(wt.tmp), str(log),
+        session_id=sid,
+    )
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    released = wt.workers.release_idle_workers(queue="Q")
+
+    assert [row["worker_id"] for row in released] == [rec["worker_id"]]
+    assert sent and sent[0][0] == sid
+    assert "continue any unrelated work" in sent[0][1]
+    assert wt.workers._pid_alive(os.getpid())
 
 
 def test_reap_spares_cold_worker_with_active_ticket(wt):
@@ -1138,7 +1248,7 @@ def test_reap_spares_cold_worker_with_active_ticket(wt):
     try:
         item = wt.q.enqueue(project="Q", note="long-running work")
         wt.q.claim_by_ref(item["ref"], rec["worker_id"])
-        _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+        _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
 
         assert wt.workers.reap_stale_workers(queue="Q") == []
         assert child.poll() is None
@@ -1159,7 +1269,7 @@ def test_reap_spares_worker_owned_by_claimed_session_id(wt):
     try:
         item = wt.q.enqueue(project="Q", note="session-owned work")
         wt.q.claim_by_ref(item["ref"], "old-worker-alias", session_uuid=session_id)
-        _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+        _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
 
         assert wt.workers.reap_stale_workers(queue="Q") == []
         assert child.poll() is None
@@ -1168,7 +1278,7 @@ def test_reap_spares_worker_owned_by_claimed_session_id(wt):
         child.wait(timeout=5)
 
 
-def test_reap_still_kills_cold_worker_with_blocked_ticket(wt):
+def test_release_spares_worker_with_blocked_ticket(wt):
     child = subprocess.Popen(["sleep", "30"])
     log = wt.tmp / "blocked-cold.log"
     log.write_text("")
@@ -1178,12 +1288,15 @@ def test_reap_still_kills_cold_worker_with_blocked_ticket(wt):
     item = wt.q.enqueue(project="Q", note="needs a decision")
     wt.q.claim_by_ref(item["ref"], rec["worker_id"])
     wt.q.block(item["ref"], rec["worker_id"], "Which option?", "Investigated")
-    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+    try:
+        _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
 
-    reaped = wt.workers.reap_stale_workers(queue="Q")
-
-    assert [row["worker_id"] for row in reaped] == [rec["worker_id"]]
-    child.wait(timeout=5)
+        assert wt.workers.release_idle_workers(queue="Q") == []
+        assert child.poll() is None
+        assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
 
 
 def test_global_reap_fails_closed_per_queue(wt, monkeypatch):
@@ -1199,7 +1312,7 @@ def test_global_reap_fails_closed_per_queue(wt, monkeypatch):
             str(wt.tmp), str(log),
         )
         records.append(rec)
-        _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+        _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
     warm = subprocess.Popen(["sleep", "30"])
     children.append(warm)
     warm_log = wt.tmp / "warm.log"
@@ -1218,8 +1331,8 @@ def test_global_reap_fails_closed_per_queue(wt, monkeypatch):
 
     monkeypatch.setattr(wt.q, "list_items", strict_items)
     try:
-        reaped = wt.workers.reap_stale_workers()
-        assert [row["worker_id"] for row in reaped] == ["healthy-cold"]
+        released = wt.workers.release_idle_workers()
+        assert [row["worker_id"] for row in released] == ["healthy-cold"]
         assert children[0].poll() is None
         assert calls == [
             ("BROKEN", True, True),
@@ -1239,11 +1352,11 @@ def test_reap_fails_closed_when_file_queue_is_corrupt(wt):
     rec = wt.workers.record_worker(
         child.pid, "Q", "codex", "q-corrupt-store", str(wt.tmp), str(log)
     )
-    _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
     wt.q._resolve_store_path().write_text("{not-json")
 
     try:
-        assert wt.workers.reap_stale_workers(queue="Q") == []
+        assert wt.workers.release_idle_workers(queue="Q") == []
         assert child.poll() is None
     finally:
         child.terminate()

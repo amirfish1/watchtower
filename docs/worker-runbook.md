@@ -41,7 +41,7 @@ prefix is ever missing.
 
 ## Idle Protocol
 
-Do this when `wt claim` reports the queue is drained (returns nothing), FIRST — before ending your turn. A cold worker gets killed while idle and cannot write then, so this is not optional and not deferrable to "next time."
+Do this when `wt claim` reports the queue is drained (returns nothing), FIRST — before ending your turn. An idle conversation may later be released from queue staffing, so this is not optional and not deferrable to "next time."
 
 1. Read the queue's learnings file at `~/.watchtower/learnings/{queue}.md`
    (create it if it doesn't exist).

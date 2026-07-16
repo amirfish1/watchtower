@@ -354,8 +354,9 @@ def cmd_add(args: argparse.Namespace) -> int:
             # Enqueue already succeeded; a claim hiccup shouldn't fail the file.
             print(f"[watchtower] could not claim {item['ref']}: {e}", file=sys.stderr)
         return 0
-    # Decide + act on the new ticket NOW (nudge a live worker via FIFO, else
-    # reap+spawn) and log the decision to the activity log. Centralized in
+    # Decide + act on the new ticket NOW (nudge current staffing via FIFO, else
+    # gracefully release verified-idle staffing and spawn) and log the
+    # decision. Centralized in
     # workers.dispatch_after_enqueue so the CLI and the CCC dashboard share one
     # disposition path. Best-effort -- a hiccup here never fails the enqueue.
     try:
@@ -415,8 +416,9 @@ def cmd_claim(args: argparse.Namespace) -> int:
             # Nothing claimable. Decide surplus HERE, at claim time, when the real
             # current state is known — not on the reconciler's future-guessing
             # count. A worker is surplus only if more workers are live than the
-            # queue wants; then it exits itself. Otherwise it stays warm (its next
-            # `wt add` nudge wakes it) and REAP handles a persistently-idle one.
+            # queue wants; then it exits itself. Otherwise it stays available
+            # (its next `wt add` nudge wakes it), with queue-scoped release as the
+            # persistently-idle safety net.
             from . import config
             desired = config.desired_workers(args.queue) if config.auto_drain(args.queue) else 0
             live = workers.live_worker_count(args.queue)

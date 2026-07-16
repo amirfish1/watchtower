@@ -125,8 +125,8 @@ DRAIN_GOAL_TEMPLATE = (
     "figured out so far\"`, then move on to the next ticket. "
     "IDLE: when `wt claim` reports the queue is drained, follow the Idle "
     "Protocol in {runbook} BEFORE ending your turn (it has you update the "
-    "queue's learnings file -- a cold worker gets killed while idle and "
-    "cannot write then). Do NOT poll, do NOT sleep-loop, do NOT exit the "
+    "queue's learnings file -- an idle worker may later be released from queue "
+    "staffing). Do NOT poll, do NOT sleep-loop, do NOT exit the "
     "process on your own -- your stdin is a live input channel: when a new "
     "ticket is filed, a fresh instruction message arrives and you resume "
     "automatically with your full warm context. Ending your turn on an "
@@ -325,11 +325,15 @@ def write_to_worker_fifo(fifo_path: str, text: str) -> bool:
         _close_fd_quiet(fd)
 
 
-# Anthropic prompt-cache TTL. A worker idle LONGER than this has lost its
-# context cache, so waking it would pay a full uncached re-read of its entire
-# (by-then bloated) accumulated context -- the worst case. Past this window we
-# retire it and spawn a FRESH worker instead (cold but tiny context = cheaper).
+# Cache warmth is a routing/cost hint, not permission to terminate or release a
+# worker. Claude's default prompt-cache TTL is five minutes; Codex can retain a
+# cached prefix longer. Keep this threshold for warm FIFO nudges only.
 WARM_TTL_S = 300
+
+# A queue worker must be inactive for at least this long before WatchTower may
+# release it from queue staffing. This intentionally applies to every engine:
+# provider cache policy and worker lifecycle are separate concerns.
+RELEASE_IDLE_S = 30 * 60
 
 
 def _codex_rollout_mtime(w: Dict[str, Any]) -> float:
@@ -359,13 +363,44 @@ def _codex_rollout_mtime(w: Dict[str, Any]) -> float:
     return newest
 
 
+def _claude_transcript_mtime(w: Dict[str, Any]) -> float:
+    """Main transcript mtime for a Claude worker, or 0 when unavailable.
+
+    A Claude conversation resumed outside the original WatchTower subprocess
+    updates ``~/.claude/projects/*/<session-id>.jsonl`` without touching the
+    spawn stdout log. Treating only that log as activity can therefore release
+    a session that is actively doing unrelated work.
+    """
+    if w.get("engine") != "claude":
+        return 0.0
+    session_id = str(w.get("session_id") or "").strip()
+    if not session_id:
+        return 0.0
+    claude_home = Path(
+        os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")
+    )
+    newest = 0.0
+    try:
+        for path in (claude_home / "projects").glob(f"*/{session_id}.jsonl"):
+            try:
+                newest = max(newest, path.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        return 0.0
+    return newest
+
+
 def _worker_idle_s(w: Dict[str, Any]) -> float:
     """Seconds since this worker last did anything.
 
     The stream-json output log is written on every turn, so its mtime is the
     worker's last-activity clock. Falls back to ``started_at`` if the log is
     missing. Returns a large number when nothing is resolvable (treat as cold)."""
-    latest_activity = _codex_rollout_mtime(w)
+    latest_activity = max(
+        _codex_rollout_mtime(w),
+        _claude_transcript_mtime(w),
+    )
     log = w.get("log")
     if log:
         try:
@@ -386,23 +421,33 @@ def _worker_idle_s(w: Dict[str, Any]) -> float:
     return float("inf")
 
 
+def _worker_released(w: Dict[str, Any]) -> bool:
+    if w.get("released_at"):
+        return True
+    worker_id = str(w.get("worker_id") or "")
+    return bool(worker_id and (STOP_SIGNALS_DIR / worker_id).exists())
+
+
 def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) -> int:
     """Push `text` to live workers on `queue` via their FIFO.
 
-    ``max_idle_s`` (default ``WARM_TTL_S`` when None) skips workers idle longer
-    than the prompt-cache TTL: pushing to a cold worker is the worst case, so
-    the caller should reap+respawn instead. Returns the number of WARM workers
-    that accepted the message; 0 means "no warm worker -- reap stale + spawn"."""
+    ``max_idle_s`` defaults to the lifecycle release floor. A cache-cold worker
+    is still the queue's valid worker and must be woken for new work; only a
+    separately verified/released worker is skipped. Callers may pass a smaller
+    bound when they specifically want warm-cache-only routing.
+    """
     if max_idle_s is None:
-        max_idle_s = WARM_TTL_S
+        max_idle_s = RELEASE_IDLE_S
     n = 0
     for w in list_workers():
         if not w.get("alive"):
             continue
         if w.get("queue") != queue:
             continue
+        if _worker_released(w):
+            continue  # already released from queue staffing
         if _worker_idle_s(w) >= max_idle_s:
-            continue  # cold cache -- do not wake; let the caller spawn fresh
+            continue
         fifo = w.get("fifo")
         if fifo and write_to_worker_fifo(fifo, text):
             n += 1
@@ -458,14 +503,43 @@ def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
     return delivered
 
 
-def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
-                       queue: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Kill live workers idle past ``max_idle_s`` (cold cache).
+def _release_instruction(w: Dict[str, Any]) -> str:
+    queue = str(w.get("queue") or "this queue")
+    return (
+        "This is from the WatchTower Reconciler. You are no longer a "
+        f"WatchTower worker for {queue}. Do not claim any more tickets from "
+        "this queue. If the active goal is this queue's WatchTower drain goal, "
+        "clear/complete that goal now; do not clear or interrupt an unrelated "
+        "goal. This release is queue-scoped: continue any unrelated work "
+        "already underway in this conversation."
+    )
 
-    An idle worker has ended its turn and is blocked reading its FIFO -- nothing
-    is in flight, so SIGTERM is safe. Killing it frees the queue so the next
-    add/reconcile spawns a fresh, small-context worker instead of waking a cold,
-    bloated one. Returns the records reaped (after pruning + FIFO cleanup)."""
+
+def _deliver_release_instruction(w: Dict[str, Any], text: str) -> bool:
+    fifo = str(w.get("fifo") or "")
+    if fifo and write_to_worker_fifo(fifo, text):
+        return True
+    target = str(w.get("session_id") or "").strip()
+    if not target:
+        return False
+    try:
+        from . import messages
+        return bool(messages.send(target, text).get("ok"))
+    except Exception:
+        return False
+
+
+def release_idle_workers(max_idle_s: float = RELEASE_IDLE_S,
+                         queue: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Release verified-idle workers from queue staffing without killing them.
+
+    Release is deliberately conservative: the process must still be tracked,
+    both the engine transcript and spawn log must be stale past the floor, and
+    the queue backend must affirm that the worker owns no in-progress ticket,
+    including one blocked for human input. A durable stop sentinel prevents
+    future claims; a live instruction explains that unrelated conversation work
+    may continue. Unknown queue state fails closed. Returns newly released rows.
+    """
     from . import queue as _q
     worker_rows = list_workers(prune=False)
     candidates_by_queue: Dict[str, List[Dict[str, Any]]] = {}
@@ -474,12 +548,13 @@ def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
             continue
         if queue and w.get("queue") != queue:
             continue
+        if _worker_released(w):
+            continue
         if _worker_idle_s(w) < max_idle_s:
             continue
         candidates_by_queue.setdefault(str(w.get("queue") or ""), []).append(w)
 
-    reaped: List[Dict[str, Any]] = []
-    pids: List[int] = []
+    released: List[Dict[str, Any]] = []
     for queue_name, candidates in sorted(candidates_by_queue.items()):
         if not queue_name:
             continue
@@ -494,7 +569,7 @@ def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
         active_owners = {
             str(owner)
             for item in items
-            if item.get("status") == "in_progress" and not item.get("needs_input")
+            if item.get("status") == "in_progress"
             for owner in (item.get("claimed_by"), item.get("claimed_session_id"))
             if owner
         }
@@ -504,44 +579,25 @@ def reap_stale_workers(max_idle_s: float = WARM_TTL_S,
                 for field in ("worker_id", "session_id")
             ):
                 continue
-            pid = int(w.get("pid", 0) or 0)
-            if pid:
-                try:
-                    os.kill(pid, 15)
-                    idle_min = int(_worker_idle_s(w) / 60)
-                    ttl_min = int(max_idle_s / 60)
-                    w["_reap_reason"] = (
-                        f"idle {idle_min}m (cold cache, >{ttl_min}m TTL)"
-                    )
-                    # Drop any pending stop-signal — the worker is being killed,
-                    # so the sentinel would otherwise linger orphaned.
-                    try:
-                        (STOP_SIGNALS_DIR / str(w.get("worker_id", ""))).unlink()
-                    except OSError:
-                        pass
-                    reaped.append(w)
-                    pids.append(pid)
-                except OSError:
-                    pass
-    # SIGTERM is async -- the process keeps answering os.kill(pid, 0) until it
-    # actually exits. Wait for death (escalating to SIGKILL) BEFORE returning so
-    # a caller that reconciles next sees the slot truly free and spawns fresh.
-    # Without this wait, reconcile counts the dying worker as live and skips the
-    # respawn, stranding the ticket until the next daemon tick.
-    deadline = time.time() + 3.0
-    while pids and time.time() < deadline:
-        pids = [p for p in pids if _pid_alive(p)]
-        if not pids:
-            break
-        time.sleep(0.05)
-    for p in pids:  # stubborn ones: SIGKILL
-        try:
-            os.kill(p, 9)
-        except OSError:
-            pass
-    if reaped:
-        list_workers(prune=True)  # drop the dead records + unlink their FIFOs
-    return reaped
+            worker_id = str(w.get("worker_id") or "")
+            if not worker_id:
+                continue
+            request_stop(worker_id)
+            delivered = _deliver_release_instruction(w, _release_instruction(w))
+            idle_min = int(_worker_idle_s(w) / 60)
+            floor_min = int(max_idle_s / 60)
+            w["_release_reason"] = (
+                f"idle {idle_min}m (verified idle, >{floor_min}m release floor)"
+            )
+            w["_release_delivered"] = delivered
+            released.append(w)
+    return released
+
+
+def reap_stale_workers(max_idle_s: float = RELEASE_IDLE_S,
+                       queue: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Compatibility alias; stale workers are now released, never killed."""
+    return release_idle_workers(max_idle_s=max_idle_s, queue=queue)
 
 
 def _load() -> Dict[str, Any]:
@@ -584,6 +640,22 @@ def _save(data: Dict[str, Any]) -> None:
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp, WORKERS_FILE)
+
+
+def _mark_worker_released(worker_id: str) -> None:
+    """Persist queue detachment after the one-shot stop sentinel is consumed."""
+    with _WorkersFileLock():
+        data = _load()
+        changed = False
+        for row in data["workers"]:
+            if row.get("worker_id") != worker_id or row.get("released_at"):
+                continue
+            row["released_at"] = datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+            changed = True
+        if changed:
+            _save(data)
 
 
 def _load_worker_session_ledger() -> List[str]:
@@ -1180,7 +1252,7 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
 def live_worker_count(queue: Optional[str] = None) -> int:
     n = 0
     for w in list_workers():
-        if not w.get("alive"):
+        if not w.get("alive") or _worker_released(w):
             continue
         if queue and w.get("queue") != queue:
             continue
@@ -1198,7 +1270,7 @@ def worker_counts(prune: bool = False) -> Dict[str, Dict[str, int]]:
     for w in list_workers(prune=prune):
         row = out.setdefault(w.get("queue", ""), {"total": 0, "live": 0})
         row["total"] += 1
-        if w.get("alive"):
+        if w.get("alive") and not _worker_released(w):
             row["live"] += 1
     return out
 
@@ -1440,13 +1512,14 @@ def build_drain_command(
 
 
 def request_stop(worker_id: str) -> Path:
-    """Ask a running worker to stop by dropping a sentinel file.
+    """Release a running worker from queue staffing via a sentinel file.
 
     The worker's next ``wt claim`` call will detect the file, delete it, and
-    return ``{"stop": True}`` so the worker exits cleanly instead of being
-    killed. Uses the file-system only -- does NOT touch workers.json so the
-    record stays visible until the worker process dies and is pruned.
+    return ``{"stop": True}`` instead of claiming more queue work. The
+    underlying conversation/process is preserved and may continue unrelated
+    work. Uses the file-system only -- does NOT touch workers.json.
     """
+    _mark_worker_released(worker_id)
     stop_dir = STOP_SIGNALS_DIR
     stop_dir.mkdir(parents=True, exist_ok=True)
     signal_path = stop_dir / worker_id
@@ -1548,7 +1621,7 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
     Disposition, logged as `DISPATCH <ref> — <reason>`:
       - auto_drain off            → queued as backlog (no worker)
       - a warm worker is live     → nudged via its FIFO (immediate pickup)
-      - no warm worker            → reap cold + reconcile; spawned a fresh worker
+      - no eligible worker        → release verified-idle + reconcile
       - reconcile spawned nothing → no action (with the reconcile skip reason)
 
     Returns the reason string. Best-effort: never raises."""
@@ -1570,8 +1643,9 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             reason = f"nudged {delivered} live worker(s) — immediate pickup"
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
-        # No warm worker: reap cold ones, then reconcile to spawn a fresh worker.
-        reap_stale_workers(queue=queue)
+        # No warm worker: only release workers past the separate lifecycle
+        # floor, then reconcile. Cache coldness alone is not a release signal.
+        release_idle_workers(queue=queue)
         result = reconcile_once()
         spawned = [r for r in result.get("spawned", []) if r.get("queue") == queue]
         if spawned:
@@ -1799,8 +1873,8 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     `open` on a busy queue is a bet on the future — a worker that just claimed
     the last ticket would be STOPped prematurely. The surplus decision is made
     at claim time (``cli.cmd_claim``: nothing claimable AND live>desired), and
-    REAP is the idle safety net. So ``result["stopped"]`` stays empty from the
-    reconciler; the key + its log rendering remain for other callers.
+    graceful release is the idle safety net. So ``result["stopped"]`` stays
+    empty from the reconciler; the key + its log rendering remain for callers.
 
     Returns ``{"spawned": [...], "stopped": [...], "skipped": [...]}``.
     ``skipped`` entries explain why a queue was left alone (e.g. auto_drain=off,
@@ -1830,16 +1904,16 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         pass
 
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
-                              "reaped": [], "requeued": [], "backfilled": [],
+                              "released": [], "reaped": [], "requeued": [],
+                              "backfilled": [],
                               "session_title_backfilled": [],
                               "launch_failed": []}
 
-    # Reap cold idle workers first (idle past the prompt-cache TTL): waking one
-    # would re-read its bloated context uncached. Killing it lets the spawn pass
-    # below start a fresh, small-context worker instead. Skipped in dry_run.
+    # Gracefully release workers only after engine-aware activity clocks are
+    # stale past the lifecycle floor. Never derive lifecycle from cache warmth.
     if not dry_run:
         try:
-            result["reaped"] = reap_stale_workers()
+            result["released"] = release_idle_workers()
         except Exception:
             pass
         # Release tickets stranded in_progress by a dead/reaped/crashed worker so
@@ -1889,7 +1963,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     # Build live-worker counts keyed by queue.
     live_by_queue: Dict[str, List[Dict[str, Any]]] = {}
     for w in list_workers(prune=False):
-        if w.get("alive"):
+        if w.get("alive") and not _worker_released(w):
             q_name = w.get("queue", "")
             live_by_queue.setdefault(q_name, []).append(w)
 
@@ -1943,7 +2017,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             # ticket it flips open->in_progress, depth reads 0, and STOPping the
             # busy worker is premature. The surplus/idle decision is made at
             # claim time (cmd_claim, live>desired) when the real current state is
-            # known, and REAP is the idle safety net.
+            # known, and graceful release is the idle safety net.
             continue
         live = live_by_queue.get(q_name, [])
         actual = len(live)
@@ -2008,11 +2082,12 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         elif actual > desired:
             # Surplus is NOT wound down here. A worker discovers it is surplus at
             # claim time (cmd_claim: nothing claimable AND live>desired) and exits
-            # itself; REAP handles the persistently-idle case. The reconciler no
-            # longer pushes a speculative STOP based on a momentary count.
+            # itself; graceful release handles the persistently-idle case. The
+            # reconciler no longer pushes a speculative STOP based on a momentary
+            # count.
             result["skipped"].append(
                 {"queue": q_name,
-                 "reason": f"surplus ({actual}>{desired}) — resolved at claim/reap"}
+                 "reason": f"surplus ({actual}>{desired}) — resolved at claim/release"}
             )
         else:
             result["skipped"].append(
@@ -2044,11 +2119,14 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             q = (w.get("queue", "") if isinstance(w, dict) else "")
             reason = (w.get("reason", "") if isinstance(w, dict) else "")
             _log("STOP", str(wid) + (f" — {reason}" if reason else ""), queue=q)
-        for w in result.get("reaped", []):
+        for w in result.get("released", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
             q = (w.get("queue", "") if isinstance(w, dict) else "")
-            reason = (w.get("_reap_reason", "") if isinstance(w, dict) else "")
-            _log("REAP", str(wid) + (f" — {reason}" if reason else ""), queue=q)
+            reason = (w.get("_release_reason", "") if isinstance(w, dict) else "")
+            delivered = (w.get("_release_delivered") if isinstance(w, dict) else False)
+            detail = str(wid) + (f" — {reason}" if reason else "")
+            detail += " — instruction delivered" if delivered else " — stop pending"
+            _log("RELEASE", detail, queue=q)
         for ref in result.get("requeued", []):
             q = ref.rsplit("-", 1)[0] if "-" in ref else ""
             _log("REQUEUE", f"{ref} — worker gone, reopened for re-drain", queue=q)
