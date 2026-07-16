@@ -2,13 +2,25 @@
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-**Run fleets of AI coding-agent workers, unattended.** File tickets into named queues. Workers drain them automatically. `wt status` shows which queues are stuck — nothing more, nothing less.
+**Run fleets of AI coding-agent workers, unattended.** File tickets into named queues. Workers drain them automatically. `wt status` shows which queues are stuck: nothing more, nothing less.
 
-The engine is a single durable JSON queue (append-only, file-locked) — stdlib-only Python, zero runtime dependencies.
+The engine is a single durable JSON queue (append-only, file-locked): stdlib-only Python, zero runtime dependencies. WatchTower is a standalone product. It does not require [Claude Command Center](https://github.com/amirfish1/claude-command-center) or any other desktop app to run; every command below works from a plain terminal. A couple of optional integrations (an HTTP delegate for one alternate messaging transport, a shared model-default file) light up automatically if CCC happens to be installed on the same machine, and are called out explicitly where they appear. Nothing in the core queue, worker, or dashboard path depends on them.
+
+## The 30-second demo
+
+The signature feature is `wt wait`: it blocks until a queue has zero open tickets, so you can gate a script on a fleet of agents finishing their work. See it end to end, with no agent CLI required, in one script:
+
+```bash
+git clone https://github.com/amirfish1/watchtower.git
+cd watchtower && pip install -e .
+./examples/quickstart-demo.sh
+```
+
+It files a ticket, starts `wt wait` in the background, claims and closes the ticket (standing in for a real worker), and shows `wt wait` unblock the instant the queue empties. Read [`examples/quickstart-demo.sh`](examples/quickstart-demo.sh); it is a plain shell script, nothing hidden.
 
 ## Quick start (3 steps)
 
-**Requirements:** Python 3.11+, macOS or Linux, [Claude Code](https://claude.ai/code) CLI.
+**Requirements:** Python 3.11+, macOS or Linux. An agent CLI, [Claude Code](https://claude.ai/code) or [Codex](https://github.com/openai/codex), is only needed once you want WatchTower to spawn real AI workers instead of draining tickets yourself.
 
 ```bash
 # 1. Install
@@ -63,26 +75,28 @@ use.
 
 The first `wt start` also syncs the bundled skills into every agent harness
 present on the machine (`~/.claude/skills/`, `~/.codex/skills/`,
-`~/.gemini/skills/` for Antigravity) so any session — regardless of which
-repo it's rooted in — can use them without being told about `wt` first.
+`~/.gemini/skills/` for Antigravity), so any session, regardless of which
+repo it's rooted in, can use them without being told about `wt` first.
 Each is a symlink to the copy inside the installed package, so a `git pull`
-(editable install) or package upgrade updates it everywhere instantly — no
-separate re-sync step. Three skills ship today:
+(editable install) or package upgrade updates it everywhere instantly with no
+separate re-sync step. Four skills ship today:
 
-- **`watchtower`** — look up a ticket by ref (`wt find HERMES-20`), check
+- **`watchtower`**: look up a ticket by ref (`wt find HERMES-20`), check
   queue health, file/claim/close tickets.
-- **`critique`** (`/critique` in any synced harness) — spawn two
+- **`wt-triage-queue`**: unstick a queue that's flagged stuck or has aging,
+  abandoned, or unclosed claims.
+- **`critique`** (`/critique` in any synced harness): spawn two
   cross-family agents that independently critique a plan/design/diff and
   report back via `wt send`. Wraps `wt critique`; the reports arrive
   asynchronously (`wt critique --json` returns the spawned worker records
   for scripted callers, and each critic's log file holds the raw output).
-- **`group-chat-checkin`** — coordinate parallel sessions for discussion,
+- **`group-chat-checkin`**: coordinate parallel sessions for discussion,
   task execution, and git commits.
 
 ```bash
 wt skills sync      # same sync `wt install` runs; safe to re-run anytime
 wt skills status    # show what's linked, without changing anything
-wt skills remove    # undo — removes only the symlinks wt manages
+wt skills remove    # undo: removes only the symlinks wt manages
 ```
 
 See [`docs/agent-discovery.md`](docs/agent-discovery.md) for the design
@@ -132,7 +146,7 @@ wt skills sync                         # (re-)sync the bundled skills into insta
 WatchTower supports two agent engines. Set the engine per queue with `wt set`:
 
 ```bash
-wt set -q MYAPP --engine claude    # default — Claude Code (stream-json, FIFO, live)
+wt set -q MYAPP --engine claude    # default: Claude Code (stream-json, FIFO, live)
 wt set -q MYAPP --engine codex     # OpenAI Codex (one-shot exec)
 ```
 
@@ -154,10 +168,10 @@ claude -p --input-format stream-json --output-format stream-json \
 The drain goal is delivered as the **first stream-json message** on a named pipe
 (FIFO) that is the worker's stdin. This makes the worker a **live, pushable
 process**: when `wt add` files a new ticket while the worker is idle, the
-message arrives on the FIFO immediately — no polling, no sleep loop, warm context
-preserved. The worker's prompt cache stays hot for ~5 minutes after the last
-claim (Anthropic's cache TTL), so tickets that arrive in that window are
-cheaper and faster to handle.
+message arrives on the FIFO immediately, with no polling and no sleep loop; warm
+context is preserved. The worker's prompt cache stays hot for ~5 minutes after
+the last claim (Anthropic's cache TTL), so tickets that arrive in that window
+are cheaper and faster to handle.
 
 The reconciler reaps workers idle longer than 5 minutes (cold cache) and spawns
 a fresh one on the next tick rather than waking a worker whose context would be
@@ -185,9 +199,9 @@ delivered to a running codex worker.
 | | `claude` | `codex` |
 |---|---|---|
 | Spawn mode | stream-json over FIFO | `exec <goal>` |
-| Live push (`wt add`) | yes — via FIFO | no |
+| Live push (`wt add`) | yes, via FIFO | no |
 | Prompt cache warm wake | yes (~5 min) | no |
-| Multi-ticket session | yes — one process, warm ctx | one process, warm ctx |
+| Multi-ticket session | yes, one process, warm ctx | one process, warm ctx |
 | Requires | Claude Code CLI | OpenAI Codex CLI |
 
 ### GitHub Issues backend (optional)
@@ -224,7 +238,7 @@ time, a `WORKERS` column (`total (n live)`), and a STUCK/draining/ok flag,
 followed by a **drain readout** (`~3/min · empty in ~20m`, or `stalled` when no
 ticket has closed recently). Then a workers section listing each tracked
 worker's id, queue, pid, LIVE/DEAD state (process liveness via
-`os.kill(pid, 0)`), and what it is doing right now — `-> DASH-3 (4m)` (the
+`os.kill(pid, 0)`), and what it is doing right now: `-> DASH-3 (4m)` (the
 in-progress ticket it holds and how long ago it claimed it) or `idle`.
 
 ### Drain rate + ETA
@@ -232,12 +246,12 @@ in-progress ticket it holds and how long ago it claimed it) or `idle`.
 WatchTower turns the queue's own close timestamps into a live estimate, so
 `wt status` and the dashboard read like a forecast rather than a static count:
 
-- **drain rate** — tickets closed in the last 30 minutes (a fixed window) over
+- **drain rate**: tickets closed in the last 30 minutes (a fixed window) over
   the window, i.e. closes/min.
-- **ETA** — `depth / drain_rate`, rendered as `~20m` / `~2h`; `stalled` (null in
+- **ETA**: `depth / drain_rate`, rendered as `~20m` / `~2h`; `stalled` (null in
   JSON) when nothing has closed in the window.
 
-These are computed from data already in the queue (`closed_at` timestamps) — no
+These are computed from data already in the queue (`closed_at` timestamps); no
 new persistent state, no transcript parsing. `/api/status` carries
 `drain_rate_per_min`, `eta_seconds`, and `eta_human` on each queue, and
 `active_ref` / `active_since_human` on each worker.
@@ -249,12 +263,12 @@ wt dashboard [--port 8787] [--host 127.0.0.1]
              [--no-open] [--stop] [--foreground] [--once]
 ```
 
-`wt dashboard` is a **night-watch operations console** — a calm, dark instrument
+`wt dashboard` is a **night-watch operations console**: a calm, dark instrument
 panel over your agent fleet that lights up like a beacon when a queue stalls.
 It does **not** block your terminal:
 
 1. Starts the HTTP server **detached** in the background if it isn't already
-   running (idempotent — a second `wt dashboard` won't start a second server),
+   running (idempotent: a second `wt dashboard` won't start a second server),
    recording its pid in `~/.watchtower/dashboard.pid` (override with
    `$WATCHTOWER_DASHBOARD_PID`).
 2. Opens your browser to the URL (`webbrowser.open`).
@@ -262,27 +276,27 @@ It does **not** block your terminal:
 
 Flags:
 
-- `--no-open` — ensure the server is up, but don't open a browser.
-- `--stop` — stop the background dashboard server (via the pidfile).
-- `--foreground` — run the server in the foreground (blocking), for debugging.
-- `--once` — handle a single request then exit (used by the test suite).
-- `--host` / `--port` — bind address (default `127.0.0.1:8787`, local-first).
+- `--no-open`: ensure the server is up, but don't open a browser.
+- `--stop`: stop the background dashboard server (via the pidfile).
+- `--foreground`: run the server in the foreground (blocking), for debugging.
+- `--once`: handle a single request then exit (used by the test suite).
+- `--host` / `--port`: bind address (default `127.0.0.1:8787`, local-first).
 
 The watcher can host it too: `wt start --dashboard` brings the dashboard up
 alongside the watcher in one process (`--host`/`--port` apply there as well).
 
 **The page** (stdlib-only `http.server`, no dependencies, auto-refreshes ~5s):
 
-- A **tower** header — the `WatchTower` wordmark with a beacon dot (calm green
+- A **tower** header: the `WatchTower` wordmark with a beacon dot (calm green
   normally, amber when any queue is stuck) and a mono fleet summary
   (`3 queues · 1 stuck · 2 workers live`).
-- A responsive **instrument grid** — one card per queue with a big mono readout
+- A responsive **instrument grid**: one card per queue with a big mono readout
   (`7 open · empty in ~14m`, `STALLED`, or `clear`), a slim drain bar, and a
   live-worker count. A **stuck** card gets an amber accent border and a slow
   pulsing beacon glow (respecting `prefers-reduced-motion`).
-- A **workers** section — worker id (mono), queue, activity (`→ SHIP-3 (4m)` or
+- A **workers** section: worker id (mono), queue, activity (`-> SHIP-3 (4m)` or
   `idle`), and a LIVE / DEAD pill.
-- **Drill-down** — clicking a queue card opens `/q/<queue>`, listing that
+- **Drill-down**: clicking a queue card opens `/q/<queue>`, listing that
   queue's active tickets (ref / status / worker / title) and, below them, a
   **Closed** section where each row shows its resolution summary + chips.
 - An **empty state** that reads as an invitation, not an error: a dim beacon and
@@ -290,16 +304,16 @@ alongside the watcher in one process (`--host`/`--port` apply there as well).
 
 It also exposes read-only JSON:
 
-- `GET /api/status` — health rows (each annotated with worker counts) + the
+- `GET /api/status`: health rows (each annotated with worker counts) + the
   worker roster.
-- `GET /api/queues` — per-queue counts (mirrors `wt queues`).
-- `GET /api/queue/<name>` — the active tickets in one queue plus a `closed`
+- `GET /api/queues`: per-queue counts (mirrors `wt queues`).
+- `GET /api/queue/<name>`: the active tickets in one queue plus a `closed`
   array (each closed item carries its `resolution`).
 
 ### Resolutions: record HOW a ticket was fixed
 
-Closing a ticket is also where a worker records *what it did* — the trust-layer
-signal that turns a drained queue into an auditable log:
+Closing a ticket is also where a worker records *what it did*: the trust-layer
+signal that turns a drained queue into an auditable log.
 
 ```bash
 wt close DEMO-1 --summary "rewrote the flex container" \
@@ -309,7 +323,7 @@ wt close DEMO-1 --summary "rewrote the flex container" \
 ```
 
 `--summary` is the one-liner; `--caveat`, `--follow-up`, and `--unresolved` are
-repeatable. All are optional — `wt close DEMO-1` with no flags still works. The
+repeatable. All are optional: `wt close DEMO-1` with no flags still works. The
 resolution is stored on the item (`item["resolution"]`) and surfaced in the
 dashboard's per-queue **Closed** section and on closed `wt ls` rows. Spawned
 workers are instructed to always pass `--summary` so nothing closes silently.
@@ -325,8 +339,9 @@ active `tickets` and the `closed` array (closed items carry their `resolution`).
 ### The signature feature: `wt wait`
 
 `wt wait -q DEMO` blocks (polling) until the queue has zero open tickets, then
-exits 0 — optionally running a `--cmd` afterward. Drop it at the end of a script
-to gate on a fleet of agents finishing their work.
+exits 0, optionally running a `--cmd` afterward. Drop it at the end of a script
+to gate on a fleet of agents finishing their work. [`examples/quickstart-demo.sh`](examples/quickstart-demo.sh)
+runs this exact flow start to finish.
 
 ## Cross-agent messaging
 
@@ -376,11 +391,13 @@ the same conversations. Per-engine feasibility ground truth lives in
 
 WatchTower resolves its store in this order:
 
-1. `$WATCHTOWER_STORE` — explicit override (used by tests/CI).
+1. `$WATCHTOWER_STORE`: explicit override (used by tests/CI).
 2. The existing CCC store at `~/.claude/command-center/ux-fixes-queue.json`
-   **if it already exists** on this machine — so WatchTower drains real work
+   **if it already exists** on this machine, so WatchTower drains real work
    today without migration.
-3. `~/.watchtower/queues.json` — WatchTower's own default.
+3. `~/.watchtower/queues.json`: WatchTower's own default, used whenever no CCC
+   store is present. A fresh install with no CCC on the machine always lands
+   here.
 
 Tracked workers live in `~/.watchtower/workers.json`; the watcher daemon's
 pidfile is `~/.watchtower/daemon.pid`, and the background dashboard server's is
@@ -389,15 +406,15 @@ pidfile is `~/.watchtower/daemon.pid`, and the background dashboard server's is
 ## Stuck detection
 
 A queue is **stuck** when it has open tickets AND no ticket has been closed in
-the last 10 minutes. This is pure queue ground-truth — WatchTower decides from
+the last 10 minutes. This is pure queue ground-truth: WatchTower decides from
 the queue file alone, with no dependency on any external liveness signal.
 
 ## Roadmap
 
-- **Tap-to-act / buttons** — claim, close, or requeue tickets from the dashboard UI.
-- **Cost / token tracking** — per-queue and per-worker spend.
-- **Push notifications** — alert on a queue going stuck or draining.
-- **MCP server** — a structured, versioned tool API (`wt_find`, `wt_status`,
+- **Tap-to-act / buttons**: claim, close, or requeue tickets from the dashboard UI.
+- **Cost / token tracking**: per-queue and per-worker spend.
+- **Push notifications**: alert on a queue going stuck or draining.
+- **MCP server**: a structured, versioned tool API (`wt_find`, `wt_status`,
   `wt_claim`, ...) as the longer-term follow-up to the CLI + skill combo
   above, for harnesses without shell access. See
   [`docs/agent-discovery.md`](docs/agent-discovery.md) for the full option
@@ -405,12 +422,14 @@ the queue file alone, with no dependency on any external liveness signal.
 
 ## More docs
 
-- [`docs/worker-lifecycle.md`](docs/worker-lifecycle.md) — vocabulary, service
+- [`examples/quickstart-demo.sh`](examples/quickstart-demo.sh): a runnable
+  walkthrough of the enqueue -> claim -> close -> `wt wait` flow.
+- [`docs/worker-lifecycle.md`](docs/worker-lifecycle.md): vocabulary, service
   lifecycle, worker lifecycle.
-- [`docs/agent-discovery.md`](docs/agent-discovery.md) — how an agent session
+- [`docs/agent-discovery.md`](docs/agent-discovery.md): how an agent session
   (Claude Code, Codex, etc.) outside this repo can discover and query
   WatchTower; 4 options compared with a recommendation.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
