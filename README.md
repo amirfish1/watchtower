@@ -178,7 +178,7 @@ wt set -q MYAPP --engine codex     # OpenAI Codex (one-shot exec)
 
 The engine is stored in `~/.watchtower/queue-config.json` and picked up by the
 reconciler on the next spawn. Existing live workers are unaffected until they
-are reaped and a fresh one is started.
+are released from queue staffing and a replacement is started.
 
 #### `claude` (default)
 
@@ -188,7 +188,7 @@ Workers are spawned as:
 
 ```
 claude -p --input-format stream-json --output-format stream-json \
-       --verbose --name "<QUEUE> queue worker" --permission-mode bypassPermissions
+       --verbose --permission-mode bypassPermissions
 ```
 
 The drain goal is delivered as the **first stream-json message** on a named pipe
@@ -199,9 +199,9 @@ context is preserved. The worker's prompt cache stays hot for ~5 minutes after
 the last claim (Anthropic's cache TTL), so tickets that arrive in that window
 are cheaper and faster to handle.
 
-The reconciler reaps workers idle longer than 5 minutes (cold cache) and spawns
-a fresh one on the next tick rather than waking a worker whose context would be
-re-read uncached.
+Cache warmth does not control staffing. After 30 minutes of verified inactivity,
+the reconciler gracefully releases the conversation from this queue without
+killing it; later work gets replacement staffing as needed.
 
 #### `codex`
 
@@ -216,9 +216,10 @@ codex exec <drain-goal>
 
 The drain goal is passed directly as the command-line argument (one-shot exec).
 There is no FIFO stdin channel and no live push notification: the worker drains
-until the queue is empty, then exits. New tickets filed while it is running are
-picked up on the next `wt claim` loop iteration. `wt add` notifications are not
-delivered to a running codex worker.
+until the queue is empty, performs the idle audit, completes the active drain
+goal, and exits immediately. New tickets filed while it is running are picked up
+on the next `wt claim` loop iteration. `wt add` notifications are not delivered
+to a running codex worker.
 
 #### Comparison
 

@@ -913,7 +913,14 @@ def test_build_codex_has_goal_in_argv(wt):
     argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")
     assert argv[:2] == ["codex", "exec"]
     assert "--dangerously-bypass-approvals-and-sandbox" in argv
-    assert any("Drain the Q" in a for a in argv)
+    goal = argv[-1]
+    assert "Drain the Q" in goal
+    assert "live stdin" not in goal.lower()
+    assert "full warm context" not in goal
+    assert "whenever you wake" not in goal
+    assert "released from queue staffing" not in goal
+    assert "complete this queue's drain goal" in goal.lower()
+    assert "after the idle audit" in goal.lower()
 
 
 def test_drain_goal_content(wt):
@@ -928,6 +935,11 @@ def test_drain_goal_content(wt):
     # -- the prompt keeps only a one-line trigger pointing at it by path.
     assert "RESUME CHECK" in goal
     assert "IDLE" in goal
+    assert "stdin is a live input channel" in goal
+    assert "full warm context" in goal
+    assert "whenever you wake" in goal
+    assert "released from queue staffing" in goal
+    assert "complete this queue's drain goal" not in goal.lower()
     runbook = str(wt.workers._WORKER_RUNBOOK_PATH)
     assert goal.count(runbook) == 2  # one trigger each for Resume Check + Idle
     # Push policy must not override queue-specific ticket instructions such as

@@ -5,10 +5,10 @@ Shared, queue-agnostic procedures for a `wt`-spawned worker. This file is
 absolute path from `DRAIN_GOAL_TEMPLATE` (`watchtower/workers.py`), the
 literal prompt every worker across every queue is spawned with. The prompt
 keeps only a one-line trigger for each protocol below ("follow the Idle
-Protocol in `<path>`"); the *how* lives here so the prompt itself stays
-lean. If you're a worker reading this because your prompt pointed you here,
-you're in the right place — do what the matching section says, then return
-to your prompt's next instruction.
+Protocol in `<path>") plus the engine-specific action to take afterward; the
+*how* lives here so the prompt itself stays lean. If you're a worker reading
+this because your prompt pointed you here, you're in the right place — do what
+the matching section says, then return to your prompt's next instruction.
 
 This is distinct from `~/.watchtower/learnings/{queue}.md`: that file is
 per-queue accumulated wisdom (infra quirks, recurring ticket patterns) that
@@ -41,7 +41,10 @@ prefix is ever missing.
 
 ## Idle Protocol
 
-Do this when `wt claim` reports the queue is drained (returns nothing), FIRST — before ending your turn. An idle conversation may later be released from queue staffing, so this is not optional and not deferrable to "next time."
+Do this when `wt claim` reports the queue is drained (returns nothing), FIRST —
+before ending your turn. A Claude conversation may later be released from queue
+staffing, while a Codex worker exits immediately after this audit. Either way,
+the audit is not optional and not deferrable to "next time."
 
 1. Read the queue's learnings file at `~/.watchtower/learnings/{queue}.md`
    (create it if it doesn't exist).
@@ -56,8 +59,11 @@ Do this when `wt claim` reports the queue is drained (returns nothing), FIRST �
 5. Durable design reasoning (why something is structured a certain way,
    multi-paragraph gotchas) belongs in `docs/*.md` with just a one-line
    pointer left in the learnings file — not inlined in full there.
-6. THEN stop and end your turn. Do NOT poll, do NOT sleep-loop, do NOT exit
-   the process yourself. Your stdin is a live input channel: when a new
-   ticket is filed, a fresh instruction message arrives and you resume
-   automatically with full warm context. Ending your turn on an empty queue
-   is correct — the next message wakes you.
+6. THEN follow the lifecycle for your engine:
+   - **Claude (stream-json over FIFO):** end your turn. Do NOT poll, do NOT
+     sleep-loop, and do NOT exit the process yourself. Stdin is a live input
+     channel; a new ticket arrives as a fresh instruction and resumes the
+     conversation with full warm context.
+   - **Codex (`codex exec`):** complete this queue's active drain goal (or clear
+     it if the harness has no completion state), then exit immediately. There
+     is no live stdin channel and no wake message to wait for.

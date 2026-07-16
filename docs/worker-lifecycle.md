@@ -96,8 +96,9 @@ The worker's stdin is a named pipe (FIFO). The drain goal arrives as the first
 stream-json user message; subsequent `wt add` notifications push new messages
 on the same channel. The worker stays alive between tickets, so its prompt cache
 (Anthropic's 5-minute TTL) covers tickets filed within that window: they are
-cheaper and faster than a cold start. Workers idle past 5 minutes are reaped and
-replaced with a fresh process on the next reconciler tick.
+cheaper and faster than a cold start. Cache warmth is separate from staffing:
+after 30 minutes of verified inactivity, the reconciler gracefully releases the
+conversation from this queue without killing it.
 
 **`codex`** — requires the OpenAI Codex CLI.
 
@@ -106,17 +107,23 @@ there is no FIFO and no live push channel. The worker drains until the queue is
 empty and then exits. New tickets filed while it is running are picked up on the
 next `wt claim` iteration inside the same process.
 
-### Normal cycle
+### Normal cycles
 
 ```
-reconciler spawns worker
-  └─ worker loop:
+reconciler spawns Claude worker
+  └─ FIFO-backed worker loop:
        wt claim → ticket → do work → wt close --summary "..."
        wt claim → ticket → ...
-       wt claim → empty  → idle 2 min, re-poll
-       wt claim → empty  → idle 2 min, re-poll (up to 5 min total)
-       wt claim → empty  → self-exit (warm-idle TTL reached)
-  └─ reconciler sees actual < desired → respawn if work returns
+       wt claim → empty  → idle audit → end turn (no polling)
+  └─ a new FIFO message wakes the warm conversation
+  └─ after 30m verified idle, reconciler releases it from queue staffing
+
+reconciler spawns Codex worker
+  └─ one-shot worker loop:
+       wt claim → ticket → do work → wt close --summary "..."
+       wt claim → ticket → ...
+       wt claim → empty  → idle audit → complete drain goal → exit immediately
+  └─ reconciler spawns a new process when later work needs staffing
 ```
 
 ### Blocked cycle (needs human input)
@@ -126,7 +133,7 @@ worker reaches a decision it can't make alone
   └─ wt block <ref> --question "..." --progress "analysis so far"
        ticket: still in_progress, still bound to this session
        needs_input = true, block_question set
-  └─ worker moves to next ticket (or self-exits if nothing else)
+  └─ worker moves to next ticket, then follows its engine's empty-queue lifecycle
   └─ human sees blocked ticket in CCC or `wt blocked`
   └─ human answers: `wt answer <ref> "decision"` OR `wt discuss <ref>`
        answer appended to ticket, needs_input cleared
@@ -161,13 +168,15 @@ reconciler: actual > desired
 Cost: wind-down waits up to one ticket's duration (the worker finishes what it
 started). That is intentional.
 
-### Warm-idle window
+### Engine-specific idle behavior
 
-When `wt claim` returns empty (nothing open), a worker does NOT exit
-immediately. It re-polls every 2 minutes for up to 5 minutes total, then
-self-exits. Rationale: Anthropic's prompt cache has a 5-minute TTL — a ticket
-arriving in that window reuses the warm cache (cheaper, faster) rather than
-paying a cold start. A wind-down STOP bypasses the warm window.
+When `wt claim` returns empty, neither engine polls or sleep-loops. A Claude
+worker ends its turn and remains blocked on its live FIFO, so a later ticket can
+wake the same conversation. Its prompt cache is typically warm for about five
+minutes, but cache warmth does not control staffing; the reconciler may release
+the conversation after 30 minutes of verified inactivity. A Codex exec worker
+has no FIFO, so after its idle audit it completes the active queue-drain goal and
+exits immediately. A wind-down STOP makes either engine exit between tickets.
 
 ---
 
@@ -198,8 +207,9 @@ SPAWN     ccc-def2  (pid 4929) [claude] — 1 open, 0 live < 2 desired
 DISPATCH  CCC-461   spawned 2 worker(s): ccc-abc1, ccc-def2
 ```
 
-The extra worker sits warm until another ticket arrives (cheaper: reuses the
-prompt cache) or is reaped after the 5-minute idle TTL.
+An extra Claude worker waits on its FIFO until another ticket arrives or it is
+gracefully released after 30 minutes of verified inactivity. An extra Codex
+worker exits immediately after its empty-queue idle audit.
 
 ---
 

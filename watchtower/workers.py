@@ -93,7 +93,38 @@ _WORKER_RUNBOOK_PATH = Path(__file__).resolve().parent.parent / "docs" / "worker
 
 # Drain goal adapted from CCC's docs/ux-fixes-worker-brief.md canonical /goal.
 # Generalized: no CCC paths, no shared-clone assumptions. The worker drains one
-# queue via the `wt` CLI it was spawned by and idles when empty.
+# queue via the `wt` CLI it was spawned by. Claude waits warm on its FIFO when
+# empty; Codex completes the drain goal and exits because it has no live input.
+CLAUDE_IDLE_CONTRACT = (
+    "An idle worker may later be released from queue staffing. "
+    "Do NOT poll, do NOT sleep-loop, and do NOT exit the process on your own -- "
+    "your stdin is a live input channel: when a new ticket is filed, a fresh "
+    "instruction message arrives and you resume automatically with your full "
+    "warm context. Ending your turn on an empty queue is correct -- the next "
+    "message wakes you. "
+)
+
+CODEX_IDLE_CONTRACT = (
+    "Do NOT poll or sleep-loop. After the idle audit, complete this queue's "
+    "drain goal using the native goal control (or clear it if completion is "
+    "unavailable), then exit immediately. This is a one-shot run; do not wait "
+    "for a wake message. "
+)
+
+CLAUDE_RESUME_CONTRACT = (
+    "RESUME CHECK: whenever you wake and your warm context says you were "
+    "mid-work on a ticket, follow the Resume Check protocol in {runbook} "
+    "before you edit, commit, or close anything -- skipping this is how the "
+    "same ticket gets fixed and committed twice. "
+)
+
+CODEX_RESUME_CONTRACT = (
+    "RESUME CHECK: if this Codex run starts with context indicating you were "
+    "mid-work on a ticket, follow the Resume Check protocol in {runbook} before "
+    "you edit, commit, or close anything -- skipping this is how the same "
+    "ticket gets fixed and committed twice. "
+)
+
 DRAIN_GOAL_TEMPLATE = (
     "Drain the {queue} WatchTower queue and keep it empty. "
     "Work in the git repo at {repo}. "
@@ -125,16 +156,7 @@ DRAIN_GOAL_TEMPLATE = (
     "figured out so far\"`, then move on to the next ticket. "
     "IDLE: when `wt claim` reports the queue is drained, follow the Idle "
     "Protocol in {runbook} BEFORE ending your turn (it has you update the "
-    "queue's learnings file -- an idle worker may later be released from queue "
-    "staffing). Do NOT poll, do NOT sleep-loop, do NOT exit the "
-    "process on your own -- your stdin is a live input channel: when a new "
-    "ticket is filed, a fresh instruction message arrives and you resume "
-    "automatically with your full warm context. Ending your turn on an "
-    "empty queue is correct -- the next message wakes you. "
-    "RESUME CHECK: whenever you wake and your warm context says you were "
-    "mid-work on a ticket, follow the Resume Check protocol in {runbook} "
-    "before you edit, commit, or close anything -- skipping this is how the "
-    "same ticket gets fixed and committed twice. "
+    "queue's learnings file). {idle_contract}{resume_contract}"
     "Push or publish exactly when the claimed ticket's worker instructions tell "
     "you to. If the claimed ticket has no explicit push/publish instruction, "
     "leave commits local unless the user explicitly asks you to push."
@@ -1441,13 +1463,22 @@ def annotate_activity(
     return rows
 
 
-def drain_goal(queue: str, worker_id: str, repo_path: str = "") -> str:
-    """The canonical drain goal text for one worker."""
+def drain_goal(
+    queue: str, worker_id: str, repo_path: str = "", engine: str = "claude",
+) -> str:
+    """The canonical drain goal text for one worker and engine lifecycle."""
     from . import config
     claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
     return DRAIN_GOAL_TEMPLATE.format(
         queue=queue, worker_id=worker_id, repo=repo_path or os.getcwd(),
         claim_filter=claim_filter, runbook=str(_WORKER_RUNBOOK_PATH),
+        idle_contract=(
+            CODEX_IDLE_CONTRACT if engine == "codex" else CLAUDE_IDLE_CONTRACT
+        ),
+        resume_contract=(
+            CODEX_RESUME_CONTRACT if engine == "codex"
+            else CLAUDE_RESUME_CONTRACT
+        ).format(runbook=str(_WORKER_RUNBOOK_PATH)),
     )
 
 
@@ -1493,7 +1524,7 @@ def build_drain_command(
             argv += ["--model", model]
         if effort:
             argv += ["--config", f'model_reasoning_effort="{effort}"']
-        argv.append(goal or drain_goal(queue, worker_id, repo_path))
+        argv.append(goal or drain_goal(queue, worker_id, repo_path, engine=engine))
         return argv
     argv = [
         bin_name, "-p",
@@ -2181,7 +2212,7 @@ def spawn_workers(
             resolved_bin = _resolve_engine_bin(engine)
             if resolved_bin:
                 argv = [resolved_bin] + argv[1:]
-        goal = drain_goal(queue, worker_id, repo_path)
+        goal = drain_goal(queue, worker_id, repo_path, engine=engine)
         if dry_run:
             rec = {
                 "worker_id": worker_id,
