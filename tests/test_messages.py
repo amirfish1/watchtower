@@ -62,6 +62,7 @@ def wt(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "WATCHTOWER_CODEX_THREAD_REGISTRY", str(tmp_path / "codex-thread-registry.json")
     )
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
 
     # No codex binary by default: is_available() must read False so the
     # codex-app-server adapter is a clean no-op miss in every test that
@@ -136,6 +137,15 @@ def _write_transcript(wt, sid, age_s=0.0):
     if age_s:
         old = time.time() - age_s
         os.utime(p, (old, old))
+    return p
+
+
+def _write_codex_rollout(wt, sid):
+    """Drop a Codex rollout where receipt verification expects it."""
+    d = Path(os.environ["CODEX_HOME"]) / "sessions" / "2026" / "07" / "17"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"rollout-2026-07-17T00-00-00-{sid}.jsonl"
+    p.write_text('{"type":"session_meta"}\n')
     return p
 
 
@@ -461,6 +471,7 @@ def test_deliver_codex_target_via_app_server(wt, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(script))
     _disable_resume(wt, monkeypatch)
     wt.messages.register_agent("codexer", SID_D, engine="codex", cwd="/repo")
+    rollout = _write_codex_rollout(wt, SID_D)
 
     res = wt.messages.send("codexer", "hello from wt")
 
@@ -473,11 +484,30 @@ def test_deliver_codex_target_via_app_server(wt, monkeypatch):
     assert res["codex_total_ms"] >= res["codex_resume_ms"]
     # WT-77: every ok delivery also carries a verification receipt.
     assert res.get("receipt_id", "").startswith("rcpt-")
+    from watchtower import receipts
+    receipt = receipts.get(res["receipt_id"], refresh=False)
+    assert receipt["engine"] == "codex"
+    assert receipt["at_send"]["path"] == str(rollout)
     reg = wt.codex_registry.entry(SID_D)
     assert reg["transport_owner"] == "wt-private-app-server"
     assert reg["transport"] == "stdio"
     assert reg["wt"]["last_delivery_transport"] == "codex-app-server"
     assert reg["wt"]["last_delivery_via"] == "start"
+
+
+def test_deliver_codex_app_server_without_rollout_is_failure(wt, monkeypatch):
+    """An app-server acknowledgement is not delivery truth when WT cannot
+    locate the target thread's durable rollout for receipt verification."""
+    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(_write_fake_codex_bin(wt.tmp)))
+    _disable_resume(wt, monkeypatch)
+    wt.messages.register_agent("codexer", SID_D, engine="codex", cwd="/repo")
+
+    res = wt.messages.send("codexer", "cannot verify this", queue_on_fail=False)
+
+    assert res["ok"] is False and res["queued"] is False
+    assert "Codex rollout" in res["error"]
+    from watchtower import receipts
+    assert receipts.list_receipts() == []
 
 
 def test_deliver_codex_prefers_delegate_broker_over_private_app_server(wt, delegate, monkeypatch):
@@ -1049,6 +1079,45 @@ def test_ask_timeout_returns_partial(wt):
         t.join()
     assert res["ok"] is False and res["error"] == "timeout"
     assert res["partial"] == "part one"
+
+
+def test_ask_codex_without_delegate_is_explicitly_unsupported(wt, monkeypatch):
+    wt.messages.register_agent("codexer", SID_D, engine="codex", cwd="/repo")
+
+    def _claude_resume_must_not_run(*_args, **_kwargs):
+        raise AssertionError("Codex ask must not use the Claude resume adapter")
+
+    monkeypatch.setattr(wt.messages, "_deliver_resume", _claude_resume_must_not_run)
+
+    res = wt.messages.ask("codexer", "question?", timeout_ms=1000)
+
+    assert res == {
+        "ok": False,
+        "error": "ask is unsupported for standalone Codex targets; configure a delegate/broker",
+        "source": "unsupported",
+        "engine": "codex",
+    }
+
+
+def test_ask_codex_routes_directly_to_delegate(wt, delegate, monkeypatch):
+    srv, url = delegate
+    srv.responses.append((200, {"ok": True, "answer": "codex answer"}))
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    wt.messages.register_agent("codexer", SID_D, engine="codex", cwd="/repo")
+
+    def _claude_resume_must_not_run(*_args, **_kwargs):
+        raise AssertionError("Codex ask must not use the Claude resume adapter")
+
+    monkeypatch.setattr(wt.messages, "_deliver_resume", _claude_resume_must_not_run)
+
+    res = wt.messages.ask("codexer", "question?", timeout_ms=1000)
+
+    assert res == {"ok": True, "answer": "codex answer", "source": "delegate"}
+    assert srv.requests == [("/api/ask", {
+        "session_id": SID_D,
+        "text": "question?",
+        "timeout_ms": 1000,
+    })]
 
 
 # ===================================================================== CLI wiring

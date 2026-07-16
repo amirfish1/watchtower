@@ -138,7 +138,9 @@ Reply detection: fifo/resume paths tail the worker or resume log for a
 `{"type":"result"}` event or assistant text followed by end of turn; delegate
 path passes through to CCC `/api/ask`. Timeout returns
 `{"ok": false, "error": "timeout", "partial": "..."}`. Optional
-`--notify-webhook` mirrors `wt wait`.
+`--notify-webhook` mirrors `wt wait`. Standalone Codex targets return an
+explicit unsupported result for `ask`; synchronous Codex questions require a
+CCC/delegate broker that owns response correlation.
 
 ## Group chats: CCC-compatible on disk
 
@@ -230,8 +232,8 @@ numbers drift): `_register_coordination`, `_coordination_watcher`,
 | claude (idle session) | native resume | yes |
 | claude (live TTY, no CCC) | native busy-hold, resume on idle | yes (nudge lands on idle) |
 | claude (live TTY, CCC present) | delegate upgrade: instant keystroke inject | yes, instant |
-| codex (CCC present) | CCC delegate/broker to managed app-server | yes |
-| codex (standalone WT) | WT private `codex app-server` fallback | yes |
+| codex (CCC present) | send + ask through CCC delegate/broker | yes |
+| codex (standalone WT) | send through private `codex app-server`; ask unsupported | yes |
 | gemini / cursor / antigravity / hermes | delegate or engine-specific CCC path | yes via delegate/broker |
 
 Codex nuance (per the canonical engine study, see below): `codex exec`
@@ -243,7 +245,9 @@ steerable mid-run through app-server JSON-RPC (`thread/resume`, `turn/start`,
 `turn/steer`, and experimental `thread/inject`), but the ownership rule matters
 more than the method list: avoid two app-server owners for one thread.
 Without any delegate, WT covers claude sessions with at-most-idle-lag delivery
-and Codex sessions through its private fallback.
+and Codex sends through its private fallback. A successful private app-server
+send requires a receipt backed by the thread's durable Codex rollout; an
+app-server acknowledgement without that proof path is reported as failure.
 
 Shared knowledge: the cross-engine feasibility ground truth (headless vs
 terminal vs app-server, inject/steer/reap per engine) is maintained as

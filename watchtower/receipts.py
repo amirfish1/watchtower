@@ -14,9 +14,10 @@ time and is later verified against what actually happened:
   - ``pending``    — nothing observable yet, still inside the wait window.
   - ``lost``       — wait window elapsed and the transcript never advanced.
 
-``record()`` is called by messages.send on every ok delivery; ``sweep()``
-runs from the daemon tick; ``wt receipts`` / ``wt receipts stats`` expose
-the ledger. ``stats()`` is the soak-gate instrument for WT-57/WT-64
+``record()`` is called by messages.send on every ok delivery and snapshots
+Claude transcripts or Codex rollouts according to the target engine;
+``sweep()`` runs from the daemon tick; ``wt receipts`` / ``wt receipts stats``
+expose the ledger. ``stats()`` is the soak-gate instrument for WT-57/WT-64
 (flip wt to default only after N verified deliveries, zero lost).
 """
 
@@ -71,8 +72,12 @@ def _save(rows: List[Dict[str, Any]]) -> None:
     os.replace(tmp, path)
 
 
-def _transcript_stat(sid: str) -> Dict[str, Any]:
-    p = messages._find_transcript(sid)
+def _transcript_stat(sid: str, engine: str = "claude") -> Dict[str, Any]:
+    p = (
+        messages._find_codex_rollout(sid)
+        if str(engine).lower() == "codex"
+        else messages._find_transcript(sid)
+    )
     if p is None:
         return {"path": "", "size": 0, "mtime": 0.0}
     try:
@@ -90,17 +95,27 @@ def _needle(text: str) -> str:
 
 
 def record(
-    sid: str, text: str, transport: str, now: Optional[float] = None
+    sid: str,
+    text: str,
+    transport: str,
+    now: Optional[float] = None,
+    engine: str = "claude",
+    require_path: bool = False,
 ) -> Dict[str, Any]:
     """Snapshot the target transcript at send time; returns the receipt."""
     now = time.time() if now is None else float(now)
+    engine = str(engine or "claude").lower()
+    at_send = _transcript_stat(str(sid), engine)
+    if require_path and not at_send["path"]:
+        raise ValueError(f"{engine} transcript path not found for {str(sid)[:8]}")
     rec = {
         "id": f"rcpt-{_uuid.uuid4().hex[:12]}",
         "sid": str(sid),
+        "engine": engine,
         "transport": str(transport or "?"),
         "needle": _needle(text),
         "sent_at": now,
-        "at_send": _transcript_stat(str(sid)),
+        "at_send": at_send,
         "status": "pending",
         "verified_at": None,
     }
@@ -117,7 +132,7 @@ def _verify_one(rec: Dict[str, Any], now: float) -> Dict[str, Any]:
     if rec.get("status") not in ("pending", "advanced"):
         return rec
     sid = str(rec.get("sid") or "")
-    cur = _transcript_stat(sid)
+    cur = _transcript_stat(sid, str(rec.get("engine") or "claude"))
     needle = str(rec.get("needle") or "")
     if cur["path"] and needle:
         try:

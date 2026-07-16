@@ -497,6 +497,26 @@ def _find_transcript(sid: str) -> Optional[Path]:
     return None
 
 
+def _find_codex_rollout(sid: str) -> Optional[Path]:
+    """Locate the newest durable Codex rollout for a thread, if any."""
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    newest: Optional[Path] = None
+    newest_mtime = -1.0
+    try:
+        paths = codex_home.joinpath("sessions").glob(f"*/*/*/*{sid}.jsonl")
+        for path in paths:
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest = path
+                newest_mtime = mtime
+    except OSError:
+        return None
+    return newest
+
+
 def _latest_session_title(path: Path) -> str:
     """Return the last explicit Claude title/agent-name in a transcript."""
     try:
@@ -1290,10 +1310,22 @@ def deliver(
     if result.get("ok") and sid:
         try:
             from . import receipts
-            rec = receipts.record(sid, text, str(result.get("transport") or "?"))
+            transport = str(result.get("transport") or "?")
+            rec = receipts.record(
+                sid,
+                text,
+                transport,
+                engine=str(resolved.get("engine") or "claude"),
+                require_path=transport == "codex-app-server",
+            )
             result["receipt_id"] = rec["id"]
-        except Exception:  # noqa: BLE001 - receipts must never fail delivery
-            pass
+        except Exception as exc:  # noqa: BLE001 - surface proof failures honestly
+            if result.get("transport") == "codex-app-server":
+                return {
+                    "ok": False,
+                    "error": "codex-app-server accepted message but Codex rollout "
+                             f"is unavailable for receipt verification: {exc}",
+                }
     return result
 
 
@@ -1699,11 +1731,14 @@ def ask(target: str, text: str, timeout_ms: int = 30000) -> Dict[str, Any]:
             queue_mod._log("ASK", f"{target} via fifo: {str(text)[:60]}")
             return _await_reply(log, offset, deadline, source="fifo")
 
-    r = _deliver_resume(resolved, text)
-    if r.get("ok"):
-        queue_mod._log("ASK", f"{target} via resume: {str(text)[:60]}")
-        return _await_reply(str(r.get("log") or ""), 0, deadline, source="resume")
-    resume_error = str(r.get("error") or "resume unavailable")
+    engine = str(resolved.get("engine") or "claude")
+    resume_error = "resume unavailable"
+    if engine != "codex":
+        r = _deliver_resume(resolved, text)
+        if r.get("ok"):
+            queue_mod._log("ASK", f"{target} via resume: {str(text)[:60]}")
+            return _await_reply(str(r.get("log") or ""), 0, deadline, source="resume")
+        resume_error = str(r.get("error") or resume_error)
 
     base = _delegate_base()
     sid = str(resolved.get("session_id") or "")
@@ -1723,5 +1758,14 @@ def ask(target: str, text: str, timeout_ms: int = 30000) -> Dict[str, Any]:
         if out.get("ok"):
             queue_mod._log("ASK", f"{target} via delegate: {str(text)[:60]}")
         return out
+
+    if engine == "codex":
+        return {
+            "ok": False,
+            "error": "ask is unsupported for standalone Codex targets; "
+                     "configure a delegate/broker",
+            "source": "unsupported",
+            "engine": "codex",
+        }
 
     return {"ok": False, "error": resume_error, "source": "none"}
