@@ -332,18 +332,48 @@ def write_to_worker_fifo(fifo_path: str, text: str) -> bool:
 WARM_TTL_S = 300
 
 
+def _codex_rollout_mtime(w: Dict[str, Any]) -> float:
+    """Newest rollout mtime for a Codex worker, or 0 when unavailable.
+
+    Codex app-server turns update the durable rollout without writing to the
+    original ``codex exec`` stdout log. The rollout is therefore the only
+    standalone activity clock that prevents a live resumed conversation from
+    looking cold to WatchTower's reaper.
+    """
+    if w.get("engine") != "codex":
+        return 0.0
+    session_id = str(w.get("session_id") or "").strip()
+    if not session_id:
+        return 0.0
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    sessions = codex_home / "sessions"
+    newest = 0.0
+    try:
+        for path in sessions.glob(f"*/*/*/*{session_id}.jsonl"):
+            try:
+                newest = max(newest, path.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        return 0.0
+    return newest
+
+
 def _worker_idle_s(w: Dict[str, Any]) -> float:
     """Seconds since this worker last did anything.
 
     The stream-json output log is written on every turn, so its mtime is the
     worker's last-activity clock. Falls back to ``started_at`` if the log is
     missing. Returns a large number when nothing is resolvable (treat as cold)."""
+    latest_activity = _codex_rollout_mtime(w)
     log = w.get("log")
     if log:
         try:
-            return max(0.0, time.time() - os.path.getmtime(log))
+            latest_activity = max(latest_activity, os.path.getmtime(log))
         except OSError:
             pass
+    if latest_activity:
+        return max(0.0, time.time() - latest_activity)
     started = w.get("started_at")
     if started:
         try:

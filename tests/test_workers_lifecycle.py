@@ -1101,6 +1101,32 @@ def test_reap_spares_warm_worker(wt):
     assert wt.workers.reap_stale_workers(queue="Q") == []
 
 
+def test_reap_spares_codex_worker_with_fresh_rollout_activity(wt, monkeypatch):
+    """A stale WT log is not idle proof when the Codex rollout is active."""
+    child = subprocess.Popen(["sleep", "30"])
+    log = wt.tmp / "codex-silent.log"
+    log.write_text("")
+    sid = "11111111-1111-1111-1111-111111111111"
+    codex_home = wt.tmp / "codex-home"
+    rollout_dir = codex_home / "sessions" / "2026" / "07" / "16"
+    rollout_dir.mkdir(parents=True)
+    rollout = rollout_dir / f"rollout-2026-07-16T00-00-00-{sid}.jsonl"
+    rollout.write_text('{"type":"event_msg"}\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    rec = wt.workers.record_worker(
+        child.pid, "Q", "codex", "q-codex-silent", str(wt.tmp), str(log),
+        session_id=sid,
+    )
+    try:
+        _age_worker_log(wt, rec, wt.workers.WARM_TTL_S + 60)
+
+        assert wt.workers.reap_stale_workers(queue="Q") == []
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
 def test_reap_spares_cold_worker_with_active_ticket(wt):
     """A stale log is not proof of idleness while the worker owns work."""
     child = subprocess.Popen(["sleep", "30"])
