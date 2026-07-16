@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WatchTower + Claude Command Center</title>
+<meta name="description" content="WatchTower is standalone and CLI-first. Claude Command Center is one client: it delegates durable delivery to WatchTower and adds a desktop UI on top. Here is the exact boundary.">
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='38' fill='%23f6b545'/></svg>">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="index.html"><span class="beacon"></span>WatchTower</a>
+    <div class="nav-links">
+      <a href="index.html#install">Install</a>
+      <a href="index.html#quickstart">Quickstart</a>
+      <a href="cli.html">CLI reference</a>
+      <a href="integration.html">CCC integration</a>
+      <a href="https://github.com/amirfish1/watchtower">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<section style="padding-top:56px">
+  <div class="wrap">
+    <p class="eyebrow">Command Center integration</p>
+    <h2>WatchTower is standalone. Command Center is one client.</h2>
+    <p class="lede">
+      WatchTower runs from a plain terminal with nothing else installed. Claude Command Center (CCC) is a
+      desktop app that sits on top of it: it delegates durable delivery to WatchTower and adds a UI,
+      transcript rendering, and local desktop transports. Neither owns the other. This page is the exact
+      boundary, taken from the canonical ownership contract.
+    </p>
+    <div class="note green">
+      <b>You never need CCC to use WatchTower.</b> A couple of optional integrations (an HTTP delegate for one
+      alternate messaging transport, a shared model-default file) light up automatically if CCC happens to be
+      installed on the same machine. Nothing in the core queue, worker, or dashboard path depends on them.
+    </div>
+  </div>
+</section>
+
+<section style="border-top:1px solid var(--border-soft)">
+  <div class="wrap">
+    <p class="eyebrow">Ownership</p>
+    <h2>Who owns what.</h2>
+    <div class="grid g2" style="margin-top:28px">
+      <div class="card">
+        <h3 style="color:var(--amber)">WatchTower owns the control plane</h3>
+        <p style="margin-top:12px;color:var(--text)">
+          Addressing (worker ids, registered agents, session ids, queue refs). Message delivery intent:
+          <code class="inline-code">send</code>, <code class="inline-code">ask</code>, chats, nudges, outbox retry, TTL, dead-letter, and receipts.
+          Queue-worker lifecycle: config, claim, close, reap, and spawn policy. The durable ledgers under
+          <code class="inline-code">~/.watchtower</code>.
+        </p>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--muted)">Command Center owns the desktop surface</h3>
+        <p style="margin-top:12px;color:var(--text)">
+          HTTP and UI entry points such as <code class="inline-code">/api/inject-input</code>, conversation panes, status
+          pills, and transcript rendering. Local desktop transports WatchTower cannot own portably, like
+          terminal keystroke injection. The managed Codex app-server connection when CCC is running. Local
+          conversation archives and rendering caches.
+        </p>
+      </div>
+    </div>
+    <div class="note">
+      <b>The dividing line, in one sentence.</b> WatchTower owns durable control-plane semantics; CCC owns
+      local desktop transports, the user-facing UI, transcript rendering, and the managed Codex app-server
+      broker when CCC is running.
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">Call direction</p>
+    <h2>Who calls whom, and why.</h2>
+    <div class="grid g2" style="margin-top:28px">
+      <div class="card">
+        <h3>CCC calls WatchTower</h3>
+        <p style="margin-top:10px;color:var(--text)">when it wants durable delivery semantics: dormant or
+           unknown sessions, queue-worker messages, anything that should survive a CCC restart via outbox
+           retry, or anything that needs a WatchTower receipt.</p>
+      </div>
+      <div class="card">
+        <h3>WatchTower calls CCC</h3>
+        <p style="margin-top:10px;color:var(--text)">only as a delegate or broker: desktop-only transports
+           like a live terminal tab it cannot type into directly, or managed Codex app-server access when CCC
+           is the local broker. If CCC is absent, WatchTower delivers through a native adapter or parks the
+           message in its outbox.</p>
+      </div>
+    </div>
+    <div class="note">
+      <b>Loop prevention is explicit.</b> Every WatchTower-to-CCC delegate request carries
+      <code class="inline-code">origin=wt</code>, which CCC honors by never calling back into <code class="inline-code">wt send</code> for the same
+      delivery. If delivery cannot be proven and queueing is disabled, the result is a failure, not a
+      delivered toast.
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="eyebrow">Reporting success</p>
+    <h2>Delivered means verified landed.</h2>
+    <p class="lede">
+      The whole contract exists to prevent two classes of bug: duplicate writers against one session, and
+      delivery paths that report success before a message has landed or been durably queued.
+    </p>
+    <table class="matrix">
+      <thead><tr><th>State</th><th>What it means</th></tr></thead>
+      <tbody>
+        <tr><td>accepted</td><td>WatchTower accepted the message for durable handling. CCC may say "accepted".</td></tr>
+        <tr><td>queued / outbox</td><td>WatchTower could not deliver yet and parked the message for retry. CCC should surface queued state, not "delivered".</td></tr>
+        <tr><td>delivered</td><td>A direct local transport succeeded, or WatchTower returned a receipt-backed result. Only then is it "delivered".</td></tr>
+      </tbody>
+    </table>
+    <p class="lede" style="margin-top:16px;font-size:15px">
+      WatchTower receipts are the durable delivery ledger; CCC may render them, but WatchTower owns their
+      state transitions. Codex durable truth is its own on-disk rollout store: app-server notifications are
+      useful for fast UI and receipts, but are not canonical unless persisted and reconciled with the rollout.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="index.html">Back to overview</a>
+      <a class="btn btn-ghost" href="cli.html">CLI reference &rarr;</a>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot-inner">
+    <div>
+      <div class="brand" style="margin-bottom:8px"><span class="beacon"></span>WatchTower</div>
+      <div>Boundary summarized from the canonical WT / CCC / Codex ownership contract.</div>
+    </div>
+    <div class="foot-links">
+      <a href="index.html">Home</a>
+      <a href="cli.html">CLI</a>
+      <a href="https://github.com/amirfish1/watchtower">GitHub</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

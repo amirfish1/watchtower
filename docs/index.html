@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WatchTower - run fleets of AI coding agents unattended</title>
+<meta name="description" content="WatchTower is a CLI-first queue and fleet manager for AI coding agents. Drop work into named queues, workers drain them, and wt wait blocks until the queue is empty. Standalone, zero-dependency, local-first.">
+<link rel="stylesheet" href="styles.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='38' fill='%23f6b545'/></svg>">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a class="brand" href="index.html"><span class="beacon"></span>WatchTower</a>
+    <div class="nav-links">
+      <a href="#install">Install</a>
+      <a href="#quickstart">Quickstart</a>
+      <a href="cli.html">CLI reference</a>
+      <a href="integration.html">CCC integration</a>
+      <a href="#scope">Scope</a>
+      <a href="https://github.com/amirfish1/watchtower">GitHub</a>
+    </div>
+  </div>
+</nav>
+
+<!-- ================= HERO ================= -->
+<header class="hero">
+  <div class="wrap">
+    <div class="hero-tag"><b>&#9679; draining</b> &nbsp;trust the queue, not the agent</div>
+    <h1>Run a fleet of AI coding agents <span class="hl">unattended</span>, and know which ones to trust.</h1>
+    <p class="lede">
+      WatchTower is a CLI-first queue and fleet manager. You drop work into named queues.
+      Workers drain them one ticket at a time: claim, fix, verify, commit, next. One command,
+      <code class="inline-code">wt wait</code>, blocks until a queue is empty, so you can gate any
+      script on a fleet of agents actually finishing.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="#quickstart">Get started &rarr;</a>
+      <a class="btn btn-ghost" href="cli.html">Browse the CLI</a>
+    </div>
+
+    <!-- signature move: wt wait -->
+    <div style="margin-top:40px">
+      <div class="term">
+        <div class="term-bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>the signature move: gate a script on a fleet finishing</span></div>
+        <div class="term-body"><pre><span class="cmd">wt add -q LAUNCH --title "ship the release notes" --type feature</span>
+<span class="out">filed LAUNCH-42</span>
+
+<span class="cmd">wt wait -q LAUNCH --timeout 1800 --cmd "./deploy.sh"</span>
+<span class="cm"># blocks here while workers claim, fix, verify, commit...</span>
+<span class="out">LAUNCH: 3 open  -&gt; 1 open  -&gt; </span><span class="ok">0 open, drained.</span>
+<span class="ok">&#10003; queue empty, running: ./deploy.sh</span></pre></div>
+      </div>
+      <p class="lede" style="margin-top:16px;font-size:16px">
+        No polling loop, no babysitting terminals. The queue is the ground truth: when it hits
+        zero open tickets, the work is done and your next step runs.
+      </p>
+    </div>
+
+    <!-- glanceable status strip -->
+    <div class="strip">
+      <span class="pill live"><span class="dot"></span><span class="q">CCC</span><span class="meta">0 open</span><b>LIVE</b></span>
+      <span class="pill live"><span class="dot"></span><span class="q">BYM</span><span class="meta">2 open, draining</span><b>LIVE</b></span>
+      <span class="pill stuck"><span class="dot"></span><span class="q">OPS</span><span class="meta">14 open, 41m idle</span><b>STUCK</b></span>
+      <span class="pill live"><span class="dot"></span><span class="q">HERMES</span><span class="meta">0 open</span><b>LIVE</b></span>
+    </div>
+    <p class="lede" style="margin-top:14px;font-size:15px">
+      <code class="inline-code">wt status</code> in one glance: green means draining, red means a queue has open
+      tickets and no worker making progress. Detection is keyed to queue ground-truth, never to what an
+      agent claims about itself.
+    </p>
+  </div>
+</header>
+
+<!-- ================= WHAT IT IS ================= -->
+<section id="what">
+  <div class="wrap">
+    <p class="eyebrow">What it is</p>
+    <h2>A list that empties itself, and turns red when something is wrong.</h2>
+    <p class="lede">
+      WatchTower makes background agent work legible. No new IDE to live in, no habits to learn.
+      The engine is a single durable JSON queue: append-only, file-locked, stdlib-only Python, zero
+      runtime dependencies.
+    </p>
+    <div class="grid g3">
+      <div class="card">
+        <h3><span class="ic">&#9633;</span> Named queues</h3>
+        <p>One namespaced store of tickets per project (CCC, BYM, OPS, and so on), behind a
+           backend-agnostic API. File work with the CLI, a dashboard, or a browser widget.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ic">&#9654;</span> Autonomous workers</h3>
+        <p>A worker session drains one queue: claim, fix, verify, commit, next. Idle workers are
+           pushed new tickets the instant they land, with no polling loop.</p>
+      </div>
+      <div class="card">
+        <h3><span class="ic">&#9673;</span> Queue-health watcher</h3>
+        <p>Open tickets plus no progress equals STUCK. The watcher trusts the queue, not the agent,
+           and can wake a stuck worker automatically.</p>
+      </div>
+    </div>
+    <div class="note">
+      <b>The one rule that defines it.</b> A worker can swear it is done while 14 tickets sit open.
+      The watcher catches that, because health is measured against the queue, never against the
+      agent's own report.
+    </div>
+  </div>
+</section>
+
+<!-- ================= INSTALL ================= -->
+<section id="install">
+  <div class="wrap">
+    <p class="eyebrow">Install</p>
+    <h2>Two commands, then the <code style="font-size:0.8em" class="inline-code">wt</code> CLI is on your path.</h2>
+    <p class="lede">Requirements: Python 3.11 or newer, macOS or Linux. An agent CLI (Claude Code or Codex)
+       is only needed once you want WatchTower to spawn real AI workers instead of draining tickets yourself.</p>
+    <div class="term" style="margin-top:26px">
+      <div class="term-bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>install</span></div>
+      <div class="term-body"><pre><span class="cmd">git clone https://github.com/amirfish1/watchtower.git</span>
+<span class="cmd">cd watchtower &amp;&amp; pip install -e .</span>
+<span class="cmd">wt --version</span>
+<span class="out">wt 0.1.0</span></pre></div>
+    </div>
+    <div class="note green">
+      <b>Prefer to see it first?</b> <code class="inline-code">./examples/quickstart-demo.sh</code> files a ticket,
+      starts <code class="inline-code">wt wait</code> in the background, then claims and closes the ticket to stand in
+      for a real worker, so you watch <code class="inline-code">wt wait</code> unblock the instant the queue empties.
+      No agent CLI required.
+    </div>
+  </div>
+</section>
+
+<!-- ================= QUICKSTART ================= -->
+<section id="quickstart">
+  <div class="wrap">
+    <p class="eyebrow">Quickstart</p>
+    <h2>From zero to a self-draining queue in three steps.</h2>
+    <div class="steps">
+      <div class="step">
+        <div>
+          <h3>Point a queue at your repo</h3>
+          <p>Create the queue and tell it which repo and engine to use. Turning auto-drain on
+             also starts the background service.</p>
+          <div class="term">
+            <div class="term-body"><pre><span class="cmd">wt config -q MYAPP --engine claude --auto-drain on</span>
+<span class="cmd">wt set -q MYAPP --repo-path /path/to/your/repo</span></pre></div>
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div>
+          <h3>File your first ticket</h3>
+          <p>A Claude worker spawns automatically in your repo and starts draining. Tickets get a
+             stable ref like <code class="inline-code">MYAPP-1</code>.</p>
+          <div class="term">
+            <div class="term-body"><pre><span class="cmd">wt add -q MYAPP --title "Fix the login page" --type bug</span>
+<span class="out">filed MYAPP-1</span></pre></div>
+          </div>
+        </div>
+      </div>
+      <div class="step">
+        <div>
+          <h3>Watch it empty itself</h3>
+          <p>Glance at the strip: green means draining, red means stuck. Open the dashboard, or gate a
+             script on the queue reaching zero.</p>
+          <div class="term">
+            <div class="term-body"><pre><span class="cmd">wt status</span>
+<span class="ok">MYAPP   1 open   draining   LIVE</span>
+<span class="cmd">wt dashboard</span>          <span class="cm"># opens http://127.0.0.1:8787</span>
+<span class="cmd">wt wait -q MYAPP --cmd "say done"</span></pre></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <p class="lede" style="margin-top:22px">
+      That is the whole loop: <b style="color:var(--text-strong)">file work, a worker drains it, the watcher
+      guarantees it.</b> You do not manage agents. You manage a queue, and watch it empty itself.
+    </p>
+    <div class="cta-row">
+      <a class="btn btn-primary" href="cli.html">Full CLI reference &rarr;</a>
+      <a class="btn btn-ghost" href="integration.html">Use it with Command Center</a>
+    </div>
+  </div>
+</section>
+
+<!-- ================= SCOPE / HONEST ================= -->
+<section id="scope">
+  <div class="wrap">
+    <p class="eyebrow">Honest scope</p>
+    <h2>What WatchTower is, and what it is not.</h2>
+    <p class="lede">
+      WatchTower is a standalone product. It does not require Claude Command Center or any desktop app
+      to run: every command works from a plain terminal. It is CLI-first and local-first by design.
+    </p>
+
+    <div class="grid g2" style="margin-top:30px">
+      <div class="card">
+        <h3 style="color:var(--green)">In the box today</h3>
+        <p style="margin-top:12px;color:var(--text)">
+          Named queues and a durable ledger. Autonomous claim/fix/verify/commit workers.
+          The queue-health watcher and auto-nudge. <code class="inline-code">wt wait</code> gating.
+          Document import into tickets. Cross-agent messaging (send, ask, group chats).
+          A local dashboard on 127.0.0.1. Claude and Codex engines.
+        </p>
+      </div>
+      <div class="card">
+        <h3 style="color:var(--muted)">Deliberately out of scope for v1</h3>
+        <p style="margin-top:12px;color:var(--text)">
+          Cross-machine federation (the delegate URL is the seam, nothing more). An MCP server
+          (skill-first instead). LLM-driven chat moderation (targeting stays deterministic). A native
+          macOS keystroke adapter (deferred, not rejected: busy-hold covers the need in v1).
+        </p>
+      </div>
+    </div>
+
+    <h3 style="margin-top:40px">Engine reach, stated plainly</h3>
+    <p class="lede" style="font-size:16px">Without any delegate, WatchTower covers Claude sessions with at-most-idle-lag
+       delivery and sends to Codex through its private fallback. This is the honest v1 matrix.</p>
+    <table class="matrix">
+      <thead><tr><th>Engine / session</th><th>send &amp; ask</th><th>group chat</th></tr></thead>
+      <tbody>
+        <tr><td>Claude (WatchTower worker)</td><td><span class="tag yes">native fifo</span></td><td><span class="tag yes">yes</span></td></tr>
+        <tr><td>Claude (idle session)</td><td><span class="tag yes">native resume</span></td><td><span class="tag yes">yes</span></td></tr>
+        <tr><td>Claude (live terminal, no CCC)</td><td><span class="tag mid">busy-hold, resume on idle</span></td><td><span class="tag yes">yes, lands on idle</span></td></tr>
+        <tr><td>Claude (live terminal, CCC present)</td><td><span class="tag yes">instant keystroke inject</span></td><td><span class="tag yes">yes, instant</span></td></tr>
+        <tr><td>Codex (CCC present)</td><td><span class="tag yes">through CCC broker</span></td><td><span class="tag yes">yes</span></td></tr>
+        <tr><td>Codex (standalone WatchTower)</td><td><span class="tag mid">send only, ask unsupported</span></td><td><span class="tag yes">yes</span></td></tr>
+      </tbody>
+    </table>
+    <p class="lede" style="margin-top:16px;font-size:15px">
+      A successful private app-server send to Codex requires a receipt backed by the thread's durable
+      rollout. An acknowledgement without that proof path is reported as failure, not delivery.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap foot-inner">
+    <div>
+      <div class="brand" style="margin-bottom:8px"><span class="beacon"></span>WatchTower</div>
+      <div>CLI-first queue and fleet manager for AI coding agents. MIT licensed.</div>
+    </div>
+    <div class="foot-links">
+      <a href="#install">Install</a>
+      <a href="cli.html">CLI</a>
+      <a href="integration.html">CCC integration</a>
+      <a href="https://github.com/amirfish1/watchtower">GitHub</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
