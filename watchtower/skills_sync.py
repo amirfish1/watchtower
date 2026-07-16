@@ -15,7 +15,9 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 SKILL_NAME = "watchtower"
-SKILL_NAMES: Tuple[str, ...] = ("watchtower", "group-chat-checkin", "critique")
+SKILL_NAMES: Tuple[str, ...] = (
+    "watchtower", "group-chat-checkin", "critique", "wt-triage-queue",
+)
 
 # One entry per agent harness this machine might have. A harness is skipped
 # entirely if its home directory doesn't exist -- we never create ~/.codex on
