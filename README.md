@@ -102,6 +102,9 @@ wt find DEMO-1                         # look up one ticket by ref, no -q needed
 wt add -q DEMO --title "Fix nav" \
        --text "navbar overlaps on mobile" --type bug
 
+wt import plan.md -q DEMO                 # preview document tasks
+wt import plan.md -q DEMO --apply         # file only new tasks
+
 wt edit   DEMO-1 --priority p0 --type feature  # patch fields on an existing ticket
 wt edit   DEMO-1 --queue OTHER                 # move to a different queue in place (reassigns ref)
 
@@ -126,6 +129,29 @@ wt dashboard                           # open the night-watch dashboard (non-blo
 wt dashboard --no-open                 # ensure the server is up, don't open a browser
 wt skills sync                         # (re-)sync the bundled skills into installed harnesses
 ```
+
+### Import a document into a queue
+
+`wt import` sends the complete document through one Claude reasoning call. It
+infers explicit and implicit work, chooses ticket-sized units that one worker
+session can complete coherently, and preserves dependency order. Checkboxes,
+headings, and numbered steps are hints rather than parsing rules.
+
+The command previews the full reasoned ticket set by default. Pass `--apply`
+to file it and optionally `--type bug|feature` to override every inferred type.
+The locally authenticated `claude` CLI must be available. A missing CLI,
+timeout, malformed response, invalid source anchor, or invalid dependency fails
+loudly before any ticket is filed. Imports use Sonnet in Claude safe mode by
+default; set `WATCHTOWER_IMPORT_MODEL` to override the model.
+
+```bash
+wt import docs/launch-plan.md -q LAUNCH
+wt import docs/launch-plan.md -q LAUNCH --apply --type feature
+```
+
+Each ticket records the resolved source file and line anchor. A stable source
+key makes repeat imports safe: importing the same document again creates no
+duplicates, while newly inferred document tasks create new tickets.
 
 ### Agent engines
 

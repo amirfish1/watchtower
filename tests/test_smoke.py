@@ -85,6 +85,8 @@ def test_help_shows_git_style_grouped_sections(capsys):
     # Spot-check: a command still shows up with its one-line help.
     assert "status" in out
     assert "per-queue depth / age / stuck flag" in out
+    assert "import" in out
+    assert "turn a document into queue tickets" in out
 
     # `install` is a hidden alias folded into `wt start`'s first-run
     # auto-install; it must not appear in the top-level listing.
