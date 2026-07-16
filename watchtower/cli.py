@@ -5,6 +5,7 @@
     wt ls -q Q [--status ..]  list the tickets in one queue
     wt find <ref>             look up one ticket by ref, across all queues
     wt add -q Q --title..     file a ticket
+    wt import FILE -q Q       preview document tasks; file them with --apply
     wt edit <ref> --priority..  patch fields on an existing ticket
     wt edit <ref> --queue Q    move ticket to a different queue in place
     wt claim -q Q             claim next ticket (smart: priority → type → age)
@@ -366,6 +367,96 @@ def cmd_add(args: argparse.Namespace) -> int:
             print(f"[watchtower] {reason}")
     except Exception:
         pass
+    return 0
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    """Reason about a document once, then preview or apply its ticket graph."""
+    from .document_import import ReasoningError, extract_document, plan_import
+
+    try:
+        candidates = extract_document(args.file)
+    except (OSError, UnicodeError, ValueError, ReasoningError) as exc:
+        print(f"error: cannot import {args.file}: {exc}", file=sys.stderr)
+        return 1
+
+    existing_items = q.list_items(project=args.queue)
+    plan = plan_import(candidates, existing_items)
+    new_ids = {candidate.import_key for candidate in plan.new}
+    for candidate in plan.candidates:
+        item_type = args.type or candidate.item_type
+        if candidate.import_key in new_ids:
+            verb = "FILE" if args.apply else "WOULD FILE"
+            print(f"{verb}: [{item_type}] {candidate.title}")
+        else:
+            print(f"EXISTS: [{item_type}] {candidate.title}")
+        print(f"  source: {candidate.source_ref}")
+        dependencies = ", ".join(candidate.depends_on) or "none"
+        print(f"  depends_on: {dependencies}")
+        for line in candidate.body.splitlines():
+            print(f"  {line}")
+
+    if not args.apply:
+        print(
+            "IMPORT dry-run: "
+            f"candidates={len(plan.candidates)} new={len(plan.new)} "
+            f"existing={len(plan.existing)}; pass --apply to file"
+        )
+        return 0
+
+    existing_by_id = {
+        str(item.get("id") or ""): item
+        for item in existing_items
+        if item.get("id")
+    }
+    refs_by_title = {}
+    for candidate in plan.existing:
+        stored = existing_by_id.get(candidate.import_key)
+        if stored and stored.get("ref"):
+            refs_by_title[candidate.title] = str(stored["ref"])
+
+    created = 0
+    for candidate in plan.new:
+        dependency_lines = []
+        for title in candidate.depends_on:
+            ref = refs_by_title.get(title)
+            if not ref:
+                print(
+                    f"error: validated dependency {title!r} has no queue ref; "
+                    "no further tickets were filed",
+                    file=sys.stderr,
+                )
+                return 1
+            dependency_lines.append(f"- {ref}: {title}")
+        ticket_body = candidate.body
+        if dependency_lines:
+            ticket_body += "\n\nDepends on:\n" + "\n".join(dependency_lines)
+        try:
+            item = q.enqueue(
+                project=args.queue,
+                title=candidate.title,
+                note=candidate.title,
+                text=ticket_body,
+                source="doc-import",
+                annotation_id=candidate.import_key,
+                url=candidate.source_ref,
+                repo_path=str(Path(candidate.source_path).parent),
+                item_type=args.type or candidate.item_type,
+            )
+        except Exception as exc:
+            print(
+                f"error: import stopped after creating {created} ticket(s): {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"FILED: {item['ref']}  {item.get('title') or item.get('note', '')}")
+        refs_by_title[candidate.title] = str(item["ref"])
+        created += 1
+    print(
+        "IMPORT applied: "
+        f"candidates={len(plan.candidates)} created={created} "
+        f"existing={len(plan.existing)}"
+    )
     return 0
 
 
@@ -2495,6 +2586,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Queues", "monitor"),
     ("Queues", "workers"),
     ("Tickets", "add"),
+    ("Tickets", "import"),
     ("Tickets", "take"),
     ("Tickets", "edit"),
     ("Tickets", "ready"),
@@ -2524,6 +2616,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
 
 COMMAND_HELP: Dict[str, str] = {
     "add": "file a ticket",
+    "import": "turn a document into queue tickets (default: dry-run)",
     "take": "file a ticket and immediately claim it (= add --claim)",
     "edit": "patch fields (title/priority/type/readiness/...) on an existing ticket",
     "claim": "claim next open ticket (smart sort: priority + type + age)",
@@ -2680,6 +2773,28 @@ def build_parser() -> argparse.ArgumentParser:
                    help="immediately claim the new ticket (mark in_progress) so no "
                         "auto-drain worker picks it up; use when you're already working it")
     s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser(
+        "import",
+        description=(
+            "Use one Claude reasoning call over the whole document to infer a "
+            "validated ticket graph. Preview is the default; --apply files it."
+        ),
+    )
+    s.add_argument("file", help="Markdown or text document to extract tasks from")
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument(
+        "--apply",
+        action="store_true",
+        help="file new tickets (default: dry-run)",
+    )
+    s.add_argument(
+        "--type",
+        default="",
+        choices=["bug", "feature"],
+        help="override the inferred type for every newly filed ticket",
+    )
+    s.set_defaults(func=cmd_import)
 
     s = sub.add_parser("take")
     _add_common_ticket_args(s)
