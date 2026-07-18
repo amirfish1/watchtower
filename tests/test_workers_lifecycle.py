@@ -24,6 +24,7 @@ import select
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -87,6 +88,24 @@ def _dead_pid():
     p = subprocess.Popen(["true"])
     p.wait()
     return p.pid
+
+
+def test_find_engine_ancestor_ignores_codex_app_server(wt, monkeypatch):
+    """The shared app server is not a worker continuation process."""
+    monkeypatch.setattr(wt.workers.os, "getppid", lambda: 9001)
+    monkeypatch.setattr(wt.workers, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        wt.workers.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout=(
+                "9000 /Users/amirfish/.local/bin/codex -c "
+                "model_context_window=1000000 app-server --listen stdio://\n"
+            )
+        ),
+    )
+
+    assert wt.workers._find_engine_ancestor_pid("codex") == 0
 
 
 def _live_worker(wt, queue, *, with_fifo=True):

@@ -1106,7 +1106,13 @@ def _find_engine_ancestor_pid(engine: str, max_depth: int = 8) -> int:
                 command.lstrip().split(maxsplit=1)[0] if command.strip() else ""
             )
             executable = Path(executable_path).name.lower()
-            if executable == _ENGINE_BIN[expected] and _pid_alive(pid):
+            command_tokens = shlex.split(command) if command.strip() else []
+            is_codex_app_server = expected == "codex" and "app-server" in command_tokens
+            if (
+                executable == _ENGINE_BIN[expected]
+                and not is_codex_app_server
+                and _pid_alive(pid)
+            ):
                 return pid
             pid = parent_pid
         except (OSError, ValueError, subprocess.SubprocessError):
