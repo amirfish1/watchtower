@@ -1175,9 +1175,15 @@ def rebind_continued_worker(worker_id: str, session_id: str, pid: int) -> bool:
                 or recorded_sid != session_id
             ):
                 return False
-            if int(worker.get("pid") or 0) == int(pid):
+            recorded_pid = int(worker.get("pid") or 0)
+            if recorded_pid == int(pid):
                 return True
-            worker["previous_pid"] = int(worker.get("pid") or 0)
+            if recorded_pid and _pid_alive(recorded_pid):
+                raise ValueError(
+                    f"worker {worker_id!r} is still owned by live pid "
+                    f"{recorded_pid}; refusing concurrent rebind to pid {int(pid)}"
+                )
+            worker["previous_pid"] = recorded_pid
             worker["pid"] = int(pid)
 
         worker["rebound_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

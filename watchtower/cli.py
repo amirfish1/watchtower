@@ -479,7 +479,13 @@ def cmd_claim(args: argparse.Namespace) -> int:
     if codex_thread_id:
         continuation_pid = workers._find_engine_ancestor_pid("codex")
         if continuation_pid:
-            workers.rebind_continued_worker(worker, codex_thread_id, continuation_pid)
+            try:
+                workers.rebind_continued_worker(
+                    worker, codex_thread_id, continuation_pid
+                )
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
 
     if ref:
         try:

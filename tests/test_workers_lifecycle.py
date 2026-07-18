@@ -563,6 +563,40 @@ def test_claim_rebinds_continued_codex_worker_to_new_process(wt, monkeypatch, ca
     assert rebound["alive"] is True
 
 
+def test_claim_rejects_concurrent_codex_process_for_same_thread(
+    wt, monkeypatch, capsys
+):
+    """A continuation must not replace a different Codex PID that is still live."""
+    cli = _reloaded_cli(wt)
+    session_id = "11111111-1111-1111-1111-111111111111"
+    worker_id = "q-codex-live"
+    wt.workers.record_worker(
+        os.getpid(),
+        "Q",
+        "codex",
+        worker_id,
+        str(wt.tmp),
+        str(wt.tmp / f"{worker_id}.log"),
+        session_id=session_id,
+    )
+    ticket = wt.q.enqueue(project="Q", note="must stay open")
+    monkeypatch.setenv("CODEX_THREAD_ID", session_id)
+    monkeypatch.setattr(
+        cli.workers, "_find_engine_ancestor_pid", lambda engine: os.getppid()
+    )
+
+    rc = cli.cmd_claim(_claim_ns("Q", worker_id, json_out=True))
+
+    assert rc == 1
+    assert "still owned by live pid" in capsys.readouterr().err
+    assert wt.q.get(ticket["ref"])["status"] == "open"
+    recorded = next(
+        worker for worker in wt.workers.list_workers(prune=False)
+        if worker["worker_id"] == worker_id
+    )
+    assert recorded["pid"] == os.getpid()
+
+
 def test_claim_rejects_pruned_codex_alias_from_unrelated_session(
     wt, monkeypatch, capsys
 ):
