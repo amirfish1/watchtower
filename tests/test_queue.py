@@ -71,6 +71,24 @@ def test_mutations_append_canonical_history_and_stop_legacy_lists(wt):
     assert closed["history"][-1]["resolution"] == {"summary": "done"}
 
 
+def test_cli_edit_text_replaces_file_backed_ticket_body(wt, capsys):
+    item = wt.q.enqueue(
+        project="EDIT",
+        note="short summary",
+        text="original body",
+        source="test",
+    )
+
+    assert wt.cli.main(["edit", item["ref"], "--text", "replacement body"]) == 0
+    capsys.readouterr()
+
+    edited = wt.q.get(item["ref"])
+    assert edited["text"] == "replacement body"
+    assert edited["note"] == "short summary"
+    assert edited["history"][-1]["event"] == "edit"
+    assert edited["history"][-1]["fields"] == {"text": "replacement body"}
+
+
 def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsys):
     item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
     sid = "11111111-2222-3333-4444-555555555555"

@@ -357,6 +357,33 @@ def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys)
     assert any(c.startswith("issue close 1") for c in commands)
 
 
+def test_cli_edit_text_replaces_github_issue_body_and_preserves_metadata(
+    tmp_path, monkeypatch, capsys,
+):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    item = q.enqueue(
+        project="GHI",
+        note="short summary",
+        text="original body",
+        priority="p1",
+    )
+    from watchtower.cli import main
+
+    assert main(["edit", item["ref"], "--text", "replacement body"]) == 0
+    capsys.readouterr()
+
+    edited = q.get(item["ref"])
+    assert edited["text"] == "replacement body"
+    assert edited["note"] == "short summary"
+    assert edited["priority"] == "p1"
+    issue_body = json.loads(state.read_text())["issues"][0]["body"]
+    assert issue_body.startswith("replacement body\n\n<!-- watchtower\n")
+    assert "original body" not in issue_body
+
+
 def test_github_backend_lists_all_open_issues_but_claims_only_queue_labeled(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)

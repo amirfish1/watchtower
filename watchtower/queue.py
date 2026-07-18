@@ -803,7 +803,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     readiness, value, etc.).
 
     Allowed fields: item_type, readiness, priority, value, confidence, note,
-    title, url, selector, screenshot_path, repo_path, needs_input,
+    text, title, url, selector, screenshot_path, repo_path, needs_input,
     block_question.
 
     Disallowed (managed by state machine): status, claimed_by, claimed_at,
@@ -817,7 +817,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
         return backend.update(ident, **fields)
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
-        "note", "title", "url", "selector", "screenshot_path", "repo_path",
+        "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
         "needs_input", "block_question",
     })
     with _FileLock(_lock_path()):

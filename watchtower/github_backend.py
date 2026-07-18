@@ -776,6 +776,8 @@ class GitHubIssuesBackend:
         for key, value in fields.items():
             if key == "title":
                 title = _clip(value, 200)
+            elif key == "text":
+                body = _clip(value, 24000)
             elif key == "item_type":
                 meta["type"] = _effective_type(value)
             elif key == "type":
