@@ -149,6 +149,17 @@ def _write_codex_rollout(wt, sid):
     return p
 
 
+def test_delegate_base_accepts_a_url_in_the_ccc_port_file(wt, monkeypatch):
+    """CCC's native launcher records its full local base URL, not just a port."""
+    ccc_dir = wt.tmp / ".claude" / "command-center"
+    ccc_dir.mkdir(parents=True)
+    (ccc_dir / "port.txt").write_text("http://127.0.0.1:8090\n")
+    monkeypatch.delenv("WATCHTOWER_DELEGATE_URL", raising=False)
+    monkeypatch.setattr(wt.messages.Path, "home", lambda: wt.tmp)
+
+    assert wt.messages._delegate_base() == "http://127.0.0.1:8090"
+
+
 def _write_worker_log(wt, worker_id, sid, age_s=0.0):
     """Drop a worker stream-json log where WT's log scanner expects it."""
     d = wt.workers.WORKERS_FILE.parent / "logs"

@@ -83,6 +83,7 @@ import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from . import queue as queue_mod
 from . import tty as tty_mod
@@ -171,17 +172,34 @@ def _delegate_base() -> str:
 
     $WATCHTOWER_DELEGATE_URL wins; the literal value 'off' disables the
     delegate even if a CCC port file exists. With no env var, a readable
-    ``~/.claude/command-center/port.txt`` (single integer) auto-detects a
-    local CCC. No delegate at all is a fully supported configuration."""
+    ``~/.claude/command-center/port.txt`` containing either a port number or
+    a loopback base URL auto-detects a local CCC. No delegate at all is a
+    fully supported configuration."""
     env = (os.environ.get("WATCHTOWER_DELEGATE_URL") or "").strip()
     if env:
         return "" if env.lower() == "off" else env.rstrip("/")
     port_file = Path.home() / ".claude" / "command-center" / "port.txt"
     try:
-        port = int(port_file.read_text().strip())
-        return f"http://127.0.0.1:{port}"
-    except (OSError, ValueError):
+        value = port_file.read_text().strip()
+    except OSError:
         return ""
+    try:
+        return f"http://127.0.0.1:{int(value)}"
+    except ValueError:
+        parsed = urlparse(value)
+        try:
+            is_loopback_url = (
+                parsed.scheme in ("http", "https")
+                and parsed.hostname in ("127.0.0.1", "localhost", "::1")
+                and parsed.port is not None
+                and not parsed.path.rstrip("/")
+                and not parsed.params
+                and not parsed.query
+                and not parsed.fragment
+            )
+        except ValueError:
+            is_loopback_url = False
+        return value.rstrip("/") if is_loopback_url else ""
 
 
 def _codex_delegate_first_enabled() -> bool:
