@@ -11,12 +11,14 @@ standalone.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 SKILL_NAME = "watchtower"
 SKILL_NAMES: Tuple[str, ...] = (
     "watchtower", "group-chat-checkin", "critique", "wt-triage-queue",
+    "compact-to-queue",
 )
 
 # One entry per agent harness this machine might have. A harness is skipped
@@ -27,6 +29,8 @@ ENGINE_HOMES: Dict[str, Path] = {
     "codex": Path.home() / ".codex",
     # Antigravity (the agy CLI) reads skills from Gemini's per-user home.
     "antigravity": Path.home() / ".gemini",
+    # Kimi Code CLI reads user skills from $KIMI_CODE_HOME/skills.
+    "kimi": Path(os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code"),
 }
 
 
