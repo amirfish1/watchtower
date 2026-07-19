@@ -956,7 +956,31 @@ def count_claimable(
         return len(_claim_candidates(data["items"], project=proj, lane=lane, item_types=item_types))
 
 
-def _verify_worker_live(session_id: str) -> None:
+def _hosted_codex_thread_owns_worker(worker_id: str, session_uuid: str) -> bool:
+    """Return whether a hosted Codex thread proves its worker continuity.
+
+    A Codex thread can outlive the short-lived ``codex exec`` process that WT
+    spawned.  In that state the thread id is the durable identity; require the
+    shared registry and its WT metadata to agree before bypassing the normal
+    dead-worker guard.
+    """
+    real_sid = _coerce_session_uuid(session_uuid)
+    if not real_sid:
+        return False
+    try:
+        from . import codex_registry
+        entry = codex_registry.entry(real_sid) or {}
+        wt_meta = entry.get("wt") if isinstance(entry.get("wt"), dict) else {}
+        return (
+            entry.get("engine") == "codex"
+            and str(entry.get("worker_id") or "") == worker_id
+            and str(wt_meta.get("worker_id") or "") == worker_id
+        )
+    except Exception:
+        return False
+
+
+def _verify_worker_live(session_id: str, session_uuid: str = "") -> None:
     """Raise ValueError if session_id is a known-spawned worker that is dead.
 
     Ambient sessions (wt claim --worker <alias> from a bare Claude session,
@@ -976,6 +1000,8 @@ def _verify_worker_live(session_id: str) -> None:
             return  # not a tracked spawned worker — can't verify, allow through
         live_ids = {str(w.get("worker_id", "")) for w in known if w.get("alive")}
         if session_id not in live_ids:
+            if _hosted_codex_thread_owns_worker(session_id, session_uuid):
+                return
             raise ValueError(
                 f"worker {session_id!r} is registered as a spawned worker but is "
                 "not currently alive — claim rejected to prevent a silent requeue"
@@ -1017,7 +1043,7 @@ def claim_next(
     """
     if not session_id:
         raise ValueError("session_id is required")
-    _verify_worker_live(session_id)
+    _verify_worker_live(session_id, session_uuid)
     # A reconciler stop signal is a durable, queue-scoped release. It must win
     # over a racing enqueue: the released session must never claim more work,
     # while the still-open ticket remains available for replacement staffing.
@@ -1086,7 +1112,7 @@ def claim_by_ref(
     """
     if not session_id:
         raise ValueError("session_id is required")
-    _verify_worker_live(session_id)
+    _verify_worker_live(session_id, session_uuid)
     backend = _github_backend_for_project(_project_from_ident(ref))
     if backend is not None:
         item = backend.claim_by_ref(ref, session_id, session_uuid=session_uuid)

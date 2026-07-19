@@ -582,6 +582,35 @@ def test_claim_rebinds_continued_codex_worker_to_new_process(wt, monkeypatch, ca
     assert rebound["alive"] is True
 
 
+def test_claim_allows_hosted_codex_thread_after_worker_pid_exits(
+    wt, monkeypatch, capsys
+):
+    """A hosted continuation may claim after its short-lived exec parent exits."""
+    cli = _reloaded_cli(wt)
+    session_id = "11111111-1111-1111-1111-111111111111"
+    worker_id = "q-codex-hosted"
+    wt.workers.record_worker(
+        _dead_pid(),
+        "Q",
+        "codex",
+        worker_id,
+        str(wt.tmp),
+        str(wt.tmp / f"{worker_id}.log"),
+        session_id=session_id,
+    )
+    wt.workers.list_workers()  # routine reads prune the dead exec process
+    wt.q.enqueue(project="Q", note="continuation work")
+    monkeypatch.setenv("CODEX_THREAD_ID", session_id)
+    monkeypatch.setattr(cli.workers, "_find_engine_ancestor_pid", lambda engine: 0)
+
+    rc = cli.cmd_claim(_claim_ns("Q", worker_id, json_out=True))
+
+    assert rc == 0
+    claimed = json.loads(capsys.readouterr().out)
+    assert claimed["claimed_by"] == worker_id
+    assert claimed["claimed_session_id"] == session_id
+
+
 def test_claim_rejects_concurrent_codex_process_for_same_thread(
     wt, monkeypatch, capsys
 ):
