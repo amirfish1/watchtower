@@ -1483,6 +1483,20 @@ def test_resolve_session_id_from_codex_exec_log(wt):
             == "019f23e3-ba0e-7ec1-949d-d72d3f590ad2")
 
 
+def test_resolve_session_id_from_kimi_log(wt):
+    """kimi -p stream-json logs close with a session.resume_hint meta line;
+    the session_-prefixed id is returned as-is (CCC indexes kimi that way)."""
+    log = wt.tmp / "kimi.log"
+    log.write_text(
+        '{"role":"assistant","content":"done"}\n'
+        '{"role":"meta","type":"session.resume_hint",'
+        '"session_id":"session_86aa9848-9a2d-4bf7-8aa6-ce55b6e1ff61",'
+        '"command":"kimi -r session_86aa9848-9a2d-4bf7-8aa6-ce55b6e1ff61"}\n'
+    )
+    assert (wt.workers.resolve_session_id_from_log(str(log))
+            == "session_86aa9848-9a2d-4bf7-8aa6-ce55b6e1ff61")
+
+
 def test_resolve_session_id_absent_returns_empty(wt):
     log = wt.tmp / "noinit.log"
     log.write_text('{"type":"assistant","message":{}}\n')

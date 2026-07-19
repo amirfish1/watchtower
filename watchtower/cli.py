@@ -731,6 +731,11 @@ def _resume_session_headless(
             "--dangerously-bypass-approvals-and-sandbox",
             sid, prompt,
         ]
+    elif engine == "kimi":
+        # Print mode resumes the session, applies the prompt, exits; kimi
+        # auto-approves internally in this mode (no permission flag exists).
+        argv = ["kimi", "--session", sid, "-p", prompt,
+                "--output-format", "stream-json"]
     else:
         argv = ["claude", "--resume", sid, "-p", prompt,
                 "--permission-mode", "bypassPermissions"]
@@ -855,6 +860,8 @@ def cmd_discuss(args: argparse.Namespace) -> int:
     repo = item.get("repo_path") or os.getcwd()
     if args.engine == "codex":
         inner = ["codex", "resume", sid]
+    elif args.engine == "kimi":
+        inner = ["kimi", "--session", sid]
     else:
         inner = ["claude", "--resume", sid]
     cmd = "cd " + shlex.quote(repo) + " && " + " ".join(shlex.quote(c) for c in inner)
@@ -2726,7 +2733,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("models")
-    s.add_argument("--engine", required=True, choices=["claude", "codex"],
+    s.add_argument("--engine", required=True, choices=["claude", "codex", "kimi"],
                    help="engine whose supported worker model identifiers to list")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_models)
@@ -2903,7 +2910,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("ref")
     s.add_argument("text", help="your answer")
     s.add_argument("--worker", default="")
-    s.add_argument("--engine", default="claude", choices=["claude", "codex"],
+    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi"],
                    help="engine to resume the blocked session with")
     s.set_defaults(func=cmd_answer)
 
@@ -2916,7 +2923,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("discuss")
     s.add_argument("ref")
-    s.add_argument("--engine", default="claude", choices=["claude", "codex"])
+    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi"])
     s.add_argument("--print", action="store_true", dest="print",
                    help="print the resume command instead of running it")
     s.set_defaults(func=cmd_discuss)
@@ -3130,13 +3137,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="assignee used by GitHub-backed claims (default: @me)")
     s.add_argument("--repo-path", default=None, dest="repo_path",
                    help="default cwd for workers spawned on this queue")
-    s.add_argument("--engine", default=None, choices=["claude", "codex"],
+    s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi"],
                    help=(
                        "agent engine for workers on this queue (default: claude). "
                        "claude: stream-json mode over a FIFO stdin — live, pushable, "
                        "prompt-cache warm for ~5 min; requires the Claude Code CLI. "
                        "codex: one-shot `codex exec <goal>` — no FIFO, no live push; "
-                       "requires the OpenAI Codex CLI."
+                       "requires the OpenAI Codex CLI. "
+                       "kimi: one-shot `kimi -p <goal>` — no FIFO, no live push; "
+                       "auto-approves internally in print mode; requires the "
+                       "Kimi Code CLI."
                    ))
     s.add_argument("--model", default=None, dest="model",
                    help=(
@@ -3181,7 +3191,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="GitHub repo for --backend github, as OWNER/REPO")
     s.add_argument("--github-assignee", default=None, dest="github_assignee",
                    help="assignee used by GitHub-backed claims (default: @me)")
-    s.add_argument("--engine", default=None, choices=["claude", "codex"],
+    s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi"],
                    help="agent engine for workers on this queue")
     s.add_argument("--model", default=None,
                    help="model workers are spawned with (e.g. claude-sonnet-5)")
@@ -3220,7 +3230,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=int, default=30,
                    help="reconciler tick interval in seconds (default 30)")
     s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
-    s.add_argument("--engine", default="claude", choices=["claude", "codex"])
+    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi"])
     s.add_argument("--auto-spawn", action="store_true",
                    help="auto spawn-worker on a stuck queue with no live workers")
     s.add_argument("--dry-run", action="store_true", dest="dry_run",

@@ -40,6 +40,13 @@ MODEL_EFFORTS = {
         ("claude-opus-4-8", VALID_EFFORTS),
         ("claude-sonnet-5", VALID_EFFORTS),
     ),
+    # kimi has no effort flag on its CLI; pinned models accept no explicit
+    # effort. highspeed is the low-cost tier meant for queue workers.
+    "kimi": (
+        ("kimi-code/k3", ()),
+        ("kimi-code/kimi-for-coding", ()),
+        ("kimi-code/kimi-for-coding-highspeed", ()),
+    ),
 }
 
 CONFIG_FILE = Path(

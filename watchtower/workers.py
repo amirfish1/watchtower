@@ -125,6 +125,19 @@ CODEX_RESUME_CONTRACT = (
     "ticket gets fixed and committed twice. "
 )
 
+KIMI_IDLE_CONTRACT = (
+    "Do NOT poll or sleep-loop. After the idle audit, end your turn and exit "
+    "immediately. This is a one-shot run (kimi -p); do not wait for a wake "
+    "message. "
+)
+
+KIMI_RESUME_CONTRACT = (
+    "RESUME CHECK: if this run starts with context indicating you were "
+    "mid-work on a ticket, follow the Resume Check protocol in {runbook} before "
+    "you edit, commit, or close anything -- skipping this is how the same "
+    "ticket gets fixed and committed twice. "
+)
+
 DRAIN_GOAL_TEMPLATE = (
     "Drain the {queue} WatchTower queue and keep it empty. "
     "Work in the git repo at {repo}. "
@@ -196,7 +209,11 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "asks you to push."
 )
 
-_ENGINE_BIN = {"claude": "claude", "codex": "codex"}
+_ENGINE_BIN = {"claude": "claude", "codex": "codex", "kimi": "kimi"}
+
+# Engines whose workers are one-shot processes (goal in argv, DEVNULL stdin,
+# exit when done) rather than FIFO-fed live processes like claude.
+_ONE_SHOT_ENGINES = ("codex", "kimi")
 
 
 def _resolve_engine_bin(engine: str) -> str:
@@ -213,6 +230,7 @@ def _resolve_engine_bin(engine: str) -> str:
     env_name = {
         "claude": "WATCHTOWER_CLAUDE_BIN",
         "codex": "WATCHTOWER_CODEX_BIN",
+        "kimi": "WATCHTOWER_KIMI_BIN",
     }.get(engine)
     if env_name:
         env_bin = os.environ.get(env_name)
@@ -232,6 +250,11 @@ def _resolve_engine_bin(engine: str) -> str:
     user_local = Path.home() / ".local" / "bin" / bin_name
     if user_local.is_file() and os.access(user_local, os.X_OK):
         return str(user_local)
+    if engine == "kimi":
+        # The kimi CLI self-installs here; daemon/service PATHs often miss it.
+        kimi_local = Path.home() / ".kimi-code" / "bin" / bin_name
+        if kimi_local.is_file() and os.access(kimi_local, os.X_OK):
+            return str(kimi_local)
     return ""
 
 
@@ -413,6 +436,32 @@ def _claude_transcript_mtime(w: Dict[str, Any]) -> float:
     return newest
 
 
+def _kimi_wire_mtime(w: Dict[str, Any]) -> float:
+    """Newest wire.jsonl mtime for a kimi worker, or 0 when unavailable.
+
+    A kimi session driven from outside its original ``kimi -p`` worker process
+    (e.g. a CCC ACP attach steering it) updates
+    ``~/.kimi-code/sessions/*/<sid>/agents/*/wire.jsonl`` without touching the
+    spawn stdout log -- same reaper-blindness class as the codex rollout.
+    """
+    if w.get("engine") != "kimi":
+        return 0.0
+    session_id = str(w.get("session_id") or "").strip()
+    if not session_id:
+        return 0.0
+    kimi_home = Path(os.environ.get("KIMI_CODE_HOME") or (Path.home() / ".kimi-code"))
+    newest = 0.0
+    try:
+        for path in (kimi_home / "sessions").glob(f"*/{session_id}/agents/*/wire.jsonl"):
+            try:
+                newest = max(newest, path.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        return 0.0
+    return newest
+
+
 def _worker_idle_s(w: Dict[str, Any]) -> float:
     """Seconds since this worker last did anything.
 
@@ -422,6 +471,7 @@ def _worker_idle_s(w: Dict[str, Any]) -> float:
     latest_activity = max(
         _codex_rollout_mtime(w),
         _claude_transcript_mtime(w),
+        _kimi_wire_mtime(w),
     )
     log = w.get("log")
     if log:
@@ -974,14 +1024,17 @@ def _wait_for_immediate_launch_failure(
 
 
 def resolve_session_id_from_log(log_path: str) -> str:
-    """Extract the cloud-assigned session UUID from a worker's stream-json log.
+    """Extract the engine-assigned session id from a worker's stream-json log.
 
     A ``claude -p --output-format stream-json`` worker emits an init/system event
     carrying ``session_id`` (the UUID Claude/cloud assigns -- WatchTower does NOT
     mint it). ``codex exec`` prints the same UUID as a plain ``session id:``
-    startup line. We scan the first lines of the captured output log for either
-    shape. Returns "" until the event has been written (the worker must have
-    started its first turn)."""
+    startup line. ``kimi -p --output-format stream-json`` closes with a
+    ``{"role":"meta","type":"session.resume_hint","session_id":"session_<uuid>"}``
+    line; the prefixed id is returned as-is (CCC indexes kimi sessions that way).
+    We scan the first lines of the captured output log for any of these shapes.
+    Returns "" until the event has been written (the worker must have started
+    its first turn)."""
     if not log_path:
         return ""
     try:
@@ -1000,8 +1053,17 @@ def resolve_session_id_from_log(log_path: str) -> str:
                         return m.group(1)
                     continue
                 sid = ev.get("session_id") or ev.get("sessionId")
-                if sid and _SESSION_ID_RE.fullmatch(str(sid)):
-                    return str(sid)
+                if sid:
+                    sid = str(sid)
+                    if _SESSION_ID_RE.fullmatch(sid):
+                        return sid
+                    # kimi emits {"role":"meta","type":"session.resume_hint",
+                    # "session_id":"session_<uuid>"} -- keep the prefixed form,
+                    # which is the id CCC knows this session by.
+                    if sid.startswith("session_") and _SESSION_ID_RE.fullmatch(
+                        sid[len("session_"):]
+                    ):
+                        return sid
     except (OSError, UnicodeDecodeError):
         pass
     return ""
@@ -1486,10 +1548,13 @@ def drain_goal(
         queue=queue, worker_id=worker_id, repo=repo_path or os.getcwd(),
         claim_filter=claim_filter, runbook=str(_WORKER_RUNBOOK_PATH),
         idle_contract=(
-            CODEX_IDLE_CONTRACT if engine == "codex" else CLAUDE_IDLE_CONTRACT
+            CODEX_IDLE_CONTRACT if engine == "codex"
+            else KIMI_IDLE_CONTRACT if engine == "kimi"
+            else CLAUDE_IDLE_CONTRACT
         ),
         resume_contract=(
             CODEX_RESUME_CONTRACT if engine == "codex"
+            else KIMI_RESUME_CONTRACT if engine == "kimi"
             else CLAUDE_RESUME_CONTRACT
         ).format(runbook=str(_WORKER_RUNBOOK_PATH)),
     )
@@ -1545,6 +1610,18 @@ def build_drain_command(
             argv += ["--model", model]
         if effort:
             argv += ["--config", f'model_reasoning_effort="{effort}"']
+        argv.append(goal or drain_goal(queue, worker_id, repo_path, engine=engine))
+        return argv
+    if engine == "kimi":
+        # One-shot print mode, like codex exec: the goal rides in argv, stdin
+        # is DEVNULL, and the process exits when the drain loop ends. Print
+        # mode forces kimi's auto permission mode internally (the CLI rejects
+        # --yolo/--auto with -p), and stream-json stdout keeps the worker log
+        # machine-readable. Kimi has no --effort flag; queue effort config is
+        # ignored for this engine.
+        argv = [bin_name, "-p", "--output-format", "stream-json"]
+        if model:
+            argv += ["--model", model]
         argv.append(goal or drain_goal(queue, worker_id, repo_path, engine=engine))
         return argv
     argv = [
@@ -2266,10 +2343,11 @@ def spawn_workers(
         log_path = log_dir / f"{worker_id}.log"
         logf = open(log_path, "ab")
         # claude workers get a stream-json FIFO stdin so they stay live and
-        # pushable; codex (one-shot exec) keeps the goal in argv + DEVNULL.
+        # pushable; one-shot engines (codex exec, kimi -p) keep the goal in
+        # argv + DEVNULL.
         fifo_path = None
         child_stdin_fd = None
-        if engine != "codex":
+        if engine not in _ONE_SHOT_ENGINES:
             fifo_path, child_stdin_fd = _make_stdin_fifo(log_path)
         stdin_arg = child_stdin_fd if child_stdin_fd is not None else subprocess.DEVNULL
         proc = None
@@ -2386,7 +2464,7 @@ def spawn_run_once_worker(
     logf = open(log_path, "ab")
     fifo_path = None
     child_stdin_fd = None
-    if engine != "codex":
+    if engine not in _ONE_SHOT_ENGINES:
         fifo_path, child_stdin_fd = _make_stdin_fifo(log_path)
     stdin_arg = child_stdin_fd if child_stdin_fd is not None else subprocess.DEVNULL
     try:
@@ -2436,7 +2514,7 @@ def spawn_run_once_worker(
 # telling the agent to deliver its report with `wt send <report_to>` -- the
 # same delivery path (and outbox fallback) every other WT message uses.
 
-ADHOC_ENGINES = ("claude", "codex", "antigravity")
+ADHOC_ENGINES = ("claude", "codex", "antigravity", "kimi")
 
 # The footer pipes the report over stdin via a quoted heredoc: a report is
 # multi-paragraph markdown full of double quotes, $variables, and `backticks`,
@@ -2496,6 +2574,19 @@ def build_adhoc_command(
             raise ValueError("claude CLI not found on PATH")
         argv = [_ENGINE_BIN["claude"], "-p",
                 "--permission-mode", "bypassPermissions"]
+        if model:
+            argv += ["--model", model]
+        argv.append(prompt)
+        return argv
+    if engine == "kimi":
+        bin_path = _resolve_engine_bin("kimi")
+        if not bin_path:
+            raise ValueError(
+                "kimi CLI not found (install kimi-code or set WATCHTOWER_KIMI_BIN)"
+            )
+        # Print mode auto-approves internally; --yolo/--auto are rejected
+        # with -p by the CLI, so there is no permission flag to pass.
+        argv = [bin_path, "-p"]
         if model:
             argv += ["--model", model]
         argv.append(prompt)

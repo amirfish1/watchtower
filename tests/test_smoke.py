@@ -362,6 +362,84 @@ def test_queue_effort_reaches_codex_and_claude_workers(store):
         config.set_effort("DEMO", "")
 
 
+def test_spawn_worker_kimi_one_shot(store):
+    """kimi workers are one-shot print-mode processes: the drain goal rides in
+    argv (no FIFO stdin channel exists), stream-json stdout, and no permission
+    flag -- kimi print mode auto-approves internally and rejects --yolo/--auto."""
+    import watchtower.workers as workers
+
+    assert "kimi" in workers._ONE_SHOT_ENGINES
+    spawned = workers.spawn_workers("DEMO", n=1, engine="kimi", dry_run=True)
+    argv = spawned[0]["argv"]
+    assert argv[0] == workers._resolve_engine_bin("kimi")
+    assert "-p" in argv
+    assert "--output-format" in argv and "stream-json" in argv
+    assert "--input-format" not in argv  # no stream-json stdin channel
+    assert "--yolo" not in argv and "--auto" not in argv
+    assert "--permission-mode" not in argv
+    goal = workers.drain_goal("DEMO", spawned[0]["worker_id"], engine="kimi")
+    assert goal in argv  # one-shot: goal in argv, not on a FIFO
+    assert "one-shot run (kimi -p)" in goal  # kimi idle contract, not FIFO one
+
+
+def test_spawn_worker_kimi_model_and_effort(store):
+    """A queue's kimi model reaches the argv; effort config is ignored (kimi
+    has no --effort flag)."""
+    import watchtower.config as config
+    import watchtower.workers as workers
+
+    config.set_model("DEMO", "kimi-code/kimi-for-coding-highspeed")
+    config.set_effort("DEMO", "high")
+    try:
+        argv = workers.spawn_workers(
+            "DEMO", n=1, engine="kimi", dry_run=True,
+        )[0]["argv"]
+        assert argv[argv.index("--model") + 1] == "kimi-code/kimi-for-coding-highspeed"
+        assert "--effort" not in argv
+        assert "--config" not in argv
+    finally:
+        config.set_model("DEMO", "")
+        config.set_effort("DEMO", "")
+
+
+def test_set_kimi_engine_model_effort_validation(store, capsys):
+    """`wt set` accepts kimi engine+model but rejects effort for a pinned kimi
+    model (no kimi CLI flag exists for it)."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+
+    assert cli.main([
+        "set", "-q", "DEMO", "--engine", "kimi",
+        "--model", "kimi-code/kimi-for-coding-highspeed",
+    ]) == 0
+    assert config.engine("DEMO") == "kimi"
+    assert config.model("DEMO") == "kimi-code/kimi-for-coding-highspeed"
+    assert cli.main(["set", "-q", "DEMO", "--effort", "high"]) == 1
+    assert "does not support effort" in capsys.readouterr().err
+
+
+def test_models_command_lists_kimi(store, capsys):
+    import watchtower.cli as cli
+
+    assert cli.main(["models", "--engine", "kimi", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "kimi-code/kimi-for-coding-highspeed" in payload["models"]
+    assert "kimi-code/k3" in payload["models"]
+
+
+def test_build_adhoc_command_kimi(store, monkeypatch):
+    import watchtower.workers as workers
+
+    monkeypatch.setattr(
+        workers, "_resolve_engine_bin", lambda engine: f"/fake/{engine}")
+    argv = workers.build_adhoc_command(
+        "kimi", "do the thing", model="kimi-code/k3")
+    assert argv[0] == "/fake/kimi"
+    assert argv[1] == "-p"
+    assert argv[argv.index("--model") + 1] == "kimi-code/k3"
+    assert argv[-1] == "do the thing"
+
+
 def test_config_command_persists_queue_effort(store, capsys):
     """WT-116: the canonical queue-config command exposes effort control."""
     import watchtower.cli as cli
