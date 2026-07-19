@@ -18,7 +18,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 SKILL_NAME = "watchtower"
 SKILL_NAMES: Tuple[str, ...] = (
     "watchtower", "group-chat-checkin", "critique", "wt-triage-queue",
-    "compact-to-queue",
+    "compact-to-queue", "add-annotate-widget",
 )
 
 # One entry per agent harness this machine might have. A harness is skipped
