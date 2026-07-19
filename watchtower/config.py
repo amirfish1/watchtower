@@ -41,7 +41,8 @@ MODEL_EFFORTS = {
         ("claude-sonnet-5", VALID_EFFORTS),
     ),
     # kimi has no effort flag on its CLI; pinned models accept no explicit
-    # effort. highspeed is the low-cost tier meant for queue workers.
+    # effort. Plain kimi-for-coding is the low-cost tier ($0.95/$4 per 1M
+    # tok); highspeed is the fast tier at 2x ($1.90/$8) — pick per queue.
     "kimi": (
         ("kimi-code/k3", ()),
         ("kimi-code/kimi-for-coding", ()),
