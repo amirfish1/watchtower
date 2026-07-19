@@ -183,10 +183,18 @@ def _body_with_metadata(human_body: str, meta: Dict[str, Any]) -> str:
 
 
 def _first_line(value: str) -> str:
+    """First non-blank line of real content, skipping markdown ATX headings.
+
+    Bug-report bodies from the studio-assistant template open with a bare
+    ``## Problem`` / ``## Feature request`` heading — returning that verbatim
+    left every queue-panel row reading "## Problem" instead of the actual
+    complaint, since ``note`` is what list rows preview.
+    """
     for line in (value or "").splitlines():
         line = line.strip()
-        if line:
-            return line
+        if not line or line.startswith("#"):
+            continue
+        return line
     return ""
 
 
