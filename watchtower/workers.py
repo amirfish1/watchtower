@@ -1477,11 +1477,12 @@ def annotate_activity(
 
 def drain_goal(
     queue: str, worker_id: str, repo_path: str = "", engine: str = "claude",
+    extra_instructions: str = "",
 ) -> str:
     """The canonical drain goal text for one worker and engine lifecycle."""
     from . import config
     claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
-    return DRAIN_GOAL_TEMPLATE.format(
+    goal = DRAIN_GOAL_TEMPLATE.format(
         queue=queue, worker_id=worker_id, repo=repo_path or os.getcwd(),
         claim_filter=claim_filter, runbook=str(_WORKER_RUNBOOK_PATH),
         idle_contract=(
@@ -1492,6 +1493,14 @@ def drain_goal(
             else CLAUDE_RESUME_CONTRACT
         ).format(runbook=str(_WORKER_RUNBOOK_PATH)),
     )
+    extra = (extra_instructions or "").strip()
+    if extra:
+        goal += (
+            "\n\nADDITIONAL INSTRUCTIONS from the dispatcher — apply them to "
+            "every ticket you touch in this drain, but never let them override "
+            "the claiming, resolution, or stop-signal rules above: " + extra
+        )
+    return goal
 
 
 def build_drain_command(
@@ -2186,6 +2195,8 @@ def spawn_workers(
     *,
     repo_path: str = "",
     model: str = "",
+    extra_instructions: str = "",
+    kind: str = "",
     dry_run: bool = False,
     launch_failures: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
@@ -2197,6 +2208,11 @@ def spawn_workers(
     ``~/.watchtower/logs/<worker_id>.log`` so a dead worker leaves a trail
     instead of vanishing into ``/dev/null``. Returns records (with ``pid``).
     ``dry_run`` builds + records the command without spawning (tests).
+
+    ``extra_instructions`` is appended to the drain goal (bespoke spawns that
+    need dispatcher guidance beyond the standard drain contract). ``kind``
+    tags the worker record (e.g. ``"bespoke"`` for one-off custom spawns) so
+    dashboards can tell them from reconciler-spawned drain workers.
     """
     repo_path = repo_path or os.getcwd()
     if not model:
@@ -2216,15 +2232,18 @@ def spawn_workers(
     spawned: List[Dict[str, Any]] = []
     for _ in range(n):
         worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
+        goal = drain_goal(
+            queue, worker_id, repo_path, engine=engine,
+            extra_instructions=extra_instructions,
+        )
         argv = build_drain_command(
-            queue, engine, worker_id, repo_path, model, effort=effort,
+            queue, engine, worker_id, repo_path, model, goal=goal, effort=effort,
         )
         logical_bin = _ENGINE_BIN.get(engine, engine)
         if argv and argv[0] == logical_bin:
             resolved_bin = _resolve_engine_bin(engine)
             if resolved_bin:
                 argv = [resolved_bin] + argv[1:]
-        goal = drain_goal(queue, worker_id, repo_path, engine=engine)
         if dry_run:
             rec = {
                 "worker_id": worker_id,
@@ -2239,6 +2258,8 @@ def spawn_workers(
                 rec["model"] = model
             if effort:
                 rec["effort"] = effort
+            if kind:
+                rec["kind"] = kind
             spawned.append(rec)
             continue
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -2316,7 +2337,7 @@ def spawn_workers(
             continue
         rec = record_worker(
             proc.pid, queue, engine, worker_id, repo_path, str(log_path),
-            fifo=fifo_path or "", model=model,
+            fifo=fifo_path or "", model=model, kind=kind,
         )
         rec["argv"] = argv
         spawned.append(rec)
