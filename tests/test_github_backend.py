@@ -79,6 +79,7 @@ def project_fields(issue):
         "url": issue["url"],
         "assignees": [{"login": a} for a in issue["assignees"]],
         "labels": [{"name": name} for name in issue["labels"]],
+        "comments": issue.get("comments", []),
         "createdAt": issue["createdAt"],
         "updatedAt": issue["updatedAt"],
         "closedAt": issue.get("closedAt"),
@@ -229,9 +230,12 @@ def _write_fake_issues(state: Path, issues):
     state.write_text(json.dumps({"next": 1 + len(issues), "issues": issues, "commands": []}, indent=2))
 
 
-def _fake_issue(number: int, title: str, labels=None, assignees=None, body: str = ""):
+def _fake_issue(
+    number: int, title: str, labels=None, assignees=None, body: str = "", comments=None,
+):
     labels = labels or []
     assignees = assignees or []
+    comments = comments or []
     return {
         "number": number,
         "title": title,
@@ -243,7 +247,7 @@ def _fake_issue(number: int, title: str, labels=None, assignees=None, body: str 
         "createdAt": "2026-07-01T12:00:00Z",
         "updatedAt": "2026-07-01T12:00:00Z",
         "closedAt": None,
-        "comments": [],
+        "comments": comments,
     }
 
 
@@ -293,6 +297,38 @@ def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     assert issue["state"] == "CLOSED"
     assert "@me" in issue["assignees"]
     assert any("fixed it" in c for c in issue["comments"])
+
+
+def test_github_backend_imports_issue_title_and_comments_into_worker_text(
+    tmp_path, monkeypatch,
+):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    _write_fake_issues(state, [
+        _fake_issue(
+            1,
+            "Actual GitHub title",
+            body="Original report",
+            comments=[{
+                "author": {"login": "reporter"},
+                "body": "Additional reproduction details",
+                "createdAt": "2026-07-02T12:00:00Z",
+            }],
+        ),
+    ])
+
+    item = q.get("GHI-1")
+
+    assert item["title"] == "Actual GitHub title"
+    assert "GitHub comments" in item["text"]
+    assert "@reporter" in item["text"]
+    assert "Additional reproduction details" in item["text"]
+    assert any(
+        command[:2] == ["issue", "view"] and any("comments" in arg for arg in command)
+        for command in json.loads(state.read_text())["commands"]
+    )
 
 
 def test_github_backend_blocks_claimed_ticket_by_documented_ref(tmp_path, monkeypatch):

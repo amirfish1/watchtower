@@ -226,6 +226,33 @@ def _assignee_logins(raw: Any) -> List[str]:
     return out
 
 
+def _issue_comments_text(raw: Any) -> str:
+    """Render GitHub issue comments as worker-readable ticket context."""
+    if not isinstance(raw, list):
+        return ""
+    comments: List[str] = []
+    for comment in raw:
+        if isinstance(comment, dict):
+            body = str(comment.get("body") or "").strip()
+            author = comment.get("author")
+            login = str(author.get("login") or "").strip() if isinstance(author, dict) else ""
+        else:
+            body = str(comment or "").strip()
+            login = ""
+        if body:
+            comments.append(f"@{login}: {body}" if login else body)
+    return "\n\n".join(comments)
+
+
+def _issue_text(body: str, note: Any, title: Any, comments: Any) -> str:
+    """Combine an issue's body and discussion without altering its source body."""
+    text = body or str(note or "") or str(title or "")
+    comment_text = _issue_comments_text(comments)
+    if not comment_text:
+        return text
+    return f"{text}\n\n## GitHub comments\n\n{comment_text}" if text else comment_text
+
+
 class GitHubIssuesBackend:
     """A WatchTower queue backed by GitHub Issues via ``gh``."""
 
@@ -308,6 +335,7 @@ class GitHubIssuesBackend:
 
     def _issue_to_item(self, issue: Dict[str, Any]) -> Dict[str, Any]:
         body, meta = _split_body(str(issue.get("body") or ""))
+        text = _issue_text(body, meta.get("note"), issue.get("title"), issue.get("comments"))
         labels = _label_names(issue.get("labels"))
         assignees = _assignee_logins(issue.get("assignees"))
         queue_member = self.queue_label in labels
@@ -337,7 +365,7 @@ class GitHubIssuesBackend:
             "lane": _norm_choice(meta.get("lane", "normal"), VALID_LANES, "normal"),
             "source": str(meta.get("source") or "github"),
             "note": _clip(meta.get("note") or _first_line(body) or issue.get("title", ""), 4000),
-            "text": _clip(body or meta.get("note") or issue.get("title", ""), 24000),
+            "text": _clip(text, 24000),
             "url": str(issue.get("url") or ""),
             "title": _clip(issue.get("title", ""), 200),
             "selector": "",
@@ -396,7 +424,7 @@ class GitHubIssuesBackend:
                 "issue", "list",
                 *self._repo_args(),
                 "--state", state,
-                "--json", "number,title,body,state,url,assignees,labels,createdAt,updatedAt,closedAt",
+                "--json", "number,title,body,state,url,assignees,labels,comments,createdAt,updatedAt,closedAt",
                 "--limit", "1000",
             ])
             try:
@@ -524,7 +552,7 @@ class GitHubIssuesBackend:
         raw = self._run([
             "issue", "view", str(number),
             *self._repo_args(),
-            "--json", "number,title,body,state,url,assignees,labels,createdAt,updatedAt,closedAt",
+            "--json", "number,title,body,state,url,assignees,labels,comments,createdAt,updatedAt,closedAt",
         ])
         try:
             issue = json.loads(raw or "{}")
