@@ -378,7 +378,10 @@ def test_spawn_worker_kimi_one_shot(store):
     assert "--yolo" not in argv and "--auto" not in argv
     assert "--permission-mode" not in argv
     goal = workers.drain_goal("DEMO", spawned[0]["worker_id"], engine="kimi")
-    assert goal in argv  # one-shot: goal in argv, not on a FIFO
+    prompt_index = argv.index("-p") + 1
+    assert argv[prompt_index] == goal  # Kimi requires the prompt immediately after -p.
+    assert argv.index("--output-format") > prompt_index
+    assert argv.index("--model") > prompt_index if "--model" in argv else True
     assert "one-shot run (kimi -p)" in goal  # kimi idle contract, not FIFO one
 
 

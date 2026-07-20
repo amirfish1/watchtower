@@ -8,7 +8,14 @@ from pathlib import Path
 
 from watchtower import skills_sync
 
-EXPECTED_SKILLS = ("watchtower", "group-chat-checkin", "critique", "wt-triage-queue", "compact-to-queue")
+EXPECTED_SKILLS = (
+    "watchtower",
+    "group-chat-checkin",
+    "critique",
+    "wt-triage-queue",
+    "compact-to-queue",
+    "add-annotate-widget",
+)
 ALL_ENGINES = ("claude", "codex", "antigravity", "kimi")
 
 

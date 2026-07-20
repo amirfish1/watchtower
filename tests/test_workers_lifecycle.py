@@ -1171,6 +1171,27 @@ def test_spawn_run_once_worker_logs_spawn(wt, monkeypatch):
         wt.workers.spawn_run_once_worker("Q", ref, effort="low")
 
 
+def test_spawn_run_once_kimi_uses_resolved_binary_and_prompt_position(wt, monkeypatch):
+    """Kimi needs its prompt immediately after ``-p`` and may not be on PATH."""
+    wt.config.set_engine("Q", "kimi")
+    item = wt.q.enqueue(project="Q", note="work")
+    captured = []
+
+    class FakeProc:
+        pid = 999998
+
+    def fake_popen(argv, **kwargs):
+        captured.extend(argv)
+        return FakeProc()
+
+    monkeypatch.setattr(wt.workers.subprocess, "Popen", fake_popen)
+
+    wt.workers.spawn_run_once_worker("Q", item["ref"])
+
+    assert captured[0] == wt.workers._resolve_engine_bin("kimi")
+    assert captured[captured.index("-p") + 1].startswith("Fix ticket Q-1")
+
+
 # ============================================ cache-TTL staleness (warm vs cold)
 def _age_worker_log(wt, rec, seconds):
     """Backdate a worker's log mtime so it reads as idle for `seconds`."""

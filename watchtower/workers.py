@@ -1619,10 +1619,17 @@ def build_drain_command(
         # --yolo/--auto with -p), and stream-json stdout keeps the worker log
         # machine-readable. Kimi has no --effort flag; queue effort config is
         # ignored for this engine.
-        argv = [bin_name, "-p", "--output-format", "stream-json"]
+        # Kimi parses the value immediately following -p as its prompt.  Flags
+        # placed before it make ``stream-json`` look like a subcommand.
+        argv = [
+            bin_name,
+            "-p",
+            goal or drain_goal(queue, worker_id, repo_path, engine=engine),
+            "--output-format",
+            "stream-json",
+        ]
         if model:
             argv += ["--model", model]
-        argv.append(goal or drain_goal(queue, worker_id, repo_path, engine=engine))
         return argv
     argv = [
         bin_name, "-p",
@@ -2470,6 +2477,11 @@ def spawn_run_once_worker(
     argv = build_drain_command(
         queue, engine, worker_id, repo_path, model, goal=goal, effort=effort,
     )
+    logical_bin = _ENGINE_BIN.get(engine, engine)
+    if argv and argv[0] == logical_bin:
+        resolved_bin = _resolve_engine_bin(engine)
+        if resolved_bin:
+            argv = [resolved_bin] + argv[1:]
     log_dir = WORKERS_FILE.parent / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{worker_id}.log"
