@@ -595,6 +595,31 @@ def test_engine_default_precedence(store, tmp_path, monkeypatch):
         importlib.reload(config)
 
 
+def test_fallback_engine_uses_available_default_without_retrying_failed_engine(
+    store, tmp_path, monkeypatch,
+):
+    import json
+    import importlib
+    import watchtower.config as config
+    import watchtower.workers as workers
+
+    ccc_file = tmp_path / "ccc-spawn-defaults.json"
+    ccc_file.write_text(json.dumps({
+        "worker_engine": "codex",
+        "models": {"codex": "gpt-5.6-terra", "claude": "sonnet-5"},
+    }))
+    monkeypatch.setenv("WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(ccc_file))
+    monkeypatch.setattr(workers, "engine_available", lambda eng: eng in {"codex", "claude"})
+    importlib.reload(config)
+    try:
+        assert config.fallback_engine("kimi") == "codex"
+        assert config.default_model("codex") == "gpt-5.6-terra"
+        assert config.fallback_engine("codex") == "claude"
+        assert config.default_model("claude") == "claude-sonnet-5"
+    finally:
+        importlib.reload(config)
+
+
 def test_auto_drain_config(tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "qc.json"))
     import watchtower.config as config

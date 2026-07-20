@@ -351,9 +351,14 @@ def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
 
     first = wt.workers.reconcile_once(dry_run=False)
     assert not first["spawned"]
-    assert len(first["launch_failed"]) == 1
+    assert len(first["launch_failed"]) == 2
     assert first["launch_failed"][0]["reason"] == "engine usage limit"
     assert first["launch_failed"][0]["session_id"] == sid
+    assert first["fallbacks"] == [{
+        "queue": "Q", "from_engine": "codex", "to_engine": "claude",
+        "reason": "engine usage limit",
+    }]
+    assert wt.config.engine("Q") == "claude"
 
     ledger = json.loads((wt.tmp / "worker-sessions.json").read_text())
     assert sid in ledger["session_ids"]
@@ -365,6 +370,39 @@ def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
         s["queue"] == "Q" and "launch cooldown" in s["reason"]
         for s in second["skipped"]
     )
+
+
+def test_reconcile_usage_limit_falls_back_to_default_engine(wt, monkeypatch):
+    """A quota-exhausted explicit engine is replaced once, not retried forever."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_engine("Q", "kimi")
+    wt.config.set_model("Q", "kimi-code/k3")
+    wt.q.enqueue(project="Q", note="work")
+    calls = []
+
+    def fake_spawn(
+        queue, n=1, engine="claude", *, repo_path="", dry_run=False,
+        launch_failures=None,
+    ):
+        calls.append(engine)
+        if engine == "kimi":
+            launch_failures.append({"reason": "engine usage limit"})
+            return []
+        return [{"worker_id": "fallback-worker", "queue": queue, "engine": engine}]
+
+    monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
+    monkeypatch.setattr(wt.config, "fallback_engine", lambda failed: "codex")
+    monkeypatch.setattr(wt.config, "default_model", lambda engine: "gpt-5.6-terra")
+
+    result = wt.workers.reconcile_once(dry_run=False)
+
+    assert calls == ["kimi", "codex"]
+    assert wt.config.engine("Q") == "codex"
+    assert wt.config.model("Q") == "gpt-5.6-terra"
+    assert result["fallbacks"] == [{
+        "queue": "Q", "from_engine": "kimi", "to_engine": "codex",
+        "reason": "engine usage limit",
+    }]
 
 
 def test_spawn_workers_missing_binary_records_launch_failure(wt, monkeypatch):

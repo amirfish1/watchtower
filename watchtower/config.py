@@ -288,6 +288,32 @@ def _ccc_default_model(eng: str) -> str:
     return m
 
 
+def default_model(eng: str) -> str:
+    """Return the shared default model for an engine, if CCC configured one."""
+    return _ccc_default_model(eng)
+
+
+def fallback_engine(failed_engine: str) -> str:
+    """Choose an available replacement engine after a provider-level failure.
+
+    Prefer CCC's worker default so queue workers follow the fleet policy, then
+    use the deterministic local order Codex -> Claude -> Kimi. The failed
+    engine is never retried as its own fallback.
+    """
+    failed = str(failed_engine or "").strip().lower()
+    candidates = [_ccc_worker_engine_default(), "codex", "claude", "kimi"]
+    from . import workers as _workers
+    seen = set()
+    for candidate in candidates:
+        candidate = str(candidate or "").strip().lower()
+        if not candidate or candidate == failed or candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate in MODEL_EFFORTS and _workers.engine_available(candidate):
+            return candidate
+    return ""
+
+
 def model(queue: str) -> str:
     """Return the worker model for a queue: an explicit `wt set --model`
     override if one is configured, else CCC's shared default for this
@@ -296,7 +322,7 @@ def model(queue: str) -> str:
     explicit = _load().get(queue, {}).get("model", "")
     if explicit:
         return explicit
-    return _ccc_default_model(engine(queue))
+    return default_model(engine(queue))
 
 
 def set_effort(queue: str, value: str) -> Dict[str, Any]:

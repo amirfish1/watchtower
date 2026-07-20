@@ -2043,7 +2043,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                               "released": [], "reaped": [], "requeued": [],
                               "backfilled": [],
                               "session_title_backfilled": [],
-                              "launch_failed": []}
+                              "launch_failed": [], "fallbacks": []}
 
     # Gracefully release workers only after engine-aware activity clocks are
     # stale past the lifecycle floor. Never derive lifecycle from cache warmth.
@@ -2225,6 +2225,35 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 rec["spawn_reason"] = spawn_reason
             for rec in launch_failed:
                 rec["spawn_reason"] = spawn_reason
+            usage_failure = next(
+                (rec for rec in launch_failed
+                 if rec.get("reason") == "engine usage limit"),
+                None,
+            )
+            fallback = "" if dry_run or not usage_failure else config.fallback_engine(engine)
+            if fallback:
+                fallback_model = config.default_model(fallback)
+                config.set_engine(q_name, fallback)
+                config.set_model(q_name, fallback_model)
+                fallback_reason = f"fallback from {engine} usage limit"
+                fallback_failures: List[Dict[str, Any]] = []
+                fallback_spawned = spawn_workers(
+                    q_name, n=to_spawn, engine=fallback,
+                    repo_path=repo_path, dry_run=False,
+                    launch_failures=fallback_failures,
+                )
+                for rec in fallback_spawned:
+                    rec["spawn_reason"] = f"{spawn_reason}; {fallback_reason}"
+                for rec in fallback_failures:
+                    rec["spawn_reason"] = f"{spawn_reason}; {fallback_reason}"
+                result["fallbacks"].append({
+                    "queue": q_name,
+                    "from_engine": engine,
+                    "to_engine": fallback,
+                    "reason": "engine usage limit",
+                })
+                spawned.extend(fallback_spawned)
+                launch_failed.extend(fallback_failures)
             result["spawned"].extend(spawned)
             result["launch_failed"].extend(launch_failed)
         elif actual > desired:
@@ -2278,6 +2307,13 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         for ref in result.get("requeued", []):
             q = ref.rsplit("-", 1)[0] if "-" in ref else ""
             _log("REQUEUE", f"{ref} — worker gone, reopened for re-drain", queue=q)
+        for fallback in result.get("fallbacks", []):
+            _log(
+                "FALLBACK",
+                f"{fallback.get('from_engine')} usage limit — switched to "
+                f"{fallback.get('to_engine')} default",
+                queue=fallback.get("queue", ""),
+            )
     except Exception:
         pass
 
