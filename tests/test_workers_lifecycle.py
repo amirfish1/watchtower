@@ -147,6 +147,32 @@ def test_reconcile_cold_drain_on_spawns(wt):
     assert [s["queue"] for s in r["spawned"]] == ["Q"]
 
 
+def test_reconcile_continues_when_one_queue_depth_lookup_fails(wt, monkeypatch):
+    """A transient queue-backend failure must not stop other queues draining."""
+    from watchtower.github_backend import GitHubBackendError
+
+    wt.config.set_auto_drain("BROKEN", True)
+    wt.config.set_auto_drain("HEALTHY", True)
+    wt.q.enqueue(project="HEALTHY", note="work")
+
+    real_count_claimable = wt.q.count_claimable
+
+    def count_claimable(*, project=None, **kwargs):
+        if project == "BROKEN":
+            raise GitHubBackendError("GitHub backend unavailable")
+        return real_count_claimable(project=project, **kwargs)
+
+    monkeypatch.setattr(wt.q, "count_claimable", count_claimable)
+
+    result = wt.workers.reconcile_once(dry_run=True)
+
+    assert [s["queue"] for s in result["spawned"]] == ["HEALTHY"]
+    assert any(
+        skipped["queue"] == "BROKEN" and "depth lookup failed" in skipped["reason"]
+        for skipped in result["skipped"]
+    )
+
+
 def test_reconcile_dry_run_spawn_is_labeled_in_activity(wt):
     wt.config.set_auto_drain("Q", True)
     wt.q.enqueue(project="Q", note="work")

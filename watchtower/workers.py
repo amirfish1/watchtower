@@ -2130,7 +2130,19 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     for q_name in all_cfg:
         auto = config.auto_drain(q_name)
         desired = config.desired_workers(q_name) if auto else 0
-        depth, total_open = _claimable_depth(q_name)
+        try:
+            depth, total_open = _claimable_depth(q_name)
+        except Exception as exc:  # A remote queue must not abort every queue.
+            result["skipped"].append(
+                {
+                    "queue": q_name,
+                    "reason": (
+                        "depth lookup failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                }
+            )
+            continue
         if not auto:
             result["skipped"].append({"queue": q_name, "reason": "auto_drain=off"})
             continue
