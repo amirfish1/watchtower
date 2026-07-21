@@ -1047,6 +1047,11 @@ def resolve_session_id_from_log(log_path: str) -> str:
                     continue
                 try:
                     ev = json.loads(line)
+                    if not isinstance(ev, dict):
+                        # A worker can echo a bare JSON scalar (e.g. a quoted
+                        # sentence) into its log; json.loads succeeds but the
+                        # result has no .get. Treat it as a non-event line.
+                        raise ValueError("not a JSON object")
                 except (json.JSONDecodeError, ValueError):
                     m = _CODEX_SESSION_ID_LINE_RE.match(line)
                     if m:

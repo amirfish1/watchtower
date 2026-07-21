@@ -1588,6 +1588,22 @@ def test_resolve_session_id_absent_returns_empty(wt):
     assert wt.workers.resolve_session_id_from_log(str(log)) == ""
 
 
+def test_resolve_session_id_skips_bare_json_scalars(wt):
+    """A worker can echo a bare JSON scalar (a quoted sentence) into its log.
+    json.loads succeeds but yields a str -- it must be skipped, not crash the
+    reconciler (which launchd then respawns into a crash loop)."""
+    log = wt.tmp / "scalar.log"
+    log.write_text(
+        '"You have got 0 sessions left on your Private Class for now."\n'
+        '42\n'
+        'true\n'
+        '{"type":"system","subtype":"init",'
+        '"session_id":"86aa9848-9a2d-4bf7-8aa6-ce55b6e1ff61"}\n'
+    )
+    assert (wt.workers.resolve_session_id_from_log(str(log))
+            == "86aa9848-9a2d-4bf7-8aa6-ce55b6e1ff61")
+
+
 def test_list_workers_backfills_and_persists_session_id(wt):
     """list_workers parses the log, stamps session_id on the record, persists it
     so CCC can resolve worker -> session and link to its conversation."""
