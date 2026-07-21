@@ -405,6 +405,79 @@ def test_reconcile_usage_limit_falls_back_to_default_engine(wt, monkeypatch):
     }]
 
 
+_KIMI_QUOTA_LOG = (
+    '{"role":"meta","type":"turn.step.retrying","failed_attempt":1,'
+    '"error_name":"APIConnectionError","error_message":"Connection error."}\n'
+    "error: failed to run prompt: provider.api_error: 403 You've reached your "
+    "usage limit for this billing cycle.\n"
+)
+
+
+def _dead_launch_worker(wt, **overrides):
+    """Register a worker record whose pid is guaranteed dead."""
+    log = wt.tmp / f"{overrides.get('worker_id', 'w')}.log"
+    log.write_text(overrides.pop("log_text", _KIMI_QUOTA_LOG))
+    rec = {
+        "worker_id": "q-dead1234", "pid": 2 ** 31 - 1, "queue": "Q",
+        "engine": "kimi", "repo_path": str(wt.tmp), "log": str(log),
+        "started_at": "2099-01-01T00:00:00Z", "model": "kimi-code/k3",
+    }
+    rec.update(overrides)
+    rec["log"] = str(log)
+    (wt.tmp / "workers.json").write_text(json.dumps({"workers": [rec]}))
+    return rec
+
+
+def test_prune_postmortem_records_late_quota_failure(wt):
+    """kimi backs off an APIConnectionError for ~2min before printing its 403,
+    so the death lands well outside _LAUNCH_FAILURE_GRACE_S and used to go
+    unrecorded -- leaving no cooldown and respawning into the same wall."""
+    _dead_launch_worker(wt, worker_id="q-late")
+
+    wt.workers.list_workers(prune=True)
+
+    cooldown = wt.workers.active_launch_failure_cooldown("Q", "kimi")
+    assert cooldown and cooldown["reason"] == "engine usage limit"
+    assert cooldown["worker_id"] == "q-late"
+
+
+def test_prune_postmortem_skips_workers_that_actually_ran(wt):
+    """A worker with an engine session established did real work; a "usage
+    limit" string in its log is ticket text, not a launch failure."""
+    _dead_launch_worker(
+        wt,
+        worker_id="q-ran",
+        session_id="11111111-1111-1111-1111-111111111111",
+        log_text="ticket: users hit a usage limit on the pricing page\n",
+    )
+
+    wt.workers.list_workers(prune=True)
+
+    assert wt.workers.active_launch_failure_cooldown("Q", "kimi") is None
+
+
+def test_prune_postmortem_skips_long_lived_and_chatty_workers(wt, monkeypatch):
+    """Age and log-size ceilings keep the classifier off logs of workers that ran."""
+    _dead_launch_worker(wt, worker_id="q-old", started_at="2020-01-01T00:00:00Z")
+    wt.workers.list_workers(prune=True)
+    assert wt.workers.active_launch_failure_cooldown("Q", "kimi") is None
+
+    monkeypatch.setattr(wt.workers, "_LAUNCH_POSTMORTEM_MAX_LOG_BYTES", 16)
+    _dead_launch_worker(wt, worker_id="q-chatty")
+    wt.workers.list_workers(prune=True)
+    assert wt.workers.active_launch_failure_cooldown("Q", "kimi") is None
+
+
+def test_prune_postmortem_is_not_run_when_not_pruning(wt):
+    """prune=False leaves the record in place, so the post-mortem must wait --
+    otherwise every reconciler tick would re-log the same LAUNCH_FAIL."""
+    _dead_launch_worker(wt, worker_id="q-keep")
+
+    wt.workers.list_workers(prune=False)
+
+    assert wt.workers.active_launch_failure_cooldown("Q", "kimi") is None
+
+
 def test_spawn_workers_missing_binary_records_launch_failure(wt, monkeypatch):
     """A missing engine binary should not bubble out of Popen and kill the
     daemon; it becomes a launch failure with cooldown."""

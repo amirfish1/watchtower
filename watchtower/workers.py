@@ -83,6 +83,16 @@ _LAUNCH_FAILURE_GRACE_S = float(
 _LAUNCH_FAILURE_DEFAULT_COOLDOWN_S = float(
     os.environ.get("WATCHTOWER_LAUNCH_FAILURE_COOLDOWN_S", "300")
 )
+# Bounds on the prune-time post-mortem (see _postmortem_launch_failure). A real
+# launch failure dies young and writes a handful of lines; these two ceilings
+# keep the classifier away from the logs of workers that actually ran, whose
+# ticket text can easily contain phrases like "usage limit".
+_LAUNCH_POSTMORTEM_MAX_AGE_S = float(
+    os.environ.get("WATCHTOWER_LAUNCH_POSTMORTEM_MAX_AGE_S", "900")
+)
+_LAUNCH_POSTMORTEM_MAX_LOG_BYTES = int(
+    os.environ.get("WATCHTOWER_LAUNCH_POSTMORTEM_MAX_LOG_BYTES", "65536")
+)
 
 # Shared, queue-agnostic runbook (WT-101): DRAIN_GOAL_TEMPLATE keeps only a
 # one-line trigger for the Resume Check / Idle Protocol steps; the how-to
@@ -972,6 +982,65 @@ def _record_launch_failure(
     return rec
 
 
+def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Classify a dead worker's log as its record is pruned.
+
+    ``_wait_for_immediate_launch_failure`` only watches the first
+    ``_LAUNCH_FAILURE_GRACE_S`` seconds after spawn, but an engine can burn far
+    longer than that before surfacing the real error: kimi retries an
+    ``APIConnectionError`` up to 10 times with exponential backoff (~2 minutes)
+    and only then prints the 403 that was the actual cause. Those deaths went
+    unrecorded, so no cooldown was set, so the next tick saw "0 live < 1
+    desired" and spawned straight back into the same wall -- a quota-exhausted
+    engine produced a spawn every ~45s until one attempt happened to fail
+    inside the grace window. Catching it at prune time makes the grace wait an
+    optimization rather than the only detector.
+
+    Deliberately conservative -- a match requires all of:
+      * no ``session_id`` (the engine never established a session, so the
+        worker never got off the ground),
+      * death within ``_LAUNCH_POSTMORTEM_MAX_AGE_S`` of spawn,
+      * a log small enough to be pure startup output, and
+      * no cooldown already active for this queue/engine (so a batch of
+        simultaneously-pruned casualties logs one LAUNCH_FAIL, not five).
+    """
+    log_path = str(worker.get("log") or "")
+    queue = str(worker.get("queue") or "")
+    if not log_path or not queue or worker.get("session_id"):
+        return None
+    started_at = worker.get("started_at")
+    if started_at:
+        try:
+            started = datetime.fromisoformat(
+                str(started_at).replace("Z", "+00:00")
+            ).timestamp()
+        except ValueError:
+            started = None
+        if started is not None and (time.time() - started) > _LAUNCH_POSTMORTEM_MAX_AGE_S:
+            return None
+    try:
+        if os.path.getsize(log_path) > _LAUNCH_POSTMORTEM_MAX_LOG_BYTES:
+            return None
+    except OSError:
+        return None
+    engine = str(worker.get("engine") or "")
+    if active_launch_failure_cooldown(queue, engine):
+        return None
+    classified = _classify_launch_failure_log(Path(log_path))
+    if not classified:
+        return None
+    return _record_launch_failure(
+        queue=queue,
+        engine=engine,
+        worker_id=str(worker.get("worker_id") or ""),
+        pid=int(worker.get("pid") or 0),
+        log_path=Path(log_path),
+        reason=str(classified.get("reason") or "worker launch failed"),
+        retry_at=classified.get("retry_at"),
+        model=str(worker.get("model") or ""),
+    )
+
+
 def active_launch_failure_cooldown(
     queue: str, engine: str
 ) -> Optional[Dict[str, Any]]:
@@ -1311,6 +1380,10 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
 
     When ``prune`` is set, dead workers are dropped from the store.
     """
+    # Post-mortems are collected under the lock but run after it is released:
+    # they read logs and write launch-failures.json / the activity log, which
+    # has no business holding an exclusive cross-process lock on workers.json.
+    postmortem: List[Dict[str, Any]] = []
     with _WorkersFileLock():
         data = _load()
         out: List[Dict[str, Any]] = []
@@ -1336,6 +1409,10 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
             if alive:
                 kept.append(w)
             else:
+                # This record is about to be dropped -- last chance to learn why
+                # the worker died (see _postmortem_launch_failure).
+                if prune:
+                    postmortem.append(dict(w))
                 # Dead worker: unlink its FIFO node so it doesn't linger on disk.
                 fifo = w.get("fifo")
                 if fifo:
@@ -1347,7 +1424,12 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
             _save({"workers": kept})  # kept holds the same dicts -> backfill persists
         elif backfilled:
             _save(data)
-        return out
+    for w in postmortem:
+        try:
+            _postmortem_launch_failure(w)
+        except Exception:
+            pass  # a post-mortem must never break a plain worker listing
+    return out
 
 
 def live_worker_count(queue: Optional[str] = None) -> int:
