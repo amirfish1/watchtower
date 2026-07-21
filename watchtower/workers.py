@@ -83,6 +83,19 @@ _LAUNCH_FAILURE_GRACE_S = float(
 _LAUNCH_FAILURE_DEFAULT_COOLDOWN_S = float(
     os.environ.get("WATCHTOWER_LAUNCH_FAILURE_COOLDOWN_S", "300")
 )
+# Consecutive failures double the cooldown, up to this ceiling. Providers often
+# refuse for far longer than the default 5 minutes without saying until when --
+# kimi's billing-cycle 403 carries no reset timestamp at all, so _parse_usage_
+# retry_at returns None and every queue still on that engine re-spawns into the
+# same wall every 5 minutes for the rest of the cycle.
+_LAUNCH_FAILURE_MAX_COOLDOWN_S = float(
+    os.environ.get("WATCHTOWER_LAUNCH_FAILURE_MAX_COOLDOWN_S", "3600")
+)
+# How long a failure record keeps counting toward the streak after it expires.
+# Also how long an expired record is kept before being dropped entirely.
+_LAUNCH_FAILURE_STREAK_WINDOW_S = float(
+    os.environ.get("WATCHTOWER_LAUNCH_FAILURE_STREAK_WINDOW_S", "21600")
+)
 # Bounds on the prune-time post-mortem (see _postmortem_launch_failure). A real
 # launch failure dies young and writes a handful of lines; these two ceilings
 # keep the classifier away from the logs of workers that actually ran, whose
@@ -930,6 +943,40 @@ def _classify_launch_failure_log(
     return {"reason": reason, "retry_at": retry_at}
 
 
+def _recent_failure_streak(rec: Optional[Dict[str, Any]], now: float) -> int:
+    """How many consecutive failures the prior record still counts for.
+
+    Zero once the record falls outside ``_LAUNCH_FAILURE_STREAK_WINDOW_S``, so a
+    queue that failed hard yesterday starts today's first failure back at the
+    default cooldown instead of inheriting a stale hour-long one."""
+    if not isinstance(rec, dict):
+        return 0
+    try:
+        failed_at = float(rec.get("failed_at") or 0)
+    except (TypeError, ValueError):
+        return 0
+    if not failed_at or (now - failed_at) > _LAUNCH_FAILURE_STREAK_WINDOW_S:
+        return 0
+    try:
+        return max(0, int(rec.get("consecutive") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _clear_launch_failure(queue: str, engine: str) -> None:
+    """Drop the failure record for queue/engine after a proven-good launch.
+
+    Called once a worker establishes an engine session -- the only evidence that
+    actually distinguishes "this engine works now" from "the process has not
+    fallen over yet". Ends the streak so the next unrelated failure starts at
+    the default cooldown rather than an escalated one."""
+    key = _launch_failure_key(queue, engine)
+    data = _load_launch_failures()
+    if key in data:
+        data.pop(key, None)
+        _save_launch_failures(data)
+
+
 def _record_launch_failure(
     *,
     queue: str,
@@ -943,9 +990,16 @@ def _record_launch_failure(
     exit_code: Optional[int] = None,
 ) -> Dict[str, Any]:
     now = time.time()
-    cooldown_until = retry_at if retry_at and retry_at > now else (
-        now + _LAUNCH_FAILURE_DEFAULT_COOLDOWN_S
-    )
+    data = _load_launch_failures()
+    key = _launch_failure_key(queue, engine)
+    consecutive = 1 + _recent_failure_streak(data.get(key), now)
+    if retry_at and retry_at > now:
+        # The provider told us when it will serve again -- trust that over any
+        # guess of ours, however many times in a row it has refused.
+        cooldown_until = retry_at
+    else:
+        backoff = _LAUNCH_FAILURE_DEFAULT_COOLDOWN_S * (2 ** (consecutive - 1))
+        cooldown_until = now + min(backoff, _LAUNCH_FAILURE_MAX_COOLDOWN_S)
     session_id = resolve_session_id_from_log(str(log_path))
     _add_worker_session_id(session_id)
     rec: Dict[str, Any] = {
@@ -958,6 +1012,8 @@ def _record_launch_failure(
         "cooldown_until": cooldown_until,
         "cooldown_until_human": _iso_from_epoch(cooldown_until),
         "recorded_at": _iso_from_epoch(now),
+        "failed_at": now,
+        "consecutive": consecutive,
     }
     if model:
         rec["model"] = model
@@ -966,15 +1022,15 @@ def _record_launch_failure(
     if session_id:
         rec["session_id"] = session_id
 
-    data = _load_launch_failures()
-    data[_launch_failure_key(queue, engine)] = rec
+    data[key] = rec
     _save_launch_failures(data)
+    streak = f" (x{consecutive})" if consecutive > 1 else ""
     try:
         from watchtower.queue import _log
         _log(
             "LAUNCH_FAIL",
-            f"{worker_id} (pid {pid}) [{engine}] — {reason}; cooldown until "
-            f"{rec['cooldown_until_human']}",
+            f"{worker_id} (pid {pid}) [{engine}] — {reason}{streak}; cooldown "
+            f"until {rec['cooldown_until_human']}",
             queue=queue,
         )
     except Exception:
@@ -1044,20 +1100,27 @@ def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any
 def active_launch_failure_cooldown(
     queue: str, engine: str
 ) -> Optional[Dict[str, Any]]:
-    """Return active launch-failure cooldown for queue/engine, pruning expired."""
+    """Return active launch-failure cooldown for queue/engine, pruning expired.
+
+    An expired record is kept until it falls outside the streak window, not
+    dropped on sight: dropping it reset ``consecutive`` to zero every time the
+    cooldown lapsed, which made the escalating backoff below permanently flat at
+    the default interval."""
     key = _launch_failure_key(queue, engine)
     data = _load_launch_failures()
     rec = data.get(key)
     if not isinstance(rec, dict):
         return None
+    now = time.time()
     try:
         until = float(rec.get("cooldown_until") or 0)
     except (TypeError, ValueError):
         until = 0
-    if until > time.time():
+    if until > now:
         return rec
-    data.pop(key, None)
-    _save_launch_failures(data)
+    if not _recent_failure_streak(rec, now):
+        data.pop(key, None)
+        _save_launch_failures(data)
     return None
 
 
@@ -1384,6 +1447,7 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
     # they read logs and write launch-failures.json / the activity log, which
     # has no business holding an exclusive cross-process lock on workers.json.
     postmortem: List[Dict[str, Any]] = []
+    recovered: List[tuple] = []
     with _WorkersFileLock():
         data = _load()
         out: List[Dict[str, Any]] = []
@@ -1402,6 +1466,10 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                     # Ledger it so it survives this worker being pruned later.
                     _add_worker_session_id(sid)
                     _upsert_codex_worker_registry(w)
+                    # A session means this engine really did launch -- end any
+                    # failure streak so the next one starts from the default.
+                    recovered.append((str(w.get("queue") or ""),
+                                      str(w.get("engine") or "")))
             alive = _pid_alive(int(w.get("pid", 0)))
             row = dict(w)
             row["alive"] = alive
@@ -1424,6 +1492,12 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
             _save({"workers": kept})  # kept holds the same dicts -> backfill persists
         elif backfilled:
             _save(data)
+    for q_name, eng in recovered:
+        if q_name:
+            try:
+                _clear_launch_failure(q_name, eng)
+            except Exception:
+                pass
     for w in postmortem:
         try:
             _postmortem_launch_failure(w)

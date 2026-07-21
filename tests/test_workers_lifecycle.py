@@ -478,6 +478,98 @@ def test_prune_postmortem_is_not_run_when_not_pruning(wt):
     assert wt.workers.active_launch_failure_cooldown("Q", "kimi") is None
 
 
+def _fail(wt, **kw):
+    log = wt.tmp / "fail.log"
+    log.write_text(kw.pop("log_text", "usage limit reached\n"))
+    return wt.workers._record_launch_failure(
+        queue="Q", engine="kimi", worker_id="q-w", pid=1,
+        log_path=log, reason="engine usage limit", **kw,
+    )
+
+
+def test_repeat_launch_failures_escalate_the_cooldown(wt):
+    """kimi's billing-cycle 403 carries no reset timestamp, so the cooldown falls
+    back to a flat 5 minutes -- a queue still on that engine would respawn into
+    the same wall every 5 minutes for the rest of the cycle. Consecutive
+    failures must back off instead."""
+    base = wt.workers._LAUNCH_FAILURE_DEFAULT_COOLDOWN_S
+    spans = []
+    for _ in range(4):
+        rec = _fail(wt)
+        spans.append(rec["cooldown_until"] - time.time())
+        # Expire the cooldown the way the passage of time would, leaving the
+        # record in place so the streak survives.
+        data = json.loads((wt.tmp / "launch-failures.json").read_text())
+        data["Q:kimi"]["cooldown_until"] = time.time() - 1
+        (wt.tmp / "launch-failures.json").write_text(json.dumps(data))
+        assert wt.workers.active_launch_failure_cooldown("Q", "kimi") is None
+
+    assert [round(s / base) for s in spans] == [1, 2, 4, 8]
+    assert json.loads(
+        (wt.tmp / "launch-failures.json").read_text()
+    )["Q:kimi"]["consecutive"] == 4
+
+
+def test_launch_failure_cooldown_is_capped(wt, monkeypatch):
+    monkeypatch.setattr(wt.workers, "_LAUNCH_FAILURE_MAX_COOLDOWN_S", 900)
+    for _ in range(10):
+        rec = _fail(wt)
+        data = json.loads((wt.tmp / "launch-failures.json").read_text())
+        data["Q:kimi"]["cooldown_until"] = time.time() - 1
+        (wt.tmp / "launch-failures.json").write_text(json.dumps(data))
+        wt.workers.active_launch_failure_cooldown("Q", "kimi")
+    assert rec["cooldown_until"] - time.time() <= 900
+
+
+def test_provider_retry_at_wins_over_backoff(wt):
+    """When the engine says when it will serve again, trust it over our guess."""
+    _fail(wt)
+    retry_at = time.time() + 30
+    rec = _fail(wt, retry_at=retry_at)
+    assert rec["consecutive"] == 2
+    assert abs(rec["cooldown_until"] - retry_at) < 1
+
+
+def test_stale_failure_record_does_not_inherit_a_streak(wt):
+    """A queue that failed hard yesterday starts today at the default cooldown."""
+    _fail(wt)
+    _fail(wt)
+    data = json.loads((wt.tmp / "launch-failures.json").read_text())
+    data["Q:kimi"]["failed_at"] = time.time() - (
+        wt.workers._LAUNCH_FAILURE_STREAK_WINDOW_S + 60
+    )
+    data["Q:kimi"]["cooldown_until"] = time.time() - 1
+    (wt.tmp / "launch-failures.json").write_text(json.dumps(data))
+
+    # Expired and outside the streak window -> dropped entirely.
+    assert wt.workers.active_launch_failure_cooldown("Q", "kimi") is None
+    assert "Q:kimi" not in json.loads(
+        (wt.tmp / "launch-failures.json").read_text()
+    )
+    assert _fail(wt)["consecutive"] == 1
+
+
+def test_established_session_clears_the_failure_streak(wt):
+    """A worker that reaches a session proves the engine works again."""
+    _fail(wt)
+    _fail(wt)
+    log = wt.tmp / "good.log"
+    sid = "22222222-2222-2222-2222-222222222222"
+    log.write_text(f'{{"type":"system","subtype":"init","session_id":"{sid}"}}\n')
+    (wt.tmp / "workers.json").write_text(json.dumps({"workers": [{
+        "worker_id": "q-good", "pid": os.getpid(), "queue": "Q",
+        "engine": "kimi", "repo_path": str(wt.tmp), "log": str(log),
+        "started_at": "2099-01-01T00:00:00Z",
+    }]}))
+
+    wt.workers.list_workers(prune=True)
+
+    assert "Q:kimi" not in json.loads(
+        (wt.tmp / "launch-failures.json").read_text()
+    )
+    assert _fail(wt)["consecutive"] == 1
+
+
 def test_spawn_workers_missing_binary_records_launch_failure(wt, monkeypatch):
     """A missing engine binary should not bubble out of Popen and kill the
     daemon; it becomes a launch failure with cooldown."""
