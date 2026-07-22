@@ -89,6 +89,22 @@ def test_cli_edit_text_replaces_file_backed_ticket_body(wt, capsys):
     assert edited["history"][-1]["fields"] == {"text": "replacement body"}
 
 
+def test_cli_block_json_returns_the_blocked_ticket(wt, capsys):
+    item = wt.q.enqueue(project="BLOCK", note="needs a decision", source="test")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    assert wt.cli.main([
+        "block", item["ref"], "--worker", "worker-a",
+        "--question", "approve the rollout?", "--progress", "verified the options",
+        "--json",
+    ]) == 0
+
+    blocked = json.loads(capsys.readouterr().out)
+    assert blocked["ref"] == item["ref"]
+    assert blocked["status"] == "in_progress"
+    assert blocked["block_question"] == "approve the rollout?"
+
+
 def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsys):
     item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
     sid = "11111111-2222-3333-4444-555555555555"

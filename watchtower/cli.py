@@ -683,6 +683,9 @@ def cmd_block(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
     print(f"BLOCKED: {item['ref']} — {item.get('block_question') or '(no question)'}")
     sid = item.get("claimed_session_id")
     if sid:
@@ -2899,6 +2902,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--question", default="", help="the specific decision you need")
     s.add_argument("--progress", default="",
                    help="analysis-so-far note (backstop if the session is lost)")
+    s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_block)
 
     s = sub.add_parser("blocked")
