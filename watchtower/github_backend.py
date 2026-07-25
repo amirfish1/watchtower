@@ -702,6 +702,7 @@ class GitHubIssuesBackend:
         session_uuid: str = "",
         resolution: Any = None,
         reason: str = "",
+        expect_owner: str = "",
     ) -> Optional[Dict[str, Any]]:
         if status not in ("open", "in_progress", "closed"):
             raise ValueError("status must be one of ('open', 'in_progress', 'closed')")
@@ -715,6 +716,18 @@ class GitHubIssuesBackend:
             raise ValueError(
                 f"{ident} is missing label {self.queue_label}; "
                 f"run `wt run {ident}` before closing it"
+            )
+        if (
+            status == "closed"
+            and expect_owner
+            and item.get("status") == "in_progress"
+            and item.get("claimed_by")
+            and str(item.get("claimed_by")) != expect_owner
+        ):
+            raise ValueError(
+                f"{item.get('ref', ident)} is claimed by {item.get('claimed_by')}; "
+                f"you are {expect_owner}. Only the claiming worker may close "
+                "an in-progress ticket. Pass --force to override deliberately."
             )
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))

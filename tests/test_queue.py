@@ -169,18 +169,14 @@ def test_close_ownership_guard_blocks_reap_duplicate(wt):
     assert _events(wt.q.get(item["ref"])["history"]).count("close") == 1
 
 
-def test_close_guard_allows_owner_force_crosscloser_and_unclaimed(wt):
-    """The guard must not break legitimate closes: own in_progress ticket,
-    a different worker closing a still-open claim (intentional cross-closer
-    attribution), --force override of an already-closed ticket, and
-    close-by-ref on a never-claimed ticket (dedup-close path)."""
-    # A different worker closing a *still-open* claim is allowed.
+def test_close_guard_rejects_crosscloser_but_allows_force_and_unclaimed(wt):
+    """Only the claimant may close an in-progress ticket without --force."""
+    # A different worker must not close a still-open claim.
     x = wt.q.enqueue(project="OWN", note="crossclose", source="test")
     wt.q.claim_by_ref(x["ref"], "worker-a")
-    crossed = wt.q.close(x["ref"], "worker-b", resolution="closed by b")
-    assert crossed["status"] == "closed"
-    assert crossed["claimed_by"] == "worker-a"  # original claimant preserved
-    assert crossed["closed_by"] == "worker-b"
+    with pytest.raises(ValueError, match="claimed by worker-a"):
+        wt.q.close(x["ref"], "worker-b", resolution="closed by b")
+    assert wt.q.get(x["ref"])["status"] == "in_progress"
 
     # Own in_progress ticket closes normally.
     a = wt.q.enqueue(project="OWN", note="mine", source="test")

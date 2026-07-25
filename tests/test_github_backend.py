@@ -299,6 +299,20 @@ def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     assert any("fixed it" in c for c in issue["comments"])
 
 
+def test_github_backend_rejects_crossworker_close(tmp_path, monkeypatch):
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+
+    item = q.enqueue(project="GHI", note="claimed work", source="test")
+    q.claim_by_ref(item["ref"], "worker-a")
+
+    with pytest.raises(ValueError, match="claimed by worker-a"):
+        q.close(item["ref"], "worker-b", resolution={"summary": "wrong worker"})
+    assert q.get(item["ref"])["status"] == "in_progress"
+
+
 def test_github_backend_imports_issue_title_and_comments_into_worker_text(
     tmp_path, monkeypatch,
 ):
