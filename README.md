@@ -156,7 +156,10 @@ to file it and optionally `--type bug|feature` to override every inferred type.
 The locally authenticated `claude` CLI must be available. A missing CLI,
 timeout, malformed response, invalid source anchor, or invalid dependency fails
 loudly before any ticket is filed. Imports use Sonnet in Claude safe mode by
-default; set `WATCHTOWER_IMPORT_MODEL` to override the model.
+default; set `WATCHTOWER_IMPORT_MODEL` to override the model. `--tools ""` alone
+is not an isolation boundary: Claude Code may still load local skills, plugins,
+and project instructions. Keep `--safe-mode` on the importer invocation so that
+ambient local context cannot consume the import budget.
 
 ```bash
 wt import docs/launch-plan.md -q LAUNCH
