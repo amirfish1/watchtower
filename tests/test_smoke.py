@@ -12,6 +12,7 @@ import json
 import threading
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -678,7 +679,7 @@ def test_cli_enqueue_and_status(store, capsys):
     assert "CLI" in out
 
     assert main(["claim", "-q", "CLI"]) == 0
-    assert main(["close", "CLI-1", "--summary", "done"]) == 0
+    assert main(["close", "CLI-1", "--summary", "done", "--no-code"]) == 0
     out = capsys.readouterr().out
     assert "CLOSED: CLI-1" in out
 
@@ -1088,6 +1089,7 @@ def test_cli_close_builds_resolution(store, capsys):
     rc = main([
         "close", "CLIRES-1",
         "--summary", "did X",
+        "--no-code",
         "--caveat", "watch Y",
         "--follow-up", "do Z later",
     ])
@@ -1116,6 +1118,7 @@ def test_cli_close_enqueue_follow_ups(store, capsys):
     rc = main([
         "close", "CARRY-1",
         "--summary", "did the main bit",
+        "--no-code",
         "--follow-up", "polish the edges",
         "--unresolved", "the flaky test",
         "--enqueue-follow-ups",
@@ -1448,6 +1451,78 @@ def test_close_requires_summary(store, capsys):
     assert rc == 1, "expected exit code 1 when --summary is missing"
     err = capsys.readouterr().err
     assert "--summary" in err
+
+
+def test_close_requires_commit_evidence_or_explicit_no_code(store, capsys):
+    """A summary alone cannot prove a code-changing ticket was committed."""
+    import watchtower.queue as q
+    from watchtower.cli import main
+
+    q.enqueue(project="EVIDENCE", note="needs fixing")
+    q.claim_next("w", project="EVIDENCE")
+
+    rc = main([
+        "close", "EVIDENCE-1", "--worker", "w", "--summary", "fixed it",
+    ])
+
+    assert rc == 1
+    assert q.get("EVIDENCE-1")["status"] == "in_progress"
+    assert "--commit" in capsys.readouterr().err
+
+
+def test_close_records_verified_commit_or_explicit_no_code(store, monkeypatch, capsys):
+    """Close persists either normalized commit evidence or an explicit no-code declaration."""
+    import watchtower.cli as cli
+    import watchtower.queue as q
+
+    q.enqueue(project="EVIDENCE", note="code fix")
+    q.claim_next("w", project="EVIDENCE")
+    full_sha = "a" * 40
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=full_sha + "\n"),
+    )
+
+    rc = cli.main([
+        "close", "EVIDENCE-1", "--worker", "w", "--summary", "fixed it",
+        "--commit", "a" * 7,
+    ])
+
+    assert rc == 0
+    assert q.get("EVIDENCE-1")["resolution"]["commit"] == full_sha
+
+    q.enqueue(project="EVIDENCE", note="investigation only")
+    q.claim_next("w", project="EVIDENCE")
+    assert cli.main([
+        "close", "EVIDENCE-2", "--worker", "w", "--summary", "no code needed",
+        "--no-code",
+    ]) == 0
+    assert q.get("EVIDENCE-2")["resolution"]["no_code"] is True
+    capsys.readouterr()
+
+
+def test_close_leaves_ticket_open_when_commit_cannot_be_verified(store, monkeypatch, capsys):
+    """A SHA-shaped value is not completion evidence unless git resolves it."""
+    import watchtower.cli as cli
+    import watchtower.queue as q
+
+    q.enqueue(project="EVIDENCE", note="code fix")
+    q.claim_next("w", project="EVIDENCE")
+    monkeypatch.setattr(
+        cli.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=1, stdout=""),
+    )
+
+    rc = cli.main([
+        "close", "EVIDENCE-1", "--worker", "w", "--summary", "fixed it",
+        "--commit", "b" * 40,
+    ])
+
+    assert rc == 1
+    assert q.get("EVIDENCE-1")["status"] == "in_progress"
+    assert "not a commit" in capsys.readouterr().err
 
 
 def test_enqueue_with_triage_fields(store):

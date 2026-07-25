@@ -264,15 +264,16 @@ wt stop</div>
     <div class="term" style="margin-top:24px">
       <div class="term-body"><pre><span class="cmd">wt claim  -q DEMO</span>              <span class="cm"># claim next open ticket (smart sort: priority + type + age)</span>
 <span class="cmd">wt claim  -q DEMO DEMO-1</span>       <span class="cm"># or claim a specific ticket by ref</span>
-<span class="cmd">wt close  DEMO-1 --summary "fixed the overlap" \</span>
+<span class="cmd">wt close  DEMO-1 --summary "fixed the overlap" --commit &lt;SHA&gt; \</span>
 <span class="cmd">          --caveat "only tested on iOS" --follow-up "add a regression test"</span>
 <span class="cmd">wt release DEMO-1</span>              <span class="cm"># give up a claim without closing; returns it to open</span>
 <span class="cmd">wt block   DEMO-1</span>              <span class="cm"># park a ticket that needs a human decision</span></pre></div>
     </div>
     <div class="note">
-      <b>Closes carry how it was fixed.</b> <code class="inline-code">wt close</code> takes <code>--summary</code>,
-      <code>--caveat</code>, <code>--follow-up</code>, and <code>--unresolved</code>, so every close is an audit
-      record, not a bare "done". Pass <code>--enqueue-follow-ups</code> to auto-file the follow-ups as new tickets.
+      <b>Closes carry how it was fixed.</b> <code class="inline-code">wt close</code> requires <code>--summary</code>
+      and either a verified <code>--commit &lt;SHA&gt;</code> or explicit <code>--no-code</code>, plus optional
+      <code>--caveat</code>, <code>--follow-up</code>, and <code>--unresolved</code>. Pass
+      <code>--enqueue-follow-ups</code> to auto-file the follow-ups as new tickets.
     </div>
     <div class="cta-row">
       <a class="btn btn-primary" href="index.html#quickstart">Back to quickstart</a>

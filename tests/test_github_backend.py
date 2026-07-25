@@ -396,6 +396,7 @@ def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys)
         "close", "GHCLI-1",
         "--worker", "cli-worker",
         "--summary", "closed via gh",
+        "--no-code",
     ]) == 0
     out = capsys.readouterr().out
     assert "CLOSED: GHCLI-1" in out

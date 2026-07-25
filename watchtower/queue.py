@@ -39,6 +39,8 @@ Item shape::
       "claimed_session_id": null,        # real worker/session id, when known
       "resolution": {                    # HOW it was fixed (set on close, optional)
         "summary": "...",                # the main one-liner
+        "commit": "...",                 # verified code-change commit, if any
+        "no_code": true,                  # explicit non-code completion, if any
         "caveats": [...], "follow_ups": [...], "unresolved": [...]
       },
       "history": [                       # append-only lifecycle trail (WT-87):
@@ -1163,7 +1165,8 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
     """Coerce a resolution into the stored shape, or None when empty.
 
     Accepts a bare string (treated as the summary) or a dict with any of
-    ``summary`` / ``caveats`` / ``follow_ups`` / ``unresolved``. List fields are
+    ``summary`` / ``commit`` / ``no_code`` / ``caveats`` / ``follow_ups`` /
+    ``unresolved``. List fields are
     coerced to lists of clipped strings; empty fields are dropped. Returns None
     when nothing meaningful was supplied (so close stays back-compatible)."""
     if resolution is None:
@@ -1176,6 +1179,11 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
     summary = _clip(resolution.get("summary", ""), 4000)
     if summary:
         out["summary"] = summary
+    commit = _clip(resolution.get("commit", ""), 128)
+    if commit:
+        out["commit"] = commit
+    if resolution.get("no_code") is True:
+        out["no_code"] = True
     for field in ("caveats", "follow_ups", "unresolved"):
         raw = resolution.get(field)
         if raw is None:
