@@ -753,6 +753,24 @@ def test_outbox_backoff_schedule_and_dead_letter(wt, monkeypatch):
     assert not out["retried"] and not out["dead"] and not out["delivered"]
 
 
+def test_send_engine_override_survives_outbox_retry(wt, monkeypatch):
+    attempts = []
+
+    def fake_deliver(resolved, text, mode="send"):
+        attempts.append(resolved["engine"])
+        return {"ok": len(attempts) > 1, "error": "try again"}
+
+    monkeypatch.setattr(wt.messages, "deliver", fake_deliver)
+
+    queued = wt.messages.send(SID_D, "retry me", engine="kimi")
+
+    assert queued["queued"] is True
+    assert wt.messages.outbox_list()[0]["engine"] == "kimi"
+    result = wt.messages.drain_outbox(now=time.time() + 60)
+    assert result["delivered"] == [queued["id"]]
+    assert attempts == ["kimi", "kimi"]
+
+
 def test_drain_outbox_delivers_once_delegate_comes_up(wt, delegate, monkeypatch):
     _disable_resume(wt, monkeypatch)
     # Delegate down (off): the send parks in the outbox.

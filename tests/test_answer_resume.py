@@ -107,7 +107,11 @@ def test_answer_delivers_via_messages_send_not_a_blind_fork(wt, tmp_path, monkey
     calls = {}
 
     def fake_send(target, text, mode="send", **kw):
-        calls["send"] = {"target": target, "mode": mode}
+        calls["send"] = {
+            "target": target,
+            "mode": mode,
+            "engine": kw.get("engine"),
+        }
         return {"ok": True, "transport": "delegate"}
 
     forked = []
@@ -120,9 +124,32 @@ def test_answer_delivers_via_messages_send_not_a_blind_fork(wt, tmp_path, monkey
     assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
     # Delivered through the one liveness-aware primitive, steering the session —
     # never a blind `codex exec resume` fork.
-    assert calls["send"] == {"target": sid, "mode": "steer"}
+    assert calls["send"] == {
+        "target": sid,
+        "mode": "steer",
+        "engine": "codex",
+    }
     assert forked == []
     assert q.get(item["ref"])["needs_input"] is False
+
+
+def test_answer_explicit_engine_overrides_primary_delivery(
+    wt, tmp_path, monkeypatch
+):
+    cli, q, workers = wt
+    import watchtower.messages as messages
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    item = _blocked_codex_ticket(q, workers, tmp_path, worker_id="w-1", sid=sid)
+    calls = []
+
+    def fake_send(target, text, mode="send", **kwargs):
+        calls.append(kwargs.get("engine"))
+        return {"ok": True, "transport": "delegate"}
+
+    monkeypatch.setattr(messages, "send", fake_send)
+
+    assert cli.cmd_answer(_answer_args(item["ref"], "A", engine="claude")) == 0
+    assert calls == ["claude"]
 
 
 def test_answer_queued_delivery_does_not_fork(wt, tmp_path, monkeypatch):
