@@ -222,6 +222,29 @@ def test_answer_resume_reports_immediate_process_exit(wt, tmp_path, monkeypatch)
     )
 
 
+def test_answer_fallback_failure_names_engine_for_manual_resume(
+    wt, tmp_path, monkeypatch, capsys
+):
+    cli, q, workers = wt
+    import watchtower.messages as messages
+    sid = "11111111-2222-3333-4444-555555555555"
+    item = _blocked_codex_ticket(
+        q, workers, tmp_path, worker_id="ccc-deadbeef", sid=sid,
+    )
+    assert workers.list_workers()[-1]["alive"] is False
+    monkeypatch.setattr(
+        messages, "send",
+        lambda *a, **k: {"ok": False, "error": "unresolvable target"},
+    )
+    monkeypatch.setattr(cli, "_resume_session_headless", lambda *a, **k: False)
+
+    assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
+
+    output = capsys.readouterr().out
+    assert "codex resume also failed to stay running" in output
+    assert f"wt discuss {item['ref']} --engine codex" in output
+
+
 def test_answered_ticket_not_reopened_while_answer_in_flight(wt, tmp_path):
     cli, q, workers = wt
     sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"

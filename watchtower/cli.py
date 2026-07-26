@@ -918,11 +918,12 @@ def cmd_answer(args: argparse.Namespace) -> int:
     # Unresolvable target (nothing queued): fall back to the headless resume
     # fork, which registers the resume child under the worker id so the orphan
     # sweep cannot reopen the ticket while the answer is applied.
+    fallback_engine = _answer_engine(item, args.engine)
     started = _resume_session_headless(
         sid,
         repo,
         prompt,
-        _answer_engine(item, args.engine),
+        fallback_engine,
         queue=item.get("project", ""),
         worker_id=item.get("claimed_by", ""),
     )
@@ -931,8 +932,9 @@ def cmd_answer(args: argparse.Namespace) -> int:
               f"to apply your answer and close.")
     else:
         print(f"ANSWERED: {item['ref']} — needs_input cleared, but delivery "
-              f"failed ({sent.get('error', 'unknown')}). Resume manually: "
-              f"wt discuss {item['ref']}")
+              f"failed ({sent.get('error', 'unknown')}); {fallback_engine} "
+              "resume also failed to stay running. Resume manually: "
+              f"wt discuss {item['ref']} --engine {fallback_engine}")
     return 0
 
 
@@ -3044,7 +3046,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("text", help="your answer")
     s.add_argument("--worker", default="")
     s.add_argument("--engine", choices=["claude", "codex", "kimi"],
-                   help="override the blocked session engine")
+                   help="override the engine for headless resume fallback")
     s.set_defaults(func=cmd_answer)
 
     s = sub.add_parser("comment")
