@@ -251,13 +251,19 @@ def test_close_unclaimed_backfills_claimed_by(store):
 
 
 def test_close_keeps_original_claimant(store):
-    """A different closer credits the close but never overwrites the
-    original claimant."""
+    """A non-claiming worker cannot close a live claim, but a deliberate
+    ``force`` close credits the closer without overwriting the claimant."""
     import watchtower.queue as q
+    import pytest
 
     q.enqueue(project="DEMO", note="claimed work")
     claimed = q.claim_next("worker-1", project="DEMO")
-    closed = q.close(claimed["ref"], "worker-2")
+
+    # Ownership guard: resolution theft is refused by default.
+    with pytest.raises(ValueError, match="Only the claiming worker may close"):
+        q.close(claimed["ref"], "worker-2")
+
+    closed = q.close(claimed["ref"], "worker-2", force=True)
     assert closed["closed_by"] == "worker-2"
     assert closed["claimed_by"] == "worker-1"
 
