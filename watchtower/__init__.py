@@ -5,4 +5,4 @@ CLI-first (binary ``wt``); the queue engine in :mod:`watchtower.queue` is
 self-contained and stdlib-only. An HTTP viewer arrives in phase 2.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
