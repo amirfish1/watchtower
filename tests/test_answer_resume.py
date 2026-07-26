@@ -207,12 +207,16 @@ def test_answer_resume_reports_immediate_process_exit(wt, tmp_path, monkeypatch)
     class Proc:
         pid = os.getpid()
 
+        def __init__(self):
+            self.polls = 0
+
         def poll(self):
-            return 2
+            self.polls += 1
+            return None if self.polls == 1 else 2
 
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Proc())
     monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "0.2")
+    monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "0.01")
 
     assert not cli._resume_session_headless(
         "11111111-2222-3333-4444-555555555555",

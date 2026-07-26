@@ -816,12 +816,15 @@ def _resume_session_headless(
             verify_s = float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
         except ValueError:
             verify_s = 2.0
-        deadline = time.time() + verify_s
+        deadline = time.monotonic() + max(0.0, verify_s)
         poll = getattr(proc, "poll", None)
-        while callable(poll) and time.time() < deadline:
+        while callable(poll):
             if poll() is not None:
                 return False
-            time.sleep(0.1)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
         if queue and worker_id:
             workers.record_worker(
                 proc.pid,
