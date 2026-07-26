@@ -140,3 +140,13 @@ def test_ticket_closing_skills_document_summary_and_completion_proof():
         assert "--summary" in text
         assert "--commit" in text
         assert "--no-code" in text
+
+
+def test_annotate_skill_closes_the_ref_returned_by_the_ingest_api():
+    """A wiring test must not assume it created the queue's first ticket."""
+    text = (
+        skills_sync.source_dir("add-annotate-widget") / "SKILL.md"
+    ).read_text()
+    assert 'json.load(sys.stdin)["ref"]' in text
+    assert 'wt close "$annotation_ref"' in text
+    assert "\n   wt close MYAPP-1 --no-code" not in text

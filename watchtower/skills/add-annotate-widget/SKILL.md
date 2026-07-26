@@ -46,11 +46,13 @@ picks an element, types a note, and a ticket lands in their WatchTower queue
    annotation and confirm a ticket lands, then delete/close it:
 
    ```bash
-   curl -s -X POST http://127.0.0.1:8787/api/queue/MYAPP/add \
+   annotation_response=$(curl -sS -X POST http://127.0.0.1:8787/api/queue/MYAPP/add \
      -H 'Content-Type: application/json' \
-     -d '{"note":"annotate wiring test","url":"http://localhost/","selector":"body"}'
-   wt ls -q MYAPP
-   wt close MYAPP-1 --no-code --summary "Verified annotate widget ingest wiring"
+     -d '{"note":"annotate wiring test","url":"http://localhost/","selector":"body"}')
+   annotation_ref=$(printf '%s' "$annotation_response" |
+     python3 -c 'import json,sys; print(json.load(sys.stdin)["ref"])')
+   wt find "$annotation_ref" --json
+   wt close "$annotation_ref" --no-code --summary "Verified annotate widget ingest wiring"
    ```
 
 6. **Tell the user**: open the page, click the floating **⚑** (bottom-right, draggable),
