@@ -11,7 +11,7 @@ import json
 import re
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from .queue import UNCLAIMABLE_READINESS
@@ -22,6 +22,7 @@ VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
 VALID_VALUES = ("H", "M", "L", "")
 VALID_CONFIDENCES = ("H", "M", "L", "")
 DEFAULT_ITEM_TYPE = "bug"
+COMPLETED_ISSUE_RETENTION_DAYS = 14
 
 _ISSUE_URL_RE = re.compile(r"/issues/(\d+)(?:\D*)?$")
 _META_START = "<!-- watchtower"
@@ -54,6 +55,26 @@ _LIST_ERROR_BACKOFF = 60.0
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_iso(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _recently_closed(issue: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
+    closed_at = _parse_iso(issue.get("closedAt"))
+    if closed_at is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    return closed_at >= current - timedelta(days=COMPLETED_ISSUE_RETENTION_DAYS)
 
 
 def _clip(value: Any, max_len: int) -> str:
@@ -420,13 +441,20 @@ class GitHubIssuesBackend:
             elif not fresh and age < _LIST_CACHE_TTL:
                 return cached["data"]
         try:
-            raw = self._run([
+            args = [
                 "issue", "list",
                 *self._repo_args(),
                 "--state", state,
                 "--json", "number,title,body,state,url,assignees,labels,comments,createdAt,updatedAt,closedAt",
                 "--limit", "1000",
-            ])
+            ]
+            if state == "closed":
+                cutoff = (
+                    datetime.now(timezone.utc)
+                    - timedelta(days=COMPLETED_ISSUE_RETENTION_DAYS)
+                ).date().isoformat()
+                args.extend(["--search", f"closed:>={cutoff}"])
+            raw = self._run(args)
             try:
                 data = json.loads(raw or "[]")
             except json.JSONDecodeError as exc:
@@ -519,12 +547,20 @@ class GitHubIssuesBackend:
         fresh: bool = False,
         strict: bool = False,
     ) -> List[Dict[str, Any]]:
-        if status == "closed":
-            return []
-        items = [
-            self._issue_to_item(issue)
-            for issue in self._list_issues("open", fresh=fresh, strict=strict)
-        ]
+        issues: List[Dict[str, Any]] = []
+        if status != "closed":
+            issues.extend(
+                self._list_issues("open", fresh=fresh, strict=strict)
+            )
+        if status in (None, "closed"):
+            issues.extend(
+                issue
+                for issue in self._list_issues(
+                    "closed", fresh=fresh, strict=strict
+                )
+                if _recently_closed(issue)
+            )
+        items = [self._issue_to_item(issue) for issue in issues]
         if status:
             items = [it for it in items if it.get("status") == status]
         if lane:
