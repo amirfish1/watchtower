@@ -118,7 +118,11 @@ def test_answer_delivers_via_messages_send_not_a_blind_fork(wt, tmp_path, monkey
     calls = {}
 
     def fake_send(target, text, mode="send", **kw):
-        calls["send"] = {"target": target, "mode": mode}
+        calls["send"] = {
+            "target": target,
+            "mode": mode,
+            "engine": kw.get("engine"),
+        }
         return {"ok": True, "transport": "delegate"}
 
     forked = []
@@ -128,10 +132,14 @@ def test_answer_delivers_via_messages_send_not_a_blind_fork(wt, tmp_path, monkey
         lambda *a, **k: forked.append(a) or True,
     )
 
-    assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
+    assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
     # Delivered through the one liveness-aware primitive, steering the session —
     # never a blind `codex exec resume` fork.
-    assert calls["send"] == {"target": sid, "mode": "steer"}
+    assert calls["send"] == {
+        "target": sid,
+        "mode": "steer",
+        "engine": "codex",
+    }
     assert forked == []
     assert q.get(item["ref"])["needs_input"] is False
 
@@ -180,6 +188,54 @@ def test_answer_falls_back_to_resume_when_target_unresolvable(wt, tmp_path, monk
     assert forked[0][0][3] == "codex"
 
 
+def test_answer_explicit_engine_override_wins(wt, tmp_path, monkeypatch):
+    cli, q, workers = wt
+    import watchtower.messages as messages
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    item = _blocked_codex_ticket(q, workers, tmp_path, worker_id="w-1", sid=sid)
+    assert workers.list_workers()[-1]["alive"] is False
+
+    calls = []
+    monkeypatch.setattr(
+        messages, "send",
+        lambda *a, **k: calls.append(k) or {"ok": True, "transport": "delegate"},
+    )
+    monkeypatch.setattr(
+        cli, "_resume_session_headless",
+        lambda *a, **k: pytest.fail("successful primary delivery must not fork"),
+    )
+
+    assert cli.cmd_answer(_answer_args(item["ref"], "A", engine="kimi")) == 0
+    assert calls[0]["engine"] == "kimi"
+
+
+def test_answer_infers_kimi_after_worker_process_exits(wt, tmp_path, monkeypatch):
+    cli, q, workers = wt
+    import watchtower.messages as messages
+    sid = "session_aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    item = q.enqueue(project="THROUGHPUT", note="blocked work")
+    q.claim_next("w-1", project="THROUGHPUT", session_uuid=sid)
+    q.block(item["ref"], session_id="w-1", question="A or B?")
+    workers.record_worker(
+        _dead_pid(), "THROUGHPUT", "kimi", "w-1",
+        repo_path=str(tmp_path), session_id=sid,
+    )
+    assert workers.list_workers()[-1]["alive"] is False
+
+    forked = []
+    monkeypatch.setattr(
+        messages, "send",
+        lambda *a, **k: {"ok": False, "error": "unresolvable target"},
+    )
+    monkeypatch.setattr(
+        cli, "_resume_session_headless",
+        lambda *a, **k: forked.append((a, k)) or True,
+    )
+
+    assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
+    assert forked[0][0][3] == "kimi"
+
+
 def test_answer_resume_reports_immediate_process_exit(wt, tmp_path, monkeypatch):
     cli, _, _ = wt
 
@@ -191,6 +247,31 @@ def test_answer_resume_reports_immediate_process_exit(wt, tmp_path, monkeypatch)
 
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Proc())
     monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "0.2")
+
+    assert not cli._resume_session_headless(
+        "11111111-2222-3333-4444-555555555555",
+        str(tmp_path),
+        "apply the answer",
+        "codex",
+    )
+
+
+def test_answer_resume_polls_after_final_sleep(wt, tmp_path, monkeypatch):
+    cli, _, _ = wt
+    poll_results = iter([None, 2])
+    clock = iter([0.0, 0.0, 0.2])
+
+    class Proc:
+        pid = os.getpid()
+
+        def poll(self):
+            return next(poll_results)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(cli.time, "time", lambda: next(clock))
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
     monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "0.2")
 
     assert not cli._resume_session_headless(

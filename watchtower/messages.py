@@ -71,6 +71,7 @@ same ``fcntl`` file lock the queue store uses. Stdlib only.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -406,6 +407,16 @@ def _known_sessions(
 ) -> Dict[str, str]:
     """All session UUIDs we know about, mapped to their engine."""
     known: Dict[str, str] = {}
+    for sid in workers._load_worker_session_ledger():
+        known[sid] = "kimi" if sid.startswith("session_") else "claude"
+    try:
+        from . import codex_registry
+        threads = codex_registry.load().get("threads") or {}
+        for sid, rec in threads.items():
+            if isinstance(rec, dict) and rec.get("engine") == "codex":
+                known[str(sid)] = "codex"
+    except (OSError, ValueError):
+        pass
     for name, rec in agents.items():
         if isinstance(rec, dict) and rec.get("session_id"):
             known[str(rec["session_id"])] = str(rec.get("engine") or "claude")
@@ -457,11 +468,18 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
             "engine": str(rec.get("engine") or "claude"),
             "cwd": str(rec.get("cwd") or ""),
         }
+    known = _known_sessions(live, agents)
+    if include_recent:
+        for r in recent_sessions():
+            known.setdefault(str(r["session_id"]), "claude")
+    if t in known:
+        return {
+            "kind": "session",
+            "session_id": t,
+            "worker": _worker_for_session(live, t),
+            "engine": known[t],
+        }
     if _HEX_PREFIX_RE.match(t):
-        known = _known_sessions(live, agents)
-        if include_recent:
-            for r in recent_sessions():
-                known.setdefault(str(r["session_id"]), "claude")
         matches = sorted(
             {sid for sid in known if sid.lower().startswith(t.lower())}
         )
@@ -758,9 +776,9 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     # missing transcript) exits within a second or two. Reporting ok on a
     # dead child silently drops the message — watch the verify window and
     # surface the death so send() parks the text for retry instead.
-    deadline = time.time() + _resume_verify_window_s()
+    deadline = time.monotonic() + _resume_verify_window_s()
     poll = getattr(proc, "poll", None)
-    while callable(poll) and time.time() < deadline:
+    while callable(poll):
         rc = poll()
         if rc is not None:
             return {
@@ -768,7 +786,10 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
                 "error": f"claude resume exited rc={rc} at boot "
                          f"(see {log_path})",
             }
-        time.sleep(0.1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
     return {"ok": True, "transport": "resume", "log": str(log_path)}
 
 
@@ -837,9 +858,10 @@ def _ensure_transcript_in_cwd_bucket(sid: str, cwd: str) -> None:
 def _resume_verify_window_s() -> float:
     """How long to watch a fresh resume child for boot-time death."""
     try:
-        return float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
+        value = float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
     except ValueError:
         return 2.0
+    return value if math.isfinite(value) and value > 0 else 2.0
 
 
 # ------------------------------------------------------ resume-child reaper
@@ -1436,6 +1458,7 @@ def outbox_add(
     to: str,
     text: str,
     mode: str = "send",
+    engine: str = "",
     error: str = "",
     delay_s: float = BACKOFF_BASE_S,
     ttl_s: Optional[float] = None,
@@ -1456,6 +1479,8 @@ def outbox_add(
     }
     if ttl_s is not None:
         msg["expires_at"] = _iso(now + float(ttl_s))
+    if engine:
+        msg["engine"] = str(engine)
     with queue_mod._FileLock(_outbox_lock()):
         data = _load_outbox()
         data["messages"].append(msg)
@@ -1556,6 +1581,8 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             # transcript archive; outbox targets are already resolved sids
             # (or exact worker ids / names), so the window adds nothing here.
             resolved = resolve_target(str(m.get("to") or ""), include_recent=False)
+            if m.get("engine"):
+                resolved["engine"] = str(m["engine"])
             outcomes[str(m.get("id"))] = deliver(
                 resolved, str(m.get("text") or ""), str(m.get("mode") or "send")
             )
@@ -1613,6 +1640,7 @@ def send(
     mode: str = "send",
     queue_on_fail: bool = True,
     ttl_s: Optional[float] = None,
+    engine: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
@@ -1625,6 +1653,8 @@ def send(
         resolved = resolve_target(target)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
+    if engine:
+        resolved["engine"] = str(engine)
     result = deliver(resolved, text, mode)
     if result.get("ok"):
         out = {"ok": True, "transport": result.get("transport", "?")}
@@ -1647,7 +1677,7 @@ def send(
     delay = BUSY_HOLD_S if result.get("busy") else float(BACKOFF_BASE_S)
     to = str(resolved.get("session_id") or target)
     msg = outbox_add(
-        to, text, mode=mode,
+        to, text, mode=mode, engine=str(engine or ""),
         error=str(result.get("error") or ""), delay_s=delay, ttl_s=ttl_s,
     )
     return {

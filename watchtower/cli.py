@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -816,12 +817,17 @@ def _resume_session_headless(
             verify_s = float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
         except ValueError:
             verify_s = 2.0
-        deadline = time.time() + verify_s
+        if not math.isfinite(verify_s) or verify_s <= 0:
+            verify_s = 2.0
+        deadline = time.monotonic() + verify_s
         poll = getattr(proc, "poll", None)
-        while callable(poll) and time.time() < deadline:
+        while callable(poll):
             if poll() is not None:
                 return False
-            time.sleep(0.1)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.1, remaining))
         if queue and worker_id:
             workers.record_worker(
                 proc.pid,
@@ -843,26 +849,18 @@ def _answer_engine(item: Dict[str, object], requested: Optional[str]) -> str:
     if requested:
         return requested
     sid = str(item.get("claimed_session_id") or "")
-    worker_id = str(item.get("claimed_by") or "")
-    try:
-        known = workers.list_workers(prune=False)
-        for field, value in (("session_id", sid), ("worker_id", worker_id)):
-            if not value:
-                continue
-            for worker in reversed(known):
-                if str(worker.get(field) or "") == value:
-                    engine = str(worker.get("engine") or "")
-                    if engine in ("claude", "codex", "kimi"):
-                        return engine
-    except (OSError, ValueError):
-        pass
     if sid:
         try:
-            from . import codex_registry
-            if (codex_registry.entry(sid) or {}).get("engine") == "codex":
-                return "codex"
+            from . import messages
+            engine = str(
+                messages.resolve_target(sid, include_recent=False).get("engine") or ""
+            )
+            if engine in ("claude", "codex", "kimi"):
+                return engine
         except (OSError, ValueError):
             pass
+        if sid.startswith("session_"):
+            return "kimi"
     return "claude"
 
 
@@ -899,8 +897,9 @@ def cmd_answer(args: argparse.Namespace) -> int:
     )
     from . import messages
     target = item.get("claimed_session_id") or item.get("claimed_by")
+    engine = _answer_engine(item, args.engine)
     try:
-        sent = messages.send(str(target), prompt, mode="steer")
+        sent = messages.send(str(target), prompt, mode="steer", engine=engine)
     except Exception as e:  # never lose the answer to a delivery-layer crash
         sent = {"ok": False, "error": str(e)}
     if sent.get("ok"):
@@ -922,7 +921,7 @@ def cmd_answer(args: argparse.Namespace) -> int:
         sid,
         repo,
         prompt,
-        _answer_engine(item, args.engine),
+        engine,
         queue=item.get("project", ""),
         worker_id=item.get("claimed_by", ""),
     )

@@ -281,6 +281,20 @@ def test_resolve_full_uuid_unknown_accepted(wt):
     assert r["worker"] is None and r["engine"] == "claude"
 
 
+def test_resolve_pruned_codex_worker_from_durable_registry(wt):
+    wt.workers.record_worker(
+        99_999_999, "CODEX", "codex", "codex-deadbeef",
+        repo_path=str(wt.tmp), session_id=SID_D,
+    )
+    assert wt.workers.list_workers()[-1]["alive"] is False
+
+    r = wt.messages.resolve_target(SID_D, include_recent=False)
+
+    assert r["session_id"] == SID_D
+    assert r["engine"] == "codex"
+    assert r.get("known") is not False
+
+
 def test_resolve_unique_prefix(wt):
     wt.messages.register_agent("planner", SID_A)
     r = wt.messages.resolve_target(SID_A[:8])
@@ -756,6 +770,24 @@ def test_send_ttl_is_stored_on_queued_outbox_entry(wt, monkeypatch):
     assert res["ok"] is False and res["queued"] is True
     m = wt.messages.outbox_list(status="pending")[0]
     assert wt.messages._parse_iso(m["expires_at"]) == t0 + 45
+
+
+def test_send_engine_override_is_used_and_persisted(wt, monkeypatch):
+    resolved = []
+    monkeypatch.setattr(
+        wt.messages,
+        "deliver",
+        lambda target, text, mode: resolved.append(target) or {
+            "ok": False,
+            "error": "offline",
+        },
+    )
+
+    res = wt.messages.send(SID_B, "queued hello", engine="kimi")
+
+    assert res["queued"] is True
+    assert resolved[0]["engine"] == "kimi"
+    assert wt.messages.outbox_list()[0]["engine"] == "kimi"
 
 
 def test_drain_outbox_marks_expired_pending_message_dead(wt, monkeypatch):
