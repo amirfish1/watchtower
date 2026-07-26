@@ -258,12 +258,13 @@ wt close MYAPP-123 --worker worker-1 --summary "fixed the null state" --commit <
 ```
 
 GitHub-backed refs use the issue number (`MYAPP-123` is issue `#123`). A
-GitHub-backed queue lists open issues from the configured repository so GitHub is
-the visible storage layer. The `watchtower:<QUEUE>` label is the automation gate:
-unlabeled open issues are visible in `wt ls`, `wt status`, and the dashboard, but
-workers will not claim them. Use `wt run MYAPP-123` (or the dashboard Run action)
-to add that label and dispatch the queue. Claims assign the issue to `@me` by
-default; override with `wt set -q MYAPP --github-assignee USERNAME`.
+GitHub-backed queue lists open issues plus issues completed in the last 14 days
+from the configured repository, so GitHub is the visible storage layer. The
+`watchtower:<QUEUE>` label is the automation gate: unlabeled open issues are
+visible in `wt ls`, `wt status`, and the dashboard, but workers will not claim
+them. Use `wt run MYAPP-123` (or the dashboard Run action) to add that label and
+dispatch the queue. Claims assign the issue to `@me` by default; override with
+`wt set -q MYAPP --github-assignee USERNAME`.
 
 `wt status` shows, per queue, depth (open) / WIP / done, oldest-open age, idle
 time, a `WORKERS` column (`total (n live)`), and a STUCK/draining/ok flag,

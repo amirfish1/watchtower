@@ -71,6 +71,25 @@ def test_mutations_append_canonical_history_and_stop_legacy_lists(wt):
     assert closed["history"][-1]["resolution"] == {"summary": "done"}
 
 
+def test_ticket_updates_appear_in_activity_log(wt):
+    item = wt.q.enqueue(project="EVT", note="activity log", source="test")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    wt.q.block(
+        item["ref"],
+        session_id="worker-a",
+        question="Which option?",
+        progress="Investigated both options.",
+    )
+    wt.q.comment(item["ref"], "Use option A.")
+    wt.q.answer(item["ref"], "Approved.")
+
+    log = (wt.store.parent / "activity.log").read_text()
+    assert f"PROGRESS {item['ref']} — Investigated both options." in log
+    assert f"BLOCK    {item['ref']} — Which option?" in log
+    assert f"COMMENT  {item['ref']} — Use option A." in log
+    assert f"ANSWER   {item['ref']} — Approved." in log
+
+
 def test_cli_edit_text_replaces_file_backed_ticket_body(wt, capsys):
     item = wt.q.enqueue(
         project="EDIT",

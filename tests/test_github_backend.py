@@ -12,6 +12,7 @@ import json
 import os
 import threading
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -455,6 +456,42 @@ def test_github_backend_lists_all_open_issues_but_claims_only_queue_labeled(tmp_
     claimed = q.claim_next("worker-1", project="GHI")
     assert claimed["ref"] == "GHI-2"
     assert q.claim_next("worker-2", project="GHI") is None
+
+
+def test_github_backend_lists_issues_closed_within_last_14_days(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+
+    now = datetime.now(timezone.utc)
+    recent = _fake_issue(1, "Recently completed")
+    recent["state"] = "CLOSED"
+    recent["closedAt"] = (now - timedelta(days=13)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    old = _fake_issue(2, "Old completion")
+    old["state"] = "CLOSED"
+    old["closedAt"] = (now - timedelta(days=15)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    open_issue = _fake_issue(3, "Still open")
+    _write_fake_issues(state, [recent, old, open_issue])
+
+    assert [it["ref"] for it in q.list_items(project="GHI")] == [
+        "GHI-1", "GHI-3",
+    ]
+    assert [it["ref"] for it in q.list_items(project="GHI", status="closed")] == [
+        "GHI-1",
+    ]
+    assert q.list_items(project="GHI", status="closed")[0]["claimable"] is False
+
+    commands = json.loads(state.read_text())["commands"]
+    closed_lists = [
+        command for command in commands
+        if command[:2] == ["issue", "list"] and "closed" in command
+    ]
+    assert closed_lists
+    assert any(
+        arg.startswith("closed:>=")
+        for arg in closed_lists[0]
+    )
 
 
 def test_github_backend_refuses_direct_claim_until_issue_is_marked_runnable(tmp_path, monkeypatch):

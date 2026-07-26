@@ -113,6 +113,69 @@ _LAUNCH_POSTMORTEM_MAX_LOG_BYTES = int(
 # is absolute and independent of {repo} -- the runbook ships with the wt
 # package, not with whatever repo a given queue's tickets live in.
 _WORKER_RUNBOOK_PATH = Path(__file__).resolve().parent.parent / "docs" / "worker-runbook.md"
+# A pip install lays the package in site-packages WITHOUT docs/, so the path
+# above only resolves in a repo checkout. Workers handed a dead path burn
+# approval prompts probing for the file (observed: a default-policy Codex
+# turn hung on `cat <dead path>`, then on a fallback fetch); point them at
+# the canonical published copy instead.
+_WORKER_RUNBOOK_URL = (
+    "https://raw.githubusercontent.com/amirfish1/watchtower/main/docs/worker-runbook.md"
+)
+
+
+def _worker_runbook_ref() -> str:
+    """Where a spawned worker should read the shared runbook: the local file
+    when it exists, else the published URL (fetch it)."""
+    try:
+        if _WORKER_RUNBOOK_PATH.is_file():
+            return str(_WORKER_RUNBOOK_PATH)
+    except OSError:
+        pass
+    return _WORKER_RUNBOOK_URL
+
+
+# Codex approval/sandbox policy is per-turn, not per-thread: the spawn's
+# --dangerously-bypass-approvals-and-sandbox does NOT carry over to turns
+# other clients start on the same thread (native goal continuations, desktop
+# takeovers). Such a turn runs workspace-write with on-request approvals, and
+# its first `wt` command -- which writes ~/.watchtower, outside any repo
+# workspace -- hangs on an approval prompt no headless worker can answer
+# (observed: a goal-continuation turn stalled 60 minutes on `wt claim`).
+# Codex's user execpolicy is the scoped fix: an allow rule for `wt`
+# auto-approves exactly those commands in every turn, full-auto or not.
+_CODEX_EXECPOLICY_RULE = 'prefix_rule(pattern=["wt"], decision="allow")'
+
+
+def ensure_codex_wt_execpolicy() -> bool:
+    """Idempotently allow `wt` in Codex's user execpolicy (`$CODEX_HOME/rules`).
+
+    Writes a WatchTower-owned ``watchtower.rules`` file next to Codex's own
+    ``default.rules``. No-op when Codex isn't set up (no home dir), when the
+    rule is already present, or on any OS error -- never raises. Returns True
+    when the rule is in place."""
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    try:
+        if not codex_home.is_dir():
+            return False
+        rules_dir = codex_home / "rules"
+        rules_path = rules_dir / "watchtower.rules"
+        if rules_path.is_file() and _CODEX_EXECPOLICY_RULE in rules_path.read_text(
+            encoding="utf-8"
+        ):
+            return True
+        rules_dir.mkdir(mode=0o700, exist_ok=True)
+        rules_path.write_text(
+            "# Managed by WatchTower (workers.ensure_codex_wt_execpolicy).\n"
+            "# Default-policy Codex turns (e.g. native goal continuations,\n"
+            "# which do not inherit a spawn's full-auto policy) would\n"
+            "# otherwise hang on an approval prompt for WatchTower queue\n"
+            "# commands.\n"
+            + _CODEX_EXECPOLICY_RULE + "\n",
+            encoding="utf-8",
+        )
+        return True
+    except OSError:
+        return False
 
 # Drain goal adapted from CCC's docs/ux-fixes-worker-brief.md canonical /goal.
 # Generalized: no CCC paths, no shared-clone assumptions. The worker drains one
@@ -1770,7 +1833,7 @@ def drain_goal(
     claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
     goal = DRAIN_GOAL_TEMPLATE.format(
         queue=queue, worker_id=worker_id, repo=repo_path or os.getcwd(),
-        claim_filter=claim_filter, runbook=str(_WORKER_RUNBOOK_PATH),
+        claim_filter=claim_filter, runbook=_worker_runbook_ref(),
         idle_contract=(
             CODEX_IDLE_CONTRACT if engine == "codex"
             else KIMI_IDLE_CONTRACT if engine == "kimi"
@@ -1780,7 +1843,7 @@ def drain_goal(
             CODEX_RESUME_CONTRACT if engine == "codex"
             else KIMI_RESUME_CONTRACT if engine == "kimi"
             else CLAUDE_RESUME_CONTRACT
-        ).format(runbook=str(_WORKER_RUNBOOK_PATH)),
+        ).format(runbook=_worker_runbook_ref()),
     )
     extra = (extra_instructions or "").strip()
     if extra:
@@ -1822,6 +1885,9 @@ def build_drain_command(
     """
     bin_name = _ENGINE_BIN.get(engine, engine)
     if engine == "codex":
+        # Best-effort, idempotent: keep `wt` runnable in turns that do NOT
+        # inherit the bypass flag below (see ensure_codex_wt_execpolicy).
+        ensure_codex_wt_execpolicy()
         argv = [
             bin_name,
             "exec",
@@ -1887,7 +1953,44 @@ def request_stop(worker_id: str) -> Path:
     return signal_path
 
 
-def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
+def _answer_in_flight(
+    answered_at: Any, sid: str, now: float, grace_s: float
+) -> bool:
+    """True while a just-delivered answer is still being applied to a ticket.
+
+    ``wt answer`` delivers through the liveness-aware messaging primitive
+    (steer a live worker, resume an idle one) rather than forking a resume
+    child registered under the worker id, so the original ``claimed_by`` worker
+    can read "dead" in the orphan sweep while the answer is mid-application.
+    Reopening then would hand the ticket to a second worker (duplicate work).
+    Hold off while the answer is still fresh (within ``grace_s``), or while the
+    resumed/steered session is actively writing its transcript. Best-effort:
+    any lookup failure returns False so the sweep is never wedged by it."""
+    if not answered_at:
+        return False
+    try:
+        from datetime import datetime
+        ts = datetime.fromisoformat(str(answered_at).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return False
+    if (now - ts) < grace_s:
+        return True
+    # Beyond the grace, still protect a session that is demonstrably working the
+    # answer (hot transcript). Codex sessions have no wt-visible transcript, so
+    # this only helps claude; codex relies on the grace window above.
+    if sid:
+        try:
+            from . import messages
+            if messages.session_state(str(sid)) == "busy":
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def requeue_orphaned_tickets(
+    grace_s: float = 120.0, answer_grace_s: Optional[float] = None
+) -> List[Dict[str, Any]]:
     """Reopen in_progress tickets whose claiming worker is no longer alive.
 
     A worker that dies, crashes, or is reaped mid-ticket leaves its ticket
@@ -1912,6 +2015,11 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
     Returns the list of reopened items."""
     from . import queue as _q
     import time as _time
+    if answer_grace_s is None:
+        try:
+            answer_grace_s = float(os.environ.get("WATCHTOWER_ANSWER_GRACE_S", "300"))
+        except (TypeError, ValueError):
+            answer_grace_s = 300.0
     known_workers = list_workers(prune=False)
     live_ids = {str(w.get("worker_id", "")) for w in known_workers if w.get("alive")}
     # Union with the persistent ledger, not just the current (prunable) store:
@@ -1933,6 +2041,15 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
         # resumes the original session. Reopening would hand it to a different
         # worker that lacks the original context.
         if it.get("needs_input"):
+            continue
+        # Skip a ticket whose answer is still being applied. `wt answer` delivers
+        # via the liveness-aware messaging primitive, so the original worker can
+        # look dead here while the resumed/steered session works the answer;
+        # reopening now would duplicate that work (see _answer_in_flight).
+        if _answer_in_flight(
+            it.get("answered_at"), str(it.get("claimed_session_id") or ""),
+            now, answer_grace_s,
+        ):
             continue
         claimer = str(it.get("claimed_by") or "")
         if claimer and claimer in live_ids:

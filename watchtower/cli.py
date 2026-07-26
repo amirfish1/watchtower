@@ -829,11 +829,17 @@ def _resume_session_headless(
 
 
 def cmd_answer(args: argparse.Namespace) -> int:
-    """Inject a human answer onto a blocked ticket and auto-resume its session.
+    """Inject a human answer onto a blocked ticket and hand it to the session.
 
-    Clears needs_input, then wakes the blocked worker's session headless with
-    the answer so it finishes and closes the ticket — no manual `wt discuss`
-    step (WT-28)."""
+    Clears needs_input, then delivers the answer through the one liveness-aware
+    delivery primitive (``messages.send`` with ``mode="steer"``): steer the
+    worker if its turn is live, resume it if idle, hold-and-retry via the
+    durable outbox if it is busy or momentarily unreachable. This replaces a
+    blind ``--resume`` fork, which for a Codex worker becomes a second
+    app-server owner on a session CCC may already be driving (WT-28, WT-90).
+    Only CCC knows a Codex session's liveness, so ``messages.send`` delegates
+    there; a genuinely unresolvable target still falls back to the headless
+    resume fork so the answer is never silently dropped."""
     item = q.answer(args.ref, args.text, session_id=args.worker)
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
@@ -853,6 +859,27 @@ def cmd_answer(args: argparse.Namespace) -> int:
         f"If it still cannot be resolved, run `wt block` again with the new "
         f"open question."
     )
+    from . import messages
+    target = item.get("claimed_session_id") or item.get("claimed_by")
+    try:
+        sent = messages.send(str(target), prompt, mode="steer")
+    except Exception as e:  # never lose the answer to a delivery-layer crash
+        sent = {"ok": False, "error": str(e)}
+    if sent.get("ok"):
+        print(f"ANSWERED: {item['ref']} — delivered to session {sid} via "
+              f"{sent.get('transport', '?')} to apply your answer and close.")
+        return 0
+    if sent.get("queued"):
+        # Busy or momentarily unreachable: the durable outbox will deliver once
+        # the session goes idle. The answer_grace in requeue_orphaned_tickets
+        # keeps the sweep from reopening the ticket in the meantime.
+        held = "session is mid-turn" if sent.get("busy") else "delivery deferred"
+        print(f"ANSWERED: {item['ref']} — {held}; answer queued for delivery "
+              f"({sent.get('id', '?')}).")
+        return 0
+    # Unresolvable target (nothing queued): fall back to the headless resume
+    # fork, which registers the resume child under the worker id so the orphan
+    # sweep cannot reopen the ticket while the answer is applied.
     started = _resume_session_headless(
         sid,
         repo,
@@ -865,8 +892,9 @@ def cmd_answer(args: argparse.Namespace) -> int:
         print(f"ANSWERED: {item['ref']} — resuming session {sid} in {repo} "
               f"to apply your answer and close.")
     else:
-        print(f"ANSWERED: {item['ref']} — needs_input cleared, but auto-resume "
-              f"failed to start. Resume manually: wt discuss {item['ref']}")
+        print(f"ANSWERED: {item['ref']} — needs_input cleared, but delivery "
+              f"failed ({sent.get('error', 'unknown')}). Resume manually: "
+              f"wt discuss {item['ref']}")
     return 0
 
 
