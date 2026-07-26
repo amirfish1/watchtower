@@ -302,11 +302,17 @@ def _github_backend_for_project(project: Any):
         if config.backend(proj) != "github":
             return None
         from .github_backend import GitHubIssuesBackend
+        repo = config.github_repo(proj)
         return GitHubIssuesBackend(
             proj,
-            repo=config.github_repo(proj),
+            repo=repo,
             repo_path=config.repo_path(proj),
             assignee=config.github_assignee(proj),
+            # Queue-level eligibility inputs, resolved here so the backend
+            # judges every item against one policy snapshot per operation.
+            auto_drain=config.auto_drain(proj),
+            grace_s=config.grace_s(proj),
+            partition_by_label=len(config.github_queues_for_repo(repo)) > 1,
         )
     except Exception:
         raise
@@ -696,6 +702,11 @@ def enqueue(
             "confidence": _norm_choice(confidence, VALID_CONFIDENCES),
             "needs_input": False,
             "block_question": "",
+            # The two ticket-level eligibility inputs (2026-07-26 design). The
+            # GitHub backend stores these as labels; here they are plain
+            # booleans, so both backends hand downstream code the same shape.
+            "no_auto_drain": False,
+            "run_requested": False,
             "claimed_by": None,
             "claimed_at": None,
             "closed_at": None,
@@ -765,23 +776,66 @@ def list_items(
     return items
 
 
-def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
-    """Mark an existing ticket as eligible for WatchTower automation.
+def _set_run_requested(ident: Any, requested: bool, event: str) -> Optional[Dict[str, Any]]:
+    """Flip a file-backed ticket's ``run_requested`` flag, recording the event."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                if bool(it.get("run_requested", False)) == requested:
+                    return it
+                now = _now_iso()
+                it["run_requested"] = requested
+                it["updated_at"] = now
+                _append_history(it, event, by=_by("system"), at=now)
+                _save_unlocked(data)
+                return it
+    return None
 
-    For GitHub-backed queues this adds the queue's ``watchtower:<QUEUE>`` label
-    to an existing open issue. For file-backed queues, a closed ticket is
-    reopened so that it can be claimed again; open and in-progress tickets are
-    left unchanged.
+
+def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
+    """Request a run for this ticket — the ▶ / ``wt run`` path.
+
+    Sets ``run_requested``, the eligibility input that beats auto_drain being
+    off, the no-auto-drain opt-out, and the grace period (2026-07-26 design).
+    The GitHub backend stores it as a label; here it is a boolean on the item,
+    so both backends leave the same observable state behind. A closed
+    file-backed ticket is reopened first — asking to run a closed ticket can
+    only mean "work it again", and there is nothing to run while it is closed.
     """
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         item = backend.mark_runnable(ident)
         if item:
-            _log("RUN", f"{item.get('ref', ident)} — marked runnable", queue=item.get("project", ""))
+            _log("RUN", f"{item.get('ref', ident)} — run requested", queue=item.get("project", ""))
         return item
     item = get(ident)
-    if item and item.get("status") == "closed":
-        return update_status(ident, "open", reason="marked runnable")
+    if item is None:
+        return None
+    if item.get("status") == "closed":
+        update_status(ident, "open", reason="marked runnable")
+    item = _set_run_requested(ident, True, "run_requested")
+    if item:
+        _log("RUN", f"{item.get('ref', ident)} — run requested", queue=item.get("project", ""))
+    return item
+
+
+def clear_run_request(ident: Any) -> Optional[Dict[str, Any]]:
+    """Cancel a pending run request (pressing ▶ again while still queued).
+
+    The inverse of ``mark_runnable``. It only withdraws the request: nothing
+    else about the ticket changes, and a ticket a worker has already claimed
+    keeps running — the request has served its purpose by then.
+    """
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        item = backend.clear_run_request(ident)
+        if item:
+            _log("RUN", f"{item.get('ref', ident)} — run request cleared", queue=item.get("project", ""))
+        return item
+    item = _set_run_requested(ident, False, "run_request_cleared")
+    if item:
+        _log("RUN", f"{item.get('ref', ident)} — run request cleared", queue=item.get("project", ""))
     return item
 
 
@@ -966,6 +1020,31 @@ def count_claimable(
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         return len(_claim_candidates(data["items"], project=proj, lane=lane, item_types=item_types))
+
+
+def count_manual_eligible(
+    project: Optional[str] = None,
+    lane: Optional[str] = None,
+    item_types: Optional[List[str]] = None,
+) -> int:
+    """How many claimable tickets a human explicitly asked to run (``▶``).
+
+    ``count_claimable`` answers "does this queue want unattended workers", so it
+    is deliberately blind to run requests. This is the other half: what the
+    reconciler must still staff on a queue with auto_drain off, because
+    auto_drain=off means "no *automatic* work", not "ignore what I pressed".
+    Same candidate filter as claim_next, so a run request on a ticket no worker
+    could claim (wrong claim_type, needs-shaping) still spawns nothing."""
+    backend = _github_backend_for_project(project)
+    if backend is not None:
+        return backend.count_manual_eligible(lane=lane, item_types=item_types)
+    proj = _norm_project(project) if project else None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        candidates = _claim_candidates(
+            data["items"], project=proj, lane=lane, item_types=item_types
+        )
+        return len([it for it in candidates if it.get("run_requested", False)])
 
 
 def _hosted_codex_thread_owns_worker(worker_id: str, session_uuid: str) -> bool:

@@ -252,18 +252,39 @@ gh auth login
 wt set -q MYAPP --backend github --github-repo owner/repo
 
 wt add -q MYAPP --title "Fix checkout" --text "Steps to reproduce..."
-wt run MYAPP-123                       # opt an existing issue into automation
+wt run MYAPP-123                       # run this issue now (overrides drain/grace)
 wt claim -q MYAPP --worker worker-1
 wt close MYAPP-123 --worker worker-1 --summary "fixed the null state" --commit <SHA>
 ```
 
 GitHub-backed refs use the issue number (`MYAPP-123` is issue `#123`). A
 GitHub-backed queue lists open issues plus issues completed in the last 14 days
-from the configured repository, so GitHub is the visible storage layer. The
-`watchtower:<QUEUE>` label is the automation gate: unlabeled open issues are
-visible in `wt ls`, `wt status`, and the dashboard, but workers will not claim
-them. Use `wt run MYAPP-123` (or the dashboard Run action) to add that label and
-dispatch the queue. Claims assign the issue to `@me` by default; override with
+from the configured repository, so GitHub is the visible storage layer.
+
+Whether a ticket gets worked comes from three independent inputs, not from a
+whitelist label:
+
+| Input | Lives on | Default |
+|---|---|---|
+| `auto_drain` (`wt drain on\|off MYAPP`) | queue | off |
+| `watchtower:no-auto-drain` | issue label | absent |
+| `watchtower:play` (`wt run MYAPP-123`) | issue label | absent |
+| `grace_s` (`wt config -q MYAPP --grace-s 180`) | queue | 180s |
+
+```
+auto_eligible   = auto_drain AND NOT no-auto-drain AND age >= grace_s
+manual_eligible = run_requested            # wt run / the dashboard Run action
+work_it         = auto_eligible OR manual_eligible
+```
+
+So a queue with drain on works every open issue except the ones labelled
+`watchtower:no-auto-drain`, and leaves brand-new issues alone for `grace_s`
+seconds so a human can label them first. `wt run MYAPP-123` overrides all
+three. The old `watchtower:<QUEUE>` label no longer admits anything; it is
+only still read when two or more queues point at the *same* repo, where it is
+the only way to say which issue belongs to which queue. Turning drain on for a
+**public** repo prints a warning first — agents will work strangers' issues.
+Claims assign the issue to `@me` by default; override with
 `wt set -q MYAPP --github-assignee USERNAME`.
 
 `wt status` shows, per queue, depth (open) / WIP / done, oldest-open age, idle

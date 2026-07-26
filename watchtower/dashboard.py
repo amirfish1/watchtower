@@ -13,7 +13,7 @@ Routes:
     GET  /api/status                {"queues": [...health rows + workers...], "workers": [...]}
     GET  /api/queues                raw per-queue counts (mirrors `wt queues`)
     GET  /api/queue/<name>          active + closed tickets (closed carry resolution)
-    POST /api/ticket/<ref>/run      mark a ticket runnable and spawn one scoped worker
+    POST /api/ticket/<ref>/run      request a run; the reconciler spawns the worker
     POST /api/queue/<name>/add      ingest a ticket — {"note": "...", "url": "...",
                                       "selector": "...", "repo_path": "...",
                                       "title": "...", "source": "...", "text": "..."}
@@ -1056,9 +1056,13 @@ def render_queue(
         )
         title = html.escape(str(it.get("title") or it.get("note") or "")[:120])
         action = '<span class="run-spacer"></span>'
-        if status == "open" and not it.get("watchtower_runnable", True):
+        # Shown on any open ticket that hasn't been asked to run yet. The old
+        # condition ("missing the queue label") is gone with the whitelist:
+        # every open ticket is now a candidate, so the button's job is to
+        # request a run, not to admit the ticket.
+        if status == "open" and not it.get("run_requested", False):
             action = (
-                f'<button class="run-btn" title="Mark runnable" '
+                f'<button class="run-btn" title="Run this ticket" '
                 f'onclick="wtRun(\'{ref}\')">Run</button>'
             )
         trows.append(
@@ -1327,10 +1331,15 @@ class _Handler(BaseHTTPRequestHandler):
                 if item.get("status") != "open":
                     self._json(400, {"error": f"{item.get('ref', ref)} is not open"})
                     return
-                worker = workers.spawn_run_once_worker(
-                    item.get("project", ""),
-                    item.get("ref", ""),
-                    repo_path=str(item.get("repo_path") or ""),
+                # Mark-and-dispatch, not spawn-directly. `mark_runnable` has
+                # already set `run_requested`, which beats auto_drain being off;
+                # letting the reconciler own the spawn is what keeps a queue's
+                # worker budget honoured, so pressing run on three tickets works
+                # them one at a time instead of starting three workers at once.
+                # Spawning here would bypass that -- and would diverge from the
+                # CCC dashboard, which drives the same button through this path.
+                reason = workers.dispatch_after_enqueue(
+                    item.get("project", ""), item.get("ref", ""),
                 )
             except ValueError as exc:
                 self._json(400, {"error": str(exc)})
@@ -1338,7 +1347,7 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:  # noqa: BLE001
                 self._json(500, {"error": str(exc)})
                 return
-            self._json(200, {"ok": True, "ticket": item, "worker": worker})
+            self._json(200, {"ok": True, "ticket": item, "dispatch": reason})
             return
         # POST /api/send: {"to", "text", "mode"} -> messages.send
         if path == "/api/send":

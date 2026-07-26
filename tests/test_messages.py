@@ -1325,8 +1325,10 @@ def test_cli_close_renames_session_with_summary(wt):
     wt.q.claim_next("w1", project="NAMEQ")
     wt.q.backfill_session_id(item["ref"], SID_A)
 
+    # Closes are bound to the claiming worker, so close as `w1` (the claimant).
     assert cli.main([
-        "close", item["ref"], "--summary", "fixed the thing", "--no-code",
+        "close", item["ref"], "--worker", "w1",
+        "--summary", "fixed the thing", "--no-code",
     ]) == 0
 
     lines = [l for l in p.read_text().splitlines() if l.strip()]

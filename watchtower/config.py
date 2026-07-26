@@ -7,6 +7,9 @@ auto-drained. Auto-drain is **off by default** — a new queue is a backlog
 until you explicitly opt in with ``wt drain on <queue>``. This prevents
 surprise worker spawns on queues that are just parking lots.
 
+It also holds ``grace_s`` (see :data:`DEFAULT_GRACE_S`), the other queue-level
+input to a GitHub-backed ticket's eligibility.
+
 Stored as ``~/.watchtower/queue-config.json`` = ``{queue: {auto_drain: bool}}``.
 """
 
@@ -15,12 +18,22 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
 VALID_BACKENDS = ("file", "github")
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 STANDARD_EFFORTS = VALID_EFFORTS[:-1]
+
+# How long a ticket is left alone before auto-drain may claim it. With
+# auto-drain on, the reconciler claims a brand-new issue within ~30s, so a
+# human never gets a chance to label it `watchtower:no-auto-drain` -- the
+# grace period is what makes that opt-out usable for *inbound* issues rather
+# than only pre-existing ones. 0 disables it (fast queues that should drain
+# immediately). It gates auto-eligibility only; a human pressing play ignores
+# it.
+DEFAULT_GRACE_S = 180
 
 # WatchTower's explicitly supported worker model identifiers. This is a
 # deployment policy rather than a claim about every model an account may be
@@ -163,6 +176,55 @@ def auto_drain(queue: str) -> bool:
     """False unless explicitly opted in. Default-off so a fresh queue is a
     backlog until you run ``wt drain on <queue>``."""
     return bool(_load().get(queue, {}).get("auto_drain", False))
+
+
+def set_grace_s(queue: str, seconds: Any) -> Dict[str, Any]:
+    """Set this queue's auto-drain grace period in seconds (see DEFAULT_GRACE_S).
+
+    ``None`` clears the override so the queue falls back to the default; 0 is a
+    meaningful value (drain immediately) and is stored as such."""
+    data = _load()
+    q = data.setdefault(queue, {})
+    if seconds is None:
+        q.pop("grace_s", None)
+    else:
+        value = int(seconds)
+        if value < 0:
+            raise ValueError("grace_s must be >= 0")
+        q["grace_s"] = value
+    _save(data)
+    return q
+
+
+def grace_s(queue: str) -> int:
+    """Seconds a ticket must age before auto-drain may claim it."""
+    raw = _load().get(queue, {}).get("grace_s", DEFAULT_GRACE_S)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_GRACE_S
+    return value if value >= 0 else DEFAULT_GRACE_S
+
+
+def github_queues_for_repo(repo: str) -> list:
+    """Every github-backed queue configured against ``repo`` (OWNER/REPO).
+
+    Used to decide whether the legacy ``watchtower:<QUEUE>`` label still has a
+    job: with one queue per repo it is inert, with two or more it is the only
+    thing that can partition the repo's issues between them.
+    """
+    target = str(repo or "").strip().lower()
+    if not target:
+        return []
+    out = []
+    for name, entry in _load().items():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("backend") or "").strip().lower() != "github":
+            continue
+        if str(entry.get("github_repo") or "").strip().lower() == target:
+            out.append(name)
+    return sorted(out)
 
 
 def set_claim_types(queue: str, types: Any) -> Dict[str, Any]:
@@ -411,6 +473,61 @@ def ensure_entry(queue: str) -> Dict[str, Any]:
         data[queue] = {}
         _save(data)
     return dict(data[queue])
+
+
+# One-time marker for the GitHub eligibility migration below. It lives next to
+# the config file (not *inside* it) because every top-level key of that file is
+# a queue name -- a reserved key would show up as a phantom queue in
+# all_queues() and everything that iterates it.
+GH_DRAIN_MIGRATION_MARKER = CONFIG_FILE.parent / "gh-drain-migration.done"
+
+GH_DRAIN_MIGRATION_MESSAGE = (
+    "WatchTower changed how GitHub queues pick work; drain was turned off for "
+    "{queue} so nothing runs unexpectedly. Turn it back on when ready."
+)
+
+
+def migrate_github_auto_drain() -> list:
+    """One-time: turn ``auto_drain`` off for every GitHub-backed queue.
+
+    The dangerous moment in the eligibility change (2026-07-26 design) is the
+    flip itself: the ``watchtower:<QUEUE>`` whitelist stops admitting tickets,
+    so someone who upgrades with auto-drain on would have agents immediately
+    start working *every* open issue in their repo. Turning drain off once, and
+    saying why, makes re-enabling a deliberate act (which is also where the
+    public-repo warning fires).
+
+    Returns the queues that were switched off — empty on every later run,
+    guarded by :data:`GH_DRAIN_MIGRATION_MARKER` so it cannot fire twice and
+    undo a user who has since turned drain back on.
+    """
+    if GH_DRAIN_MIGRATION_MARKER.exists():
+        return []
+    data = _load()
+    switched = []
+    for name, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("backend") or "").strip().lower() != "github":
+            continue
+        if entry.get("auto_drain"):
+            entry["auto_drain"] = False
+            switched.append(name)
+    if switched:
+        _save(data)
+    try:
+        GH_DRAIN_MIGRATION_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        GH_DRAIN_MIGRATION_MARKER.write_text(
+            json.dumps({
+                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "queues": switched,
+            }) + "\n"
+        )
+    except OSError:
+        # Marker unwritable: the migration is still correct, it just may repeat
+        # on the next run. Better than crashing the reconciler at startup.
+        pass
+    return switched
 
 
 _REGISTRY_FILE = Path.home() / ".watchtower" / "queue-registry.json"
