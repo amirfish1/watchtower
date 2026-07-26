@@ -963,22 +963,23 @@ def test_dashboard_drilldown_page_and_api(store):
 
 
 def test_dashboard_run_api_spawns_one_worker_for_backlog_queue(store, monkeypatch):
-    """The row-level Run action is a one-ticket spawn, even when auto_drain is off."""
+    """The row-level Run action records a run request and delegates the spawn.
+
+    It deliberately does NOT spawn directly: going through dispatch_after_enqueue
+    leaves the reconciler owning the spawn, which is what keeps the queue's worker
+    budget honoured when several tickets are requested at once. Auto_drain being
+    off must not stop it — a run request beats that."""
     import watchtower.config as config
     import watchtower.queue as q
     import watchtower.dashboard as dashboard
 
     config.set_auto_drain("CCC", False)
     item = q.enqueue(project="CCC", title="run me", note="run me")
-    spawned = []
+    dispatched = []
     monkeypatch.setattr(
         dashboard.workers,
-        "spawn_run_once_worker",
-        lambda queue, ref, **kw: spawned.append((queue, ref, kw)) or {
-            "queue": queue,
-            "ref": ref,
-            "worker_id": "ccc-test",
-        },
+        "dispatch_after_enqueue",
+        lambda queue, ref="": dispatched.append((queue, ref)) or "nudged",
     )
 
     httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
@@ -998,8 +999,10 @@ def test_dashboard_run_api_spawns_one_worker_for_backlog_queue(store, monkeypatc
         httpd.server_close()
 
     assert payload["ok"] is True
-    assert payload["worker"]["worker_id"] == "ccc-test"
-    assert spawned == [("CCC", item["ref"], {"repo_path": ""})]
+    assert payload["dispatch"] == "nudged"
+    assert dispatched == [("CCC", item["ref"])]
+    # The request is durable on the ticket, not just an in-flight side effect.
+    assert q.get(item["ref"])["run_requested"] is True
 
 
 def test_dashboard_launch_nonblocking_and_stop(store, tmp_path, monkeypatch, capsys):
