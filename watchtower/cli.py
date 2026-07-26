@@ -582,7 +582,22 @@ def cmd_run(args: argparse.Namespace) -> int:
     """Mark an existing ticket runnable and dispatch its queue.
 
     Alias: ``wt ready`` (more descriptive name — 'run' implies 'execute now'
-    but the command actually marks a ticket drainable by workers)."""
+    but the command actually marks a ticket drainable by workers).
+
+    ``--cancel`` withdraws a run request that has not started yet. The dashboards
+    can already do this (a second press of the play button), so without a flag
+    here the CLI is the only surface that can queue a run but not un-queue it."""
+    if getattr(args, "cancel", False):
+        try:
+            item = q.clear_run_request(args.ref)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        if not item:
+            print(f"error: {args.ref} not found", file=sys.stderr)
+            return 1
+        print(f"CANCELLED: {item['ref']}  {item.get('title') or item.get('note','')}")
+        return 0
     try:
         item = q.mark_runnable(args.ref)
     except ValueError as e:
@@ -2989,7 +3004,9 @@ def build_parser() -> argparse.ArgumentParser:
     def _add_ready_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("ref", help="ticket ref / GitHub issue ref, e.g. BYM-GH-FINIE-402")
         p.add_argument("--no-dispatch", action="store_true",
-                       help="only add the WatchTower label; do not nudge/spawn workers")
+                       help="only record the run request; do not nudge/spawn workers")
+        p.add_argument("--cancel", action="store_true",
+                       help="withdraw a run request that has not started yet")
 
     s = sub.add_parser("ready", help="mark an existing ticket ready for workers")
     _add_ready_args(s)
