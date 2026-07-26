@@ -506,6 +506,28 @@ def test_deliver_codex_target_via_app_server(wt, monkeypatch):
     assert reg["wt"]["last_delivery_via"] == "start"
 
 
+def test_deliver_full_uuid_uses_durable_codex_registry_engine(wt, monkeypatch):
+    """A pruned Codex worker remains addressable by its durable thread record."""
+    script = _write_fake_codex_bin(wt.tmp)
+    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(script))
+    _disable_resume(wt, monkeypatch)
+    wt.codex_registry.upsert(
+        SID_D,
+        source="wt-workers",
+        visibility="worker",
+        repo_path="/repo",
+        worker_id="ccc-deadbeef",
+        queue="CCC",
+        wt={"worker_id": "ccc-deadbeef", "queue": "CCC"},
+    )
+    _write_codex_rollout(wt, SID_D)
+
+    res = wt.messages.send(SID_D, "apply the answer", queue_on_fail=False)
+
+    assert res["ok"] is True
+    assert res["transport"] == "codex-app-server"
+
+
 def test_deliver_codex_app_server_without_rollout_is_failure(wt, monkeypatch):
     """An app-server acknowledgement is not delivery truth when WT cannot
     locate the target thread's durable rollout for receipt verification."""

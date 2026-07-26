@@ -477,6 +477,22 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
                 "engine": known.get(sid, "claude"),
             }
         if _UUID_RE.match(t):
+            try:
+                from . import codex_registry
+                codex = codex_registry.entry(t) or {}
+            except Exception:
+                codex = {}
+            if codex.get("engine") == "codex":
+                return {
+                    "kind": "session",
+                    "session_id": t,
+                    "worker": None,
+                    "engine": "codex",
+                    "cwd": str(
+                        codex.get("cwd") or codex.get("repo_path") or ""
+                    ),
+                    "known": True,
+                }
             # Nothing known matches, but a full UUID is a valid address as-is.
             # "known": False marks that the engine is an assumption (claude),
             # not a fact -- callers holding a non-claude UUID should register
