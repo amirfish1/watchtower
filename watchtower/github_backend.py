@@ -17,6 +17,17 @@ from typing import Any, Dict, List, Optional
 from .queue import UNCLAIMABLE_READINESS
 
 VALID_LANES = ("normal", "express")
+# Ticket-level eligibility inputs, stored as GitHub labels so they are visible
+# and editable from GitHub's own UI (the file backend mirrors them as the plain
+# booleans `no_auto_drain`/`run_requested` on each item, so downstream code
+# never learns where they came from). `no-auto-drain` is an opt-*out*:
+# the old `watchtower:<QUEUE>` whitelist is gone, so an issue is workable
+# unless someone says otherwise. `play` is a human pressing the run button.
+NO_AUTO_DRAIN_LABEL = "watchtower:no-auto-drain"
+RUN_REQUESTED_LABEL = "watchtower:play"
+# Mirrors config.DEFAULT_GRACE_S; duplicated only as the fallback for a backend
+# built without a readable config (embedders, tests).
+DEFAULT_GRACE_S = 180
 VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "")
 VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
 VALID_VALUES = ("H", "M", "L", "")
@@ -67,6 +78,16 @@ def _parse_iso(value: Any) -> Optional[datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _age_seconds(created_at: Any, *, now: Optional[datetime] = None) -> float:
+    """Seconds since ``created_at``. An unparseable/missing timestamp reads as
+    infinitely old: the grace period exists to protect *new* issues, and a
+    ticket we cannot date is not new evidence."""
+    created = _parse_iso(created_at)
+    if created is None:
+        return float("inf")
+    return ((now or datetime.now(timezone.utc)) - created).total_seconds()
 
 
 def _recently_closed(issue: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
@@ -274,6 +295,48 @@ def _issue_text(body: str, note: Any, title: Any, comments: Any) -> str:
     return f"{text}\n\n## GitHub comments\n\n{comment_text}" if text else comment_text
 
 
+def repo_visibility(repo: str) -> str:
+    """``"public"``/``"private"``/``"internal"`` for a repo, or "" if unknown.
+
+    Best-effort by design: no gh, no auth, no network, a renamed repo — all
+    come back "" so a caller can say "couldn't check" instead of guessing.
+    """
+    repo = str(repo or "").strip()
+    if not repo:
+        return ""
+    try:
+        proc = subprocess.run(
+            ["gh", "repo", "view", repo, "--json", "visibility"],
+            capture_output=True, text=True, timeout=20,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except json.JSONDecodeError:
+        return ""
+    return str((data or {}).get("visibility") or "").strip().lower()
+
+
+def public_repo_warning(queue: str, repo: str) -> str:
+    """The warning to show before auto-drain is switched on, or "".
+
+    Turning drain on for a queue backed by a *public* repo points agents at
+    every issue anyone on the internet can file. That is a legitimate setup,
+    so this warns rather than refuses — but it must be said out loud, once,
+    at the moment of the decision.
+    """
+    if repo_visibility(repo) != "public":
+        return ""
+    return (
+        f"WARNING: {repo} is a PUBLIC repo. With drain on, {queue} workers will "
+        f"pick up issues filed by anyone, including strangers. Label an issue "
+        f"{NO_AUTO_DRAIN_LABEL} to keep agents off it, or run `wt drain off {queue}`."
+    )
+
+
 class GitHubIssuesBackend:
     """A WatchTower queue backed by GitHub Issues via ``gh``."""
 
@@ -284,6 +347,9 @@ class GitHubIssuesBackend:
         repo: str = "",
         repo_path: str = "",
         assignee: str = "@me",
+        auto_drain: Optional[bool] = None,
+        grace_s: Optional[int] = None,
+        partition_by_label: Optional[bool] = None,
     ):
         self.queue = queue
         self.repo = str(repo or "").strip()
@@ -291,6 +357,45 @@ class GitHubIssuesBackend:
         self.assignee = str(assignee or "@me").strip() or "@me"
         self.queue_label = f"watchtower:{queue}"
         self.in_progress_label = "watchtower:in-progress"
+        self.no_auto_drain_label = NO_AUTO_DRAIN_LABEL
+        self.run_requested_label = RUN_REQUESTED_LABEL
+        # The queue-level half of the eligibility model. Read once per backend
+        # instance (one is built per queue operation, see
+        # queue._github_backend_for_project) so every item produced by this
+        # instance is judged against one consistent policy snapshot. Callers
+        # may inject explicit values; tests and embedders that never wrote a
+        # config file get the safe defaults (drain off, standard grace).
+        self.auto_drain = bool(auto_drain) if auto_drain is not None else self._config_auto_drain()
+        self.grace_s = int(grace_s) if grace_s is not None else self._config_grace_s()
+        # `watchtower:<QUEUE>` is inert when this repo backs exactly one queue.
+        # It keeps one job -- and only this one: partitioning a repo shared by
+        # two or more queues, where nothing else can say which issue is whose.
+        self.partition_by_label = (
+            bool(partition_by_label)
+            if partition_by_label is not None
+            else self._config_partitions_by_label()
+        )
+
+    def _config_auto_drain(self) -> bool:
+        try:
+            from . import config
+            return bool(config.auto_drain(self.queue))
+        except Exception:
+            return False
+
+    def _config_grace_s(self) -> int:
+        try:
+            from . import config
+            return int(config.grace_s(self.queue))
+        except Exception:
+            return DEFAULT_GRACE_S
+
+    def _config_partitions_by_label(self) -> bool:
+        try:
+            from . import config
+            return len(config.github_queues_for_repo(self.repo)) > 1
+        except Exception:
+            return False
 
     def _repo_args(self) -> List[str]:
         return ["--repo", self.repo] if self.repo else []
@@ -341,6 +446,19 @@ class GitHubIssuesBackend:
             "fbca04",
             "Claimed by a WatchTower worker",
         )
+        # Created even though nothing here adds them automatically: they are
+        # the user's controls, and GitHub only offers labels that already
+        # exist in the repo's picker.
+        self._ensure_label(
+            self.no_auto_drain_label,
+            "b60205",
+            "WatchTower: never auto-drain this ticket",
+        )
+        self._ensure_label(
+            self.run_requested_label,
+            "0e8a16",
+            "WatchTower: run this ticket now",
+        )
 
     def _issue_number(self, ident: Any) -> Optional[int]:
         s = str(ident or "").strip()
@@ -359,7 +477,10 @@ class GitHubIssuesBackend:
         text = _issue_text(body, meta.get("note"), issue.get("title"), issue.get("comments"))
         labels = _label_names(issue.get("labels"))
         assignees = _assignee_logins(issue.get("assignees"))
-        queue_member = self.queue_label in labels
+        # Membership, not admission: under the blacklist model every issue in
+        # the repo belongs to this queue unless the repo is shared, in which
+        # case the legacy label is the only thing that can divide them.
+        queue_member = (not self.partition_by_label) or self.queue_label in labels
         number = int(issue.get("number") or 0)
         state = str(issue.get("state") or "").upper()
         if state == "CLOSED":
@@ -368,6 +489,22 @@ class GitHubIssuesBackend:
             status = "in_progress"
         else:
             status = "open"
+
+        # Eligibility: three independent inputs, two derived predicates.
+        #   auto_eligible   = auto_drain AND NOT no-auto-drain AND age >= grace_s
+        #   manual_eligible = run_requested   (play beats all three of them)
+        #   work_it         = auto_eligible OR manual_eligible
+        no_auto_drain = self.no_auto_drain_label in labels
+        run_requested = self.run_requested_label in labels
+        workable = queue_member and status == "open"
+        auto_eligible = bool(
+            workable
+            and self.auto_drain
+            and not no_auto_drain
+            and _age_seconds(issue.get("createdAt")) >= self.grace_s
+        )
+        manual_eligible = bool(workable and run_requested)
+        work_it = auto_eligible or manual_eligible
 
         resolution = _normalize_resolution({
             "summary": meta.get("resolution_summary", ""),
@@ -413,7 +550,15 @@ class GitHubIssuesBackend:
             "github_assignees": assignees,
             "watchtower_label": self.queue_label,
             "watchtower_runnable": bool(queue_member),
-            "claimable": bool(queue_member and status == "open"),
+            "no_auto_drain": no_auto_drain,
+            "run_requested": run_requested,
+            "auto_eligible": auto_eligible,
+            "manual_eligible": manual_eligible,
+            "work_it": work_it,
+            # `claimable` predates the three-input model and is still what
+            # health.queue_status and CCC read; it now means work_it, so those
+            # consumers follow the new rules without knowing about them.
+            "claimable": work_it,
             "_github_body": str(issue.get("body") or ""),
         }
         if status == "closed":
@@ -561,6 +706,10 @@ class GitHubIssuesBackend:
                 if _recently_closed(issue)
             )
         items = [self._issue_to_item(issue) for issue in issues]
+        if self.partition_by_label:
+            # Two or more queues share this repo: each shows only its own
+            # slice, because nothing but the legacy label can tell them apart.
+            items = [it for it in items if it.get("watchtower_runnable")]
         if status:
             items = [it for it in items if it.get("status") == status]
         if lane:
@@ -568,16 +717,28 @@ class GitHubIssuesBackend:
         return sorted(items, key=lambda it: int(it.get("number", 0)))
 
     def mark_runnable(self, ident: Any) -> Optional[Dict[str, Any]]:
+        """Request a run for this ticket (the ▶ / ``wt run`` path).
+
+        This used to add the `watchtower:<QUEUE>` whitelist label. That label
+        no longer admits anything, so marking runnable now sets
+        ``run_requested`` — the one input that beats drain being off, the
+        no-auto-drain opt-out, and the grace period. On a repo shared by
+        several queues the queue label is still added, since it is what says
+        which queue the ticket belongs to.
+        """
         item = self.get(ident)
         if item is None:
             return None
         if item.get("status") == "closed":
             raise ValueError(f"{item.get('ref', ident)} is closed")
         self._ensure_labels()
+        add_labels = ["--add-label", self.run_requested_label]
+        if self.partition_by_label:
+            add_labels += ["--add-label", self.queue_label]
         self._run([
             "issue", "edit", str(item["number"]),
             *self._repo_args(),
-            "--add-label", self.queue_label,
+            *add_labels,
         ])
         return self.get(ident)
 
@@ -615,13 +776,22 @@ class GitHubIssuesBackend:
         oldest: bool = False,
         item_types: Optional[List[str]] = None,
         readiness_filters: Optional[List[str]] = None,
+        auto_only: bool = False,
     ) -> List[Dict[str, Any]]:
+        """Tickets a worker could claim right now, in claim order.
+
+        ``auto_only`` narrows the eligibility test from ``work_it`` (what a
+        worker would actually claim) to ``auto_eligible`` (what the reconciler
+        may spawn a worker *for*). Both run through this one filter so the
+        auto-eligible set stays a strict subset of work_it by construction.
+        """
         # fresh=True: claiming must see the current claimed/open state, not a
         # cached snapshot up to _LIST_CACHE_TTL stale -- otherwise two workers
         # could both pick a ticket that was already claimed moments ago.
+        eligibility = "auto_eligible" if auto_only else "work_it"
         candidates = [
             it for it in self.list_items(status="open", lane=lane, fresh=True)
-            if it.get("claimable", True)
+            if it.get(eligibility, False)
         ]
         if readiness_filters:
             candidates = [
@@ -702,10 +872,15 @@ class GitHubIssuesBackend:
         status = item.get("status", "open")
         if status != "open":
             raise ValueError(f"{ref} is not open (status={status})")
-        if not item.get("claimable", True):
+        # No whitelist to fail any more: the only way to be ineligible is to
+        # be opted out, inside the grace period, or on a queue that is not
+        # draining. `wt run` (run_requested) overrides all three.
+        if not item.get("work_it", False):
             raise ValueError(
-                f"{ref} is missing label {self.queue_label}; "
-                f"run `wt run {ref}` before claiming it"
+                f"{ref} is not eligible to run "
+                f"(auto_drain={'on' if self.auto_drain else 'off'}, "
+                f"no-auto-drain={'yes' if item.get('no_auto_drain') else 'no'}, "
+                f"grace={self.grace_s}s); run `wt run {ref}` to work it anyway"
             )
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
@@ -748,11 +923,9 @@ class GitHubIssuesBackend:
         item = self.get(ident)
         if item is None:
             return None
-        if status == "closed" and not item.get("watchtower_runnable", True):
-            raise ValueError(
-                f"{ident} is missing label {self.queue_label}; "
-                f"run `wt run {ident}` before closing it"
-            )
+        # No queue-label guard on close: the label admitted nothing to begin
+        # with, and refusing to close an issue a worker just finished because
+        # of a missing label only ever stranded finished work.
         if (
             status == "closed"
             and expect_owner
@@ -896,10 +1069,16 @@ class GitHubIssuesBackend:
         lane: Optional[str] = None,
         item_types: Optional[List[str]] = None,
     ) -> int:
-        """How many tickets claim_next() would currently pick from — the
+        """How many tickets auto-drain would currently pick from — the
         reconciler's single source of truth for spawn-worthy depth on a
-        GitHub-backed queue (see queue.count_claimable)."""
-        return len(self._claim_candidates(lane=lane, item_types=item_types))
+        GitHub-backed queue (see queue.count_claimable).
+
+        Deliberately narrower than claim_next()'s candidate set: a ticket that
+        is only workable because a human pressed ▶ must not, by itself, make
+        the reconciler decide this queue wants unattended workers."""
+        return len(
+            self._claim_candidates(lane=lane, item_types=item_types, auto_only=True)
+        )
 
     def last_progress_iso(self) -> Optional[str]:
         latest: Optional[str] = None

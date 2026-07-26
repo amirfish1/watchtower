@@ -166,6 +166,13 @@ if args[:2] == ["issue", "close"]:
     print(f"Closed issue #{issue['number']}")
     sys.exit(0)
 
+if args[:2] == ["repo", "view"]:
+    save(data)
+    print(json.dumps({
+        "visibility": os.environ.get("FAKE_GH_VISIBILITY", "private"),
+    }))
+    sys.exit(0)
+
 if args[:2] == ["issue", "reopen"]:
     issue = issue_by_number(data, args[2])
     issue["state"] = "OPEN"
@@ -224,7 +231,20 @@ def _reload_isolated(tmp_path: Path, monkeypatch):
     # from a prior test would otherwise leak into this one within its TTL.
     importlib.reload(github_backend)
     importlib.reload(q)
+    # Pretend the one-time GitHub drain migration already ran (it has, on any
+    # real install, long before these code paths run). Tests that exercise the
+    # migration itself remove this marker first.
+    config.GH_DRAIN_MIGRATION_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    config.GH_DRAIN_MIGRATION_MARKER.write_text("{}\n")
     return config, q
+
+
+def _drainable(config, queue: str = "GHI") -> None:
+    """Make ``queue`` behave like a queue an operator has opted in to draining:
+    auto-drain on with no grace period. Under the eligibility model that is
+    what makes an ordinary open ticket claimable at all."""
+    config.set_auto_drain(queue, True)
+    config.set_grace_s(queue, 0)
 
 
 def _write_fake_issues(state: Path, issues):
@@ -257,6 +277,7 @@ def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "owner/repo")
+    _drainable(config)
 
     item = q.enqueue(
         project="GHI",
@@ -305,6 +326,7 @@ def test_github_backend_rejects_crossworker_close(tmp_path, monkeypatch):
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "owner/repo")
+    _drainable(config)
 
     item = q.enqueue(project="GHI", note="claimed work", source="test")
     q.claim_by_ref(item["ref"], "worker-a")
@@ -351,6 +373,7 @@ def test_github_backend_blocks_claimed_ticket_by_documented_ref(tmp_path, monkey
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "owner/repo")
+    _drainable(config)
 
     item = q.enqueue(project="GHI", note="needs a decision")
     q.claim_by_ref(item["ref"], "worker-1")
@@ -373,7 +396,7 @@ def test_github_backend_blocks_claimed_ticket_by_documented_ref(tmp_path, monkey
 
 def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys):
     state = _install_fake_gh(tmp_path, monkeypatch)
-    _reload_isolated(tmp_path, monkeypatch)
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
     from watchtower.cli import main
 
     assert main([
@@ -381,6 +404,7 @@ def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys)
         "--backend", "github",
         "--github-repo", "owner/repo",
     ]) == 0
+    _drainable(config, "GHCLI")
     assert main([
         "add", "-q", "GHCLI",
         "--title", "CLI issue",
@@ -436,26 +460,52 @@ def test_cli_edit_text_replaces_github_issue_body_and_preserves_metadata(
     assert "original body" not in issue_body
 
 
-def test_github_backend_lists_all_open_issues_but_claims_only_queue_labeled(tmp_path, monkeypatch):
+def test_github_backend_ignores_legacy_queue_label_for_a_single_queue_repo(tmp_path, monkeypatch):
+    """The `watchtower:<QUEUE>` whitelist is inert: with one queue on a repo,
+    a plain issue nobody labelled is as workable as a labelled one."""
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "owner/repo")
+    _drainable(config)
     _write_fake_issues(state, [
         _fake_issue(1, "Plain GitHub issue"),
-        _fake_issue(2, "Runnable WatchTower issue", labels=["watchtower:GHI"]),
+        _fake_issue(2, "Legacy-labelled issue", labels=["watchtower:GHI"]),
     ])
 
     items = q.list_items(project="GHI")
     assert [it["ref"] for it in items] == ["GHI-1", "GHI-2"]
     assert {it["ref"]: it["claimable"] for it in items} == {
-        "GHI-1": False,
+        "GHI-1": True,
         "GHI-2": True,
     }
 
-    claimed = q.claim_next("worker-1", project="GHI")
-    assert claimed["ref"] == "GHI-2"
-    assert q.claim_next("worker-2", project="GHI") is None
+    assert q.claim_next("worker-1", project="GHI")["ref"] == "GHI-1"
+    assert q.claim_next("worker-2", project="GHI")["ref"] == "GHI-2"
+    assert q.claim_next("worker-3", project="GHI") is None
+
+
+def test_github_backend_still_partitions_a_repo_shared_by_two_queues(tmp_path, monkeypatch):
+    """The one job the legacy label keeps: when 2+ queues point at the same
+    repo it is the only thing that can say which issue belongs to which."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    for name in ("GHA", "GHB"):
+        config.set_backend(name, "github")
+        config.set_github_repo(name, "owner/shared")
+        config.set_auto_drain(name, True)
+        config.set_grace_s(name, 0)
+    _write_fake_issues(state, [
+        _fake_issue(1, "Unlabelled — belongs to neither", labels=[]),
+        _fake_issue(2, "Queue A work", labels=["watchtower:GHA"]),
+        _fake_issue(3, "Queue B work", labels=["watchtower:GHB"]),
+    ])
+
+    assert [it["ref"] for it in q.list_items(project="GHA")] == ["GHA-2"]
+    assert [it["ref"] for it in q.list_items(project="GHB")] == ["GHB-3"]
+    assert q.count_claimable(project="GHA") == 1
+    assert q.claim_next("worker-a", project="GHA")["ref"] == "GHA-2"
+    assert q.claim_next("worker-a2", project="GHA") is None
 
 
 def test_github_backend_lists_issues_closed_within_last_14_days(tmp_path, monkeypatch):
@@ -494,25 +544,31 @@ def test_github_backend_lists_issues_closed_within_last_14_days(tmp_path, monkey
     )
 
 
-def test_github_backend_refuses_direct_claim_until_issue_is_marked_runnable(tmp_path, monkeypatch):
+def test_github_backend_refuses_direct_claim_until_a_run_is_requested(tmp_path, monkeypatch):
+    """With drain off nothing is auto-eligible, so a targeted claim is refused
+    — but pressing run (mark_runnable) overrides that, no whitelist involved."""
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "owner/repo")
     _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
 
-    with pytest.raises(ValueError, match="missing label watchtower:GHI"):
+    with pytest.raises(ValueError, match="not eligible to run"):
         q.claim_by_ref("GHI-1", "worker-1")
 
     marked = q.mark_runnable("GHI-1")
+    assert marked["run_requested"] is True
+    assert marked["manual_eligible"] is True
     assert marked["claimable"] is True
-    assert "watchtower:GHI" in json.loads(state.read_text())["issues"][0]["labels"]
+    assert "watchtower:play" in json.loads(state.read_text())["issues"][0]["labels"]
+    # The inert label is never written any more.
+    assert "watchtower:GHI" not in json.loads(state.read_text())["issues"][0]["labels"]
 
     claimed = q.claim_by_ref("GHI-1", "worker-1")
     assert claimed["status"] == "in_progress"
 
 
-def test_github_unlabeled_issues_count_as_visible_but_not_claimable_for_health_and_reconcile(tmp_path, monkeypatch):
+def test_github_drain_off_issues_are_visible_but_not_spawn_worthy(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     import watchtower.health as health
@@ -522,7 +578,6 @@ def test_github_unlabeled_issues_count_as_visible_but_not_claimable_for_health_a
     importlib.reload(workers)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "owner/repo")
-    config.set_auto_drain("GHI", True)
     _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
 
     row = {r["queue"]: r for r in health.all_status()}["GHI"]
@@ -532,10 +587,36 @@ def test_github_unlabeled_issues_count_as_visible_but_not_claimable_for_health_a
 
     result = workers.reconcile_once(dry_run=True)
     assert result["spawned"] == []
-    assert any(
-        skip["queue"] == "GHI" and "0 claimable" in skip["reason"]
-        for skip in result["skipped"]
-    )
+    assert any(skip["queue"] == "GHI" for skip in result["skipped"])
+
+    # Opting the queue in is all it takes now -- no per-issue labelling.
+    _drainable(config)
+    importlib.reload(health)
+    importlib.reload(workers)
+    row = {r["queue"]: r for r in health.all_status()}["GHI"]
+    assert row["claimable_depth"] == 1
+    assert [s["queue"] for s in workers.reconcile_once(dry_run=True)["spawned"]] == ["GHI"]
+
+
+def test_github_no_auto_drain_label_keeps_a_ticket_out_of_auto_drain(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    _drainable(config)
+    _write_fake_issues(state, [
+        _fake_issue(1, "Hands off", labels=["watchtower:no-auto-drain"]),
+        _fake_issue(2, "Fair game"),
+    ])
+
+    assert q.count_claimable(project="GHI") == 1
+    assert q.claim_next("worker-1", project="GHI")["ref"] == "GHI-2"
+    with pytest.raises(ValueError, match="not eligible to run"):
+        q.claim_by_ref("GHI-1", "worker-2")
+
+    # ...until a human presses run, which beats the opt-out.
+    q.mark_runnable("GHI-1")
+    assert q.claim_by_ref("GHI-1", "worker-2")["status"] == "in_progress"
 
 
 def test_cli_run_marks_existing_github_issue_runnable(tmp_path, monkeypatch, capsys):
@@ -549,7 +630,7 @@ def test_cli_run_marks_existing_github_issue_runnable(tmp_path, monkeypatch, cap
     assert main(["run", "GHI-1", "--no-dispatch"]) == 0
     out = capsys.readouterr().out
     assert "RUNNABLE: GHI-1" in out
-    assert "watchtower:GHI" in json.loads(state.read_text())["issues"][0]["labels"]
+    assert "watchtower:play" in json.loads(state.read_text())["issues"][0]["labels"]
 
 
 def test_dashboard_run_api_marks_existing_github_issue_runnable(tmp_path, monkeypatch):
@@ -589,9 +670,10 @@ def test_dashboard_run_api_marks_existing_github_issue_runnable(tmp_path, monkey
 
     assert payload["ok"] is True
     assert payload["ticket"]["claimable"] is True
+    assert payload["ticket"]["run_requested"] is True
     assert payload["worker"]["ref"] == "GHI-1"
     assert spawned == [("GHI", "GHI-1", {"repo_path": ""})]
-    assert "watchtower:GHI" in json.loads(state.read_text())["issues"][0]["labels"]
+    assert "watchtower:play" in json.loads(state.read_text())["issues"][0]["labels"]
 
 
 def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
@@ -732,3 +814,272 @@ def test_cached_github_list_failure_is_logged_only_once(tmp_path, monkeypatch):
 
     activity = (tmp_path / "activity.log").read_text()
     assert activity.count("GitHub list failed: gh auth unavailable") == 1
+
+
+# ============================================================ eligibility model
+
+def _eligibility_issue(number: int, *, age_s: float, labels=None):
+    """An open issue ``age_s`` seconds old carrying ``labels``."""
+    created = datetime.now(timezone.utc) - timedelta(seconds=age_s)
+    issue = _fake_issue(number, f"issue {number}", labels=labels or [])
+    issue["createdAt"] = created.strftime("%Y-%m-%dT%H:%M:%SZ")
+    issue["updatedAt"] = issue["createdAt"]
+    return issue
+
+
+def _eligibility_backend(*, auto_drain: bool, grace_s: int = 180, repo="owner/elig"):
+    import watchtower.github_backend as github_backend
+
+    return github_backend.GitHubIssuesBackend(
+        "ELIG",
+        repo=repo,
+        auto_drain=auto_drain,
+        grace_s=grace_s,
+        partition_by_label=False,
+    )
+
+
+# drain on/off x no-auto-drain label present/absent x inside/outside the grace
+# period x play/not. auto_eligible is the AND of the first three; play alone
+# decides manual_eligible and can carry work_it on its own.
+ELIGIBILITY_TRUTH_TABLE = [
+    # (auto_drain, no_auto_drain, inside_grace, play, auto_eligible, work_it)
+    (False, False, False, False, False, False),
+    (False, False, False, True,  False, True),
+    (False, False, True,  False, False, False),
+    (False, False, True,  True,  False, True),
+    (False, True,  False, False, False, False),
+    (False, True,  False, True,  False, True),
+    (False, True,  True,  False, False, False),
+    (False, True,  True,  True,  False, True),
+    (True,  False, False, False, True,  True),
+    (True,  False, False, True,  True,  True),
+    (True,  False, True,  False, False, False),
+    (True,  False, True,  True,  False, True),
+    (True,  True,  False, False, False, False),
+    (True,  True,  False, True,  False, True),
+    (True,  True,  True,  False, False, False),
+    (True,  True,  True,  True,  False, True),
+]
+
+
+@pytest.mark.parametrize(
+    "auto_drain,no_auto_drain,inside_grace,play,auto_eligible,work_it",
+    ELIGIBILITY_TRUTH_TABLE,
+)
+def test_eligibility_truth_table(
+    auto_drain, no_auto_drain, inside_grace, play, auto_eligible, work_it,
+):
+    labels = []
+    if no_auto_drain:
+        labels.append("watchtower:no-auto-drain")
+    if play:
+        labels.append("watchtower:play")
+    backend = _eligibility_backend(auto_drain=auto_drain, grace_s=180)
+    issue = _eligibility_issue(1, age_s=5 if inside_grace else 4000, labels=labels)
+
+    item = backend._issue_to_item(issue)
+
+    assert item["no_auto_drain"] is no_auto_drain
+    assert item["run_requested"] is play
+    assert item["auto_eligible"] is auto_eligible
+    assert item["manual_eligible"] is play
+    assert item["work_it"] is work_it
+    assert item["claimable"] is work_it
+
+
+def test_grace_period_of_zero_makes_a_brand_new_ticket_auto_eligible():
+    backend = _eligibility_backend(auto_drain=True, grace_s=0)
+    assert backend._issue_to_item(_eligibility_issue(1, age_s=0))["auto_eligible"] is True
+
+
+def test_closed_tickets_are_never_eligible_even_with_play():
+    backend = _eligibility_backend(auto_drain=True, grace_s=0)
+    issue = _eligibility_issue(1, age_s=4000, labels=["watchtower:play"])
+    issue["state"] = "CLOSED"
+    issue["closedAt"] = _eligibility_issue(1, age_s=1)["createdAt"]
+
+    item = backend._issue_to_item(issue)
+
+    assert item["status"] == "closed"
+    assert (item["auto_eligible"], item["manual_eligible"], item["work_it"]) == (
+        False, False, False,
+    )
+
+
+@pytest.mark.parametrize("auto_drain", [True, False])
+@pytest.mark.parametrize("grace_s", [0, 180])
+def test_auto_eligible_set_is_always_a_subset_of_work_it(monkeypatch, auto_drain, grace_s):
+    """The invariant the two filters must never drift out of: everything the
+    reconciler counts as spawn-worthy is something a worker would claim."""
+    import watchtower.github_backend as github_backend
+
+    github_backend._LIST_CACHE.clear()
+    repo = f"owner/subset-{int(auto_drain)}-{grace_s}"
+    backend = _eligibility_backend(auto_drain=auto_drain, grace_s=grace_s, repo=repo)
+    issues = []
+    number = 0
+    for no_auto_drain in (False, True):
+        for age_s in (1, 4000):
+            for play in (False, True):
+                number += 1
+                labels = []
+                if no_auto_drain:
+                    labels.append("watchtower:no-auto-drain")
+                if play:
+                    labels.append("watchtower:play")
+                issues.append(_eligibility_issue(number, age_s=age_s, labels=labels))
+    monkeypatch.setattr(backend, "_run", lambda args, *, check=True: json.dumps(issues))
+
+    items = backend.list_items(status="open")
+    auto_items = {it["ref"] for it in items if it["auto_eligible"]}
+    work_items = {it["ref"] for it in items if it["work_it"]}
+    assert auto_items <= work_items
+
+    auto_refs = {it["ref"] for it in backend._claim_candidates(auto_only=True)}
+    work_refs = {it["ref"] for it in backend._claim_candidates()}
+    assert auto_refs <= work_refs
+    assert auto_refs == auto_items and work_refs == work_items
+    # count_claimable (reconciler spawn depth) counts the auto set, never the
+    # tickets that are only workable because a human pressed run.
+    assert backend.count_claimable() == len(auto_refs)
+
+
+def test_grace_period_delays_auto_claim_but_never_a_requested_run(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    config.set_auto_drain("GHI", True)
+    config.set_grace_s("GHI", 180)
+    _write_fake_issues(state, [
+        _eligibility_issue(1, age_s=5),      # just filed: still protected
+        _eligibility_issue(2, age_s=4000),   # old enough to drain
+    ])
+
+    assert q.count_claimable(project="GHI") == 1
+    assert q.claim_next("worker-1", project="GHI")["ref"] == "GHI-2"
+    assert q.claim_next("worker-2", project="GHI") is None
+
+    q.mark_runnable("GHI-1")
+    assert q.claim_next("worker-2", project="GHI")["ref"] == "GHI-1"
+
+
+def test_close_no_longer_requires_the_legacy_queue_label(tmp_path, monkeypatch):
+    """Dropped rule: close() refusing when the queue label is absent."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    _write_fake_issues(state, [_fake_issue(1, "Never labelled")])
+
+    closed = q.close("GHI-1", "worker-1", resolution={"summary": "done anyway"})
+
+    assert closed["status"] == "closed"
+    assert json.loads(state.read_text())["issues"][0]["state"] == "CLOSED"
+
+
+# ==================================================================== migration
+
+def test_github_drain_migration_turns_drain_off_exactly_once(tmp_path, monkeypatch):
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    config.GH_DRAIN_MIGRATION_MARKER.unlink()
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    config.set_auto_drain("GHI", True)
+    config.set_auto_drain("FILEQ", True)  # file-backed: not this migration's business
+
+    assert config.migrate_github_auto_drain() == ["GHI"]
+    assert config.auto_drain("GHI") is False
+    assert config.auto_drain("FILEQ") is True
+
+    # Turning it back on is a deliberate act the migration must never undo.
+    config.set_auto_drain("GHI", True)
+    assert config.migrate_github_auto_drain() == []
+    assert config.auto_drain("GHI") is True
+
+
+def test_reconciler_runs_the_drain_migration_and_says_why(tmp_path, monkeypatch, capsys):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.workers as workers
+
+    importlib.reload(workers)
+    config.GH_DRAIN_MIGRATION_MARKER.unlink()
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    config.set_auto_drain("GHI", True)
+    _write_fake_issues(state, [_eligibility_issue(1, age_s=4000)])
+
+    result = workers.reconcile_once(dry_run=True)
+
+    assert config.auto_drain("GHI") is False
+    assert [s["queue"] for s in result["spawned"]] == []
+    err = capsys.readouterr().err
+    assert "drain was turned off for GHI" in err
+    assert "drain was turned off for GHI" in (tmp_path / "activity.log").read_text()
+
+
+# ========================================================== public-repo warning
+
+def test_public_repo_warning_fires_only_for_public_repos(tmp_path, monkeypatch):
+    _install_fake_gh(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv("FAKE_GH_VISIBILITY", "public")
+    assert github_backend.repo_visibility("owner/repo") == "public"
+    warning = github_backend.public_repo_warning("GHI", "owner/repo")
+    assert "PUBLIC" in warning and "owner/repo" in warning
+
+    monkeypatch.setenv("FAKE_GH_VISIBILITY", "private")
+    assert github_backend.public_repo_warning("GHI", "owner/repo") == ""
+
+
+def test_public_repo_visibility_is_unknown_without_gh(monkeypatch, tmp_path):
+    """No gh, no auth, no network: report unknown rather than guess public."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    assert github_backend.repo_visibility("owner/repo") == ""
+    assert github_backend.public_repo_warning("GHI", "owner/repo") == ""
+
+
+def test_drain_on_warns_before_enabling_on_a_public_repo(tmp_path, monkeypatch, capsys):
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.cli as cli
+
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    monkeypatch.setenv("FAKE_GH_VISIBILITY", "public")
+
+    cli._warn_if_public_repo("GHI", config)
+    assert "PUBLIC" in capsys.readouterr().err
+
+    # A file-backed queue has no repo to check and must stay quiet.
+    cli._warn_if_public_repo("PLAIN", config)
+    assert capsys.readouterr().err == ""
+
+
+# ================================================================ grace_s config
+
+def test_grace_s_config_defaults_round_trips_and_is_visible_on_wt_config(
+    tmp_path, monkeypatch, capsys,
+):
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    from watchtower.cli import main
+
+    assert config.grace_s("GHI") == config.DEFAULT_GRACE_S == 180
+    config.set_grace_s("GHI", 0)
+    assert config.grace_s("GHI") == 0
+    with pytest.raises(ValueError):
+        config.set_grace_s("GHI", -1)
+    config.set_grace_s("GHI", None)
+    assert config.grace_s("GHI") == 180
+
+    assert main(["config", "-q", "GHI", "--grace-s", "30"]) == 0
+    assert "grace_s=30" in capsys.readouterr().out
+    assert config.grace_s("GHI") == 30
+
+    assert main(["config", "-q", "GHI"]) == 0
+    assert "'grace_s': 30" in capsys.readouterr().out

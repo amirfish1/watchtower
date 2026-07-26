@@ -2329,6 +2329,19 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # One-time drain blackout for GitHub-backed queues (no-op after first
+    # run). This is the reconciler's own first tick after the upgrade, i.e.
+    # the last moment before it would have spawned workers against every open
+    # issue in a repo under the new eligibility rules.
+    try:
+        from . import queue as _q_mig
+        for migrated_queue in config.migrate_github_auto_drain():
+            message = config.GH_DRAIN_MIGRATION_MESSAGE.format(queue=migrated_queue)
+            print(f"[watchtower] {message}", file=sys.stderr)
+            _q_mig._log("MIGRATE", message, queue=migrated_queue)
+    except Exception:
+        pass
+
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
                               "released": [], "reaped": [], "requeued": [],
                               "backfilled": [],

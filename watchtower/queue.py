@@ -292,11 +292,17 @@ def _github_backend_for_project(project: Any):
         if config.backend(proj) != "github":
             return None
         from .github_backend import GitHubIssuesBackend
+        repo = config.github_repo(proj)
         return GitHubIssuesBackend(
             proj,
-            repo=config.github_repo(proj),
+            repo=repo,
             repo_path=config.repo_path(proj),
             assignee=config.github_assignee(proj),
+            # Queue-level eligibility inputs, resolved here so the backend
+            # judges every item against one policy snapshot per operation.
+            auto_drain=config.auto_drain(proj),
+            grace_s=config.grace_s(proj),
+            partition_by_label=len(config.github_queues_for_repo(repo)) > 1,
         )
     except Exception:
         raise
@@ -686,6 +692,11 @@ def enqueue(
             "confidence": _norm_choice(confidence, VALID_CONFIDENCES),
             "needs_input": False,
             "block_question": "",
+            # The two ticket-level eligibility inputs (2026-07-26 design). The
+            # GitHub backend stores these as labels; here they are plain
+            # booleans, so both backends hand downstream code the same shape.
+            "no_auto_drain": False,
+            "run_requested": False,
             "claimed_by": None,
             "claimed_at": None,
             "closed_at": None,

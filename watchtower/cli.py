@@ -1915,10 +1915,31 @@ def cmd_set(args: argparse.Namespace) -> int:
     return 0
 
 
+def _warn_if_public_repo(queue: str, config) -> None:
+    """Print the public-repo warning before auto-drain is switched on.
+
+    A warning, not a refusal: draining a public repo is a real (if bold)
+    choice. But it is the moment the fleet stops working only your issues and
+    starts working strangers', so it must be said at the point of decision.
+    Never fatal — an unreachable/unknown repo just says nothing.
+    """
+    if config.backend(queue) != "github":
+        return
+    try:
+        from .github_backend import public_repo_warning
+        warning = public_repo_warning(queue, config.github_repo(queue))
+    except Exception:
+        return
+    if warning:
+        print(warning, file=sys.stderr)
+
+
 def cmd_drain(args: argparse.Namespace) -> int:
     """Enable or disable auto-drain for a queue (wt drain on|off <queue>)."""
     from . import config
     enabled = args.onoff == "on"
+    if enabled:
+        _warn_if_public_repo(args.queue, config)
     config.set_auto_drain(args.queue, enabled)
     # Claim-type restriction: set on `on`, cleared on `off` (off = no policy).
     types = (getattr(args, "type", None) or []) if enabled else []
@@ -1970,6 +1991,8 @@ def cmd_config(args: argparse.Namespace) -> int:
     auto_drain = getattr(args, "auto_drain", None)
     if auto_drain is not None:
         enabled = auto_drain == "on"
+        if enabled:
+            _warn_if_public_repo(args.queue, config)
         config.set_auto_drain(args.queue, enabled)
         types = (getattr(args, "type", None) or []) if enabled else []
         config.set_claim_types(args.queue, types)
@@ -2016,6 +2039,13 @@ def cmd_config(args: argparse.Namespace) -> int:
     if getattr(args, "workers_local_path", None) is not None:
         config.set_repo_path(args.queue, args.workers_local_path)
         changed.append(f"workers_local_path={args.workers_local_path}")
+    if getattr(args, "grace_s", None) is not None:
+        try:
+            config.set_grace_s(args.queue, args.grace_s)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        changed.append(f"grace_s={config.grace_s(args.queue)}")
     if getattr(args, "engine", None) is not None:
         config.set_engine(args.queue, args.engine)
         changed.append(f"engine={args.engine}")
@@ -2030,7 +2060,11 @@ def cmd_config(args: argparse.Namespace) -> int:
         changed.append(f"workers={args.workers}")
     if not changed:
         cfg = config.get_queue_config(args.queue)
-        print(f"{args.queue}: {cfg if cfg else '(no config)'}")
+        # grace_s is shown even when unset: it silently gates auto-drain, so
+        # "why did nothing pick up my new ticket for 3 minutes" has to be
+        # answerable from the queue's own config output.
+        cfg.setdefault("grace_s", config.grace_s(args.queue))
+        print(f"{args.queue}: {cfg}")
     else:
         print(f"{args.queue}: {', '.join(changed)}")
     return 0
@@ -3295,6 +3329,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="reasoning effort for queue workers; omit for the engine default")
     s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
                    help="restrict auto-drain to these ticket types (requires --auto-drain on)")
+    s.add_argument("--grace-s", default=None, type=int, dest="grace_s",
+                   help=(
+                       "seconds a new ticket is left alone before auto-drain may "
+                       "claim it (default 180); 0 drains "
+                       "immediately. Gives a human time to label a ticket "
+                       "watchtower:no-auto-drain; pressing run ignores it."
+                   ))
     s.set_defaults(func=cmd_config)
 
     s = sub.add_parser("monitor")

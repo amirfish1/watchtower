@@ -1056,9 +1056,13 @@ def render_queue(
         )
         title = html.escape(str(it.get("title") or it.get("note") or "")[:120])
         action = '<span class="run-spacer"></span>'
-        if status == "open" and not it.get("watchtower_runnable", True):
+        # Shown on any open ticket that hasn't been asked to run yet. The old
+        # condition ("missing the queue label") is gone with the whitelist:
+        # every open ticket is now a candidate, so the button's job is to
+        # request a run, not to admit the ticket.
+        if status == "open" and not it.get("run_requested", False):
             action = (
-                f'<button class="run-btn" title="Mark runnable" '
+                f'<button class="run-btn" title="Run this ticket" '
                 f'onclick="wtRun(\'{ref}\')">Run</button>'
             )
         trows.append(
