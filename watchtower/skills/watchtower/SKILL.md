@@ -48,7 +48,8 @@ A queue is "stuck" when it has open tickets and none has closed in the last
 wt ls -q WT --json                          # tickets in one queue (needs -q)
 wt add -q WT --title "..." --type bug       # file a ticket
 wt claim -q WT --worker <id> --type bug --json   # claim the next open one
-wt close <ref> --worker <id> --summary "..."      # close (summary required)
+wt close <ref> --worker <id> --commit <sha> --summary "..."  # code change
+wt close <ref> --worker <id> --no-code --summary "..."       # no code changed
 ```
 
 ## Import a document as tickets
@@ -69,9 +70,11 @@ source keys make repeat imports idempotent, so a later import files only newly
 inferred tasks. If Claude is unavailable or returns a malformed ticket graph,
 the command fails before filing anything.
 
-`wt close` rejects a close with no `--summary` (exit code 1) — that
-resolution text is the trust signal surfaced on the dashboard, so always
-supply one when closing a ticket you worked.
+`wt close` requires both resolution text and completion proof. Always supply
+`--summary`, plus exactly one of `--commit <sha>` for code changes or
+`--no-code` for work that changed no code. Missing either requirement is
+rejected with exit code 1. The summary is the trust signal surfaced on the
+dashboard; the proof keeps uncommitted or fabricated fixes from being closed.
 
 ## Don't fabricate
 
