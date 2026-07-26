@@ -228,6 +228,35 @@ def test_answer_fallback_infers_codex_engine_from_blocked_session(
     ]
 
 
+def test_answer_infers_kimi_engine_after_worker_exit(wt, tmp_path, monkeypatch):
+    cli, q, workers = wt
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
+    worker_id = "throughput-deadbeef"
+    sid = "session_11111111-2222-3333-4444-555555555555"
+    item = q.enqueue(project="THROUGHPUT", note="blocked work")
+    q.claim_next(worker_id, project="THROUGHPUT", session_uuid=sid)
+    q.block(item["ref"], session_id=worker_id, question="A or B?")
+    workers.record_worker(
+        _dead_pid(), "THROUGHPUT", "kimi", worker_id,
+        repo_path=str(tmp_path), session_id=sid,
+    )
+    assert workers.list_workers()[-1]["alive"] is False
+
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "_resume_session_headless",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or True,
+    )
+
+    assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
+    assert calls[0][0][3] == "kimi"
+    assert calls[0][1] == {
+        "queue": "THROUGHPUT",
+        "worker_id": worker_id,
+    }
+
+
 def test_answer_resume_reports_immediate_process_exit(wt, tmp_path, monkeypatch):
     cli, _, _ = wt
 
@@ -244,6 +273,63 @@ def test_answer_resume_reports_immediate_process_exit(wt, tmp_path, monkeypatch)
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Proc())
     monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
     monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "0.01")
+
+    assert not cli._resume_session_headless(
+        "11111111-2222-3333-4444-555555555555",
+        str(tmp_path),
+        "apply the answer",
+        "codex",
+    )
+
+
+def test_answer_resume_nonfinite_verify_window_uses_default(
+    wt, tmp_path, monkeypatch
+):
+    cli, _, _ = wt
+
+    class Proc:
+        pid = os.getpid()
+
+        def __init__(self):
+            self.polls = 0
+
+        def poll(self):
+            self.polls += 1
+            return None if self.polls == 1 else 2
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "nan")
+
+    assert not cli._resume_session_headless(
+        "11111111-2222-3333-4444-555555555555",
+        str(tmp_path),
+        "apply the answer",
+        "codex",
+    )
+
+
+def test_answer_resume_polls_after_deadline_sleep(wt, tmp_path, monkeypatch):
+    cli, _, _ = wt
+    clock = [0.0]
+    poll_results = iter([None, 2])
+
+    class Proc:
+        pid = os.getpid()
+
+        def poll(self):
+            return next(poll_results)
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        cli.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds + 0.1),
+    )
+    monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "0.2")
 
     assert not cli._resume_session_headless(
         "11111111-2222-3333-4444-555555555555",

@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -838,7 +839,9 @@ def _resume_session_headless(
             verify_s = float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
         except ValueError:
             verify_s = 2.0
-        deadline = time.monotonic() + max(0.0, verify_s)
+        if not math.isfinite(verify_s) or verify_s <= 0:
+            verify_s = 2.0
+        deadline = time.monotonic() + verify_s
         poll = getattr(proc, "poll", None)
         while callable(poll):
             if poll() is not None:
@@ -868,6 +871,8 @@ def _answer_engine(item: Dict[str, object], requested: Optional[str]) -> str:
     if requested:
         return requested
     sid = str(item.get("claimed_session_id") or "")
+    if sid.startswith("session_"):
+        return "kimi"
     worker_id = str(item.get("claimed_by") or "")
     try:
         known = workers.list_workers(prune=False)
@@ -925,9 +930,19 @@ def cmd_answer(args: argparse.Namespace) -> int:
     from . import messages
     target = item.get("claimed_session_id") or item.get("claimed_by")
     delivery_engine = _answer_engine(item, args.engine)
+    # Kimi has no local messages adapter. Without a delegate, parking this in
+    # the outbox would retry the same unsupported adapter chain until dead.
+    # Let the existing headless Kimi resume fallback run immediately instead.
+    queue_on_fail = not (
+        delivery_engine == "kimi" and not messages._delegate_base()
+    )
     try:
         sent = messages.send(
-            str(target), prompt, mode="steer", engine=delivery_engine,
+            str(target),
+            prompt,
+            mode="steer",
+            engine=delivery_engine,
+            queue_on_fail=queue_on_fail,
         )
     except Exception as e:  # never lose the answer to a delivery-layer crash
         sent = {"ok": False, "error": str(e)}

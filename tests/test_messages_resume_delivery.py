@@ -95,6 +95,49 @@ def test_resume_reports_failure_when_claude_dies_at_boot(wt, monkeypatch):
     assert wt.messages.outbox_list(status="pending")
 
 
+def test_resume_polls_after_final_sleep(wt, monkeypatch):
+    _write_transcript(wt, SID_B, age_s=600)
+    poll_results = iter([None, 1])
+    clock = [0.0]
+
+    class Stdin:
+        def write(self, data):
+            return None
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class Proc:
+        pid = 424244
+        stdin = Stdin()
+
+        def poll(self):
+            return next(poll_results)
+
+    monkeypatch.setattr(wt.messages.subprocess, "Popen", lambda *a, **k: Proc())
+    monkeypatch.setattr(wt.messages.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(
+        wt.messages.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(0, clock[0] + seconds + 0.1),
+    )
+    monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "0.2")
+
+    res = wt.messages.send(SID_B, "resume me")
+
+    assert res["ok"] is False and res["queued"] is True
+    assert "exited" in res["error"]
+
+
+def test_resume_verify_window_rejects_nonfinite_values(wt, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "nan")
+
+    assert wt.messages._resume_verify_window_s() == 2.0
+
+
 # ================================================================== rebucket
 def test_resume_rebuckets_transcript_into_cwd_project_bucket(wt, monkeypatch):
     """claude --resume only sees transcripts in the cwd's own project bucket

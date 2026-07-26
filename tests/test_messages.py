@@ -281,6 +281,20 @@ def test_resolve_full_uuid_unknown_accepted(wt):
     assert r["worker"] is None and r["engine"] == "claude"
 
 
+def test_resolve_pruned_kimi_worker_from_session_ledger(wt):
+    sid = "session_11111111-2222-3333-4444-555555555555"
+    wt.workers.record_worker(
+        99_999_999, "KIMI", "kimi", "kimi-deadbeef",
+        repo_path=str(wt.tmp), session_id=sid,
+    )
+    assert wt.workers.list_workers()[-1]["alive"] is False
+
+    r = wt.messages.resolve_target(sid, include_recent=False)
+
+    assert r["session_id"] == sid
+    assert r["engine"] == "kimi"
+
+
 def test_resolve_unique_prefix(wt):
     wt.messages.register_agent("planner", SID_A)
     r = wt.messages.resolve_target(SID_A[:8])

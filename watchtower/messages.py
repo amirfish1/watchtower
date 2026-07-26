@@ -71,6 +71,7 @@ same ``fcntl`` file lock the queue store uses. Stdlib only.
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -457,6 +458,18 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
             "engine": str(rec.get("engine") or "claude"),
             "cwd": str(rec.get("cwd") or ""),
         }
+    if (
+        t.startswith("session_")
+        and workers._is_worker_session_id(t)
+        and t in workers._load_worker_session_ledger()
+    ):
+        return {
+            "kind": "session",
+            "session_id": t,
+            "worker": None,
+            "engine": "kimi",
+            "known": True,
+        }
     if _HEX_PREFIX_RE.match(t):
         known = _known_sessions(live, agents)
         if include_recent:
@@ -774,9 +787,9 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     # missing transcript) exits within a second or two. Reporting ok on a
     # dead child silently drops the message — watch the verify window and
     # surface the death so send() parks the text for retry instead.
-    deadline = time.time() + _resume_verify_window_s()
+    deadline = time.monotonic() + _resume_verify_window_s()
     poll = getattr(proc, "poll", None)
-    while callable(poll) and time.time() < deadline:
+    while callable(poll):
         rc = poll()
         if rc is not None:
             return {
@@ -784,7 +797,10 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
                 "error": f"claude resume exited rc={rc} at boot "
                          f"(see {log_path})",
             }
-        time.sleep(0.1)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
     return {"ok": True, "transport": "resume", "log": str(log_path)}
 
 
@@ -853,9 +869,10 @@ def _ensure_transcript_in_cwd_bucket(sid: str, cwd: str) -> None:
 def _resume_verify_window_s() -> float:
     """How long to watch a fresh resume child for boot-time death."""
     try:
-        return float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
+        value = float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
     except ValueError:
         return 2.0
+    return value if math.isfinite(value) and value > 0 else 2.0
 
 
 # ------------------------------------------------------ resume-child reaper
