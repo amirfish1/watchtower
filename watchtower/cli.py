@@ -812,6 +812,16 @@ def _resume_session_headless(
             )
         finally:
             logf.close()
+        try:
+            verify_s = float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
+        except ValueError:
+            verify_s = 2.0
+        deadline = time.time() + verify_s
+        poll = getattr(proc, "poll", None)
+        while callable(poll) and time.time() < deadline:
+            if poll() is not None:
+                return False
+            time.sleep(0.1)
         if queue and worker_id:
             workers.record_worker(
                 proc.pid,
@@ -826,6 +836,34 @@ def _resume_session_headless(
         return True
     except (OSError, FileNotFoundError):
         return False
+
+
+def _answer_engine(item: Dict[str, object], requested: Optional[str]) -> str:
+    """Resolve the blocked session's engine unless the caller overrode it."""
+    if requested:
+        return requested
+    sid = str(item.get("claimed_session_id") or "")
+    worker_id = str(item.get("claimed_by") or "")
+    try:
+        known = workers.list_workers(prune=False)
+        for field, value in (("session_id", sid), ("worker_id", worker_id)):
+            if not value:
+                continue
+            for worker in reversed(known):
+                if str(worker.get(field) or "") == value:
+                    engine = str(worker.get("engine") or "")
+                    if engine in ("claude", "codex", "kimi"):
+                        return engine
+    except (OSError, ValueError):
+        pass
+    if sid:
+        try:
+            from . import codex_registry
+            if (codex_registry.entry(sid) or {}).get("engine") == "codex":
+                return "codex"
+        except (OSError, ValueError):
+            pass
+    return "claude"
 
 
 def cmd_answer(args: argparse.Namespace) -> int:
@@ -884,7 +922,7 @@ def cmd_answer(args: argparse.Namespace) -> int:
         sid,
         repo,
         prompt,
-        args.engine,
+        _answer_engine(item, args.engine),
         queue=item.get("project", ""),
         worker_id=item.get("claimed_by", ""),
     )
@@ -3005,8 +3043,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("ref")
     s.add_argument("text", help="your answer")
     s.add_argument("--worker", default="")
-    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi"],
-                   help="engine to resume the blocked session with")
+    s.add_argument("--engine", choices=["claude", "codex", "kimi"],
+                   help="override the blocked session engine")
     s.set_defaults(func=cmd_answer)
 
     s = sub.add_parser("comment")
