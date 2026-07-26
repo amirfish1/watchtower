@@ -645,6 +645,48 @@ def test_github_drain_off_issues_are_visible_but_not_spawn_worthy(tmp_path, monk
     assert [s["queue"] for s in workers.reconcile_once(dry_run=True)["spawned"]] == ["GHI"]
 
 
+def test_github_drain_off_queue_still_staffs_a_requested_run(tmp_path, monkeypatch):
+    """The ▶ dead end: with drain off the reconciler skipped the queue outright,
+    so a ticket a human asked to run never got a worker at all."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.workers as workers
+
+    importlib.reload(workers)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    _write_fake_issues(state, [_fake_issue(1, "Parked"), _fake_issue(2, "Run this")])
+
+    assert workers.reconcile_once(dry_run=True)["spawned"] == []
+
+    q.mark_runnable("GHI-2")
+
+    # The queue is still not auto-draining -- the requested ticket is the only
+    # thing that counts as depth now.
+    assert q.count_claimable(project="GHI") == 0
+    assert q.count_manual_eligible(project="GHI") == 1
+    assert [s["queue"] for s in workers.reconcile_once(dry_run=True)["spawned"]] == ["GHI"]
+
+
+def test_github_run_request_can_be_cancelled_while_still_queued(tmp_path, monkeypatch):
+    """Press ▶ again while queued and the ticket goes back to parked."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
+
+    q.mark_runnable("GHI-1")
+    cleared = q.clear_run_request("GHI-1")
+
+    assert cleared["run_requested"] is False
+    assert cleared["work_it"] is False
+    assert "watchtower:play" not in json.loads(state.read_text())["issues"][0]["labels"]
+    assert q.count_manual_eligible(project="GHI") == 0
+    with pytest.raises(ValueError, match="not eligible to run"):
+        q.claim_by_ref("GHI-1", "worker-1")
+
+
 def test_github_no_auto_drain_label_keeps_a_ticket_out_of_auto_drain(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
@@ -1181,11 +1223,18 @@ def test_auto_eligible_set_is_always_a_subset_of_work_it(monkeypatch, auto_drain
 
     auto_refs = {it["ref"] for it in backend._claim_candidates(auto_only=True)}
     work_refs = {it["ref"] for it in backend._claim_candidates()}
+    manual_refs = {it["ref"] for it in backend._claim_candidates(manual_only=True)}
     assert auto_refs <= work_refs
+    assert manual_refs <= work_refs
+    # The two halves account for work_it exactly -- nothing a worker would
+    # claim falls outside both, so neither counter can hide a claimable ticket.
+    assert auto_refs | manual_refs == work_refs
     assert auto_refs == auto_items and work_refs == work_items
     # count_claimable (reconciler spawn depth) counts the auto set, never the
-    # tickets that are only workable because a human pressed run.
+    # tickets that are only workable because a human pressed run;
+    # count_manual_eligible is the counter that sees exactly those.
     assert backend.count_claimable() == len(auto_refs)
+    assert backend.count_manual_eligible() == len(manual_refs)
 
 
 def test_grace_period_delays_auto_claim_but_never_a_requested_run(tmp_path, monkeypatch):

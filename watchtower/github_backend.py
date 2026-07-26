@@ -859,6 +859,22 @@ class GitHubIssuesBackend:
         ])
         return self.get(ident)
 
+    def clear_run_request(self, ident: Any) -> Optional[Dict[str, Any]]:
+        """Withdraw a run request by removing the ▶ label (see
+        queue.clear_run_request). The queue label, if this repo is shared, says
+        which queue the ticket belongs to and is left alone."""
+        item = self.get(ident)
+        if item is None:
+            return None
+        if not item.get("run_requested", False):
+            return item
+        self._run([
+            "issue", "edit", str(item["number"]),
+            *self._repo_args(),
+            "--remove-label", self.run_requested_label,
+        ])
+        return self.get(ident)
+
     def get(self, ident: Any) -> Optional[Dict[str, Any]]:
         number = self._issue_number(ident)
         if number is None:
@@ -894,18 +910,25 @@ class GitHubIssuesBackend:
         item_types: Optional[List[str]] = None,
         readiness_filters: Optional[List[str]] = None,
         auto_only: bool = False,
+        manual_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """Tickets a worker could claim right now, in claim order.
 
-        ``auto_only`` narrows the eligibility test from ``work_it`` (what a
-        worker would actually claim) to ``auto_eligible`` (what the reconciler
-        may spawn a worker *for*). Both run through this one filter so the
-        auto-eligible set stays a strict subset of work_it by construction.
+        ``auto_only``/``manual_only`` narrow the eligibility test from
+        ``work_it`` (what a worker would actually claim) to one of its two
+        halves: ``auto_eligible`` (what the reconciler may spawn a worker *for*
+        unattended) or ``manual_eligible`` (what a human pressed ▶ on). All
+        three run through this one filter, over predicates derived together in
+        ``_issue_to_item``, so neither half can drift out of the work_it set.
         """
         # fresh=True: claiming must see the current claimed/open state, not a
         # cached snapshot up to _LIST_CACHE_TTL stale -- otherwise two workers
         # could both pick a ticket that was already claimed moments ago.
-        eligibility = "auto_eligible" if auto_only else "work_it"
+        eligibility = "work_it"
+        if auto_only:
+            eligibility = "auto_eligible"
+        elif manual_only:
+            eligibility = "manual_eligible"
         candidates = [
             it for it in self.list_items(status="open", lane=lane, fresh=True)
             if it.get(eligibility, False)
@@ -1195,6 +1218,19 @@ class GitHubIssuesBackend:
         the reconciler decide this queue wants unattended workers."""
         return len(
             self._claim_candidates(lane=lane, item_types=item_types, auto_only=True)
+        )
+
+    def count_manual_eligible(
+        self,
+        *,
+        lane: Optional[str] = None,
+        item_types: Optional[List[str]] = None,
+    ) -> int:
+        """How many claimable tickets carry a run request (see
+        queue.count_manual_eligible) — the depth the reconciler staffs even
+        when this queue is not auto-draining."""
+        return len(
+            self._claim_candidates(lane=lane, item_types=item_types, manual_only=True)
         )
 
     def last_progress_iso(self) -> Optional[str]:

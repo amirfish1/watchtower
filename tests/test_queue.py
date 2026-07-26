@@ -222,8 +222,39 @@ def test_cli_ready_reopens_a_closed_file_backed_ticket(wt, capsys):
     assert reopened["status"] == "open"
     assert reopened["claimed_by"] is None
     assert reopened["closed_at"] is None
-    assert reopened["history"][-1]["event"] == "reopen"
+    # Reopened AND marked run_requested: `wt ready` is the ▶ path, so it leaves
+    # the same request behind on a file-backed ticket as on a GitHub one.
+    assert [h["event"] for h in reopened["history"]][-2:] == ["reopen", "run_requested"]
+    assert reopened["run_requested"] is True
     assert "RUNNABLE: LOCAL-1" in capsys.readouterr().out
+
+
+def test_file_backed_run_request_is_set_cleared_and_counted(wt):
+    """Backend parity: ▶ on a file-backed ticket leaves the same
+    ``run_requested`` state a GitHub-backed one does, and can be withdrawn."""
+    item = wt.q.enqueue(project="LOCAL", note="press play", source="test")
+    assert item["run_requested"] is False
+    assert wt.q.count_manual_eligible(project="LOCAL") == 0
+
+    requested = wt.q.mark_runnable(item["ref"])
+    assert requested["run_requested"] is True
+    assert requested["history"][-1]["event"] == "run_requested"
+    assert wt.q.count_manual_eligible(project="LOCAL") == 1
+
+    cleared = wt.q.clear_run_request(item["ref"])
+    assert cleared["run_requested"] is False
+    assert cleared["history"][-1]["event"] == "run_request_cleared"
+    assert wt.q.count_manual_eligible(project="LOCAL") == 0
+    # Withdrawing a request touches nothing else about the ticket.
+    assert cleared["status"] == "open"
+
+
+def test_run_request_on_an_unclaimable_ticket_is_not_counted(wt):
+    """A ▶ on a ticket claim_next would never hand out (needs-spec) must not
+    make the reconciler think there is a run to staff."""
+    item = wt.q.enqueue(project="LOCAL", note="half an idea", readiness="needs-spec")
+    wt.q.mark_runnable(item["ref"])
+    assert wt.q.count_manual_eligible(project="LOCAL") == 0
 
 
 def test_timeline_normalizes_old_answers_progress_sentinels_and_snapshot(wt):

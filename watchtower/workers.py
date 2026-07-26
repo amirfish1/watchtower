@@ -307,6 +307,17 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "asks you to push."
 )
 
+# Appended to the drain goal when the reconciler staffs a queue whose owner
+# turned auto-drain OFF: the only reason this worker exists is the tickets
+# somebody pressed the run button on.
+_MANUAL_RUN_INSTRUCTIONS = (
+    "The {queue} queue is NOT auto-draining. You were started only for the "
+    "tickets a human explicitly requested a run for (`wt ls -q {queue} --json` "
+    "-> `run_requested: true`). Work those, oldest first, and then stop -- do "
+    "NOT claim any other ticket on this queue, however claimable it looks, and "
+    "do NOT wait for new work."
+)
+
 _ENGINE_BIN = {"claude": "claude", "codex": "codex", "kimi": "kimi"}
 
 # Engines whose workers are one-shot processes (goal in argv, DEVNULL stdin,
@@ -2044,8 +2055,12 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
     is handled immediately instead of waiting for the next reconciler tick, and so
     the activity log explains the outcome rather than going silent after ENQUEUE.
 
+    Also the nudge behind ▶ (``wt run`` calls it right after marking a ticket
+    run_requested), which is what makes a requested run start now instead of at
+    the next reconciler tick.
+
     Disposition, logged as `DISPATCH <ref> — <reason>`:
-      - auto_drain off            → queued as backlog (no worker)
+      - auto_drain off, no ▶      → queued as backlog (no worker)
       - a warm worker is live     → nudged via its FIFO (immediate pickup)
       - no eligible worker        → release verified-idle + reconcile
       - reconcile spawned nothing → no action (with the reconcile skip reason)
@@ -2055,12 +2070,25 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
     from .queue import _log
     try:
         ref = ref or ""
+        run_requested = False
         if not config.auto_drain(queue):
-            reason = "queued — auto_drain off (backlog, no worker)"
-            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
-            return reason
+            # Drain off parks the backlog, but not a run somebody just asked
+            # for -- bailing here is what made ▶ report "Running" and do
+            # nothing. reconcile_once() staffs requested runs on drain-off
+            # queues, so the reconcile path below has real work to do.
+            item = _q.get(ref) if ref else None
+            run_requested = bool((item or {}).get("run_requested", False))
+            if not run_requested:
+                reason = "queued — auto_drain off (backlog, no worker)"
+                _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+                return reason
         claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
         nudge = (
+            f"A run was requested for {ref} on {queue} (its queue is not "
+            f"auto-draining, so this ticket only). Claim it with "
+            f"`wt claim -q {queue} {ref} --worker <your-id> --json`, work it, "
+            f"and do not claim anything else on this queue."
+            if run_requested else
             f"New ticket {ref} filed on {queue}. Claim it with "
             f"`wt claim -q {queue} --worker <your-id>{claim_filter} --json` and drain the queue."
         )
@@ -2437,11 +2465,27 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         claimable = _q.count_claimable(project=qn, item_types=types)
         return claimable, total
 
+    def _manual_depth(qn: str) -> int:
+        """How many claimable tickets on this queue a human pressed ▶ on."""
+        types = config.claim_types(qn) or None
+        return _q.count_manual_eligible(project=qn, item_types=types)
+
     for q_name in all_cfg:
         auto = config.auto_drain(q_name)
         desired = config.desired_workers(q_name) if auto else 0
+        manual_run = False
         try:
-            depth, total_open = _claimable_depth(q_name)
+            if auto:
+                depth, total_open = _claimable_depth(q_name)
+            else:
+                # auto_drain=off means "no *automatic* work" -- it is not a veto
+                # on a run a human explicitly asked for. Without this the ▶
+                # button is a dead end: the ticket is marked run_requested and
+                # then nothing ever spawns for it. Only the requested tickets
+                # count as depth here, so the rest of the backlog stays parked.
+                depth = _manual_depth(q_name)
+                total_open = _total_open_by_q.get(q_name, 0)
+                manual_run = depth > 0
         except Exception as exc:  # A remote queue must not abort every queue.
             result["skipped"].append(
                 {
@@ -2454,8 +2498,14 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             )
             continue
         if not auto:
-            result["skipped"].append({"queue": q_name, "reason": "auto_drain=off"})
-            continue
+            if not manual_run:
+                result["skipped"].append({"queue": q_name, "reason": "auto_drain=off"})
+                continue
+            # A drain-off queue has no worker budget of its own (desired is
+            # forced to 0 above), so requested runs need one to spawn into.
+            # Keeping the queue's own desired_workers as the floor is what makes
+            # three ▶ presses run serially, in order, instead of at once.
+            desired = max(config.desired_workers(q_name), 1)
         if depth == 0:
             # Distinguish "truly empty" from "only non-claimable items remain"
             # (wrong claim_type, or needs-shaping/needs-spec readiness).
@@ -2518,11 +2568,20 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 q_name, n=to_spawn, engine=engine,
                 repo_path=repo_path, dry_run=dry_run,
                 launch_failures=launch_failed,
+                # On a drain-off queue the worker exists only for the tickets
+                # that were asked for. The GitHub backend already refuses to
+                # claim anything else there; the file backend has no such gate,
+                # so say it in the goal rather than let the worker drain a
+                # backlog its owner deliberately parked.
+                extra_instructions=(
+                    _MANUAL_RUN_INSTRUCTIONS.format(queue=q_name) if manual_run else ""
+                ),
             )
             # Why this spawn happened: open depth + how short of desired we were.
             unclaimed = max(0, depth - actual)
+            counted = "requested to run" if manual_run else "open"
             spawn_reason = (
-                f"{depth} open, {actual} live < {desired} desired, {unclaimed} unclaimed, spawn {to_spawn}"
+                f"{depth} {counted}, {actual} live < {desired} desired, {unclaimed} unclaimed, spawn {to_spawn}"
             )
             for rec in spawned:
                 rec["spawn_reason"] = spawn_reason

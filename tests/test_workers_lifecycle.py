@@ -194,6 +194,99 @@ def test_reconcile_drain_off_skips(wt):
     assert any(s["queue"] == "Q" and "auto_drain=off" in s["reason"] for s in r["skipped"])
 
 
+def test_reconcile_drain_off_still_staffs_a_requested_run(wt):
+    """auto_drain=off means "no automatic work", not "ignore the ▶ button":
+    a run_requested ticket is the one thing that still gets a worker (the
+    dead-end this whole eligibility change exists to fix)."""
+    wt.config.set_auto_drain("Q", False)
+    parked = wt.q.enqueue(project="Q", note="backlog")
+    wanted = wt.q.enqueue(project="Q", note="run this one")
+    wt.q.mark_runnable(wanted["ref"])
+
+    r = wt.workers.reconcile_once(dry_run=True)
+
+    assert [s["queue"] for s in r["spawned"]] == ["Q"]
+    # Only the requested ticket counts as depth -- the parked backlog stays
+    # parked, and the worker is told so.
+    assert "1 requested to run" in r["spawned"][0]["spawn_reason"]
+    assert wt.q.get(parked["ref"])["run_requested"] is False
+
+
+def test_three_run_requests_on_a_drain_off_queue_run_one_at_a_time(wt):
+    """Spec Part 3: three ▶ presses run serially, in order, respecting the
+    worker budget -- not three workers at once."""
+    wt.config.set_auto_drain("Q", False)
+    wt.config.set_desired_workers("Q", 1)
+    refs = [wt.q.enqueue(project="Q", note=f"work {i}")["ref"] for i in range(3)]
+    for ref in refs:
+        wt.q.mark_runnable(ref)
+
+    first = wt.workers.reconcile_once(dry_run=True)
+    assert [s["queue"] for s in first["spawned"]] == ["Q"]
+
+    # That worker is now live: the next tick must not add a second one, however
+    # many tickets are still queued to run.
+    _live_worker(wt, "Q")
+    assert not wt.workers.reconcile_once(dry_run=True)["spawned"]
+
+    # And it works them oldest-first, one ticket at a time.
+    assert wt.q.claim_next("w1", project="Q")["ref"] == refs[0]
+    wt.q.close(refs[0], "w1", resolution={"summary": "done"})
+    assert wt.q.claim_next("w1", project="Q")["ref"] == refs[1]
+
+
+def test_cancelled_run_request_stops_being_staffed(wt):
+    """Pressing ▶ again while still queued takes the queue back to parked."""
+    wt.config.set_auto_drain("Q", False)
+    item = wt.q.enqueue(project="Q", note="never mind")
+    wt.q.mark_runnable(item["ref"])
+    wt.q.clear_run_request(item["ref"])
+
+    r = wt.workers.reconcile_once(dry_run=True)
+
+    assert not r["spawned"]
+    assert any(s["queue"] == "Q" and s["reason"] == "auto_drain=off" for s in r["skipped"])
+
+
+def test_manual_run_worker_is_told_to_work_only_requested_tickets(wt, monkeypatch):
+    """The file backend has no eligibility gate on claim, so the goal is what
+    keeps a manual-run worker off the backlog its owner deliberately parked."""
+    wt.config.set_auto_drain("Q", False)
+    wt.q.enqueue(project="Q", note="backlog")
+    wanted = wt.q.enqueue(project="Q", note="run this one")
+    wt.q.mark_runnable(wanted["ref"])
+    seen = {}
+
+    def fake_spawn(queue, n=1, **kwargs):
+        seen.update(kwargs)
+        return [{"worker_id": "q-manual", "queue": queue}]
+
+    monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
+
+    wt.workers.reconcile_once(dry_run=True)
+
+    assert "run_requested" in seen["extra_instructions"]
+    assert "not auto-draining" in seen["extra_instructions"].lower()
+
+
+def test_dispatch_after_enqueue_acts_on_a_requested_run_with_drain_off(wt, monkeypatch):
+    """▶ must feel immediate: `wt run` dispatches instead of waiting for the
+    next 30s reconciler tick."""
+    wt.config.set_auto_drain("Q", False)
+    item = wt.q.enqueue(project="Q", note="run me")
+
+    parked = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+    assert "auto_drain off" in parked
+
+    wt.q.mark_runnable(item["ref"])
+    monkeypatch.setattr(
+        wt.workers, "spawn_workers",
+        lambda queue, n=1, **kwargs: [{"worker_id": "q-manual", "queue": queue}],
+    )
+
+    assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-manual"
+
+
 def test_reconcile_empty_queue_skips(wt):
     wt.config.set_auto_drain("Q", True)  # config entry exists, but no tickets
     r = wt.workers.reconcile_once(dry_run=True)
@@ -288,7 +381,7 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
 
     def fake_spawn(
         queue, n=1, engine="claude", *, repo_path="", dry_run=False,
-        launch_failures=None,
+        launch_failures=None, **_kwargs,
     ):
         # Real spawn minus the subprocess: linger inside the critical section
         # (so an unserialized second pass would count live=0 meanwhile), then
@@ -382,7 +475,7 @@ def test_reconcile_usage_limit_falls_back_to_default_engine(wt, monkeypatch):
 
     def fake_spawn(
         queue, n=1, engine="claude", *, repo_path="", dry_run=False,
-        launch_failures=None,
+        launch_failures=None, **_kwargs,
     ):
         calls.append(engine)
         if engine == "kimi":
