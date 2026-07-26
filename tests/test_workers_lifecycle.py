@@ -2053,3 +2053,95 @@ def test_take_is_add_with_claim(wt, monkeypatch):
     assert it["status"] == "in_progress"
     assert it["claimed_by"] == "amir"
     assert calls == []
+
+
+# --- kimi worker session-id recovery (session_<uuid> shape) -----------------
+
+
+KIMI_SID = "session_019f83df-284b-7d20-9b72-4e60f3c9b535"
+
+
+def _kimi_log(tmp_path, lines_before=200):
+    """A kimi -p stream-json log: tool chatter, resume_hint only at the END."""
+    log = tmp_path / "kimi-worker.log"
+    body = "".join(
+        '{"role":"assistant","content":"working step %d"}\n' % i
+        for i in range(lines_before)
+    )
+    body += (
+        '{"role":"meta","type":"session.resume_hint","session_id":"%s",'
+        '"command":"kimi -r %s"}\n' % (KIMI_SID, KIMI_SID)
+    )
+    log.write_text(body)
+    return log
+
+
+def test_resolve_session_id_tail_scans_kimi_resume_hint(wt, tmp_path):
+    """kimi's session id sits past the 80-line head window — the tail scan
+    must still find it, in the prefixed session_<uuid> form."""
+    log = _kimi_log(tmp_path)
+    assert wt.workers.resolve_session_id_from_log(str(log)) == KIMI_SID
+
+
+def test_resolve_session_id_ignores_quoted_resume_hint(wt, tmp_path):
+    """A log that merely *quotes* a resume_hint inside another engine's
+    content must not be misattributed."""
+    log = tmp_path / "codex.log"
+    log.write_text(
+        'some preamble\nthinking: {"role":"meta","type":"session.resume_hint",'
+        '"session_id":"%s"} trailing\n' % KIMI_SID
+    )
+    assert wt.workers.resolve_session_id_from_log(str(log)) == ""
+
+
+def test_worker_session_ledger_accepts_kimi_prefixed_ids(wt):
+    wt.workers._add_worker_session_id(KIMI_SID)
+    wt.workers._add_worker_session_id("not-a-session-id")
+    wt.workers._add_worker_session_id("session_also-not-a-uuid")
+    assert wt.workers._load_worker_session_ledger() == [KIMI_SID]
+
+
+def test_backfill_worker_session_ledger_recovers_kimi(wt, tmp_path, monkeypatch):
+    """Log-tail path: a pruned kimi worker's id joins the ledger via the log."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    monkeypatch.setattr(wt.workers, "WORKERS_FILE", tmp_path / "workers.json")
+    _kimi_log(log_dir)
+    added = wt.workers.backfill_worker_session_ledger()
+    assert added == [KIMI_SID]
+    assert KIMI_SID in wt.workers._load_worker_session_ledger()
+
+
+def test_kimi_worker_session_ids_from_kimi_store(wt, tmp_path, monkeypatch):
+    """Kimi-store path: a worker that died before its resume_hint (quota
+    failure) is recovered from the drain-goal prompt in its own wire.jsonl."""
+    worker_id = "bym-deep-fixes-e4b58d49"
+    wt.workers._add_worker_id(worker_id)
+    wire = (
+        tmp_path / "kimi-home" / "sessions" / "wd_repo" / KIMI_SID
+        / "agents" / "main" / "wire.jsonl"
+    )
+    wire.parent.mkdir(parents=True)
+    wire.write_text(
+        '{"type":"metadata"}\n'
+        '{"type":"turn.prompt","input":[{"type":"text","text":"Drain the '
+        'BYM-DEEP-FIXES WatchTower queue. Your worker id is %s. FIRST, read '
+        'the learnings file."}]}\n' % worker_id
+    )
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "kimi-home"))
+    assert wt.workers._kimi_worker_session_ids(0) == [KIMI_SID]
+    # A session quoting the phrase with an unknown worker id is ignored.
+    wire.write_text(
+        '{"type":"turn.prompt","input":[{"type":"text","text":"Your worker id '
+        'is not-a-real-worker."}]}\n'
+    )
+    assert wt.workers._kimi_worker_session_ids(0) == []
+
+
+def test_coerce_session_uuid_preserves_kimi_prefix(wt):
+    assert wt.q._coerce_session_uuid(KIMI_SID) == KIMI_SID
+    bare = "019f83df-284b-7d20-9b72-4e60f3c9b535"
+    assert wt.q._coerce_session_uuid(bare) == bare
+    # Embedded bare UUID in prose still extracts (claude/codex path).
+    assert wt.q._coerce_session_uuid("session is " + bare) == bare
+    assert wt.q._coerce_session_uuid("garbage") is None

@@ -34,3 +34,4 @@ htmlcov/
 queues.json
 workers.json
 daemon.pid
+.gstack/

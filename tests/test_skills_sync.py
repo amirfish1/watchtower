@@ -130,3 +130,23 @@ def test_remove_never_touches_a_real_directory(tmp_path):
     results = skills_sync.remove(engine_homes=homes)
     assert _actions(results)[("claude", skills_sync.SKILL_NAME)] == "skipped-exists"
     assert (target / "mine.txt").exists()
+
+
+def test_ticket_closing_skills_document_summary_and_completion_proof():
+    """Current wt close rejects calls without both resolution text and exactly
+    one proof flag, so user-facing skill examples must teach both."""
+    for skill_name in ("watchtower", "add-annotate-widget"):
+        text = (skills_sync.source_dir(skill_name) / "SKILL.md").read_text()
+        assert "--summary" in text
+        assert "--commit" in text
+        assert "--no-code" in text
+
+
+def test_annotate_skill_closes_the_ref_returned_by_the_ingest_api():
+    """A wiring test must not assume it created the queue's first ticket."""
+    text = (
+        skills_sync.source_dir("add-annotate-widget") / "SKILL.md"
+    ).read_text()
+    assert 'json.load(sys.stdin)["ref"]' in text
+    assert 'wt close "$annotation_ref"' in text
+    assert "\n   wt close MYAPP-1 --no-code" not in text

@@ -182,11 +182,21 @@ _SESSION_ID_RE = _re.compile(
 
 
 def _coerce_session_uuid(value: Any) -> Optional[str]:
-    """Return a bare UUID from ``value`` if one is present, else None."""
+    """Return a reachable session id from ``value`` if one is present, else None.
+
+    Kimi sessions are indexed (by both kimi itself and CCC) under their
+    ``session_<uuid>`` prefixed form, so that shape is preserved verbatim --
+    extracting the bare UUID would produce an id no consumer can resolve."""
     s = str(value or "").strip()
     if not s:
         return None
     if _SESSION_ID_RE.match(s):
+        return s
+    if _re.match(
+        r"^session_[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
+        r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+        s,
+    ):
         return s
     m = _re.search(
         r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",

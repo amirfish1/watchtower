@@ -46,15 +46,20 @@ picks an element, types a note, and a ticket lands in their WatchTower queue
    annotation and confirm a ticket lands, then delete/close it:
 
    ```bash
-   curl -s -X POST http://127.0.0.1:8787/api/queue/MYAPP/add \
+   annotation_response=$(curl -sS -X POST http://127.0.0.1:8787/api/queue/MYAPP/add \
      -H 'Content-Type: application/json' \
-     -d '{"note":"annotate wiring test","url":"http://localhost/","selector":"body"}'
-   wt ls -q MYAPP
+     -d '{"note":"annotate wiring test","url":"http://localhost/","selector":"body"}')
+   annotation_ref=$(printf '%s' "$annotation_response" |
+     python3 -c 'import json,sys; print(json.load(sys.stdin)["ref"])')
+   wt find "$annotation_ref" --json
+   wt close "$annotation_ref" --no-code --summary "Verified annotate widget ingest wiring"
    ```
 
 6. **Tell the user**: open the page, click the floating **⚑** (bottom-right, draggable),
-   pick an element, type a note → ticket lands in `MYAPP`. Drain with `wt claim -q MYAPP`,
-   close with `wt close MYAPP-1 --summary "..."`.
+   pick an element, type a note → ticket lands in `MYAPP`. Drain with
+   `wt claim -q MYAPP`. Close implemented code tickets with
+   `wt close MYAPP-1 --commit <sha> --summary "..."`; use `--no-code` instead
+   only when resolving the ticket changed no code.
 
 ## Notes
 - Guard the widget behind a dev-only check so it never ships to production.
