@@ -1890,7 +1890,44 @@ def request_stop(worker_id: str) -> Path:
     return signal_path
 
 
-def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
+def _answer_in_flight(
+    answered_at: Any, sid: str, now: float, grace_s: float
+) -> bool:
+    """True while a just-delivered answer is still being applied to a ticket.
+
+    ``wt answer`` delivers through the liveness-aware messaging primitive
+    (steer a live worker, resume an idle one) rather than forking a resume
+    child registered under the worker id, so the original ``claimed_by`` worker
+    can read "dead" in the orphan sweep while the answer is mid-application.
+    Reopening then would hand the ticket to a second worker (duplicate work).
+    Hold off while the answer is still fresh (within ``grace_s``), or while the
+    resumed/steered session is actively writing its transcript. Best-effort:
+    any lookup failure returns False so the sweep is never wedged by it."""
+    if not answered_at:
+        return False
+    try:
+        from datetime import datetime
+        ts = datetime.fromisoformat(str(answered_at).replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return False
+    if (now - ts) < grace_s:
+        return True
+    # Beyond the grace, still protect a session that is demonstrably working the
+    # answer (hot transcript). Codex sessions have no wt-visible transcript, so
+    # this only helps claude; codex relies on the grace window above.
+    if sid:
+        try:
+            from . import messages
+            if messages.session_state(str(sid)) == "busy":
+                return True
+        except Exception:
+            pass
+    return False
+
+
+def requeue_orphaned_tickets(
+    grace_s: float = 120.0, answer_grace_s: Optional[float] = None
+) -> List[Dict[str, Any]]:
     """Reopen in_progress tickets whose claiming worker is no longer alive.
 
     A worker that dies, crashes, or is reaped mid-ticket leaves its ticket
@@ -1915,6 +1952,11 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
     Returns the list of reopened items."""
     from . import queue as _q
     import time as _time
+    if answer_grace_s is None:
+        try:
+            answer_grace_s = float(os.environ.get("WATCHTOWER_ANSWER_GRACE_S", "300"))
+        except (TypeError, ValueError):
+            answer_grace_s = 300.0
     known_workers = list_workers(prune=False)
     live_ids = {str(w.get("worker_id", "")) for w in known_workers if w.get("alive")}
     # Union with the persistent ledger, not just the current (prunable) store:
@@ -1936,6 +1978,15 @@ def requeue_orphaned_tickets(grace_s: float = 120.0) -> List[Dict[str, Any]]:
         # resumes the original session. Reopening would hand it to a different
         # worker that lacks the original context.
         if it.get("needs_input"):
+            continue
+        # Skip a ticket whose answer is still being applied. `wt answer` delivers
+        # via the liveness-aware messaging primitive, so the original worker can
+        # look dead here while the resumed/steered session works the answer;
+        # reopening now would duplicate that work (see _answer_in_flight).
+        if _answer_in_flight(
+            it.get("answered_at"), str(it.get("claimed_session_id") or ""),
+            now, answer_grace_s,
+        ):
             continue
         claimer = str(it.get("claimed_by") or "")
         if claimer and claimer in live_ids:

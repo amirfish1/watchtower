@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import importlib
 import os
 import subprocess
@@ -79,3 +80,106 @@ def test_codex_answer_resume_is_headless_and_keeps_claim_owned(
     assert [(w["worker_id"], w["session_id"]) for w in live] == [(worker_id, sid)]
     assert workers.requeue_orphaned_tickets(grace_s=0) == []
     assert q.get(item["ref"])["status"] == "in_progress"
+
+
+def _answer_args(ref, text, worker="human", engine="codex"):
+    return argparse.Namespace(ref=ref, text=text, worker=worker, engine=engine)
+
+
+def _blocked_codex_ticket(q, workers, tmp_path, *, worker_id, sid, alive=False):
+    item = q.enqueue(project="THROUGHPUT", note="blocked work")
+    q.claim_next(worker_id, project="THROUGHPUT", session_uuid=sid)
+    q.block(item["ref"], session_id=worker_id, question="A or B?")
+    pid = os.getpid() if alive else _dead_pid()
+    workers.record_worker(
+        pid, "THROUGHPUT", "codex", worker_id,
+        repo_path=str(tmp_path), session_id=sid,
+    )
+    return item
+
+
+def test_answer_delivers_via_messages_send_not_a_blind_fork(wt, tmp_path, monkeypatch):
+    cli, q, workers = wt
+    import watchtower.messages as messages
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    item = _blocked_codex_ticket(q, workers, tmp_path, worker_id="w-1", sid=sid)
+
+    calls = {}
+
+    def fake_send(target, text, mode="send", **kw):
+        calls["send"] = {"target": target, "mode": mode}
+        return {"ok": True, "transport": "delegate"}
+
+    forked = []
+    monkeypatch.setattr(messages, "send", fake_send)
+    monkeypatch.setattr(
+        cli, "_resume_session_headless",
+        lambda *a, **k: forked.append(a) or True,
+    )
+
+    assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
+    # Delivered through the one liveness-aware primitive, steering the session —
+    # never a blind `codex exec resume` fork.
+    assert calls["send"] == {"target": sid, "mode": "steer"}
+    assert forked == []
+    assert q.get(item["ref"])["needs_input"] is False
+
+
+def test_answer_queued_delivery_does_not_fork(wt, tmp_path, monkeypatch):
+    cli, q, workers = wt
+    import watchtower.messages as messages
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    item = _blocked_codex_ticket(q, workers, tmp_path, worker_id="w-1", sid=sid)
+
+    forked = []
+    monkeypatch.setattr(
+        messages, "send",
+        lambda *a, **k: {"ok": False, "queued": True, "id": "msg-x", "busy": True},
+    )
+    monkeypatch.setattr(
+        cli, "_resume_session_headless",
+        lambda *a, **k: forked.append(a) or True,
+    )
+
+    assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
+    # Busy/held is delivered by the durable outbox, not a parallel fork.
+    assert forked == []
+
+
+def test_answer_falls_back_to_resume_when_target_unresolvable(wt, tmp_path, monkeypatch):
+    cli, q, workers = wt
+    import watchtower.messages as messages
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    item = _blocked_codex_ticket(q, workers, tmp_path, worker_id="w-1", sid=sid)
+
+    forked = []
+    monkeypatch.setattr(
+        messages, "send",
+        lambda *a, **k: {"ok": False, "error": "unresolvable target"},
+    )
+    monkeypatch.setattr(
+        cli, "_resume_session_headless",
+        lambda *a, **k: forked.append((a, k)) or True,
+    )
+
+    assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
+    # Nothing queued -> preserve delivery via the headless resume fallback.
+    assert len(forked) == 1
+
+
+def test_answered_ticket_not_reopened_while_answer_in_flight(wt, tmp_path):
+    cli, q, workers = wt
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    item = _blocked_codex_ticket(q, workers, tmp_path, worker_id="w-1", sid=sid)
+    q.answer(item["ref"], "A", session_id="human")
+
+    # Worker is dead and needs_input is now cleared, but the answer is fresh:
+    # the sweep must not hand the ticket to a second worker mid-answer.
+    assert workers.requeue_orphaned_tickets(grace_s=0, answer_grace_s=300) == []
+    assert q.get(item["ref"])["status"] == "in_progress"
+
+    # Once the answer grace lapses (and the codex session shows no live
+    # transcript), the ticket reopens so it is not stranded forever.
+    reopened = workers.requeue_orphaned_tickets(grace_s=0, answer_grace_s=0)
+    assert [r["ref"] for r in reopened] == [item["ref"]]
+    assert q.get(item["ref"])["status"] == "open"
