@@ -209,11 +209,15 @@ def all_status(
     now: Optional[datetime] = None,
     stuck_minutes: int = STUCK_MINUTES,
     drain_window_minutes: int = DRAIN_WINDOW_MINUTES,
+    fresh: bool = False,
 ) -> List[Dict[str, Any]]:
     """Status rows for every queue (or one, if ``project`` is given).
 
     Empty queues (all closed, depth 0) are still listed so a drained queue
     shows up as healthy rather than vanishing.
+
+    ``fresh`` revalidates GitHub-backed queues instead of serving the list
+    cache; CLI reads set it, the dashboard's own polling loop does not.
     """
     now = now or datetime.now(timezone.utc)
     by_queue: Dict[str, List[Dict[str, Any]]] = {}
@@ -224,7 +228,7 @@ def all_status(
     else:
         for name in configured:
             by_queue.setdefault(name, [])
-    for it in q.list_items(project=project):
+    for it in q.list_items(project=project, fresh=fresh):
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
     rows = [
         queue_status(

@@ -19,6 +19,7 @@ import pytest
 
 
 FAKE_GH = r'''#!/usr/bin/env python3
+import hashlib
 import json
 import os
 import sys
@@ -115,6 +116,37 @@ if args[:2] == ["issue", "create"]:
     data["issues"].append(issue)
     save(data)
     print(issue["url"])
+    sys.exit(0)
+
+if args[:2] == ["api", "-i"]:
+    # The conditional GET WatchTower uses as a change detector. The ETag is a
+    # hash of the same issue state `issue list` reads, so "unchanged" here
+    # means exactly what it means on GitHub. Reproduces the landmine too:
+    # real `gh api` EXITS 1 on a 304, with `gh: HTTP 304` on stderr.
+    path = args[-1]
+    want_state = "CLOSED" if "state=closed" in path else "OPEN"
+    payload = json.dumps(
+        [project_fields(i) for i in data["issues"] if i["state"] == want_state],
+        sort_keys=True,
+    )
+    etag = '"' + hashlib.sha256(payload.encode()).hexdigest() + '"'
+    sent = ""
+    for i, a in enumerate(args):
+        if a == "-H" and i + 1 < len(args):
+            name, _, value = args[i + 1].partition(":")
+            if name.strip().lower() == "if-none-match":
+                sent = value.strip()
+    save(data)
+    if sent and sent == etag:
+        print("HTTP/2.0 304 Not Modified")
+        print("Etag: " + etag)
+        print("gh: HTTP 304", file=sys.stderr)
+        sys.exit(1)
+    print("HTTP/2.0 200 OK")
+    print("Etag: " + etag)
+    print("Content-Type: application/json; charset=utf-8")
+    print()
+    print(payload)
     sys.exit(0)
 
 if args[:2] == ["issue", "list"]:
@@ -245,6 +277,21 @@ def _drainable(config, queue: str = "GHI") -> None:
     what makes an ordinary open ticket claimable at all."""
     config.set_auto_drain(queue, True)
     config.set_grace_s(queue, 0)
+
+
+def _no_etag_probe(monkeypatch, backend):
+    """Neutralise the ETag change detector on ``backend``.
+
+    Tests that fake `gh` by patching ``_run`` need this: the probe is a
+    *separate* `gh` invocation (``_run_raw``), so without it they would shell
+    out to the real GitHub API. ``(None, etag)`` is the detector's "unusable"
+    answer, which makes ``_list_issues`` behave exactly as it did before ETags
+    -- one unconditional `gh issue list` per refresh, which is what these tests
+    are counting.
+    """
+    monkeypatch.setattr(
+        backend, "_probe_list_change", lambda state, etag: (None, etag)
+    )
 
 
 def _write_fake_issues(state: Path, issues):
@@ -701,6 +748,7 @@ def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
         return json.dumps([good_issue])
 
     monkeypatch.setattr(backend, "_run", fake_run)
+    _no_etag_probe(monkeypatch, backend)
 
     # Two calls within the TTL window share one cached result.
     first = backend._list_issues()
@@ -730,6 +778,7 @@ def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
     # there's nothing safe to fall back to.
     cold = github_backend.GitHubIssuesBackend("T", repo="acme/cache-test-cold")
     monkeypatch.setattr(cold, "_run", failing_run)
+    _no_etag_probe(monkeypatch, cold)
     with pytest.raises(github_backend.GitHubBackendError):
         cold._list_issues()
 
@@ -781,6 +830,7 @@ def test_list_issues_strict_never_uses_cached_or_stale_data(monkeypatch):
         return json.dumps([issue])
 
     monkeypatch.setattr(backend, "_run", succeed)
+    _no_etag_probe(monkeypatch, backend)
     assert backend._list_issues() == [issue]
 
     def fail(args, *, check=True):
@@ -814,6 +864,199 @@ def test_cached_github_list_failure_is_logged_only_once(tmp_path, monkeypatch):
 
     activity = (tmp_path / "activity.log").read_text()
     assert activity.count("GitHub list failed: gh auth unavailable") == 1
+
+
+# ============================================================= ETag freshness
+
+_PROBE_ISSUE = {
+    "number": 1, "title": "t", "body": "", "state": "OPEN",
+    "url": "https://github.com/acme/etag-test/issues/1",
+    "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+    "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+}
+
+
+def _proc(returncode, stdout="", stderr=""):
+    import subprocess
+
+    return subprocess.CompletedProcess(
+        args=["gh"], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+def _not_modified():
+    """Exactly what `gh api -i` does on a 304: exit 1, `gh: HTTP 304` on
+    stderr, status line on stdout. Verified against gh 2.96.0."""
+    return _proc(
+        1,
+        stdout='HTTP/2.0 304 Not Modified\r\nEtag: "v1"\r\n\r\n',
+        stderr="gh: HTTP 304\n",
+    )
+
+
+def _ok(etag="v1", body="[]"):
+    return _proc(
+        0,
+        stdout=f'HTTP/2.0 200 OK\r\nEtag: "{etag}"\r\n'
+               f"Content-Type: application/json\r\n\r\n{body}",
+    )
+
+
+def _etag_backend(monkeypatch, repo="acme/etag-test"):
+    """A backend that always revalidates, with both `gh` seams instrumented.
+
+    Returns ``(backend, counts, probes)``: ``counts['fetch']`` is the rich
+    `gh issue list` calls, ``probes`` the argv of each conditional GET.
+    """
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.0)
+    github_backend._LIST_CACHE.clear()
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    counts = {"fetch": 0}
+    probes = []
+
+    def fake_run(args, *, check=True):
+        counts["fetch"] += 1
+        return json.dumps([_PROBE_ISSUE])
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    return backend, counts, probes
+
+
+def test_etag_304_reads_as_unchanged_and_never_as_an_error(monkeypatch):
+    """The landmine: `gh api` exits 1 on a 304. Decoded as a failure it would
+    trip _LIST_ERROR_BACKOFF and freeze the queue on stale data for 60s at a
+    time -- on the poll that is supposed to be the cheap common case."""
+    import watchtower.github_backend as github_backend
+
+    backend, counts, probes = _etag_backend(monkeypatch)
+
+    def fake_run_raw(args):
+        probes.append(list(args))
+        return _ok() if "-H" not in args else _not_modified()
+
+    monkeypatch.setattr(backend, "_run_raw", fake_run_raw)
+
+    # Cold: nothing cached to validate, so no probe -- just today's fetch.
+    assert backend._list_issues() == [_PROBE_ISSUE]
+    assert (counts["fetch"], len(probes)) == (1, 0)
+
+    # First revalidation has no ETag yet: unconditional probe, 200, fetch.
+    assert backend._list_issues() == [_PROBE_ISSUE]
+    assert (counts["fetch"], len(probes)) == (2, 1)
+
+    # Now every poll is a 304. No exception, no re-listing, same data.
+    for _ in range(3):
+        assert backend._list_issues() == [_PROBE_ISSUE]
+    assert counts["fetch"] == 2, "a 304 must not trigger the expensive fetch"
+    assert len(probes) == 4
+    assert 'If-None-Match: "v1"' in probes[-1]
+
+    # And crucially it is not remembered as a failure: no error cached, so
+    # nothing is backing off and the next real change is picked up at once.
+    cached = github_backend._LIST_CACHE["acme/etag-test:open"]
+    assert cached["error"] is None
+    assert cached["etag"] == '"v1"'
+
+
+def test_etag_200_refetches_and_stores_the_new_validator(monkeypatch):
+    """A changed repo goes back through the rich fetch -- the probe is a
+    detector, not a fetcher (its payload has comment counts, not bodies)."""
+    import watchtower.github_backend as github_backend
+
+    backend, counts, probes = _etag_backend(monkeypatch)
+    versions = iter(["v1", "v2"])
+
+    def fake_run_raw(args):
+        probes.append(list(args))
+        return _ok(etag=next(versions))
+
+    monkeypatch.setattr(backend, "_run_raw", fake_run_raw)
+
+    backend._list_issues()                       # cold fetch, no validator yet
+    backend._list_issues()                       # 200 -> fetch, stores "v1"
+    assert github_backend._LIST_CACHE["acme/etag-test:open"]["etag"] == '"v1"'
+    backend._list_issues()                       # 200 again -> fetch, "v2"
+    assert github_backend._LIST_CACHE["acme/etag-test:open"]["etag"] == '"v2"'
+    assert counts["fetch"] == 3
+    assert 'If-None-Match: "v1"' in probes[-1]
+
+
+def test_unusable_etag_probe_falls_through_to_the_unconditional_fetch(monkeypatch):
+    """Worst case must equal the behaviour we had before ETags: an unhelpful
+    probe (5xx, network blip, an old gh that can't do -i) costs one wasted
+    call and nothing else."""
+    backend, counts, probes = _etag_backend(monkeypatch)
+
+    def broken_probe(args):
+        probes.append(list(args))
+        return _proc(1, stdout="", stderr="gh: HTTP 502 Bad Gateway\n")
+
+    monkeypatch.setattr(backend, "_run_raw", broken_probe)
+
+    for _ in range(3):
+        assert backend._list_issues() == [_PROBE_ISSUE]
+    assert counts["fetch"] == 3  # every poll still gets real data
+    assert len(probes) == 2      # cold call has nothing to validate
+
+
+def test_genuine_list_failure_still_backs_off_with_the_probe_in_play(monkeypatch):
+    """The 304 handling must not soften the error path: a repo that really is
+    failing (rate limit, auth) is still retried at most once per backoff."""
+    import watchtower.github_backend as github_backend
+
+    backend, counts, probes = _etag_backend(monkeypatch)
+    monkeypatch.setattr(github_backend, "_LIST_ERROR_BACKOFF", 60.0)
+
+    def changed_probe(args):
+        probes.append(list(args))
+        return _ok(etag="v1")
+
+    monkeypatch.setattr(backend, "_run_raw", changed_probe)
+    assert backend._list_issues() == [_PROBE_ISSUE]  # one good list to fall back to
+
+    def failing_run(args, *, check=True):
+        counts["fetch"] += 1
+        raise github_backend.GitHubBackendError("API rate limit already exceeded")
+
+    monkeypatch.setattr(backend, "_run", failing_run)
+    assert backend._list_issues() == [_PROBE_ISSUE]  # stale-but-good, served silently
+    assert (counts["fetch"], len(probes)) == (2, 1)
+
+    # Inside the backoff window nothing hits GitHub at all -- not even the
+    # cheap probe, because there is nothing worth revalidating until the
+    # repo is healthy again.
+    assert backend._list_issues() == [_PROBE_ISSUE]
+    assert (counts["fetch"], len(probes)) == (2, 1)
+    assert github_backend._LIST_CACHE["acme/etag-test:open"]["error"] is not None
+
+
+def test_a_new_issue_is_visible_to_the_next_revalidating_read(tmp_path, monkeypatch):
+    """End to end over the fake gh, which reproduces the 304 exit-1 landmine:
+    an unchanged repo is answered from cache, a new issue is not."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+    _write_fake_issues(state, [_fake_issue(1, "first")])
+
+    def refs():
+        return [it["ref"] for it in q.list_items(project="GHI", fresh=True)]
+
+    assert refs() == ["GHI-1"]          # cold
+    assert refs() == ["GHI-1"]          # bootstraps the validator
+    _write_fake_issues(state, [_fake_issue(1, "first")])  # same state, cmds reset
+    assert refs() == ["GHI-1"]          # answered by a 304
+
+    commands = [" ".join(c) for c in json.loads(state.read_text())["commands"]]
+    assert any("If-None-Match" in c for c in commands)
+    assert not [c for c in commands if c.startswith("issue list")], (
+        "a 304 must not be followed by `gh issue list`"
+    )
+
+    _write_fake_issues(state, [_fake_issue(1, "first"), _fake_issue(2, "second")])
+    assert refs() == ["GHI-1", "GHI-2"]
 
 
 # ============================================================ eligibility model

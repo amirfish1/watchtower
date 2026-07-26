@@ -59,9 +59,26 @@ class GitHubBackendError(RuntimeError):
 # result instead of re-listing; `_LIST_ERROR_BACKOFF` throttles how often a
 # failing repo is retried at all, and falls back to the last known-good list
 # (silently, if we have one) rather than re-raising the same error forever.
+#
+# The TTL is deliberately short (2s, was 20s): it is no longer what keeps the
+# poll cheap -- the ETag probe below is. It now only dedupes bursts of calls
+# within a single agent turn, so a new issue shows up on the board within
+# seconds instead of up to twenty.
 _LIST_CACHE: Dict[str, Dict[str, Any]] = {}
-_LIST_CACHE_TTL = 20.0
+_LIST_CACHE_TTL = 2.0
 _LIST_ERROR_BACKOFF = 60.0
+
+# Cheap change *detector* for the issue list. A conditional GET answers "did
+# anything move in this repo?" in ~0.5s and, on a 304, costs nothing against
+# the rate limit (`X-RateLimit-Remaining` is unchanged across it).
+#
+# It is a detector and not a replacement fetcher on purpose: this REST endpoint
+# reports `comments` as a *count* while `_issue_to_item` embeds full comment
+# bodies in every row, and it mixes pull requests into the payload. Swapping
+# the fetcher would silently strip comment context out of worker tickets. So a
+# 200 only means "go look" -- `gh issue list --json ...` is still what produces
+# the data.
+_HTTP_STATUS_RE = re.compile(r"^HTTP/[\d.]+\s+(\d{3})")
 
 
 def _now_iso() -> str:
@@ -117,6 +134,26 @@ def _append_history(meta: Dict[str, Any], event: str, **fields: Any) -> None:
             entry[key] = value
     hist.append(entry)
     meta["history"] = hist
+
+
+def _http_status(raw: str) -> Optional[int]:
+    """Status code from ``gh api -i`` output, whose first line is the status
+    line. Returns None when the output does not look like an HTTP response."""
+    first = (raw or "").lstrip().split("\n", 1)[0].strip()
+    match = _HTTP_STATUS_RE.match(first)
+    return int(match.group(1)) if match else None
+
+
+def _etag_header(raw: str) -> str:
+    """The ETag out of ``gh api -i`` output (headers only: the scan stops at
+    the blank line, so a body that happens to contain `etag:` can't spoof it)."""
+    for line in (raw or "").splitlines():
+        if not line.strip():
+            break
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() == "etag":
+            return value.strip()
+    return ""
 
 
 def _norm_choice(value: Any, valid_values: tuple, default: str = "") -> str:
@@ -400,9 +437,15 @@ class GitHubIssuesBackend:
     def _repo_args(self) -> List[str]:
         return ["--repo", self.repo] if self.repo else []
 
-    def _run(self, args: List[str], *, check: bool = True) -> str:
+    def _run_raw(self, args: List[str]) -> "subprocess.CompletedProcess[str]":
+        """Run ``gh`` and hand back the whole result.
+
+        Split out of ``_run`` because the ETag probe has to read the exit code
+        and stderr itself: ``gh api`` exits 1 on a 304, which is a success for
+        us, and ``_run``'s exit-code-means-failure rule cannot express that.
+        """
         try:
-            proc = subprocess.run(
+            return subprocess.run(
                 ["gh", *args],
                 cwd=self.repo_path or None,
                 capture_output=True,
@@ -415,6 +458,9 @@ class GitHubIssuesBackend:
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise GitHubBackendError(f"gh {' '.join(args)} timed out") from exc
+
+    def _run(self, args: List[str], *, check: bool = True) -> str:
+        proc = self._run_raw(args)
         if check and proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             raise GitHubBackendError(
@@ -570,12 +616,64 @@ class GitHubIssuesBackend:
             item["history"] = history
         return item
 
+    def _list_probe_path(self, state: str) -> str:
+        """REST path the change detector polls.
+
+        ``sort=updated`` matters: the endpoint defaults to creation order, so
+        on a repo with more than one page of open issues a comment on an old
+        issue would never reach page 1 and the ETag would not move. Sorted by
+        update time, *any* change -- new issue, comment, label, close --
+        surfaces on the page we ask for and flips the ETag.
+        """
+        return (
+            f"repos/{self.repo}/issues"
+            f"?state={state}&per_page=100&sort=updated&direction=desc"
+        )
+
+    def _probe_list_change(
+        self, state: str, etag: str
+    ) -> "tuple[Optional[bool], str]":
+        """Ask GitHub whether the issue list moved since ``etag``.
+
+        Returns ``(unchanged, etag)``: True on a 304 (keep the cached list),
+        False on a 200 (go fetch), None when the probe itself was unusable --
+        in which case the caller falls through to an unconditional list, so the
+        worst case is exactly the behaviour we had before ETags.
+
+        THE LANDMINE: ``gh api`` **exits 1** on a 304 and prints ``gh: HTTP
+        304`` to stderr. Read as a failure that would trip
+        ``_LIST_ERROR_BACKOFF`` and freeze the queue on stale data for a minute
+        at a time, on the poll that is *supposed* to be the cheap common case.
+        So "unchanged" is decoded from the response status, never from the exit
+        code.
+        """
+        if not self.repo:
+            return None, etag
+        args = ["api", "-i"]
+        if etag:
+            args.extend(["-H", f"If-None-Match: {etag}"])
+        args.append(self._list_probe_path(state))
+        try:
+            proc = self._run_raw(args)
+        except GitHubBackendError:
+            return None, etag  # gh missing or hung: let the real fetch report it
+        status = _http_status(proc.stdout)
+        if status == 304 or (status is None and "HTTP 304" in (proc.stderr or "")):
+            return True, etag
+        if status == 200 and proc.returncode == 0:
+            return False, _etag_header(proc.stdout)
+        return None, etag
+
     def _list_issues(
         self, state: str = "open", *, fresh: bool = False, strict: bool = False
     ) -> List[Dict[str, Any]]:
         key = f"{self.repo}:{state}"
         now = time.time()
         cached = _LIST_CACHE.get(key)
+        # Only a 200 from the probe below sets this. Every other route to the
+        # fetch stores no ETag, so the next poll re-bootstraps one rather than
+        # pairing a fresh list with a validator taken at some other moment.
+        etag = ""
         if cached is not None:
             age = now - cached["at"]
             if cached.get("error") is not None:
@@ -583,8 +681,22 @@ class GitHubIssuesBackend:
                     if cached.get("data") is not None and not strict:
                         return cached["data"]
                     raise GitHubBackendError(str(cached["error"]), cached=True)
+                # Backoff expired: retry unconditionally. Deliberately no probe
+                # -- the stored ETag pairs with data we already know is stale,
+                # and a 304 would leave the error latched forever.
             elif not fresh and age < _LIST_CACHE_TTL:
                 return cached["data"]
+            elif cached.get("data") is not None and not strict:
+                # Revalidate rather than re-list. Past the 2s TTL nearly every
+                # poll finds an unchanged repo, and a 304 settles it without
+                # spending rate limit. Strict callers (claim, close) skip the
+                # detour: they are about to write and pay for certainty.
+                unchanged, etag = self._probe_list_change(
+                    state, str(cached.get("etag") or "")
+                )
+                if unchanged:
+                    cached["at"] = now  # unchanged is as good as re-fetched
+                    return cached["data"]
         try:
             args = [
                 "issue", "list",
@@ -609,11 +721,16 @@ class GitHubIssuesBackend:
             result = [issue for issue in data if isinstance(issue, dict)]
         except GitHubBackendError as exc:
             prev_data = cached.get("data") if cached else None
-            _LIST_CACHE[key] = {"at": now, "data": prev_data, "error": exc}
+            _LIST_CACHE[key] = {
+                # The stale data keeps its own validator; nothing probes with
+                # it while an error is recorded, so it cannot mislead.
+                "at": now, "data": prev_data, "error": exc,
+                "etag": (cached.get("etag") or "") if cached else "",
+            }
             if prev_data is not None and not strict:
                 return prev_data
             raise
-        _LIST_CACHE[key] = {"at": now, "data": result, "error": None}
+        _LIST_CACHE[key] = {"at": now, "data": result, "error": None, "etag": etag}
         return result
 
     def enqueue(

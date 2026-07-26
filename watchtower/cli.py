@@ -194,7 +194,12 @@ def _event_summary(event: dict) -> str:
 
 # ----------------------------------------------------------------------- commands
 def cmd_status(args: argparse.Namespace) -> int:
-    rows = health.all_status(project=args.queue, stuck_minutes=args.stuck_minutes)
+    # fresh=True: a human asking for status gets current state, never a cached
+    # snapshot. On a GitHub queue that is an ETag revalidation, so the usual
+    # answer is a ~0.5s 304 that costs no rate limit.
+    rows = health.all_status(
+        project=args.queue, stuck_minutes=args.stuck_minutes, fresh=True
+    )
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
@@ -205,7 +210,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_ls(args: argparse.Namespace) -> int:
     """List the tickets in a single queue (the actual items, not just counts)."""
-    items = q.list_items(project=args.queue)
+    # fresh=True for the same reason as `wt status`: a CLI read always
+    # revalidates, so `wt ls` is never behind the repo.
+    items = q.list_items(project=args.queue, fresh=True)
     want = args.status
     if want == "active":
         items = [i for i in items if i.get("status") in ("open", "in_progress")]
