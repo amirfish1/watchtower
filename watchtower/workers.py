@@ -782,13 +782,29 @@ def _load_worker_session_ledger() -> List[str]:
     return [str(s) for s in ids if isinstance(s, str)]
 
 
+def _is_worker_session_id(sid: str) -> bool:
+    """Accept the session-id shapes CCC can index a worker session by.
+
+    Claude/Codex use a bare cloud UUID. Kimi sessions are indexed under their
+    ``session_<uuid>`` prefixed form (that is the id CCC's kimi session scan
+    and the ACP harness both use), so the prefixed shape is valid too --
+    rejecting it silently dropped every kimi worker from the ledger, which is
+    why kimi worker sessions never showed up as workers in CCC."""
+    s = str(sid or "")
+    if _SESSION_ID_RE.fullmatch(s):
+        return True
+    return s.startswith("session_") and bool(
+        _SESSION_ID_RE.fullmatch(s[len("session_"):])
+    )
+
+
 def _add_worker_session_id(sid: str) -> None:
     """Append a worker session_id to the persistent ledger if not already present.
 
     Cheap: only writes when a genuinely new id is added. Caps the list to the
     most recent ``_WORKER_SESSIONS_CAP`` ids (drops oldest). Atomic tmp+replace,
-    mirroring ``_save``. Silently no-ops on a falsy/non-UUID id or write error."""
-    if not sid or not _SESSION_ID_RE.fullmatch(str(sid)):
+    mirroring ``_save``. Silently no-ops on a falsy/invalid id or write error."""
+    if not sid or not _is_worker_session_id(str(sid)):
         return
     sid = str(sid)
     ids = _load_worker_session_ledger()
@@ -858,6 +874,10 @@ _CODEX_SESSION_ID_LINE_RE = re.compile(
     r")\s*$",
     re.IGNORECASE,
 )
+
+# Tail window resolve_session_id_from_log scans when the 80-line head pass
+# finds nothing (kimi's closing session.resume_hint line).
+_RESOLVE_LOG_TAIL_BYTES = 16384
 
 _USAGE_RETRY_DATE_RE = re.compile(
     r"try again at\s+([A-Za-z]+ \d{1,2}(?:st|nd|rd|th)?, \d{4} "
@@ -1213,6 +1233,37 @@ def resolve_session_id_from_log(log_path: str) -> str:
                         sid[len("session_"):]
                     ):
                         return sid
+    except (OSError, UnicodeDecodeError):
+        pass
+    # Kimi one-shot logs (`kimi -p --output-format stream-json`) carry the
+    # session id ONLY in the closing session.resume_hint meta line. For any
+    # real run that line sits far past the 80-line head window above, so kimi
+    # workers used to resolve "" forever. Fall back to a small tail scan,
+    # restricted to the exact resume_hint shape so a log that merely *quotes*
+    # another session's id in its content can't be misattributed.
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, "rb") as f:
+            if size > _RESOLVE_LOG_TAIL_BYTES:
+                f.seek(-_RESOLVE_LOG_TAIL_BYTES, os.SEEK_END)
+            tail = f.read().decode("utf-8", errors="replace")
+        for line in tail.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            if ev.get("role") != "meta" or ev.get("type") != "session.resume_hint":
+                continue
+            sid = str(ev.get("session_id") or "")
+            if sid.startswith("session_") and _SESSION_ID_RE.fullmatch(
+                sid[len("session_"):]
+            ):
+                return sid
     except (OSError, UnicodeDecodeError):
         pass
     return ""
@@ -2109,6 +2160,100 @@ def _session_title_backfill_row(
     }
 
 
+def backfill_worker_session_ledger(hours: float = 24 * 7) -> List[str]:
+    """Ledger session ids resolvable from recent worker logs.
+
+    The live-worker backfill in ``list_workers`` only covers workers still
+    present in workers.json. One-shot engines (``codex exec``, ``kimi -p``)
+    exit and are pruned quickly, and kimi's resume_hint only appears at the
+    END of the log -- past the head window that pass used while the worker
+    was alive. This pass re-resolves recent logs and ledgers their ids so
+    CCC keeps treating those sessions as WT worker sessions (Workers tab,
+    Current-sessions exclusion) after the worker record is gone.
+
+    Idempotent; returns the ids newly added this pass."""
+    added: List[str] = []
+    log_dir = WORKERS_FILE.parent / "logs"
+    try:
+        logs = sorted(log_dir.glob("*.log"))
+    except OSError:
+        return added
+    cutoff = time.time() - max(0.0, float(hours)) * 3600.0
+    known = set(_load_worker_session_ledger())
+
+    def _ledger(sid: str) -> None:
+        if not sid or sid in known:
+            return
+        _add_worker_session_id(sid)
+        known.add(sid)
+        added.append(sid)
+
+    for path in logs:
+        try:
+            if path.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        _ledger(resolve_session_id_from_log(str(path)))
+    for sid in _kimi_worker_session_ids(cutoff):
+        _ledger(sid)
+    return added
+
+
+_KIMI_WORKER_GOAL_RE = re.compile(r"Your worker id is ([A-Za-z0-9-]+)")
+
+# Lines of a kimi wire.jsonl head scanned for the drain-goal prompt. The goal
+# is the very first turn.prompt, so this never needs to be deep.
+_KIMI_WIRE_HEAD_LINES = 40
+
+
+def _kimi_worker_session_ids(cutoff: float) -> List[str]:
+    """Session ids of kimi sessions spawned as WT workers, from kimi's own
+    session store.
+
+    A kimi worker that dies before its closing resume_hint (quota 403, early
+    launch failure) leaves no session id anywhere in its WT log, so the
+    log-based backfill above can never recover it. The session itself
+    survives under ``~/.kimi-code/sessions/*/session_<uuid>/`` and its first
+    turn.prompt carries the drain goal's "Your worker id is <id>" line.
+    Recover the link from that side. An id only counts when it appears in
+    the worker-ids ledger, so a user session that merely quotes the phrase
+    is never misclassified."""
+    try:
+        known_workers = set(_load_worker_id_ledger())
+    except Exception:
+        known_workers = set()
+    if not known_workers:
+        return []
+    kimi_home = Path(os.environ.get("KIMI_CODE_HOME") or (Path.home() / ".kimi-code"))
+    sessions_dir = kimi_home / "sessions"
+    out: List[str] = []
+    try:
+        wires = sessions_dir.glob("*/session_*/agents/main/wire.jsonl")
+    except OSError:
+        return out
+    for wire in wires:
+        try:
+            if wire.stat().st_mtime < cutoff:
+                continue
+        except OSError:
+            continue
+        try:
+            with wire.open("r", errors="replace") as f:
+                head = [next(f, "") for _ in range(_KIMI_WIRE_HEAD_LINES)]
+        except OSError:
+            continue
+        text = "".join(head)
+        m = _KIMI_WORKER_GOAL_RE.search(text)
+        if not m or m.group(1) not in known_workers:
+            continue
+        # wire path: <sessions>/<wd>/session_<uuid>/agents/main/wire.jsonl
+        sid = wire.parents[2].name
+        if _is_worker_session_id(sid):
+            out.append(sid)
+    return out
+
+
 def backfill_recent_session_titles(
     hours: float = 24.0,
     dry_run: bool = False,
@@ -2216,6 +2361,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                               "released": [], "reaped": [], "requeued": [],
                               "backfilled": [],
                               "session_title_backfilled": [],
+                              "ledger_backfilled": [],
                               "launch_failed": [], "fallbacks": []}
 
     # Gracefully release workers only after engine-aware activity clocks are
@@ -2265,6 +2411,14 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         # safely run on every reconciler tick.
         try:
             result["session_title_backfilled"] = backfill_recent_session_titles()
+        except Exception:
+            pass
+        # Ledger session ids resolvable from recent worker logs. One-shot
+        # engines are pruned from workers.json within seconds of exiting,
+        # and kimi's id only lands at the end of its log -- this keeps the
+        # ledger (and therefore CCC's worker views) complete anyway.
+        try:
+            result["ledger_backfilled"] = backfill_worker_session_ledger()
         except Exception:
             pass
 
