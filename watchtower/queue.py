@@ -1461,6 +1461,17 @@ def block(
                     _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
                 _append_history(it, "block", by=actor, at=now, question=_clip(question, 4000))
                 _save_unlocked(data)
+                if progress:
+                    _log(
+                        "PROGRESS",
+                        f"{it.get('ref', '?')} — {_clip(progress, 240)}",
+                        queue=it.get("project", ""),
+                    )
+                _log(
+                    "BLOCK",
+                    f"{it.get('ref', '?')} — {_clip(question, 240)}",
+                    queue=it.get("project", ""),
+                )
                 return it
     return None
 
@@ -1500,6 +1511,11 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                         reason="answered_without_resumable_session",
                     )
                 _save_unlocked(data)
+                _log(
+                    "ANSWER",
+                    f"{it.get('ref', '?')} — {_clip(text, 240)}",
+                    queue=it.get("project", ""),
+                )
                 return it
     return None
 
@@ -1521,6 +1537,11 @@ def comment(ident: Any, text: str, by: str = "human", session_id: str = "") -> O
                     text=_clip(text, 24000),
                 )
                 _save_unlocked(data)
+                _log(
+                    "COMMENT",
+                    f"{it.get('ref', '?')} — {_clip(text, 240)}",
+                    queue=it.get("project", ""),
+                )
                 return it
     return None
 
