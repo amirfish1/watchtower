@@ -39,6 +39,8 @@ Item shape::
       "claimed_session_id": null,        # real worker/session id, when known
       "resolution": {                    # HOW it was fixed (set on close, optional)
         "summary": "...",                # the main one-liner
+        "commit": "...",                 # verified code-change commit, if any
+        "no_code": true,                  # explicit non-code completion, if any
         "caveats": [...], "follow_ups": [...], "unresolved": [...]
       },
       "history": [                       # append-only lifecycle trail (WT-87):
@@ -1163,7 +1165,8 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
     """Coerce a resolution into the stored shape, or None when empty.
 
     Accepts a bare string (treated as the summary) or a dict with any of
-    ``summary`` / ``caveats`` / ``follow_ups`` / ``unresolved``. List fields are
+    ``summary`` / ``commit`` / ``no_code`` / ``caveats`` / ``follow_ups`` /
+    ``unresolved``. List fields are
     coerced to lists of clipped strings; empty fields are dropped. Returns None
     when nothing meaningful was supplied (so close stays back-compatible)."""
     if resolution is None:
@@ -1176,6 +1179,11 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
     summary = _clip(resolution.get("summary", ""), 4000)
     if summary:
         out["summary"] = summary
+    commit = _clip(resolution.get("commit", ""), 128)
+    if commit:
+        out["commit"] = commit
+    if resolution.get("no_code") is True:
+        out["no_code"] = True
     for field in ("caveats", "follow_ups", "unresolved"):
         raw = resolution.get(field)
         if raw is None:
@@ -1239,7 +1247,8 @@ def update_status(
     closed a moment after the snapshot was taken (OPS-72).
 
     ``expect_owner``, when set (close path only), makes the close refuse to
-    re-close an *already-closed* ticket, raising ``ValueError``. This is the
+    re-close an already-closed ticket or close a live claim owned by a
+    different worker, raising ``ValueError``. This is the
     durable stop for reap-induced duplicate work: a worker reaped mid-ticket
     (idle past the prompt-cache TTL) gets its claim reopened and re-drained by
     a fresh worker; when the reaped session later resumes from checkpoint with
@@ -1247,11 +1256,10 @@ def update_status(
     worker, so this guard refuses and tells it the work is a duplicate — rather
     than silently re-closing and overwriting the real resolution (observed:
     CCC-502 closed twice, once by the reaped session after the fresh worker had
-    already fixed and closed it). Closing a *different worker's still-open*
-    claim stays allowed (a close is credited to the closer, the original
-    claimant preserved). ``expect_owner`` is left empty by non-worker closes
-    (e.g. dedup-close by ref) so those are unaffected. Guard is authoritative
-    for local file-backed queues; the GitHub-backed path is unaffected.
+    already fixed and closed it). A worker also cannot close another worker's
+    still-open claim. ``expect_owner`` is left empty by non-worker closes
+    (e.g. dedup-close by ref) so those are unaffected. The same guard is
+    forwarded to GitHub-backed queues.
 
     ``reason`` (optional) is recorded on the appended ``history`` entry, e.g.
     the orphan-ticket sweep passes "worker gone" for a reopen."""
@@ -1266,6 +1274,7 @@ def update_status(
             session_uuid=session_uuid,
             resolution=resolution,
             reason=reason,
+            expect_owner=expect_owner,
         )
         if item:
             verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
@@ -1291,13 +1300,11 @@ def update_status(
                 # Ownership guard for close (see expect_owner docstring). Runs
                 # inside the lock against the fresh item, so it's race-free with
                 # a concurrent close by the fresh worker that re-drained the
-                # ticket after a reap. Deliberately scoped to the already-closed
-                # case only: closing a *different worker's still-open* claim is
-                # intentional (a close is credited to whoever closes, the
-                # original claimant is preserved — test_close_keeps_original_claimant).
-                # The reap-duplicate always lands here anyway, because by the
-                # time the reaped session resumes from checkpoint the fresh
-                # worker has already closed the re-drained ticket.
+                # ticket after a reap. A live claim is also bound to its worker:
+                # a different worker cannot replace its resolution. The
+                # reap-duplicate always lands in the closed case anyway, because
+                # by the time the reaped session resumes from checkpoint the
+                # fresh worker has already closed the re-drained ticket.
                 if status == "closed" and expect_owner and it.get("status") == "closed":
                     ref_label = it.get("ref", ident)
                     closer = str(it.get("closed_by") or it.get("claimed_by") or "?")
@@ -1308,6 +1315,18 @@ def update_status(
                         f"and it was re-drained by another worker. Your work may "
                         f"duplicate theirs: do NOT re-commit; run `wt find {ref_label} "
                         f"--json` to compare. Pass --force to close anyway."
+                    )
+                if (
+                    status == "closed"
+                    and expect_owner
+                    and it.get("status") == "in_progress"
+                    and it.get("claimed_by")
+                    and str(it.get("claimed_by")) != expect_owner
+                ):
+                    raise ValueError(
+                        f"{it.get('ref', ident)} is claimed by {it.get('claimed_by')}; "
+                        f"you are {expect_owner}. Only the claiming worker may close "
+                        "an in-progress ticket. Pass --force to override deliberately."
                     )
                 it["status"] = status
                 now = _now_iso()
@@ -1392,9 +1411,9 @@ def close(
     closes with no resolution (back-compatible).
 
     When ``session_id`` identifies a worker (and ``force`` is not set), the
-    close is ownership-checked: a ticket already closed, or claimed by a
-    *different* worker, raises ``ValueError`` instead of silently re-closing.
-    This blocks reap-induced duplicate closes (see ``update_status``'s
+    close is ownership-checked: a ticket already closed, or a still-open claim
+    owned by a different worker, raises ``ValueError``. This blocks reap-induced
+    duplicate closes and cross-worker resolution theft (see ``update_status``'s
     ``expect_owner``). Callers that close by ref without asserting ownership
     (e.g. dedup-close) pass no ``session_id`` and are unaffected. ``force=True``
     bypasses the guard for a human deliberately force-closing someone's ticket."""

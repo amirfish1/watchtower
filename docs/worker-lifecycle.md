@@ -145,12 +145,15 @@ in the resumable session, not in a running process.
 
 ### Resolution is mandatory
 
-`wt close` rejects a close with no `--summary` (exit 1). Workers are instructed
-in their goal prompt to never close silently. The resolution is the trust signal
-that turns a drained queue into an auditable log.
+`wt close` rejects a close with no `--summary` or completion proof (exit 1).
+Code-changing work must provide `--commit <SHA>`, which is verified in the
+ticket's repository; non-code work must explicitly provide `--no-code`. Workers
+are instructed to block work with progress when a verified change cannot be
+committed, rather than closing it with a follow-up. The resolution is the trust
+signal that turns a drained queue into an auditable log.
 
 ```bash
-wt close REF --summary "what changed"
+wt close REF --summary "what changed" --commit <SHA>
              --caveat "watch X"          # repeatable
              --follow-up "do Y next"     # repeatable
              --unresolved "Z still open" # repeatable

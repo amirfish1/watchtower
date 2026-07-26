@@ -108,6 +108,22 @@ def test_cli_edit_text_replaces_file_backed_ticket_body(wt, capsys):
     assert edited["history"][-1]["fields"] == {"text": "replacement body"}
 
 
+def test_cli_block_json_returns_the_blocked_ticket(wt, capsys):
+    item = wt.q.enqueue(project="BLOCK", note="needs a decision", source="test")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    assert wt.cli.main([
+        "block", item["ref"], "--worker", "worker-a",
+        "--question", "approve the rollout?", "--progress", "verified the options",
+        "--json",
+    ]) == 0
+
+    blocked = json.loads(capsys.readouterr().out)
+    assert blocked["ref"] == item["ref"]
+    assert blocked["status"] == "in_progress"
+    assert blocked["block_question"] == "approve the rollout?"
+
+
 def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsys):
     item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
     sid = "11111111-2222-3333-4444-555555555555"
@@ -172,18 +188,14 @@ def test_close_ownership_guard_blocks_reap_duplicate(wt):
     assert _events(wt.q.get(item["ref"])["history"]).count("close") == 1
 
 
-def test_close_guard_allows_owner_force_crosscloser_and_unclaimed(wt):
-    """The guard must not break legitimate closes: own in_progress ticket,
-    a different worker closing a still-open claim (intentional cross-closer
-    attribution), --force override of an already-closed ticket, and
-    close-by-ref on a never-claimed ticket (dedup-close path)."""
-    # A different worker closing a *still-open* claim is allowed.
+def test_close_guard_rejects_crosscloser_but_allows_force_and_unclaimed(wt):
+    """Only the claimant may close an in-progress ticket without --force."""
+    # A different worker must not close a still-open claim.
     x = wt.q.enqueue(project="OWN", note="crossclose", source="test")
     wt.q.claim_by_ref(x["ref"], "worker-a")
-    crossed = wt.q.close(x["ref"], "worker-b", resolution="closed by b")
-    assert crossed["status"] == "closed"
-    assert crossed["claimed_by"] == "worker-a"  # original claimant preserved
-    assert crossed["closed_by"] == "worker-b"
+    with pytest.raises(ValueError, match="claimed by worker-a"):
+        wt.q.close(x["ref"], "worker-b", resolution="closed by b")
+    assert wt.q.get(x["ref"])["status"] == "in_progress"
 
     # Own in_progress ticket closes normally.
     a = wt.q.enqueue(project="OWN", note="mine", source="test")

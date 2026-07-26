@@ -125,8 +125,9 @@ wt edit   DEMO-1 --queue OTHER                 # move to a different queue in pl
 wt claim  -q DEMO                      # claim the next open ticket (smart sort)
 wt claim  -q DEMO DEMO-1               # claim a specific ticket by ref
 wt run    DEMO-1                       # mark an existing GitHub issue runnable
-wt close  DEMO-1                       # close a ticket by ref
-wt close  DEMO-1 --summary "fixed the overlap" \
+wt close  DEMO-1 --summary "fixed the overlap" --commit <SHA>
+wt close  DEMO-1 --summary "documented the decision" --no-code
+wt close  DEMO-1 --summary "fixed the overlap" --commit <SHA> \
           --caveat "only tested on iOS" --follow-up "add a regression test"
 
 wt drain on DEMO                       # enable auto-drain for a queue
@@ -156,7 +157,10 @@ to file it and optionally `--type bug|feature` to override every inferred type.
 The locally authenticated `claude` CLI must be available. A missing CLI,
 timeout, malformed response, invalid source anchor, or invalid dependency fails
 loudly before any ticket is filed. Imports use Sonnet in Claude safe mode by
-default; set `WATCHTOWER_IMPORT_MODEL` to override the model.
+default; set `WATCHTOWER_IMPORT_MODEL` to override the model. `--tools ""` alone
+is not an isolation boundary: Claude Code may still load local skills, plugins,
+and project instructions. Keep `--safe-mode` on the importer invocation so that
+ambient local context cannot consume the import budget.
 
 ```bash
 wt import docs/launch-plan.md -q LAUNCH
@@ -238,8 +242,9 @@ still exposes the same commands; behind the scenes `wt add` creates an issue,
 `wt claim` assigns it, and `wt close` closes it with a resolution comment.
 
 So yes: closing a GitHub-backed ticket closes the corresponding GitHub Issue.
-The required `--summary` (plus any caveats, follow-ups, or unresolved items)
-is posted as that issue's resolution comment and is also retained in
+The required `--summary` plus a completion proof (`--commit <SHA>` for code
+changes or `--no-code` for non-code work), and any caveats, follow-ups, or
+unresolved items, are posted as that issue's resolution comment and retained in
 WatchTower's metadata for the dashboard and CLI history.
 
 ```bash
@@ -249,7 +254,7 @@ wt set -q MYAPP --backend github --github-repo owner/repo
 wt add -q MYAPP --title "Fix checkout" --text "Steps to reproduce..."
 wt run MYAPP-123                       # opt an existing issue into automation
 wt claim -q MYAPP --worker worker-1
-wt close MYAPP-123 --worker worker-1 --summary "fixed the null state"
+wt close MYAPP-123 --worker worker-1 --summary "fixed the null state" --commit <SHA>
 ```
 
 GitHub-backed refs use the issue number (`MYAPP-123` is issue `#123`). A
@@ -344,17 +349,19 @@ Closing a ticket is also where a worker records *what it did*: the trust-layer
 signal that turns a drained queue into an auditable log.
 
 ```bash
-wt close DEMO-1 --summary "rewrote the flex container" \
+wt close DEMO-1 --summary "rewrote the flex container" --commit <SHA> \
          --caveat "watch the sticky footer on Safari" \
          --follow-up "add a visual regression test" \
          --unresolved "the print stylesheet still clips"
 ```
 
-`--summary` is the one-liner; `--caveat`, `--follow-up`, and `--unresolved` are
-repeatable. All are optional: `wt close DEMO-1` with no flags still works. The
-resolution is stored on the item (`item["resolution"]`) and surfaced in the
-dashboard's per-queue **Closed** section and on closed `wt ls` rows. Spawned
-workers are instructed to always pass `--summary` so nothing closes silently.
+`--summary` is the one-liner. Every close also needs exactly one proof:
+`--commit <SHA>` validates and records the code-change commit in the ticket's
+repository; `--no-code` explicitly records that the work changed no code.
+`--caveat`, `--follow-up`, and `--unresolved` are repeatable. The resolution is
+stored on the item (`item["resolution"]`) and surfaced in the dashboard's
+per-queue **Closed** section and on closed `wt ls` rows. If a verified change
+cannot be committed, block the ticket with progress instead of closing it.
 
 Pass `--enqueue-follow-ups` to also file each follow-up / unresolved item as a
 new open ticket in the same queue (opt-in), so loose ends don't get lost.

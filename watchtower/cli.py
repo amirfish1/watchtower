@@ -13,7 +13,7 @@
     wt claim -q Q --oldest    claim oldest ticket (pure FIFO)
     wt claim -q Q --type bug  claim only bugs (or --type feature for ideas)
     wt claim -q Q --readiness needs-shaping  claim unspecced ideas
-    wt close <ref>            close a ticket (--summary required)
+    wt close <ref>            close a ticket (summary + commit proof required)
     wt drain on|off Q         opt a queue in/out of auto-spawn
     wt workers                list workers the watcher started
     wt block / blocked        park a ticket needing a human / list parked
@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import signal
 import subprocess
@@ -598,7 +599,7 @@ cmd_ready = cmd_run  # preferred alias: 'wt ready' reads as "mark this ticket re
 
 
 def _resolution_from_args(args: argparse.Namespace) -> Optional[dict]:
-    """Build a resolution dict from --summary/--caveat/--follow-up/--unresolved.
+    """Build a resolution dict from the close-resolution flags.
 
     Returns None when no flag was given (so close stays back-compatible)."""
     res = {
@@ -607,9 +608,52 @@ def _resolution_from_args(args: argparse.Namespace) -> Optional[dict]:
         "follow_ups": list(args.follow_up or []),
         "unresolved": list(args.unresolved or []),
     }
+    if getattr(args, "commit", ""):
+        res["commit"] = args.commit
+    if getattr(args, "no_code", False):
+        res["no_code"] = True
     if not any(res.values()):
         return None
     return res
+
+
+_COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
+
+
+def _verify_close_commit(ref: str, sha: str) -> Tuple[str, str]:
+    """Return a canonical commit SHA or an actionable validation error.
+
+    A ticket may point at its repository directly, while an older ticket uses
+    its queue's configured repository.  Falling back to the current directory
+    keeps ad-hoc local queues usable.  The commit must resolve in that repo;
+    accepting a merely SHA-shaped string would let dirty work masquerade as a
+    committed resolution.
+    """
+    candidate = str(sha or "").strip()
+    if not _COMMIT_SHA_RE.fullmatch(candidate):
+        return "", "error: --commit must be a 7- to 64-character hexadecimal commit SHA"
+    item = q.get(ref)
+    if not item:
+        return "", f"error: {ref} not found"
+    from . import config
+    repo = str(item.get("repo_path") or config.repo_path(item.get("project", "")) or os.getcwd())
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as e:
+        return "", f"error: cannot verify --commit in {repo}: {e}"
+    verified = result.stdout.strip()
+    if result.returncode != 0 or not _COMMIT_SHA_RE.fullmatch(verified):
+        return "", (
+            f"error: {candidate} is not a commit in {repo}; commit the verified work "
+            "or use `wt block <ref> --progress \"...\"` instead of closing"
+        )
+    return verified, ""
 
 
 def cmd_close(args: argparse.Namespace) -> int:
@@ -620,6 +664,19 @@ def cmd_close(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    if bool(args.commit) == bool(args.no_code):
+        print(
+            "error: closing requires exactly one completion proof: --commit <SHA> "
+            "for code changes or --no-code for work that changed no code",
+            file=sys.stderr,
+        )
+        return 1
+    if args.commit:
+        verified, error = _verify_close_commit(args.ref, args.commit)
+        if error:
+            print(error, file=sys.stderr)
+            return 1
+        args.commit = verified
     worker = args.worker or f"wt-cli-{os.getpid()}"
     resolution = _resolution_from_args(args)
     try:
@@ -683,6 +740,9 @@ def cmd_block(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
     print(f"BLOCKED: {item['ref']} — {item.get('block_question') or '(no question)'}")
     sid = item.get("claimed_session_id")
     if sid:
@@ -794,7 +854,8 @@ def cmd_answer(args: argparse.Namespace) -> int:
     prompt = (
         f"A human answered your blocked question on ticket {item['ref']}. "
         f"Their answer: {args.text}. Apply it, finish the ticket, and close it "
-        f"with `wt close {item['ref']} --worker <your-id> --summary \"...\"`. "
+        f"with `wt close {item['ref']} --worker <your-id> --summary \"...\" "
+        "--commit <SHA>` (or `--no-code` if no code changed). "
         f"If it still cannot be resolved, run `wt block` again with the new "
         f"open question."
     )
@@ -2902,6 +2963,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--worker", default="")
     s.add_argument("--summary", default="",
                    help="one-line description of what you changed")
+    proof = s.add_mutually_exclusive_group()
+    proof.add_argument("--commit", default="", metavar="SHA",
+                       help="verified commit SHA containing code changes")
+    proof.add_argument("--no-code", action="store_true",
+                       help="explicitly declare that this ticket changed no code")
     s.add_argument("--caveat", action="append",
                    help="something to watch out for (repeatable)")
     s.add_argument("--follow-up", action="append", dest="follow_up",
@@ -2927,6 +2993,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--question", default="", help="the specific decision you need")
     s.add_argument("--progress", default="",
                    help="analysis-so-far note (backstop if the session is lost)")
+    s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_block)
 
     s = sub.add_parser("blocked")
