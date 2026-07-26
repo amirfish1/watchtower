@@ -1456,6 +1456,7 @@ def outbox_add(
     delay_s: float = BACKOFF_BASE_S,
     ttl_s: Optional[float] = None,
     now: Optional[float] = None,
+    engine: str = "",
 ) -> Dict[str, Any]:
     """Append a pending message to the durable outbox. Locked + atomic."""
     now = time.time() if now is None else float(now)
@@ -1472,6 +1473,8 @@ def outbox_add(
     }
     if ttl_s is not None:
         msg["expires_at"] = _iso(now + float(ttl_s))
+    if engine:
+        msg["engine"] = str(engine)
     with queue_mod._FileLock(_outbox_lock()):
         data = _load_outbox()
         data["messages"].append(msg)
@@ -1572,6 +1575,8 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             # transcript archive; outbox targets are already resolved sids
             # (or exact worker ids / names), so the window adds nothing here.
             resolved = resolve_target(str(m.get("to") or ""), include_recent=False)
+            if m.get("engine"):
+                resolved["engine"] = str(m["engine"])
             outcomes[str(m.get("id"))] = deliver(
                 resolved, str(m.get("text") or ""), str(m.get("mode") or "send")
             )
@@ -1629,6 +1634,7 @@ def send(
     mode: str = "send",
     queue_on_fail: bool = True,
     ttl_s: Optional[float] = None,
+    engine: str = "",
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
@@ -1641,6 +1647,8 @@ def send(
         resolved = resolve_target(target)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
+    if engine:
+        resolved["engine"] = str(engine)
     result = deliver(resolved, text, mode)
     if result.get("ok"):
         out = {"ok": True, "transport": result.get("transport", "?")}
@@ -1665,6 +1673,7 @@ def send(
     msg = outbox_add(
         to, text, mode=mode,
         error=str(result.get("error") or ""), delay_s=delay, ttl_s=ttl_s,
+        engine=engine,
     )
     return {
         "ok": False,

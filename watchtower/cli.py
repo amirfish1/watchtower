@@ -924,8 +924,11 @@ def cmd_answer(args: argparse.Namespace) -> int:
     )
     from . import messages
     target = item.get("claimed_session_id") or item.get("claimed_by")
+    delivery_engine = _answer_engine(item, args.engine)
     try:
-        sent = messages.send(str(target), prompt, mode="steer")
+        sent = messages.send(
+            str(target), prompt, mode="steer", engine=delivery_engine,
+        )
     except Exception as e:  # never lose the answer to a delivery-layer crash
         sent = {"ok": False, "error": str(e)}
     if sent.get("ok"):
@@ -943,12 +946,11 @@ def cmd_answer(args: argparse.Namespace) -> int:
     # Unresolvable target (nothing queued): fall back to the headless resume
     # fork, which registers the resume child under the worker id so the orphan
     # sweep cannot reopen the ticket while the answer is applied.
-    fallback_engine = _answer_engine(item, args.engine)
     started = _resume_session_headless(
         sid,
         repo,
         prompt,
-        fallback_engine,
+        delivery_engine,
         queue=item.get("project", ""),
         worker_id=item.get("claimed_by", ""),
     )
@@ -957,9 +959,9 @@ def cmd_answer(args: argparse.Namespace) -> int:
               f"to apply your answer and close.")
     else:
         print(f"ANSWERED: {item['ref']} — needs_input cleared, but delivery "
-              f"failed ({sent.get('error', 'unknown')}); {fallback_engine} "
+              f"failed ({sent.get('error', 'unknown')}); {delivery_engine} "
               "resume also failed to stay running. Resume manually: "
-              f"wt discuss {item['ref']} --engine {fallback_engine}")
+              f"wt discuss {item['ref']} --engine {delivery_engine}")
     return 0
 
 
@@ -3107,7 +3109,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("text", help="your answer")
     s.add_argument("--worker", default="")
     s.add_argument("--engine", choices=["claude", "codex", "kimi"],
-                   help="override the engine for headless resume fallback")
+                   help="override the blocked session engine")
     s.set_defaults(func=cmd_answer)
 
     s = sub.add_parser("comment")
