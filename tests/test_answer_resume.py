@@ -98,6 +98,17 @@ def _blocked_codex_ticket(q, workers, tmp_path, *, worker_id, sid, alive=False):
     return item
 
 
+def test_answer_parser_infers_engine_unless_overridden(wt):
+    cli, _, _ = wt
+    parser = cli.build_parser()
+
+    assert parser.parse_args(["answer", "WT-1", "A"]).engine is None
+    assert (
+        parser.parse_args(["answer", "WT-1", "A", "--engine", "kimi"]).engine
+        == "kimi"
+    )
+
+
 def test_answer_delivers_via_messages_send_not_a_blind_fork(wt, tmp_path, monkeypatch):
     cli, q, workers = wt
     import watchtower.messages as messages
@@ -151,6 +162,7 @@ def test_answer_falls_back_to_resume_when_target_unresolvable(wt, tmp_path, monk
     import watchtower.messages as messages
     sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     item = _blocked_codex_ticket(q, workers, tmp_path, worker_id="w-1", sid=sid)
+    assert workers.list_workers()[-1]["alive"] is False
 
     forked = []
     monkeypatch.setattr(
@@ -162,9 +174,31 @@ def test_answer_falls_back_to_resume_when_target_unresolvable(wt, tmp_path, monk
         lambda *a, **k: forked.append((a, k)) or True,
     )
 
-    assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
+    assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
     # Nothing queued -> preserve delivery via the headless resume fallback.
     assert len(forked) == 1
+    assert forked[0][0][3] == "codex"
+
+
+def test_answer_resume_reports_immediate_process_exit(wt, tmp_path, monkeypatch):
+    cli, _, _ = wt
+
+    class Proc:
+        pid = os.getpid()
+
+        def poll(self):
+            return 2
+
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "0.2")
+
+    assert not cli._resume_session_headless(
+        "11111111-2222-3333-4444-555555555555",
+        str(tmp_path),
+        "apply the answer",
+        "codex",
+    )
 
 
 def test_answered_ticket_not_reopened_while_answer_in_flight(wt, tmp_path):
