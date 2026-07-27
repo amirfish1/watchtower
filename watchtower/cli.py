@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import re
 import shlex
@@ -51,7 +50,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from . import __version__
-from . import health, queue as q, workers
+from . import health, queue as q, resume_verify, workers
 
 DAEMON_PID_FILE = Path(
     os.environ.get("WATCHTOWER_DAEMON_PID")
@@ -835,21 +834,9 @@ def _resume_session_headless(
             )
         finally:
             logf.close()
-        try:
-            verify_s = float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
-        except ValueError:
-            verify_s = 2.0
-        if not math.isfinite(verify_s) or verify_s <= 0:
-            verify_s = 2.0
-        deadline = time.monotonic() + verify_s
-        poll = getattr(proc, "poll", None)
-        while callable(poll):
-            if poll() is not None:
-                return False
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            time.sleep(min(0.1, remaining))
+        died, _ = resume_verify.verify_resume_child(proc)
+        if died:
+            return False
         if queue and worker_id:
             workers.record_worker(
                 proc.pid,

@@ -299,7 +299,7 @@ def test_answer_resume_nonfinite_verify_window_uses_default(
 
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Proc())
     monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(cli.resume_verify.time, "sleep", lambda seconds: None)
     monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "nan")
 
     assert not cli._resume_session_headless(
@@ -323,9 +323,9 @@ def test_answer_resume_polls_after_deadline_sleep(wt, tmp_path, monkeypatch):
 
     monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Proc())
     monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
-    monkeypatch.setattr(cli.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cli.resume_verify.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(
-        cli.time,
+        cli.resume_verify.time,
         "sleep",
         lambda seconds: clock.__setitem__(0, clock[0] + seconds + 0.1),
     )
@@ -337,6 +337,65 @@ def test_answer_resume_polls_after_deadline_sleep(wt, tmp_path, monkeypatch):
         "apply the answer",
         "codex",
     )
+
+
+def test_answer_and_message_resume_share_boot_verifier(wt, tmp_path, monkeypatch):
+    cli, _, _ = wt
+    import watchtower.messages as messages
+
+    resume_verify = getattr(cli, "resume_verify", None)
+    assert resume_verify is not None
+    assert resume_verify is getattr(messages, "resume_verify", None)
+
+    verified = []
+
+    def fake_verify(proc):
+        verified.append(proc)
+        return True, 7
+
+    class Stdin:
+        def write(self, data):
+            return None
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    class Proc:
+        pid = os.getpid()
+        stdin = Stdin()
+
+    monkeypatch.setattr(resume_verify, "verify_resume_child", fake_verify)
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *args, **kwargs: Proc())
+    monkeypatch.setattr(cli.Path, "home", classmethod(lambda cls: tmp_path))
+
+    assert not cli._resume_session_headless(
+        "11111111-2222-3333-4444-555555555555",
+        str(tmp_path),
+        "apply the answer",
+        "codex",
+    )
+
+    monkeypatch.setattr(messages, "_find_transcript", lambda sid: tmp_path / sid)
+    monkeypatch.setattr(messages, "_stale_claim_stop_prefix", lambda sid: "")
+    monkeypatch.setattr(messages, "_session_busy", lambda sid: False)
+    monkeypatch.setattr(messages, "_session_cwd_from_transcript", lambda sid: None)
+    monkeypatch.setattr(messages, "_logs_dir", lambda: tmp_path)
+    monkeypatch.setattr(messages, "_resume_ledger_add", lambda *args: None)
+
+    result = messages._deliver_resume(
+        {
+            "session_id": "11111111-2222-3333-4444-555555555555",
+            "engine": "claude",
+        },
+        "apply the answer",
+    )
+
+    assert result["ok"] is False
+    assert "rc=7" in result["error"]
+    assert len(verified) == 2
 
 
 def test_answer_fallback_failure_names_engine_for_manual_resume(

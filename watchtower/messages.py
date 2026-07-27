@@ -71,7 +71,6 @@ same ``fcntl`` file lock the queue store uses. Stdlib only.
 from __future__ import annotations
 
 import json
-import math
 import os
 import re
 import shlex
@@ -87,6 +86,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from . import queue as queue_mod
+from . import resume_verify
 from . import tty as tty_mod
 from . import workers
 
@@ -787,20 +787,13 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     # missing transcript) exits within a second or two. Reporting ok on a
     # dead child silently drops the message — watch the verify window and
     # surface the death so send() parks the text for retry instead.
-    deadline = time.monotonic() + _resume_verify_window_s()
-    poll = getattr(proc, "poll", None)
-    while callable(poll):
-        rc = poll()
-        if rc is not None:
-            return {
-                "ok": False,
-                "error": f"claude resume exited rc={rc} at boot "
-                         f"(see {log_path})",
-            }
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            break
-        time.sleep(min(0.1, remaining))
+    died, rc = resume_verify.verify_resume_child(proc)
+    if died:
+        return {
+            "ok": False,
+            "error": f"claude resume exited rc={rc} at boot "
+                     f"(see {log_path})",
+        }
     return {"ok": True, "transport": "resume", "log": str(log_path)}
 
 
@@ -864,15 +857,6 @@ def _ensure_transcript_in_cwd_bucket(sid: str, cwd: str) -> None:
         os.rename(src, dest)
     except OSError:
         return
-
-
-def _resume_verify_window_s() -> float:
-    """How long to watch a fresh resume child for boot-time death."""
-    try:
-        value = float(os.environ.get("WATCHTOWER_RESUME_VERIFY_S", "2.0"))
-    except ValueError:
-        return 2.0
-    return value if math.isfinite(value) and value > 0 else 2.0
 
 
 # ------------------------------------------------------ resume-child reaper

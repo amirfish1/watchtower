@@ -16,6 +16,8 @@ import os
 import time
 from pathlib import Path
 
+import pytest
+
 from test_messages import (  # noqa: F401  (wt is a fixture, needed in scope)
     SID_B,
     _fake_popen,
@@ -118,9 +120,11 @@ def test_resume_polls_after_final_sleep(wt, monkeypatch):
             return next(poll_results)
 
     monkeypatch.setattr(wt.messages.subprocess, "Popen", lambda *a, **k: Proc())
-    monkeypatch.setattr(wt.messages.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(
-        wt.messages.time,
+        wt.messages.resume_verify.time, "monotonic", lambda: clock[0]
+    )
+    monkeypatch.setattr(
+        wt.messages.resume_verify.time,
         "sleep",
         lambda seconds: clock.__setitem__(0, clock[0] + seconds + 0.1),
     )
@@ -132,10 +136,11 @@ def test_resume_polls_after_final_sleep(wt, monkeypatch):
     assert "exited" in res["error"]
 
 
-def test_resume_verify_window_rejects_nonfinite_values(wt, monkeypatch):
-    monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", "nan")
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1", "invalid"])
+def test_resume_verify_window_rejects_invalid_values(wt, monkeypatch, value):
+    monkeypatch.setenv("WATCHTOWER_RESUME_VERIFY_S", value)
 
-    assert wt.messages._resume_verify_window_s() == 2.0
+    assert wt.messages.resume_verify.verify_window_s() == 2.0
 
 
 # ================================================================== rebucket
