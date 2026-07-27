@@ -286,6 +286,17 @@ def _ccc_worker_engine_default() -> str:
         return ""
 
 
+def _ccc_worker_effort_default() -> str:
+    """CCC's shared worker-only reasoning effort, if one is configured."""
+    try:
+        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
+            data = json.load(f)
+        value = str(data.get("worker_reasoning_effort") or "").strip().lower()
+        return value if value in VALID_EFFORTS else ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
 def engine(queue: str) -> str:
     """Return the worker engine for a queue (used by both DRAIN and
     RUN_ONCE spawns): an explicit `wt set --engine` override wins; else
@@ -403,9 +414,11 @@ def set_effort(queue: str, value: str) -> Dict[str, Any]:
 
 
 def effort(queue: str) -> str:
-    """Return a queue's explicit reasoning effort, or "" for engine default."""
+    """Return a queue override, CCC worker default, or engine default."""
     value = str(_load().get(queue, {}).get("effort") or "").strip().lower()
-    return value if value in VALID_EFFORTS else ""
+    if value in VALID_EFFORTS:
+        return value
+    return _ccc_worker_effort_default()
 
 
 def approved_models(eng: str) -> tuple[str, ...]:

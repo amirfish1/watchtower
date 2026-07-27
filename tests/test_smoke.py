@@ -566,6 +566,28 @@ def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeyp
         importlib.reload(workers)
 
 
+def test_ccc_worker_effort_default_used_when_queue_unset(store, tmp_path, monkeypatch):
+    """A queue effort override wins; otherwise use CCC's worker-only effort."""
+    import json
+    import importlib
+    import watchtower.config as config
+
+    ccc_file = tmp_path / "ccc-spawn-defaults.json"
+    ccc_file.write_text(json.dumps({
+        "reasoning_effort": "high",
+        "worker_reasoning_effort": "medium",
+    }))
+    monkeypatch.setenv("WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(ccc_file))
+    importlib.reload(config)
+    try:
+        assert config.effort("DEMO") == "medium"
+        config.set_effort("DEMO", "low")
+        assert config.effort("DEMO") == "low"
+    finally:
+        config.set_effort("DEMO", "")
+        importlib.reload(config)
+
+
 def test_engine_default_precedence(store, tmp_path, monkeypatch):
     """WT-105: config.engine() precedence is explicit per-queue override >
     CCC's shared `worker_engine` default > bare `codex` (guarded by
