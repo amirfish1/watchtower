@@ -126,25 +126,39 @@ def _resolve_activity_log_path() -> Path:
     return _ACTIVITY_LOG
 
 
-def _log(verb: str, detail: str, queue: str = "") -> None:
-    """Append one plain-text line to the unified activity log."""
+def _log_many(events: List[tuple]) -> bool:
+    """Append multiple activity events with one write.
+
+    Lifecycle audit bundles use this strict return value to fail closed when
+    their evidence cannot be recorded. Other activity producers may continue
+    to use ``_log()``, whose best-effort behavior is unchanged.
+    """
     try:
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-        q_col = (queue or "reconciler")
         log_path = _resolve_activity_log_path()
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        # Append [sid:xxxx] for session-initiated commands so the log shows
-        # WHICH worker session triggered each operation.  ENQUEUE and CLAIM
-        # are excluded: enqueue is user/tool-initiated and needs no extra
-        # context; CLAIM already encodes the session_id in its detail field.
         sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
-        if sid and verb.upper() not in ("ENQUEUE", "CLAIM"):
-            detail = f"{detail} [sid:{sid[:8]}]"
+        lines = []
+        for verb, detail, queue in events:
+            # Append [sid:xxxx] for session-initiated commands so the log shows
+            # WHICH worker session triggered each operation. ENQUEUE and CLAIM
+            # are excluded because their existing details already identify the
+            # initiating actor.
+            if sid and str(verb).upper() not in ("ENQUEUE", "CLAIM"):
+                detail = f"{detail} [sid:{sid[:8]}]"
+            q_col = (queue or "reconciler")
+            lines.append(f"{now}  {q_col:<14}  {verb:<9}{detail}\n")
         with open(log_path, "a") as f:
-            f.write(f"{now}  {q_col:<14}  {verb:<9}{detail}\n")
+            f.write("".join(lines))
+        return True
     except Exception:
-        pass
+        return False
+
+
+def _log(verb: str, detail: str, queue: str = "") -> bool:
+    """Append one plain-text line to the unified activity log."""
+    return _log_many([(verb, detail, queue)])
 
 
 def _resolve_store_path() -> Path:

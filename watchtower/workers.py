@@ -15,6 +15,7 @@ queue ground-truth.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import shlex
@@ -488,6 +489,7 @@ WARM_TTL_S = 300
 # release it from queue staffing. This intentionally applies to every engine:
 # provider cache policy and worker lifecycle are separate concerns.
 RELEASE_IDLE_S = 30 * 60
+_AUDIT_BOOT_ID = uuid.uuid4().hex[:12]
 
 
 def _codex_rollout_mtime(w: Dict[str, Any]) -> float:
@@ -696,22 +698,537 @@ def _release_instruction(w: Dict[str, Any]) -> str:
     )
 
 
-def _deliver_release_instruction(w: Dict[str, Any], text: str) -> bool:
+def _deliver_release_instruction(
+    w: Dict[str, Any], text: str
+) -> Dict[str, Any]:
     fifo = str(w.get("fifo") or "")
-    if fifo and write_to_worker_fifo(fifo, text):
-        return True
+    if fifo:
+        try:
+            if write_to_worker_fifo(fifo, text):
+                return {"transport": "fifo", "delivered": True, "error": ""}
+        except Exception as exc:
+            return {
+                "transport": "fifo",
+                "delivered": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
     target = str(w.get("session_id") or "").strip()
     if not target:
-        return False
+        return {
+            "transport": "unavailable",
+            "delivered": False,
+            "error": "missing session id",
+        }
     try:
         from . import messages
-        return bool(messages.send(target, text).get("ok"))
+        result = messages.send(target, text)
+        delivered = bool(result.get("ok"))
+        return {
+            "transport": "native_session",
+            "delivered": delivered,
+            "error": "" if delivered else str(result.get("error") or "delivery failed"),
+        }
+    except Exception as exc:
+        return {
+            "transport": "native_session",
+            "delivered": False,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _audit_value(value: Any) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "missing"
+    if isinstance(value, (int, float)):
+        if isinstance(value, float) and value == float("inf"):
+            return "infinite"
+        return str(value)
+    if isinstance(value, (list, dict)):
+        return json.dumps(
+            value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+    text = str(value)
+    if text and re.fullmatch(r"[A-Za-z0-9_./:@+\-=]+", text):
+        return text
+    return json.dumps(text, separators=(",", ":"), ensure_ascii=False)
+
+
+def _audit_detail(**fields: Any) -> str:
+    return " ".join(f"{key}={_audit_value(value)}" for key, value in fields.items())
+
+
+def _whole_age(value: Any) -> Any:
+    age = float(value)
+    return int(age) if age != float("inf") else age
+
+
+def _file_activity(path: Optional[Path], source: str) -> Dict[str, Any]:
+    if path is None:
+        return {
+            "source": source,
+            "path": "missing",
+            "exists": False,
+            "mtime": 0.0,
+            "age_s": float("inf"),
+            "error": "missing",
+        }
+    try:
+        stat = path.stat()
+    except OSError as exc:
+        return {
+            "source": source,
+            "path": str(path),
+            "exists": False,
+            "mtime": 0.0,
+            "age_s": float("inf"),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "source": source,
+        "path": str(path),
+        "exists": True,
+        "mtime": stat.st_mtime,
+        "age_s": max(0.0, time.time() - stat.st_mtime),
+        "error": "",
+    }
+
+
+def _newest_matching_path(paths: Any) -> tuple:
+    newest_path: Optional[Path] = None
+    newest_mtime = 0.0
+    lookup_error = ""
+    try:
+        for path in paths:
+            try:
+                mtime = path.stat().st_mtime
+            except OSError as exc:
+                lookup_error = f"{type(exc).__name__}: {exc}"
+                continue
+            if mtime >= newest_mtime:
+                newest_path = path
+                newest_mtime = mtime
+    except OSError as exc:
+        lookup_error = f"{type(exc).__name__}: {exc}"
+    return newest_path, lookup_error
+
+
+def _matched_activity(paths: Any, source: str, search_path: str) -> Dict[str, Any]:
+    path, lookup_error = _newest_matching_path(paths)
+    activity = _file_activity(path, source)
+    if lookup_error:
+        activity["error"] = lookup_error
+        if path is None:
+            activity["path"] = search_path
+    return activity
+
+
+def _engine_activity(w: Dict[str, Any]) -> Dict[str, Any]:
+    engine = str(w.get("engine") or "").lower()
+    session_id = str(w.get("session_id") or "").strip()
+    if not session_id:
+        return _file_activity(None, f"{engine or 'engine'}_activity")
+    if engine == "codex":
+        home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+        pattern = f"*/*/*/*{session_id}.jsonl"
+        return _matched_activity(
+            (home / "sessions").glob(pattern),
+            "codex_rollout",
+            str(home / "sessions" / pattern),
+        )
+    if engine == "claude":
+        home = Path(
+            os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")
+        )
+        pattern = f"*/{session_id}.jsonl"
+        return _matched_activity(
+            (home / "projects").glob(pattern),
+            "claude_transcript",
+            str(home / "projects" / pattern),
+        )
+    if engine == "kimi":
+        home = Path(
+            os.environ.get("KIMI_CODE_HOME") or (Path.home() / ".kimi-code")
+        )
+        pattern = f"*/{session_id}/agents/*/wire.jsonl"
+        return _matched_activity(
+            (home / "sessions").glob(pattern),
+            "kimi_wire",
+            str(home / "sessions" / pattern),
+        )
+    return _file_activity(None, f"{engine or 'engine'}_activity")
+
+
+def _started_activity(w: Dict[str, Any]) -> Dict[str, Any]:
+    started = str(w.get("started_at") or "")
+    try:
+        dt = datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=timezone.utc
+        )
+        timestamp = dt.timestamp()
+    except (TypeError, ValueError):
+        timestamp = 0.0
+    return {
+        "source": "started_at",
+        "path": "missing",
+        "exists": bool(timestamp),
+        "mtime": timestamp,
+        "age_s": (
+            max(0.0, time.time() - timestamp)
+            if timestamp else float("inf")
+        ),
+    }
+
+
+def _activity_evidence(w: Dict[str, Any]) -> Dict[str, Any]:
+    log_path = Path(str(w.get("log"))) if w.get("log") else None
+    wt_log = _file_activity(log_path, "watchtower_stdout")
+    engine_activity = _engine_activity(w)
+    started = _started_activity(w)
+    file_evidence = [
+        row for row in (wt_log, engine_activity) if row.get("exists")
+    ]
+    effective = (
+        max(
+            file_evidence,
+            key=lambda row: float(row.get("mtime") or 0.0),
+        )
+        if file_evidence else started
+    )
+    return {
+        "wt_log": wt_log,
+        "engine_activity": engine_activity,
+        "effective": effective,
+    }
+
+
+def _persist_worker_audit_state(worker_id: str, state: Dict[str, Any]) -> bool:
+    try:
+        with _WorkersFileLock():
+            data = _load()
+            for row in data["workers"]:
+                if row.get("worker_id") == worker_id:
+                    row["lifecycle_audit"] = state
+                    _save(data)
+                    return True
     except Exception:
         return False
+    return False
+
+
+def _patch_worker_audit_state(
+    worker_id: str,
+    *,
+    updates: Optional[Dict[str, Any]] = None,
+    remove: Optional[List[str]] = None,
+) -> bool:
+    try:
+        with _WorkersFileLock():
+            data = _load()
+            for row in data["workers"]:
+                if row.get("worker_id") != worker_id:
+                    continue
+                state = (
+                    dict(row.get("lifecycle_audit"))
+                    if isinstance(row.get("lifecycle_audit"), dict)
+                    else {}
+                )
+                state.update(updates or {})
+                for key in (remove or []):
+                    state.pop(key, None)
+                row["lifecycle_audit"] = state
+                _save(data)
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _audit_fingerprint(snapshot: Dict[str, Any]) -> str:
+    stable = {
+        "queue": snapshot["queue"],
+        "worker_id": snapshot["worker_id"],
+        "session_id": snapshot["session_id"],
+        "pid": snapshot["pid"],
+        "engine": snapshot["engine"],
+        "model": snapshot["model"],
+        "kind": snapshot["kind"],
+        "floor_s": snapshot["floor_s"],
+        "pid_alive": snapshot["pid_alive"],
+        "pid_identity": snapshot["pid_identity"],
+        "pid_started": snapshot["pid_started"],
+        "pid_started_current": snapshot["pid_started_current"],
+        "wt_log_path": snapshot["wt_log"]["path"],
+        "wt_log_exists": snapshot["wt_log"]["exists"],
+        "wt_log_mtime": snapshot["wt_log"]["mtime"],
+        "wt_log_error": snapshot["wt_log"]["error"],
+        "engine_path": snapshot["engine_activity"]["path"],
+        "engine_exists": snapshot["engine_activity"]["exists"],
+        "engine_mtime": snapshot["engine_activity"]["mtime"],
+        "engine_error": snapshot["engine_activity"]["error"],
+        "effective_source": snapshot["effective"]["source"],
+        "effective_mtime": snapshot["effective"]["mtime"],
+        "queue_read": snapshot["queue_read"],
+        "queue_error": snapshot["queue_error"],
+        "worker_refs": snapshot["worker_refs"],
+        "session_refs": snapshot["session_refs"],
+        "blocked_refs": snapshot["blocked_refs"],
+        "released": snapshot["released"],
+        "reasons": snapshot["reasons"],
+    }
+    raw = json.dumps(stable, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(raw).hexdigest()[:20]
+
+
+def _idle_snapshot(
+    w: Dict[str, Any],
+    max_idle_s: float,
+    *,
+    items: Optional[List[Dict[str, Any]]] = None,
+    queue_error: str = "",
+) -> Dict[str, Any]:
+    evidence = _activity_evidence(w)
+    worker_id = str(w.get("worker_id") or "")
+    session_id = str(w.get("session_id") or "")
+    owned_by_worker = [
+        str(item.get("ref") or "")
+        for item in (items or [])
+        if item.get("status") == "in_progress"
+        and worker_id
+        and str(item.get("claimed_by") or "") == worker_id
+    ]
+    owned_by_session = [
+        str(item.get("ref") or "")
+        for item in (items or [])
+        if item.get("status") == "in_progress"
+        and session_id
+        and session_id in {
+            str(item.get("claimed_by") or ""),
+            str(item.get("claimed_session_id") or ""),
+        }
+    ]
+    owned_refs = set(owned_by_worker + owned_by_session)
+    blocked_refs = [
+        str(item.get("ref") or "")
+        for item in (items or [])
+        if str(item.get("ref") or "") in owned_refs
+        and bool(item.get("needs_input") or item.get("blocked_at"))
+    ]
+    reasons: List[str] = []
+    engine = str(w.get("engine") or "").lower()
+    pid_alive = bool(w.get("alive"))
+    recorded_pid_token = str(w.get("pid_started") or "")
+    current_pid_token = (
+        _pid_start_token(int(w.get("pid") or 0)) if pid_alive else ""
+    )
+    pid_identity = bool(
+        recorded_pid_token
+        and current_pid_token
+        and recorded_pid_token == current_pid_token
+    )
+    if not pid_alive:
+        reasons.append("pid_not_alive")
+    if not pid_identity:
+        reasons.append("pid_identity_unknown")
+    if queue_error:
+        reasons.append("queue_read_error")
+    if owned_by_worker:
+        reasons.append("owned_by_worker")
+    if owned_by_session:
+        reasons.append("owned_by_session")
+    if blocked_refs:
+        reasons.append("blocked_ticket")
+    if not session_id:
+        reasons.append("session_identity_missing")
+    if not worker_id:
+        reasons.append("worker_identity_missing")
+    if not str(w.get("queue") or ""):
+        reasons.append("queue_identity_missing")
+    if engine not in {"claude", "codex", "kimi"}:
+        reasons.append("authoritative_activity_unknown")
+    elif session_id:
+        if not evidence["engine_activity"]["exists"]:
+            reasons.append("authoritative_activity_missing")
+        if evidence["engine_activity"]["error"] not in ("", "missing"):
+            reasons.append("authoritative_activity_unreadable")
+    if not evidence["wt_log"]["exists"] and not evidence["engine_activity"]["exists"]:
+        reasons.append("activity_evidence_missing")
+    snapshot = {
+        "queue": str(w.get("queue") or "missing"),
+        "worker_id": worker_id,
+        "session_id": session_id or "missing",
+        "pid": int(w.get("pid") or 0),
+        "engine": str(w.get("engine") or "missing"),
+        "model": str(w.get("model") or "missing"),
+        "kind": str(w.get("kind") or "drain"),
+        "released": _worker_released(w),
+        "pid_alive": pid_alive,
+        "pid_identity": pid_identity,
+        "pid_started": recorded_pid_token or "missing",
+        "pid_started_current": current_pid_token or "missing",
+        "wt_log": evidence["wt_log"],
+        "engine_activity": evidence["engine_activity"],
+        "effective": evidence["effective"],
+        "idle_s": evidence["effective"]["age_s"],
+        "floor_s": int(max_idle_s),
+        "queue_read": "error" if queue_error else "success",
+        "queue_error": queue_error,
+        "worker_refs": sorted(owned_by_worker),
+        "session_refs": sorted(owned_by_session),
+        "blocked_refs": sorted(blocked_refs),
+        "reasons": sorted(set(reasons)),
+    }
+    snapshot["fingerprint"] = _audit_fingerprint(snapshot)
+    return snapshot
+
+
+def _idle_bundle(
+    snapshot: Dict[str, Any],
+    evaluation_id: str,
+    decision: str,
+    release_id: str = "",
+) -> List[tuple]:
+    queue_name = snapshot["queue"]
+    effective = snapshot["effective"]
+    candidate = _audit_detail(
+        evaluation_id=evaluation_id,
+        queue=queue_name,
+        worker_id=snapshot["worker_id"],
+        session_id=snapshot["session_id"],
+        pid=snapshot["pid"],
+        engine=snapshot["engine"],
+        model=snapshot["model"],
+        kind=snapshot["kind"],
+        released=snapshot["released"],
+        floor_s=snapshot["floor_s"],
+        effective_source=effective["source"],
+        effective_age_s=_whole_age(effective["age_s"]),
+    )
+    signals = [
+        _audit_detail(
+            evaluation_id=evaluation_id,
+            signal="pid_alive",
+            value=snapshot["pid_alive"],
+            source="tracked_pid",
+        ),
+        _audit_detail(
+            evaluation_id=evaluation_id,
+            signal="pid_identity",
+            value=snapshot["pid_identity"],
+            recorded_start=snapshot["pid_started"],
+            current_start=snapshot["pid_started_current"],
+        ),
+        _audit_detail(
+            evaluation_id=evaluation_id,
+            signal="watchtower_stdout",
+            path=snapshot["wt_log"]["path"],
+            exists=snapshot["wt_log"]["exists"],
+            mtime=snapshot["wt_log"]["mtime"],
+            age_s=_whole_age(snapshot["wt_log"]["age_s"]),
+            error=snapshot["wt_log"]["error"] or "none",
+        ),
+        _audit_detail(
+            evaluation_id=evaluation_id,
+            signal=snapshot["engine_activity"]["source"],
+            path=snapshot["engine_activity"]["path"],
+            exists=snapshot["engine_activity"]["exists"],
+            mtime=snapshot["engine_activity"]["mtime"],
+            age_s=_whole_age(snapshot["engine_activity"]["age_s"]),
+            error=snapshot["engine_activity"]["error"] or "none",
+        ),
+        _audit_detail(
+            evaluation_id=evaluation_id,
+            signal="effective_activity",
+            source=effective["source"],
+            mtime=effective["mtime"],
+            age_s=_whole_age(effective["age_s"]),
+        ),
+        _audit_detail(
+            evaluation_id=evaluation_id,
+            signal="queue_read",
+            value=snapshot["queue_read"],
+            error=snapshot["queue_error"] or "none",
+        ),
+        _audit_detail(
+            evaluation_id=evaluation_id,
+            signal="owned_by_worker",
+            value=len(snapshot["worker_refs"]),
+            refs=snapshot["worker_refs"],
+        ),
+        _audit_detail(
+            evaluation_id=evaluation_id,
+            signal="owned_by_session",
+            value=len(snapshot["session_refs"]),
+            refs=snapshot["session_refs"],
+        ),
+        _audit_detail(
+            evaluation_id=evaluation_id,
+            signal="blocked_refs",
+            value=len(snapshot["blocked_refs"]),
+            refs=snapshot["blocked_refs"],
+        ),
+        _audit_detail(
+            evaluation_id=evaluation_id,
+            signal="pid_signal_planned",
+            value=False,
+            reason="queue-scoped release never terminates the conversation",
+        ),
+    ]
+    decision_fields: Dict[str, Any] = {
+        "evaluation_id": evaluation_id,
+        "decision": decision,
+        "reasons": snapshot["reasons"],
+    }
+    if release_id:
+        decision_fields["release_id"] = release_id
+    return (
+        [("IDLE_CANDIDATE", candidate, queue_name)]
+        + [("IDLE_SIGNAL", detail, queue_name) for detail in signals]
+        + [("IDLE_DECISION", _audit_detail(**decision_fields), queue_name)]
+    )
+
+
+def _released_at(worker_id: str) -> str:
+    for row in _load().get("workers", []):
+        if row.get("worker_id") == worker_id:
+            return str(row.get("released_at") or "")
+    return ""
+
+
+def _retry_pending_release_events(
+    worker_rows: List[Dict[str, Any]],
+    log_many: Any,
+) -> None:
+    """Replay final RELEASE rows whose first append failed after detachment."""
+    for worker in worker_rows:
+        state = (
+            worker.get("lifecycle_audit")
+            if isinstance(worker.get("lifecycle_audit"), dict)
+            else {}
+        )
+        pending = (
+            state.get("release_log_pending")
+            if isinstance(state.get("release_log_pending"), dict)
+            else {}
+        )
+        detail = str(pending.get("detail") or "")
+        if not detail:
+            continue
+        queue_name = str(pending.get("queue") or worker.get("queue") or "")
+        if not log_many([("RELEASE", detail, queue_name)]):
+            continue
+        _patch_worker_audit_state(
+            str(worker.get("worker_id") or ""),
+            remove=["release_log_pending"],
+        )
 
 
 def release_idle_workers(max_idle_s: float = RELEASE_IDLE_S,
-                         queue: Optional[str] = None) -> List[Dict[str, Any]]:
+                         queue: Optional[str] = None,
+                         reconcile_id: str = "") -> List[Dict[str, Any]]:
     """Release verified-idle workers from queue staffing without killing them.
 
     Release is deliberately conservative: the process must still be tracked,
@@ -722,7 +1239,9 @@ def release_idle_workers(max_idle_s: float = RELEASE_IDLE_S,
     may continue. Unknown queue state fails closed. Returns newly released rows.
     """
     from . import queue as _q
+    from .queue import _log_many
     worker_rows = list_workers(prune=False)
+    _retry_pending_release_events(worker_rows, _log_many)
     candidates_by_queue: Dict[str, List[Dict[str, Any]]] = {}
     for w in worker_rows:
         if not w.get("alive") or w.get("kind") == "adhoc":
@@ -731,46 +1250,183 @@ def release_idle_workers(max_idle_s: float = RELEASE_IDLE_S,
             continue
         if _worker_released(w):
             continue
-        if _worker_idle_s(w) < max_idle_s:
+        evidence = _activity_evidence(w)
+        previous = (
+            w.get("lifecycle_audit")
+            if isinstance(w.get("lifecycle_audit"), dict)
+            else {}
+        )
+        if evidence["effective"]["age_s"] < max_idle_s:
+            if previous.get("candidate"):
+                evaluation_id = str(previous.get("evaluation_id") or "missing")
+                detail = _audit_detail(
+                    previous_evaluation_id=evaluation_id,
+                    queue=str(w.get("queue") or ""),
+                    worker_id=str(w.get("worker_id") or ""),
+                    effective_source=evidence["effective"]["source"],
+                    effective_age_s=_whole_age(evidence["effective"]["age_s"]),
+                    staffing_attached=True,
+                )
+                if not _log_many(
+                    [("ACTIVE_AGAIN", detail, str(w.get("queue") or ""))]
+                ):
+                    # Keep the previous candidate state so the transition is
+                    # retried instead of silently suppressed.
+                    continue
+            if previous.get("candidate") or not previous:
+                _persist_worker_audit_state(
+                    str(w.get("worker_id") or ""),
+                    {
+                        "boot_id": _AUDIT_BOOT_ID,
+                        "candidate": False,
+                        "decision": "ACTIVE",
+                        "evaluation_id": str(previous.get("evaluation_id") or ""),
+                        "fingerprint": "",
+                        "effective_mtime": evidence["effective"]["mtime"],
+                        "logged_at": datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"
+                        ),
+                    },
+                )
             continue
         candidates_by_queue.setdefault(str(w.get("queue") or ""), []).append(w)
 
     released: List[Dict[str, Any]] = []
     for queue_name, candidates in sorted(candidates_by_queue.items()):
+        items: List[Dict[str, Any]] = []
+        queue_error = ""
         if not queue_name:
-            continue
-        try:
-            items = _q.list_items(
-                project=queue_name, fresh=True, strict=True
-            )
-        except Exception:
-            # Failing closed per queue is safer than killing a worker whose
-            # active claim could not be authoritatively inspected.
-            continue
-        active_owners = {
-            str(owner)
-            for item in items
-            if item.get("status") == "in_progress"
-            for owner in (item.get("claimed_by"), item.get("claimed_session_id"))
-            if owner
-        }
+            queue_error = "missing queue identity"
+        else:
+            try:
+                items = _q.list_items(
+                    project=queue_name, fresh=True, strict=True
+                )
+            except Exception as exc:
+                queue_error = f"{type(exc).__name__}: {exc}"
         for w in candidates:
-            if any(
-                str(w.get(field) or "") in active_owners
-                for field in ("worker_id", "session_id")
-            ):
+            snapshot = _idle_snapshot(
+                w, max_idle_s, items=items, queue_error=queue_error
+            )
+            previous = (
+                w.get("lifecycle_audit")
+                if isinstance(w.get("lifecycle_audit"), dict)
+                else {}
+            )
+            decision = "PRESERVE" if snapshot["reasons"] else "RELEASE"
+            identical = (
+                previous.get("boot_id") == _AUDIT_BOOT_ID
+                and previous.get("candidate") is True
+                and previous.get("fingerprint") == snapshot["fingerprint"]
+                and previous.get("decision") == decision
+            )
+            if identical:
                 continue
             worker_id = str(w.get("worker_id") or "")
-            if not worker_id:
+            evaluation_id = f"idle-{uuid.uuid4().hex[:12]}"
+            release_id = (
+                f"release-{uuid.uuid4().hex[:12]}"
+                if decision == "RELEASE" else ""
+            )
+            if not _log_many(
+                _idle_bundle(snapshot, evaluation_id, decision, release_id)
+            ):
+                # The audit evidence is the authorization record for release.
+                # If it cannot be written, leave staffing attached.
                 continue
-            request_stop(worker_id)
-            delivered = _deliver_release_instruction(w, _release_instruction(w))
-            idle_min = int(_worker_idle_s(w) / 60)
+            state = {
+                "boot_id": _AUDIT_BOOT_ID,
+                "candidate": True,
+                "decision": decision,
+                "evaluation_id": evaluation_id,
+                "release_id": release_id,
+                "fingerprint": snapshot["fingerprint"],
+                "effective_mtime": snapshot["effective"]["mtime"],
+                "logged_at": datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                ),
+            }
+            if decision == "PRESERVE":
+                if worker_id:
+                    _persist_worker_audit_state(worker_id, state)
+                continue
+            try:
+                stop_path = request_stop(worker_id)
+            except Exception as exc:
+                failed_state = dict(state)
+                failed_state["decision"] = "RELEASE_FAILED"
+                _persist_worker_audit_state(worker_id, failed_state)
+                _log_many([
+                    (
+                        "RELEASE_FAIL",
+                        _audit_detail(
+                            reconcile_id=reconcile_id or "none",
+                            evaluation_id=evaluation_id,
+                            release_id=release_id,
+                            queue=queue_name,
+                            worker_id=worker_id,
+                            error=f"{type(exc).__name__}: {exc}",
+                            pid_signalled=False,
+                        ),
+                        queue_name,
+                    )
+                ])
+                continue
+            # Persist transition suppression only after durable detachment and
+            # sentinel creation have both succeeded. A failed request_stop
+            # therefore remains retryable on the next tick.
+            _persist_worker_audit_state(worker_id, state)
+            delivery = _deliver_release_instruction(
+                w, _release_instruction(w)
+            )
+            released_at = _released_at(worker_id)
+            idle_min = int(snapshot["idle_s"] / 60)
             floor_min = int(max_idle_s / 60)
             w["_release_reason"] = (
                 f"idle {idle_min}m (verified idle, >{floor_min}m release floor)"
             )
-            w["_release_delivered"] = delivered
+            w["_release_delivered"] = delivery["delivered"]
+            w["_release_transport"] = delivery["transport"]
+            w["_release_error"] = delivery["error"]
+            w["_release_id"] = release_id
+            w["_evaluation_id"] = evaluation_id
+            w["_reconcile_id"] = reconcile_id
+            w["released_at"] = released_at
+            w["_stop_sentinel"] = stop_path.exists()
+            release_detail = _audit_detail(
+                reconcile_id=reconcile_id or "none",
+                evaluation_id=evaluation_id,
+                release_id=release_id,
+                queue=queue_name,
+                worker_id=worker_id,
+                session_id=str(w.get("session_id") or "missing"),
+                released_at=released_at,
+                transport=delivery["transport"],
+                delivered=delivery["delivered"],
+                delivery_error=delivery["error"] or "none",
+                stop_sentinel=stop_path.exists(),
+                reason=w["_release_reason"],
+                pid_signalled=False,
+            )
+            release_logged = _log_many(
+                [("RELEASE", release_detail, queue_name)]
+            )
+            w["_release_log_written"] = release_logged
+            if not release_logged:
+                _patch_worker_audit_state(
+                    worker_id,
+                    updates={
+                        "release_log_pending": {
+                            "queue": queue_name,
+                            "detail": release_detail,
+                        }
+                    },
+                )
+                import sys
+                print(
+                    f"[watchtower] failed to log RELEASE for {worker_id}",
+                    file=sys.stderr,
+                )
             released.append(w)
     return released
 
@@ -823,20 +1479,27 @@ def _save(data: Dict[str, Any]) -> None:
     os.replace(tmp, WORKERS_FILE)
 
 
-def _mark_worker_released(worker_id: str) -> None:
+def _mark_worker_released(worker_id: str) -> str:
     """Persist queue detachment after the one-shot stop sentinel is consumed."""
     with _WorkersFileLock():
         data = _load()
         changed = False
+        released_at = ""
         for row in data["workers"]:
             if row.get("worker_id") != worker_id or row.get("released_at"):
                 continue
-            row["released_at"] = datetime.now(timezone.utc).strftime(
+            released_at = datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"
             )
+            row["released_at"] = released_at
             changed = True
         if changed:
             _save(data)
+            return released_at
+        for row in data["workers"]:
+            if row.get("worker_id") == worker_id:
+                return str(row.get("released_at") or "")
+    return ""
 
 
 def _load_worker_session_ledger() -> List[str]:
@@ -1382,6 +2045,22 @@ def _upsert_codex_worker_registry(
         pass
 
 
+def _pid_start_token(pid: int) -> str:
+    """Return the OS-reported process start time used to detect PID reuse."""
+    if not pid:
+        return ""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "lstart="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
 def _pid_alive(pid: int) -> bool:
     """Check if a process is truly alive (not a zombie).
 
@@ -1504,6 +2183,7 @@ def rebind_continued_worker(worker_id: str, session_id: str, pid: int) -> bool:
                     or ""
                 ),
                 "session_id": session_id,
+                "pid_started": _pid_start_token(int(pid)),
             }
             if registry_row.get("model"):
                 worker["model"] = registry_row["model"]
@@ -1527,6 +2207,7 @@ def rebind_continued_worker(worker_id: str, session_id: str, pid: int) -> bool:
                 )
             worker["previous_pid"] = recorded_pid
             worker["pid"] = int(pid)
+            worker["pid_started"] = _pid_start_token(int(pid))
 
         worker["rebound_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _save(data)
@@ -1557,6 +2238,7 @@ def record_worker(
             "log": log,
             "fifo": fifo,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "pid_started": _pid_start_token(int(pid)),
         }
         if model:
             rec["model"] = model
@@ -1611,7 +2293,16 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
             row = dict(w)
             row["alive"] = alive
             out.append(row)
-            if alive:
+            audit_state = (
+                w.get("lifecycle_audit")
+                if isinstance(w.get("lifecycle_audit"), dict)
+                else {}
+            )
+            pending_audit = bool(
+                audit_state.get("release_log_pending")
+                or audit_state.get("spawn_plan_pending")
+            )
+            if alive or pending_audit:
                 kept.append(w)
             else:
                 # This record is about to be dropped -- last chance to learn why
@@ -1956,11 +2647,18 @@ def request_stop(worker_id: str) -> Path:
     underlying conversation/process is preserved and may continue unrelated
     work. Uses the file-system only -- does NOT touch workers.json.
     """
-    _mark_worker_released(worker_id)
     stop_dir = STOP_SIGNALS_DIR
     stop_dir.mkdir(parents=True, exist_ok=True)
     signal_path = stop_dir / worker_id
     signal_path.touch()
+    try:
+        _mark_worker_released(worker_id)
+    except Exception:
+        try:
+            signal_path.unlink()
+        except OSError:
+            pass
+        raise
     return signal_path
 
 
@@ -2495,6 +3193,7 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
 def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     from . import config, health
     import sys
+    reconcile_id = f"reconcile-{uuid.uuid4().hex[:12]}"
 
     # One-time import of legacy queue-registry.json (no-op after first run).
     try:
@@ -2520,13 +3219,29 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                               "backfilled": [],
                               "session_title_backfilled": [],
                               "ledger_backfilled": [],
-                              "launch_failed": [], "fallbacks": []}
+                              "launch_failed": [], "fallbacks": [],
+                              "spawn_plans": [],
+                              "reconcile_id": reconcile_id}
+
+    staffing_before = list_workers(prune=False)
+    eligible_before_by_q: Dict[str, List[Dict[str, Any]]] = {}
+    dead_before_by_q: Dict[str, List[Dict[str, Any]]] = {}
+    for worker in staffing_before:
+        q_name = str(worker.get("queue") or "")
+        if not q_name or worker.get("kind") == "adhoc":
+            continue
+        if worker.get("alive") and not _worker_released(worker):
+            eligible_before_by_q.setdefault(q_name, []).append(worker)
+        elif not worker.get("alive") and not _worker_released(worker):
+            dead_before_by_q.setdefault(q_name, []).append(worker)
 
     # Gracefully release workers only after engine-aware activity clocks are
     # stale past the lifecycle floor. Never derive lifecycle from cache warmth.
     if not dry_run:
         try:
-            result["released"] = release_idle_workers()
+            result["released"] = release_idle_workers(
+                reconcile_id=reconcile_id
+            )
         except Exception:
             pass
         # Release tickets stranded in_progress by a dead/reaped/crashed worker so
@@ -2581,6 +3296,40 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             pass
 
     all_cfg = config.all_queues()
+    released_by_q: Dict[str, List[Dict[str, Any]]] = {}
+    for released_worker in result["released"]:
+        released_by_q.setdefault(
+            str(released_worker.get("queue") or ""), []
+        ).append(released_worker)
+    # A failed release-correlated SPAWN_PLAN is retried on later passes. The
+    # released worker remains the durable carrier of that causal link.
+    for prior_worker in staffing_before:
+        prior_state = (
+            prior_worker.get("lifecycle_audit")
+            if isinstance(prior_worker.get("lifecycle_audit"), dict)
+            else {}
+        )
+        pending_plan = prior_state.get("spawn_plan_pending")
+        if not prior_worker.get("released_at") or not pending_plan:
+            continue
+        pending_row = dict(prior_worker)
+        pending_row["_release_id"] = str(
+            prior_state.get("release_id") or ""
+        )
+        if isinstance(pending_plan, dict):
+            pending_row["_pending_replacement"] = bool(
+                pending_plan.get("replacement")
+            )
+            pending_row["_pending_base_cause"] = str(
+                pending_plan.get("base_cause") or ""
+            )
+        queue_name = str(prior_worker.get("queue") or "")
+        existing_ids = {
+            str(row.get("worker_id") or "")
+            for row in released_by_q.get(queue_name, [])
+        }
+        if str(prior_worker.get("worker_id") or "") not in existing_ids:
+            released_by_q.setdefault(queue_name, []).append(pending_row)
     # Build live-worker counts keyed by queue.
     live_by_queue: Dict[str, List[Dict[str, Any]]] = {}
     for w in list_workers(prune=False):
@@ -2624,7 +3373,162 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         types = config.claim_types(qn) or None
         return _q.count_manual_eligible(project=qn, item_types=types)
 
-    for q_name in all_cfg:
+    planned_queues: set = set()
+
+    def _base_spawn_cause(qn: str, manual_run: bool) -> str:
+        if manual_run:
+            return "manual_or_run_once"
+        if dead_before_by_q.get(qn):
+            return "dead_worker_recovery"
+        if not eligible_before_by_q.get(qn):
+            return "initial_staffing"
+        return "scale_up"
+
+    def _record_spawn_plan(
+        qn: str,
+        *,
+        total_open: int,
+        claimable_depth: int,
+        desired: int,
+        actual: int,
+        requested: int,
+        manual_run: bool,
+        zero_spawn_reason: str = "",
+    ) -> Dict[str, Any]:
+        if qn in planned_queues:
+            return next(
+                plan for plan in result["spawn_plans"] if plan["queue"] == qn
+            )
+        released_rows = released_by_q.get(qn, [])
+        before_count = len(eligible_before_by_q.get(qn, []))
+        before_deficit = max(0, desired - before_count)
+        after_deficit = max(0, desired - actual)
+        pending_replacement_slots = sum(
+            1 for row in released_rows if row.get("_pending_replacement")
+        )
+        replacement_slots = min(
+            requested,
+            max(
+                pending_replacement_slots,
+                max(0, after_deficit - before_deficit),
+            ),
+        )
+        pending_base_cause = next(
+            (
+                str(row.get("_pending_base_cause") or "")
+                for row in released_rows
+                if row.get("_pending_base_cause")
+            ),
+            "",
+        )
+        base_cause = (
+            pending_base_cause or _base_spawn_cause(qn, manual_run)
+        )
+        plan = {
+            "queue": qn,
+            "reconcile_id": reconcile_id,
+            "total_open": total_open,
+            "claimable_depth": claimable_depth,
+            "desired": desired,
+            "eligible_before": before_count,
+            "eligible_after": actual,
+            "released_worker_ids": [
+                str(row.get("worker_id") or "") for row in released_rows
+            ],
+            "release_ids": [
+                str(row.get("_release_id") or "") for row in released_rows
+            ],
+            "unclaimed_work": max(0, claimable_depth - actual),
+            "deficit": max(0, desired - actual),
+            "requested": requested,
+            "replacement_slots": replacement_slots,
+            "base_cause": base_cause,
+            "cause": (
+                "release_replacement" if released_rows else base_cause
+            ),
+            "zero_spawn_reason": zero_spawn_reason or "none",
+        }
+        result["spawn_plans"].append(plan)
+        planned_queues.add(qn)
+        plan_detail = _audit_detail(
+                reconcile_id=plan["reconcile_id"],
+                queue=plan["queue"],
+                total_open=plan["total_open"],
+                claimable_depth=plan["claimable_depth"],
+                desired=plan["desired"],
+                eligible_before=plan["eligible_before"],
+                eligible_after=plan["eligible_after"],
+                released_worker_ids=plan["released_worker_ids"],
+                release_ids=plan["release_ids"],
+                unclaimed_work=plan["unclaimed_work"],
+                deficit=plan["deficit"],
+                requested=plan["requested"],
+                cause=plan["cause"],
+                base_cause=plan["base_cause"],
+                replacement_slots=plan["replacement_slots"],
+                zero_spawn_reason=plan["zero_spawn_reason"],
+            )
+        plan["logged"] = _q._log(
+            "SPAWN_PLAN", plan_detail, queue=plan["queue"]
+        )
+        if not plan["logged"]:
+            # One immediate retry handles a transient append race without
+            # delaying the reconcile loop.
+            plan["logged"] = _q._log(
+                "SPAWN_PLAN", plan_detail, queue=plan["queue"]
+            )
+        for released_index, released_row in enumerate(released_rows):
+            worker_id = str(released_row.get("worker_id") or "")
+            if not worker_id:
+                continue
+            if plan["logged"]:
+                _patch_worker_audit_state(
+                    worker_id, remove=["spawn_plan_pending"]
+                )
+            else:
+                _patch_worker_audit_state(
+                    worker_id,
+                    updates={
+                        "spawn_plan_pending": {
+                            "replacement": (
+                                released_index < plan["replacement_slots"]
+                            ),
+                            "base_cause": plan["base_cause"],
+                        }
+                    },
+                )
+        if not plan["logged"]:
+            print(
+                f"[watchtower] failed to log SPAWN_PLAN for {qn}",
+                file=sys.stderr,
+            )
+        return plan
+
+    def _annotate_spawn_records(
+        records: List[Dict[str, Any]],
+        plan: Dict[str, Any],
+        spawn_reason: str,
+    ) -> None:
+        released_rows = released_by_q.get(plan["queue"], [])
+        for fallback_index, rec in enumerate(records):
+            spawn_index = int(rec.get("_spawn_index", fallback_index))
+            is_replacement = spawn_index < int(plan["replacement_slots"])
+            if is_replacement and released_rows:
+                related = released_rows[min(spawn_index, len(released_rows) - 1)]
+                cause = "release_replacement"
+                release_ids = [str(related.get("_release_id") or "")]
+                previous_worker_ids = [str(related.get("worker_id") or "")]
+            else:
+                cause = plan["base_cause"]
+                release_ids = []
+                previous_worker_ids = []
+            rec["spawn_reason"] = spawn_reason
+            rec["_reconcile_id"] = reconcile_id
+            rec["_spawn_cause"] = cause
+            rec["_related_release_ids"] = release_ids
+            rec["_previous_worker_ids"] = previous_worker_ids
+
+    for q_name in sorted(set(all_cfg) | set(released_by_q)):
         auto = config.auto_drain(q_name)
         desired = config.desired_workers(q_name) if auto else 0
         manual_run = False
@@ -2650,10 +3554,32 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                     ),
                 }
             )
+            if released_by_q.get(q_name):
+                _record_spawn_plan(
+                    q_name,
+                    total_open=_total_open_by_q.get(q_name, 0),
+                    claimable_depth=0,
+                    desired=desired,
+                    actual=len(live_by_queue.get(q_name, [])),
+                    requested=0,
+                    manual_run=manual_run,
+                    zero_spawn_reason="depth_lookup_failed",
+                )
             continue
         if not auto:
             if not manual_run:
                 result["skipped"].append({"queue": q_name, "reason": "auto_drain=off"})
+                if released_by_q.get(q_name):
+                    _record_spawn_plan(
+                        q_name,
+                        total_open=total_open,
+                        claimable_depth=depth,
+                        desired=desired,
+                        actual=len(live_by_queue.get(q_name, [])),
+                        requested=0,
+                        manual_run=False,
+                        zero_spawn_reason="auto_drain_off",
+                    )
                 continue
             # A drain-off queue has no worker budget of its own (desired is
             # forced to 0 above), so requested runs need one to spawn into.
@@ -2667,6 +3593,17 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             reason = (f"0 claimable ({total_open} open, filtered by claim_types/readiness)"
                       if filtered > 0 else "depth=0")
             result["skipped"].append({"queue": q_name, "reason": reason})
+            if released_by_q.get(q_name):
+                _record_spawn_plan(
+                    q_name,
+                    total_open=total_open,
+                    claimable_depth=depth,
+                    desired=desired,
+                    actual=len(live_by_queue.get(q_name, [])),
+                    requested=0,
+                    manual_run=manual_run,
+                    zero_spawn_reason="no_claimable_work",
+                )
             # Wind-down is NOT decided here. Counting only `open` on a drained
             # queue is a bet on the future: the instant a worker claims the last
             # ticket it flips open->in_progress, depth reads 0, and STOPping the
@@ -2698,6 +3635,35 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             # while workers are still claiming. E.g., 1 ticket + 1 live worker should
             # spawn 0 more, not 1.
             to_spawn = min(desired - actual, max(0, depth - actual))
+            plan = _record_spawn_plan(
+                q_name,
+                total_open=total_open,
+                claimable_depth=depth,
+                desired=desired,
+                actual=actual,
+                requested=to_spawn,
+                manual_run=manual_run,
+                zero_spawn_reason=(
+                    "live_workers_cover_claimable_work" if to_spawn == 0 else ""
+                ),
+            )
+            if (
+                not plan["logged"]
+                and (
+                    plan["replacement_slots"] > 0
+                    or plan["base_cause"]
+                    not in {"initial_staffing", "dead_worker_recovery"}
+                )
+            ):
+                result["skipped"].append(
+                    {
+                        "queue": q_name,
+                        "reason": (
+                            "spawn deferred: SPAWN_PLAN audit append failed"
+                        ),
+                    }
+                )
+                continue
             from . import queue as _q
             # Peek at the next ticket to get its repo_path; fall back to queue config.
             peeked = _q.peek_next(project=q_name)
@@ -2737,31 +3703,46 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             spawn_reason = (
                 f"{depth} {counted}, {actual} live < {desired} desired, {unclaimed} unclaimed, spawn {to_spawn}"
             )
-            for rec in spawned:
-                rec["spawn_reason"] = spawn_reason
-            for rec in launch_failed:
-                rec["spawn_reason"] = spawn_reason
-            usage_failure = next(
-                (rec for rec in launch_failed
-                 if rec.get("reason") == "engine usage limit"),
-                None,
+            _annotate_spawn_records(spawned, plan, spawn_reason)
+            _annotate_spawn_records(launch_failed, plan, spawn_reason)
+            usage_failures = [
+                rec for rec in launch_failed
+                if rec.get("reason") == "engine usage limit"
+            ]
+            fallback = (
+                ""
+                if dry_run or not usage_failures
+                else config.fallback_engine(engine)
             )
-            fallback = "" if dry_run or not usage_failure else config.fallback_engine(engine)
             if fallback:
                 fallback_model = config.default_model(fallback)
                 config.set_engine(q_name, fallback)
                 config.set_model(q_name, fallback_model)
                 fallback_reason = f"fallback from {engine} usage limit"
                 fallback_failures: List[Dict[str, Any]] = []
+                failed_indices = [
+                    int(rec.get("_spawn_index", index))
+                    for index, rec in enumerate(usage_failures)
+                ]
                 fallback_spawned = spawn_workers(
-                    q_name, n=to_spawn, engine=fallback,
+                    q_name, n=len(failed_indices), engine=fallback,
                     repo_path=repo_path, dry_run=False,
                     launch_failures=fallback_failures,
                 )
-                for rec in fallback_spawned:
-                    rec["spawn_reason"] = f"{spawn_reason}; {fallback_reason}"
-                for rec in fallback_failures:
-                    rec["spawn_reason"] = f"{spawn_reason}; {fallback_reason}"
+                for rec in fallback_spawned + fallback_failures:
+                    local_index = int(rec.get("_spawn_index", 0))
+                    if local_index < len(failed_indices):
+                        rec["_spawn_index"] = failed_indices[local_index]
+                _annotate_spawn_records(
+                    fallback_spawned,
+                    plan,
+                    f"{spawn_reason}; {fallback_reason}",
+                )
+                _annotate_spawn_records(
+                    fallback_failures,
+                    plan,
+                    f"{spawn_reason}; {fallback_reason}",
+                )
                 result["fallbacks"].append({
                     "queue": q_name,
                     "from_engine": engine,
@@ -2782,10 +3763,32 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 {"queue": q_name,
                  "reason": f"surplus ({actual}>{desired}) — resolved at claim/release"}
             )
+            if released_by_q.get(q_name):
+                _record_spawn_plan(
+                    q_name,
+                    total_open=total_open,
+                    claimable_depth=depth,
+                    desired=desired,
+                    actual=actual,
+                    requested=0,
+                    manual_run=manual_run,
+                    zero_spawn_reason="surplus_staffing_after_release",
+                )
         else:
             result["skipped"].append(
                 {"queue": q_name, "reason": f"actual={actual}==desired={desired}"}
             )
+            if released_by_q.get(q_name):
+                _record_spawn_plan(
+                    q_name,
+                    total_open=total_open,
+                    claimable_depth=depth,
+                    desired=desired,
+                    actual=actual,
+                    requested=0,
+                    manual_run=manual_run,
+                    zero_spawn_reason="staffing_sufficient_after_release",
+                )
 
     # Log the reconcile event to the unified activity log via queue._log().
     try:
@@ -2799,27 +3802,53 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             mdl = w.get("model", "")
             engine_label = f"{eng}:{mdl}" if mdl else eng
             if w.get("dry_run"):
-                detail = f"{wid} (dry-run; no process started) [{engine_label}]"
+                legacy = f"{wid} (dry-run; no process started) [{engine_label}]"
                 if reason:
-                    detail += f" — plan: {reason}"
+                    legacy += f" — plan: {reason}"
             else:
-                detail = f"{wid} (pid {pid}) [{engine_label}]"
+                legacy = f"{wid} (pid {pid}) [{engine_label}]"
                 if reason:
-                    detail += f" — {reason}"
+                    legacy += f" — {reason}"
+            detail = _audit_detail(
+                worker_id=wid,
+                reconcile_id=w.get("_reconcile_id") or reconcile_id,
+                queue=q,
+                cause=w.get("_spawn_cause") or "initial_staffing",
+                release_ids=w.get("_related_release_ids") or [],
+                previous_worker_ids=w.get("_previous_worker_ids") or [],
+                detail=legacy,
+            )
             _log("SPAWN", detail, queue=q)
+        for failure in result.get("launch_failed", []):
+            _log(
+                "SPAWN_FAIL",
+                _audit_detail(
+                    worker_id=failure.get("worker_id") or "missing",
+                    reconcile_id=(
+                        failure.get("_reconcile_id") or reconcile_id
+                    ),
+                    queue=failure.get("queue") or "missing",
+                    cause=(
+                        failure.get("_spawn_cause") or "initial_staffing"
+                    ),
+                    release_ids=(
+                        failure.get("_related_release_ids") or []
+                    ),
+                    previous_worker_ids=(
+                        failure.get("_previous_worker_ids") or []
+                    ),
+                    reason=failure.get("reason") or "unknown",
+                    cooldown_until=(
+                        failure.get("cooldown_until_human") or "missing"
+                    ),
+                ),
+                queue=failure.get("queue") or "",
+            )
         for w in result.get("stopped", []):
             wid = w.get("worker_id", w) if isinstance(w, dict) else w
             q = (w.get("queue", "") if isinstance(w, dict) else "")
             reason = (w.get("reason", "") if isinstance(w, dict) else "")
             _log("STOP", str(wid) + (f" — {reason}" if reason else ""), queue=q)
-        for w in result.get("released", []):
-            wid = w.get("worker_id", w) if isinstance(w, dict) else w
-            q = (w.get("queue", "") if isinstance(w, dict) else "")
-            reason = (w.get("_release_reason", "") if isinstance(w, dict) else "")
-            delivered = (w.get("_release_delivered") if isinstance(w, dict) else False)
-            detail = str(wid) + (f" — {reason}" if reason else "")
-            detail += " — instruction delivered" if delivered else " — stop pending"
-            _log("RELEASE", detail, queue=q)
         for ref in result.get("requeued", []):
             q = ref.rsplit("-", 1)[0] if "-" in ref else ""
             _log("REQUEUE", f"{ref} — worker gone, reopened for re-drain", queue=q)
@@ -2878,7 +3907,7 @@ def spawn_workers(
         model = ""
     log_dir = WORKERS_FILE.parent / "logs"
     spawned: List[Dict[str, Any]] = []
-    for _ in range(n):
+    for spawn_index in range(n):
         worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
         goal = drain_goal(
             queue, worker_id, repo_path, engine=engine,
@@ -2901,6 +3930,7 @@ def spawn_workers(
                 "repo_path": repo_path,
                 "argv": argv,
                 "dry_run": True,
+                "_spawn_index": spawn_index,
             }
             if model:
                 rec["model"] = model
@@ -2956,6 +3986,7 @@ def spawn_workers(
                 reason=reason,
                 model=model,
             )
+            failure["_spawn_index"] = spawn_index
             if launch_failures is not None:
                 launch_failures.append(failure)
             continue
@@ -2981,6 +4012,7 @@ def spawn_workers(
         )
         if failure is not None:
             _unlink_path_quiet(fifo_path)
+            failure["_spawn_index"] = spawn_index
             if launch_failures is not None:
                 launch_failures.append(failure)
             continue
@@ -2989,6 +4021,7 @@ def spawn_workers(
             fifo=fifo_path or "", model=model, kind=kind,
         )
         rec["argv"] = argv
+        rec["_spawn_index"] = spawn_index
         spawned.append(rec)
     return spawned
 
@@ -3076,7 +4109,21 @@ def spawn_run_once_worker(
     try:
         from watchtower.queue import _log
         engine_label = f"{engine}:{model}" if model else engine
-        _log("SPAWN", f"{worker_id} (pid {proc.pid}) [{engine_label}] — run-once for {ref}", queue=queue)
+        _log(
+            "SPAWN",
+            _audit_detail(
+                worker_id=worker_id,
+                reconcile_id=f"manual-{uuid.uuid4().hex[:12]}",
+                cause="manual_or_run_once",
+                release_ids=[],
+                previous_worker_ids=[],
+                detail=(
+                    f"{worker_id} (pid {proc.pid}) [{engine_label}] "
+                    f"— run-once for {ref}"
+                ),
+            ),
+            queue=queue,
+        )
     except Exception:
         pass
     return rec

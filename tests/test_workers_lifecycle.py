@@ -24,6 +24,7 @@ import select
 import subprocess
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -52,6 +53,7 @@ def wt(tmp_path, monkeypatch):
     monkeypatch.setenv(
         "WATCHTOWER_CODEX_THREAD_REGISTRY", str(tmp_path / "codex-thread-registry.json")
     )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-home"))
 
     import watchtower.queue as q
     import watchtower.health as health
@@ -121,10 +123,17 @@ def _live_worker(wt, queue, *, with_fifo=True):
     if with_fifo:
         fifo_path, rdwr_fd = workers._make_stdin_fifo(log)
         wt._readers.append(rdwr_fd)
-    return workers.record_worker(
+    sid = f"00000000-0000-0000-0000-{len(wt._readers):012d}"
+    transcript_dir = wt.tmp / "claude-home" / "projects" / "-test-project"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript = transcript_dir / f"{sid}.jsonl"
+    transcript.write_text('{"type":"user"}\n')
+    rec = workers.record_worker(
         os.getpid(), queue, "claude", wid, str(wt.tmp), str(log),
-        fifo=fifo_path or "",
+        fifo=fifo_path or "", session_id=sid,
     )
+    rec["_test_activity_path"] = str(transcript)
+    return rec
 
 
 def _dead_worker(wt, queue):
@@ -180,7 +189,9 @@ def test_reconcile_dry_run_spawn_is_labeled_in_activity(wt):
     wt.workers.reconcile_once(dry_run=True)
 
     activity = (wt.tmp / "activity.log").read_text()
-    spawn_line = next(line for line in activity.splitlines() if "SPAWN" in line)
+    spawn_line = next(
+        line for line in activity.splitlines() if "  SPAWN    " in line
+    )
     assert "(dry-run; no process started)" in spawn_line
     assert "— plan:" in spawn_line
     assert "(pid 0)" not in spawn_line
@@ -452,6 +463,16 @@ def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
         "reason": "engine usage limit",
     }]
     assert wt.config.engine("Q") == "claude"
+    activity = (wt.tmp / "activity.log").read_text()
+    correlated_failures = [
+        line for line in activity.splitlines() if "  SPAWN_FAIL" in line
+    ]
+    assert len(correlated_failures) == 2
+    assert all(
+        f"reconcile_id={first['reconcile_id']}" in line
+        and "cause=initial_staffing" in line
+        for line in correlated_failures
+    )
 
     ledger = json.loads((wt.tmp / "worker-sessions.json").read_text())
     assert sid in ledger["session_ids"]
@@ -1461,6 +1482,8 @@ def test_spawn_run_once_worker_logs_spawn(wt, monkeypatch):
     log_content = (wt.tmp / "activity.log").read_text()
     assert "SPAWN" in log_content
     assert f"run-once for {ref}" in log_content
+    assert "cause=manual_or_run_once" in log_content
+    assert "reconcile_id=manual-" in log_content
 
     # WT-116 effort is queue-level policy, not a single-ticket override.
     with pytest.raises(TypeError):
@@ -1494,6 +1517,9 @@ def _age_worker_log(wt, rec, seconds):
     log = rec.get("log")
     old = time.time() - seconds
     os.utime(log, (old, old))
+    test_activity = rec.get("_test_activity_path")
+    if test_activity:
+        os.utime(test_activity, (old, old))
 
 
 def test_notify_pushes_to_warm_worker(wt):
@@ -1603,9 +1629,16 @@ def test_release_marks_idle_worker_without_killing_process(wt):
     log.write_text("")
     fifo, fd = wt.workers._make_stdin_fifo(log)
     wt._readers.append(fd)
+    sid = "44444444-4444-4444-4444-444444444444"
+    transcript_dir = wt.tmp / "claude-home" / "projects" / "-test-project"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript = transcript_dir / f"{sid}.jsonl"
+    transcript.write_text('{"type":"user"}\n')
     rec = wt.workers.record_worker(
         child.pid, "Q", "claude", "q-cold", str(wt.tmp), str(log), fifo=fifo or "",
+        session_id=sid,
     )
+    rec["_test_activity_path"] = str(transcript)
     try:
         _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
         released = wt.workers.release_idle_workers(queue="Q")
@@ -1658,6 +1691,12 @@ def test_release_injects_queue_scoped_instruction_into_codex_session(wt, monkeyp
         lambda target, text: sent.append((target, text)) or {"ok": True},
     )
     sid = "33333333-3333-3333-3333-333333333333"
+    codex_home = wt.tmp / "codex-home"
+    rollout_dir = codex_home / "sessions" / "2026" / "07" / "16"
+    rollout_dir.mkdir(parents=True)
+    rollout = rollout_dir / f"rollout-2026-07-16T00-00-00-{sid}.jsonl"
+    rollout.write_text('{"type":"event_msg"}\n')
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
     log = wt.tmp / "codex-idle.log"
     log.write_text("")
     rec = wt.workers.record_worker(
@@ -1665,6 +1704,8 @@ def test_release_injects_queue_scoped_instruction_into_codex_session(wt, monkeyp
         session_id=sid,
     )
     _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    old = time.time() - wt.workers.RELEASE_IDLE_S - 60
+    os.utime(rollout, (old, old))
 
     released = wt.workers.release_idle_workers(queue="Q")
 
@@ -1739,15 +1780,23 @@ def test_release_spares_worker_with_blocked_ticket(wt):
 def test_global_reap_fails_closed_per_queue(wt, monkeypatch):
     children = []
     records = []
-    for queue in ("BROKEN", "HEALTHY"):
+    codex_home = wt.tmp / "codex-home"
+    rollout_dir = codex_home / "sessions" / "2026" / "07" / "16"
+    rollout_dir.mkdir(parents=True)
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    for index, queue in enumerate(("BROKEN", "HEALTHY"), start=1):
         child = subprocess.Popen(["sleep", "30"])
         children.append(child)
         log = wt.tmp / f"{queue.lower()}-cold.log"
         log.write_text("")
+        sid = f"66666666-6666-6666-6666-{index:012d}"
+        rollout = rollout_dir / f"rollout-{sid}.jsonl"
+        rollout.write_text('{"type":"event_msg"}\n')
         rec = wt.workers.record_worker(
             child.pid, queue, "codex", f"{queue.lower()}-cold",
-            str(wt.tmp), str(log),
+            str(wt.tmp), str(log), session_id=sid,
         )
+        rec["_test_activity_path"] = str(rollout)
         records.append(rec)
         _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
     warm = subprocess.Popen(["sleep", "30"])
@@ -1798,6 +1847,647 @@ def test_reap_fails_closed_when_file_queue_is_corrupt(wt):
     finally:
         child.terminate()
         child.wait(timeout=5)
+
+
+# ===================================== lifecycle audit + spawn causality (CCC-592)
+def _activity_lines(wt, verb):
+    path = wt.tmp / "activity.log"
+    if not path.exists():
+        return []
+    return [line for line in path.read_text().splitlines() if f"  {verb}" in line]
+
+
+def test_idle_threshold_crossing_logs_complete_correlated_bundle(wt):
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    released = wt.workers.release_idle_workers(queue="Q")
+
+    assert [row["worker_id"] for row in released] == [rec["worker_id"]]
+    candidate = _activity_lines(wt, "IDLE_CANDIDATE")
+    signals = _activity_lines(wt, "IDLE_SIGNAL")
+    decisions = _activity_lines(wt, "IDLE_DECISION")
+    releases = _activity_lines(wt, "RELEASE")
+    assert len(candidate) == 1
+    assert "worker_id=" + rec["worker_id"] in candidate[0]
+    assert "effective_source=watchtower_stdout" in candidate[0]
+    assert "floor_s=1800" in candidate[0]
+    evaluation_id = candidate[0].split("evaluation_id=", 1)[1].split()[0]
+    assert signals
+    assert all(f"evaluation_id={evaluation_id}" in line for line in signals)
+    assert any("signal=pid_alive value=true" in line for line in signals)
+    assert any("signal=queue_read value=success" in line for line in signals)
+    assert any("signal=pid_signal_planned value=false" in line for line in signals)
+    assert len(decisions) == 1
+    assert f"evaluation_id={evaluation_id}" in decisions[0]
+    assert "decision=RELEASE" in decisions[0]
+    assert "release_id=" in decisions[0]
+    assert len(releases) == 1
+    assert f"evaluation_id={evaluation_id}" in releases[0]
+    assert "pid_signalled=false" in releases[0]
+    assert "stop_sentinel=true" in releases[0]
+    assert "released_at=" in releases[0]
+
+
+def test_identical_idle_preserve_evaluation_is_suppressed(wt):
+    rec = _live_worker(wt, "Q")
+    item = wt.q.enqueue(project="Q", note="still working")
+    wt.q.claim_by_ref(item["ref"], rec["worker_id"])
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    assert wt.workers.release_idle_workers(queue="Q") == []
+
+    assert len(_activity_lines(wt, "IDLE_CANDIDATE")) == 1
+    decisions = _activity_lines(wt, "IDLE_DECISION")
+    assert len(decisions) == 1
+    assert "decision=PRESERVE" in decisions[0]
+    assert "owned_by_worker" in decisions[0]
+
+
+def test_changed_idle_evidence_emits_new_complete_bundle(wt):
+    rec = _live_worker(wt, "Q")
+    item = wt.q.enqueue(project="Q", note="still working")
+    wt.q.claim_by_ref(item["ref"], rec["worker_id"])
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    assert wt.workers.release_idle_workers(queue="Q") == []
+
+    wt.q.block(item["ref"], rec["worker_id"], "Need a decision", "Investigated")
+    assert wt.workers.release_idle_workers(queue="Q") == []
+
+    assert len(_activity_lines(wt, "IDLE_CANDIDATE")) == 2
+    decisions = _activity_lines(wt, "IDLE_DECISION")
+    assert len(decisions) == 2
+    assert "blocked_ticket" not in decisions[0]
+    assert "blocked_ticket" in decisions[1]
+
+
+def test_idle_candidate_with_fresh_activity_logs_active_again(wt):
+    rec = _live_worker(wt, "Q")
+    item = wt.q.enqueue(project="Q", note="still working")
+    wt.q.claim_by_ref(item["ref"], rec["worker_id"])
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    assert wt.workers.release_idle_workers(queue="Q") == []
+
+    Path(rec["log"]).touch()
+    assert wt.workers.release_idle_workers(queue="Q") == []
+
+    active_again = _activity_lines(wt, "ACTIVE_AGAIN")
+    assert len(active_again) == 1
+    assert "worker_id=" + rec["worker_id"] in active_again[0]
+    assert "effective_source=watchtower_stdout" in active_again[0]
+    assert "staffing_attached=true" in active_again[0]
+
+
+def test_idle_queue_read_failure_logs_all_fail_closed_evidence(wt, monkeypatch):
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    def fail_read(**kwargs):
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr(wt.q, "list_items", fail_read)
+    assert wt.workers.release_idle_workers(queue="Q") == []
+
+    signals = _activity_lines(wt, "IDLE_SIGNAL")
+    assert any(
+        "signal=queue_read value=error" in line
+        and "backend unavailable" in line
+        for line in signals
+    )
+    decision = _activity_lines(wt, "IDLE_DECISION")[0]
+    assert "decision=PRESERVE" in decision
+    assert "queue_read_error" in decision
+
+
+def test_missing_authoritative_activity_evidence_preserves_worker(wt):
+    rec = _live_worker(wt, "Q")
+    Path(rec["log"]).unlink()
+    Path(rec["_test_activity_path"]).unlink()
+
+    assert wt.workers.release_idle_workers(max_idle_s=0, queue="Q") == []
+
+    decision = _activity_lines(wt, "IDLE_DECISION")[0]
+    assert "decision=PRESERVE" in decision
+    assert "activity_evidence_missing" in decision
+    assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+
+
+def test_missing_session_identity_preserves_stale_worker(wt):
+    log = wt.tmp / "sessionless.log"
+    log.write_text("")
+    rec = wt.workers.record_worker(
+        os.getpid(), "Q", "claude", "q-sessionless",
+        str(wt.tmp), str(log),
+    )
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+
+    decision = _activity_lines(wt, "IDLE_DECISION")[0]
+    assert "decision=PRESERVE" in decision
+    assert "session_identity_missing" in decision
+
+
+def test_unknown_engine_preserves_stale_worker(wt):
+    log = wt.tmp / "unknown-engine.log"
+    log.write_text("")
+    rec = wt.workers.record_worker(
+        os.getpid(), "Q", "mystery", "q-unknown-engine",
+        str(wt.tmp), str(log),
+        session_id="55555555-5555-5555-5555-555555555555",
+    )
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+
+    decision = _activity_lines(wt, "IDLE_DECISION")[0]
+    assert "decision=PRESERVE" in decision
+    assert "authoritative_activity_unknown" in decision
+
+
+def test_unknown_pid_identity_preserves_worker(wt):
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    data = wt.workers._load()
+    data["workers"][0].pop("pid_started", None)
+    wt.workers._save(data)
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+
+    decision = _activity_lines(wt, "IDLE_DECISION")[0]
+    assert "decision=PRESERVE" in decision
+    assert "pid_identity_unknown" in decision
+    assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+
+
+def test_audit_bundle_write_failure_fails_closed(wt, monkeypatch):
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    monkeypatch.setattr(wt.q, "_log_many", lambda events: False)
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+    stored = wt.workers._load()["workers"][0]
+    assert "released_at" not in stored
+
+
+def test_release_stop_failure_stays_attached_and_retries(wt, monkeypatch):
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    blocked_stop_dir = wt.tmp / "not-a-directory"
+    blocked_stop_dir.write_text("occupied")
+    monkeypatch.setattr(wt.workers, "STOP_SIGNALS_DIR", blocked_stop_dir)
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    stored = wt.workers._load()["workers"][0]
+    assert "released_at" not in stored
+    assert stored["lifecycle_audit"]["decision"] == "RELEASE_FAILED"
+    assert len(_activity_lines(wt, "RELEASE_FAIL")) == 1
+
+    blocked_stop_dir.unlink()
+    released = wt.workers.release_idle_workers(queue="Q")
+    assert [row["worker_id"] for row in released] == [rec["worker_id"]]
+    assert len(_activity_lines(wt, "IDLE_CANDIDATE")) == 2
+
+
+def test_active_again_log_failure_keeps_transition_retryable(wt, monkeypatch):
+    rec = _live_worker(wt, "Q")
+    item = wt.q.enqueue(project="Q", note="still working")
+    wt.q.claim_by_ref(item["ref"], rec["worker_id"])
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    Path(rec["log"]).touch()
+    Path(rec["_test_activity_path"]).touch()
+    real_log_many = wt.q._log_many
+
+    monkeypatch.setattr(
+        wt.q,
+        "_log_many",
+        lambda events: (
+            False if events and events[0][0] == "ACTIVE_AGAIN"
+            else real_log_many(events)
+        ),
+    )
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    assert wt.workers._load()["workers"][0]["lifecycle_audit"]["candidate"] is True
+
+    monkeypatch.setattr(wt.q, "_log_many", real_log_many)
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    assert len(_activity_lines(wt, "ACTIVE_AGAIN")) == 1
+
+
+def test_release_log_failure_is_persisted_and_replayed(wt, monkeypatch):
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    real_log_many = wt.q._log_many
+
+    monkeypatch.setattr(
+        wt.q,
+        "_log_many",
+        lambda events: (
+            False if events and events[0][0] == "RELEASE"
+            else real_log_many(events)
+        ),
+    )
+    released = wt.workers.release_idle_workers(queue="Q")
+    assert released and released[0]["_release_log_written"] is False
+    state = wt.workers._load()["workers"][0]["lifecycle_audit"]
+    assert state["release_log_pending"]["detail"]
+    assert _activity_lines(wt, "RELEASE") == []
+
+    monkeypatch.setattr(wt.q, "_log_many", real_log_many)
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    assert len(_activity_lines(wt, "RELEASE")) == 1
+    state = wt.workers._load()["workers"][0]["lifecycle_audit"]
+    assert "release_log_pending" not in state
+
+
+def test_dead_worker_with_pending_release_log_is_not_pruned(wt, monkeypatch):
+    child = subprocess.Popen(["sleep", "30"])
+    log = wt.tmp / "pending-release.log"
+    log.write_text("")
+    fifo, fd = wt.workers._make_stdin_fifo(log)
+    wt._readers.append(fd)
+    sid = "77777777-7777-7777-7777-777777777777"
+    transcript_dir = wt.tmp / "claude-home" / "projects" / "-test-project"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript = transcript_dir / f"{sid}.jsonl"
+    transcript.write_text('{"type":"user"}\n')
+    rec = wt.workers.record_worker(
+        child.pid, "Q", "claude", "q-pending-release",
+        str(wt.tmp), str(log), fifo=fifo or "", session_id=sid,
+    )
+    rec["_test_activity_path"] = str(transcript)
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    real_log_many = wt.q._log_many
+    monkeypatch.setattr(
+        wt.q,
+        "_log_many",
+        lambda events: (
+            False if events and events[0][0] == "RELEASE"
+            else real_log_many(events)
+        ),
+    )
+    try:
+        assert wt.workers.release_idle_workers(queue="Q")
+        child.terminate()
+        child.wait(timeout=5)
+        rows = wt.workers.list_workers(prune=True)
+        assert [row["worker_id"] for row in rows] == ["q-pending-release"]
+        assert wt.workers._load()["workers"]
+
+        monkeypatch.setattr(wt.q, "_log_many", real_log_many)
+        wt.workers.release_idle_workers(queue="Q")
+        wt.workers.list_workers(prune=True)
+        assert wt.workers._load()["workers"] == []
+    finally:
+        if child.poll() is None:
+            child.terminate()
+            child.wait(timeout=5)
+
+
+def test_normal_idle_release_never_signals_worker_pid(wt, monkeypatch):
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    real_kill = os.kill
+    observed_signals = []
+
+    def observing_kill(pid, sig):
+        observed_signals.append(sig)
+        return real_kill(pid, sig)
+
+    monkeypatch.setattr(wt.workers.os, "kill", observing_kill)
+    assert wt.workers.release_idle_workers(queue="Q")
+    assert observed_signals
+    assert set(observed_signals) == {0}
+
+
+def test_reconcile_logs_correlated_release_replacement_plan_and_spawn(wt, monkeypatch):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    wt.q.enqueue(project="Q", note="new work")
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    monkeypatch.setattr(
+        wt.workers,
+        "spawn_workers",
+        lambda queue, n=1, **kwargs: [
+            {
+                "worker_id": "q-replacement",
+                "queue": queue,
+                "pid": 12345,
+                "engine": kwargs.get("engine", "claude"),
+            }
+        ],
+    )
+
+    result = wt.workers.reconcile_once()
+
+    assert [row["worker_id"] for row in result["released"]] == [rec["worker_id"]]
+    plan = _activity_lines(wt, "SPAWN_PLAN")[0]
+    spawn = next(
+        line for line in _activity_lines(wt, "SPAWN")
+        if "worker_id=q-replacement" in line
+    )
+    reconcile_id = plan.split("reconcile_id=", 1)[1].split()[0]
+    release_id = result["released"][0]["_release_id"]
+    assert "cause=release_replacement" in plan
+    assert "requested=1" in plan
+    assert f"release_ids=[\"{release_id}\"]" in plan
+    assert f"reconcile_id={reconcile_id}" in spawn
+    assert "cause=release_replacement" in spawn
+    assert f"release_ids=[\"{release_id}\"]" in spawn
+    assert f"previous_worker_ids=[\"{rec['worker_id']}\"]" in spawn
+
+
+def test_release_without_claimable_work_logs_zero_spawn_plan(wt):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    result = wt.workers.reconcile_once()
+
+    assert [row["worker_id"] for row in result["released"]] == [rec["worker_id"]]
+    assert result["spawned"] == []
+    plan = _activity_lines(wt, "SPAWN_PLAN")[0]
+    assert "cause=release_replacement" in plan
+    assert "claimable_depth=0" in plan
+    assert "requested=0" in plan
+    assert "zero_spawn_reason=no_claimable_work" in plan
+
+
+def test_release_on_auto_drain_off_queue_logs_zero_spawn_plan(wt):
+    wt.config.set_auto_drain("Q", False)
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+
+    result = wt.workers.reconcile_once()
+
+    assert result["released"]
+    plan = _activity_lines(wt, "SPAWN_PLAN")[0]
+    assert "requested=0" in plan
+    assert "zero_spawn_reason=auto_drain_off" in plan
+
+
+def test_release_with_remaining_staffing_logs_zero_spawn_plan(wt):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    wt.q.enqueue(project="Q", note="work one")
+    wt.q.enqueue(project="Q", note="work two")
+    cold = _live_worker(wt, "Q")
+    _live_worker(wt, "Q")
+    _age_worker_log(wt, cold, wt.workers.RELEASE_IDLE_S + 60)
+
+    result = wt.workers.reconcile_once()
+
+    assert [row["worker_id"] for row in result["released"]] == [cold["worker_id"]]
+    assert result["spawned"] == []
+    plan = _activity_lines(wt, "SPAWN_PLAN")[0]
+    assert "requested=0" in plan
+    assert "zero_spawn_reason=staffing_sufficient_after_release" in plan
+
+
+def test_mixed_deficit_links_only_incremental_replacement_spawn(wt, monkeypatch):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 3)
+    for number in range(3):
+        wt.q.enqueue(project="Q", note=f"work {number}")
+    cold = _live_worker(wt, "Q")
+    _age_worker_log(wt, cold, wt.workers.RELEASE_IDLE_S + 60)
+
+    def fake_spawn(queue, n=1, **kwargs):
+        return [
+            {
+                "worker_id": f"q-new-{index}",
+                "queue": queue,
+                "pid": 12000 + index,
+                "engine": "claude",
+                "_spawn_index": index,
+            }
+            for index in range(n)
+        ]
+
+    monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
+    result = wt.workers.reconcile_once()
+
+    assert len(result["spawned"]) == 3
+    assert [row["_spawn_cause"] for row in result["spawned"]] == [
+        "release_replacement",
+        "scale_up",
+        "scale_up",
+    ]
+    assert result["spawned"][0]["_related_release_ids"]
+    assert result["spawned"][1]["_related_release_ids"] == []
+    assert result["spawned"][2]["_related_release_ids"] == []
+    plan = result["spawn_plans"][0]
+    assert plan["replacement_slots"] == 1
+    assert plan["base_cause"] == "scale_up"
+
+
+def test_spawn_plan_log_failure_is_reported_without_dropping_work(
+    wt, monkeypatch, capsys
+):
+    wt.config.set_auto_drain("Q", True)
+    wt.q.enqueue(project="Q", note="work")
+    real_log = wt.q._log
+
+    def selective_log(verb, detail, queue=""):
+        if verb == "SPAWN_PLAN":
+            return False
+        return real_log(verb, detail, queue)
+
+    monkeypatch.setattr(wt.q, "_log", selective_log)
+    result = wt.workers.reconcile_once(dry_run=True)
+
+    assert result["spawned"]
+    assert result["spawn_plans"][0]["logged"] is False
+    assert "failed to log SPAWN_PLAN for Q" in capsys.readouterr().err
+
+
+def test_release_replacement_waits_for_plan_log_and_keeps_correlation(
+    wt, monkeypatch
+):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    wt.q.enqueue(project="Q", note="work")
+    cold = _live_worker(wt, "Q")
+    _age_worker_log(wt, cold, wt.workers.RELEASE_IDLE_S + 60)
+    real_log = wt.q._log
+    spawn_calls = []
+
+    def fake_spawn(queue, n=1, **kwargs):
+        spawn_calls.append(n)
+        return [
+            {
+                "worker_id": "q-replacement",
+                "queue": queue,
+                "pid": 12345,
+                "engine": "claude",
+                "_spawn_index": 0,
+            }
+        ]
+
+    monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
+    monkeypatch.setattr(
+        wt.q,
+        "_log",
+        lambda verb, detail, queue="": (
+            False if verb == "SPAWN_PLAN" else real_log(verb, detail, queue)
+        ),
+    )
+    first = wt.workers.reconcile_once()
+    assert first["released"]
+    assert first["spawned"] == []
+    assert spawn_calls == []
+    state = wt.workers._load()["workers"][0]["lifecycle_audit"]
+    assert state["spawn_plan_pending"]["replacement"] is True
+
+    monkeypatch.setattr(wt.q, "_log", real_log)
+    second = wt.workers.reconcile_once()
+    assert spawn_calls == [1]
+    assert second["spawned"][0]["_spawn_cause"] == "release_replacement"
+    assert second["spawned"][0]["_related_release_ids"] == [
+        first["released"][0]["_release_id"]
+    ]
+
+
+def test_mixed_dead_recovery_still_defers_unlogged_replacement_plan(
+    wt, monkeypatch
+):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 2)
+    wt.q.enqueue(project="Q", note="work one")
+    wt.q.enqueue(project="Q", note="work two")
+    cold = _live_worker(wt, "Q")
+    _dead_worker(wt, "Q")
+    _age_worker_log(wt, cold, wt.workers.RELEASE_IDLE_S + 60)
+    real_log = wt.q._log
+    spawn_calls = []
+    monkeypatch.setattr(
+        wt.workers,
+        "spawn_workers",
+        lambda queue, n=1, **kwargs: spawn_calls.append(n) or [],
+    )
+    monkeypatch.setattr(
+        wt.q,
+        "_log",
+        lambda verb, detail, queue="": (
+            False if verb == "SPAWN_PLAN" else real_log(verb, detail, queue)
+        ),
+    )
+
+    result = wt.workers.reconcile_once()
+
+    assert result["spawned"] == []
+    assert spawn_calls == []
+    assert result["spawn_plans"][0]["base_cause"] == "dead_worker_recovery"
+    assert result["spawn_plans"][0]["replacement_slots"] == 1
+
+
+def test_engine_activity_lookup_error_is_logged_and_preserved(wt, monkeypatch):
+    rec = _live_worker(wt, "Q")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    monkeypatch.setattr(
+        wt.workers,
+        "_newest_matching_path",
+        lambda paths: (None, "PermissionError: denied"),
+    )
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+
+    signal = next(
+        line for line in _activity_lines(wt, "IDLE_SIGNAL")
+        if "signal=claude_transcript" in line
+    )
+    assert "PermissionError: denied" in signal
+    decision = _activity_lines(wt, "IDLE_DECISION")[0]
+    assert "authoritative_activity_unreadable" in decision
+
+
+def test_partial_usage_fallback_preserves_failed_slot_causality(
+    wt, monkeypatch
+):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 2)
+    wt.config.set_engine("Q", "codex")
+    wt.q.enqueue(project="Q", note="work one")
+    wt.q.enqueue(project="Q", note="work two")
+    cold = _live_worker(wt, "Q")
+    _age_worker_log(wt, cold, wt.workers.RELEASE_IDLE_S + 60)
+    calls = []
+
+    def fake_spawn(queue, n=1, engine="claude", launch_failures=None, **kwargs):
+        calls.append((engine, n))
+        if engine == "codex":
+            launch_failures.append(
+                {
+                    "worker_id": "q-primary-failed",
+                    "queue": queue,
+                    "reason": "engine usage limit",
+                    "_spawn_index": 1,
+                }
+            )
+            return [
+                {
+                    "worker_id": "q-primary-ok",
+                    "queue": queue,
+                    "pid": 12000,
+                    "engine": engine,
+                    "_spawn_index": 0,
+                }
+            ]
+        return [
+            {
+                "worker_id": "q-fallback-ok",
+                "queue": queue,
+                "pid": 12001,
+                "engine": engine,
+                "_spawn_index": 0,
+            }
+        ]
+
+    monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
+    result = wt.workers.reconcile_once()
+
+    assert calls == [("codex", 2), ("claude", 1)]
+    assert [row["_spawn_cause"] for row in result["spawned"]] == [
+        "release_replacement",
+        "scale_up",
+    ]
+    assert result["spawned"][0]["_related_release_ids"]
+    assert result["spawned"][1]["_related_release_ids"] == []
+
+
+@pytest.mark.parametrize(
+    ("setup", "expected_cause"),
+    [
+        ("initial", "initial_staffing"),
+        ("scale", "scale_up"),
+        ("dead", "dead_worker_recovery"),
+        ("manual", "manual_or_run_once"),
+    ],
+)
+def test_reconcile_spawn_cause_classification(wt, setup, expected_cause):
+    wt.config.set_auto_drain("Q", setup != "manual")
+    wt.config.set_desired_workers("Q", 2 if setup == "scale" else 1)
+    first = wt.q.enqueue(project="Q", note="work one")
+    if setup == "scale":
+        wt.q.enqueue(project="Q", note="work two")
+        _live_worker(wt, "Q")
+    elif setup == "dead":
+        _dead_worker(wt, "Q")
+    elif setup == "manual":
+        wt.q.mark_runnable(first["ref"])
+
+    wt.workers.reconcile_once(dry_run=True)
+
+    plan = _activity_lines(wt, "SPAWN_PLAN")[0]
+    spawn = _activity_lines(wt, "SPAWN")[0]
+    assert f"cause={expected_cause}" in plan
+    assert f"cause={expected_cause}" in spawn
 
 
 # ===================================== cloud session-id resolution (WT-38)

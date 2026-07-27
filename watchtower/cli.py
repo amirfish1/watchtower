@@ -2348,8 +2348,12 @@ def _daemon_loop(args: argparse.Namespace) -> None:
                         f"no live workers -> auto-spawn",
                         flush=True,
                     )
-                    if not dry_run:
-                        workers.spawn_workers(r["queue"], n=1, engine=args.engine)
+                    # A queue can become configured between the registry
+                    # snapshot above and this health scan. Re-enter the locked
+                    # reconciler so the spawn receives the same SPAWN_PLAN,
+                    # cause classification, and capacity cap as every other
+                    # worker launch.
+                    workers.reconcile_once(dry_run=dry_run)
         time.sleep(interval)
 
 

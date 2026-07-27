@@ -78,7 +78,10 @@ reconciler running, `auto_drain` queues drain automatically.
 
 A **worker** is a subprocess running a headless agent CLI (`claude -p ...` or
 `codex exec ...`). It is not a user — it is a tool the daemon uses to drain a
-queue. Workers are ephemeral and stateless outside the queue.
+queue. Worker processes are ephemeral, while queue staffing state is durable in
+`workers.json`: a released conversation
+remains recorded so it cannot silently rejoin the queue after consuming its
+one-shot stop sentinel.
 
 ### Engines
 
@@ -159,17 +162,23 @@ wt close REF --summary "what changed" --commit <SHA>
              --unresolved "Z still open" # repeatable
 ```
 
-### Wind-down (reconciler asked the worker to stop)
+### Queue-scoped release
 
 ```
-reconciler: actual > desired
-  └─ request_stop(worker_id)          # writes a sentinel file (INTERNAL)
+worker crosses the 30-minute inactivity floor
+  └─ reconciler snapshots PID, WT stdout, engine transcript/rollout, and ownership
+  └─ strict queue read confirms no ticket is owned by worker ID or session ID
+  └─ complete IDLE_CANDIDATE / IDLE_SIGNAL / IDLE_DECISION bundle is logged
+  └─ released_at is persisted and a one-shot stop sentinel is written
+  └─ queue-scoped release instruction is attempted over FIFO/session delivery
   └─ worker's next wt claim returns {"stop": true}
-  └─ worker exits cleanly — no ticket abandoned, it only saw STOP between tickets
+  └─ process and unrelated conversation work continue untouched
 ```
 
-Cost: wind-down waits up to one ticket's duration (the worker finishes what it
-started). That is intentional.
+Unknown or unreadable evidence fails closed. A worker is preserved when it owns
+in-progress or blocked work, the strict queue read fails, its PID identity is
+not attributable, or required activity evidence is unavailable. WatchTower
+never sends `SIGTERM` or `SIGKILL` as part of normal queue release.
 
 ### Engine-specific idle behavior
 
@@ -183,6 +192,39 @@ exits immediately. A wind-down STOP makes either engine exit between tickets.
 
 ---
 
+## Auditable idle decisions
+
+The unified activity log at `~/.watchtower/activity.log` contains the evidence,
+decision, release, and any replacement spawn. Stable `key=value` fields allow
+an operator to reconstruct the transaction without reading a worker transcript.
+
+| Verb | Meaning |
+|------|---------|
+| `IDLE_CANDIDATE` | Identity, release floor, and newest effective activity clock for a worker that crossed the floor. |
+| `IDLE_SIGNAL` | One line per safety signal: PID, WT stdout, Claude transcript/Codex rollout/Kimi wire log, queue-read result, owned and blocked refs, and `pid_signal_planned=false`. |
+| `IDLE_DECISION` | Exactly one `PRESERVE` (with every reason) or `RELEASE` result for an evaluation. |
+| `ACTIVE_AGAIN` | A prior idle candidate received newer authoritative activity and fell below the floor. |
+| `RELEASE` | Durable detachment, delivery outcome, sentinel state, and `pid_signalled=false`. |
+| `SPAWN_PLAN` | Claimable depth, before/after staffing, releases, deficit, requested count, and cause for one reconcile pass. |
+| `SPAWN` / `SPAWN_FAIL` | Launch result correlated to its reconcile pass and any replacement release. |
+
+Every evaluation has an `evaluation_id`, every release a `release_id`, and every
+reconcile pass a `reconcile_id`. The worker record stores the last evidence
+fingerprint and decision, so identical 30-second ticks are silent. Changed
+evidence emits a fresh complete bundle; daemon restart may emit one new
+snapshot.
+
+Spawn causes are `initial_staffing`, `scale_up`, `release_replacement`,
+`dead_worker_recovery`, and `manual_or_run_once`. Only
+`release_replacement` spawns carry related release and previous-worker IDs. In
+a mixed deficit, only the incremental slot created by a same-pass release gets
+that cause; pre-existing deficit slots retain their initial, scale-up, or
+dead-worker-recovery cause.
+
+Failed final `RELEASE` appends and failed release-correlated `SPAWN_PLAN`
+appends are retained in the worker's lifecycle audit state and retried on later
+passes. Replacement spawning waits until its causal plan is durably logged.
+
 ## Activity log — SPAWN vs DISPATCH
 
 The activity log at `~/.watchtower/activity.log` records two related but distinct
@@ -190,24 +232,25 @@ events when a new ticket is filed:
 
 | Verb | Who emits it | What it means |
 |------|-------------|---------------|
-| **SPAWN** | `reconcile_once()` / reconciler | A new worker *process* was created (one line per process). Detail: `<worker-id> (pid <PID>) [engine] — <N> open, <A> live < <D> desired`. |
+| **SPAWN_PLAN** | `reconcile_once()` / reconciler | The staffing calculation, including cause and release correlation. A release with no claimable work records `requested=0`. |
+| **SPAWN** | `reconcile_once()` / reconciler | A new worker process was created, labeled with cause and reconcile ID. |
 | **DISPATCH** | `dispatch_after_enqueue()` | The routing decision for *this ticket* — what happened to ensure it gets worked. One line per ticket, one of: nudged an existing worker, spawned new worker(s), or queued as backlog. |
 
 **Why do I see two SPAWN lines for one ticket?**  
 The queue's `desired_workers` setting controls how many workers the reconciler
-keeps running at all times. If the queue has `desired_workers=2` and there are
-0 live workers, `reconcile_once()` spawns 2 regardless of how many tickets are
-open — it's provisioning to capacity, not one-for-one. The DISPATCH line then
-records which of those workers the ticket was routed to.
+may run concurrently, but launches are capped by unclaimed claimable tickets.
+With `desired_workers=2`, zero live workers, and one claimable ticket, only one
+worker starts. Two SPAWN lines require at least two unclaimed tickets. The
+DISPATCH line records which workers the enqueue was routed to.
 
 To reduce to 1 worker per queue: `wt set -q <QUEUE> --desired-workers 1`.
 
 **Example sequence** for a queue with `desired_workers=2`, 0 live workers, 1 ticket:
 ```
-ENQUEUE   CCC-461   Command Center ticket
-SPAWN     ccc-abc1  (pid 4928) [claude] — 1 open, 0 live < 2 desired
-SPAWN     ccc-def2  (pid 4929) [claude] — 1 open, 0 live < 2 desired
-DISPATCH  CCC-461   spawned 2 worker(s): ccc-abc1, ccc-def2
+ENQUEUE     CCC-461   Command Center ticket
+SPAWN_PLAN  reconcile_id=reconcile-a1 claimable_depth=1 requested=1 cause=initial_staffing
+SPAWN       worker_id=ccc-abc1 reconcile_id=reconcile-a1 cause=initial_staffing
+DISPATCH    CCC-461   spawned 1 worker: ccc-abc1
 ```
 
 An extra Claude worker waits on its FIFO until another ticket arrives or it is
@@ -255,15 +298,22 @@ overridable via `$WATCHTOWER_STOP_SIGNALS_DIR` for test isolation.
 ### `reconcile_once(dry_run=False)`
 
 One tick of the reconciler. Called by the `wt start` daemon loop. Per queue:
-computes `desired = desired_workers if (auto_drain and depth > 0) else 0`,
-compares to `live_worker_count(queue)`, calls `spawn_workers()` or
-`request_stop()` to match. Returns `{spawned: [...], stopped: [...], skipped:
-[...]}`. In `dry_run` mode, skips all I/O — used by tests.
+snapshots eligible staffing, evaluates and persists idle releases, recomputes
+eligible staffing, reads claimable depth, records a `SPAWN_PLAN`, and starts
+only the capped deficit. A same-pass release plus claimable work is labeled
+`release_replacement`; a release with no claimable work records a zero-worker
+plan. Returns `spawned`, `released`, `spawn_plans`, `launch_failed`, `skipped`,
+and related maintenance results. In `dry_run` mode, no subprocesses or releases
+occur; staffing plans and synthetic spawn records are still returned and
+logged for tests.
 
 ### `request_stop(worker_id)`
 
-Creates the stop-signal sentinel file. Does NOT touch `workers.json` (avoids
-write races between the reconciler and the claim path).
+Creates the stop-signal sentinel, then persists `released_at` under the
+workers-file lock. If durable persistence fails, the new sentinel is removed so
+staffing remains attached and the next evaluation can retry. The sentinel is
+only the next-claim transport; durable detachment in `workers.json` remains
+after the worker consumes it.
 
 ### `claim_next(queue, worker_id, ...)`
 
@@ -275,10 +325,11 @@ atomic under `_FileLock`.
 ### Workers file
 
 `~/.watchtower/workers.json` — PID + metadata for workers THIS CLI spawned.
-Liveness is process-level (`os.kill(pid, 0)`). Pruned on read when `prune=True`
-(dead workers removed). Distinct from queue state — a worker can be alive in the
-workers file but idle (no in-progress ticket), or have an in-progress ticket but
-no tracked worker (if spawned by a different CLI invocation).
+Liveness is process-level (`os.kill(pid, 0)`). Dead workers are pruned on reads
+with `prune=True`. Live records may carry `released_at` plus a
+`lifecycle_audit` fingerprint, previous decision/evaluation ID, effective
+activity timestamp, and log timestamp. This state suppresses duplicate audit
+bundles and keeps a released conversation out of eligible staffing.
 
 ### `_CCC_LEGACY_STORE`
 
