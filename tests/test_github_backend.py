@@ -221,7 +221,16 @@ sys.exit(2)
 
 
 @pytest.fixture(autouse=True)
-def restore_watchtower_modules():
+def restore_watchtower_modules(tmp_path, monkeypatch):
+    # Isolate the GitHub connectivity state file for every test in this
+    # module, including the many below that call `_list_issues` directly
+    # without going through `_reload_isolated`. Without this, a synthetic
+    # failure in one test (e.g. "gh auth unavailable") would write to the
+    # real `~/.watchtower/gh-connectivity.json` on the developer's machine
+    # and then leak into whichever test runs next.
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "autouse-gh-connectivity.json")
+    )
     yield
     import watchtower.config as config
     import watchtower.health as health
@@ -252,6 +261,9 @@ def _reload_isolated(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
     monkeypatch.setenv(
         "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(tmp_path / "no-ccc-spawn-defaults.json")
+    )
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json")
     )
     import watchtower.config as config
     import watchtower.github_backend as github_backend
@@ -1371,3 +1383,162 @@ def test_grace_s_config_defaults_round_trips_and_is_visible_on_wt_config(
 
     assert main(["config", "-q", "GHI"]) == 0
     assert "'grace_s': 30" in capsys.readouterr().out
+
+
+# ==================================================== GitHub connectivity health
+
+def test_gh_connectivity_backoff_escalates_and_resets_on_success(tmp_path, monkeypatch):
+    """First failure backs off by the base delay; a further consecutive
+    failure doubles it up to the cap; a success resets to the base again."""
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+    import time as _time
+
+    # Whole-second values: `next_retry_at` is persisted at second precision
+    # (matching every other WatchTower timestamp), so sub-second deltas would
+    # round away and make the escalation assertion below meaningless.
+    monkeypatch.setattr(github_backend, "_GH_BACKOFF_BASE_S", 1.0)
+    monkeypatch.setattr(github_backend, "_GH_BACKOFF_CAP_S", 3.0)
+
+    backend = github_backend.GitHubIssuesBackend("T", repo="acme/backoff-test")
+
+    def failing_run(args, *, check=True):
+        raise github_backend.GitHubBackendError("gh auth unavailable")
+
+    monkeypatch.setattr(backend, "_run", failing_run)
+
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend._list_issues()
+    state = github_backend._load_connectivity()
+    assert state["consecutive_failures"] == 1
+    first_broken_since = state["broken_since"]
+    assert first_broken_since is not None
+    first_next_retry = github_backend._parse_iso(state["next_retry_at"])
+
+    _time.sleep(1.2)  # cross the first (1s) backoff window
+    github_backend._LIST_CACHE.clear()  # simulate a fresh process: cold cache
+
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend._list_issues()
+    state = github_backend._load_connectivity()
+    assert state["consecutive_failures"] == 2
+    assert state["broken_since"] == first_broken_since  # unchanged: still the same outage
+    second_next_retry = github_backend._parse_iso(state["next_retry_at"])
+    assert second_next_retry > first_next_retry  # escalated
+
+    _time.sleep(2.2)  # cross the doubled (2s) backoff window
+    github_backend._LIST_CACHE.clear()
+
+    def succeeding_run(args, *, check=True):
+        return json.dumps([])
+
+    monkeypatch.setattr(backend, "_run", succeeding_run)
+    assert backend._list_issues() == []
+    state = github_backend._load_connectivity()
+    assert state["consecutive_failures"] == 0
+    assert state["broken_since"] is None
+    assert state["next_retry_at"] is None
+    assert state["last_success_at"] is not None
+
+
+def test_gh_connectivity_backoff_blocks_cold_process_until_it_expires(tmp_path, monkeypatch):
+    """A failure recorded by one call must block a *different, cache-cold*
+    backend instance (simulating a fresh `wt status` process) from
+    re-attempting `gh` until the persisted backoff window passes."""
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+
+    # A whole-second base: `next_retry_at` is persisted at second precision,
+    # so a sub-second base (e.g. 0.2s) can truncate away to a near-zero
+    # effective margin depending on where in the current second the failure
+    # happens to land -- flaky by construction, not just slow.
+    monkeypatch.setattr(github_backend, "_GH_BACKOFF_BASE_S", 2.0)
+
+    backend = github_backend.GitHubIssuesBackend("T", repo="acme/cold-backoff-test")
+    calls = {"n": 0}
+
+    def failing_run(args, *, check=True):
+        calls["n"] += 1
+        raise github_backend.GitHubBackendError("gh auth unavailable")
+
+    monkeypatch.setattr(backend, "_run", failing_run)
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend._list_issues()
+    assert calls["n"] == 1
+
+    github_backend._LIST_CACHE.clear()  # fresh-process-like: cold in-memory cache
+    cold = github_backend.GitHubIssuesBackend("T", repo="acme/cold-backoff-test")
+    monkeypatch.setattr(cold, "_run", failing_run)
+    with pytest.raises(github_backend.GitHubBackendError) as excinfo:
+        cold._list_issues()
+    assert calls["n"] == 1  # no new `gh` invocation -- served from persisted backoff
+    assert excinfo.value.cached is True
+
+
+def test_gh_connectivity_strict_bypasses_persisted_backoff(tmp_path, monkeypatch):
+    """`strict=True` (claim/close today, `wt gh recheck` after Task 4) must
+    force a live attempt immediately, regardless of an active backoff."""
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setattr(github_backend, "_GH_BACKOFF_BASE_S", 60.0)
+
+    backend = github_backend.GitHubIssuesBackend("T", repo="acme/recheck-test")
+
+    def failing_run(args, *, check=True):
+        raise github_backend.GitHubBackendError("gh auth unavailable")
+
+    monkeypatch.setattr(backend, "_run", failing_run)
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend._list_issues()
+
+    calls = {"n": 0}
+
+    def succeeding_run(args, *, check=True):
+        calls["n"] += 1
+        return json.dumps([])
+
+    monkeypatch.setattr(backend, "_run", succeeding_run)
+    github_backend._LIST_CACHE.clear()  # fresh-process-like: cold in-memory cache
+
+    result = backend._list_issues(fresh=True, strict=True)
+    assert result == []
+    assert calls["n"] == 1
+    state = github_backend._load_connectivity()
+    assert state["broken_since"] is None  # the successful recheck cleared it
+
+
+def test_gh_connectivity_stale_data_fallback_still_records_failure(tmp_path, monkeypatch):
+    """WT-87's stale-data fallback returns cached good data without raising
+    to the caller -- the connectivity state must still record the failure,
+    since this is exactly the "silently degrading" case a human can't see
+    any other way."""
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.05)
+    monkeypatch.setattr(github_backend, "_LIST_ERROR_BACKOFF", 60.0)
+
+    backend = github_backend.GitHubIssuesBackend("T", repo="acme/stale-fallback-test")
+    good_issue = {
+        "number": 1, "title": "t", "body": "", "state": "OPEN",
+        "url": "https://github.com/acme/stale-fallback-test/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+    monkeypatch.setattr(backend, "_run", lambda args, *, check=True: json.dumps([good_issue]))
+    _no_etag_probe(monkeypatch, backend)
+    assert backend._list_issues() == [good_issue]
+
+    def failing_run(args, *, check=True):
+        raise github_backend.GitHubBackendError("API rate limit already exceeded")
+
+    monkeypatch.setattr(backend, "_run", failing_run)
+    import time as _time
+    _time.sleep(0.06)  # expire the TTL so the next call actually attempts gh
+    stale = backend._list_issues()
+    assert stale == [good_issue]  # served silently -- no exception reaches this caller
+
+    state = github_backend._load_connectivity()
+    assert state["broken_since"] is not None
+    assert state["last_error"] == "API rate limit already exceeded"

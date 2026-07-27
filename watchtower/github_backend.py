@@ -8,13 +8,15 @@ store for a queue configured with ``backend=github`` and uses the installed
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .queue import UNCLAIMABLE_READINESS
+from .queue import UNCLAIMABLE_READINESS, _FileLock
 
 VALID_LANES = ("normal", "express")
 # Ticket-level eligibility inputs, stored as GitHub labels so they are visible
@@ -67,6 +69,101 @@ class GitHubBackendError(RuntimeError):
 _LIST_CACHE: Dict[str, Dict[str, Any]] = {}
 _LIST_CACHE_TTL = 2.0
 _LIST_ERROR_BACKOFF = 60.0
+
+# Global GitHub-reachability tracking (2026-07-27 design). Persisted, not
+# in-memory: `wt status`/`wt ls` each run in a fresh short-lived process, so
+# the module-level `_LIST_CACHE` above is invisible across CLI invocations --
+# "no successful poll in 5 minutes" only means something if the evidence
+# survives between them. `_GH_BACKOFF_BASE_S`/`_GH_BACKOFF_CAP_S` are the
+# escalating-retry ladder (60s -> 120s -> 240s -> 480s -> capped at 600s)
+# applied while GitHub stays unreachable, so a prolonged outage doesn't keep
+# retrying every 60 seconds forever. `_GH_SUCCESS_WRITE_THROTTLE_S` caps how
+# often a healthy poll rewrites the state file -- this sits on a hot path
+# (CCC's dashboard polls every few seconds).
+_GH_CONNECTIVITY_FILE = Path.home() / ".watchtower" / "gh-connectivity.json"
+_GH_BACKOFF_BASE_S = 60.0
+_GH_BACKOFF_CAP_S = 600.0
+_GH_SUCCESS_WRITE_THROTTLE_S = 30.0
+
+
+def _connectivity_path() -> Path:
+    env = os.environ.get("WATCHTOWER_GH_CONNECTIVITY_FILE")
+    if env:
+        return Path(env).expanduser()
+    return _GH_CONNECTIVITY_FILE
+
+
+def _empty_connectivity() -> Dict[str, Any]:
+    return {
+        "last_success_at": None,
+        "broken_since": None,
+        "consecutive_failures": 0,
+        "next_retry_at": None,
+        "last_error": "",
+    }
+
+
+def _load_connectivity() -> Dict[str, Any]:
+    try:
+        return json.loads(_connectivity_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return _empty_connectivity()
+
+
+def _save_connectivity(state: Dict[str, Any]) -> None:
+    path = _connectivity_path()
+    with _FileLock(path.with_suffix(".lock")):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def _record_gh_success() -> None:
+    """Record a real, live GitHub fetch that succeeded.
+
+    Throttled: on a healthy streak this runs on nearly every poll (a hot
+    path), and a healthy queue doesn't need sub-second precision on "last
+    success". A recovery (``broken_since`` was set) always writes
+    immediately so the alert clears without waiting out the throttle.
+    """
+    state = _load_connectivity()
+    recovering = state.get("broken_since") is not None
+    if not recovering:
+        last = _parse_iso(state.get("last_success_at"))
+        if last is not None:
+            elapsed = (datetime.now(timezone.utc) - last).total_seconds()
+            if elapsed < _GH_SUCCESS_WRITE_THROTTLE_S:
+                return
+    state["last_success_at"] = _now_iso()
+    state["broken_since"] = None
+    state["consecutive_failures"] = 0
+    state["next_retry_at"] = None
+    state["last_error"] = ""
+    _save_connectivity(state)
+
+
+def _record_gh_failure(error: str) -> None:
+    """Record a real, live GitHub fetch that failed and escalate the backoff."""
+    state = _load_connectivity()
+    if state.get("broken_since") is None:
+        state["broken_since"] = _now_iso()
+    failures = int(state.get("consecutive_failures") or 0) + 1
+    state["consecutive_failures"] = failures
+    delay = min(_GH_BACKOFF_CAP_S, _GH_BACKOFF_BASE_S * (2 ** (failures - 1)))
+    state["next_retry_at"] = (
+        datetime.now(timezone.utc) + timedelta(seconds=delay)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    state["last_error"] = str(error)
+    _save_connectivity(state)
+
+
+def _gh_backoff_active() -> "tuple[bool, Dict[str, Any]]":
+    """Whether a live GitHub fetch should be skipped right now, plus the
+    current persisted state (so the caller can reuse it for the error
+    message without a second read)."""
+    state = _load_connectivity()
+    next_retry = _parse_iso(state.get("next_retry_at"))
+    active = next_retry is not None and datetime.now(timezone.utc) < next_retry
+    return active, state
 
 # Cheap change *detector* for the issue list. A conditional GET answers "did
 # anything move in this repo?" in ~0.5s and, on a 304, costs nothing against
@@ -697,6 +794,15 @@ class GitHubIssuesBackend:
                 if unchanged:
                     cached["at"] = now  # unchanged is as good as re-fetched
                     return cached["data"]
+        if not strict:
+            backoff_active, conn_state = _gh_backoff_active()
+            if backoff_active:
+                if cached is not None and cached.get("data") is not None:
+                    return cached["data"]
+                raise GitHubBackendError(
+                    str(conn_state.get("last_error") or "GitHub unreachable (backoff)"),
+                    cached=True,
+                )
         try:
             args = [
                 "issue", "list",
@@ -720,6 +826,7 @@ class GitHubIssuesBackend:
                 raise GitHubBackendError("gh issue list returned a non-list JSON value")
             result = [issue for issue in data if isinstance(issue, dict)]
         except GitHubBackendError as exc:
+            _record_gh_failure(str(exc))
             prev_data = cached.get("data") if cached else None
             _LIST_CACHE[key] = {
                 # The stale data keeps its own validator; nothing probes with
@@ -730,6 +837,7 @@ class GitHubIssuesBackend:
             if prev_data is not None and not strict:
                 return prev_data
             raise
+        _record_gh_success()
         _LIST_CACHE[key] = {"at": now, "data": result, "error": None, "etag": etag}
         return result
 
