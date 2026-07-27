@@ -64,6 +64,11 @@ def main():
 
         if os.environ.get("FAKE_CODEX_FAIL_METHOD") == method:
             resp = {"jsonrpc": "2.0", "id": req_id, "error": {"message": "fake failure"}}
+        elif (req.get("params") or {}).get("threadId") == os.environ.get(
+            "FAKE_CODEX_NOT_FOUND_THREAD"
+        ) and os.environ.get("FAKE_CODEX_NOT_FOUND_THREAD"):
+            tid = (req.get("params") or {}).get("threadId")
+            resp = {"jsonrpc": "2.0", "id": req_id, "error": {"message": f"thread not found: {tid}"}}
         else:
             resp = {"jsonrpc": "2.0", "id": req_id, "result": result}
 
@@ -91,6 +96,7 @@ def rpc(tmp_path, monkeypatch):
         "FAKE_CODEX_NO_REPLY_METHOD",
         "FAKE_CODEX_EXIT_AFTER",
         "FAKE_CODEX_FAIL_METHOD",
+        "FAKE_CODEX_NOT_FOUND_THREAD",
     ):
         monkeypatch.delenv(var, raising=False)
 
@@ -215,6 +221,67 @@ def test_server_crash_then_restart_on_next_deliver(rpc, monkeypatch):
     assert second["via"] == "start"
     assert second["turn_id"] == "turn-new"
     assert rpc._PROC is not dead_proc
+
+
+# ------------------------------------------------------------- wedge recycle
+def test_wedged_server_recycled_after_verified_false_misses(rpc, monkeypatch):
+    """'thread not found' for a thread whose rollout exists on disk is a
+    false miss — after _FALSE_MISS_LIMIT consecutive ones the child must be
+    recycled, and the next deliver must succeed on a fresh process."""
+    monkeypatch.setenv("FAKE_CODEX_NOT_FOUND_THREAD", "thread-lost")
+    monkeypatch.setattr(rpc, "_rollout_exists_on_disk", lambda tid: True)
+    first_proc = rpc.ensure_server()
+
+    for _ in range(rpc._FALSE_MISS_LIMIT):
+        result = rpc.deliver("thread-lost", "hi")
+        assert result["ok"] is False
+        assert "thread not found" in result["error"]
+
+    assert rpc._PROC is None  # shutdown() ran: wedged child dropped
+
+    # The respawned child gets a fresh env copy, so clearing the failure
+    # mode now makes the next deliver succeed on a NEW process.
+    monkeypatch.delenv("FAKE_CODEX_NOT_FOUND_THREAD")
+    result = rpc.deliver("thread-lost", "hi again")
+    assert result["ok"] is True
+    assert rpc._PROC is not first_proc
+
+
+def test_genuine_thread_miss_does_not_recycle(rpc, monkeypatch):
+    """No rollout on disk = genuine miss (deleted/archived thread), which
+    must never recycle a healthy child."""
+    monkeypatch.setenv("FAKE_CODEX_NOT_FOUND_THREAD", "thread-gone")
+    monkeypatch.setattr(rpc, "_rollout_exists_on_disk", lambda tid: False)
+    proc = rpc.ensure_server()
+
+    for _ in range(rpc._FALSE_MISS_LIMIT + 2):
+        result = rpc.deliver("thread-gone", "hi")
+        assert result["ok"] is False
+
+    assert rpc._PROC is proc
+    assert rpc.is_running() is True
+    assert rpc._FALSE_MISSES == 0
+
+
+def test_false_miss_counter_resets_on_success(rpc, monkeypatch):
+    """A successful thread-level RPC between false misses resets the strike
+    counter, so intermittent failures against a healthy child never
+    accumulate into a recycle."""
+    monkeypatch.setenv("FAKE_CODEX_NOT_FOUND_THREAD", "thread-lost")
+    monkeypatch.setattr(rpc, "_rollout_exists_on_disk", lambda tid: True)
+    proc = rpc.ensure_server()
+
+    rpc.deliver("thread-lost", "hi")
+    rpc.deliver("thread-lost", "hi")
+    assert rpc._FALSE_MISSES == 2
+    ok = rpc.deliver("thread-healthy", "hi")
+    assert ok["ok"] is True
+    assert rpc._FALSE_MISSES == 0
+    rpc.deliver("thread-lost", "hi")
+    rpc.deliver("thread-lost", "hi")
+
+    assert rpc._PROC is proc  # 2 + 2 non-consecutive strikes: no recycle
+    assert rpc._FALSE_MISSES == 2
 
 
 # -------------------------------------------------------------------- shutdown

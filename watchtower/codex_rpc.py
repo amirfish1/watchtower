@@ -27,6 +27,13 @@ can never hang the caller — a broken/absent process degrades to
 ``{"ok": False, "error": ...}``, letting ``messages.deliver`` fall through to
 the next adapter.
 
+A half-dead app-server can also stay *process-alive* while failing every
+thread-level call with ``thread not found`` (CCC observed ~10h of continuous
+failures against such a child). ``request()`` therefore verifies that error
+against the on-disk rollout store: ``_FALSE_MISS_LIMIT`` consecutive
+verified false misses (rollout file exists, server claims otherwise) force
+a ``shutdown()`` so the next call respawns a fresh app-server.
+
 ``$WATCHTOWER_CODEX_BIN`` overrides which binary is spawned (tests point it at
 a fake stdio JSON-RPC script; never a real ``codex`` binary in tests).
 """
@@ -36,8 +43,10 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import pathlib
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -252,7 +261,70 @@ def request(
     proc = ensure_server()
     if proc is None:
         return {"ok": False, "error": "codex app-server is unavailable"}
-    return _request_to_proc(proc, method, params=params, timeout=timeout)
+    response = _request_to_proc(proc, method, params=params, timeout=timeout)
+    try:
+        _track_thread_health(method, (params or {}).get("threadId"), response)
+    except Exception:
+        pass  # health tracking must never break the request path
+    return response
+
+
+# ----------------------------------------------------------- wedge detection
+_FALSE_MISS_LIMIT = 3
+_FALSE_MISSES = 0
+# Thread-level methods whose "thread not found" can be checked against disk.
+_FALSE_MISS_METHODS = {"thread/resume", "turn/steer", "turn/start"}
+
+
+def _rollout_exists_on_disk(thread_id: Any) -> bool:
+    """True when a rollout JSONL for ``thread_id`` exists under
+    ``~/.codex/sessions``. This is the ground truth for 'the thread exists,
+    the app-server just can't see it'."""
+    sid = str(thread_id or "").strip()
+    if not sid:
+        return False
+    try:
+        root = pathlib.Path.home() / ".codex" / "sessions"
+        if not root.is_dir():
+            return False
+        return any(root.rglob(f"*{sid}.jsonl"))
+    except OSError:
+        return False
+
+
+def _track_thread_health(method: str, thread_id: Any, response: Dict[str, Any]) -> None:
+    """Recycle a wedged app-server child on verified false 'thread not found'.
+
+    A process-alive child can still be half-dead: its JSON-RPC loop answers
+    while the thread runtime fails every call. 'thread not found' for a
+    thread whose rollout exists on disk is a definitive false miss — the
+    server lost track of durable state. After ``_FALSE_MISS_LIMIT``
+    consecutive verified misses, ``shutdown()`` drops the child so the next
+    request respawns a fresh app-server. Genuine misses (deleted/archived
+    threads) are neutral — no strike, no reset; any successful thread-level
+    RPC resets the counter. Mirrors CCC's
+    ``_codex_app_server_track_thread_health``."""
+    global _FALSE_MISSES
+    if _response_succeeded(response):
+        if method in _FALSE_MISS_METHODS:
+            _FALSE_MISSES = 0
+        return
+    if method not in _FALSE_MISS_METHODS or not thread_id:
+        return
+    if "thread not found" not in _error_text(response).lower():
+        return
+    if not _rollout_exists_on_disk(thread_id):
+        return
+    _FALSE_MISSES += 1
+    if _FALSE_MISSES >= _FALSE_MISS_LIMIT:
+        _FALSE_MISSES = 0
+        print(
+            f"  [codex_rpc] {_FALSE_MISS_LIMIT} verified false"
+            " 'thread not found' misses with rollouts on disk;"
+            " recycling app-server child",
+            file=sys.stderr,
+        )
+        shutdown()
 
 
 def shutdown() -> None:
