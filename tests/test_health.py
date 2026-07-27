@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 from watchtower import health
@@ -70,3 +71,43 @@ def test_stale_claim_with_no_close_is_still_stuck():
     row = health.queue_status("Q", items)
     assert row["claimable_depth"] == 1
     assert row["stuck"] is True
+
+
+# ==================================================== GitHub connectivity health
+
+def test_github_connectivity_healthy_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json"))
+    result = health.github_connectivity()
+    assert result["alert"] is False
+    assert result["broken_since"] is None
+    assert result["outage_duration_s"] is None
+    assert result["consecutive_failures"] == 0
+
+
+def test_github_connectivity_alert_false_under_threshold_true_at_it(tmp_path, monkeypatch):
+    path = tmp_path / "gh-connectivity.json"
+    monkeypatch.setenv("WATCHTOWER_GH_CONNECTIVITY_FILE", str(path))
+    now = datetime(2026, 7, 27, 12, 0, 0, tzinfo=timezone.utc)
+
+    just_under = (now - timedelta(seconds=299)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path.write_text(json.dumps({
+        "last_success_at": None, "broken_since": just_under,
+        "consecutive_failures": 3, "next_retry_at": None,
+        "last_error": "gh auth unavailable",
+    }))
+    result = health.github_connectivity(now=now)
+    assert result["alert"] is False
+    assert result["outage_duration_s"] == 299
+
+    at_threshold = (now - timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path.write_text(json.dumps({
+        "last_success_at": None, "broken_since": at_threshold,
+        "consecutive_failures": 5, "next_retry_at": None,
+        "last_error": "gh auth unavailable",
+    }))
+    result = health.github_connectivity(now=now)
+    assert result["alert"] is True
+    assert result["outage_duration_s"] == 300
+    assert result["outage_duration"] == "5m"
+    assert result["last_error"] == "gh auth unavailable"
+    assert result["consecutive_failures"] == 5
