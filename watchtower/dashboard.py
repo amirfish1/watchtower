@@ -116,7 +116,7 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
         r["workers_live"] = wc["live"]
     wrows = workers.list_workers(prune=False)
     workers.annotate_activity(wrows, q.list_items())
-    return {"queues": rows, "workers": wrows}
+    return {"queues": rows, "workers": wrows, "github": health.github_connectivity()}
 
 
 CLOSED_LIMIT = 50  # cap the drill-down's closed section to the most-recent N.
@@ -729,15 +729,25 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
         payload["queues"], key=lambda r: r.get("state") != "stuck"
     )
     wkrs: List[Dict[str, Any]] = payload["workers"]
+    gh: Dict[str, Any] = payload.get("github") or {}
+    gh_alert = bool(gh.get("alert"))
 
     any_stuck = any(r.get("state") == "stuck" for r in rows)
     stuck_n = sum(1 for r in rows if r.get("state") == "stuck")
     live_workers = sum(1 for w in wkrs if w.get("alive"))
 
-    beacon_cls = "beacon alert" if any_stuck else ("beacon dim" if not rows else "beacon")
+    beacon_cls = (
+        "beacon alert" if (any_stuck or gh_alert)
+        else ("beacon dim" if not rows else "beacon")
+    )
     fleet_bits = [f'<span class="mono">{len(rows)}</span> queue{"" if len(rows)==1 else "s"}']
     if stuck_n:
         fleet_bits.append(f'<span class="hot mono">{stuck_n} stuck</span>')
+    if gh_alert:
+        gh_dur = html.escape(str(gh.get("outage_duration") or "?"))
+        gh_err = html.escape(str(gh.get("last_error") or "")[:60])
+        gh_text = f"GitHub unreachable {gh_dur}" + (f" — {gh_err}" if gh_err else "")
+        fleet_bits.append(f'<span class="hot mono">{gh_text}</span>')
     fleet_bits.append(
         f'<span class="ok mono">{live_workers}</span> '
         f'worker{"" if live_workers == 1 else "s"} live'

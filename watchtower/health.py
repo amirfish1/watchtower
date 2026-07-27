@@ -246,3 +246,33 @@ def all_status(
     # A backlog (opted out) is calm, so it sorts with the normal rows.
     rows.sort(key=lambda r: (r["state"] != "stuck", -r["depth"], r["queue"]))
     return rows
+
+
+# GitHub connectivity alert threshold (2026-07-27 design): a single failed
+# poll must not flip a global "GitHub is down" banner -- only sustained
+# failure does. Time-since-`broken_since`, not a failure count, for the same
+# reason `stuck` above is measured by age: it's directly displayable ("down
+# for 6m") and doesn't depend on how often polling happens to run.
+GH_ALERT_THRESHOLD_S = 300
+
+
+def github_connectivity(now: Optional[datetime] = None) -> Dict[str, Any]:
+    """Global "is GitHub reachable" signal, computed from the real polling
+    every GitHub-backed queue already does (see
+    ``github_backend._record_gh_success``/``_record_gh_failure``) rather than
+    a synthetic ping, so it can never report healthy while the queues'
+    actual fetches are failing."""
+    from . import github_backend
+    now = now or datetime.now(timezone.utc)
+    state = github_backend._load_connectivity()
+    broken_since = state.get("broken_since")
+    outage_s = _age_seconds(broken_since, now) if broken_since else None
+    alert = outage_s is not None and outage_s >= GH_ALERT_THRESHOLD_S
+    return {
+        "alert": alert,
+        "broken_since": broken_since,
+        "outage_duration_s": outage_s,
+        "outage_duration": _fmt_age(outage_s) if outage_s is not None else None,
+        "consecutive_failures": int(state.get("consecutive_failures") or 0),
+        "last_error": str(state.get("last_error") or ""),
+    }
