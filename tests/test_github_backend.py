@@ -1542,3 +1542,66 @@ def test_gh_connectivity_stale_data_fallback_still_records_failure(tmp_path, mon
     state = github_backend._load_connectivity()
     assert state["broken_since"] is not None
     assert state["last_error"] == "API rate limit already exceeded"
+
+
+def test_cli_gh_recheck_forces_live_check_and_reports_per_queue(tmp_path, monkeypatch, capsys):
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+    from watchtower.cli import main
+
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+
+    def succeed(self, args, *, check=True):
+        return "[]"
+
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_run", succeed)
+
+    assert main(["gh", "recheck"]) == 0
+    out = capsys.readouterr().out
+    assert "GHI: ok" in out
+    assert "GitHub connectivity: healthy" in out
+
+
+def test_cli_gh_recheck_bypasses_backoff_after_a_prior_failure(tmp_path, monkeypatch, capsys):
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+    from watchtower.cli import main
+
+    monkeypatch.setattr(github_backend, "_GH_BACKOFF_BASE_S", 3600.0)  # would not expire mid-test
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "owner/repo")
+
+    def fail(self, args, *, check=True):
+        raise github_backend.GitHubBackendError("gh auth unavailable")
+
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_run", fail)
+    assert q.list_items() == []  # records the failure and sets a long backoff
+
+    def succeed(self, args, *, check=True):
+        return "[]"
+
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_run", succeed)
+    github_backend._LIST_CACHE.clear()  # fresh-process-like: cold in-memory cache
+
+    assert main(["gh", "recheck"]) == 0
+    out = capsys.readouterr().out
+    assert "GHI: ok" in out
+    assert "GitHub connectivity: healthy" in out
+
+
+def test_cli_status_prints_warning_when_github_alert_active(tmp_path, monkeypatch, capsys):
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+    from watchtower.cli import main
+
+    state = github_backend._empty_connectivity()
+    state["broken_since"] = "2026-01-01T00:00:00Z"  # far enough in the past to be >= threshold
+    state["last_error"] = "gh auth login required"
+    state["consecutive_failures"] = 9
+    github_backend._save_connectivity(state)
+
+    assert main(["status"]) == 0
+    out = capsys.readouterr().out
+    assert "GitHub unreachable" in out
+    assert "gh auth login required" in out

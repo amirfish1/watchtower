@@ -203,6 +203,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
+        gh = health.github_connectivity()
+        if gh.get("alert"):
+            msg = f"⚠ GitHub unreachable for {gh.get('outage_duration') or '?'}"
+            if gh.get("last_error"):
+                msg += f" — {gh['last_error']}"
+            print(msg)
         _print_status(rows)
     return 0
 
@@ -1493,6 +1499,43 @@ def cmd_logs(args: argparse.Namespace) -> int:
     )
     if report.get("error"):
         print(f"warning: {report['error']}", file=sys.stderr)
+    return 0
+
+
+def cmd_gh(args: argparse.Namespace) -> int:
+    """GitHub-backend diagnostics: `wt gh recheck [--json]`.
+
+    Forces a live `gh issue list` for every GitHub-backed queue, bypassing
+    the persisted connectivity backoff -- the explicit "I fixed it, check
+    now" action instead of waiting out the escalated retry window.
+    """
+    sub = getattr(args, "gh_command", None)
+    if sub != "recheck":
+        print("usage: wt gh recheck [--json]", file=sys.stderr)
+        return 2
+    results = []
+    for name in q._github_projects():
+        backend = q._github_backend_for_project(name)
+        if backend is None:
+            continue
+        try:
+            backend.list_items(fresh=True, strict=True)
+            results.append({"queue": name, "ok": True, "error": ""})
+        except Exception as e:
+            results.append({"queue": name, "ok": False, "error": str(e)})
+    gh = health.github_connectivity()
+    if args.json:
+        print(json.dumps({"queues": results, "github": gh}, indent=2))
+        return 0
+    if not results:
+        print("no GitHub-backed queues configured")
+    for r in results:
+        status = "ok" if r["ok"] else f"FAIL — {r['error']}"
+        print(f"{r['queue']}: {status}")
+    if gh.get("alert"):
+        print(f"still unreachable — {gh.get('outage_duration')} — {gh.get('last_error')}")
+    else:
+        print("GitHub connectivity: healthy")
     return 0
 
 
@@ -3247,6 +3290,15 @@ def build_parser() -> argparse.ArgumentParser:
     sl.add_argument("--dry-run", action="store_true", dest="dry_run")
     sl.add_argument("--json", action="store_true")
     sl.set_defaults(func=cmd_logs)
+
+    s = sub.add_parser("gh")
+    s.set_defaults(func=cmd_gh, gh_command=None)
+    ghsub = s.add_subparsers(dest="gh_command")
+    sg = ghsub.add_parser(
+        "recheck", help="force a live GitHub connectivity check now, bypassing backoff"
+    )
+    sg.add_argument("--json", action="store_true")
+    sg.set_defaults(func=cmd_gh)
 
     # `wt agents` is the single address-book command (git-remote pattern):
     # bare `wt agents [--json]` lists; `register`/`set-name`/`rm` are nested
