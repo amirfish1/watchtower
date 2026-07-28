@@ -21,13 +21,36 @@ Do this FIRST whenever you wake and your warm context says you were
 mid-work on a ticket (i.e. this is a resumed session, not a fresh spawn).
 
 Before you edit, commit, or close anything: re-verify you still own that
-ticket. Run `wt find <ref> --json` and confirm `claimed_by` matches your
-worker id AND `status == in_progress`. If it was reassigned or is already
-closed, you were reaped for idling while you worked and another worker took
-it over: STOP — discard any uncommitted changes for that ticket, do NOT
-commit and do NOT close (a duplicate close is rejected anyway), and go back
-to `wt claim` for fresh work. Skipping this check is how the same ticket
-gets fixed and committed twice.
+ticket. Run `wt find <ref> --json --worker <your-id>` and read the
+self-attribution marks: `claimed_by_you`, `closed_by_you`, and `"you": true`
+on timeline events (matched against your worker id and your harness session
+id). Then decide by WHO, not just by status:
+
+- `status == in_progress` and `claimed_by_you`: still yours — continue.
+- `status == closed` and `closed_by_you`: **you already closed it**, earlier
+  in this same session or turn. This is NOT a duplicate process and NOT a
+  "concurrent resolution" — do not discard anything on that theory. If you
+  still hold uncommitted hunks for it, judge them on their merits: if the
+  close missed part of the requested surface, file a corrective ticket and
+  commit them under it; if the close covered everything, drop them.
+- claimed or closed by a **different** worker id: you were reaped for idling
+  while you worked and another worker took it over: STOP — discard any
+  uncommitted changes for that ticket, do NOT commit and do NOT close (a
+  duplicate close is rejected anyway), and go back to `wt claim` for fresh
+  work. Skipping this check is how the same ticket gets fixed and committed
+  twice.
+
+Identity is trustworthy: worker ids are per-run and never shared between
+live processes (WT-125 tracks hardening continuations; its interim rule —
+a fresh worker id per continuation — is what keeps "same id = same agent"
+true). Do NOT reason from "duplicate processes can share my worker id", and
+never write that theory into a learnings file: it is unfalsifiable (once
+your own id stops proving it's you, ALL evidence of your own work reads as
+someone else's) and it caused a worker to revert its own correct fix and
+report a phantom "concurrent resolution" (CCC-675, 2026-07-28). If you
+genuinely suspect an identity collision, compare the event timestamps
+against commands you actually ran this session, and file a WT ticket with
+that evidence instead of silently discarding work.
 
 Note: WT also enforces this automatically at the transport layer for
 headless resumes (`messages._deliver_resume`'s reap-displacement guard,
@@ -49,7 +72,12 @@ the audit is not optional and not deferrable to "next time."
 1. Read the queue's learnings file at `~/.watchtower/learnings/{queue}.md`
    (create it if it doesn't exist).
 2. Update it with anything the next worker should know from this session:
-   infra changes, recurring ticket patterns, gotchas, env quirks.
+   infra changes, recurring ticket patterns, gotchas, env quirks. Record
+   VERIFIED facts only. Never record rules that tell future workers to
+   distrust their own worker id or to treat their own commits, closes, or
+   working-tree hunks as another process's — that class of entry is
+   self-amplifying paranoia and has caused workers to destroy their own
+   correct work (CCC-675/676; see Resume Check above).
 3. Keep the WHOLE FILE under ~60 lines. This cap is on the whole file, not
    per-edit — read the current file before editing and prune, don't just
    append unboundedly.

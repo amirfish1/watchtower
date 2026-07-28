@@ -47,7 +47,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
 from . import health, queue as q, resume_verify, workers
@@ -192,6 +192,74 @@ def _event_summary(event: dict) -> str:
     return name or "event"
 
 
+def _caller_identity(args: argparse.Namespace) -> Tuple[str, str]:
+    """``(worker_id, session_id)`` identifying the CALLER, for self-attribution.
+
+    Ticket records read in the third person: "closed by ccc-0906ba75" looks
+    like somebody else even when it was the reader ten seconds earlier, and
+    the safe-side reaction to a phantom "duplicate process" is a worker
+    discarding its own correct work (CCC-675/676, 2026-07-28). Worker id
+    comes from ``--worker`` or a ``WT_WORKER`` env a spawner may export;
+    session id from the same harness env vars the claim path records into
+    ``claimed_session_id``, so hosted workers get marks with no flag at all.
+    """
+    worker = str(getattr(args, "worker", "") or os.environ.get("WT_WORKER", "")).strip()
+    session = (
+        os.environ.get("CODEX_THREAD_ID", "").strip()
+        or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    )
+    return worker, session
+
+
+def _mark_self(item: dict, worker: str, session: str) -> dict:
+    """Annotate a ticket dict with "this was YOU" marks for the caller.
+
+    Adds ``claimed_by_you`` / ``closed_by_you`` at the top level and
+    ``"you": true`` on matching timeline/history events. Matching is by
+    worker id or session id. Close events record only a worker id, so once
+    the claim is established as yours (e.g. via session id), any event by
+    that same claimed worker id is also yours — worker ids are per-run,
+    never shared between live processes.
+    """
+    if not worker and not session:
+        return item
+
+    def mine(w: Any, s: Any = None) -> bool:
+        return bool(
+            (worker and w and str(w) == worker)
+            or (session and s and str(s) == session)
+        )
+
+    out = dict(item)
+    claimed_by = str(out.get("claimed_by") or "")
+    if mine(claimed_by, out.get("claimed_session_id")):
+        out["claimed_by_you"] = True
+    closed_by = str(out.get("closed_by") or "")
+    if closed_by and (
+        mine(closed_by) or (out.get("claimed_by_you") and closed_by == claimed_by)
+    ):
+        out["closed_by_you"] = True
+    for key in ("timeline", "history"):
+        events = out.get(key)
+        if not isinstance(events, list):
+            continue
+        marked = []
+        for event in events:
+            if isinstance(event, dict):
+                by = event.get("by") if isinstance(event.get("by"), dict) else {}
+                actor_w = by.get("worker")
+                if mine(actor_w, by.get("session_id")) or (
+                    out.get("claimed_by_you")
+                    and actor_w
+                    and str(actor_w) == claimed_by
+                ):
+                    event = dict(event)
+                    event["you"] = True
+            marked.append(event)
+        out[key] = marked
+    return out
+
+
 # ----------------------------------------------------------------------- commands
 def cmd_status(args: argparse.Namespace) -> int:
     # fresh=True: a human asking for status gets current state, never a cached
@@ -265,7 +333,10 @@ def cmd_find(args: argparse.Namespace) -> int:
     if not item:
         print(f"not found: {args.ref}", file=sys.stderr)
         return 1
-    item_with_timeline = _with_timeline(item)
+    caller_worker, caller_session = _caller_identity(args)
+    item_with_timeline = _mark_self(
+        _with_timeline(item), caller_worker, caller_session
+    )
     if args.json:
         print(json.dumps(item_with_timeline, indent=2))
         return 0
@@ -273,7 +344,12 @@ def cmd_find(args: argparse.Namespace) -> int:
     title = _oneline(item.get("title") or item.get("note") or "")
     print(f"{item.get('ref',''):<14}[{item.get('status',''):<11}] {title}")
     if worker:
-        print(f"  claimed_by: {worker}")
+        you = " (you)" if item_with_timeline.get("claimed_by_you") else ""
+        print(f"  claimed_by: {worker}{you}")
+    closed_by = str(item.get("closed_by") or "")
+    if closed_by:
+        you = " (you)" if item_with_timeline.get("closed_by_you") else ""
+        print(f"  closed_by: {closed_by}{you}")
     res = item.get("resolution") if item.get("status") == "closed" else None
     if res and res.get("summary"):
         print(f"  resolution: {res['summary']}")
@@ -281,7 +357,8 @@ def cmd_find(args: argparse.Namespace) -> int:
     if timeline:
         print("  activity:")
         for event in timeline:
-            print(f"    {event.get('at') or '-'}  {_event_summary(event)}")
+            you = "  (you)" if event.get("you") else ""
+            print(f"    {event.get('at') or '-'}  {_event_summary(event)}{you}")
     return 0
 
 
@@ -556,7 +633,10 @@ def cmd_claim(args: argparse.Namespace) -> int:
     _rename_claiming_session(item)
 
     if args.json:
-        _print_item(item)
+        # The claim just made is by definition the caller's; marking history
+        # events under the same identity keeps a re-claimed ticket's earlier
+        # activity from reading as another worker's (CCC-675).
+        _print_item(_mark_self(item, worker, session_uuid))
     else:
         print(f"CLAIMED: {item['ref']} -> {worker}")
         print(item.get("text") or item.get("note") or "")
@@ -2992,6 +3072,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("find")
     s.add_argument("ref", help="ticket ref (e.g. WT-48) or bare number")
+    s.add_argument(
+        "--worker", default="",
+        help="your worker id: events you performed are marked claimed_by_you/"
+             "closed_by_you/\"you\" so your own past actions never read as "
+             "another worker's (also honors $WT_WORKER and harness session env)",
+    )
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_find)
 
