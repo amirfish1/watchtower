@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Spawn and track WatchTower workers.
 
 A *worker* is a subprocess running an agent CLI (``claude`` or ``codex``) with a
@@ -499,6 +502,20 @@ WARM_TTL_S = 300
 # provider cache policy and worker lifecycle are separate concerns.
 RELEASE_IDLE_S = 30 * 60
 _AUDIT_BOOT_ID = uuid.uuid4().hex[:12]
+
+# A released-but-alive worker (queue-detached, sentinel dropped, conversation
+# left running so it stays chattable) is invisible to every staffing path --
+# _worker_released() gates it out of live counts, nudges, and re-release
+# scans alike. Without a bound it lives forever and leaks one engine process
+# per release cycle (GH issue #1: 11 released-but-alive workers observed on
+# one host, ~2.2GB RSS + 1.5GB swap, oldest silent for 2 days). This TTL
+# caps that: reap_released_workers() SIGTERMs (then SIGKILLs, after
+# _RELEASED_KILL_GRACE_S) any released worker whose released_at is older
+# than this, on a path that does NOT consult _worker_released() as an
+# exclusion -- the whole point is to collect exactly the workers that gate
+# excludes everywhere else.
+RELEASED_TTL_S = int(os.environ.get("WATCHTOWER_RELEASED_TTL_S") or 4 * 3600)
+_RELEASED_KILL_GRACE_S = 30
 
 
 def _codex_rollout_mtime(w: Dict[str, Any]) -> float:
@@ -1509,6 +1526,158 @@ def _mark_worker_released(worker_id: str) -> str:
             if row.get("worker_id") == worker_id:
                 return str(row.get("released_at") or "")
     return ""
+
+
+def _iso_age_s(ts: str, now: float) -> float:
+    """Seconds since an activity-log-style UTC timestamp (``%Y-%m-%dT%H:%M:%SZ``).
+
+    Returns 0.0 for an empty/unparseable timestamp rather than raising, so a
+    malformed field never blocks the caller's TTL comparison."""
+    if not ts:
+        return 0.0
+    try:
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return 0.0
+    return max(0.0, now - dt.timestamp())
+
+
+def _cleanup_stop_signal(worker_id: str) -> bool:
+    """Drop a worker's stop sentinel once its process is confirmed dead.
+
+    A live released worker still needs its sentinel -- it is only consumed
+    (and deleted) the next time that worker itself calls ``wt claim``. Once
+    the process is gone that will never happen, so the file would otherwise
+    sit in ``stop-signals/`` forever."""
+    if not worker_id:
+        return False
+    try:
+        (STOP_SIGNALS_DIR / worker_id).unlink()
+        return True
+    except OSError:
+        return False
+
+
+def sweep_orphan_stop_signals() -> List[str]:
+    """Remove stop-signal sentinels whose worker is not alive.
+
+    ``request_stop()`` writes one sentinel per release; it is normally
+    consumed (and deleted) by that worker's own next ``wt claim`` call. A
+    worker that dies (or is reaped by ``reap_released_workers``) before ever
+    claiming again leaves its sentinel orphaned -- GH issue #1 observed two
+    of these on one host. Cheap and safe to run every reconcile tick: a
+    sentinel for a still-alive worker is left untouched regardless of
+    release state, since that worker may yet consume it."""
+    try:
+        sentinel_names = [p.name for p in STOP_SIGNALS_DIR.iterdir() if p.is_file()]
+    except OSError:
+        return []
+    if not sentinel_names:
+        return []
+    alive_ids = {
+        str(w.get("worker_id") or "")
+        for w in list_workers(prune=False)
+        if w.get("alive")
+    }
+    removed = []
+    for name in sentinel_names:
+        if name in alive_ids:
+            continue
+        if _cleanup_stop_signal(name):
+            removed.append(name)
+    return removed
+
+
+def reap_released_workers(
+    ttl_s: float = RELEASED_TTL_S,
+    kill_grace_s: float = _RELEASED_KILL_GRACE_S,
+    now: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Bound the lifetime of released-but-alive workers (GH issue #1).
+
+    Release deliberately leaves the process running so the conversation stays
+    chattable, and ``_worker_released()`` correctly excludes it from every
+    staffing path (counts, nudges, re-release scans) for that reason. But
+    nothing ever brought it back in, so a released worker was previously
+    invisible forever -- an unbounded process/memory leak on any long-running
+    host. This function is that missing bound, and deliberately does NOT
+    consult ``_worker_released()`` as an exclusion: collecting exactly the
+    workers that gate hides from everyone else is the whole point.
+
+    A worker past ``ttl_s`` since ``released_at`` gets SIGTERM; if still
+    alive ``kill_grace_s`` after that it gets SIGKILL. Either way its
+    stop-signal sentinel is dropped once the process is confirmed dead, so
+    ``stop-signals/`` does not accumulate orphans for it.
+
+    Returns one dict per action taken:
+    ``{"worker_id", "queue", "pid", "action": "sigterm"|"sigkill",
+    "released_age_s"}``.
+    """
+    now = time.time() if now is None else float(now)
+    actions: List[Dict[str, Any]] = []
+    with _WorkersFileLock():
+        data = _load()
+        changed = False
+        for row in data["workers"]:
+            released_at = str(row.get("released_at") or "")
+            if not released_at:
+                continue
+            age_s = _iso_age_s(released_at, now)
+            if age_s < ttl_s:
+                continue
+            worker_id = str(row.get("worker_id") or "")
+            pid = int(row.get("pid", 0) or 0)
+            if not _pid_alive(pid):
+                continue  # sweep_orphan_stop_signals() cleans up its sentinel
+            kill_sent_at = str(row.get("gc_kill_sent_at") or "")
+            if not kill_sent_at:
+                try:
+                    os.kill(pid, 15)
+                except OSError:
+                    pass
+                row["gc_kill_sent_at"] = datetime.now(timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+                changed = True
+                actions.append({
+                    "worker_id": worker_id,
+                    "queue": str(row.get("queue") or ""),
+                    "pid": pid,
+                    "action": "sigterm",
+                    "released_age_s": int(age_s),
+                })
+                continue
+            if _iso_age_s(kill_sent_at, now) < kill_grace_s:
+                continue  # SIGTERM was just sent -- give it the grace window
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+            _cleanup_stop_signal(worker_id)
+            actions.append({
+                "worker_id": worker_id,
+                "queue": str(row.get("queue") or ""),
+                "pid": pid,
+                "action": "sigkill",
+                "released_age_s": int(age_s),
+            })
+        if changed:
+            _save(data)
+    if actions:
+        try:
+            from .queue import _log_many
+            _log_many([
+                (
+                    "GC_RELEASED",
+                    f"worker {a['worker_id']} pid {a['pid']} {a['action']} "
+                    f"(released {a['released_age_s']}s ago, TTL {int(ttl_s)}s)",
+                    a["queue"],
+                )
+                for a in actions
+            ])
+        except Exception:
+            pass
+    return actions
 
 
 def _load_worker_session_ledger() -> List[str]:
@@ -3225,6 +3394,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
 
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
                               "released": [], "reaped": [], "requeued": [],
+                              "stop_signals_swept": [],
                               "backfilled": [],
                               "session_title_backfilled": [],
                               "ledger_backfilled": [],
@@ -3251,6 +3421,19 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             result["released"] = release_idle_workers(
                 reconcile_id=reconcile_id
             )
+        except Exception:
+            pass
+        # Bound the lifetime of released-but-alive workers (GH issue #1) and
+        # clean up any stop-signal sentinel left behind once a worker is
+        # confirmed dead. Independent of the release pass above and of every
+        # staffing count below -- released workers are invisible to those by
+        # design, so this is the only path that ever collects them.
+        try:
+            result["reaped"] = reap_released_workers()
+        except Exception:
+            pass
+        try:
+            result["stop_signals_swept"] = sweep_orphan_stop_signals()
         except Exception:
             pass
         # Release tickets stranded in_progress by a dead/reaped/crashed worker so

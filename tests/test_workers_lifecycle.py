@@ -1297,6 +1297,178 @@ def test_request_stop_makes_claim_return_stop(wt):
     assert item and item.get("ref") == "Q-1"
 
 
+# ============================================ GC released-but-alive (GH issue #1)
+def _spawn_sleeper():
+    """A real, long-lived child process to stand in for a released worker."""
+    return subprocess.Popen(
+        ["sleep", "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def _wait_gone(pid, timeout=5.0):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            pass
+        if not wt_module_pid_alive(pid):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def wt_module_pid_alive(pid):
+    import watchtower.workers as workers
+    return workers._pid_alive(pid)
+
+
+def _released_worker(wt, queue, *, released_age_s, kill_sent_age_s=None):
+    """Record a real, alive worker and backdate its released_at (and
+    optionally gc_kill_sent_at) so it looks like it was released long ago."""
+    proc = _spawn_sleeper()
+    rec = wt.workers.record_worker(
+        proc.pid, queue, "claude", f"{queue.lower()}-released-{proc.pid}",
+        str(wt.tmp), str(wt.tmp / f"{proc.pid}.log"),
+    )
+    now = time.time()
+    released_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - released_age_s))
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        for row in data["workers"]:
+            if row["worker_id"] == rec["worker_id"]:
+                row["released_at"] = released_at
+                if kill_sent_age_s is not None:
+                    row["gc_kill_sent_at"] = time.strftime(
+                        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - kill_sent_age_s)
+                    )
+        wt.workers._save(data)
+    (wt.workers.STOP_SIGNALS_DIR).mkdir(parents=True, exist_ok=True)
+    (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).touch()
+    return rec, proc
+
+
+def test_reap_released_workers_leaves_fresh_release_alone(wt):
+    rec, proc = _released_worker(wt, "Q", released_age_s=10)
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600)
+        assert actions == []
+        assert wt.workers._pid_alive(proc.pid)
+        assert (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_reap_released_workers_sigterms_past_ttl(wt):
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600, kill_grace_s=30)
+        assert len(actions) == 1
+        assert actions[0]["action"] == "sigterm"
+        assert actions[0]["worker_id"] == rec["worker_id"]
+        assert _wait_gone(proc.pid)
+        # SIGTERM only, not yet SIGKILL -- the grace window hasn't elapsed, so
+        # the sentinel (only dropped once the process is confirmed dead) and
+        # the row's gc_kill_sent_at marker are both still in place.
+        data = wt.workers._load()
+        row = next(r for r in data["workers"] if r["worker_id"] == rec["worker_id"])
+        assert row.get("gc_kill_sent_at")
+    finally:
+        try:
+            proc.terminate()
+            proc.wait()
+        except Exception:
+            pass
+
+
+def test_reap_released_workers_ignores_worker_released_gate(wt):
+    """The GC pass must collect a released worker that every OTHER staffing
+    path (live_worker_count, notify_workers, ...) correctly hides via
+    _worker_released() -- gating the reaper the same way would mean it can
+    never collect the workers it exists to collect (GH issue #1)."""
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    try:
+        assert wt.workers.live_worker_count("Q") == 0  # hidden everywhere else
+        actions = wt.workers.reap_released_workers(ttl_s=3600)
+        assert [a["worker_id"] for a in actions] == [rec["worker_id"]]
+    finally:
+        try:
+            proc.terminate()
+            proc.wait()
+        except Exception:
+            pass
+
+
+def test_reap_released_workers_sigkills_after_grace(wt, monkeypatch):
+    rec, proc = _released_worker(
+        wt, "Q", released_age_s=7200, kill_sent_age_s=120,
+    )
+    # SIGTERM was "sent" (backdated) but the process ignored it (sleep does).
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600, kill_grace_s=30)
+        assert len(actions) == 1
+        assert actions[0]["action"] == "sigkill"
+        assert _wait_gone(proc.pid)
+        assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+    finally:
+        try:
+            proc.terminate()
+            proc.wait()
+        except Exception:
+            pass
+
+
+def test_reap_released_workers_cleans_up_already_dead(wt):
+    """A released worker whose process already exited (no signal needed) still
+    gets its orphaned sentinel swept -- via sweep_orphan_stop_signals(), which
+    reap_released_workers() leaves to run right after it every reconcile tick."""
+    dead = _dead_worker(wt, "Q")
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        for row in data["workers"]:
+            if row["worker_id"] == dead["worker_id"]:
+                row["released_at"] = time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200)
+                )
+        wt.workers._save(data)
+    (wt.workers.STOP_SIGNALS_DIR).mkdir(parents=True, exist_ok=True)
+    (wt.workers.STOP_SIGNALS_DIR / dead["worker_id"]).touch()
+
+    actions = wt.workers.reap_released_workers(ttl_s=3600)
+    assert actions == []  # nothing alive to signal
+    swept = wt.workers.sweep_orphan_stop_signals()
+    assert dead["worker_id"] in swept
+    assert not (wt.workers.STOP_SIGNALS_DIR / dead["worker_id"]).exists()
+
+
+def test_sweep_orphan_stop_signals_keeps_live_worker_sentinel(wt):
+    rec, proc = _released_worker(wt, "Q", released_age_s=10)
+    try:
+        swept = wt.workers.sweep_orphan_stop_signals()
+        assert rec["worker_id"] not in swept
+        assert (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_reconcile_once_reaps_and_sweeps(wt):
+    rec, proc = _released_worker(
+        wt, "Q", released_age_s=wt.workers.RELEASED_TTL_S + 60,
+    )
+    try:
+        result = wt.workers.reconcile_once()
+        assert [a["worker_id"] for a in result["reaped"]] == [rec["worker_id"]]
+        assert _wait_gone(proc.pid)
+    finally:
+        try:
+            proc.terminate()
+            proc.wait()
+        except Exception:
+            pass
+
+
 # =========================================================== tracking & cleanup
 def test_prune_drops_dead_and_unlinks_fifo(wt):
     dead = _dead_worker(wt, "Q")

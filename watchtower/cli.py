@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """WatchTower CLI — the ``wt`` binary.
 
     wt status                 per-queue depth / age / drain / stuck flag
@@ -2450,6 +2453,20 @@ def _daemon_loop(args: argparse.Namespace) -> None:
             print(
                 f"[watchtower] requested stop for {rec.get('worker_id','')} "
                 f"on {rec.get('queue','')}{tag}",
+                flush=True,
+            )
+        for rec in result.get("reaped", []):
+            print(
+                f"[watchtower] {rec.get('action','')} released worker "
+                f"{rec.get('worker_id','')} pid {rec.get('pid','')} on "
+                f"{rec.get('queue','')} (released {rec.get('released_age_s','')}s ago)",
+                flush=True,
+            )
+        swept = result.get("stop_signals_swept") or []
+        if swept:
+            print(
+                f"[watchtower] swept {len(swept)} orphaned stop-signal "
+                f"sentinel(s): {', '.join(swept)}",
                 flush=True,
             )
         # Handle stuck-queue auto-spawn for queues not handled by reconcile_once
