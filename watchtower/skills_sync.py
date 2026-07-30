@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Keep bundled agent skills in sync across every installed
 agent harness (Claude Code, Codex, ...) that reads skills from a per-user
 directory.

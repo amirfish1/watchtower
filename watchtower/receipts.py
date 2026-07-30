@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Delivery receipts (WT-77): make "delivered" mean *verified landed*.
 
 The 2026-07-02 incident showed the gap: every resume delivery died at boot

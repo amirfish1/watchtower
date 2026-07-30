@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """WatchTower HTTP dashboard — the night-watch operations console.
 
 A read-only viewer over the same queue engine. Stdlib-only (``http.server`` +

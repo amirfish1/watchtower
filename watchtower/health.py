@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Queue health: depth, oldest-open age, and the stuck flag.
 
 Pure queue ground-truth. WatchTower decides a queue is *stuck* from the queue

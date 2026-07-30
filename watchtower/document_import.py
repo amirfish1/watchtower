@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Whole-document reasoning extraction for ``wt import``.
 
 Task discovery is intentionally delegated to one reasoning-model call. Local

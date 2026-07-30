@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """WT-owned Codex app-server JSON-RPC client (WT-54).
 
 Codex's app-server is a persistent subprocess speaking JSON-RPC 2.0 over its

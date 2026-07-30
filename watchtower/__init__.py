@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """WatchTower — a queue-focused tool for running fleets of AI coding-agent
 workers and knowing which queues are stuck.
 

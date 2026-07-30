@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Native macOS tty keystroke delivery (WT-55): type a message into a LIVE
 terminal claude TUI (Terminal.app / iTerm2) via AppleScript — no CCC needed.
 

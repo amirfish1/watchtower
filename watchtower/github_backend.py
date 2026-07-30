@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """GitHub Issues-backed WatchTower queue backend.
 
 The public queue module stays the stable API. This module is an opt-in backing

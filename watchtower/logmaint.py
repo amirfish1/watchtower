@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Log maintenance for ~/.watchtower/logs (WT-74).
 
 The logs dir grows without bound: every worker and every resume delivery

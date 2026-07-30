@@ -1,3 +1,6 @@
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Shared Codex thread reconciliation registry for WT and CCC.
 
 The Codex rollout/state stores remain authoritative history. This file is a
