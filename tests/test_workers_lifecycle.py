@@ -259,6 +259,54 @@ def test_cancelled_run_request_stops_being_staffed(wt):
     assert any(s["queue"] == "Q" and s["reason"] == "auto_drain=off" for s in r["skipped"])
 
 
+# ==================================================== never-configured queue (WT-131)
+def test_config_ensure_entries_is_batched_and_idempotent(wt):
+    created = wt.config.ensure_entries(["A", "B", "A", "", None])
+    assert created == ["A", "B"]
+    assert "A" in wt.config.all_queues() and "B" in wt.config.all_queues()
+    assert wt.config.ensure_entries(["A"]) == []  # already exists -> no-op
+
+
+def test_enqueue_registers_a_brand_new_queue(wt):
+    """A queue's very first-ever ticket must make it visible to the
+    reconciler, or a later ▶ press silently no-ops forever (WT-131): dispatch
+    nudges no live worker (there's never been one), reconcile_once() skips a
+    queue with no config entry entirely -- not even into its own `skipped`
+    list -- so the reason surfaced is the generic "no live worker accepted
+    and none spawned" with no hint the real cause is "never registered"."""
+    assert "NEWQ" not in wt.config.all_queues()
+    wt.q.enqueue(project="NEWQ", note="first ever ticket")
+    assert "NEWQ" in wt.config.all_queues()
+    assert wt.config.auto_drain("NEWQ") is False  # unchanged default
+
+
+def test_manual_run_spawns_worker_for_never_configured_queue(wt):
+    item = wt.q.enqueue(project="NEWQ", note="first ever ticket")
+    wt.q.mark_runnable(item["ref"])
+
+    r = wt.workers.reconcile_once(dry_run=True)
+
+    assert [s["queue"] for s in r["spawned"]] == ["NEWQ"]
+
+
+def test_reconcile_backfills_config_for_queue_missing_it_by_any_other_path(wt):
+    """Belt-and-suspenders for the enqueue()-side fix above: even if a
+    queue's config entry is missing for some other reason (hand-edited
+    config, a backend that bypasses queue.enqueue()), reconcile_once() must
+    not blind itself to a queue with real open tickets and a pending run."""
+    item = wt.q.enqueue(project="NEWQ2", note="first ever ticket")
+    wt.q.mark_runnable(item["ref"])
+    data = wt.config._load()
+    data.pop("NEWQ2", None)
+    wt.config._save(data)
+    assert "NEWQ2" not in wt.config.all_queues()
+
+    r = wt.workers.reconcile_once(dry_run=True)
+
+    assert [s["queue"] for s in r["spawned"]] == ["NEWQ2"]
+    assert "NEWQ2" in wt.config.all_queues()
+
+
 def test_manual_run_worker_is_told_to_work_only_requested_tickets(wt, monkeypatch):
     """The file backend has no eligibility gate on claim, so the goal is what
     keeps a manual-run worker off the backlog its owner deliberately parked."""

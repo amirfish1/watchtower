@@ -3720,6 +3720,23 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             rec["_related_release_ids"] = release_ids
             rec["_previous_worker_ids"] = previous_worker_ids
 
+    # A queue can have real, visible-in-`wt status` tickets yet no entry in
+    # queue-config.json (its very first ticket was filed before it was ever
+    # `wt drain on`-ed, or filed through a path that never called
+    # queue.enqueue()'s own backfill). Such a queue is invisible to the loop
+    # below -- not even into `skipped` -- so a manual ▶ run on it silently
+    # no-ops forever, surfacing only the generic "no live worker accepted
+    # and none spawned" with no hint the real cause is "never registered"
+    # (WT-131). Backfill a (default auto_drain=off, so no staffing-behavior
+    # change) entry for every project seen above; auto_drain stays off, so
+    # this only makes the queue visible to the manual-run path, not to
+    # automatic spawning.
+    try:
+        if config.ensure_entries(_total_open_by_q.keys()):
+            all_cfg = config.all_queues()
+    except Exception:
+        pass
+
     for q_name in sorted(set(all_cfg) | set(released_by_q)):
         auto = config.auto_drain(q_name)
         desired = config.desired_workers(q_name) if auto else 0

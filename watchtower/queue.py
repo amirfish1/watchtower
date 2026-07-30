@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Durable, numbered, stateful work queue — the WatchTower engine.
 
 This module is the self-contained heart of WatchTower. It replaces
@@ -669,6 +672,20 @@ def enqueue(
         raise ValueError("note or text is required")
     lane = lane if lane in VALID_LANES else "normal"
     proj = _project_for(source, repo_path, project)
+    # A queue's first-ever ticket must make it visible to the reconciler
+    # (workers._reconcile_once_locked() only iterates config.all_queues()),
+    # or a ▶ press on it silently no-ops forever: dispatch_after_enqueue()
+    # nudges no live worker (there's never been one), falls through to
+    # reconcile_once(), which skips a queue with no config entry entirely --
+    # not even into its own `skipped` list -- so the dispatch reason comes
+    # back as the generic "no live worker accepted and none spawned" with no
+    # indication the real cause is "this queue was never registered" (WT-131).
+    # auto_drain stays default-off; this only makes the queue exist.
+    try:
+        from . import config
+        config.ensure_entry(proj)
+    except Exception:
+        pass
     backend = _github_backend_for_project(proj)
     if backend is not None:
         saved = backend.enqueue(
