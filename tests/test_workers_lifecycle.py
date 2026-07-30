@@ -340,6 +340,27 @@ def test_reconcile_live_equals_desired_skips(wt):
     assert not r["spawned"]
 
 
+def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
+    """A worker parked on a human question (``needs_input``) is alive but does
+    no dispatch work until answered, which can take hours. Before this fix it
+    still counted toward desired_workers, so one blocked ticket could occupy
+    the queue's entire budget and starve every other claimable ticket
+    alongside it (WT-129 blocking WT-131's dispatch)."""
+    wt.config.set_auto_drain("Q", True)  # desired_workers defaults to 1
+    blocked = wt.q.enqueue(project="Q", note="needs a human call")
+    wt.q.enqueue(project="Q", note="unrelated claimable work")
+
+    worker = _live_worker(wt, "Q")
+    claimed = wt.q.claim_next(
+        worker["worker_id"], project="Q", session_uuid=worker["session_id"],
+    )
+    assert claimed["ref"] == blocked["ref"]
+    wt.q.block(blocked["ref"], question="fix or dismiss?", session_id=worker["worker_id"])
+
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1
+
+
 def test_reconcile_desired_two_spawns_two(wt):
     wt.config.set_auto_drain("Q", True)
     wt.config.set_desired_workers("Q", 2)
@@ -428,7 +449,7 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
     assert wt.workers.live_worker_count("Q") == 2
     # The losing pass must have skipped with the fully-staffed reason.
     skips = [s for r in results for s in r["skipped"] if s["queue"] == "Q"]
-    assert any("actual=2==desired=2" in s["reason"] for s in skips)
+    assert any("staffed=2==desired=2" in s["reason"] for s in skips)
 
 
 def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):

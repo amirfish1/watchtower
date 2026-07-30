@@ -28,7 +28,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 try:
     import fcntl
@@ -3529,6 +3529,25 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             q_name = w.get("queue", "")
             live_by_queue.setdefault(q_name, []).append(w)
 
+    # A worker parked on `needs_input` is alive but produces no dispatch
+    # progress until a human answers it -- which can take hours. It still
+    # held its slot against desired_workers below, so one blocked ticket
+    # could occupy a queue's entire worker budget and starve every other
+    # claimable ticket alongside it (WT-129 blocking WT-131's dispatch despite
+    # WT-131 being claimable). Track which live workers are blocked so the
+    # spawn decision can staff productive capacity around them instead of
+    # waiting on the block to clear.
+    from . import queue as _q_blocked
+    blocked_worker_ids: Dict[str, Set[str]] = {}
+    try:
+        for it in (_q_blocked.list_blocked() or []):
+            wid = str(it.get("claimed_by") or "")
+            qn = str(it.get("project") or "")
+            if wid and qn:
+                blocked_worker_ids.setdefault(qn, set()).add(wid)
+    except Exception:
+        blocked_worker_ids = {}
+
     # Use health for queue depth + stuck ground-truth -- one call covers all queues.
     health_by_queue: Dict[str, Dict[str, Any]] = {
         row["queue"]: row for row in health.all_status()
@@ -3805,6 +3824,16 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             continue
         live = live_by_queue.get(q_name, [])
         actual = len(live)
+        blocked_ids_here = blocked_worker_ids.get(q_name, set())
+        blocked_count = sum(
+            1 for w in live if str(w.get("worker_id") or "") in blocked_ids_here
+        )
+        # Blocked workers don't do dispatch work, so they shouldn't consume the
+        # queue's spawn budget -- `staffed` is what actually gates spawn/surplus
+        # decisions below, while `actual` (raw live count) stays around for
+        # logging and the nudge/stuck check, which cares about real processes.
+        staffed = actual - blocked_count
+        blocked_note = f", {blocked_count} blocked" if blocked_count else ""
 
         # A queue can be fully staffed (actual > 0) yet show zero progress --
         # e.g. every live worker's last turn errored out on a transient API or
@@ -3821,12 +3850,14 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 and not _all_workers_within_startup_grace(live)):
             _maybe_nudge_stuck_queue(q_name, actual)
 
-        if actual < desired:
+        if staffed < desired:
             # Never spawn more workers than unclaimed tickets. Don't assume a live
-            # worker will fail to claim: cap at (depth - actual) to avoid overspawning
+            # worker will fail to claim: cap at (depth - staffed) to avoid overspawning
             # while workers are still claiming. E.g., 1 ticket + 1 live worker should
-            # spawn 0 more, not 1.
-            to_spawn = min(desired - actual, max(0, depth - actual))
+            # spawn 0 more, not 1. Blocked workers are excluded from `staffed` (see
+            # above) so one ticket parked on a human question can't by itself starve
+            # every other claimable ticket in the queue.
+            to_spawn = min(desired - staffed, max(0, depth - staffed))
             plan = _record_spawn_plan(
                 q_name,
                 total_open=total_open,
@@ -3890,10 +3921,11 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 ),
             )
             # Why this spawn happened: open depth + how short of desired we were.
-            unclaimed = max(0, depth - actual)
+            unclaimed = max(0, depth - staffed)
             counted = "requested to run" if manual_run else "open"
             spawn_reason = (
-                f"{depth} {counted}, {actual} live < {desired} desired, {unclaimed} unclaimed, spawn {to_spawn}"
+                f"{depth} {counted}, {staffed} staffed < {desired} desired "
+                f"({actual} live{blocked_note}), {unclaimed} unclaimed, spawn {to_spawn}"
             )
             _annotate_spawn_records(spawned, plan, spawn_reason)
             _annotate_spawn_records(launch_failed, plan, spawn_reason)
@@ -3945,7 +3977,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 launch_failed.extend(fallback_failures)
             result["spawned"].extend(spawned)
             result["launch_failed"].extend(launch_failed)
-        elif actual > desired:
+        elif staffed > desired:
             # Surplus is NOT wound down here. A worker discovers it is surplus at
             # claim time (cmd_claim: nothing claimable AND live>desired) and exits
             # itself; graceful release handles the persistently-idle case. The
@@ -3953,7 +3985,10 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             # count.
             result["skipped"].append(
                 {"queue": q_name,
-                 "reason": f"surplus ({actual}>{desired}) — resolved at claim/release"}
+                 "reason": (
+                     f"surplus ({staffed}>{desired}) — resolved at claim/release "
+                     f"({actual} live{blocked_note})"
+                 )}
             )
             if released_by_q.get(q_name):
                 _record_spawn_plan(
@@ -3968,7 +4003,8 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 )
         else:
             result["skipped"].append(
-                {"queue": q_name, "reason": f"actual={actual}==desired={desired}"}
+                {"queue": q_name,
+                 "reason": f"staffed={staffed}==desired={desired} ({actual} live{blocked_note})"}
             )
             if released_by_q.get(q_name):
                 _record_spawn_plan(
