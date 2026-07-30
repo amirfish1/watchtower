@@ -3054,4 +3054,117 @@ def test_coerce_session_uuid_preserves_kimi_prefix(wt):
     assert wt.q._coerce_session_uuid(bare) == bare
     # Embedded bare UUID in prose still extracts (claude/codex path).
     assert wt.q._coerce_session_uuid("session is " + bare) == bare
+
+
+# ===================================================== zombie-worker escape hatch
+def _set_worker_started_at(wt, rec, iso):
+    """Backdate a worker's started_at in workers.json."""
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        for row in data["workers"]:
+            if row.get("worker_id") == rec["worker_id"]:
+                row["started_at"] = iso
+        wt.workers._save(data)
+
+
+def _make_queue_stuck(wt, queue):
+    """Enqueue a ticket and backdate it so the queue reads stuck."""
+    item = wt.q.enqueue(project=queue, note="stuck work")
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == item["ref"]:
+            it["created_at"] = "2000-01-01T00:00:00Z"
+    wt.q._save_unlocked(data)
+    return item
+
+
+def test_release_zombie_detects_unproductive_worker(wt):
+    wt.config.set_auto_drain("Q", True)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+
+    released = wt.workers.release_zombie_workers(queue="Q")
+
+    assert [w["worker_id"] for w in released] == [rec["worker_id"]]
+    assert (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+    assert len(_activity_lines(wt, "ZOMBIE_RELEASE")) == 1
+
+
+def test_release_zombie_skips_worker_holding_ticket(wt):
+    wt.config.set_auto_drain("Q", True)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+    wt.q.claim_by_ref(wt.q.list_items(project="Q")[0]["ref"], rec["worker_id"])
+
+    assert wt.workers.release_zombie_workers(queue="Q") == []
+
+
+def test_release_zombie_skips_unstuck_queue(wt):
+    wt.config.set_auto_drain("Q", True)
+    # Fresh ticket -> queue is not stuck.
+    wt.q.enqueue(project="Q", note="fresh work")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+
+    assert wt.workers.release_zombie_workers(queue="Q") == []
+
+
+def test_release_zombie_skips_fresh_worker(wt):
+    wt.config.set_auto_drain("Q", True)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    # started_at is "now" by default, so the worker is too fresh to be a zombie.
+
+    assert wt.workers.release_zombie_workers(queue="Q") == []
+
+
+def test_release_zombie_records_launch_failure_on_model_errors(wt):
+    wt.config.set_auto_drain("Q", True)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+    log = Path(rec["log"])
+    log.write_text(
+        "init\n"
+        '{"error":"model_not_found"}\n'
+        '{"error":"model_not_found"}\n'
+        '{"error":"model_not_found"}\n'
+    )
+
+    released = wt.workers.release_zombie_workers(queue="Q")
+
+    assert [w["worker_id"] for w in released] == [rec["worker_id"]]
+    assert len(_activity_lines(wt, "ZOMBIE_RELEASE")) == 1
+    cooldown = wt.workers.active_launch_failure_cooldown("Q", "claude")
+    assert cooldown is not None
+    assert "model_not_found" in cooldown["reason"]
+
+
+def test_release_zombie_ignores_worker_that_closed_ticket(wt):
+    wt.config.set_auto_drain("Q", True)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+    # Manually close a ticket by this worker after its start time.
+    item = wt.q.enqueue(project="Q", note="closed work")
+    wt.q.close(item["ref"], session_id=rec["worker_id"], resolution={"summary": "done"})
+
+    assert wt.workers.release_zombie_workers(queue="Q") == []
+
+
+def test_reconcile_logs_zombie_release(wt):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+
+    r = wt.workers.reconcile_once(dry_run=False)
+
+    assert any(w["worker_id"] == rec["worker_id"] for w in r["zombies_released"])
+    zombie_logs = _activity_lines(wt, "ZOMBIE_RELEASE")
+    assert len(zombie_logs) == 1
+    assert rec["worker_id"] in zombie_logs[0]
     assert wt.q._coerce_session_uuid("garbage") is None

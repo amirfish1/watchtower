@@ -517,6 +517,15 @@ _AUDIT_BOOT_ID = uuid.uuid4().hex[:12]
 RELEASED_TTL_S = int(os.environ.get("WATCHTOWER_RELEASED_TTL_S") or 4 * 3600)
 _RELEASED_KILL_GRACE_S = 30
 
+# A live worker that has never claimed a ticket and whose queue is stuck can be
+# released sooner than the normal idle floor. The classic failure mode is an
+# engine that boots but immediately fails every turn (e.g. model_not_found):
+# each stuck-queue nudge writes to the log, so the worker looks "active" by
+# mtime while making zero queue progress. This threshold is the escape hatch.
+ZOMBIE_THRESHOLD_S = int(os.environ.get("WATCHTOWER_ZOMBIE_THRESHOLD_S") or 10 * 60)
+# How many trailing log lines to scan when classifying a zombie's failure.
+ZOMBIE_LOG_SCAN_LINES = int(os.environ.get("WATCHTOWER_ZOMBIE_LOG_SCAN_LINES") or 80)
+
 
 def _codex_rollout_mtime(w: Dict[str, Any]) -> float:
     """Newest rollout mtime for a Codex worker, or 0 when unavailable.
@@ -1457,6 +1466,151 @@ def release_idle_workers(max_idle_s: float = RELEASE_IDLE_S,
     return released
 
 
+def release_zombie_workers(queue: Optional[str] = None,
+                           reconcile_id: str = "") -> List[Dict[str, Any]]:
+    """Release live workers that are alive but making no queue progress.
+
+    The normal idle-release path relies on log/transcript mtime, but a worker
+    whose engine fails every turn (wrong model, auth error, quota fault) still
+    gets stuck-queue nudges every ~5 minutes. Each nudge writes to the log, so
+    the worker looks active by mtime while never claiming a ticket. This
+    function is the escape hatch: it releases workers that are alive, past the
+    zombie threshold, hold no in-progress ticket, have not closed anything since
+    they started, and whose queue is visibly stuck.
+
+    When the worker's recent log shows a repeated fatal error, a launch failure
+    is recorded so the reconciler backs off instead of immediately respawning
+    into the same broken state.
+
+    Returns the list of released workers.
+    """
+    from . import config, health, queue as _q
+    from .queue import _log_many
+
+    now = time.time()
+    threshold = ZOMBIE_THRESHOLD_S
+    worker_rows = list_workers(prune=False)
+
+    try:
+        stuck_queues = {
+            row["queue"] for row in health.all_status()
+            if row.get("stuck") and row.get("queue")
+        }
+    except Exception:
+        stuck_queues = set()
+
+    released: List[Dict[str, Any]] = []
+    try:
+        items = _q.list_items()
+    except Exception:
+        items = []
+
+    in_progress_by_claimant: Dict[str, Dict[str, Any]] = {}
+    for it in items:
+        if it.get("status") != "in_progress":
+            continue
+        for field in ("claimed_by", "claimed_session_id"):
+            key = str(it.get(field) or "")
+            if key:
+                in_progress_by_claimant[key] = it
+
+    for w in worker_rows:
+        if not w.get("alive") or w.get("kind") == "adhoc":
+            continue
+        q_name = str(w.get("queue") or "")
+        if queue and q_name != queue:
+            continue
+        if _worker_released(w):
+            continue
+        if q_name not in stuck_queues:
+            continue
+
+        started = w.get("started_at")
+        age_s = float("inf")
+        if started:
+            try:
+                dt = datetime.strptime(started, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=timezone.utc
+                )
+                age_s = max(0.0, now - dt.timestamp())
+            except (ValueError, TypeError):
+                pass
+        if age_s < threshold:
+            continue
+
+        worker_id = str(w.get("worker_id") or "")
+        session_id = str(w.get("session_id") or "")
+        if in_progress_by_claimant.get(worker_id) or in_progress_by_claimant.get(session_id):
+            continue
+
+        # A worker that already closed something since it started is making
+        # progress; the normal idle-release path can handle its rest periods.
+        closed_since_start = False
+        if started:
+            for it in items:
+                if it.get("status") != "closed":
+                    continue
+                closed_by = str(it.get("closed_by") or "")
+                closed_session = str(it.get("closed_session_id") or "")
+                if worker_id not in (closed_by, closed_session):
+                    continue
+                closed_at = str(it.get("closed_at") or "")
+                if closed_at and closed_at >= started:
+                    closed_since_start = True
+                    break
+        if closed_since_start:
+            continue
+
+        try:
+            stop_path = request_stop(worker_id)
+        except Exception as exc:
+            _log_many([(
+                "ZOMBIE_RELEASE_FAIL",
+                _audit_detail(
+                    reconcile_id=reconcile_id or "none",
+                    queue=q_name,
+                    worker_id=worker_id,
+                    session_id=session_id,
+                    error=f"{type(exc).__name__}: {exc}",
+                ),
+                q_name,
+            )])
+            continue
+
+        failure_reason = _classify_zombie_log(str(w.get("log") or ""))
+        if failure_reason:
+            log_path = Path(str(w.get("log") or ""))
+            _record_launch_failure(
+                queue=q_name,
+                engine=str(w.get("engine") or ""),
+                worker_id=worker_id,
+                pid=int(w.get("pid") or 0),
+                log_path=log_path,
+                reason=f"zombie worker: {failure_reason}",
+                model=str(w.get("model") or ""),
+            )
+
+        released_at = _released_at(worker_id)
+        release_detail = _audit_detail(
+            reconcile_id=reconcile_id or "none",
+            queue=q_name,
+            worker_id=worker_id,
+            session_id=session_id,
+            age_s=int(age_s),
+            threshold_s=int(threshold),
+            failure_reason=failure_reason or "none",
+            released_at=released_at,
+        )
+        _log_many([("ZOMBIE_RELEASE", release_detail, q_name)])
+
+        w["released_at"] = released_at
+        w["_zombie_reason"] = failure_reason or "alive but unproductive"
+        w["_zombie_age_s"] = int(age_s)
+        released.append(w)
+
+    return released
+
+
 def reap_stale_workers(max_idle_s: float = RELEASE_IDLE_S,
                        queue: Optional[str] = None) -> List[Dict[str, Any]]:
     """Compatibility alias; stale workers are now released, never killed."""
@@ -1888,6 +2042,40 @@ def _classify_launch_failure_log(
     if not reason:
         return None
     return {"reason": reason, "retry_at": retry_at}
+
+
+def _classify_zombie_log(log_path: str, lines: int = ZOMBIE_LOG_SCAN_LINES) -> Optional[str]:
+    """Classify a live-but-unproductive worker from its recent log tail.
+
+    Returns a short reason string when the log shows repeated fatal errors
+    (e.g. model_not_found), or None when no clear failure pattern is visible.
+    This is intentionally conservative: only obvious, repeated failure modes
+    that would explain why a worker never claimed a ticket are classified.
+    """
+    try:
+        path = Path(log_path)
+        if not path.exists():
+            return None
+        with open(path, "r", errors="replace") as f:
+            all_lines = f.readlines()
+        recent = "".join(all_lines[-lines:]).lower()
+        if not recent.strip():
+            return None
+        # Repeated model rejection (Claude API returns model_not_found).
+        if (recent.count("model_not_found") >= 2
+                or recent.count("not exist or you may not have access") >= 2):
+            return "repeated model_not_found"
+        # Usage / auth / connectivity failures that would also stall a worker.
+        if "usage limit" in recent:
+            return "engine usage limit"
+        if ("authentication" in recent
+                and ("failed" in recent or "required" in recent)):
+            return "engine authentication failure"
+        if "http 503" in recent or "upstream connect error" in recent:
+            return "engine API unavailable"
+        return None
+    except Exception:
+        return None
 
 
 def _recent_failure_streak(rec: Optional[Dict[str, Any]], now: float) -> int:
@@ -3393,7 +3581,8 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         pass
 
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
-                              "released": [], "reaped": [], "requeued": [],
+                              "released": [], "zombies_released": [],
+                              "reaped": [], "requeued": [],
                               "stop_signals_swept": [],
                               "backfilled": [],
                               "session_title_backfilled": [],
@@ -3419,6 +3608,15 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     if not dry_run:
         try:
             result["released"] = release_idle_workers(
+                reconcile_id=reconcile_id
+            )
+        except Exception:
+            pass
+        # Escape hatch: release live workers that are alive but unproductive
+        # (wrong model, repeated engine errors, frozen). The normal idle path
+        # misses these because stuck-queue nudges keep touching the log.
+        try:
+            result["zombies_released"] = release_zombie_workers(
                 reconcile_id=reconcile_id
             )
         except Exception:
