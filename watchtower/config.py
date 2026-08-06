@@ -364,6 +364,28 @@ def _ccc_default_model(eng: str) -> str:
     return m
 
 
+def _ccc_worker_model_default(eng: str) -> str:
+    """Return CCC's worker-only model when it belongs to ``eng``.
+
+    ``worker_model`` is paired with ``worker_engine`` in CCC's Spawn defaults.
+    A queue that explicitly selects a different engine must fall through to its
+    own engine's shared model instead of receiving an incompatible worker
+    override.
+    """
+    try:
+        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
+            data = json.load(f)
+        worker_engine = str(data.get("worker_engine") or "").strip().lower()
+        model = str(data.get("worker_model") or "").strip()
+    except (OSError, ValueError, AttributeError):
+        return ""
+    if not model or worker_engine != str(eng or "").strip().lower():
+        return ""
+    if worker_engine == "claude" and not model.startswith("claude-"):
+        model = f"claude-{model}"
+    return model
+
+
 def default_model(eng: str) -> str:
     """Return the shared default model for an engine, if CCC configured one."""
     return _ccc_default_model(eng)
@@ -392,13 +414,15 @@ def fallback_engine(failed_engine: str) -> str:
 
 def model(queue: str) -> str:
     """Return the worker model for a queue: an explicit `wt set --model`
-    override if one is configured, else CCC's shared default for this
-    queue's engine (see CCC_SPAWN_DEFAULTS_FILE), else "" (the engine's own
-    ambient default, e.g. the bare `claude` CLI's configured default)."""
+    override if one is configured, else CCC's worker-only default for this
+    queue's engine, then CCC's shared New-session default, else "" (the
+    engine's own ambient default, e.g. the bare `claude` CLI's configured
+    default)."""
     explicit = _load().get(queue, {}).get("model", "")
     if explicit:
         return explicit
-    return default_model(engine(queue))
+    eng = engine(queue)
+    return _ccc_worker_model_default(eng) or default_model(eng)
 
 
 def set_effort(queue: str, value: str) -> Dict[str, Any]:

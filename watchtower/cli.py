@@ -2357,7 +2357,71 @@ def cmd_wait(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+def _maybe_self_update() -> None:
+    """Best-effort ``git pull --ff-only`` on the source checkout, then re-exec.
+
+    The failure this prevents: a daemon that runs for weeks never picks up
+    reconciler fixes because nothing in the start path updates the code (a
+    production VM ran 44 commits behind with a dead daemon for exactly this
+    reason). CCC's run.sh already self-updates on every restart; this gives
+    the watcher the same property no matter how it was launched (launchd,
+    systemd, manual).
+
+    Only fires when wt executes from a real git checkout (editable/source
+    install); pipx/venv installs have no .git and are skipped — their update
+    path is ``pipx upgrade``. A failed or non-fast-forward pull never blocks
+    the daemon: it logs and runs the code it has. When the pull does move
+    HEAD, the process re-execs itself immediately so the fresh code is what
+    actually runs the loop (execvp preserves the pid, so pidfiles stay valid).
+
+    Set WT_NO_SELF_UPDATE=1 to opt out (e.g. dev checkouts with uncommitted
+    work you don't want pulled over).
+    """
+    if os.environ.get("WT_NO_SELF_UPDATE"):
+        return
+    try:
+        pkg_dir = Path(__file__).resolve().parent
+        top = subprocess.run(
+            ["git", "-C", str(pkg_dir), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if top.returncode != 0:
+            return  # not a git checkout (pipx/venv install) — nothing to pull
+        repo = top.stdout.strip()
+
+        def _head() -> str:
+            r = subprocess.run(
+                ["git", "-C", repo, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return r.stdout.strip() if r.returncode == 0 else ""
+
+        before = _head()
+        pull = subprocess.run(
+            ["git", "-C", repo, "pull", "--ff-only"],
+            capture_output=True, text=True, timeout=60,
+        )
+        after = _head()
+        try:
+            q._log(
+                "SELF_UPDATE",
+                f"pull --ff-only rc={pull.returncode} head {before[:8]} -> {after[:8]}",
+            )
+        except Exception:
+            pass
+        if pull.returncode != 0 or not after or after == before:
+            return
+        print(
+            f"[watchtower] self-update moved HEAD {before[:8]} -> {after[:8]}; re-exec",
+            flush=True,
+        )
+        os.execvp(sys.executable, [sys.executable, "-m", "watchtower.cli"] + sys.argv[1:])
+    except Exception as e:  # noqa: BLE001 - an update hiccup must never block the daemon
+        print(f"[watchtower] self-update skipped: {e}", flush=True)
+
+
 def _daemon_loop(args: argparse.Namespace) -> None:
+    _maybe_self_update()  # pick up reconciler fixes on every (re)start; re-execs if HEAD moved
     interval = max(5, args.interval)
     dry_run = getattr(args, "dry_run", False)
     # Always host the HTTP server alongside the watcher.

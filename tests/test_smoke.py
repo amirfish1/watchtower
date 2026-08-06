@@ -566,6 +566,29 @@ def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeyp
         importlib.reload(workers)
 
 
+def test_ccc_worker_model_override_used_when_queue_unset(store, tmp_path, monkeypatch):
+    """The worker-only model beats the shared New-session model."""
+    import json
+    import importlib
+    import watchtower.config as config
+
+    ccc_file = tmp_path / "ccc-spawn-defaults.json"
+    ccc_file.write_text(json.dumps({
+        "worker_engine": "claude",
+        "worker_model": "sonnet-4-8",
+        "models": {"claude": "opus-5"},
+    }))
+    monkeypatch.setenv("WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(ccc_file))
+    importlib.reload(config)
+    try:
+        assert config.model("DEMO") == "claude-sonnet-4-8"
+        config.set_engine("DEMO", "codex")
+        assert config.model("DEMO") == ""
+    finally:
+        config.set_engine("DEMO", "")
+        importlib.reload(config)
+
+
 def test_ccc_worker_effort_default_used_when_queue_unset(store, tmp_path, monkeypatch):
     """A queue effort override wins; otherwise use CCC's worker-only effort."""
     import json
