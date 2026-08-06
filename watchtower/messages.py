@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Cross-agent messaging: agents registry, delivery adapters, durable outbox, ask.
 
 This module gives WatchTower its conversational primitives (see

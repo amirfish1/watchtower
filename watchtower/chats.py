@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Group-chat store: CCC-compatible on disk, deterministic nudge targeting.
 
 WatchTower's group chats live as pairs of files that are byte-compatible with

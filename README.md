@@ -1,6 +1,6 @@
 # WatchTower
 
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-source--available-blue.svg)](LICENSE)
 
 **Run fleets of AI coding-agent workers, unattended.** File tickets into named queues. Workers drain them automatically. `wt status` shows which queues are stuck: nothing more, nothing less.
 
@@ -488,4 +488,4 @@ the queue file alone, with no dependency on any external liveness signal.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+[WatchTower Software License](LICENSE) © 2026 Amir Fish — source-available, free for non-commercial use; commercial use requires permission. Versions released before 2026-07-28 remain under the [MIT License](LICENSE-MIT).

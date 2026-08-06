@@ -259,6 +259,54 @@ def test_cancelled_run_request_stops_being_staffed(wt):
     assert any(s["queue"] == "Q" and s["reason"] == "auto_drain=off" for s in r["skipped"])
 
 
+# ==================================================== never-configured queue (WT-131)
+def test_config_ensure_entries_is_batched_and_idempotent(wt):
+    created = wt.config.ensure_entries(["A", "B", "A", "", None])
+    assert created == ["A", "B"]
+    assert "A" in wt.config.all_queues() and "B" in wt.config.all_queues()
+    assert wt.config.ensure_entries(["A"]) == []  # already exists -> no-op
+
+
+def test_enqueue_registers_a_brand_new_queue(wt):
+    """A queue's very first-ever ticket must make it visible to the
+    reconciler, or a later ▶ press silently no-ops forever (WT-131): dispatch
+    nudges no live worker (there's never been one), reconcile_once() skips a
+    queue with no config entry entirely -- not even into its own `skipped`
+    list -- so the reason surfaced is the generic "no live worker accepted
+    and none spawned" with no hint the real cause is "never registered"."""
+    assert "NEWQ" not in wt.config.all_queues()
+    wt.q.enqueue(project="NEWQ", note="first ever ticket")
+    assert "NEWQ" in wt.config.all_queues()
+    assert wt.config.auto_drain("NEWQ") is False  # unchanged default
+
+
+def test_manual_run_spawns_worker_for_never_configured_queue(wt):
+    item = wt.q.enqueue(project="NEWQ", note="first ever ticket")
+    wt.q.mark_runnable(item["ref"])
+
+    r = wt.workers.reconcile_once(dry_run=True)
+
+    assert [s["queue"] for s in r["spawned"]] == ["NEWQ"]
+
+
+def test_reconcile_backfills_config_for_queue_missing_it_by_any_other_path(wt):
+    """Belt-and-suspenders for the enqueue()-side fix above: even if a
+    queue's config entry is missing for some other reason (hand-edited
+    config, a backend that bypasses queue.enqueue()), reconcile_once() must
+    not blind itself to a queue with real open tickets and a pending run."""
+    item = wt.q.enqueue(project="NEWQ2", note="first ever ticket")
+    wt.q.mark_runnable(item["ref"])
+    data = wt.config._load()
+    data.pop("NEWQ2", None)
+    wt.config._save(data)
+    assert "NEWQ2" not in wt.config.all_queues()
+
+    r = wt.workers.reconcile_once(dry_run=True)
+
+    assert [s["queue"] for s in r["spawned"]] == ["NEWQ2"]
+    assert "NEWQ2" in wt.config.all_queues()
+
+
 def test_manual_run_worker_is_told_to_work_only_requested_tickets(wt, monkeypatch):
     """The file backend has no eligibility gate on claim, so the goal is what
     keeps a manual-run worker off the backlog its owner deliberately parked."""
@@ -3027,4 +3075,117 @@ def test_coerce_session_uuid_preserves_kimi_prefix(wt):
     assert wt.q._coerce_session_uuid(bare) == bare
     # Embedded bare UUID in prose still extracts (claude/codex path).
     assert wt.q._coerce_session_uuid("session is " + bare) == bare
+
+
+# ===================================================== zombie-worker escape hatch
+def _set_worker_started_at(wt, rec, iso):
+    """Backdate a worker's started_at in workers.json."""
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        for row in data["workers"]:
+            if row.get("worker_id") == rec["worker_id"]:
+                row["started_at"] = iso
+        wt.workers._save(data)
+
+
+def _make_queue_stuck(wt, queue):
+    """Enqueue a ticket and backdate it so the queue reads stuck."""
+    item = wt.q.enqueue(project=queue, note="stuck work")
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == item["ref"]:
+            it["created_at"] = "2000-01-01T00:00:00Z"
+    wt.q._save_unlocked(data)
+    return item
+
+
+def test_release_zombie_detects_unproductive_worker(wt):
+    wt.config.set_auto_drain("Q", True)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+
+    released = wt.workers.release_zombie_workers(queue="Q")
+
+    assert [w["worker_id"] for w in released] == [rec["worker_id"]]
+    assert (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+    assert len(_activity_lines(wt, "ZOMBIE_RELEASE")) == 1
+
+
+def test_release_zombie_skips_worker_holding_ticket(wt):
+    wt.config.set_auto_drain("Q", True)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+    wt.q.claim_by_ref(wt.q.list_items(project="Q")[0]["ref"], rec["worker_id"])
+
+    assert wt.workers.release_zombie_workers(queue="Q") == []
+
+
+def test_release_zombie_skips_unstuck_queue(wt):
+    wt.config.set_auto_drain("Q", True)
+    # Fresh ticket -> queue is not stuck.
+    wt.q.enqueue(project="Q", note="fresh work")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+
+    assert wt.workers.release_zombie_workers(queue="Q") == []
+
+
+def test_release_zombie_skips_fresh_worker(wt):
+    wt.config.set_auto_drain("Q", True)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    # started_at is "now" by default, so the worker is too fresh to be a zombie.
+
+    assert wt.workers.release_zombie_workers(queue="Q") == []
+
+
+def test_release_zombie_records_launch_failure_on_model_errors(wt):
+    wt.config.set_auto_drain("Q", True)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+    log = Path(rec["log"])
+    log.write_text(
+        "init\n"
+        '{"error":"model_not_found"}\n'
+        '{"error":"model_not_found"}\n'
+        '{"error":"model_not_found"}\n'
+    )
+
+    released = wt.workers.release_zombie_workers(queue="Q")
+
+    assert [w["worker_id"] for w in released] == [rec["worker_id"]]
+    assert len(_activity_lines(wt, "ZOMBIE_RELEASE")) == 1
+    cooldown = wt.workers.active_launch_failure_cooldown("Q", "claude")
+    assert cooldown is not None
+    assert "model_not_found" in cooldown["reason"]
+
+
+def test_release_zombie_ignores_worker_that_closed_ticket(wt):
+    wt.config.set_auto_drain("Q", True)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+    # Manually close a ticket by this worker after its start time.
+    item = wt.q.enqueue(project="Q", note="closed work")
+    wt.q.close(item["ref"], session_id=rec["worker_id"], resolution={"summary": "done"})
+
+    assert wt.workers.release_zombie_workers(queue="Q") == []
+
+
+def test_reconcile_logs_zombie_release(wt):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 1)
+    _make_queue_stuck(wt, "Q")
+    rec = _live_worker(wt, "Q")
+    _set_worker_started_at(wt, rec, "2000-01-01T00:00:00Z")
+
+    r = wt.workers.reconcile_once(dry_run=False)
+
+    assert any(w["worker_id"] == rec["worker_id"] for w in r["zombies_released"])
+    zombie_logs = _activity_lines(wt, "ZOMBIE_RELEASE")
+    assert len(zombie_logs) == 1
+    assert rec["worker_id"] in zombie_logs[0]
     assert wt.q._coerce_session_uuid("garbage") is None

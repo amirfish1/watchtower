@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
 """Per-queue configuration for WatchTower.
 
 Currently holds the ``auto_drain`` policy (WT-FEATURES #16): the watcher's
@@ -486,6 +489,30 @@ def ensure_entry(queue: str) -> Dict[str, Any]:
         data[queue] = {}
         _save(data)
     return dict(data[queue])
+
+def ensure_entries(queues: Any) -> list:
+    """Batched ``ensure_entry()``: one load/save for many queues at once.
+
+    A queue with no config entry is invisible to
+    ``workers._reconcile_once_locked()`` (it only iterates
+    ``all_queues()``), so a manual ▶ run on its very first ticket silently
+    no-ops forever -- no worker spawns, and the dispatch reason surfaced is
+    the generic "no live worker accepted and none spawned" with no hint that
+    the real cause is "this queue was never registered" (WT-131). Does not
+    change ``auto_drain`` (stays default-off) or any other staffing
+    behavior -- it only makes an already-visible-in-``wt status`` queue
+    visible to the reconciler too. Returns the queue names newly created."""
+    proj = sorted({str(q) for q in queues if q})
+    if not proj:
+        return []
+    data = _load()
+    created = [q for q in proj if q not in data]
+    if not created:
+        return []
+    for q in created:
+        data[q] = {}
+    _save(data)
+    return created
 
 
 # One-time marker for the GitHub eligibility migration below. It lives next to
