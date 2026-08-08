@@ -3254,9 +3254,18 @@ def backfill_claimed_session_ids() -> List[str]:
     Returns the refs that were freshly backfilled this pass."""
     from . import queue as _q
     backfilled: List[str] = []
+    # One-shot engines (codex, kimi) exit as soon as their turn ends, and the
+    # cloud session UUID is often only resolvable from the tail of their log
+    # (e.g. kimi's closing session.resume_hint line) -- by the time it's
+    # parseable the process has frequently already exited. Requiring `alive`
+    # for those engines meant a fast one-shot turn could finish, die, and get
+    # pruned before the next reconciler tick ever saw a resolved session_id,
+    # leaving claimed_session_id permanently empty (CCC-747: "Go to session"
+    # never appears for Kimi-run tickets). Long-lived engines (claude) still
+    # require `alive` -- a dead claude worker's stale UUID isn't worth trusting.
     live_workers = [
         w for w in list_workers(prune=False)
-        if w.get("alive") and w.get("session_id")
+        if w.get("session_id") and (w.get("alive") or w.get("engine") in _ONE_SHOT_ENGINES)
     ]
     # worker_id -> cloud session_id for live workers that have a resolved UUID.
     wid_to_sid = {str(w.get("worker_id", "")): str(w.get("session_id", ""))
