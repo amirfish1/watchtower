@@ -1924,3 +1924,38 @@ def test_context_budget_recycles_worker_at_claim(store, tmp_path, monkeypatch):
     q.enqueue(project="CTXQ", note="more work")
     again = q.claim_next("ctx-worker-01", project="CTXQ")
     assert again is not None and again.get("ref") == "CTXQ-2"
+
+
+def test_answer_requeues_when_session_over_context_budget(store, tmp_path, monkeypatch, capsys):
+    """wt answer normally resumes the blocked ticket's original session, but
+    when that session's transcript exceeds WATCHTOWER_ANSWER_REQUEUE_BYTES the
+    answer is embedded on the ticket and the claim released for a fresh
+    worker instead of resuming a bloated conversation."""
+    import watchtower.cli as cli
+    import watchtower.queue as q
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("WATCHTOWER_ANSWER_REQUEUE_BYTES", "1000")
+
+    session_uuid = "99999999-8888-7777-6666-555555555555"
+    tdir = tmp_path / "claude" / "projects" / "-Users-x-proj"
+    tdir.mkdir(parents=True)
+    (tdir / f"{session_uuid}.jsonl").write_text("x" * 2000)
+
+    q.enqueue(project="ANSQ", note="needs a decision")
+    claimed = q.claim_next("ans-worker-01", project="ANSQ",
+                           session_uuid=session_uuid)
+    assert claimed["ref"] == "ANSQ-1"
+    q.block("ANSQ-1", session_id="ans-worker-01", question="which way?")
+
+    rc = cli.main(["answer", "ANSQ-1", "--worker", "human",
+                   "the answer is B"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "fresh worker" in out
+
+    item = q.get("ANSQ-1")
+    assert item["status"] == "open"
+    assert not item.get("needs_input")
+    assert "the answer is B" in (item.get("text") or "")
+    assert "which way?" in (item.get("text") or "")

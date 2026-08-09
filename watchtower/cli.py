@@ -1027,6 +1027,44 @@ def cmd_answer(args: argparse.Namespace) -> int:
               f"(no resumable session recorded; a worker will pick it up on "
               f"next claim)")
         return 0
+    # Context-budget escalation for the answer-resume path. Resuming the
+    # original session is normally right (its investigation context makes the
+    # answer land), so the threshold here is intentionally HIGHER than the
+    # claim-time recycle budget (default 2x). Past it, hours of post-answer
+    # work in an already-huge conversation costs more than the lost context:
+    # embed the Q&A on the ticket, release the claim, and let a fresh worker
+    # take it. 0 disables.
+    try:
+        _requeue_at = int(os.environ.get(
+            "WATCHTOWER_ANSWER_REQUEUE_BYTES",
+            str(2 * int(os.environ.get(
+                "WATCHTOWER_CONTEXT_RECYCLE_BYTES", "2500000") or 0)),
+        ) or 0)
+    except (TypeError, ValueError):
+        _requeue_at = 5_000_000
+    if _requeue_at > 0:
+        _tsize = workers._claude_transcript_bytes(str(sid))
+        if _tsize >= _requeue_at:
+            from datetime import datetime as _dt, timezone as _tz
+            stamp = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+            qa_note = (
+                f"{item.get('text') or item.get('note') or ''}\n\n"
+                f"[ANSWERED while blocked, {stamp}] Q: "
+                f"{item.get('block_question') or '(see history)'}\n"
+                f"A: {args.text}\n"
+                f"(Original session {str(sid)[:8]} was over the context "
+                f"budget — apply this answer fresh.)"
+            )
+            q.update(item["ref"], text=qa_note)
+            q.release(item["ref"], session_id=str(
+                item.get("claimed_by") or args.worker or ""))
+            print(
+                f"ANSWERED: {item['ref']} — answer embedded on the ticket and "
+                f"claim released: original session {str(sid)[:8]} is over the "
+                f"answer context budget ({_tsize} transcript bytes >= "
+                f"{_requeue_at}); a fresh worker will apply it."
+            )
+            return 0
     repo = item.get("repo_path") or os.getcwd()
     prompt = (
         f"A human answered your blocked question on ticket {item['ref']}. "
