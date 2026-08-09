@@ -535,6 +535,68 @@ def test_config_command_resolves_claude_opus_5_alias(store, capsys):
     assert config.is_approved_model("claude", "opus-5")
 
 
+def test_model_floor_met_ranks_across_engines(store):
+    """FEAT-NEXT-120: a queue's configured model is ranked against a
+    ticket's floor regardless of which engine either names."""
+    import watchtower.config as config
+
+    config.set_engine("Q", "claude")
+    config.set_model("Q", "claude-opus-4-8")
+    assert config.model_floor_met("Q", "kimi-code/k3") is True
+    assert config.model_floor_met("Q", "claude-opus-4-8") is True
+
+    config.set_model("Q", "claude-sonnet-5")
+    assert config.model_floor_met("Q", "claude-opus-4-8") is False
+
+    # Empty or unranked floors never block a claim (fail open).
+    assert config.model_floor_met("Q", "") is True
+    assert config.model_floor_met("Q", "gpt-5.6") is True
+
+
+def test_add_and_claim_honor_model_floor(store, capsys):
+    """FEAT-NEXT-120: a ticket whose floor exceeds the claiming queue's
+    configured model is auto-parked blocked instead of claimed."""
+    import watchtower.cli as cli
+    import watchtower.queue as q
+    import watchtower.config as config
+
+    config.set_engine("Q", "claude")
+    config.set_model("Q", "claude-sonnet-5")
+
+    assert cli.main([
+        "add", "-q", "Q", "--title", "needs opus", "--note", "n",
+        "--model-floor", "claude-opus-4-8",
+    ]) == 0
+    ref = capsys.readouterr().out.split()[1]
+
+    rc = cli.main(["claim", "-q", "Q", "--worker", "w1", "--json"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "model floor" in err
+    assert "claude-opus-4-8" in err
+
+    item = q.get(ref)
+    assert item["status"] == "in_progress"  # parked, not reopened
+    assert item["needs_input"] is True
+    assert "claude-opus-4-8" in item["block_question"]
+
+    # Bumping the queue's model to meet the floor is enough for the same
+    # check to pass -- the re-claim/reopen mechanics of answer() are a
+    # pre-existing, separately-tested path, not re-exercised here.
+    config.set_model("Q", "claude-opus-4-8")
+    assert config.model_floor_met("Q", "claude-opus-4-8") is True
+
+
+def test_edit_can_set_model_floor(store, capsys):
+    import watchtower.cli as cli
+    import watchtower.queue as q
+
+    cli.main(["add", "-q", "Q", "--title", "t", "--note", "n"])
+    ref = capsys.readouterr().out.split()[1]
+    assert cli.main(["edit", ref, "--model-floor", "kimi-code/k3"]) == 0
+    assert q.get(ref)["model_floor"] == "kimi-code/k3"
+
+
 def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeypatch):
     """A queue with no explicit `wt set --model` falls back to CCC's shared
     spawn-defaults.json for its engine (see config.CCC_SPAWN_DEFAULTS_FILE) --

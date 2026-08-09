@@ -490,6 +490,41 @@ def approved_models(eng: str) -> tuple[str, ...]:
     return canonical + tuple(MODEL_ALIASES.get(eng, {}).keys())
 
 
+# FEAT-NEXT-120 — per-ticket model floor. Index in this tuple is the tier
+# (0 = lowest). Cross-engine on purpose: a ticket's floor is one model id
+# from any approved engine's list, compared against whichever engine/model
+# the CLAIMING queue actually runs. Keep in sync with queue.py's
+# VALID_MODEL_FLOORS and MODEL_EFFORTS above as new models get approved --
+# no ordering is implied by MODEL_EFFORTS itself (kimi's own list there
+# already isn't junior->senior), this is the single explicit ranking.
+MODEL_FLOOR_TIERS = (
+    "kimi-code/k3",
+    "kimi-code/kimi-for-coding",
+    "claude-sonnet-5",
+    "kimi-code/kimi-for-coding-highspeed",
+    "claude-opus-4-8",
+)
+
+
+def model_floor_met(queue: str, floor: str) -> bool:
+    """True if ``queue``'s configured model meets or exceeds ``floor``'s tier.
+
+    Fails OPEN (returns True, i.e. does not block a claim) for an empty
+    floor, an unranked floor value, or a queue running a model this ranking
+    doesn't cover -- a per-ticket floor is an interim, best-effort signal
+    (the filer never blocks on certainty at filing time), not a hard
+    guarantee; spuriously refusing a claim over a ranking gap is worse than
+    occasionally under-enforcing one.
+    """
+    floor = str(floor or "").strip()
+    if not floor or floor not in MODEL_FLOOR_TIERS:
+        return True
+    queue_model = canonical_model(engine(queue), model(queue))
+    if queue_model not in MODEL_FLOOR_TIERS:
+        return True
+    return MODEL_FLOOR_TIERS.index(queue_model) >= MODEL_FLOOR_TIERS.index(floor)
+
+
 def is_approved_model(eng: str, value: str) -> bool:
     """Whether ``value`` is empty or is an approved model/alias for ``eng``.
 

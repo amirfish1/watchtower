@@ -375,7 +375,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
     fields = {}
     for name in (
         "title", "note", "text", "url", "type", "readiness", "priority",
-        "value", "confidence", "selector", "screenshot_path", "repo_path",
+        "value", "confidence", "model_floor", "selector", "screenshot_path",
+        "repo_path",
     ):
         value = getattr(args, name, None)
         if value is not None:
@@ -385,8 +386,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
         print(
             "error: no fields to edit -- pass at least one of "
             "--title/--note/--text/--url/--type/--readiness/--priority/"
-            "--value/--confidence/--selector/--screenshot-path/--repo-path/"
-            "--queue",
+            "--value/--confidence/--model-floor/--selector/"
+            "--screenshot-path/--repo-path/--queue",
             file=sys.stderr,
         )
         return 1
@@ -433,6 +434,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         priority=getattr(args, "priority", "") or "",
         value=getattr(args, "value", "") or "",
         confidence=getattr(args, "confidence", "") or "",
+        model_floor=getattr(args, "model_floor", "") or "",
     )
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
     # Enqueue-and-claim: file the ticket, then immediately mark it in_progress so
@@ -632,6 +634,37 @@ def cmd_claim(args: argparse.Namespace) -> int:
             else:
                 print("STOP: reconciler requested shutdown; exiting")
             return 0
+
+    # FEAT-NEXT-120 — per-ticket model floor. Checked here, after a genuine
+    # claim (not the nothing-open/stop early-returns above), so an
+    # under-tiered queue never silently works a ticket that named a higher
+    # floor. Auto-parks it via the existing block() path -- "worker parks
+    # the ticket blocked with a note" per the design -- rather than
+    # bouncing it back to open, so a human sees exactly why and can either
+    # reconfigure the queue's model or hand it to a stronger one.
+    model_floor = str(item.get("model_floor") or "").strip()
+    if model_floor:
+        from . import config
+        if not config.model_floor_met(args.queue, model_floor):
+            queue_model = config.canonical_model(config.engine(args.queue), config.model(args.queue))
+            q.block(
+                item["ref"],
+                session_uuid,
+                question=(
+                    f"This ticket's model floor is {model_floor!r}, but queue "
+                    f"{args.queue!r} is configured for {queue_model or '(unset)'!r}. "
+                    "Reassign to a queue running at least that model, or bump this "
+                    "queue's --model, then answer to resume."
+                ),
+                progress=f"Auto-parked at claim time by {worker} — floor not met.",
+            )
+            print(
+                f"error: {item['ref']} requires model floor {model_floor!r}; "
+                f"queue {args.queue!r} runs {queue_model or '(unset)'!r} — "
+                "parked blocked instead of claimed",
+                file=sys.stderr,
+            )
+            return 1
 
     _rename_claiming_session(item)
 
@@ -3182,6 +3215,11 @@ def build_parser() -> argparse.ArgumentParser:
                                help="business value: H, M, or L")
         subparser.add_argument("--confidence", default="", choices=["H", "M", "L", ""],
                                help="confidence: H, M, or L")
+        subparser.add_argument("--model-floor", default="", dest="model_floor",
+                               choices=list(q.VALID_MODEL_FLOORS),
+                               help="filer's best-guess minimum model this ticket "
+                                    "needs (FEAT-NEXT-120); empty is fine, never a "
+                                    "blocker at filing time")
         subparser.add_argument("--worker", default="",
                                help="worker/owner id to claim under when --claim is "
                                     "set; defaults to wt-cli-<pid>")
@@ -3237,6 +3275,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="business value: H, M, or L")
     s.add_argument("--confidence", default=None, choices=["H", "M", "L"],
                    help="confidence: H, M, or L")
+    s.add_argument("--model-floor", default=None, dest="model_floor",
+                   choices=[m for m in q.VALID_MODEL_FLOORS if m],
+                   help="filer's best-guess minimum model this ticket needs "
+                        "(FEAT-NEXT-120)")
     s.add_argument("--selector", default=None)
     s.add_argument("--screenshot-path", default=None, dest="screenshot_path")
     s.add_argument("--repo-path", default=None, dest="repo_path")

@@ -109,6 +109,19 @@ UNCLAIMABLE_READINESS = ("needs-shaping", "needs-spec")
 VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
 VALID_VALUES = ("H", "M", "L", "")
 VALID_CONFIDENCES = ("H", "M", "L", "")
+# FEAT-NEXT-120 — a filer's best-guess minimum model this ticket needs. Not a
+# blocker at filing time (empty is fine, filer never waits for certainty);
+# checked against the claiming queue's configured model at claim time (see
+# config.model_floor_met). Canonical model ids, not aliases -- keep in sync
+# with config.py's MODEL_EFFORTS as new models get approved.
+VALID_MODEL_FLOORS = (
+    "kimi-code/k3",
+    "kimi-code/kimi-for-coding",
+    "kimi-code/kimi-for-coding-highspeed",
+    "claude-sonnet-5",
+    "claude-opus-4-8",
+    "",
+)
 
 # Legacy CCC store — WatchTower reads it if present so it works on this machine
 # today, before any WatchTower-native queue exists.
@@ -665,6 +678,7 @@ def enqueue(
     priority: str = "",
     value: str = "",
     confidence: str = "",
+    model_floor: str = "",
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref)."""
     note = _clip(note, 4000)
@@ -731,6 +745,7 @@ def enqueue(
             "priority": _norm_choice(priority, VALID_PRIORITIES),
             "value": _norm_choice(value, VALID_VALUES),
             "confidence": _norm_choice(confidence, VALID_CONFIDENCES),
+            "model_floor": _norm_choice(model_floor, VALID_MODEL_FLOORS),
             "needs_input": False,
             "block_question": "",
             # The two ticket-level eligibility inputs (2026-07-26 design). The
@@ -899,9 +914,9 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     """Patch arbitrary fields on an item. Used for triage edits (priority,
     readiness, value, etc.).
 
-    Allowed fields: item_type, readiness, priority, value, confidence, note,
-    text, title, url, selector, screenshot_path, repo_path, needs_input,
-    block_question.
+    Allowed fields: item_type, readiness, priority, value, confidence,
+    model_floor, note, text, title, url, selector, screenshot_path,
+    repo_path, needs_input, block_question.
 
     Disallowed (managed by state machine): status, claimed_by, claimed_at,
     closed_at, claimed_session_id, number, project, ref, seq, created_at.
@@ -915,7 +930,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
-        "needs_input", "block_question",
+        "needs_input", "block_question", "model_floor",
     })
     with _FileLock(_lock_path()):
         data = _load_unlocked()
