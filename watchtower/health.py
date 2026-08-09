@@ -213,6 +213,7 @@ def all_status(
     stuck_minutes: int = STUCK_MINUTES,
     drain_window_minutes: int = DRAIN_WINDOW_MINUTES,
     fresh: bool = False,
+    items: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Status rows for every queue (or one, if ``project`` is given).
 
@@ -221,6 +222,12 @@ def all_status(
 
     ``fresh`` revalidates GitHub-backed queues instead of serving the list
     cache; CLI reads set it, the dashboard's own polling loop does not.
+
+    ``items``, when given, is used instead of calling ``q.list_items()``
+    internally. A caller that needs the raw item list for something else
+    (e.g. the dashboard also feeds it to ``workers.annotate_activity``)
+    should fetch once and pass it here, rather than triggering a second
+    round of GitHub fetches for the same data.
     """
     now = now or datetime.now(timezone.utc)
     by_queue: Dict[str, List[Dict[str, Any]]] = {}
@@ -231,7 +238,8 @@ def all_status(
     else:
         for name in configured:
             by_queue.setdefault(name, [])
-    for it in q.list_items(project=project, fresh=fresh):
+    fetched = items if items is not None else q.list_items(project=project, fresh=fresh)
+    for it in fetched:
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
     rows = [
         queue_status(

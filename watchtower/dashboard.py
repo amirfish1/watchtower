@@ -109,16 +109,21 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     """Combined queue health + per-queue worker tally + the worker roster.
 
     One pass over workers (``worker_counts``) annotates every queue row, so the
-    dashboard never probes liveness once per queue.
+    dashboard never probes liveness once per queue. Likewise, ``q.list_items()``
+    is fetched exactly once and reused for both the queue rows and the worker
+    annotation below -- on a GitHub-backed queue each fetch is a handful of
+    sequential ``gh`` subprocess calls, so calling it twice per request quietly
+    doubled every poll's latency.
     """
-    rows = health.all_status(stuck_minutes=stuck_minutes)
+    items = q.list_items()
+    rows = health.all_status(stuck_minutes=stuck_minutes, items=items)
     counts = workers.worker_counts()
     for r in rows:
         wc = counts.get(r["queue"], {"total": 0, "live": 0})
         r["workers_total"] = wc["total"]
         r["workers_live"] = wc["live"]
     wrows = workers.list_workers(prune=False)
-    workers.annotate_activity(wrows, q.list_items())
+    workers.annotate_activity(wrows, items)
     return {"queues": rows, "workers": wrows, "github": health.github_connectivity()}
 
 
