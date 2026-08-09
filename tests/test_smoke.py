@@ -1876,3 +1876,51 @@ def test_activity_log_no_session_id_when_env_unset(store, tmp_path, monkeypatch)
 
     log_text = activity_log.read_text()
     assert "[sid:" not in log_text, "No session ID should appear when env is unset"
+
+
+def test_context_budget_recycles_worker_at_claim(store, tmp_path, monkeypatch):
+    """A REGISTERED claude drain worker whose transcript exceeds
+    WATCHTOWER_CONTEXT_RECYCLE_BYTES is stopped at the claim boundary exactly
+    like a reconciler release: {"stop": True}, ticket stays open, and a fresh
+    worker claims it. Unregistered callers (humans running wt claim by hand)
+    are never recycled regardless of their own conversation size."""
+    import importlib
+
+    import watchtower.workers as workers
+    import watchtower.queue as q
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("WATCHTOWER_CONTEXT_RECYCLE_BYTES", "1000")
+    monkeypatch.setenv("WATCHTOWER_WORKERS_FILE", str(tmp_path / "workers.json"))
+    importlib.reload(workers)
+    importlib.reload(q)
+
+    session_uuid = "11111111-2222-3333-4444-555555555555"
+    transcript_dir = tmp_path / "claude" / "projects" / "-Users-x-proj"
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / f"{session_uuid}.jsonl").write_text("x" * 2000)
+
+    import os as _os
+    (tmp_path / "workers.json").write_text(json.dumps({"workers": [
+        {"worker_id": "ctx-worker-01", "engine": "claude",
+         "session_id": session_uuid, "queue": "CTXQ",
+         "pid": _os.getpid()},
+    ]}))
+
+    q.enqueue(project="CTXQ", note="pending work")
+
+    # Over-budget registered worker is recycled, ticket untouched.
+    result = q.claim_next("ctx-worker-01", project="CTXQ")
+    assert result == {"stop": True, "reason": "context_budget"}
+    assert q.get("CTXQ-1")["status"] == "open"
+
+    # An unregistered caller with the SAME huge transcript claims normally —
+    # humans must never be recycled by the worker budget.
+    fresh = q.claim_next("human-cli", project="CTXQ", session_uuid=session_uuid)
+    assert fresh["ref"] == "CTXQ-1"
+
+    # Budget 0 disables recycling even for registered workers.
+    monkeypatch.setenv("WATCHTOWER_CONTEXT_RECYCLE_BYTES", "0")
+    q.enqueue(project="CTXQ", note="more work")
+    again = q.claim_next("ctx-worker-01", project="CTXQ")
+    assert again is not None and again.get("ref") == "CTXQ-2"

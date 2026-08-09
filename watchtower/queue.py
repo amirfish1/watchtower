@@ -1199,6 +1199,27 @@ def claim_next(
             pass
         return {"stop": True}
 
+    # Context-budget recycle: a drain worker that chain-claims tickets grows
+    # its conversation without bound (observed: 800K/1M tokens ≈ 6.2MB
+    # transcript). The claim boundary is the only safe recycle point — never
+    # mid-ticket — so an over-budget worker is stopped here exactly like a
+    # reconciler release; deficit staffing then spawns a fresh worker.
+    try:
+        from . import workers as _workers
+        over = _workers.context_budget_exceeded(
+            session_id, str(session_uuid or "")
+        )
+    except Exception:
+        over = 0
+    if over:
+        _log(
+            "STOP",
+            f"{session_id} — context budget exceeded "
+            f"({over} transcript bytes); recycling worker",
+            queue=project or "",
+        )
+        return {"stop": True, "reason": "context_budget"}
+
     backend = _github_backend_for_project(project)
     if backend is not None:
         item = backend.claim_next(

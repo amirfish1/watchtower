@@ -582,6 +582,73 @@ def _claude_transcript_mtime(w: Dict[str, Any]) -> float:
     return newest
 
 
+def _claude_transcript_bytes(session_id: str) -> int:
+    """Size in bytes of a Claude session's main transcript, or 0 if unknown.
+
+    Used as the context-budget proxy: the projects/*/<session>.jsonl file
+    grows monotonically with conversation context (measured 2026-08-09:
+    ~800K/1M tokens ≈ 6.2MB), so a byte threshold catches runaway context
+    without needing token accounting the CLI does not expose.
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return 0
+    claude_home = Path(
+        os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")
+    )
+    biggest = 0
+    try:
+        for path in (claude_home / "projects").glob(f"*/{session_id}.jsonl"):
+            try:
+                biggest = max(biggest, path.stat().st_size)
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return biggest
+
+
+def context_budget_exceeded(worker_id: str, session_uuid: str = "") -> int:
+    """Transcript bytes when a DRAIN WORKER is over its context budget, else 0.
+
+    Applies ONLY to workers registered in workers.json — a human (or any
+    non-worker session) running ``wt claim`` by hand must never be "recycled"
+    just because their own conversation is large. The registered record's
+    claude session id is authoritative for locating the transcript;
+    ``session_uuid`` is a fallback when the record predates uuid capture.
+
+    The budget is ``WATCHTOWER_CONTEXT_RECYCLE_BYTES`` (default 2.5MB ≈ a
+    third of the transcript size observed at 800K tokens — recycle early;
+    a fresh worker costs seconds and regains full-quality context). Set the
+    env var to 0 to disable recycling. Read per call so tests and operators
+    can tune it without a daemon restart.
+    """
+    try:
+        budget = int(
+            os.environ.get("WATCHTOWER_CONTEXT_RECYCLE_BYTES", "2500000") or 0
+        )
+    except (TypeError, ValueError):
+        budget = 2_500_000
+    if budget <= 0:
+        return 0
+    worker_id = str(worker_id or "").strip()
+    if not worker_id:
+        return 0
+    record = next(
+        (
+            w
+            for w in _load().get("workers", [])
+            if str(w.get("worker_id") or "") == worker_id
+        ),
+        None,
+    )
+    if record is None or str(record.get("engine") or "") != "claude":
+        return 0
+    sid = str(record.get("session_id") or "").strip() or str(session_uuid or "")
+    size = _claude_transcript_bytes(sid)
+    return size if size >= budget else 0
+
+
 def _kimi_wire_mtime(w: Dict[str, Any]) -> float:
     """Newest wire.jsonl mtime for a kimi worker, or 0 when unavailable.
 
