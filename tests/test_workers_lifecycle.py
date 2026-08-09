@@ -1702,6 +1702,23 @@ def test_spawn_workers_includes_engine_and_model_in_record(wt):
     assert rec.get("model") == "claude-sonnet-5"
 
 
+def test_spawn_workers_resolves_claude_opus_5_alias(wt):
+    """A user-friendly alias is expanded to the canonical id before spawning."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_engine("Q", "claude")
+    wt.config.set_model("Q", "opus-5")
+    wt.q.enqueue(project="Q", note="work")
+    r = wt.workers.reconcile_once(dry_run=True)
+    spawned = [s for s in r["spawned"] if s["queue"] == "Q"]
+    assert spawned
+    rec = spawned[0]
+    assert rec.get("engine") == "claude"
+    assert rec.get("model") == "claude-opus-5"
+    argv = rec.get("argv", [])
+    assert "--model" in argv
+    assert argv[argv.index("--model") + 1] == "claude-opus-5"
+
+
 def test_spawn_run_once_worker_logs_spawn(wt, monkeypatch):
     """WT-103: the "drain once" play button's spawn must land a SPAWN row in
     the activity log, same as a reconcile-driven spawn -- otherwise the

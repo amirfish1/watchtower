@@ -521,6 +521,20 @@ def test_config_command_normalizes_an_approved_model(store, capsys):
     assert "model=gpt-5.5" in capsys.readouterr().out
 
 
+def test_config_command_resolves_claude_opus_5_alias(store, capsys):
+    """WT-116: a user-friendly alias is accepted and stored as the canonical id."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+
+    assert cli.main([
+        "config", "-q", "DEMO", "--engine", "claude", "--model", "opus-5",
+    ]) == 0
+    assert config.model("DEMO") == "claude-opus-5"
+    assert config.get_queue_config("DEMO")["model"] == "claude-opus-5"
+    assert "opus-5" in config.approved_models("claude")
+    assert config.is_approved_model("claude", "opus-5")
+
+
 def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeypatch):
     """A queue with no explicit `wt set --model` falls back to CCC's shared
     spawn-defaults.json for its engine (see config.CCC_SPAWN_DEFAULTS_FILE) --

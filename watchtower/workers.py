@@ -2951,6 +2951,8 @@ def build_drain_command(
     Claude workers ignore it here -- their goal always ships over the stdin
     FIFO after spawn, not in argv.
     """
+    from . import config
+    model = config.canonical_model(engine, model)
     bin_name = _ENGINE_BIN.get(engine, engine)
     if engine == "codex":
         # Best-effort, idempotent: keep `wt` runnable in turns that do NOT
