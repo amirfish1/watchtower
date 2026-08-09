@@ -1086,6 +1086,73 @@ def test_claim_rejects_pruned_codex_alias_from_unrelated_session(
     assert wt.q.get(ticket["ref"])["status"] == "open"
 
 
+def test_rebind_continued_worker_refuses_a_second_continuation(wt):
+    """FEAT-NEXT-102: a worker_id may be continued (rebound) at most once.
+
+    The live-pid guard already blocks a CONCURRENT second continuation. This
+    covers the SEQUENTIAL case: a worker_id handed off across an unbounded
+    chain of non-overlapping sessions, each silently inheriting the prior
+    session's self-attribution trust ("closed by <worker_id>") it didn't
+    earn. A second continuation must claim with a fresh --worker id instead.
+    """
+    session_id = "11111111-1111-1111-1111-111111111111"
+    worker_id = "q-codex-chain"
+    wt.workers.record_worker(
+        _dead_pid(), "Q", "codex", worker_id, str(wt.tmp),
+        str(wt.tmp / f"{worker_id}.log"), session_id=session_id,
+    )
+
+    # First continuation: legitimate Codex process replacement, must succeed.
+    assert wt.workers.rebind_continued_worker(
+        worker_id, session_id, os.getpid()
+    ) is True
+
+    # A later, different process asking to continue the SAME worker_id and
+    # thread must be refused, even though the currently-recorded pid is a
+    # different (live) process than the one requesting the rebind.
+    with pytest.raises(ValueError, match="already continued once"):
+        wt.workers.rebind_continued_worker(worker_id, session_id, os.getppid())
+
+    # The worker row must still reflect the first (legitimate) continuation,
+    # not have been mutated by the refused second attempt.
+    rebound = next(
+        w for w in wt.workers.list_workers(prune=False)
+        if w["worker_id"] == worker_id
+    )
+    assert rebound["pid"] == os.getpid()
+
+
+def test_rebind_continued_worker_refuses_a_second_continuation_after_pruning(wt):
+    """FEAT-NEXT-102: the same one-continuation bound applies even when the
+    worker row was pruned in between (routine reads prune dead pids) and the
+    rebind falls back to the codex_registry-backed recreate path — that path
+    must see the same rebound_at history, not silently reset it."""
+    session_id = "22222222-2222-2222-2222-222222222222"
+    worker_id = "q-codex-chain-pruned"
+    wt.workers.record_worker(
+        _dead_pid(), "Q", "codex", worker_id, str(wt.tmp),
+        str(wt.tmp / f"{worker_id}.log"), session_id=session_id,
+    )
+    wt.workers.list_workers()  # routine read prunes the dead pid
+    assert wt.workers.list_workers() == []
+
+    assert wt.workers.rebind_continued_worker(
+        worker_id, session_id, os.getpid()
+    ) is True
+
+    # Kill the just-rebound row off again so the second attempt is forced
+    # through the codex_registry fallback (worker is None) path.
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        data["workers"] = [
+            w for w in data["workers"] if w.get("worker_id") != worker_id
+        ]
+        wt.workers._save(data)
+
+    with pytest.raises(ValueError, match="already continued once"):
+        wt.workers.rebind_continued_worker(worker_id, session_id, os.getppid())
+
+
 def test_claim_next_allows_ambient_unregistered_worker(wt):
     """WT-92: an ambient session_id not in the spawn registry must be allowed
     through — this preserves the OPS-104 fix (unregistered claimer == unknown

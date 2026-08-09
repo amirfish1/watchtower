@@ -2391,6 +2391,7 @@ def _upsert_codex_worker_registry(
             "ref": ref,
             "log": worker.get("log") or "",
             "started_at": worker.get("started_at") or "",
+            "rebound_at": worker.get("rebound_at") or "",
         }
         codex_registry.upsert(
             sid,
@@ -2508,6 +2509,16 @@ def rebind_continued_worker(worker_id: str, session_id: str, pid: int) -> bool:
     while preserving ``CODEX_THREAD_ID``. Rebinding requires both that stable
     thread id and a live Codex ancestor discovered by the caller; a different
     session cannot revive a dead worker alias.
+
+    FEAT-NEXT-102 — bounded to ONE rebind per worker_id. Without this, a
+    worker_id can be silently handed off across an unbounded chain of
+    non-concurrent sessions (process A dies, process B rebinds, B dies,
+    process C rebinds, ...), each inheriting the self-attribution trust
+    ("closed by <worker_id>") the earlier processes earned but the later
+    ones didn't. The concurrent-rebind guard below (live pid still running)
+    catches the OVERLAPPING case; this catches the SEQUENTIAL-reuse case —
+    the second continuation must mint a fresh worker_id via ``record_worker``
+    instead of asking to inherit this one.
     """
     if not worker_id or not _SESSION_ID_RE.fullmatch(str(session_id or "")):
         return False
@@ -2533,6 +2544,13 @@ def rebind_continued_worker(worker_id: str, session_id: str, pid: int) -> bool:
                 if isinstance(registry_row.get("wt"), dict)
                 else {}
             )
+            if wt_meta.get("rebound_at"):
+                raise ValueError(
+                    f"worker {worker_id!r} was already continued once "
+                    f"(rebound at {wt_meta['rebound_at']}); a second "
+                    "continuation must claim with a fresh --worker id "
+                    "instead of reusing this one"
+                )
             worker = {
                 "worker_id": worker_id,
                 "pid": int(pid),
@@ -2566,6 +2584,13 @@ def rebind_continued_worker(worker_id: str, session_id: str, pid: int) -> bool:
             recorded_pid = int(worker.get("pid") or 0)
             if recorded_pid == int(pid):
                 return True
+            if worker.get("rebound_at"):
+                raise ValueError(
+                    f"worker {worker_id!r} was already continued once "
+                    f"(rebound at {worker['rebound_at']}); a second "
+                    "continuation must claim with a fresh --worker id "
+                    "instead of reusing this one"
+                )
             if recorded_pid and _pid_alive(recorded_pid):
                 raise ValueError(
                     f"worker {worker_id!r} is still owned by live pid "
