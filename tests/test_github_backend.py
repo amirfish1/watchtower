@@ -335,7 +335,7 @@ def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _drainable(config)
 
     item = q.enqueue(
@@ -384,7 +384,7 @@ def test_github_backend_rejects_crossworker_close(tmp_path, monkeypatch):
     _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _drainable(config)
 
     item = q.enqueue(project="GHI", note="claimed work", source="test")
@@ -401,7 +401,7 @@ def test_github_backend_imports_issue_title_and_comments_into_worker_text(
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _write_fake_issues(state, [
         _fake_issue(
             1,
@@ -431,7 +431,7 @@ def test_github_backend_blocks_claimed_ticket_by_documented_ref(tmp_path, monkey
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _drainable(config)
 
     item = q.enqueue(project="GHI", note="needs a decision")
@@ -461,7 +461,7 @@ def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys)
     assert main([
         "set", "-q", "GHCLI",
         "--backend", "github",
-        "--github-repo", "owner/repo",
+        "--github-repo", "acme/repo",
     ]) == 0
     _drainable(config, "GHCLI")
     assert main([
@@ -498,7 +498,7 @@ def test_cli_edit_text_replaces_github_issue_body_and_preserves_metadata(
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     item = q.enqueue(
         project="GHI",
         note="short summary",
@@ -525,7 +525,7 @@ def test_github_backend_ignores_legacy_queue_label_for_a_single_queue_repo(tmp_p
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _drainable(config)
     _write_fake_issues(state, [
         _fake_issue(1, "Plain GitHub issue"),
@@ -571,7 +571,7 @@ def test_github_backend_lists_issues_closed_within_last_14_days(tmp_path, monkey
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
 
     now = datetime.now(timezone.utc)
     recent = _fake_issue(1, "Recently completed")
@@ -609,7 +609,7 @@ def test_github_backend_refuses_direct_claim_until_a_run_is_requested(tmp_path, 
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
 
     with pytest.raises(ValueError, match="not eligible to run"):
@@ -636,7 +636,7 @@ def test_github_drain_off_issues_are_visible_but_not_spawn_worthy(tmp_path, monk
     importlib.reload(health)
     importlib.reload(workers)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
 
     row = {r["queue"]: r for r in health.all_status()}["GHI"]
@@ -666,7 +666,7 @@ def test_github_drain_off_queue_still_staffs_a_requested_run(tmp_path, monkeypat
 
     importlib.reload(workers)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _write_fake_issues(state, [_fake_issue(1, "Parked"), _fake_issue(2, "Run this")])
 
     assert workers.reconcile_once(dry_run=True)["spawned"] == []
@@ -685,7 +685,7 @@ def test_github_run_request_can_be_cancelled_while_still_queued(tmp_path, monkey
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
 
     q.mark_runnable("GHI-1")
@@ -703,7 +703,7 @@ def test_github_no_auto_drain_label_keeps_a_ticket_out_of_auto_drain(tmp_path, m
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _drainable(config)
     _write_fake_issues(state, [
         _fake_issue(1, "Hands off", labels=["watchtower:no-auto-drain"]),
@@ -724,7 +724,7 @@ def test_cli_run_marks_existing_github_issue_runnable(tmp_path, monkeypatch, cap
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, _q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
     from watchtower.cli import main
 
@@ -738,7 +738,7 @@ def test_dashboard_run_api_marks_existing_github_issue_runnable(tmp_path, monkey
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, _q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _write_fake_issues(state, [_fake_issue(1, "Plain GitHub issue")])
     import watchtower.dashboard as dashboard
 
@@ -902,7 +902,7 @@ def test_cached_github_list_failure_is_logged_only_once(tmp_path, monkeypatch):
     import watchtower.github_backend as github_backend
 
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
 
     def failing_run(self, args, *, check=True):
         raise github_backend.GitHubBackendError("gh auth unavailable")
@@ -1088,7 +1088,7 @@ def test_a_new_issue_is_visible_to_the_next_revalidating_read(tmp_path, monkeypa
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _write_fake_issues(state, [_fake_issue(1, "first")])
 
     def refs():
@@ -1249,7 +1249,7 @@ def test_grace_period_delays_auto_claim_but_never_a_requested_run(tmp_path, monk
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     config.set_auto_drain("GHI", True)
     config.set_grace_s("GHI", 180)
     _write_fake_issues(state, [
@@ -1270,7 +1270,7 @@ def test_close_no_longer_requires_the_legacy_queue_label(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     _write_fake_issues(state, [_fake_issue(1, "Never labelled")])
 
     closed = q.close("GHI-1", "worker-1", resolution={"summary": "done anyway"})
@@ -1285,7 +1285,7 @@ def test_github_drain_migration_turns_drain_off_exactly_once(tmp_path, monkeypat
     config, _q = _reload_isolated(tmp_path, monkeypatch)
     config.GH_DRAIN_MIGRATION_MARKER.unlink()
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     config.set_auto_drain("GHI", True)
     config.set_auto_drain("FILEQ", True)  # file-backed: not this migration's business
 
@@ -1307,7 +1307,7 @@ def test_reconciler_runs_the_drain_migration_and_says_why(tmp_path, monkeypatch,
     importlib.reload(workers)
     config.GH_DRAIN_MIGRATION_MARKER.unlink()
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     config.set_auto_drain("GHI", True)
     _write_fake_issues(state, [_eligibility_issue(1, age_s=4000)])
 
@@ -1350,7 +1350,7 @@ def test_drain_on_warns_before_enabling_on_a_public_repo(tmp_path, monkeypatch, 
     import watchtower.cli as cli
 
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
     monkeypatch.setenv("FAKE_GH_VISIBILITY", "public")
 
     cli._warn_if_public_repo("GHI", config)
@@ -1550,7 +1550,7 @@ def test_cli_gh_recheck_forces_live_check_and_reports_per_queue(tmp_path, monkey
     from watchtower.cli import main
 
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
 
     def succeed(self, args, *, check=True):
         return "[]"
@@ -1570,7 +1570,7 @@ def test_cli_gh_recheck_bypasses_backoff_after_a_prior_failure(tmp_path, monkeyp
 
     monkeypatch.setattr(github_backend, "_GH_BACKOFF_BASE_S", 3600.0)  # would not expire mid-test
     config.set_backend("GHI", "github")
-    config.set_github_repo("GHI", "owner/repo")
+    config.set_github_repo("GHI", "acme/repo")
 
     def fail(self, args, *, check=True):
         raise github_backend.GitHubBackendError("gh auth unavailable")

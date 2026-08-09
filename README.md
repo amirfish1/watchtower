@@ -249,7 +249,7 @@ WatchTower's metadata for the dashboard and CLI history.
 
 ```bash
 gh auth login
-wt set -q MYAPP --backend github --github-repo owner/repo
+wt set -q MYAPP --backend github --github-repo <OWNER>/<REPO>
 
 wt add -q MYAPP --title "Fix checkout" --text "Steps to reproduce..."
 wt run MYAPP-123                       # run this issue now (overrides drain/grace)

@@ -2115,7 +2115,11 @@ def cmd_set(args: argparse.Namespace) -> int:
             return 1
         changed.append(f"backend={config.backend(args.queue)}")
     if args.github_repo is not None:
-        config.set_github_repo(args.queue, args.github_repo)
+        try:
+            config.set_github_repo(args.queue, args.github_repo)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         changed.append(f"github_repo={args.github_repo}")
     if args.github_assignee is not None:
         config.set_github_assignee(args.queue, args.github_assignee)
@@ -2259,7 +2263,11 @@ def cmd_config(args: argparse.Namespace) -> int:
             return 1
         changed.append(f"backend={config.backend(args.queue)}")
     if getattr(args, "github_repo", None) is not None:
-        config.set_github_repo(args.queue, args.github_repo)
+        try:
+            config.set_github_repo(args.queue, args.github_repo)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         changed.append(f"github_repo={args.github_repo}")
     if getattr(args, "github_assignee", None) is not None:
         config.set_github_assignee(args.queue, args.github_assignee)

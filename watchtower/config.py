@@ -133,11 +133,21 @@ def backend(queue: str) -> str:
     return value if value in VALID_BACKENDS else "file"
 
 
+def _validate_github_repo(repo: str) -> None:
+    """Reject the literal README placeholder so it cannot be saved as a real repo."""
+    if str(repo or "").strip().lower() == "owner/repo":
+        raise ValueError(
+            "github_repo cannot be the literal README placeholder 'owner/repo'; "
+            "use a real OWNER/REPO value"
+        )
+
+
 def set_github_repo(queue: str, repo: str) -> Dict[str, Any]:
     data = _load()
     q = data.setdefault(queue, {})
     repo = str(repo or "").strip()
     if repo:
+        _validate_github_repo(repo)
         q["github_repo"] = repo
     else:
         q.pop("github_repo", None)
