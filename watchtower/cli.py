@@ -779,23 +779,18 @@ def _verify_close_commit(ref: str, sha: str) -> Tuple[str, str]:
     item = q.get(ref)
     if not item:
         return "", f"error: {ref} not found"
-    from . import config
+    from . import close_proof, config
     repo = str(item.get("repo_path") or config.repo_path(item.get("project", "")) or os.getcwd())
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
-            cwd=repo,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-    except OSError as e:
-        return "", f"error: cannot verify --commit in {repo}: {e}"
-    verified = result.stdout.strip()
-    if result.returncode != 0 or not _COMMIT_SHA_RE.fullmatch(verified):
+    # A queue has one repo_path, but its tickets need not. Look in the expected
+    # repo first, then every other configured one (including `host:/path`
+    # remotes, verified over ssh). The commit must still genuinely resolve --
+    # see close_proof for why widening the search beats loosening the check.
+    verified, _found_in = close_proof.verify(candidate, repo)
+    if not verified:
         return "", (
-            f"error: {candidate} is not a commit in {repo}; commit the verified work "
-            "or use `wt block <ref> --progress \"...\"` instead of closing"
+            f"error: {candidate} is not a commit in {repo} or any other configured "
+            "repo; commit the verified work or use "
+            "`wt block <ref> --progress \"...\"` instead of closing"
         )
     return verified, ""
 
