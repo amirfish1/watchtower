@@ -553,6 +553,33 @@ def test_model_floor_met_ranks_across_engines(store):
     assert config.model_floor_met("Q", "gpt-5.6") is True
 
 
+def test_model_floor_accepts_claude_opus_5(store, capsys):
+    """MYTOPOFMIND-12: ``claude-opus-5`` is an approved model (WT-116) but was
+    missing from VALID_MODEL_FLOORS/MODEL_FLOOR_TIERS, so ``wt add
+    --model-floor claude-opus-5`` failed argparse's choices check with
+    "invalid choice" -- opus-5 not recognized as a valid floor -- and any
+    ticket that did carry it as a floor silently failed open (ranked as
+    "unranked", never blocking a claim) instead of ranking as the top tier."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+    import watchtower.queue as q
+
+    assert "claude-opus-5" in q.VALID_MODEL_FLOORS
+
+    config.set_engine("Q", "claude")
+    config.set_model("Q", "claude-opus-4-8")
+    assert config.model_floor_met("Q", "claude-opus-5") is False
+    config.set_model("Q", "claude-opus-5")
+    assert config.model_floor_met("Q", "claude-opus-5") is True
+
+    assert cli.main([
+        "add", "-q", "Q", "--title", "needs top-tier opus", "--note", "n",
+        "--model-floor", "claude-opus-5",
+    ]) == 0
+    ref = capsys.readouterr().out.split()[1]
+    assert q.get(ref)["model_floor"] == "claude-opus-5"
+
+
 def test_add_and_claim_honor_model_floor(store, capsys):
     """FEAT-NEXT-120: a ticket whose floor exceeds the claiming queue's
     configured model is auto-parked blocked instead of claimed."""

@@ -120,6 +120,7 @@ VALID_MODEL_FLOORS = (
     "kimi-code/kimi-for-coding-highspeed",
     "claude-sonnet-5",
     "claude-opus-4-8",
+    "claude-opus-5",
     "",
 )
 

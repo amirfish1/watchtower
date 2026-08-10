@@ -540,6 +540,7 @@ MODEL_FLOOR_TIERS = (
     "claude-sonnet-5",
     "kimi-code/kimi-for-coding-highspeed",
     "claude-opus-4-8",
+    "claude-opus-5",
 )
 
 
