@@ -1980,6 +1980,9 @@ def test_context_budget_recycles_worker_at_claim(store, tmp_path, monkeypatch):
     result = q.claim_next("ctx-worker-01", project="CTXQ")
     assert result == {"stop": True, "reason": "context_budget"}
     assert q.get("CTXQ-1")["status"] == "open"
+    # Recycling is a queue-scoped release: a stopped worker must not remain
+    # eligible for staffing or stuck-queue nudges.
+    assert workers.live_worker_count("CTXQ") == 0
 
     # An unregistered caller with the SAME huge transcript claims normally —
     # humans must never be recycled by the worker budget.

@@ -1213,6 +1213,11 @@ def claim_next(
     except Exception:
         over = 0
     if over:
+        # This path itself tells the worker to exit, so persist the same
+        # queue detachment that a reconciler stop signal establishes. Without
+        # it, the worker remains countable and receives stuck-queue nudges
+        # after it has correctly honored the recycle stop.
+        _workers._mark_worker_released(session_id)
         _log(
             "STOP",
             f"{session_id} — context budget exceeded "
