@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -75,6 +76,11 @@ MODEL_ALIASES: Dict[str, Dict[str, str]] = {
         "opus-5": "claude-opus-5",
     },
 }
+
+# Claude short forms that carry a version (``sonnet-5``, ``opus-4-8``) and so
+# need the ``claude-`` prefix to be a valid ``--model`` flag value. Bare family
+# names (``sonnet``) are already accepted by the CLI and must NOT be rewritten.
+_CLAUDE_VERSIONED_ALIAS = re.compile(r"^(sonnet|opus|haiku|fable)-\d", re.IGNORECASE)
 
 CONFIG_FILE = Path(
     os.environ.get("WATCHTOWER_CONFIG_FILE")
@@ -483,10 +489,30 @@ def canonical_model(eng: str, model_value: str) -> str:
     Pass-through for values that are not aliases so legacy and CCC values stay
     unchanged. This is the single point where user-facing shortcuts like
     ``opus-5`` become the actual ``--model`` flag value the engine CLI accepts.
+
+    Two layers, in order:
+
+    1. The explicit ``MODEL_ALIASES`` table, for remaps where the short form
+       does not simply prefix (``opus-5`` -> ``claude-opus-5`` survived a
+       retarget from ``claude-opus-4-8``, so it must stay table-driven).
+    2. A structural fallback for claude's *versioned* short forms
+       (``sonnet-5`` -> ``claude-sonnet-5``). CCC stores these bare for its
+       own ``/model`` picker, but the claude CLI's ``--model`` flag rejects
+       them, so an explicit ``wt set --model sonnet-5`` used to reach
+       ``build_drain_command`` verbatim and kill the worker at spawn with
+       "There's an issue with the selected model (sonnet-5)". Bare *family*
+       names (``sonnet``, ``opus``) and already-prefixed ids are valid as-is
+       and pass through untouched.
     """
     eng = str(eng or "").strip().lower()
     m = str(model_value or "").strip()
-    return MODEL_ALIASES.get(eng, {}).get(m, m)
+    aliased = MODEL_ALIASES.get(eng, {}).get(m)
+    if aliased:
+        return aliased
+    if eng == "claude" and m and not m.lower().startswith("claude-") \
+            and _CLAUDE_VERSIONED_ALIAS.match(m):
+        return f"claude-{m}"
+    return m
 
 
 def approved_models(eng: str) -> tuple[str, ...]:
