@@ -858,7 +858,11 @@ def cmd_release(args: argparse.Namespace) -> int:
     grabbing it mid-investigation, and turns out better left for the normal
     pool to pick up."""
     worker = args.worker or f"wt-cli-{os.getpid()}"
-    item = q.release(args.ref, session_id=worker)
+    try:
+        item = q.release(args.ref, session_id=worker, force=args.force)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     if not item:
         existing = q.get(args.ref)
         if existing is None:
@@ -3392,6 +3396,10 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("release")
     s.add_argument("ref")
     s.add_argument("--worker", default="", help="your session/worker id")
+    s.add_argument("--force", action="store_true",
+                   help="release even if the ticket is blocked (needs_input) -- "
+                        "normally refused because it erases the open question; "
+                        "prefer `wt answer` to resolve a block")
     s.set_defaults(func=cmd_release)
 
     s = sub.add_parser("block")

@@ -1435,6 +1435,46 @@ def test_release_returns_claim_to_open(store, capsys):
     assert "not in_progress" in capsys.readouterr().err
 
 
+def test_release_refuses_blocked_ticket_and_force_overrides(store, capsys):
+    """A blocked ticket's release() clears needs_input/block_question (see
+    update_status's reopen branch), so releasing it hands the ticket to a
+    fresh worker with no memory of the open question -- that worker
+    re-investigates, re-blocks with the same question, and a naive
+    end-of-life cleanup that releases everything a worker holds repeats this
+    forever. `wt release` must refuse a blocked ticket by default and only
+    proceed with --force."""
+    import watchtower.queue as q
+    from watchtower.cli import build_parser
+
+    q.enqueue(project="RELB", note="needs a human call")
+    claimed = q.claim_next("worker-1", project="RELB")
+    ref = claimed["ref"]
+    q.block(ref, session_id="worker-1", question="which layout?")
+
+    parser = build_parser()
+    args = parser.parse_args(["release", ref, "--worker", "worker-1"])
+    rc = args.func(args)
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "blocked awaiting human input" in err
+    assert "which layout?" in err
+
+    item = q.get(ref)
+    assert item["status"] == "in_progress"
+    assert item["needs_input"] is True
+    assert item["block_question"] == "which layout?"
+
+    # --force still allows a deliberate override.
+    args_force = parser.parse_args(["release", ref, "--worker", "worker-1", "--force"])
+    rc_force = args_force.func(args_force)
+    out = capsys.readouterr().out
+    assert rc_force == 0
+    assert "RELEASED" in out
+    item = q.get(ref)
+    assert item["status"] == "open"
+    assert item["needs_input"] is False
+
+
 def test_ticket_history_records_full_lifecycle(store):
     """WT-87: each claim/reopen/close/block is appended to ``history``, not
     just overwritten as the latest snapshot — so a ticket that was claimed by
