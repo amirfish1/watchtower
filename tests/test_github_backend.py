@@ -563,6 +563,14 @@ def test_github_backend_comment_posts_issue_comment_and_records_history(
 
 
 def test_cli_answer_and_comment_resolve_github_backed_refs(tmp_path, monkeypatch, capsys):
+    # cmd_claim reads these from the real environment to attribute the
+    # claiming session (cli.py's session_uuid lookup). Left unset, a claim
+    # made inside a live Claude/Codex session picks up that session's real
+    # id, and the comment/answer calls below then deliver a real
+    # "[WATCHTOWER] ..." message into that live session instead of staying
+    # inside the test's isolated queue state.
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, _q = _reload_isolated(tmp_path, monkeypatch)
     from watchtower.cli import main
