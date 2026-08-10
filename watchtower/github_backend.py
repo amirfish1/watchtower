@@ -1276,6 +1276,111 @@ class GitHubIssuesBackend:
         ])
         return self.get(ident)
 
+    def answer(
+        self,
+        ident: Any,
+        text: str,
+        session_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Record a human answer on a blocked GitHub-backed ticket and post it
+        as an issue comment.
+
+        Clears ``needs_input``. When the ticket has no resumable session, the
+        claim is released so the worker pool can pick the answer back up —
+        mirroring the file-backed queue's release/requeue behaviour.
+        """
+        item = self.get(ident)
+        if item is None:
+            return None
+        number = str(item["number"])
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        now = _now_iso()
+        answer_text = _clip(text, 24000)
+        meta["needs_input"] = False
+        meta["answered_at"] = now
+        _append_history(
+            meta,
+            "answer",
+            kind="human",
+            worker=str(session_id or ""),
+            text=answer_text,
+        )
+        releasing = bool(
+            item.get("status") == "in_progress"
+            and not item.get("claimed_session_id")
+        )
+        if releasing:
+            for key in (
+                "claimed_by", "claimed_at", "claimed_session_id",
+                "block_question", "blocked_at",
+            ):
+                meta.pop(key, None)
+            _append_history(
+                meta,
+                "reopen",
+                kind="human",
+                worker=str(session_id or ""),
+                reason="answered_without_resumable_session",
+            )
+        self._run([
+            "issue", "edit", number,
+            *self._repo_args(),
+            "--body", _body_with_metadata(body, meta),
+        ])
+        if releasing:
+            self._run([
+                "issue", "edit", number,
+                *self._repo_args(),
+                "--remove-label", self.in_progress_label,
+            ])
+            self._run(["issue", "reopen", number, *self._repo_args()], check=False)
+        # Post the answer as a real GitHub issue comment so it is visible in
+        # the issue discussion and the worker session can resume from it.
+        self._run([
+            "issue", "comment", number,
+            *self._repo_args(),
+            "--body", answer_text,
+        ])
+        return self.get(ident)
+
+    def comment(
+        self,
+        ident: Any,
+        text: str,
+        by: str = "human",
+        session_id: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Append a plain activity comment to a GitHub-backed ticket.
+
+        The comment is posted as a GitHub issue comment and recorded in the
+        issue-body metadata history so the ticket timeline stays complete.
+        """
+        item = self.get(ident)
+        if item is None:
+            return None
+        number = str(item["number"])
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        actor_kind = by if by in ("worker", "human", "system") else "human"
+        comment_text = _clip(text, 24000)
+        _append_history(
+            meta,
+            "comment",
+            kind=actor_kind,
+            worker=str(session_id or ""),
+            text=comment_text,
+        )
+        self._run([
+            "issue", "edit", number,
+            *self._repo_args(),
+            "--body", _body_with_metadata(body, meta),
+        ])
+        self._run([
+            "issue", "comment", number,
+            *self._repo_args(),
+            "--body", comment_text,
+        ])
+        return self.get(ident)
+
     def update(self, ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
         item = self.get(ident)
         if item is None:

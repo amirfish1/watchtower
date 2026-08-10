@@ -1657,6 +1657,16 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
     back-and-forth. A ticket with a resumable worker stays ``in_progress``;
     without one it reopens so the worker pool can claim it instead of leaving
     the answer stranded behind an unreclaimable claim."""
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        item = backend.answer(ident, text, session_id=session_id)
+        if item:
+            _log(
+                "ANSWER",
+                f"{item.get('ref', ident)} — {_clip(text, 240)}",
+                queue=item.get("project", ""),
+            )
+        return item
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -1697,6 +1707,16 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
 
 def comment(ident: Any, text: str, by: str = "human", session_id: str = "") -> Optional[Dict[str, Any]]:
     """Append a plain ticket activity comment without changing ticket state."""
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        item = backend.comment(ident, text, by=by, session_id=session_id)
+        if item:
+            _log(
+                "COMMENT",
+                f"{item.get('ref', ident)} — {_clip(text, 240)}",
+                queue=item.get("project", ""),
+            )
+        return item
     actor_kind = by if by in ("worker", "human", "system") else "human"
     with _FileLock(_lock_path()):
         data = _load_unlocked()

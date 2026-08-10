@@ -198,6 +198,16 @@ if args[:2] == ["issue", "close"]:
     print(f"Closed issue #{issue['number']}")
     sys.exit(0)
 
+if args[:2] == ["issue", "comment"]:
+    issue = issue_by_number(data, args[2])
+    body = opt(args, "--body")
+    if body:
+        issue["comments"].append({"author": {"login": "watchtower"}, "body": body})
+    issue["updatedAt"] = now()
+    save(data)
+    print(f"https://github.com/{opt(args, '--repo', 'owner/repo')}/issues/{issue['number']}#issuecomment-{len(issue['comments'])}")
+    sys.exit(0)
+
 if args[:2] == ["repo", "view"]:
     save(data)
     print(json.dumps({
@@ -451,6 +461,132 @@ def test_github_backend_blocks_claimed_ticket_by_documented_ref(tmp_path, monkey
     ]
     issue = json.loads(state.read_text())["issues"][0]
     assert "needs_input: true" in issue["body"]
+
+
+def test_github_backend_answer_posts_comment_and_keeps_claim_with_session(
+    tmp_path, monkeypatch,
+):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "acme/repo")
+    _drainable(config)
+
+    item = q.enqueue(project="GHI", note="needs a decision")
+    q.claim_by_ref(item["ref"], "worker-1", session_uuid="session-abc")
+    q.block("GHI-1", session_id="worker-1", question="A or B?")
+
+    answered = q.answer("GHI-1", "Go with A", session_id="human-1")
+
+    assert answered["ref"] == "GHI-1"
+    assert answered["status"] == "in_progress"
+    assert answered["needs_input"] is False
+    assert answered["claimed_session_id"] == "session-abc"
+    assert [event["event"] for event in answered["history"]] == [
+        "claim", "block", "answer",
+    ]
+
+    issue = json.loads(state.read_text())["issues"][0]
+    assert "needs_input: false" in issue["body"]
+    assert any(
+        isinstance(c, dict) and c.get("body") == "Go with A"
+        for c in issue["comments"]
+    )
+    assert any(
+        command[:2] == ["issue", "comment"]
+        for command in json.loads(state.read_text())["commands"]
+    )
+
+
+def test_github_backend_answer_releases_claim_without_session(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "acme/repo")
+    _drainable(config)
+
+    item = q.enqueue(project="GHI", note="needs a decision")
+    q.claim_by_ref(item["ref"], "worker-1")
+    q.block("GHI-1", session_id="worker-1", question="A or B?")
+
+    answered = q.answer("GHI-1", "Go with B", session_id="human-1")
+
+    assert answered["ref"] == "GHI-1"
+    assert answered["status"] == "open"
+    assert answered["needs_input"] is False
+    assert answered.get("claimed_by") is None
+    assert [event["event"] for event in answered["history"]] == [
+        "claim", "block", "answer", "reopen",
+    ]
+
+    issue = json.loads(state.read_text())["issues"][0]
+    assert issue["state"] == "OPEN"
+    assert "watchtower:in-progress" not in issue["labels"]
+    assert any(
+        isinstance(c, dict) and c.get("body") == "Go with B"
+        for c in issue["comments"]
+    )
+
+
+def test_github_backend_comment_posts_issue_comment_and_records_history(
+    tmp_path, monkeypatch,
+):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "acme/repo")
+    _drainable(config)
+
+    item = q.enqueue(project="GHI", note="needs a decision")
+    q.claim_by_ref(item["ref"], "worker-1")
+
+    commented = q.comment("GHI-1", "Heads up: checking dependencies.", session_id="human-1")
+
+    assert commented["ref"] == "GHI-1"
+    assert commented["status"] == "in_progress"
+    assert [event["event"] for event in commented["history"]] == ["claim", "comment"]
+
+    issue = json.loads(state.read_text())["issues"][0]
+    assert any(
+        isinstance(c, dict) and c.get("body") == "Heads up: checking dependencies."
+        for c in issue["comments"]
+    )
+
+
+def test_cli_answer_and_comment_resolve_github_backed_refs(tmp_path, monkeypatch, capsys):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    from watchtower.cli import main
+
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "acme/repo")
+    _drainable(config)
+
+    assert main(["add", "-q", "GHI", "--title", "blocked work", "--note", "blocked"]) == 0
+    assert main(["claim", "-q", "GHI", "--worker", "cli-worker"]) == 0
+    assert main([
+        "block", "GHI-1", "--worker", "cli-worker",
+        "--question", "Which path?",
+    ]) == 0
+
+    assert main([
+        "comment", "GHI-1", "--by", "human",
+        "--worker", "cli-worker", "Adding context before the answer.",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "COMMENTED: GHI-1" in out
+
+    assert main([
+        "answer", "GHI-1", "--worker", "cli-worker", "Take path A",
+    ]) == 0
+    out = capsys.readouterr().out
+    assert "ANSWERED: GHI-1" in out
+
+    issue = json.loads(state.read_text())["issues"][0]
+    assert any(
+        isinstance(c, dict) and c.get("body") == "Take path A"
+        for c in issue["comments"]
+    )
 
 
 def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys):
