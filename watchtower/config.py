@@ -134,10 +134,11 @@ def backend(queue: str) -> str:
 
 
 def _validate_github_repo(repo: str) -> None:
-    """Reject the literal README placeholder so it cannot be saved as a real repo."""
-    if str(repo or "").strip().lower() == "owner/repo":
+    """Reject common placeholder values so they cannot be saved as a real repo."""
+    placeholder = str(repo or "").strip().lower()
+    if placeholder in {"owner/repo", "acme/repo"}:
         raise ValueError(
-            "github_repo cannot be the literal README placeholder 'owner/repo'; "
+            f"github_repo cannot be the literal placeholder '{repo}'; "
             "use a real OWNER/REPO value"
         )
 
