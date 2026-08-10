@@ -1580,15 +1580,39 @@ def close(
     )
 
 
-def release(ident: Any, session_id: str = "") -> Optional[Dict[str, Any]]:
+def release(ident: Any, session_id: str = "", force: bool = False) -> Optional[Dict[str, Any]]:
     """Give up a claim without closing it, e.g. a ticket claimed defensively
     (to stop other workers grabbing it mid-investigation) that turns out
     better left for the normal worker pool to pick up and fix.
+
+    Refuses a ticket that is currently ``needs_input`` unless ``force=True``:
+    the reopen path this calls clears ``needs_input``/``block_question`` (see
+    ``update_status``), so releasing a blocked ticket silently erases the
+    open question. A fresh worker then re-claims it with no memory of what
+    was asked, re-investigates from scratch, and re-blocks with the same
+    question -- an endless investigate/block/release/reclaim loop that burns
+    a full worker session every cycle for zero progress (observed on
+    BYM-GH-FINIE-571 and 9 sibling tickets, each recycled 3 times over 6
+    hours). ``requeue_orphaned_tickets`` already carries the equivalent
+    guard for its own reopen path; this brings the plain release path in
+    line with it. ``wt answer`` is the intentional unblock: it clears
+    ``needs_input`` together with the human's answer, not just the claim.
 
     ``require_status="in_progress"`` is a compare-and-swap guard so a stale
     ref that's already closed or reopened by someone else is left alone
     rather than clobbered (WT-86, same pattern as the OPS-72 orphan-reopen
     guard)."""
+    if not force:
+        current = get(ident)
+        if current is not None and current.get("needs_input"):
+            raise ValueError(
+                f"{current.get('ref', ident)} is blocked awaiting human input: "
+                f"{current.get('block_question') or '(no question recorded)'} "
+                f"-- releasing would erase that question and hand it to a "
+                f"fresh worker with no memory of it. Use `wt answer "
+                f"{current.get('ref', ident)} \"...\"` to resolve it, or pass "
+                f"force=True (--force on the CLI) if the block is stale."
+            )
     return update_status(ident, "open", session_id, require_status="in_progress",
                           reason="released")
 
@@ -1749,6 +1773,24 @@ def list_blocked(project: Optional[str] = None) -> List[Dict[str, Any]]:
     out = []
     for it in _load_unlocked().get("items", []):
         if not it.get("needs_input"):
+            continue
+        if proj and it.get("project") != proj:
+            continue
+        out.append(it)
+    return out
+
+
+def list_active_claims(project: Optional[str] = None) -> List[Dict[str, Any]]:
+    """In-progress tickets a worker is actively holding -- ``in_progress`` but
+    NOT parked on ``needs_input`` (a blocked ticket stays ``in_progress``, so
+    it's excluded here; use ``list_blocked`` for those). File-backed only,
+    same scope as ``list_blocked``. Lets the reconciler tell "worker has
+    nothing else to do" apart from "worker blocked one ticket but is actively
+    working another"."""
+    proj = _norm_project(project) if project else None
+    out = []
+    for it in _load_unlocked().get("items", []):
+        if it.get("status") != "in_progress" or it.get("needs_input"):
             continue
         if proj and it.get("project") != proj:
             continue

@@ -409,6 +409,34 @@ def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
     assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1
 
 
+def test_reconcile_does_not_spawn_replacement_for_worker_still_draining(wt):
+    """A worker that blocks one ticket and immediately claims the next isn't
+    idle -- it's still actively draining the queue. Before this fix, blocking
+    even a single ticket zeroed the worker's `staffed` credit for as long as
+    it held that ticket, so the reconciler spawned a fresh "replacement"
+    worker on every subsequent tick even while the original kept working --
+    each replacement then blocked its own ticket too, cascading into a pile
+    of workers nobody asked for (WATCHTOWER-1: "why do I have 3 workers when
+    I approved only 1?")."""
+    wt.config.set_auto_drain("Q", True)  # desired_workers defaults to 1
+    blocked = wt.q.enqueue(project="Q", note="needs a human call")
+    active = wt.q.enqueue(project="Q", note="actively working this one")
+
+    worker = _live_worker(wt, "Q")
+    claimed = wt.q.claim_next(
+        worker["worker_id"], project="Q", session_uuid=worker["session_id"],
+    )
+    assert claimed["ref"] == blocked["ref"]
+    wt.q.block(blocked["ref"], question="fix or dismiss?", session_id=worker["worker_id"])
+    claimed2 = wt.q.claim_next(
+        worker["worker_id"], project="Q", session_uuid=worker["session_id"],
+    )
+    assert claimed2["ref"] == active["ref"]
+
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 0
+
+
 def test_reconcile_desired_two_spawns_two(wt):
     wt.config.set_auto_drain("Q", True)
     wt.config.set_desired_workers("Q", 2)

@@ -3867,6 +3867,25 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     except Exception:
         blocked_worker_ids = {}
 
+    # A worker that blocked one ticket and immediately claimed the next isn't
+    # idle -- it's still actively draining. Blocked-worker exclusion (above)
+    # is meant to stop a worker with *nothing else to do* from hogging the
+    # spawn budget, not to treat "has ever blocked a ticket" as permanently
+    # unproductive. Without this, a queue full of one-off, mostly-unactionable
+    # tickets spawns a fresh worker every time the current one blocks another
+    # -- each new worker then blocks its own ticket too, cascading into a pile
+    # of workers that all outlive their usefulness because idle-release also
+    # spares any worker still holding a blocked ticket (WATCHTOWER-1).
+    busy_worker_ids: Dict[str, Set[str]] = {}
+    try:
+        for it in (_q_blocked.list_active_claims() or []):
+            wid = str(it.get("claimed_by") or "")
+            qn = str(it.get("project") or "")
+            if wid and qn:
+                busy_worker_ids.setdefault(qn, set()).add(wid)
+    except Exception:
+        busy_worker_ids = {}
+
     # Use health for queue depth + stuck ground-truth -- one call covers all queues.
     health_by_queue: Dict[str, Dict[str, Any]] = {
         row["queue"]: row for row in health.all_status()
@@ -4161,13 +4180,18 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         live = live_by_queue.get(q_name, [])
         actual = len(live)
         blocked_ids_here = blocked_worker_ids.get(q_name, set())
+        busy_ids_here = busy_worker_ids.get(q_name, set())
         blocked_count = sum(
-            1 for w in live if str(w.get("worker_id") or "") in blocked_ids_here
+            1 for w in live
+            if str(w.get("worker_id") or "") in blocked_ids_here
+            and str(w.get("worker_id") or "") not in busy_ids_here
         )
         # Blocked workers don't do dispatch work, so they shouldn't consume the
         # queue's spawn budget -- `staffed` is what actually gates spawn/surplus
         # decisions below, while `actual` (raw live count) stays around for
         # logging and the nudge/stuck check, which cares about real processes.
+        # A worker that holds a blocked ticket but is *also* actively working
+        # an in_progress one isn't idle, so it stays out of blocked_count.
         staffed = actual - blocked_count
         blocked_note = f", {blocked_count} blocked" if blocked_count else ""
 
