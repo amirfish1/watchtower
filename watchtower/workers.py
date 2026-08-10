@@ -138,6 +138,24 @@ def _worker_runbook_ref() -> str:
     return _WORKER_RUNBOOK_URL
 
 
+def _spawn_env() -> Optional[Dict[str, str]]:
+    """Environment for a spawned worker subprocess.
+
+    In production the child inherits the parent's environment so legitimate
+    overrides (binary paths, etc.) are preserved. When the parent is running
+    under pytest, all ``WATCHTOWER_*`` environment variables are stripped so
+    the worker does not inherit pytest sandbox variables that point at
+    temporary test files and operate against test fixture state (OPS-544).
+    """
+    if "PYTEST_CURRENT_TEST" not in os.environ:
+        return None
+    env = os.environ.copy()
+    for key in list(env):
+        if key.startswith("WATCHTOWER_"):
+            env.pop(key, None)
+    return env
+
+
 # Codex approval/sandbox policy is per-turn, not per-thread: the spawn's
 # --dangerously-bypass-approvals-and-sandbox does NOT carry over to turns
 # other clients start on the same thread (native goal continuations, desktop
@@ -4507,6 +4525,7 @@ def spawn_workers(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 cwd=repo_path,
+                env=_spawn_env(),
             )
         except OSError as e:
             popen_error = e
@@ -4630,6 +4649,7 @@ def spawn_run_once_worker(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             cwd=repo_path,
+            env=_spawn_env(),
         )
     finally:
         logf.close()
@@ -4828,6 +4848,7 @@ def spawn_adhoc(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             cwd=repo_path,
+            env=_spawn_env(),
         )
     finally:
         logf.close()

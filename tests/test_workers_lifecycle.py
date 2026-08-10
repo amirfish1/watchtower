@@ -775,6 +775,66 @@ def test_spawn_workers_missing_binary_records_launch_failure(wt, monkeypatch):
     assert cooldown and cooldown["worker_id"] == failures[0]["worker_id"]
 
 
+def test_spawn_workers_strips_pytest_sandbox_env_vars(wt, monkeypatch):
+    """Workers spawned from inside a pytest run must not inherit WATCHTOWER_*
+    test-isolation variables that point at temporary fixtures (OPS-544)."""
+    monkeypatch.setenv("WATCHTOWER_STORE", "/tmp/pytest-sandbox/queue.json")
+    monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", "/tmp/pytest-sandbox/config.json")
+    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", "/tmp/pytest-sandbox/fake-codex")
+    captured_envs = []
+
+    class FakeProc:
+        pid = 999999
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(argv, **kwargs):
+        captured_envs.append((argv, kwargs.get("env")))
+        return FakeProc()
+
+    monkeypatch.setattr(wt.workers.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wt.workers, "write_to_worker_fifo", lambda *a, **k: True)
+
+    wt.workers.spawn_workers("Q", engine="codex", repo_path=str(wt.tmp))
+
+    # The first Popen is the worker spawn; later calls may be PID liveness probes.
+    worker_env = captured_envs[0][1]
+    assert worker_env is not None
+    assert "WATCHTOWER_STORE" not in worker_env
+    assert "WATCHTOWER_CONFIG_FILE" not in worker_env
+    assert "WATCHTOWER_CODEX_BIN" not in worker_env
+    # Non-WATCHTOWER variables like PATH are preserved.
+    assert "PATH" in worker_env
+
+
+def test_spawn_workers_inherits_env_outside_pytest(wt, monkeypatch):
+    """Outside pytest, workers inherit the parent's environment unchanged."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("WATCHTOWER_STORE", "/custom/queue.json")
+    captured_envs = []
+
+    class FakeProc:
+        pid = 999999
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(argv, **kwargs):
+        captured_envs.append((argv, kwargs.get("env")))
+        return FakeProc()
+
+    monkeypatch.setattr(wt.workers.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wt.workers, "write_to_worker_fifo", lambda *a, **k: True)
+
+    wt.workers.spawn_workers("Q", engine="codex", repo_path=str(wt.tmp))
+
+    # The first Popen is the worker spawn; later calls may be PID liveness probes.
+    worker_env = captured_envs[0][1]
+    # env=None tells subprocess.Popen to inherit the parent's environment.
+    assert worker_env is None
+
+
 def test_engine_available_uses_codex_env_override(wt, monkeypatch):
     script = wt.tmp / "fake-codex"
     script.write_text("#!/bin/sh\nexit 0\n")
