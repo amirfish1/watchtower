@@ -531,8 +531,11 @@ _AUDIT_BOOT_ID = uuid.uuid4().hex[:12]
 # _RELEASED_KILL_GRACE_S) any released worker whose released_at is older
 # than this, on a path that does NOT consult _worker_released() as an
 # exclusion -- the whole point is to collect exactly the workers that gate
-# excludes everywhere else.
-RELEASED_TTL_S = int(os.environ.get("WATCHTOWER_RELEASED_TTL_S") or 4 * 3600)
+# excludes everywhere else. 1h, not the "a few hours" GH issue #1 originally
+# floated: it happens to match the measured prompt-cache TTL, so a released
+# worker's cache is already cold well before this fires -- resuming it after
+# that point buys nothing but the leak risk the TTL exists to bound.
+RELEASED_TTL_S = int(os.environ.get("WATCHTOWER_RELEASED_TTL_S") or 1 * 3600)
 _RELEASED_KILL_GRACE_S = 30
 
 # A live worker that has never claimed a ticket and whose queue is stuck can be
