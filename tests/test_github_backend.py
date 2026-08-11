@@ -275,9 +275,25 @@ def _reload_isolated(tmp_path: Path, monkeypatch):
     monkeypatch.setenv(
         "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json")
     )
+    # The worker registry has to be sandboxed too: the drain-off tests below
+    # call workers.reconcile_once(), which without this reads the machine's
+    # live ~/.watchtower/workers.json (and takes the real reconcile lock).
+    # Whether a spawn was planned then depended on what the actual fleet was
+    # doing at that second -- these tests failed whenever enough real workers
+    # were alive.
+    monkeypatch.setenv("WATCHTOWER_WORKERS_FILE", str(tmp_path / "workers.json"))
+    monkeypatch.setenv(
+        "WATCHTOWER_LAUNCH_FAILURES_FILE", str(tmp_path / "launch-failures.json")
+    )
+    monkeypatch.setenv("WATCHTOWER_STOP_SIGNALS_DIR", str(tmp_path / "stop-signals"))
+    monkeypatch.setenv(
+        "WATCHTOWER_WORKER_SESSIONS_FILE", str(tmp_path / "worker-sessions.json")
+    )
+    monkeypatch.setenv("WATCHTOWER_WORKER_IDS_FILE", str(tmp_path / "worker-ids.json"))
     import watchtower.config as config
     import watchtower.github_backend as github_backend
     import watchtower.queue as q
+    import watchtower.workers as _workers
 
     importlib.reload(config)
     # Reset github_backend's module-level `_list_issues` cache (WT-87): every
@@ -285,6 +301,7 @@ def _reload_isolated(tmp_path: Path, monkeypatch):
     # from a prior test would otherwise leak into this one within its TTL.
     importlib.reload(github_backend)
     importlib.reload(q)
+    importlib.reload(_workers)
     # Pretend the one-time GitHub drain migration already ran (it has, on any
     # real install, long before these code paths run). Tests that exercise the
     # migration itself remove this marker first.
