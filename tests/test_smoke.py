@@ -1996,6 +1996,63 @@ def test_context_budget_recycles_worker_at_claim(store, tmp_path, monkeypatch):
     assert again is not None and again.get("ref") == "CTXQ-2"
 
 
+def test_context_budget_defers_recycle_while_worker_holds_a_claim(
+    store, tmp_path, monkeypatch
+):
+    """If a registered worker somehow still holds an unfinished (in_progress,
+    non-blocked) ticket when it calls claim_next() again -- a protocol slip,
+    never the intended claim->close/block->claim loop -- recycling it would
+    tell it to exit immediately and strand that ticket. Unlike a dead worker,
+    a recycled one is only released (kept alive), so
+    requeue_orphaned_tickets() would not catch it until RELEASED_TTL_S
+    finally reaps the process, hours later. The recycle must defer instead of
+    firing while a claim is still held."""
+    import importlib
+
+    import watchtower.workers as workers
+    import watchtower.queue as q
+
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("WATCHTOWER_CONTEXT_RECYCLE_BYTES", "1000")
+    monkeypatch.setenv("WATCHTOWER_WORKERS_FILE", str(tmp_path / "workers.json"))
+    importlib.reload(workers)
+    importlib.reload(q)
+
+    session_uuid = "22222222-3333-4444-5555-666666666666"
+    transcript_dir = tmp_path / "claude" / "projects" / "-Users-x-proj"
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / f"{session_uuid}.jsonl").write_text("x" * 2000)
+
+    import os as _os
+    (tmp_path / "workers.json").write_text(json.dumps({"workers": [
+        {"worker_id": "ctx-worker-02", "engine": "claude",
+         "session_id": session_uuid, "queue": "CTXQ2",
+         "pid": _os.getpid()},
+    ]}))
+
+    q.enqueue(project="CTXQ2", note="already held")
+
+    # Claim the ticket directly (bypassing the budget check, same as a
+    # normal first claim) and leave it in_progress -- never closed or
+    # blocked -- to simulate the protocol-slip case.
+    held = q.claim_by_ref("CTXQ2-1", "ctx-worker-02", session_uuid=session_uuid)
+    assert held["status"] == "in_progress"
+
+    # A second claim_next() call is over budget, but must NOT recycle: the
+    # worker still holds CTXQ2-1 unfinished. Nothing else is open, so the
+    # call finds nothing claimable -- the point is it does NOT return the
+    # recycle-stop while abandoning the held ticket.
+    result = q.claim_next("ctx-worker-02", project="CTXQ2", session_uuid=session_uuid)
+    assert result != {"stop": True, "reason": "context_budget"}
+    assert q.get("CTXQ2-1")["status"] == "in_progress"
+
+    # Once the held ticket is closed, the worker is a clean boundary again
+    # and the next claim_next() call recycles normally.
+    q.close("CTXQ2-1", "ctx-worker-02", resolution="done")
+    result2 = q.claim_next("ctx-worker-02", project="CTXQ2", session_uuid=session_uuid)
+    assert result2 == {"stop": True, "reason": "context_budget"}
+
+
 def test_answer_requeues_when_session_over_context_budget(store, tmp_path, monkeypatch, capsys):
     """wt answer normally resumes the blocked ticket's original session, but
     when that session's transcript exceeds WATCHTOWER_ANSWER_REQUEUE_BYTES the

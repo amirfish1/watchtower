@@ -1213,18 +1213,35 @@ def claim_next(
     except Exception:
         over = 0
     if over:
-        # This path itself tells the worker to exit, so persist the same
-        # queue detachment that a reconciler stop signal establishes. Without
-        # it, the worker remains countable and receives stuck-queue nudges
-        # after it has correctly honored the recycle stop.
-        _workers._mark_worker_released(session_id)
-        _log(
-            "STOP",
-            f"{session_id} — context budget exceeded "
-            f"({over} transcript bytes); recycling worker",
-            queue=project or "",
-        )
-        return {"stop": True, "reason": "context_budget"}
+        # A worker only reaches claim_next() again after closing or blocking
+        # its previous ticket -- by protocol it should never still hold an
+        # active (non-blocked) claim here. But if it does (a protocol slip,
+        # a retried close, etc.), recycling now would tell it to "exit
+        # immediately" while that ticket sits in_progress and unfinished.
+        # requeue_orphaned_tickets() only reopens a stranded ticket once its
+        # worker's pid is dead -- a recycled worker is merely released (kept
+        # alive, same as an idle release), so the ticket would sit stuck
+        # until the released process is eventually reaped by
+        # RELEASED_TTL_S, up to hours later. Defer the recycle to the next
+        # clean boundary instead of stranding it.
+        held = [
+            it for it in list_active_claims(project)
+            if str(it.get("claimed_by") or "") == str(session_id)
+        ]
+        if not held:
+            # This path itself tells the worker to exit, so persist the same
+            # queue detachment that a reconciler stop signal establishes.
+            # Without it, the worker remains countable and receives
+            # stuck-queue nudges after it has correctly honored the recycle
+            # stop.
+            _workers._mark_worker_released(session_id)
+            _log(
+                "STOP",
+                f"{session_id} — context budget exceeded "
+                f"({over} transcript bytes); recycling worker",
+                queue=project or "",
+            )
+            return {"stop": True, "reason": "context_budget"}
 
     backend = _github_backend_for_project(project)
     if backend is not None:
