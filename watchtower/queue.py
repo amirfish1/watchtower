@@ -1790,34 +1790,29 @@ def comment(ident: Any, text: str, by: str = "human", session_id: str = "") -> O
 
 def list_blocked(project: Optional[str] = None) -> List[Dict[str, Any]]:
     """Tickets parked for a human (``needs_input`` truthy), optionally scoped to
-    one queue. The CLI's ``wt blocked`` and CCC both read this."""
-    proj = _norm_project(project) if project else None
-    out = []
-    for it in _load_unlocked().get("items", []):
-        if not it.get("needs_input"):
-            continue
-        if proj and it.get("project") != proj:
-            continue
-        out.append(it)
-    return out
+    one queue. The CLI's ``wt blocked`` and CCC both read this.
+
+    Routed through ``list_items`` (not a direct ``_load_unlocked`` scan) so a
+    github-backed queue is covered too. This used to read the file store
+    only, which silently returned nothing for every github-backed queue --
+    every worker holding a blocked ticket there read as fully productive to
+    the reconciler's staffing math (see ``list_active_claims``), so a queue
+    stuck entirely behind blocked tickets never got replacement workers."""
+    return [it for it in list_items(project=project) if it.get("needs_input")]
 
 
 def list_active_claims(project: Optional[str] = None) -> List[Dict[str, Any]]:
     """In-progress tickets a worker is actively holding -- ``in_progress`` but
     NOT parked on ``needs_input`` (a blocked ticket stays ``in_progress``, so
-    it's excluded here; use ``list_blocked`` for those). File-backed only,
-    same scope as ``list_blocked``. Lets the reconciler tell "worker has
-    nothing else to do" apart from "worker blocked one ticket but is actively
-    working another"."""
-    proj = _norm_project(project) if project else None
-    out = []
-    for it in _load_unlocked().get("items", []):
-        if it.get("status") != "in_progress" or it.get("needs_input"):
-            continue
-        if proj and it.get("project") != proj:
-            continue
-        out.append(it)
-    return out
+    it's excluded here; use ``list_blocked`` for those). Same scope as
+    ``list_blocked`` (see its docstring for why this goes through
+    ``list_items`` instead of the file store directly). Lets the reconciler
+    tell "worker has nothing else to do" apart from "worker blocked one
+    ticket but is actively working another"."""
+    return [
+        it for it in list_items(status="in_progress", project=project)
+        if not it.get("needs_input")
+    ]
 
 
 def next_item(

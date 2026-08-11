@@ -494,6 +494,38 @@ def test_github_backend_blocks_claimed_ticket_by_documented_ref(tmp_path, monkey
     assert "needs_input: true" in issue["body"]
 
 
+def test_list_blocked_and_active_claims_see_github_backed_tickets(
+    tmp_path, monkeypatch,
+):
+    """Regression guard: list_blocked/list_active_claims used to scan only
+    the file-backed store, so they silently returned nothing for a
+    github-backed queue. That fed workers.py's blocked-worker-exclusion
+    staffing math (WT-129): a live worker holding nothing but a blocked
+    github ticket read as fully productive, so its queue could sit at
+    "staffed == desired" with a growing unclaimed backlog and never spawn a
+    replacement -- exactly the state a real BYM-GH-FINIE queue was found in
+    (2/2 desired workers, both blocked, 7 open bugs untouched)."""
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    blocked_item = q.enqueue(project="GHI", note="needs a decision")
+    q.claim_by_ref(blocked_item["ref"], "worker-1")
+    q.block("GHI-1", session_id="worker-1", question="A or B?")
+
+    active_item = q.enqueue(project="GHI", note="still being worked")
+    q.claim_by_ref(active_item["ref"], "worker-2")
+
+    assert [it["ref"] for it in q.list_blocked(project="GHI")] == ["GHI-1"]
+    assert [it["ref"] for it in q.list_active_claims(project="GHI")] == ["GHI-2"]
+    # No-project form (what workers.py's reconciler actually calls) must see
+    # it too, not just the project-scoped form.
+    assert any(it["ref"] == "GHI-1" for it in q.list_blocked())
+    assert any(it["ref"] == "GHI-2" for it in q.list_active_claims())
+
+
 def test_github_backend_answer_posts_comment_and_keeps_claim_with_session(
     tmp_path, monkeypatch,
 ):
