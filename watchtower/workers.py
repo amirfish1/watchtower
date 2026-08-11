@@ -1140,6 +1140,22 @@ def _idle_snapshot(
         if str(item.get("ref") or "") in owned_refs
         and bool(item.get("needs_input") or item.get("blocked_at"))
     ]
+    # A worker holding ONLY blocked tickets used to be preserved forever --
+    # correct while someone might answer any minute, wasteful once nobody
+    # has in hours. `wt answer` never depends on this exact process staying
+    # alive: messages.deliver tries the live FIFO first, but falls through
+    # to a headless resume fork keyed on session_id when it's gone, so the
+    # same session picks the answer up regardless. Past this ceiling it's
+    # safe to let the normal idle-release path reclaim the worker like any
+    # other idle one -- reusing RELEASED_TTL_S (not a separate constant)
+    # means a worker stuck on a blocked-only claim gets released at that
+    # point and reaped RELEASED_TTL_S after that, ~2x this constant total,
+    # instead of adding a third independent timer to reason about.
+    blocked_only_past_ceiling = (
+        bool(owned_refs)
+        and owned_refs == set(blocked_refs)
+        and evidence["effective"]["age_s"] >= RELEASED_TTL_S
+    )
     reasons: List[str] = []
     engine = str(w.get("engine") or "").lower()
     pid_alive = bool(w.get("alive"))
@@ -1158,12 +1174,13 @@ def _idle_snapshot(
         reasons.append("pid_identity_unknown")
     if queue_error:
         reasons.append("queue_read_error")
-    if owned_by_worker:
-        reasons.append("owned_by_worker")
-    if owned_by_session:
-        reasons.append("owned_by_session")
-    if blocked_refs:
-        reasons.append("blocked_ticket")
+    if not blocked_only_past_ceiling:
+        if owned_by_worker:
+            reasons.append("owned_by_worker")
+        if owned_by_session:
+            reasons.append("owned_by_session")
+        if blocked_refs:
+            reasons.append("blocked_ticket")
     if not session_id:
         reasons.append("session_identity_missing")
     if not worker_id:

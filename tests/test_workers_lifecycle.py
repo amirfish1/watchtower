@@ -2190,6 +2190,74 @@ def test_release_spares_worker_with_blocked_ticket(wt):
         child.wait(timeout=5)
 
 
+def _live_worker_with_real_child(wt, queue, wid, *, engine="claude"):
+    """Like ``_live_worker``, but backed by a genuinely separate, killable
+    child process instead of this test process's own pid -- needed to prove
+    ``release_idle_workers`` never terminates the conversation. Still gives
+    it a real session_id + transcript file so it clears the same
+    authoritative-activity checks a real worker would, unlike a bare
+    ``record_worker`` call (which leaves those reasons in play regardless
+    of ticket-ownership state and would mask what's actually being tested).
+    """
+    log = wt.tmp / f"{wid}.log"
+    log.write_text("")
+    sid = f"22222222-2222-2222-2222-{abs(hash(wid)) % 10**12:012d}"
+    transcript_dir = wt.tmp / "claude-home" / "projects" / "-test-project"
+    transcript_dir.mkdir(parents=True, exist_ok=True)
+    transcript = transcript_dir / f"{sid}.jsonl"
+    transcript.write_text('{"type":"user"}\n')
+    child = subprocess.Popen(["sleep", "30"])
+    rec = wt.workers.record_worker(
+        child.pid, queue, engine, wid, str(wt.tmp), str(log), session_id=sid,
+    )
+    rec["_test_activity_path"] = str(transcript)
+    return child, rec
+
+
+def test_release_reclaims_worker_blocked_past_the_ceiling(wt):
+    """A worker holding ONLY blocked ticket(s) is spared indefinitely up to
+    RELEASED_TTL_S, then released like any other idle worker -- `wt answer`
+    still reaches the same session afterward via the headless resume fork
+    (messages.deliver), so nothing is lost by letting this worker go."""
+    child, rec = _live_worker_with_real_child(wt, "Q", "q-blocked-past-ceiling")
+    item = wt.q.enqueue(project="Q", note="needs a decision")
+    wt.q.claim_by_ref(item["ref"], rec["worker_id"])
+    wt.q.block(item["ref"], rec["worker_id"], "Which option?", "Investigated")
+    try:
+        _age_worker_log(wt, rec, wt.workers.RELEASED_TTL_S + 60)
+
+        released = wt.workers.release_idle_workers(queue="Q")
+        assert [r["worker_id"] for r in released] == [rec["worker_id"]]
+        # Release never terminates the conversation -- the process stays up
+        # so a live FIFO nudge still works right up until the separate
+        # reap_released_workers() TTL, and resume works even after that.
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
+def test_release_still_spares_worker_with_one_blocked_one_active_ticket(wt):
+    """The ceiling only applies when EVERY owned ticket is blocked. A worker
+    also holding a genuinely in-progress (non-blocked) ticket must stay
+    preserved past the ceiling too -- releasing it would abandon real,
+    unblocked work, not just an answerable question."""
+    child, rec = _live_worker_with_real_child(wt, "Q", "q-mixed-blocked")
+    blocked_item = wt.q.enqueue(project="Q", note="needs a decision")
+    wt.q.claim_by_ref(blocked_item["ref"], rec["worker_id"])
+    wt.q.block(blocked_item["ref"], rec["worker_id"], "Which option?", "Investigated")
+    active_item = wt.q.enqueue(project="Q", note="still being worked")
+    wt.q.claim_by_ref(active_item["ref"], rec["worker_id"])
+    try:
+        _age_worker_log(wt, rec, wt.workers.RELEASED_TTL_S + 60)
+
+        assert wt.workers.release_idle_workers(queue="Q") == []
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=5)
+
+
 def test_global_reap_fails_closed_per_queue(wt, monkeypatch):
     children = []
     records = []
