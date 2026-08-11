@@ -2499,6 +2499,30 @@ def _maybe_self_update() -> None:
 
 
 def _daemon_loop(args: argparse.Namespace) -> None:
+    """Own the GitHub-list-cache poller thread's lifetime, then run the tick
+    loop. A ``try/finally`` here (rather than inside the loop itself) is
+    what lets ``_daemon_loop_ticks`` stay exactly the plain ``while True``
+    it always was -- including a test driving it straight into an exception
+    via a monkeypatched ``time.sleep`` still reliably signals the poller
+    thread to stop instead of leaking it into every later test in the
+    process (it is a ``daemon=True`` thread: nothing else ever joins it)."""
+    import threading
+    from . import github_backend
+
+    gh_poller_stop = threading.Event()
+    threading.Thread(
+        target=github_backend.poll_list_caches_forever,
+        args=(5.0,),
+        kwargs={"stop_event": gh_poller_stop},
+        daemon=True,
+    ).start()
+    try:
+        _daemon_loop_ticks(args)
+    finally:
+        gh_poller_stop.set()
+
+
+def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     _maybe_self_update()  # pick up reconciler fixes on every (re)start; re-execs if HEAD moved
     interval = max(5, args.interval)
     dry_run = getattr(args, "dry_run", False)

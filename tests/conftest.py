@@ -40,6 +40,7 @@ _ENV_FILES = {
     "WATCHTOWER_WORKER_IDS_FILE": "worker-ids.json",
     "WATCHTOWER_CODEX_THREAD_REGISTRY": "codex-threads.json",
     "WATCHTOWER_GH_CONNECTIVITY_FILE": "gh-connectivity.json",
+    "WATCHTOWER_GH_LIST_CACHE_FILE": "gh-list-cache.json",
     "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE": "no-ccc-spawn-defaults.json",
     "WATCHTOWER_DAEMON_PID": "daemon.pid",
     "WATCHTOWER_DASHBOARD_PID": "dashboard.pid",

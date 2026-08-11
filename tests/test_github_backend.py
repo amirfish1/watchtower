@@ -11,9 +11,11 @@ import importlib
 import json
 import os
 import threading
+import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -274,6 +276,9 @@ def _reload_isolated(tmp_path: Path, monkeypatch):
     )
     monkeypatch.setenv(
         "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json")
+    )
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
     )
     # The worker registry has to be sandboxed too: the drain-off tests below
     # call workers.reconcile_once(), which without this reads the machine's
@@ -1064,6 +1069,260 @@ def test_list_issues_strict_never_uses_cached_or_stale_data(monkeypatch):
         backend._list_issues(fresh=True, strict=True)
 
     assert calls["n"] == 2
+
+
+def test_list_issues_soft_read_uses_persisted_cache_without_calling_gh(
+    tmp_path, monkeypatch
+):
+    """The reconciler-latency fix: a cold process (no in-memory _LIST_CACHE
+    entry -- exactly what every fresh `wt run`/`wt claim`/dispatch CLI
+    invocation is) must serve a fresh persisted-cache entry instead of
+    shelling out to `gh` itself. Only the background poller pays that cost."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    github_backend._LIST_CACHE.clear()
+
+    repo = "acme/persisted-cache-test"
+    issue = {
+        "number": 1, "title": "t", "body": "", "state": "OPEN",
+        "url": f"https://github.com/{repo}/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+    github_backend._write_persisted_list_entry(
+        f"{repo}:open", {"at": time.time(), "data": [issue]}
+    )
+
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    calls = {"n": 0}
+
+    def unexpected_run(args, *, check=True):
+        calls["n"] += 1
+        raise AssertionError("must not shell out to gh for a soft read")
+
+    monkeypatch.setattr(backend, "_run", unexpected_run)
+    monkeypatch.setattr(backend, "_run_raw", unexpected_run)
+
+    assert backend._list_issues() == [issue]
+    assert calls["n"] == 0
+    # And it warmed the in-process cache too, so a second call in the same
+    # process doesn't even touch the persisted file again.
+    assert github_backend._LIST_CACHE[f"{repo}:open"]["data"] == [issue]
+
+
+def test_list_issues_ignores_stale_persisted_cache(tmp_path, monkeypatch):
+    """If the poller stopped (daemon down/crashed) a soft reader must not
+    serve indefinitely stale data -- it self-heals by falling back to its
+    own live fetch, same as before this cache existed."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    github_backend._LIST_CACHE.clear()
+
+    repo = "acme/stale-persisted-cache-test"
+    stale_issue = {
+        "number": 1, "title": "stale", "body": "", "state": "OPEN",
+        "url": f"https://github.com/{repo}/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+    stale_at = time.time() - (github_backend._PERSISTED_LIST_STALE_S + 1)
+    github_backend._write_persisted_list_entry(
+        f"{repo}:open", {"at": stale_at, "data": [stale_issue]}
+    )
+
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    fresh_issue = {**stale_issue, "number": 2, "title": "fresh"}
+    calls = {"n": 0}
+
+    def fake_run(args, *, check=True):
+        calls["n"] += 1
+        return json.dumps([fresh_issue])
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    _no_etag_probe(monkeypatch, backend)
+
+    assert backend._list_issues() == [fresh_issue]
+    assert calls["n"] == 1
+
+
+def test_list_issues_strict_ignores_persisted_cache(tmp_path, monkeypatch):
+    """A claim/close about to write needs a live answer even when a fresh
+    persisted entry exists -- persisted-cache freshness is not the same
+    guarantee as ``strict``'s "pay for certainty" contract."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    github_backend._LIST_CACHE.clear()
+
+    repo = "acme/strict-persisted-cache-test"
+    cached_issue = {
+        "number": 1, "title": "cached", "body": "", "state": "OPEN",
+        "url": f"https://github.com/{repo}/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+    github_backend._write_persisted_list_entry(
+        f"{repo}:open", {"at": time.time(), "data": [cached_issue]}
+    )
+
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    live_issue = {**cached_issue, "number": 2, "title": "live"}
+    calls = {"n": 0}
+
+    def fake_run(args, *, check=True):
+        calls["n"] += 1
+        return json.dumps([live_issue])
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+
+    assert backend._list_issues(fresh=True, strict=True) == [live_issue]
+    assert calls["n"] == 1
+
+
+def test_refresh_persisted_list_cache_writes_file_from_live_fetch(
+    tmp_path, monkeypatch
+):
+    """``refresh_persisted_list_cache`` (the background poller's only job) is
+    the sole function allowed to pay for a live `gh` call on a soft reader's
+    behalf, and its result must be readable back for both open and closed."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    github_backend._LIST_CACHE.clear()
+
+    repo = "acme/poller-refresh-test"
+    open_issue = {
+        "number": 1, "title": "open one", "body": "", "state": "OPEN",
+        "url": f"https://github.com/{repo}/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+    closed_issue = {
+        "number": 2, "title": "closed one", "body": "", "state": "CLOSED",
+        "url": f"https://github.com/{repo}/issues/2",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z",
+        "closedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+
+    def fake_run(self, args, *, check=True):
+        state = args[args.index("--state") + 1]
+        return json.dumps([open_issue] if state == "open" else [closed_issue])
+
+    def fake_run_raw(self, args, **kwargs):
+        # Neutralise the ETag probe (`gh api ...`) the same way _no_etag_probe
+        # does for a bound backend -- here it must work for a fresh instance
+        # `refresh_persisted_list_cache` constructs internally.
+        raise github_backend.GitHubBackendError("no probe in this fake")
+
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_run", fake_run)
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_run_raw", fake_run_raw)
+
+    github_backend.refresh_persisted_list_cache(repo)
+
+    persisted = github_backend._read_persisted_list_cache()
+    assert persisted[f"{repo}:open"]["data"] == [open_issue]
+    assert persisted[f"{repo}:closed"]["data"] == [closed_issue]
+
+    # And a subsequent cold soft read serves it without another gh call.
+    github_backend._LIST_CACHE.clear()
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+
+    def unexpected_run(args, *, check=True):
+        raise AssertionError("must not shell out to gh for a soft read")
+
+    monkeypatch.setattr(backend, "_run", unexpected_run)
+    assert backend._list_issues() == [open_issue]
+
+
+def test_local_write_invalidates_list_cache_for_read_your_own_writes(
+    tmp_path, monkeypatch
+):
+    """Regression guard for making count_claimable/count_manual_eligible
+    fresh=False (WT reconciler-latency fix): a mutation this process just
+    made (mark_runnable here) must be visible to the very next soft read in
+    this same process, even though that read now prefers the cache over a
+    live `gh` call. Caught for real by
+    test_github_drain_off_queue_still_staffs_a_requested_run when the
+    invalidation hook didn't exist yet -- this pins the mechanism directly."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    github_backend._LIST_CACHE.clear()
+
+    repo = "acme/read-your-write-test"
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    open_issue = {
+        "number": 1, "title": "t", "body": "", "state": "OPEN",
+        "url": f"https://github.com/{repo}/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+    edited_issue = {**open_issue, "labels": [{"name": "watchtower:play"}]}
+    responses = iter(["", json.dumps([edited_issue])])
+
+    def fake_run_raw(args, **kwargs):
+        raw = next(responses)
+        return SimpleNamespace(returncode=0, stdout=raw, stderr="")
+
+    monkeypatch.setattr(backend, "_run_raw", fake_run_raw)
+
+    # 1) Seed both caches with the pre-write snapshot -- the in-memory one as
+    # a live soft read would, the persisted one as the background poller
+    # would (refresh_persisted_list_cache is exercised separately above).
+    github_backend._LIST_CACHE[f"{repo}:open"] = {
+        "at": time.time(), "data": [open_issue], "error": None, "etag": "",
+    }
+    github_backend._write_persisted_list_entry(
+        f"{repo}:open", {"at": time.time(), "data": [open_issue]}
+    )
+
+    # 2) A local write (any `gh issue edit/create/close/reopen/comment`)
+    # must drop both caches for this repo...
+    backend._run(["issue", "edit", "1", *backend._repo_args(), "--add-label", "x"])
+    assert f"{repo}:open" not in github_backend._LIST_CACHE
+    assert f"{repo}:open" not in github_backend._read_persisted_list_cache()
+
+    # 3) ...so the very next soft read is forced to see the post-write state,
+    # not the pre-write snapshot it would otherwise have kept serving.
+    assert backend._list_issues() == [edited_issue]
+
+
+def test_poll_list_caches_once_refreshes_every_configured_github_queue(
+    tmp_path, monkeypatch
+):
+    """The daemon-thread entrypoint discovers github-backed queues from
+    config (deduping by repo) and refreshes each one -- this is what makes
+    the persisted cache self-sustaining without any per-request trigger."""
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+
+    config.set_backend("GHQ1", "github")
+    config.set_github_repo("GHQ1", "acme/poll-once-test")
+    config.set_backend("GHQ2", "github")
+    config.set_github_repo("GHQ2", "acme/poll-once-test")  # same repo, deduped
+    config.set_backend("FILEQ", "file")
+
+    refreshed = []
+    monkeypatch.setattr(
+        github_backend, "refresh_persisted_list_cache", refreshed.append
+    )
+
+    github_backend.poll_list_caches_once()
+
+    assert refreshed == ["acme/poll-once-test"]
 
 
 def test_cached_github_list_failure_is_logged_only_once(tmp_path, monkeypatch):

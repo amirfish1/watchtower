@@ -14,6 +14,7 @@ import json
 import os
 import re
 import subprocess
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,11 @@ from typing import Any, Dict, List, Optional
 from .queue import UNCLAIMABLE_READINESS, _FileLock
 
 VALID_LANES = ("normal", "express")
+# `gh issue` subcommands that actually change an issue's list-visible state
+# (as opposed to `list`/`view`) -- `_run` invalidates the list cache for
+# `self.repo` after any of these succeed, so a write is never invisible to
+# a same-process soft read that follows it. See `_invalidate_list_cache`.
+_MUTATING_ISSUE_VERBS = frozenset({"create", "edit", "close", "reopen", "comment"})
 # Ticket-level eligibility inputs, stored as GitHub labels so they are visible
 # and editable from GitHub's own UI (the file backend mirrors them as the plain
 # booleans `no_auto_drain`/`run_requested` on each item, so downstream code
@@ -72,6 +78,162 @@ class GitHubBackendError(RuntimeError):
 _LIST_CACHE: Dict[str, Dict[str, Any]] = {}
 _LIST_CACHE_TTL = 2.0
 _LIST_ERROR_BACKOFF = 60.0
+
+# Persisted list cache (2026-08-11, WT reconciler-latency fix). `_LIST_CACHE`
+# above is in-process only, so it does nothing for the common case: `wt run`
+# / `wt claim` / the reconciler's own dispatch_after_enqueue path are each a
+# fresh short-lived process (same blind spot noted for connectivity state
+# above), so every one of them paid a live `gh` probe-or-fetch inline, on the
+# critical path, even seconds after some other process just did the exact
+# same fetch. Measured cost: a single `reconcile_once()` sweep across two
+# github-backed queues cost ~15s in `gh` subprocesses alone.
+#
+# The fix is to make GitHub reads and reconciler reads two different
+# activities. A background poller (started by the foreground daemon, see
+# cli.py `_daemon_loop` / `poll_list_caches_forever`) is now the ONLY thing
+# that calls `refresh_persisted_list_cache()` -- it owns paying the live `gh`
+# cost, on its own interval, off the reconciler's critical path. Every other
+# (non-strict) reader of `_list_issues` reads this file instead of calling
+# `gh` itself. `strict` callers (claim, close) are unaffected: they are
+# about to write and still pay for a live call, same as before.
+#
+# `_PERSISTED_LIST_STALE_S` is the self-healing bound: if the poller stops
+# (daemon not running, or crashed), a soft reader falls back to its own live
+# fetch rather than serving indefinitely stale data.
+_GH_LIST_CACHE_FILE = Path.home() / ".watchtower" / "gh-list-cache.json"
+_PERSISTED_LIST_STALE_S = 300.0
+
+
+def _list_cache_path() -> Path:
+    env = os.environ.get("WATCHTOWER_GH_LIST_CACHE_FILE")
+    if env:
+        return Path(env).expanduser()
+    return _GH_LIST_CACHE_FILE
+
+
+def _read_persisted_list_cache() -> Dict[str, Any]:
+    try:
+        data = json.loads(_list_cache_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _rewrite_persisted_list_cache(mutate) -> None:
+    """Load-modify-atomic-write the persisted cache file under its lock.
+
+    ``mutate(data) -> bool`` edits ``data`` in place and returns whether
+    anything actually changed (skipping the write entirely when it didn't)."""
+    path = _list_cache_path()
+    with _FileLock(path.with_suffix(".lock")):
+        data = _read_persisted_list_cache()
+        if not mutate(data):
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+
+
+def _write_persisted_list_entry(key: str, entry: Dict[str, Any]) -> None:
+    def mutate(data: Dict[str, Any]) -> bool:
+        data[key] = entry
+        return True
+
+    _rewrite_persisted_list_cache(mutate)
+
+
+def _invalidate_list_cache(repo: str) -> None:
+    """Drop the in-memory AND persisted list cache for ``repo`` (both
+    states) after a local write.
+
+    Read-your-own-writes: without this, a mutation this process just made
+    (mark_runnable, claim, close, comment, ...) would be invisible to the
+    next soft (``fresh=False``) read in this same process, for up to the
+    persisted cache's staleness bound -- e.g. ``count_manual_eligible()``
+    called right after ``mark_runnable()`` in ``dispatch_after_enqueue``
+    would see the pre-mutation list. Clearing both caches forces exactly one
+    fresh live read on the very next call, which is the same live-read
+    frequency this had before the persisted cache existed -- just paid only
+    right after a write, not on every read."""
+    for state in ("open", "closed"):
+        _LIST_CACHE.pop(f"{repo}:{state}", None)
+
+    def mutate(data: Dict[str, Any]) -> bool:
+        changed = False
+        for state in ("open", "closed"):
+            if data.pop(f"{repo}:{state}", None) is not None:
+                changed = True
+        return changed
+
+    _rewrite_persisted_list_cache(mutate)
+
+
+def refresh_persisted_list_cache(repo: str) -> None:
+    """Do a live ``gh`` fetch for every state of ``repo`` and persist it.
+
+    The only function in this module allowed to spend a blocking `gh` call
+    on behalf of a *soft* (non-strict) reader -- called exclusively by the
+    background poller, never by ``_list_issues`` itself. Best-effort per
+    state: a repo that is unreachable/rate-limited leaves the previous
+    persisted entry in place (``_list_issues`` already recorded the failure
+    via ``_record_gh_failure``) rather than wiping out the last known-good
+    list.
+    """
+    inst = GitHubIssuesBackend(repo, repo=repo)
+    for state in ("open", "closed"):
+        key = f"{repo}:{state}"
+        try:
+            inst._list_issues(state, fresh=True)
+        except GitHubBackendError:
+            continue
+        entry = _LIST_CACHE.get(key)
+        if entry is not None and entry.get("data") is not None:
+            _write_persisted_list_entry(
+                key, {"at": entry["at"], "data": entry["data"]}
+            )
+
+
+def poll_list_caches_once() -> None:
+    """One sweep: refresh the persisted cache for every configured
+    github-backed queue's repo (deduped -- two queues can share a repo)."""
+    from . import config
+    repos = set()
+    for qname in config.all_queues():
+        if config.backend(qname) == "github":
+            repo = config.github_repo(qname)
+            if repo:
+                repos.add(repo)
+    for repo in repos:
+        try:
+            refresh_persisted_list_cache(repo)
+        except Exception:
+            pass  # one bad repo must not stop the sweep or kill the poller
+
+
+def poll_list_caches_forever(interval_s: float = 5.0, *, stop_event=None) -> None:
+    """Background loop for the foreground daemon: keep every github-backed
+    queue's list cache warm on disk so the reconciler's reads never block on
+    `gh`. Runs until ``stop_event`` is set (never, if omitted, but a caller
+    may still pass its own ``threading.Event`` for a graceful stop).
+
+    Deliberately waits on a ``threading.Event`` rather than ``time.sleep``:
+    it is the correct primitive for a cancellable background loop, and,
+    unlike ``time.sleep``, is not the same global entry point every other
+    interval-based loop in this codebase patches to fast-forward a test.
+
+    Same never-kill-the-loop contract as the rest of cli.py's daemon loop
+    (outbox drain, receipts sweep, log prune, ...): a bad repo or a raised
+    exception during a sweep may not be allowed to end this thread, since
+    nothing else keeps the persisted cache warm."""
+    event = stop_event if stop_event is not None else threading.Event()
+    while not event.is_set():
+        try:
+            poll_list_caches_once()
+        except Exception:
+            pass
+        event.wait(interval_s)
 
 # Global GitHub-reachability tracking (2026-07-27 design). Persisted, not
 # in-memory: `wt status`/`wt ls` each run in a fresh short-lived process, so
@@ -567,6 +729,13 @@ class GitHubIssuesBackend:
                 f"gh {' '.join(args)} failed"
                 + (f": {detail}" if detail else "")
             )
+        if (
+            proc.returncode == 0
+            and len(args) > 1
+            and args[0] == "issue"
+            and args[1] in _MUTATING_ISSUE_VERBS
+        ):
+            _invalidate_list_cache(self.repo)
         return proc.stdout
 
     def _ensure_label(self, name: str, color: str, description: str) -> None:
@@ -786,17 +955,34 @@ class GitHubIssuesBackend:
                 # and a 304 would leave the error latched forever.
             elif not fresh and age < _LIST_CACHE_TTL:
                 return cached["data"]
-            elif cached.get("data") is not None and not strict:
-                # Revalidate rather than re-list. Past the 2s TTL nearly every
-                # poll finds an unchanged repo, and a 304 settles it without
-                # spending rate limit. Strict callers (claim, close) skip the
-                # detour: they are about to write and pay for certainty.
-                unchanged, etag = self._probe_list_change(
-                    state, str(cached.get("etag") or "")
-                )
-                if unchanged:
-                    cached["at"] = now  # unchanged is as good as re-fetched
-                    return cached["data"]
+        if not strict and not fresh:
+            # The common case for every fresh CLI process (wt run, wt claim,
+            # the reconciler's dispatch path): no in-process cache yet, but
+            # the background poller (poll_list_caches_forever) almost
+            # certainly refreshed this repo within the last few seconds.
+            # Read its file instead of paying for a live `gh` call here.
+            persisted = _read_persisted_list_cache().get(key)
+            if persisted is not None and persisted.get("data") is not None:
+                persisted_age = now - float(persisted.get("at") or 0)
+                if persisted_age < _PERSISTED_LIST_STALE_S:
+                    _LIST_CACHE[key] = {
+                        "at": persisted["at"], "data": persisted["data"],
+                        "error": None, "etag": "",
+                    }
+                    return persisted["data"]
+        if cached is not None and cached.get("data") is not None and not strict:
+            # Poller not running / persisted cache stale or absent: fall
+            # back to the in-process revalidation this always did. Past the
+            # 2s TTL nearly every poll finds an unchanged repo, and a 304
+            # settles it without spending rate limit. Strict callers (claim,
+            # close) skip the detour: they are about to write and pay for
+            # certainty.
+            unchanged, etag = self._probe_list_change(
+                state, str(cached.get("etag") or "")
+            )
+            if unchanged:
+                cached["at"] = now  # unchanged is as good as re-fetched
+                return cached["data"]
         if not strict:
             backoff_active, conn_state = _gh_backoff_active()
             if backoff_active:
@@ -1022,6 +1208,7 @@ class GitHubIssuesBackend:
         readiness_filters: Optional[List[str]] = None,
         auto_only: bool = False,
         manual_only: bool = False,
+        fresh: bool = True,
     ) -> List[Dict[str, Any]]:
         """Tickets a worker could claim right now, in claim order.
 
@@ -1031,17 +1218,24 @@ class GitHubIssuesBackend:
         unattended) or ``manual_eligible`` (what a human pressed ▶ on). All
         three run through this one filter, over predicates derived together in
         ``_issue_to_item``, so neither half can drift out of the work_it set.
+
+        ``fresh=True`` (the default, used by ``claim_next``/``peek_next``):
+        claiming must see the current claimed/open state, not a cached
+        snapshot -- otherwise two workers could both pick a ticket that was
+        already claimed moments ago. ``count_claimable``/
+        ``count_manual_eligible`` pass ``fresh=False``: they only answer "is
+        this queue spawn-worthy", never hand out a ticket, so a snapshot up
+        to the persisted-cache's staleness bound old is fine -- and letting
+        them stay fresh was exactly what kept the reconciler's own depth
+        checks on GitHub's critical path.
         """
-        # fresh=True: claiming must see the current claimed/open state, not a
-        # cached snapshot up to _LIST_CACHE_TTL stale -- otherwise two workers
-        # could both pick a ticket that was already claimed moments ago.
         eligibility = "work_it"
         if auto_only:
             eligibility = "auto_eligible"
         elif manual_only:
             eligibility = "manual_eligible"
         candidates = [
-            it for it in self.list_items(status="open", lane=lane, fresh=True)
+            it for it in self.list_items(status="open", lane=lane, fresh=fresh)
             if it.get(eligibility, False)
         ]
         if readiness_filters:
@@ -1431,9 +1625,15 @@ class GitHubIssuesBackend:
 
         Deliberately narrower than claim_next()'s candidate set: a ticket that
         is only workable because a human pressed ▶ must not, by itself, make
-        the reconciler decide this queue wants unattended workers."""
+        the reconciler decide this queue wants unattended workers.
+
+        ``fresh=False``: this only decides spawn-worthiness, never hands out
+        a ticket, so it reads the persisted list cache instead of blocking
+        the reconciler on a live `gh` call (see ``_claim_candidates``)."""
         return len(
-            self._claim_candidates(lane=lane, item_types=item_types, auto_only=True)
+            self._claim_candidates(
+                lane=lane, item_types=item_types, auto_only=True, fresh=False
+            )
         )
 
     def count_manual_eligible(
@@ -1444,9 +1644,12 @@ class GitHubIssuesBackend:
     ) -> int:
         """How many claimable tickets carry a run request (see
         queue.count_manual_eligible) — the depth the reconciler staffs even
-        when this queue is not auto-draining."""
+        when this queue is not auto-draining. ``fresh=False`` for the same
+        reason as ``count_claimable``."""
         return len(
-            self._claim_candidates(lane=lane, item_types=item_types, manual_only=True)
+            self._claim_candidates(
+                lane=lane, item_types=item_types, manual_only=True, fresh=False
+            )
         )
 
     def last_progress_iso(self) -> Optional[str]:
