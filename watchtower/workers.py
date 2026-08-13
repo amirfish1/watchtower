@@ -2052,6 +2052,41 @@ def _add_worker_id(worker_id: str) -> None:
         pass
 
 
+def _legacy_claude_continuity(worker_id: str, session_id: str) -> Dict[str, Any]:
+    """Recover a pre-ledger Claude worker identity from its owned log.
+
+    This one-time compatibility path is deliberately narrow: the deterministic
+    per-worker log must name the same Claude session, and the configured queue
+    name must exactly prefix the worker id. Once rebound, the worker record is
+    retained so its one-continuation latch survives later process death.
+    """
+    log_path = WORKERS_FILE.parent / "logs" / f"{worker_id}.log"
+    if resolve_session_id_from_log(str(log_path)) != session_id:
+        return {}
+    try:
+        from . import config
+        queues = [
+            str(name) for name in config.all_queues()
+            if worker_id.startswith(f"{str(name).lower()}-")
+        ]
+    except Exception:
+        queues = []
+    if not queues:
+        return {}
+    queue_name = max(queues, key=len)
+    return {
+        "worker_id": worker_id,
+        "queue": queue_name,
+        "engine": "claude",
+        "repo_path": "",
+        "log": str(log_path),
+        "started_at": "",
+        "session_id": session_id,
+        "model": "",
+        "rebound_at": "",
+    }
+
+
 _SESSION_ID_RE = re.compile(
     r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 )
@@ -2620,13 +2655,15 @@ def _find_engine_ancestor_pid(engine: str, max_depth: int = 8) -> int:
     return 0
 
 
-def rebind_continued_worker(worker_id: str, session_id: str, pid: int) -> bool:
-    """Move a Codex worker record to a continuation process with the same thread.
+def rebind_continued_worker(
+    worker_id: str, session_id: str, pid: int, *, engine: str = "codex"
+) -> bool:
+    """Move a worker record to one resumed process with the same session.
 
-    Codex goal continuation can replace the original ``codex exec`` process
-    while preserving ``CODEX_THREAD_ID``. Rebinding requires both that stable
-    thread id and a live Codex ancestor discovered by the caller; a different
-    session cannot revive a dead worker alias.
+    Codex and Claude can resume an existing cloud session after the original
+    spawned process exits. Rebinding requires both that stable session id and a
+    live matching-engine ancestor discovered by the caller; a different session
+    cannot revive a dead worker alias.
 
     FEAT-NEXT-102 — bounded to ONE rebind per worker_id. Without this, a
     worker_id can be silently handed off across an unbounded chain of
@@ -2638,6 +2675,9 @@ def rebind_continued_worker(worker_id: str, session_id: str, pid: int) -> bool:
     the second continuation must mint a fresh worker_id via ``record_worker``
     instead of asking to inherit this one.
     """
+    engine = str(engine or "").lower()
+    if engine not in {"claude", "codex"}:
+        return False
     if not worker_id or not _SESSION_ID_RE.fullmatch(str(session_id or "")):
         return False
     if not _pid_alive(int(pid or 0)):
@@ -2650,52 +2690,58 @@ def rebind_continued_worker(worker_id: str, session_id: str, pid: int) -> bool:
             None,
         )
         if worker is None:
-            try:
-                from . import codex_registry
-                registry_row = codex_registry.entry(session_id) or {}
-            except Exception:
-                registry_row = {}
-            if registry_row.get("worker_id") != worker_id:
+            identity: Dict[str, Any] = {}
+            if engine == "codex":
+                try:
+                    from . import codex_registry
+                    registry_row = codex_registry.entry(session_id) or {}
+                except Exception:
+                    registry_row = {}
+                if registry_row.get("worker_id") != worker_id:
+                    return False
+                wt_meta = (
+                    registry_row.get("wt")
+                    if isinstance(registry_row.get("wt"), dict)
+                    else {}
+                )
+                identity = {
+                    "worker_id": worker_id,
+                    "queue": registry_row.get("queue") or wt_meta.get("queue") or "",
+                    "engine": engine,
+                    "repo_path": registry_row.get("repo_path") or registry_row.get("cwd") or "",
+                    "log": wt_meta.get("log") or "",
+                    "started_at": wt_meta.get("started_at") or registry_row.get("created_at") or "",
+                    "session_id": session_id,
+                    "model": registry_row.get("model") or "",
+                    "rebound_at": wt_meta.get("rebound_at") or "",
+                }
+            else:
+                identity = _legacy_claude_continuity(worker_id, session_id)
+            if (
+                identity.get("engine") != engine
+                or identity.get("session_id") != session_id
+            ):
                 return False
-            wt_meta = (
-                registry_row.get("wt")
-                if isinstance(registry_row.get("wt"), dict)
-                else {}
-            )
-            if wt_meta.get("rebound_at"):
+            if identity.get("rebound_at"):
                 raise ValueError(
                     f"worker {worker_id!r} was already continued once "
-                    f"(rebound at {wt_meta['rebound_at']}); a second "
+                    f"(rebound at {identity['rebound_at']}); a second "
                     "continuation must claim with a fresh --worker id "
                     "instead of reusing this one"
                 )
-            worker = {
-                "worker_id": worker_id,
+            worker = dict(identity)
+            worker.update({
                 "pid": int(pid),
-                "queue": registry_row.get("queue") or wt_meta.get("queue") or "",
-                "engine": "codex",
-                "repo_path": (
-                    registry_row.get("repo_path") or registry_row.get("cwd") or ""
-                ),
-                "log": wt_meta.get("log") or "",
-                "fifo": "",
-                "started_at": (
-                    wt_meta.get("started_at")
-                    or registry_row.get("created_at")
-                    or ""
-                ),
-                "session_id": session_id,
                 "pid_started": _pid_start_token(int(pid)),
-            }
-            if registry_row.get("model"):
-                worker["model"] = registry_row["model"]
+                "fifo": "",
+            })
             data["workers"].append(worker)
         else:
             recorded_sid = str(worker.get("session_id") or "")
             if not recorded_sid and worker.get("log"):
                 recorded_sid = resolve_session_id_from_log(str(worker["log"]))
             if (
-                str(worker.get("engine") or "").lower() != "codex"
+                str(worker.get("engine") or "").lower() != engine
                 or recorded_sid != session_id
             ):
                 return False
@@ -2811,7 +2857,7 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                 audit_state.get("release_log_pending")
                 or audit_state.get("spawn_plan_pending")
             )
-            if alive or pending_audit:
+            if alive or pending_audit or w.get("rebound_at"):
                 kept.append(w)
             else:
                 # This record is about to be dropped -- last chance to learn why

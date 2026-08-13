@@ -572,12 +572,19 @@ def cmd_claim(args: argparse.Namespace) -> int:
         or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
     )
     codex_thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
-    if codex_thread_id:
-        continuation_pid = workers._find_engine_ancestor_pid("codex")
+    claude_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    continuation = (
+        ("codex", codex_thread_id)
+        if codex_thread_id
+        else ("claude", claude_session_id)
+    )
+    if continuation[1]:
+        continuation_pid = workers._find_engine_ancestor_pid(continuation[0])
         if continuation_pid:
             try:
                 workers.rebind_continued_worker(
-                    worker, codex_thread_id, continuation_pid
+                    worker, continuation[1], continuation_pid,
+                    engine=continuation[0],
                 )
             except ValueError as exc:
                 print(f"error: {exc}", file=sys.stderr)

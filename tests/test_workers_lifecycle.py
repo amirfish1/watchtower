@@ -1082,6 +1082,98 @@ def test_claim_rebinds_continued_codex_worker_to_new_process(wt, monkeypatch, ca
     assert rebound["alive"] is True
 
 
+def test_claim_rebinds_pruned_claude_worker_to_its_resumed_session(
+    wt, monkeypatch, capsys
+):
+    """A resumed Claude session may reclaim its original worker alias.
+
+    Claude's spawned process can finish before CCC resumes its exact cloud
+    session.  The dead process is pruned, but the matching session plus a live
+    Claude ancestor still proves a single safe continuation.
+    """
+    cli = _reloaded_cli(wt)
+    session_id = "33333333-3333-3333-3333-333333333333"
+    worker_id = "q-claude-dead"
+    log_path = wt.tmp / "logs" / f"{worker_id}.log"
+    log_path.parent.mkdir()
+    log_path.write_text(json.dumps({"session_id": session_id}) + "\n")
+    wt.workers.record_worker(
+        _dead_pid(),
+        "Q",
+        "claude",
+        worker_id,
+        str(wt.tmp),
+        str(log_path),
+        session_id=session_id,
+    )
+    wt.workers.list_workers()  # ordinary dashboard/status reads prune the pid
+    assert wt.workers.list_workers() == []
+    wt.q.enqueue(project="Q", note="resumed continuation work")
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session_id)
+    monkeypatch.setattr(
+        cli.workers,
+        "_find_engine_ancestor_pid",
+        lambda engine: os.getpid() if engine == "claude" else 0,
+    )
+
+    rc = cli.cmd_claim(_claim_ns("Q", worker_id, json_out=True))
+
+    assert rc == 0
+    claimed = json.loads(capsys.readouterr().out)
+    assert claimed["claimed_by"] == worker_id
+    assert claimed["claimed_session_id"] == session_id
+    rebound = next(
+        worker for worker in wt.workers.list_workers(prune=False)
+        if worker["worker_id"] == worker_id
+    )
+    assert rebound["engine"] == "claude"
+    assert rebound["pid"] == os.getpid()
+    assert rebound["alive"] is True
+    data = wt.workers._load()
+    next(row for row in data["workers"] if row["worker_id"] == worker_id)["pid"] = _dead_pid()
+    wt.workers._save(data)
+    assert any(
+        row["worker_id"] == worker_id
+        for row in wt.workers.list_workers(prune=False)
+    )
+    with pytest.raises(ValueError, match="already continued once"):
+        wt.workers.rebind_continued_worker(
+            worker_id, session_id, os.getppid(), engine="claude"
+        )
+
+
+def test_claim_rebinds_legacy_pruned_claude_worker_from_its_log(
+    wt, monkeypatch, capsys
+):
+    """Pre-continuity-ledger Claude workers may resume when their log proves it."""
+    cli = _reloaded_cli(wt)
+    session_id = "44444444-4444-4444-4444-444444444444"
+    worker_id = "q-claude-legacy"
+    log_path = wt.tmp / "logs" / f"{worker_id}.log"
+    log_path.parent.mkdir()
+    log_path.write_text(json.dumps({"session_id": session_id}) + "\n")
+    wt.workers.record_worker(
+        _dead_pid(), "Q", "claude", worker_id, str(wt.tmp), str(log_path),
+        session_id=session_id,
+    )
+    wt.workers.list_workers()
+    wt.config.set_auto_drain("Q", True)
+    wt.q.enqueue(project="Q", note="legacy resumed continuation work")
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session_id)
+    monkeypatch.setattr(
+        cli.workers,
+        "_find_engine_ancestor_pid",
+        lambda engine: os.getpid() if engine == "claude" else 0,
+    )
+
+    assert cli.cmd_claim(_claim_ns("Q", worker_id, json_out=True)) == 0
+    claimed = json.loads(capsys.readouterr().out)
+    assert claimed["claimed_by"] == worker_id
+    assert claimed["claimed_session_id"] == session_id
+
+
 def test_claim_allows_hosted_codex_thread_after_worker_pid_exits(
     wt, monkeypatch, capsys
 ):
