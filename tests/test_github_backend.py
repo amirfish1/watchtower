@@ -1587,6 +1587,32 @@ def test_genuine_list_failure_still_backs_off_with_the_probe_in_play(monkeypatch
     assert github_backend._LIST_CACHE["acme/etag-test:open"]["error"] is not None
 
 
+def test_low_graphql_quota_skips_expensive_fetch_and_serves_cache(monkeypatch):
+    """When GitHub GraphQL quota is low, `_list_issues` must not pay for a
+    rich `gh issue list` fetch even if the ETag probe says the repo changed.
+    It should return cached data instead."""
+    import watchtower.github_backend as github_backend
+
+    backend, counts, probes = _etag_backend(monkeypatch)
+
+    def changed_probe(args):
+        probes.append(list(args))
+        return _ok(etag="v1")
+
+    monkeypatch.setattr(backend, "_run_raw", changed_probe)
+    monkeypatch.setattr(github_backend, "_graphql_rate_limit_remaining", lambda: 50)
+
+    assert backend._list_issues() == [_PROBE_ISSUE]  # cold fetch seeds cache
+    assert counts["fetch"] == 1
+    assert len(probes) == 0  # cold fetch has no validator to probe
+
+    # Quota is now low. The probe would say 200 (changed), but the expensive
+    # fetch must be skipped and the cached issue returned.
+    assert backend._list_issues() == [_PROBE_ISSUE]
+    assert counts["fetch"] == 1, "low quota must skip the expensive gh issue list fetch"
+    assert len(probes) == 0, "low quota should also skip the ETag probe"
+
+
 def test_a_new_issue_is_visible_to_the_next_revalidating_read(tmp_path, monkeypatch):
     """End to end over the fake gh, which reproduces the 304 exit-1 landmine:
     an unchanged repo is answered from cache, a new issue is not."""

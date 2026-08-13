@@ -250,6 +250,42 @@ _GH_BACKOFF_BASE_S = 60.0
 _GH_BACKOFF_CAP_S = 600.0
 _GH_SUCCESS_WRITE_THROTTLE_S = 30.0
 
+# Pre-emptive GraphQL quota guard. `gh issue list` is a GraphQL operation that
+# can burn the hourly quota fast on a busy repo. Before paying for a rich
+# fetch, check `gh api rate_limit` (a cheap REST call) and skip the fetch when
+# we're close to the limit, serving cached data instead. The check is cached so
+# the extra REST call is amortized across all polls.
+_GH_GRAPHQL_LOW_THRESHOLD = 300
+_GH_RATE_LIMIT_CHECK_INTERVAL_S = 30.0
+_GH_GRAPHQL_QUOTA_CACHE: Dict[str, Any] = {"ts": 0.0, "remaining": None}
+
+
+def _graphql_rate_limit_remaining() -> Optional[int]:
+    """Return the current GitHub GraphQL rate-limit remaining, or None.
+
+    Caches the result for ``_GH_RATE_LIMIT_CHECK_INTERVAL_S`` seconds. Any
+    failure to read the limit is swallowed and returns None, in which case
+    callers should proceed normally.
+    """
+    now = time.time()
+    if now - _GH_GRAPHQL_QUOTA_CACHE["ts"] < _GH_RATE_LIMIT_CHECK_INTERVAL_S:
+        return _GH_GRAPHQL_QUOTA_CACHE["remaining"]
+    try:
+        result = subprocess.run(
+            ["gh", "api", "rate_limit", "--jq", ".resources.graphql.remaining"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            remaining = int(result.stdout.strip())
+            _GH_GRAPHQL_QUOTA_CACHE["ts"] = now
+            _GH_GRAPHQL_QUOTA_CACHE["remaining"] = remaining
+            return remaining
+    except Exception:
+        pass
+    return None
+
 
 def _connectivity_path() -> Path:
     env = os.environ.get("WATCHTOWER_GH_CONNECTIVITY_FILE")
@@ -980,6 +1016,20 @@ class GitHubIssuesBackend:
                         "error": None, "etag": "",
                     }
                     return persisted["data"]
+        # Pre-emptive GraphQL quota guard. If we're close to the hourly limit,
+        # skip the expensive rich fetch (and the ETag probe that would only tell
+        # us to do it) and serve whatever cached data we have. This keeps a
+        # busy repo from burning the remaining quota on repeated `gh issue
+        # list` calls before GitHub's reset window.
+        if (
+            not strict
+            and cached is not None
+            and cached.get("data") is not None
+        ):
+            remaining = _graphql_rate_limit_remaining()
+            if remaining is not None and remaining < _GH_GRAPHQL_LOW_THRESHOLD:
+                return cached["data"]
+
         if (
             cached is not None
             and cached.get("data") is not None
