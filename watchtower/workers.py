@@ -246,6 +246,17 @@ KIMI_RESUME_CONTRACT = (
     "ticket gets fixed and committed twice. "
 )
 
+# Style contract for the mandatory close --summary, injected into both goal
+# templates. No braces: safe for the templates' .format() calls.
+SUMMARY_STYLE = (
+    "SUMMARY STYLE: the --summary is read by a busy human skimming the "
+    "dashboard or a GitHub comment -- format it for a 5-second skim: one "
+    "short first sentence stating the outcome, then a blank line and 2-5 "
+    "short '- ' bullets for what changed and where (file paths). Use real "
+    "newlines inside the quoted string; they are preserved and rendered as "
+    "line breaks. Never submit one dense paragraph. "
+)
+
 DRAIN_GOAL_TEMPLATE = (
     "Drain the {queue} WatchTower queue and keep it empty. "
     "Work in the git repo at {repo}. "
@@ -283,6 +294,7 @@ DRAIN_GOAL_TEMPLATE = (
     "\"...\"` for anything you could not fix (each flag is repeatable). This "
     "resolution is the trust signal the dashboard surfaces; a close without "
     "--summary will be rejected with exit code 1. "
+    + SUMMARY_STYLE +
     "If a ticket genuinely cannot be resolved without a human decision, do NOT "
     "close it and do NOT guess: run `wt block <ref> --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
@@ -326,6 +338,7 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "\"what you changed\" --commit <SHA>` (or `--no-code`). Add `--caveat \"...\"` for anything to watch out "
     "for, `--follow-up \"...\"` for notable next steps, and `--unresolved "
     "\"...\"` for anything you could not fix (each flag is repeatable). "
+    + SUMMARY_STYLE +
     "If it genuinely cannot be resolved without a human decision, do NOT "
     "close it and do NOT guess: run `wt block {ref} --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
