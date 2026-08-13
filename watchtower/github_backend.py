@@ -939,6 +939,10 @@ class GitHubIssuesBackend:
         key = f"{self.repo}:{state}"
         now = time.time()
         cached = _LIST_CACHE.get(key)
+        backoff_active = False
+        conn_state: Dict[str, Any] = {}
+        if not strict:
+            backoff_active, conn_state = _gh_backoff_active()
         # Only a 200 from the probe below sets this. Every other route to the
         # fetch stores no ETag, so the next poll re-bootstraps one rather than
         # pairing a fresh list with a validator taken at some other moment.
@@ -955,22 +959,33 @@ class GitHubIssuesBackend:
                 # and a 304 would leave the error latched forever.
             elif not fresh and age < _LIST_CACHE_TTL:
                 return cached["data"]
-        if not strict and not fresh:
+        if not strict and (not fresh or backoff_active):
             # The common case for every fresh CLI process (wt run, wt claim,
             # the reconciler's dispatch path): no in-process cache yet, but
             # the background poller (poll_list_caches_forever) almost
             # certainly refreshed this repo within the last few seconds.
             # Read its file instead of paying for a live `gh` call here.
+            # A fresh status read normally bypasses this snapshot, except
+            # during a recorded GitHub outage: cached state is safer and more
+            # useful than failing the status command while retry is deferred.
             persisted = _read_persisted_list_cache().get(key)
             if persisted is not None and persisted.get("data") is not None:
                 persisted_age = now - float(persisted.get("at") or 0)
-                if persisted_age < _PERSISTED_LIST_STALE_S:
+                if (
+                    persisted_age < _PERSISTED_LIST_STALE_S
+                    or backoff_active
+                ):
                     _LIST_CACHE[key] = {
                         "at": persisted["at"], "data": persisted["data"],
                         "error": None, "etag": "",
                     }
                     return persisted["data"]
-        if cached is not None and cached.get("data") is not None and not strict:
+        if (
+            cached is not None
+            and cached.get("data") is not None
+            and not strict
+            and not backoff_active
+        ):
             # Poller not running / persisted cache stale or absent: fall
             # back to the in-process revalidation this always did. Past the
             # 2s TTL nearly every poll finds an unchanged repo, and a 304
@@ -984,7 +999,6 @@ class GitHubIssuesBackend:
                 cached["at"] = now  # unchanged is as good as re-fetched
                 return cached["data"]
         if not strict:
-            backoff_active, conn_state = _gh_backoff_active()
             if backoff_active:
                 if cached is not None and cached.get("data") is not None:
                     return cached["data"]

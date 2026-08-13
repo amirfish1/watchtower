@@ -1145,6 +1145,50 @@ def test_list_issues_soft_read_uses_persisted_cache_without_calling_gh(
     assert github_backend._LIST_CACHE[f"{repo}:open"]["data"] == [issue]
 
 
+def test_list_issues_fresh_read_uses_persisted_cache_during_github_backoff(
+    tmp_path, monkeypatch
+):
+    """A status read remains useful while GitHub's retry backoff is active."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json")
+    )
+    github_backend._LIST_CACHE.clear()
+
+    repo = "acme/fresh-backoff-persisted-cache-test"
+    issue = {
+        "number": 1, "title": "cached", "body": "", "state": "OPEN",
+        "url": f"https://github.com/{repo}/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+    github_backend._write_persisted_list_entry(
+        f"{repo}:open",
+        {
+            "at": time.time() - github_backend._PERSISTED_LIST_STALE_S - 1,
+            "data": [issue],
+        },
+    )
+    github_backend._record_gh_failure("API rate limit already exceeded")
+
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    calls = {"n": 0}
+
+    def unexpected_run(args, *, check=True):
+        calls["n"] += 1
+        raise AssertionError("must not shell out to gh during active backoff")
+
+    monkeypatch.setattr(backend, "_run", unexpected_run)
+    monkeypatch.setattr(backend, "_run_raw", unexpected_run)
+
+    assert backend._list_issues(fresh=True) == [issue]
+    assert calls["n"] == 0
+
+
 def test_list_issues_ignores_stale_persisted_cache(tmp_path, monkeypatch):
     """If the poller stopped (daemon down/crashed) a soft reader must not
     serve indefinitely stale data -- it self-heals by falling back to its
