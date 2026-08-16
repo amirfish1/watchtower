@@ -63,15 +63,19 @@ def _rev_parse_argv(repo: str, candidate: str) -> Tuple[List[str], str]:
     return verify, ""
 
 
-def resolve_in_repo(repo: str, candidate: str) -> str:
-    """Canonical SHA if ``candidate`` resolves in ``repo``, else "".
+def resolve_in_repo(repo: str, candidate: str) -> Tuple[str, str]:
+    """Canonical SHA if ``candidate`` resolves in ``repo``, else ("", "").
 
-    Never raises: an unreachable host or missing directory is a miss, so one
-    dead candidate cannot block the search across the others.
+    Returns a 2-tuple ``(verified_sha, error)``. An empty string for both means
+    the commit simply does not exist in the repository. A non-empty ``error``
+    means git itself refused to answer (e.g. ``detected dubious ownership``),
+    which must be surfaced to the caller instead of being treated as a miss.
     """
-    argv, err = _rev_parse_argv(repo, candidate)
-    if err or not argv:
-        return ""
+    argv, setup_err = _rev_parse_argv(repo, candidate)
+    if setup_err:
+        return "", setup_err
+    if not argv:
+        return "", ""
     remote = bool(_REMOTE_RE.match(repo))
     try:
         result = subprocess.run(
@@ -82,12 +86,17 @@ def resolve_in_repo(repo: str, candidate: str) -> str:
             check=False,
             timeout=REMOTE_TIMEOUT_S if remote else 10,
         )
-    except (OSError, subprocess.SubprocessError):
-        return ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return "", str(exc)
     verified = result.stdout.strip()
-    if result.returncode != 0 or not COMMIT_SHA_RE.fullmatch(verified):
-        return ""
-    return verified
+    if result.returncode == 0 and COMMIT_SHA_RE.fullmatch(verified):
+        return verified, ""
+    # Git refused to answer. Surface its stderr (dubious ownership, etc.) so the
+    # user does not chase a commit that was fine all along.
+    stderr = getattr(result, "stderr", None) or ""
+    stdout = getattr(result, "stdout", None) or ""
+    git_err = (stderr or stdout).strip()
+    return "", git_err
 
 
 def configured_repos() -> List[str]:
@@ -126,16 +135,34 @@ def search_order(primary: str, extra: Iterable[str] = ()) -> List[str]:
     return order
 
 
+def verify_with_errors(
+    candidate: str, primary: str, extra: Iterable[str] = ()
+) -> Tuple[str, str, List[str]]:
+    """Resolve ``candidate`` across repositories, preserving git error text.
+
+    Returns ``(canonical_sha, repo_it_was_found_in, errors)``.
+    ``errors`` is a list of human-readable git failures (e.g. dubious ownership)
+    encountered while searching; it is empty when the commit was simply absent.
+    """
+    candidate = str(candidate or "").strip()
+    if not COMMIT_SHA_RE.fullmatch(candidate):
+        return "", "", []
+    errors: List[str] = []
+    for repo in search_order(primary, extra):
+        verified, err = resolve_in_repo(repo, candidate)
+        if verified:
+            return verified, repo, []
+        if err:
+            # Keep the message compact: first line of git stderr is usually enough.
+            first_line = err.splitlines()[0] if err.splitlines() else err
+            errors.append(f"{repo}: {first_line}")
+    return "", "", errors
+
+
 def verify(candidate: str, primary: str, extra: Iterable[str] = ()) -> Tuple[str, str]:
     """Resolve ``candidate`` across repositories.
 
     Returns ``(canonical_sha, repo_it_was_found_in)`` or ``("", "")``.
     """
-    candidate = str(candidate or "").strip()
-    if not COMMIT_SHA_RE.fullmatch(candidate):
-        return "", ""
-    for repo in search_order(primary, extra):
-        verified = resolve_in_repo(repo, candidate)
-        if verified:
-            return verified, repo
-    return "", ""
+    verified, repo, _ = verify_with_errors(candidate, primary, extra)
+    return verified, repo

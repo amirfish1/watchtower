@@ -9,6 +9,7 @@ committed work could not be closed. The fix widens WHERE a proof is looked for
 without weakening WHAT counts as one -- these tests pin both halves.
 """
 
+import os
 import subprocess
 
 import pytest
@@ -111,3 +112,37 @@ def test_relative_colon_path_is_not_treated_as_remote():
     argv, err = close_proof._rev_parse_argv("myrepo:notabsolute", "abc1234")
     assert argv == []
     assert "not a directory" in err
+
+
+def test_git_refusal_is_surfaced_not_silently_treated_as_miss(
+    tmp_path, monkeypatch
+):
+    """When git aborts (dubious ownership, etc.) the user must see git's error,
+    not a generic 'not a commit' message that sends them looking for a commit
+    that was fine all along."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/sh\n"
+        "echo 'fatal: detected dubious ownership in repository at ' >&2\n"
+        "exit 128\n"
+    )
+    fake_git.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin) + ":" + os.environ.get("PATH", ""))
+
+    verified, err = close_proof.resolve_in_repo(str(repo), "abc1234")
+    assert verified == ""
+    assert "detected dubious ownership" in err
+
+    verified, found_in, errors = close_proof.verify_with_errors(
+        "abc1234", str(repo)
+    )
+    assert verified == ""
+    assert found_in == ""
+    assert any("detected dubious ownership" in e for e in errors)
+    # The public verify() helper preserves its old contract for callers that
+    # do not want to handle error text.
+    assert close_proof.verify("abc1234", str(repo)) == ("", "")

@@ -792,8 +792,15 @@ def _verify_close_commit(ref: str, sha: str) -> Tuple[str, str]:
     # repo first, then every other configured one (including `host:/path`
     # remotes, verified over ssh). The commit must still genuinely resolve --
     # see close_proof for why widening the search beats loosening the check.
-    verified, _found_in = close_proof.verify(candidate, repo)
+    verified, _found_in, errors = close_proof.verify_with_errors(candidate, repo)
     if not verified:
+        if errors:
+            detail = "; ".join(errors[:3])
+            return "", (
+                f"error: git refused to verify {candidate}: {detail}. "
+                "Fix the git access issue, then retry, or use "
+                "`wt block <ref> --progress \"...\"` instead of closing"
+            )
         return "", (
             f"error: {candidate} is not a commit in {repo} or any other configured "
             "repo; commit the verified work or use "
