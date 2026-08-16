@@ -79,6 +79,14 @@ _LIST_CACHE: Dict[str, Dict[str, Any]] = {}
 _LIST_CACHE_TTL = 2.0
 _LIST_ERROR_BACKOFF = 60.0
 
+# Cap on how often a non-strict reader honors a "changed" ETag probe with a
+# real GraphQL fetch. On a busy repo the probe fires on every poll sweep, so
+# without this cap the fetch rate -- not the per-call cost -- is what burns
+# the hourly GraphQL quota. 60s bounds a busy repo to one heavy fetch per
+# state per minute; quiet repos never notice (a change past the cap fetches
+# immediately).
+_LIST_FETCH_MIN_INTERVAL_S = 60.0
+
 # Persisted list cache (2026-08-11, WT reconciler-latency fix). `_LIST_CACHE`
 # above is in-process only, so it does nothing for the common case: `wt run`
 # / `wt claim` / the reconciler's own dispatch_after_enqueue path are each a
@@ -1048,6 +1056,20 @@ class GitHubIssuesBackend:
             if unchanged:
                 cached["at"] = now  # unchanged is as good as re-fetched
                 return cached["data"]
+            # Heavy-fetch rate cap. On a busy repo the probe returns 200 on
+            # EVERY sweep (active workers touch issues every few seconds),
+            # so the "cheap detector" bought nothing: the daemon poller was
+            # paying a full GraphQL `gh issue list` (~3-12 pts) per state
+            # every 5s -- ~10k pts/hr against the 5k/hr quota. Serve the
+            # cached list until the last real FETCH reaches the cap age.
+            # Keyed by fetched_at, not at: a 304 refreshes `at` ("unchanged
+            # is as good as re-fetched"), so capping on `at` would suppress
+            # fetches forever on any actively-polled repo. Quiet repos are
+            # unaffected -- their last fetch is older than the cap, so a
+            # genuine change still fetches on the next sweep. Strict callers
+            # never cap.
+            if now - float(cached.get("fetched_at") or 0) < _LIST_FETCH_MIN_INTERVAL_S:
+                return cached["data"]
         if not strict:
             if backoff_active:
                 if cached is not None and cached.get("data") is not None:
@@ -1084,14 +1106,20 @@ class GitHubIssuesBackend:
             _LIST_CACHE[key] = {
                 # The stale data keeps its own validator; nothing probes with
                 # it while an error is recorded, so it cannot mislead.
+                # fetched_at carries over: a failed attempt is not a fetch,
+                # and must not reset the rate cap's clock.
                 "at": now, "data": prev_data, "error": exc,
                 "etag": (cached.get("etag") or "") if cached else "",
+                "fetched_at": (cached.get("fetched_at") or 0) if cached else 0,
             }
             if prev_data is not None and not strict:
                 return prev_data
             raise
         _record_gh_success()
-        _LIST_CACHE[key] = {"at": now, "data": result, "error": None, "etag": etag}
+        _LIST_CACHE[key] = {
+            "at": now, "data": result, "error": None, "etag": etag,
+            "fetched_at": now,
+        }
         return result
 
     def enqueue(

@@ -989,6 +989,8 @@ def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
 
     monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.05)
     monkeypatch.setattr(github_backend, "_LIST_ERROR_BACKOFF", 0.2)
+    # Error-backoff behaviour, not fetch cadence: let every expired read attempt gh.
+    monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 0.0)
     github_backend._LIST_CACHE.clear()
 
     backend = github_backend.GitHubIssuesBackend("T", repo="acme/cache-test")
@@ -1466,6 +1468,10 @@ def _etag_backend(monkeypatch, repo="acme/etag-test"):
     import watchtower.github_backend as github_backend
 
     monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.0)
+    # These tests exercise probe semantics (304 vs 200 vs unusable), where
+    # every revalidating read must be allowed to fetch. The heavy-fetch rate
+    # cap is neutralised here and covered by its own test.
+    monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 0.0)
     github_backend._LIST_CACHE.clear()
     backend = github_backend.GitHubIssuesBackend("T", repo=repo)
     counts = {"fetch": 0}
@@ -1536,6 +1542,38 @@ def test_etag_200_refetches_and_stores_the_new_validator(monkeypatch):
     assert github_backend._LIST_CACHE["acme/etag-test:open"]["etag"] == '"v2"'
     assert counts["fetch"] == 3
     assert 'If-None-Match: "v1"' in probes[-1]
+
+
+def test_changed_probe_fetch_is_rate_capped_on_a_busy_repo(monkeypatch):
+    """A busy repo makes the probe say 200 on EVERY sweep; the rich fetch may
+    still run at most once per _LIST_FETCH_MIN_INTERVAL_S. The cap keys off
+    fetched_at (last real fetch), never `at` -- a 304 refreshes `at`, so
+    capping on it would suppress fetches forever on an actively-polled repo.
+    """
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.0)
+    monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 60.0)
+    github_backend._LIST_CACHE.clear()
+    backend = github_backend.GitHubIssuesBackend("T", repo="acme/cap-test")
+    counts = {"fetch": 0}
+
+    def fake_run(args, *, check=True):
+        counts["fetch"] += 1
+        return json.dumps([_PROBE_ISSUE])
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    monkeypatch.setattr(backend, "_run_raw", lambda args: _ok(etag="v1"))
+
+    backend._list_issues()   # cold fetch
+    backend._list_issues()   # probe 200, but last fetch is seconds old -> capped
+    backend._list_issues()   # still capped
+    assert counts["fetch"] == 1
+
+    entry = github_backend._LIST_CACHE["acme/cap-test:open"]
+    entry["fetched_at"] -= 61.0  # last real fetch now older than the cap
+    backend._list_issues()       # changed AND past the cap -> fetch
+    assert counts["fetch"] == 2
 
 
 def test_unusable_etag_probe_falls_through_to_the_unconditional_fetch(monkeypatch):
@@ -1618,6 +1656,12 @@ def test_a_new_issue_is_visible_to_the_next_revalidating_read(tmp_path, monkeypa
     an unchanged repo is answered from cache, a new issue is not."""
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.github_backend as github_backend
+
+    # This test compresses a real change into seconds after the last fetch;
+    # the fetch-rate cap (covered separately) would legitimately defer it.
+    # Set after _reload_isolated, which reloads this module and would wipe it.
+    monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 0.0)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "test-owner/test-repo")
     _write_fake_issues(state, [_fake_issue(1, "first")])
@@ -2049,6 +2093,8 @@ def test_gh_connectivity_stale_data_fallback_still_records_failure(tmp_path, mon
 
     monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.05)
     monkeypatch.setattr(github_backend, "_LIST_ERROR_BACKOFF", 60.0)
+    # Ditto: this test is about failure recording, not the fetch-rate cap.
+    monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 0.0)
 
     backend = github_backend.GitHubIssuesBackend("T", repo="acme/stale-fallback-test")
     good_issue = {
