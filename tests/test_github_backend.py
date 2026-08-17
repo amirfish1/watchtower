@@ -280,6 +280,9 @@ def _reload_isolated(tmp_path: Path, monkeypatch):
     monkeypatch.setenv(
         "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
     )
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_CLAIM_LOCKS_DIR", str(tmp_path / "gh-claim-locks")
+    )
     # The worker registry has to be sandboxed too: the drain-off tests below
     # call workers.reconcile_once(), which without this reads the machine's
     # live ~/.watchtower/workers.json (and takes the real reconcile lock).
@@ -429,6 +432,58 @@ def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     assert issue["state"] == "CLOSED"
     assert "@me" in issue["assignees"]
     assert any("fixed it" in c for c in issue["comments"])
+
+
+def test_github_backend_claim_by_ref_serializes_concurrent_claimants(tmp_path, monkeypatch):
+    """Regression for a double-claim race: two workers claiming the same ref
+    at the same instant (e.g. both nudged awake for a stuck queue) must not
+    both win. `gh issue edit` has no compare-and-swap, so without a lock
+    around claim_by_ref's read-check-write section, two concurrent claimants
+    can both read the issue as open before either write lands, then both
+    write themselves in as the claimant -- observed live as
+    BYM-GH-FINIE-780 claimed by two different workers one second apart."""
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    item = q.enqueue(project="GHI", note="racy ticket", source="test")
+
+    start = threading.Barrier(2)
+    results: list = []
+    lock = threading.Lock()
+
+    def attempt(worker: str) -> None:
+        start.wait()
+        try:
+            claimed = q.claim_by_ref(item["ref"], worker)
+            outcome = ("ok", claimed)
+        except ValueError as exc:
+            outcome = ("error", str(exc))
+        with lock:
+            results.append((worker, outcome))
+
+    threads = [
+        threading.Thread(target=attempt, args=("worker-a",)),
+        threading.Thread(target=attempt, args=("worker-b",)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert len(results) == 2
+    winners = [w for w, (kind, _) in results if kind == "ok"]
+    losers = [w for w, (kind, _) in results if kind == "error"]
+    assert len(winners) == 1, f"expected exactly one winner, got {results}"
+    assert len(losers) == 1
+
+    final = q.get(item["ref"])
+    assert final["status"] == "in_progress"
+    assert final["claimed_by"] == winners[0]
+    assert [e["event"] for e in final["history"]] == ["claim"]
+    assert final["history"][0]["worker"] == winners[0]
 
 
 def test_github_backend_rejects_crossworker_close(tmp_path, monkeypatch):

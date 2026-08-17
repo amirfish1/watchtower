@@ -119,6 +119,13 @@ def _list_cache_path() -> Path:
     return _GH_LIST_CACHE_FILE
 
 
+def _claim_locks_dir() -> Path:
+    env = os.environ.get("WATCHTOWER_GH_CLAIM_LOCKS_DIR")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".watchtower" / "gh-claim-locks"
+
+
 def _read_persisted_list_cache() -> Dict[str, Any]:
     try:
         data = json.loads(_list_cache_path().read_text())
@@ -1284,6 +1291,22 @@ class GitHubIssuesBackend:
             return None
         return self._issue_to_item(issue)
 
+    def _claim_lock_path(self) -> Path:
+        """Per-repo advisory lock serializing claim_by_ref's read-then-write.
+
+        `gh issue edit` has no compare-and-swap: two workers can both read an
+        issue as open (via `self.get`) before either write lands, then both
+        write `--add-label in-progress` and `claimed_by`, believing they each
+        hold an exclusive claim (observed: BYM-GH-FINIE-780 claimed by two
+        workers one second apart, right after a stuck-queue nudge asked
+        several live workers to claim next in the same instant). Serializing
+        the whole check-then-write section per repo closes that window.
+        """
+        safe_repo = re.sub(r"[^A-Za-z0-9_.-]", "_", self.repo) or "unknown"
+        path = _claim_locks_dir() / f"{safe_repo}.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
     def _stop_signal_path(self, session_id: str):
         try:
             from . import workers as _workers
@@ -1406,44 +1429,45 @@ class GitHubIssuesBackend:
     ) -> Optional[Dict[str, Any]]:
         if not session_id:
             raise ValueError("session_id is required")
-        item = self.get(ref)
-        if item is None:
-            return None
-        status = item.get("status", "open")
-        if status != "open":
-            raise ValueError(f"{ref} is not open (status={status})")
-        # No whitelist to fail any more: the only way to be ineligible is to
-        # be opted out, inside the grace period, or on a queue that is not
-        # draining. `wt run` (run_requested) overrides all three.
-        if not item.get("work_it", False):
-            raise ValueError(
-                f"{ref} is not eligible to run "
-                f"(auto_drain={'on' if self.auto_drain else 'off'}, "
-                f"no-auto-drain={'yes' if item.get('no_auto_drain') else 'no'}, "
-                f"grace={self.grace_s}s); run `wt run {ref}` to work it anyway"
-            )
-        number = str(item["number"])
-        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
-        meta.update({
-            "claimed_by": str(session_id),
-            "claimed_at": _now_iso(),
-        })
-        if session_uuid:
-            meta["claimed_session_id"] = str(session_uuid)
-        _append_history(meta, "claim", session_id=str(session_uuid or ""), worker=str(session_id))
-        self._ensure_labels()
-        self._run([
-            "issue", "edit", number,
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-            "--add-assignee", self.assignee,
-            "--add-label", self.in_progress_label,
-        ])
-        claimed = self.get(ref)
-        if claimed:
-            claimed["claimed_by"] = str(session_id)
-            claimed["status"] = "in_progress"
-        return claimed
+        with _FileLock(self._claim_lock_path()):
+            item = self.get(ref)
+            if item is None:
+                return None
+            status = item.get("status", "open")
+            if status != "open":
+                raise ValueError(f"{ref} is not open (status={status})")
+            # No whitelist to fail any more: the only way to be ineligible is
+            # to be opted out, inside the grace period, or on a queue that is
+            # not draining. `wt run` (run_requested) overrides all three.
+            if not item.get("work_it", False):
+                raise ValueError(
+                    f"{ref} is not eligible to run "
+                    f"(auto_drain={'on' if self.auto_drain else 'off'}, "
+                    f"no-auto-drain={'yes' if item.get('no_auto_drain') else 'no'}, "
+                    f"grace={self.grace_s}s); run `wt run {ref}` to work it anyway"
+                )
+            number = str(item["number"])
+            body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+            meta.update({
+                "claimed_by": str(session_id),
+                "claimed_at": _now_iso(),
+            })
+            if session_uuid:
+                meta["claimed_session_id"] = str(session_uuid)
+            _append_history(meta, "claim", session_id=str(session_uuid or ""), worker=str(session_id))
+            self._ensure_labels()
+            self._run([
+                "issue", "edit", number,
+                *self._repo_args(),
+                "--body", _body_with_metadata(body, meta),
+                "--add-assignee", self.assignee,
+                "--add-label", self.in_progress_label,
+            ])
+            claimed = self.get(ref)
+            if claimed:
+                claimed["claimed_by"] = str(session_id)
+                claimed["status"] = "in_progress"
+            return claimed
 
     def update_status(
         self,
