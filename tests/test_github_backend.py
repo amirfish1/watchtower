@@ -468,6 +468,31 @@ def test_github_backend_imports_issue_title_and_comments_into_worker_text(
     )
 
 
+def test_github_backend_lists_issues_without_requesting_bulk_comments(monkeypatch):
+    """A GitHub 503 for nested comments must not make the queue unreadable."""
+    import watchtower.github_backend as github_backend
+
+    github_backend._LIST_CACHE.clear()
+    backend = github_backend.GitHubIssuesBackend("GHI", repo="owner/repo")
+    issue = _fake_issue(1, "Still listable", body="Issue body")
+    calls = []
+
+    def fake_run(args, *, check=True):
+        calls.append(args)
+        if "comments" in args[args.index("--json") + 1].split(","):
+            raise github_backend.GitHubBackendError("gh issue list failed: HTTP 503")
+        return json.dumps([{key: value for key, value in issue.items() if key != "comments"}])
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    _no_etag_probe(monkeypatch, backend)
+
+    assert backend.list_items() == [backend._issue_to_item(issue)]
+    assert all(
+        "comments" not in call[call.index("--json") + 1].split(",")
+        for call in calls
+    )
+
+
 def test_github_backend_blocks_claimed_ticket_by_documented_ref(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)

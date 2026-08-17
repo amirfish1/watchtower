@@ -378,12 +378,11 @@ def _gh_backoff_active() -> "tuple[bool, Dict[str, Any]]":
 # anything move in this repo?" in ~0.5s and, on a 304, costs nothing against
 # the rate limit (`X-RateLimit-Remaining` is unchanged across it).
 #
-# It is a detector and not a replacement fetcher on purpose: this REST endpoint
-# reports `comments` as a *count* while `_issue_to_item` embeds full comment
-# bodies in every row, and it mixes pull requests into the payload. Swapping
-# the fetcher would silently strip comment context out of worker tickets. So a
-# 200 only means "go look" -- `gh issue list --json ...` is still what produces
-# the data.
+# It is a detector and not a replacement fetcher on purpose: it mixes pull
+# requests into the payload and lacks several fields WatchTower needs to render
+# queue rows. A 200 only means "go look" -- `gh issue list --json ...` still
+# produces the queue data. Full comment context is loaded by `get()` for the
+# individual ticket, not by this bulk fetch.
 _HTTP_STATUS_RE = re.compile(r"^HTTP/[\d.]+\s+(\d{3})")
 
 
@@ -1083,7 +1082,11 @@ class GitHubIssuesBackend:
                 "issue", "list",
                 *self._repo_args(),
                 "--state", state,
-                "--json", "number,title,body,state,url,assignees,labels,comments,createdAt,updatedAt,closedAt",
+                # Listing requests must stay shallow. Asking GitHub GraphQL
+                # for nested comment bodies across the whole queue can return
+                # a 503, making even an otherwise healthy queue unavailable.
+                # `get()` still requests comments for one ticket at a time.
+                "--json", "number,title,body,state,url,assignees,labels,createdAt,updatedAt,closedAt",
                 "--limit", "1000",
             ]
             if state == "closed":
