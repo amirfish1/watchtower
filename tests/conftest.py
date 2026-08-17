@@ -27,6 +27,17 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def inert_codex_binary(tmp_path, monkeypatch):
+    """Keep a test from resolving the developer's real Codex executable."""
+    bin_dir = tmp_path / "watchtower-test-bin"
+    bin_dir.mkdir()
+    codex = bin_dir / "codex"
+    codex.write_text("#!/bin/sh\nexit 0\n")
+    codex.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
 # Every path-ish knob WatchTower reads from the environment. Redirecting all of
 # them is what makes a test hermetic; missing one means a test writes into
 # ~/.watchtower on a live fleet machine.

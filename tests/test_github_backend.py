@@ -307,12 +307,22 @@ def _reload_isolated(tmp_path: Path, monkeypatch):
     importlib.reload(github_backend)
     importlib.reload(q)
     importlib.reload(_workers)
+    # Reconciler tests must not import the developer's legacy registry, which
+    # can contain live GitHub-backed queues and trigger real ``gh`` calls.
+    monkeypatch.setattr(config, "_REGISTRY_FILE", tmp_path / "no-legacy-registry.json")
     # Pretend the one-time GitHub drain migration already ran (it has, on any
     # real install, long before these code paths run). Tests that exercise the
     # migration itself remove this marker first.
     config.GH_DRAIN_MIGRATION_MARKER.parent.mkdir(parents=True, exist_ok=True)
     config.GH_DRAIN_MIGRATION_MARKER.write_text("{}\n")
     return config, q
+
+
+def test_github_backend_fixture_sandboxes_legacy_queue_registry(tmp_path, monkeypatch):
+    """Reconciler tests must not import a developer's live legacy queues."""
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+
+    assert config._REGISTRY_FILE == tmp_path / "no-legacy-registry.json"
 
 
 def _drainable(config, queue: str = "GHI") -> None:

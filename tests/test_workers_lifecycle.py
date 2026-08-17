@@ -21,6 +21,7 @@ import importlib
 import json
 import os
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -90,6 +91,13 @@ def _dead_pid():
     p = subprocess.Popen(["true"])
     p.wait()
     return p.pid
+
+
+def test_test_environment_uses_the_inert_codex_binary():
+    """A test must not resolve the developer's real Codex executable."""
+    resolved = Path(shutil.which("codex") or "")
+
+    assert resolved.parent.name == "watchtower-test-bin"
 
 
 def test_find_engine_ancestor_ignores_codex_app_server(wt, monkeypatch):
