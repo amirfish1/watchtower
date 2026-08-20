@@ -60,6 +60,7 @@ _ENV_DIRS = {
     "WATCHTOWER_STOP_SIGNALS_DIR": "stop-signals",
     "CLAUDE_CONFIG_DIR": "claude-home",
     "WATCHTOWER_GH_CLAIM_LOCKS_DIR": "gh-claim-locks",
+    "WATCHTOWER_SNAPSHOTS_DIR": "snapshots",
 }
 
 # Leftover state from an enclosing shell (a real fleet machine runs `wt` with
