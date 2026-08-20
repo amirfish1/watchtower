@@ -307,3 +307,61 @@ def run_timer(session_id: str, *, now_fn=None, sleep_fn=None, fire_fn=None) -> s
             return finish("error", str(result.get("error") or "delivery failed"))
         return finish("fired")
 
+
+def _first_user_text(path: Path) -> str:
+    """First real user-message text in a claude transcript, whitespace-collapsed."""
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") != "user":
+                    continue
+                content = (entry.get("message") or {}).get("content")
+                if isinstance(content, str):
+                    text = content
+                else:
+                    text = next((b.get("text", "") for b in (content or [])
+                                 if isinstance(b, dict) and b.get("type") == "text"), "")
+                text = " ".join(str(text).split())
+                if text:
+                    return text[:100]
+    except OSError:
+        pass
+    return ""
+
+
+def list_sessions(cwd: str, limit: int = 10, exclude: str = "") -> list:
+    """Newest-first claude sessions for a project dir (codex deferred: its
+    rollout paths don't encode the cwd)."""
+    from . import messages
+    d = messages._claude_projects_root() / cwd_slug(cwd)
+    rows = []
+    try:
+        paths = list(d.glob("*.jsonl"))
+    except OSError:
+        return []
+    for p in paths:
+        sid = p.stem
+        if sid == exclude:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        rows.append({"session_id": sid, "mtime": st.st_mtime,
+                     "size": st.st_size, "first_message": _first_user_text(p)})
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows[: max(0, int(limit))]
+
+
+def _age_str(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+

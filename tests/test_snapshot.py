@@ -140,3 +140,41 @@ def test_record_fails_when_snapshot_missing(wt_env):
     assert not r["ok"] and "not found" in r["error"]
 
 
+def _write_transcript(root, slug, sid, mtime, first_text="hello world"):
+    import json as _json, os as _os
+    d = root / slug
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{sid}.jsonl"
+    lines = [
+        _json.dumps({"type": "summary", "summary": "x"}),
+        _json.dumps({"type": "user",
+                     "message": {"role": "user", "content": [
+                         {"type": "text", "text": first_text}]}}),
+    ]
+    p.write_text("\n".join(lines) + "\n")
+    _os.utime(p, (mtime, mtime))
+    return p
+
+
+def test_list_sessions_orders_excludes_and_snippets(wt_env, tmp_path, monkeypatch):
+    root = tmp_path / "claude-projects"
+    monkeypatch.setenv("WATCHTOWER_CLAUDE_PROJECTS_DIR", str(root))
+    slug = snapshot.cwd_slug("/tmp/proj")
+    _write_transcript(root, slug, "old1", 1000.0, "first task ever")
+    _write_transcript(root, slug, "new1", 3000.0, "  newest   task  ")
+    _write_transcript(root, slug, "self1", 4000.0, "my own fresh session")
+    rows = snapshot.list_sessions("/tmp/proj", limit=10, exclude="self1")
+    assert [r["session_id"] for r in rows] == ["new1", "old1"]
+    assert rows[0]["first_message"] == "newest task"
+
+
+def test_list_sessions_respects_limit_and_missing_dir(wt_env, tmp_path, monkeypatch):
+    root = tmp_path / "claude-projects"
+    monkeypatch.setenv("WATCHTOWER_CLAUDE_PROJECTS_DIR", str(root))
+    assert snapshot.list_sessions("/tmp/nowhere") == []
+    slug = snapshot.cwd_slug("/tmp/proj")
+    for i in range(4):
+        _write_transcript(root, slug, f"s{i}", 1000.0 + i)
+    assert len(snapshot.list_sessions("/tmp/proj", limit=2)) == 2
+
+

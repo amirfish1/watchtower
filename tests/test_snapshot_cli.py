@@ -65,3 +65,16 @@ def test_status_empty_cli(run_cli):
     r = run_cli("snapshot", "status")
     assert r.code == 0
     assert "no snapshot timers" in r.out
+
+
+def test_sessions_verb_lists_and_handles_empty(run_cli, tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_CLAUDE_PROJECTS_DIR", str(tmp_path))
+    r = run_cli("snapshot", "sessions", "--cwd", "/tmp/proj")
+    assert r.code == 0 and "no sessions found" in r.out
+    from tests.test_snapshot import _write_transcript
+    from watchtower import snapshot as snap
+    _write_transcript(tmp_path, snap.cwd_slug("/tmp/proj"), "abc12345-full-id",
+                      5000.0, "build the widget")
+    r = run_cli("snapshot", "sessions", "--cwd", "/tmp/proj", "-n", "5")
+    assert r.code == 0
+    assert "abc12345-full-id" in r.out and "build the widget" in r.out

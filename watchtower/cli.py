@@ -3000,7 +3000,7 @@ def cmd_skills(args: argparse.Namespace) -> int:
 def cmd_snapshot(args: argparse.Namespace) -> int:
     """Manage session snapshots ("token-sitter") and detached timers.
 
-    Verbs: arm, disarm, status, fire, timer-run, path, record, latest, consume.
+    Verbs: arm, disarm, status, fire, timer-run, path, record, latest, consume, sessions.
     """
     from . import snapshot as snap
 
@@ -3078,8 +3078,20 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
 
         print(snap.consume(_P(args.path)))
         return 0
+    if cmd == "sessions":
+        rows = snap.list_sessions(args.cwd, limit=args.limit, exclude=args.exclude)
+        if not rows:
+            print("no sessions found for this directory")
+            return 0
+        now = time.time()
+        for i, r_ in enumerate(rows, 1):
+            print(
+                f"{i}) {r_['session_id']}  {snap._age_str(now - r_['mtime'])}  "
+                f"{r_['first_message']}"
+            )
+        return 0
     print(
-        "usage: wt snapshot arm|disarm|status|fire|path|record|latest|consume ...",
+        "usage: wt snapshot arm|disarm|status|fire|path|record|latest|consume|sessions ...",
         file=sys.stderr,
     )
     return 1
@@ -3951,6 +3963,12 @@ def build_parser() -> argparse.ArgumentParser:
     sc = ssub.add_parser("consume")
     sc.add_argument("--path", required=True)
     sc.set_defaults(func=cmd_snapshot)
+
+    se = ssub.add_parser("sessions")
+    se.add_argument("--cwd", required=True)
+    se.add_argument("-n", type=int, default=10, dest="limit")
+    se.add_argument("--exclude", default="")
+    se.set_defaults(func=cmd_snapshot)
 
     s = sub.add_parser("dashboard", aliases=["serve"])
     s.add_argument("--host", default="127.0.0.1")
