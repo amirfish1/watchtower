@@ -44,3 +44,63 @@ def test_state_roundtrip_and_paths(wt_env):
     link = snapshot.latest_link("/Users/x/Apps/demo.app")
     assert link.name == "latest"
     assert link.parent.name == "-Users-x-Apps-demo-app"
+
+
+def test_arm_rejects_threshold_at_or_past_ttl(wt_env):
+    r = snapshot.arm("s1", "claude", "/tmp/x", idle_min=60, spawn=False)
+    assert not r["ok"] and "60" in r["error"]
+
+
+def test_arm_writes_state_and_disarm_marks_it(wt_env):
+    r = snapshot.arm("s1", "claude", "/tmp/x", idle_min=10, spawn=False)
+    assert r["ok"] and snapshot.load_state("s1")["outcome"] == "armed"
+    assert snapshot.disarm("s1")["ok"]
+    assert snapshot.load_state("s1")["outcome"] == "disarmed"
+    assert snapshot.status("s1")[0]["outcome"] == "disarmed"
+
+
+def test_run_timer_sleeps_then_fires_once(wt_env, monkeypatch):
+    fired = []
+    clock = {"t": 1000.0}
+    mtimes = iter([1000.0, 1000.0])  # active at first wake, then idle long enough
+    monkeypatch.setattr(snapshot, "transcript_mtime", lambda sid, eng: next(mtimes, 1000.0))
+    snapshot.arm("s1", "claude", "/tmp/x", idle_min=55, spawn=False)
+
+    def fake_sleep(s):
+        clock["t"] += s
+
+    outcome = snapshot.run_timer(
+        "s1", now_fn=lambda: clock["t"], sleep_fn=fake_sleep,
+        fire_fn=lambda sid: fired.append(sid) or {"ok": True},
+    )
+    assert outcome == "fired" and fired == ["s1"]
+    assert snapshot.load_state("s1")["outcome"] == "fired"
+
+
+def test_run_timer_skips_when_overslept(wt_env, monkeypatch):
+    clock = {"t": 100_000.0}
+    # transcript last touched 61 minutes before the (single) wake
+    monkeypatch.setattr(snapshot, "transcript_mtime",
+                        lambda sid, eng: clock["t"] - 61 * 60)
+    snapshot.arm("s1", "claude", "/tmp/x", idle_min=55, spawn=False)
+    outcome = snapshot.run_timer("s1", now_fn=lambda: clock["t"],
+                                 sleep_fn=lambda s: None,
+                                 fire_fn=lambda sid: {"ok": True})
+    assert outcome == "skipped-overslept"
+    assert snapshot.load_state("s1")["outcome"] == "skipped-overslept"
+
+
+def test_run_timer_exits_when_disarmed_meanwhile(wt_env, monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(snapshot, "transcript_mtime", lambda sid, eng: clock["t"])
+    snapshot.arm("s1", "claude", "/tmp/x", idle_min=55, spawn=False)
+
+    def sleep_and_disarm(s):
+        clock["t"] += s
+        snapshot.disarm("s1")
+
+    outcome = snapshot.run_timer("s1", now_fn=lambda: clock["t"],
+                                 sleep_fn=sleep_and_disarm,
+                                 fire_fn=lambda sid: {"ok": True})
+    assert outcome == "disarmed"
+
