@@ -191,9 +191,77 @@ def status(session_id: Optional[str] = None) -> list:
     return out
 
 
+def build_fire_prompt(session_id: str, engine: str, cwd: str, idle_min: float) -> str:
+    path = snapshot_path(session_id)
+    return (
+        f"[auto-snapshot] This session has been idle ~{idle_min:.0f} minutes; "
+        "its prompt cache is about to go cold, so reloading this context later "
+        "would be expensive. Before anything else, write a durable snapshot so "
+        "a fresh session can resume cheaply:\n"
+        f"1. Write the file {path} with YAML frontmatter "
+        f"(session_id: {session_id}, engine: {engine}, cwd: {cwd}, git_branch, "
+        "git_commit, trigger: auto, created_at as ISO timestamp) and a body "
+        "with these sections: What's done; What's in flight; Next concrete "
+        "step; Key files; Gotchas & decisions.\n"
+        f"2. Run: wt snapshot record --session {session_id} --cwd \"{cwd}\"\n"
+        "3. Optional: if a wt queue clearly fits this work, file ONE ticket "
+        "whose note points at that file.\n"
+        "Take no other action; there is nothing to ask the user."
+    )
+
+
 def fire(session_id: str) -> Dict[str, Any]:
-    """Stub replaced in Task 3."""
-    raise NotImplementedError
+    from . import messages
+    state = load_state(session_id)
+    if not state:
+        return {"ok": False, "error": f"no timer state for session {session_id}"}
+    engine = str(state.get("engine") or "claude")
+    cwd = str(state.get("cwd") or "")
+    mtime = transcript_mtime(session_id, engine)
+    idle_min = ((time.time() - mtime) / 60.0) if mtime else 0.0
+    prompt = build_fire_prompt(session_id, engine, cwd, idle_min)
+    resolved = {"session_id": session_id, "engine": engine, "cwd": cwd}
+    return messages.deliver(resolved, prompt)
+
+
+def record(session_id: str, cwd: str) -> Dict[str, Any]:
+    path = snapshot_path(session_id)
+    if not path.exists():
+        return {"ok": False, "error": f"snapshot not found at {path}"}
+    link = latest_link(cwd)
+    link.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(path)
+    except OSError as e:
+        return {"ok": False, "error": f"cannot update latest link: {e}"}
+    return {"ok": True, "path": str(path), "latest": str(link)}
+
+
+def find_latest(cwd: str) -> Optional[Path]:
+    link = latest_link(cwd)
+    try:
+        target = link.resolve(strict=True)
+    except OSError:
+        return None
+    return target if target.exists() else None
+
+
+def consume(path: Path) -> Path:
+    archive_dir = snapshots_dir() / "archive"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    dest = archive_dir / path.name
+    by_cwd = snapshots_dir() / "by-cwd"
+    if by_cwd.is_dir():
+        for link in by_cwd.glob("*/latest"):
+            try:
+                if link.resolve() == path.resolve():
+                    link.unlink()
+            except OSError:
+                continue
+    path.replace(dest)
+    return dest
 
 
 def run_timer(session_id: str, *, now_fn=None, sleep_fn=None, fire_fn=None) -> str:

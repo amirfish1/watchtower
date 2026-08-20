@@ -104,3 +104,39 @@ def test_run_timer_exits_when_disarmed_meanwhile(wt_env, monkeypatch):
                                  fire_fn=lambda sid: {"ok": True})
     assert outcome == "disarmed"
 
+
+def test_fire_delivers_prompt_with_paths(wt_env, monkeypatch):
+    sent = {}
+    snapshot.arm("s1", "claude", "/tmp/proj", idle_min=55, spawn=False)
+    monkeypatch.setattr(snapshot, "transcript_mtime",
+                        lambda sid, eng: 0.0)  # idle forever -> prompt says ~cold
+
+    def fake_deliver(resolved, text):
+        sent.update(resolved=resolved, text=text)
+        return {"ok": True, "transport": "tty"}
+
+    monkeypatch.setattr("watchtower.messages.deliver", fake_deliver)
+    r = snapshot.fire("s1")
+    assert r["ok"]
+    assert sent["resolved"]["session_id"] == "s1"
+    assert sent["resolved"]["engine"] == "claude"
+    assert str(snapshot.snapshot_path("s1")) in sent["text"]
+    assert "wt snapshot record" in sent["text"]
+
+
+def test_record_and_find_latest_and_consume(wt_env):
+    p = snapshot.snapshot_path("s1")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("---\nsession_id: s1\n---\nstate\n")
+    assert snapshot.record("s1", "/tmp/proj")["ok"]
+    assert snapshot.find_latest("/tmp/proj") == p
+    archived = snapshot.consume(p)
+    assert archived.exists() and archived.parent.name == "archive"
+    assert snapshot.find_latest("/tmp/proj") is None
+
+
+def test_record_fails_when_snapshot_missing(wt_env):
+    r = snapshot.record("ghost", "/tmp/proj")
+    assert not r["ok"] and "not found" in r["error"]
+
+
