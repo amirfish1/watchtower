@@ -15,6 +15,10 @@ EXPECTED_SKILLS = (
     "wt-triage-queue",
     "compact-to-queue",
     "add-annotate-widget",
+    "auto-snapshot-on",
+    "auto-snapshot-off",
+    "snapshot-now",
+    "resume-from-snapshot",
 )
 ALL_ENGINES = ("claude", "codex", "antigravity", "kimi")
 
