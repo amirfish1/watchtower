@@ -2997,6 +2997,94 @@ def cmd_skills(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    """Manage session snapshots ("token-parachute") and detached timers.
+
+    Verbs: arm, disarm, status, fire, timer-run, path, record, latest, consume.
+    """
+    from . import snapshot as snap
+
+    cmd = getattr(args, "snapshot_command", None)
+    if cmd == "arm":
+        r = snap.arm(
+            args.session,
+            args.engine,
+            args.cwd,
+            idle_min=args.idle if args.idle is not None else snap.DEFAULT_IDLE_MIN,
+        )
+        if r.get("ok"):
+            if r.get("ccc_handover_armed"):
+                print(
+                    "warning: CCC auto-handover is also armed for this "
+                    "session; expect a double snapshot",
+                    file=sys.stderr,
+                )
+            st = r["state"]
+            print(
+                f"armed: snapshots after {st['idle_min']:g} idle minutes; "
+                f"window closes at {snap.CACHE_TTL_MIN} (timer pid {st['pid']})"
+            )
+            return 0
+        print(r.get("error"), file=sys.stderr)
+        return 1
+    if cmd == "disarm":
+        r = snap.disarm(args.session)
+        print(
+            "disarmed" if r.get("ok") else r.get("error"),
+            file=sys.stdout if r.get("ok") else sys.stderr,
+        )
+        return 0 if r.get("ok") else 1
+    if cmd == "status":
+        rows = snap.status(args.session)
+        for s_ in rows:
+            print(
+                f"{s_['session_id'][:8]}  {s_.get('engine','?'):7} "
+                f"{s_.get('outcome','?'):18} idle_min={s_.get('idle_min','?')} "
+                f"alive={s_.get('timer_alive')}"
+            )
+        if not rows:
+            print("no snapshot timers")
+        return 0
+    if cmd == "fire":
+        r = snap.fire(args.session)
+        print(
+            r if r.get("ok") else r.get("error"),
+            file=sys.stdout if r.get("ok") else sys.stderr,
+        )
+        return 0 if r.get("ok") else 1
+    if cmd == "timer-run":
+        outcome = snap.run_timer(args.session_id)
+        print(f"timer outcome: {outcome}")
+        return 0
+    if cmd == "path":
+        print(snap.snapshot_path(args.session))
+        return 0
+    if cmd == "record":
+        r = snap.record(args.session, args.cwd)
+        print(
+            r.get("path") if r.get("ok") else r.get("error"),
+            file=sys.stdout if r.get("ok") else sys.stderr,
+        )
+        return 0 if r.get("ok") else 1
+    if cmd == "latest":
+        p = snap.find_latest(args.cwd)
+        if p is None:
+            print("no snapshot for this directory", file=sys.stderr)
+            return 1
+        print(p)
+        return 0
+    if cmd == "consume":
+        from pathlib import Path as _P
+
+        print(snap.consume(_P(args.path)))
+        return 0
+    print(
+        "usage: wt snapshot arm|disarm|status|fire|path|record|latest|consume ...",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def _pid_from_file(path: Path) -> Optional[int]:
     """Return the live pid recorded in ``path``, or None (cleaning up stale)."""
     if not path.exists():
@@ -3133,6 +3221,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Agent messaging", "outbox"),
     ("Agent messaging", "agents"),
     ("Agent messaging", "chat"),
+    ("Agent messaging", "snapshot"),
     ("Worker protocol", "claim"),
     ("Worker protocol", "release"),
     ("Worker protocol", "close"),
@@ -3181,6 +3270,7 @@ COMMAND_HELP: Dict[str, str] = {
     "uninstall": "remove LaunchAgent (stop auto-start on login)",
     "dashboard": "open the night-watch dashboard (background server + browser)",
     "skills": "sync the bundled skills into installed agent harnesses",
+    "snapshot": "manage session auto-snapshots before prompt cache expiration",
 }
 
 # "Worker protocol" = the claim/close/block loop agent workers run; humans
@@ -3818,6 +3908,49 @@ def build_parser() -> argparse.ArgumentParser:
     ssub.add_parser("sync", help="symlink into every present harness (default; also runs on `wt install`)")
     ssub.add_parser("status", help="show sync state without changing anything")
     ssub.add_parser("remove", help="remove the managed symlinks")
+
+    s = sub.add_parser("snapshot")
+    s.set_defaults(func=cmd_snapshot, snapshot_command=None)
+    ssub = s.add_subparsers(dest="snapshot_command", metavar="<verb>")
+    sa = ssub.add_parser("arm")
+    sa.add_argument("--session", required=True)
+    sa.add_argument("--engine", required=True)
+    sa.add_argument("--cwd", required=True)
+    sa.add_argument("--idle", type=float, default=None)
+    sa.set_defaults(func=cmd_snapshot)
+
+    sd = ssub.add_parser("disarm")
+    sd.add_argument("--session", required=True)
+    sd.set_defaults(func=cmd_snapshot)
+
+    st = ssub.add_parser("status")
+    st.add_argument("--session", default=None)
+    st.set_defaults(func=cmd_snapshot)
+
+    sf = ssub.add_parser("fire")
+    sf.add_argument("--session", required=True)
+    sf.set_defaults(func=cmd_snapshot)
+
+    tr = ssub.add_parser("timer-run", help=argparse.SUPPRESS)
+    tr.add_argument("session_id")
+    tr.set_defaults(func=cmd_snapshot)
+
+    sp = ssub.add_parser("path")
+    sp.add_argument("--session", required=True)
+    sp.set_defaults(func=cmd_snapshot)
+
+    sr = ssub.add_parser("record")
+    sr.add_argument("--session", required=True)
+    sr.add_argument("--cwd", required=True)
+    sr.set_defaults(func=cmd_snapshot)
+
+    sl = ssub.add_parser("latest")
+    sl.add_argument("--cwd", required=True)
+    sl.set_defaults(func=cmd_snapshot)
+
+    sc = ssub.add_parser("consume")
+    sc.add_argument("--path", required=True)
+    sc.set_defaults(func=cmd_snapshot)
 
     s = sub.add_parser("dashboard", aliases=["serve"])
     s.add_argument("--host", default="127.0.0.1")

@@ -1,0 +1,67 @@
+# Copyright (c) 2026 Amir Fish. All rights reserved.
+# SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
+
+"""wt snapshot CLI surface, via the in-process run_cli fixture."""
+
+from pathlib import Path
+from watchtower import snapshot
+
+
+def test_arm_status_disarm_roundtrip(run_cli, monkeypatch):
+    monkeypatch.setattr(snapshot, "_spawn_timer", lambda sid: 4242)
+    r = run_cli("snapshot", "arm", "--session", "s1", "--engine", "claude",
+                "--cwd", "/tmp/proj", "--idle", "55")
+    assert r.code == 0, r.err
+    r = run_cli("snapshot", "status", "--session", "s1")
+    assert r.code == 0 and "armed" in r.out
+    assert run_cli("snapshot", "disarm", "--session", "s1").code == 0
+    assert "disarmed" in run_cli("snapshot", "status").out
+
+
+def test_arm_rejects_bad_engine_and_threshold(run_cli):
+    r = run_cli("snapshot", "arm", "--session", "s1", "--engine", "kimi",
+                "--cwd", "/tmp/x")
+    assert r.code == 1 and "snapshot-now" in r.err
+    r = run_cli("snapshot", "arm", "--session", "s1", "--engine", "claude",
+                "--cwd", "/tmp/x", "--idle", "75")
+    assert r.code == 1 and "TTL" in r.err
+
+
+def test_arm_warns_on_ccc_handover_armed(run_cli, monkeypatch):
+    monkeypatch.setattr(snapshot, "_spawn_timer", lambda sid: 4242)
+    monkeypatch.setattr(snapshot, "ccc_handover_flag_set", lambda sid: True)
+    r = run_cli("snapshot", "arm", "--session", "s1", "--engine", "claude",
+                "--cwd", "/tmp/proj")
+    assert r.code == 0
+    assert "warning: CCC auto-handover is also armed" in r.err
+
+
+def test_path_record_latest_consume_flow(run_cli):
+    p_out = run_cli("snapshot", "path", "--session", "s1")
+    assert p_out.code == 0
+    path = p_out.out.strip()
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("---\nsession_id: s1\n---\nbody\n")
+    assert run_cli("snapshot", "record", "--session", "s1",
+                   "--cwd", "/tmp/proj").code == 0
+    latest = run_cli("snapshot", "latest", "--cwd", "/tmp/proj")
+    assert latest.code == 0 and latest.out.strip() == path
+    assert run_cli("snapshot", "consume", "--path", path).code == 0
+    assert run_cli("snapshot", "latest", "--cwd", "/tmp/proj").code == 1
+
+
+def test_fire_and_timer_run_cli(run_cli, monkeypatch):
+    monkeypatch.setattr(snapshot, "fire", lambda sid: {"ok": True, "transport": "tty"})
+    r = run_cli("snapshot", "fire", "--session", "s1")
+    assert r.code == 0
+
+    monkeypatch.setattr(snapshot, "run_timer", lambda sid: "fired")
+    r2 = run_cli("snapshot", "timer-run", "s1")
+    assert r2.code == 0 and "fired" in r2.out
+
+
+def test_status_empty_cli(run_cli):
+    r = run_cli("snapshot", "status")
+    assert r.code == 0
+    assert "no snapshot timers" in r.out
