@@ -443,6 +443,21 @@ sidecar under `~/.claude/group-chats` when present), so both tools can serve
 the same conversations. Per-engine feasibility ground truth lives in
 [`docs/engine-capability-matrix.md`](docs/engine-capability-matrix.md).
 
+## Auto-snapshot
+
+Idle agent sessions lose their prompt cache at the 60-minute cliff, forcing an expensive 300K-token cold re-read. Auto-snapshot arms a daemon-free one-shot timer per session that triggers a checkpoint before cache expiry. Install the `token-parachute` Claude marketplace plugin or use the bundled `wt` skills:
+
+- `/auto-snapshot-on [min]` — Arm auto-snapshot for the session (default: 55m).
+- `/auto-snapshot-off` — Disarm auto-snapshot and cancel the timer.
+- `/snapshot-now` — Immediately write a snapshot checkpoint.
+- `/resume-from-snapshot [id|path]` — Load newest snapshot for cwd after `/clear`.
+
+| Engine | Support Tier |
+|---|---|
+| Claude | Auto-fire (live TUI keystroke / headless resume) |
+| Codex | Auto-fire (app-server transport) |
+| Kimi / Grok | Manual (`/snapshot-now`, `/resume-from-snapshot`) |
+
 ## Where the queue lives
 
 WatchTower resolves its store in this order:
