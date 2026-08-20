@@ -1,0 +1,11 @@
+{
+  "name": "watchtower",
+  "owner": { "name": "Amir Fish" },
+  "plugins": [
+    {
+      "name": "token-parachute",
+      "source": "./plugins/token-parachute",
+      "description": "Pulls the ripcord before your idle session goes cold — auto-snapshots long sessions near the prompt-cache cliff so you can /clear and resume a 300K-token session for pennies."
+    }
+  ]
+}

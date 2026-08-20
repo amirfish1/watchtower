@@ -1,0 +1,6 @@
+{
+  "name": "token-parachute",
+  "description": "Auto-snapshot idle sessions before the prompt-cache cliff; resume after /clear without re-paying the context cost.",
+  "version": "0.1.0",
+  "author": { "name": "Amir Fish" }
+}
