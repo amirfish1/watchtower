@@ -138,21 +138,29 @@ def _worker_runbook_ref() -> str:
     return _WORKER_RUNBOOK_URL
 
 
-def _spawn_env() -> Optional[Dict[str, str]]:
+def _spawn_env() -> Dict[str, str]:
     """Environment for a spawned worker subprocess.
 
-    In production the child inherits the parent's environment so legitimate
-    overrides (binary paths, etc.) are preserved. When the parent is running
-    under pytest, all ``WATCHTOWER_*`` environment variables are stripped so
-    the worker does not inherit pytest sandbox variables that point at
-    temporary test files and operate against test fixture state (OPS-544).
+    The child inherits the parent's environment so legitimate overrides
+    (binary paths, etc.) are preserved, plus ``WT_WORKER_COMMIT=1`` (VM-NEXT-8):
+    a marker a VM-side pre-commit hook can check to tell "a WatchTower worker
+    committed as part of its job" apart from "a human ran git commit over
+    SSH", since both run as the same OS user and same command. Every worker
+    spawn path (spawn_workers, spawn_run_once_worker, spawn_adhoc) funnels
+    through this one function, so the marker is set exactly once, everywhere
+    a worker subprocess is created.
+
+    When the parent is running under pytest, all ``WATCHTOWER_*`` environment
+    variables are stripped so the worker does not inherit pytest sandbox
+    variables that point at temporary test files and operate against test
+    fixture state (OPS-544).
     """
-    if "PYTEST_CURRENT_TEST" not in os.environ:
-        return None
     env = os.environ.copy()
-    for key in list(env):
-        if key.startswith("WATCHTOWER_"):
-            env.pop(key, None)
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        for key in list(env):
+            if key.startswith("WATCHTOWER_"):
+                env.pop(key, None)
+    env["WT_WORKER_COMMIT"] = "1"
     return env
 
 

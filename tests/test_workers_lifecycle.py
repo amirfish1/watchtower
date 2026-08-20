@@ -842,10 +842,14 @@ def test_spawn_workers_strips_pytest_sandbox_env_vars(wt, monkeypatch):
     assert "WATCHTOWER_CODEX_BIN" not in worker_env
     # Non-WATCHTOWER variables like PATH are preserved.
     assert "PATH" in worker_env
+    # The commit marker (VM-NEXT-8) is still set even when sandbox vars are stripped.
+    assert worker_env["WT_WORKER_COMMIT"] == "1"
 
 
 def test_spawn_workers_inherits_env_outside_pytest(wt, monkeypatch):
-    """Outside pytest, workers inherit the parent's environment unchanged."""
+    """Outside pytest, workers inherit the parent's environment, plus the
+    WT_WORKER_COMMIT=1 marker (VM-NEXT-8) a VM-side pre-commit hook uses to
+    tell a WatchTower worker's commit apart from a human's over SSH."""
     monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
     monkeypatch.setenv("WATCHTOWER_STORE", "/custom/queue.json")
     captured_envs = []
@@ -867,8 +871,10 @@ def test_spawn_workers_inherits_env_outside_pytest(wt, monkeypatch):
 
     # The first Popen is the worker spawn; later calls may be PID liveness probes.
     worker_env = captured_envs[0][1]
-    # env=None tells subprocess.Popen to inherit the parent's environment.
-    assert worker_env is None
+    assert worker_env is not None
+    assert worker_env["WT_WORKER_COMMIT"] == "1"
+    # Rest of the parent's environment (e.g. WATCHTOWER_* vars) is preserved.
+    assert worker_env["WATCHTOWER_STORE"] == "/custom/queue.json"
 
 
 def test_engine_available_uses_codex_env_override(wt, monkeypatch):
