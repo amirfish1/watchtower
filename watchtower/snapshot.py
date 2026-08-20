@@ -1,7 +1,7 @@
 # Copyright (c) 2026 Amir Fish. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
 
-"""Auto-snapshot ("token-parachute"): checkpoint an idle session before the
+"""Auto-snapshot ("token-sitter"): checkpoint an idle session before the
 prompt-cache cliff, with a one-shot detached timer per armed session.
 
 Spec: docs/superpowers/specs/2026-08-19-auto-snapshot-design.md. No daemon:

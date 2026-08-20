@@ -2998,7 +2998,7 @@ def cmd_skills(args: argparse.Namespace) -> int:
 
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
-    """Manage session snapshots ("token-parachute") and detached timers.
+    """Manage session snapshots ("token-sitter") and detached timers.
 
     Verbs: arm, disarm, status, fire, timer-run, path, record, latest, consume.
     """

@@ -1,6 +1,6 @@
-# Token Parachute
+# Token Sitter
 
-Auto-snapshot idle agent sessions before the prompt-cache cliff. When a long session sits idle, token-parachute triggers a lightweight checkpoint just before the 60-minute cache expiration window closes. After `/clear`, resume your work seamlessly from the saved snapshot without paying the cold-start context penalty.
+Auto-snapshot idle agent sessions before the prompt-cache cliff. When a long session sits idle, token-sitter triggers a lightweight checkpoint just before the 60-minute cache expiration window closes. After `/clear`, resume your work seamlessly from the saved snapshot without paying the cold-start context penalty.
 
 ## Commands
 

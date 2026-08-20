@@ -445,7 +445,7 @@ the same conversations. Per-engine feasibility ground truth lives in
 
 ## Auto-snapshot
 
-Idle agent sessions lose their prompt cache at the 60-minute cliff, forcing an expensive 300K-token cold re-read. Auto-snapshot arms a daemon-free one-shot timer per session that triggers a checkpoint before cache expiry. Install the `token-parachute` Claude marketplace plugin or use the bundled `wt` skills:
+Idle agent sessions lose their prompt cache at the 60-minute cliff, forcing an expensive 300K-token cold re-read. Auto-snapshot arms a daemon-free one-shot timer per session that triggers a checkpoint before cache expiry. Install the `token-sitter` Claude marketplace plugin or use the bundled `wt` skills:
 
 - `/auto-snapshot-on [min]` — Arm auto-snapshot for the session (default: 55m).
 - `/auto-snapshot-off` — Disarm auto-snapshot and cancel the timer.

@@ -1,4 +1,4 @@
-# Auto-Snapshot ("token-parachute" — final name pending) — Design Spec
+# Auto-Snapshot ("token-sitter") — Design Spec
 
 Date: 2026-08-19
 Status: approved design, pre-implementation
@@ -24,8 +24,7 @@ set that works without CCC.
 
 1. **Code lives in the watchtower repo; brand lives at the distribution
    layer.** Shipped as a Claude Code marketplace plugin with its own
-   feature-named brand (placeholder `token-parachute`; final name being
-   decided in a dedicated naming session). Optional later: a thin landing
+   feature-named brand (final name `token-sitter`, chosen 2026-08-20 in a dedicated naming session). Optional later: a thin landing
    repo (README + installer only, no code).
 2. **No daemon.** The trigger is a one-shot detached timer process per armed
    session — not a persistent server, not launchd, and NOT folded into the
@@ -165,6 +164,5 @@ a one-paragraph "here's where we were," archives the snapshot, continues.
 
 ## Open items
 
-- Final name (Sonnet naming session in flight; placeholder `token-parachute`).
 - Exact `codex exec resume` prompt-size/escaping limits — verify during
   implementation.
