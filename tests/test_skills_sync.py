@@ -19,6 +19,7 @@ EXPECTED_SKILLS = (
     "auto-snapshot-off",
     "snapshot-now",
     "resume-from-snapshot",
+    "resume-from-session",
 )
 ALL_ENGINES = ("claude", "codex", "antigravity", "kimi")
 

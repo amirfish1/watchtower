@@ -18,7 +18,8 @@ def test_marketplace_manifest_points_at_real_plugin():
 def test_plugin_skill_symlinks_resolve():
     skills = ROOT / "plugins" / "token-sitter" / "skills"
     names = {"auto-snapshot-on", "auto-snapshot-off",
-             "snapshot-now", "resume-from-snapshot"}
+             "snapshot-now", "resume-from-snapshot",
+             "resume-from-session"}
     assert {p.name for p in skills.iterdir()} == names
     for p in skills.iterdir():
         assert p.is_symlink()

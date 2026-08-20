@@ -7,7 +7,8 @@ from pathlib import Path
 from watchtower import skills_sync
 
 SNAPSHOT_SKILLS = ("auto-snapshot-on", "auto-snapshot-off",
-                   "snapshot-now", "resume-from-snapshot")
+                   "snapshot-now", "resume-from-snapshot",
+                   "resume-from-session")
 
 
 def test_snapshot_skills_registered_and_well_formed():
@@ -27,3 +28,5 @@ def test_skills_reference_real_cli_verbs():
     assert "wt snapshot path" in now and "wt snapshot record" in now
     res = (skills_sync.source_dir("resume-from-snapshot") / "SKILL.md").read_text()
     assert "wt snapshot latest" in res and "wt snapshot consume" in res
+    rfs = (skills_sync.source_dir("resume-from-session") / "SKILL.md").read_text()
+    assert "wt snapshot sessions" in rfs and "--exclude" in rfs

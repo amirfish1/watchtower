@@ -451,6 +451,7 @@ Idle agent sessions lose their prompt cache at the 60-minute cliff, forcing an e
 - `/auto-snapshot-off` — Disarm auto-snapshot and cancel the timer.
 - `/snapshot-now` — Immediately write a snapshot checkpoint.
 - `/resume-from-snapshot [id|path]` — Load newest snapshot for cwd after `/clear`.
+- `/resume-from-session` — pick one of the last 10 sessions for this project and continue from its transcript (no snapshot needed).
 
 | Engine | Support Tier |
 |---|---|
