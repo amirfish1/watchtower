@@ -3332,6 +3332,31 @@ def _add_agent_subcommands(parser: argparse.ArgumentParser) -> None:
     sa.set_defaults(func=cmd_agent)
 
 
+def _install_provenance() -> str:
+    """Describe where this ``wt`` actually loads code from.
+
+    A ``pipx install`` (without ``--editable``) copies the repo into the
+    venv's site-packages instead of pointing at it live — the CLI still
+    runs fine, but every commit after that snapshot is invisible to it
+    until someone happens to reinstall (see VM-NEXT-18: a Mac install went
+    stale for two days with no symptom other than "the fix didn't take").
+    Surfacing the source path and its git SHA in ``--version`` makes that
+    staleness checkable instead of silent.
+    """
+    src = Path(__file__).resolve().parent
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(src), "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, timeout=2,
+        )
+        sha = result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        sha = ""
+    if sha:
+        return f"{src} @ {sha}"
+    return f"{src} (no git history — likely a frozen pipx snapshot, not a live checkout)"
+
+
 # --------------------------------------------------------------------------- main
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -3341,7 +3366,10 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=_build_command_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--version", action="version", version=f"wt {__version__}")
+    p.add_argument(
+        "--version", action="version",
+        version=f"wt {__version__}\nsource: {_install_provenance()}",
+    )
     sub = p.add_subparsers(dest="command", metavar="<command>", help=argparse.SUPPRESS)
 
     s = sub.add_parser("status")
