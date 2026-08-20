@@ -3931,7 +3931,7 @@ def build_parser() -> argparse.ArgumentParser:
     sf.add_argument("--session", required=True)
     sf.set_defaults(func=cmd_snapshot)
 
-    tr = ssub.add_parser("timer-run", help=argparse.SUPPRESS)
+    tr = ssub.add_parser("timer-run")  # internal: spawned detached by snapshot.arm
     tr.add_argument("session_id")
     tr.set_defaults(func=cmd_snapshot)
 
