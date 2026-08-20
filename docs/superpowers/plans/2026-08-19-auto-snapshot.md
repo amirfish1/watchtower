@@ -1087,6 +1087,268 @@ git commit --only README.md -m "docs: auto-snapshot feature section"
 
 ---
 
+## Addendum (2026-08-20, approved): /resume-from-session
+
+Amir approved a fifth command after v1 shipped: resume WITHOUT a snapshot,
+by picking a recent session and briefing the fresh session from its
+transcript — like CCC's F2 "continue new". Total Recall is a
+recommendation when installed; when not installed it is NOT mentioned at
+all. Final plugin name is now `token-sitter` (commit f49c7ef) — use that
+name, not the old placeholder, in any new file.
+
+### Task 8: `wt snapshot sessions` listing verb
+
+**Files:**
+- Modify: `watchtower/snapshot.py`
+- Modify: `watchtower/cli.py` (extend the `snapshot` subparser + dispatch from Task 4)
+- Test: `tests/test_snapshot.py`, `tests/test_snapshot_cli.py`
+
+**Interfaces:**
+- Consumes: `cwd_slug` (Task 1); `messages._claude_projects_root()` (existing, env-overridable via `WATCHTOWER_CLAUDE_PROJECTS_DIR`).
+- Produces:
+  - `list_sessions(cwd: str, limit: int = 10, exclude: str = "") -> list[dict]` — newest-first `{"session_id", "mtime", "size", "first_message"}` for the cwd's Claude transcripts (claude-only in v1; codex listing deferred — rollout paths don't encode cwd).
+  - CLI: `wt snapshot sessions --cwd <dir> [-n 10] [--exclude <sid>]` printing `N) <full-session-id>  <age>  <first-message snippet>` rows; prints `no sessions found for this directory` and exits 0 when empty.
+
+- [ ] **Step 1: Write the failing tests** (append to `tests/test_snapshot.py`)
+
+```python
+def _write_transcript(root, slug, sid, mtime, first_text="hello world"):
+    import json as _json, os as _os
+    d = root / slug
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{sid}.jsonl"
+    lines = [
+        _json.dumps({"type": "summary", "summary": "x"}),
+        _json.dumps({"type": "user",
+                     "message": {"role": "user", "content": [
+                         {"type": "text", "text": first_text}]}}),
+    ]
+    p.write_text("\n".join(lines) + "\n")
+    _os.utime(p, (mtime, mtime))
+    return p
+
+
+def test_list_sessions_orders_excludes_and_snippets(wt_env, tmp_path, monkeypatch):
+    root = tmp_path / "claude-projects"
+    monkeypatch.setenv("WATCHTOWER_CLAUDE_PROJECTS_DIR", str(root))
+    slug = snapshot.cwd_slug("/tmp/proj")
+    _write_transcript(root, slug, "old1", 1000.0, "first task ever")
+    _write_transcript(root, slug, "new1", 3000.0, "  newest   task  ")
+    _write_transcript(root, slug, "self1", 4000.0, "my own fresh session")
+    rows = snapshot.list_sessions("/tmp/proj", limit=10, exclude="self1")
+    assert [r["session_id"] for r in rows] == ["new1", "old1"]
+    assert rows[0]["first_message"] == "newest task"
+
+
+def test_list_sessions_respects_limit_and_missing_dir(wt_env, tmp_path, monkeypatch):
+    root = tmp_path / "claude-projects"
+    monkeypatch.setenv("WATCHTOWER_CLAUDE_PROJECTS_DIR", str(root))
+    assert snapshot.list_sessions("/tmp/nowhere") == []
+    slug = snapshot.cwd_slug("/tmp/proj")
+    for i in range(4):
+        _write_transcript(root, slug, f"s{i}", 1000.0 + i)
+    assert len(snapshot.list_sessions("/tmp/proj", limit=2)) == 2
+```
+
+And append to `tests/test_snapshot_cli.py`:
+
+```python
+def test_sessions_verb_lists_and_handles_empty(run_cli, tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_CLAUDE_PROJECTS_DIR", str(tmp_path))
+    r = run_cli("snapshot", "sessions", "--cwd", "/tmp/proj")
+    assert r.code == 0 and "no sessions found" in r.stdout
+    from tests.test_snapshot import _write_transcript
+    from watchtower import snapshot as snap
+    _write_transcript(tmp_path, snap.cwd_slug("/tmp/proj"), "abc12345-full-id",
+                      5000.0, "build the widget")
+    r = run_cli("snapshot", "sessions", "--cwd", "/tmp/proj", "-n", "5")
+    assert r.code == 0
+    assert "abc12345-full-id" in r.stdout and "build the widget" in r.stdout
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `python3 -m pytest tests/test_snapshot.py tests/test_snapshot_cli.py -v -k sessions`
+Expected: FAIL (AttributeError / argparse invalid choice).
+
+- [ ] **Step 3: Implement** (append to `watchtower/snapshot.py`)
+
+```python
+def _first_user_text(path: Path) -> str:
+    """First real user-message text in a claude transcript, whitespace-collapsed."""
+    try:
+        with open(path) as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("type") != "user":
+                    continue
+                content = (entry.get("message") or {}).get("content")
+                if isinstance(content, str):
+                    text = content
+                else:
+                    text = next((b.get("text", "") for b in (content or [])
+                                 if isinstance(b, dict) and b.get("type") == "text"), "")
+                text = " ".join(str(text).split())
+                if text:
+                    return text[:100]
+    except OSError:
+        pass
+    return ""
+
+
+def list_sessions(cwd: str, limit: int = 10, exclude: str = "") -> list:
+    """Newest-first claude sessions for a project dir (codex deferred: its
+    rollout paths don't encode the cwd)."""
+    from . import messages
+    d = messages._claude_projects_root() / cwd_slug(cwd)
+    rows = []
+    try:
+        paths = list(d.glob("*.jsonl"))
+    except OSError:
+        return []
+    for p in paths:
+        sid = p.stem
+        if sid == exclude:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        rows.append({"session_id": sid, "mtime": st.st_mtime,
+                     "size": st.st_size, "first_message": _first_user_text(p)})
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows[: max(0, int(limit))]
+
+
+def _age_str(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 3600:
+        return f"{int(seconds // 60)}m"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)}h"
+    return f"{int(seconds // 86400)}d"
+```
+
+CLI (extend the Task 4 subparser + dispatch, same idiom):
+
+```python
+se = ssub.add_parser("sessions")
+se.add_argument("--cwd", required=True)
+se.add_argument("-n", type=int, default=10, dest="limit")
+se.add_argument("--exclude", default="")
+```
+
+```python
+    if cmd == "sessions":
+        rows = snap.list_sessions(args.cwd, limit=args.limit, exclude=args.exclude)
+        if not rows:
+            print("no sessions found for this directory")
+            return 0
+        now = time.time()
+        for i, r_ in enumerate(rows, 1):
+            print(f"{i}) {r_['session_id']}  {snap._age_str(now - r_['mtime'])}  "
+                  f"{r_['first_message']}")
+        return 0
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `python3 -m pytest tests/test_snapshot.py tests/test_snapshot_cli.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add watchtower/snapshot.py watchtower/cli.py tests/test_snapshot.py tests/test_snapshot_cli.py
+git commit --only watchtower/snapshot.py watchtower/cli.py tests/test_snapshot.py tests/test_snapshot_cli.py -m "feat(snapshot): wt snapshot sessions listing verb"
+```
+
+### Task 9: `resume-from-session` skill + registration
+
+**Files:**
+- Create: `watchtower/skills/resume-from-session/SKILL.md`
+- Modify: `watchtower/skills_sync.py` (`SKILL_NAMES` += `"resume-from-session"`)
+- Create symlink: `plugins/token-sitter/skills/resume-from-session -> ../../../watchtower/skills/resume-from-session`
+- Modify: `tests/test_snapshot_skills.py` (add to `SNAPSHOT_SKILLS` + a verb-reference assertion), `tests/test_plugin_manifest.py` (symlink-set assertion now expects 5 names), `tests/test_skills_sync.py` (if it asserts an exact list), root `README.md` (add the command line to the Auto-snapshot section)
+
+**Interfaces:**
+- Consumes: `wt snapshot sessions` (Task 8).
+- Produces: skill name `resume-from-session` (slash command `/resume-from-session`).
+
+- [ ] **Step 1: Extend the failing tests** — in `tests/test_snapshot_skills.py` add `"resume-from-session"` to `SNAPSHOT_SKILLS` and this to `test_skills_reference_real_cli_verbs`:
+
+```python
+    rfs = (skills_sync.source_dir("resume-from-session") / "SKILL.md").read_text()
+    assert "wt snapshot sessions" in rfs and "--exclude" in rfs
+```
+
+In `tests/test_plugin_manifest.py`, add `"resume-from-session"` to the expected symlink-name set.
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `python3 -m pytest tests/test_snapshot_skills.py tests/test_plugin_manifest.py -v`
+Expected: FAIL.
+
+- [ ] **Step 3: Write the skill** — `watchtower/skills/resume-from-session/SKILL.md`, verbatim:
+
+````markdown
+---
+name: resume-from-session
+description: Resume work from a recent prior session WITHOUT a snapshot — lists the last 10 sessions for this project, lets the user pick one, and briefs this fresh session from that transcript. Use when the user says "/resume-from-session", "continue from an old session", or wants to pick up prior work but no snapshot exists.
+---
+
+# Resume from a prior session (no snapshot needed)
+
+1. Determine your own session id (same procedure as auto-snapshot-on step 1)
+   so you can exclude yourself from the list.
+2. Run: `wt snapshot sessions --cwd "$PWD" -n 10 --exclude <YOUR-SID>`
+   If it prints "no sessions found", tell the user and stop.
+3. Show the numbered list (id shortened to 8 chars, age, first-message
+   snippet) and ask the user to pick one. In Claude Code, use the
+   AskUserQuestion tool with the top choices; elsewhere ask for a number.
+4. The chosen session's transcript is
+   `~/.claude/projects/<slugified-cwd>/<SID>.jsonl` (slug: `/` and `.`
+   become `-`). Read its TAIL (roughly the last 150-300 lines) and, if
+   needed for orientation, the first few user messages. Do NOT ingest the
+   whole file — these transcripts can be enormous; the point of this
+   command is briefing, not full replay.
+5. Brief the user in one short paragraph: what that session was doing, what
+   it finished, and what appears to have been left open. Mention the
+   transcript path so deeper digs are one command away.
+6. Only if a Total Recall install is detected (the `/recall` skill is
+   available, or `command -v total-recall` succeeds): recommend running
+   `/recall <topic of that session>` to pull richer cross-session context,
+   and offer to do it. If Total Recall is not installed, do not mention it
+   at all.
+7. Continue the open work (or await the user's go-ahead if the next step is
+   destructive/outward-facing).
+````
+
+- [ ] **Step 4: Register + symlink + README**
+
+Add `"resume-from-session"` to `SKILL_NAMES` in `watchtower/skills_sync.py`. Then:
+
+```bash
+ln -s ../../../watchtower/skills/resume-from-session plugins/token-sitter/skills/resume-from-session
+```
+
+Add one line to root `README.md`'s Auto-snapshot command list: `- /resume-from-session — pick one of the last 10 sessions for this project and continue from its transcript (no snapshot needed).`
+
+- [ ] **Step 5: Run tests to verify they pass**
+
+Run: `python3 -m pytest tests/test_snapshot_skills.py tests/test_plugin_manifest.py tests/test_skills_sync.py -v`
+Expected: all PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add watchtower/skills/resume-from-session watchtower/skills_sync.py plugins/token-sitter/skills/resume-from-session tests/test_snapshot_skills.py tests/test_plugin_manifest.py tests/test_skills_sync.py README.md
+git commit --only watchtower/skills/resume-from-session watchtower/skills_sync.py plugins/token-sitter/skills/resume-from-session tests/test_snapshot_skills.py tests/test_plugin_manifest.py tests/test_skills_sync.py README.md -m "feat(skills): resume-from-session — continue from a prior transcript without a snapshot"
+```
+
 ## Self-review notes (already applied)
 
 - Spec deltas discovered during planning, now authoritative: no new Codex adapter (existing `messages.deliver()` app-server path covers it); no `wt snapshot install --engine` (existing `skills_sync` covers all four engine homes — grok is not in `ENGINE_HOMES`, so grok users copy the skill files manually until a grok home is added, which matches Tier 3).
