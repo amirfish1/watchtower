@@ -438,6 +438,22 @@ def test_models_command_lists_kimi(store, capsys):
     assert "kimi-code/k3" in payload["models"]
 
 
+def test_models_command_lists_antigravity(store, capsys):
+    """SIDE-14 follow-up: the spawn-only AGY engine is discoverable too."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+
+    assert cli.main(["models", "--engine", "antigravity", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == {
+        "engine": "antigravity",
+        "models": list(config.approved_models("antigravity")),
+    }
+    assert "gemini-3.1-pro-high" in payload["models"]
+    # AGY has no effort flag; effort is baked into the model id suffix.
+    assert config.approved_efforts("antigravity", "gemini-3.1-pro-high") == ()
+
+
 def test_build_adhoc_command_kimi(store, monkeypatch):
     import watchtower.workers as workers
 

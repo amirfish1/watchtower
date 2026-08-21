@@ -66,6 +66,19 @@ MODEL_EFFORTS = {
         ("kimi-code/kimi-for-coding", ()),
         ("kimi-code/kimi-for-coding-highspeed", ()),
     ),
+    # antigravity (AGY, spawn-only via `wt spawn --engine antigravity`) has no
+    # effort flag; effort is baked into the model id suffix (-high/-medium/
+    # -low), so pinned models accept no explicit effort — same shape as kimi.
+    # Curated to the Gemini ids AGY serves (`agy models` lists the full
+    # vocabulary, which also carries other vendors' models; those are reached
+    # through their own engines, not through AGY).
+    "antigravity": (
+        ("gemini-3.1-pro-high", ()),
+        ("gemini-3.1-pro-low", ()),
+        ("gemini-3.7-flash-high", ()),
+        ("gemini-3.7-flash-medium", ()),
+        ("gemini-3.7-flash-low", ()),
+    ),
 }
 
 # Short aliases that callers may type (e.g. ``opus-5``) but that the engine CLI

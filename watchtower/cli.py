@@ -3425,7 +3425,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("models")
-    s.add_argument("--engine", required=True, choices=["claude", "codex", "kimi"],
+    s.add_argument("--engine", required=True,
+                   choices=["claude", "codex", "kimi", "antigravity"],
                    help="engine whose supported worker model identifiers to list")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_models)
