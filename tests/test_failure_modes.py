@@ -516,14 +516,6 @@ def test_a_hung_gh_call_times_out_instead_of_wedging_the_tick(wt_env, fake_gh, m
     assert "timed out" in str(exc.value)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "GAP: backend=github with no github_repo runs `gh issue list` with no "
-        "--repo, so it silently targets whatever repo the worker's cwd is in — "
-        "a misconfigured queue reads and writes issues in an unrelated repo."
-    ),
-)
 def test_github_backend_without_a_repo_refuses_to_use_the_ambient_repo(wt_env, fake_gh):
     wt_env.config.set_backend(QUEUE, "github")
     backend = wt_env.queue._github_backend_for_project(QUEUE)

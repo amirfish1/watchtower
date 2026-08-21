@@ -747,7 +747,12 @@ class GitHubIssuesBackend:
             return False
 
     def _repo_args(self) -> List[str]:
-        return ["--repo", self.repo] if self.repo else []
+        if not self.repo:
+            raise GitHubBackendError(
+                "backend=github requires github_repo to be configured; "
+                "refusing to fall back to the ambient cwd repo"
+            )
+        return ["--repo", self.repo]
 
     def _run_raw(self, args: List[str]) -> "subprocess.CompletedProcess[str]":
         """Run ``gh`` and hand back the whole result.
