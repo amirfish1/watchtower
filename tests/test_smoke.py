@@ -292,10 +292,11 @@ def test_stuck_detection(store):
     old = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    data = json.loads(store.read_text())
-    for it in data["items"]:
-        it["created_at"] = old
-    store.write_text(json.dumps(data))
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked()
+        for it in data["items"]:
+            it["created_at"] = old
+        q._save_unlocked(data)
 
     rows = {r["queue"]: r for r in health.all_status()}
     assert rows["STK"]["depth"] == 1
@@ -943,10 +944,11 @@ def test_dashboard_serves_status_json(store):
     old = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    data = json.loads(store.read_text())
-    for it in data["items"]:
-        it["created_at"] = old
-    store.write_text(json.dumps(data))
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked()
+        for it in data["items"]:
+            it["created_at"] = old
+        q._save_unlocked(data)
 
     # Bind an ephemeral port, serve exactly one request, hit it.
     httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
@@ -986,10 +988,11 @@ def test_dashboard_html_renders(store, monkeypatch):
     old = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    data = json.loads(store.read_text())
-    for it in data["items"]:
-        it["created_at"] = old
-    store.write_text(json.dumps(data))
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked()
+        for it in data["items"]:
+            it["created_at"] = old
+        q._save_unlocked(data)
 
     page = dashboard.render_html(dashboard.status_payload())
     assert "<!doctype html>" in page

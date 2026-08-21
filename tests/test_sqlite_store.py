@@ -122,7 +122,10 @@ def test_json_store_migrates_on_first_mutation(wt):
 def test_json_edits_after_migration_are_ignored(wt):
     wt.q.enqueue(project="A", note="in db")
     _seed_legacy_json(wt, counter=99, items=[{"number": 50, "project": "B", "ref": "B-1", "status": "open"}])
-    assert [it["project"] for it in wt.q.list_items()] == ["A"]
+    assert [it["note"] for it in wt.q.list_items(project="A")] == ["in db"]
+    assert wt.q.get("B-1") is None
+    # The stale JSON counter must not leak into new numbering either.
+    assert wt.q.enqueue(project="A", note="two")["number"] == 2
 
 
 def test_migrate_store_cli(wt, capsys):

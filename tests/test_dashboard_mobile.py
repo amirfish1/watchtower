@@ -57,14 +57,12 @@ def _make_stuck_queue(wt, name="STUCKQ"):
     old = (datetime.now(timezone.utc) - timedelta(minutes=30)).strftime(
         "%Y-%m-%dT%H:%M:%SZ"
     )
-    import json
-
-    store = wt.q.store_path()
-    data = json.loads(store.read_text())
-    for it in data["items"]:
-        if it.get("project") == name:
-            it["created_at"] = old
-    store.write_text(json.dumps(data))
+    with wt.q._FileLock(wt.q._lock_path()):
+        data = wt.q._load_unlocked()
+        for it in data["items"]:
+            if it.get("project") == name:
+                it["created_at"] = old
+        wt.q._save_unlocked(data)
 
 
 def _make_clear_queue(wt, name="CLEARQ"):
