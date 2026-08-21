@@ -658,7 +658,10 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 item["ref"],
                 session_uuid,
                 question=(
-                    f"This ticket's model floor is {model_floor!r}, but queue "
+                    # Built from the shared prefix so the reconciler's SIDE-39
+                    # timebox watchdog can recognize a floor-park (and only a
+                    # floor-park) from the question text alone.
+                    f"{config.MODEL_FLOOR_BLOCK_PREFIX} {model_floor!r}, but queue "
                     f"{args.queue!r} is configured for {queue_model or '(unset)'!r}. "
                     "Reassign to a queue running at least that model, or bump this "
                     "queue's --model, then answer to resume."
@@ -2114,6 +2117,45 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_migrate_store(args: argparse.Namespace) -> int:
+    """One-time JSON→SQLite store migration (idempotent; see queue docstring)."""
+    from . import queue as q
+
+    try:
+        result = q.migrate_store()
+    except Exception as e:  # corrupt JSON source — refuse to shadow it
+        print(f"migrate-store: refusing to migrate: {e}", file=sys.stderr)
+        return 1
+    n = result["items"]
+    if result["migrated"]:
+        print(f"migrated {n} item(s) into {result['db']}")
+    else:
+        print(f"store is already SQLite ({n} item(s)) at {result['db']}")
+    return 0
+
+
+def cmd_export_json(args: argparse.Namespace) -> int:
+    """Dump the store in the classic {counter, items} JSON interchange shape."""
+    from . import queue as q
+
+    try:
+        blob = json.dumps(q.export_data(), indent=2)
+    except Exception as e:
+        print(f"export-json: {e}", file=sys.stderr)
+        return 1
+    if args.out:
+        out = Path(args.out).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = str(out) + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(blob + "\n")
+        os.replace(tmp, out)
+        print(f"wrote {out}")
+    else:
+        print(blob)
+    return 0
+
+
 def cmd_dedup(args: argparse.Namespace) -> int:
     """Exact-key dedup pass (WT-FEATURES-14, first cut): group open tickets by
     normalized title+note, keep the oldest in each group, and (with --apply)
@@ -3214,6 +3256,8 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Queues", "wait"),
     ("Queues", "monitor"),
     ("Queues", "workers"),
+    ("Queues", "migrate-store"),
+    ("Queues", "export-json"),
     ("Tickets", "add"),
     ("Tickets", "import"),
     ("Tickets", "take"),
@@ -3262,6 +3306,8 @@ COMMAND_HELP: Dict[str, str] = {
     "find": "look up one ticket by ref across all queues (no -q needed)",
     "ls": "list the tickets in one queue",
     "dedup": "close exact-duplicate open tickets",
+    "migrate-store": "one-time JSON -> SQLite store migration (idempotent)",
+    "export-json": "dump the store as classic {counter, items} JSON",
     "status": "per-queue depth / age / stuck flag",
     "models": "list WatchTower-approved model identifiers per engine",
     "config": "recommended queue configuration: settings plus auto-drain policy",
@@ -3902,6 +3948,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-q", "--queue", default=None)
     s.add_argument("--apply", action="store_true", help="close dupes (default: dry-run)")
     s.set_defaults(func=cmd_dedup)
+
+    s = sub.add_parser("migrate-store")
+    s.set_defaults(func=cmd_migrate_store)
+
+    s = sub.add_parser("export-json")
+    s.add_argument("-o", "--out", default="", help="write to this path (default: stdout)")
+    s.set_defaults(func=cmd_export_json)
 
     # No `wt spawn-worker`: workers are spawned by the watcher (`wt start`) from
     # per-queue auto_drain policy + depth, not by hand. See workers.spawn_workers.

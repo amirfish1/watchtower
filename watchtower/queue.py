@@ -13,15 +13,23 @@ becomes a numbered item with a status that survives processes, so:
   * multiple workers can drain the queue in parallel by *claiming* items
     instead of stepping on each other.
 
-Storage: a single JSON file. Resolution order for its path:
+Storage: a single SQLite file (stdlib ``sqlite3`` — still no pip deps).
+Resolution order for the store's *base* path (kept from the JSON era):
 
   1. ``$WATCHTOWER_STORE`` (explicit override — used by tests and CI).
   2. The existing CCC store at ``~/.claude/command-center/ux-fixes-queue.json``
-     if it already exists on this machine (so WatchTower drains real work today).
+     if it (or its migrated ``.db``) already exists on this machine.
   3. ``~/.watchtower/queues.json`` (WatchTower's own default).
 
+The authoritative file is that path with a ``.db`` suffix once it exists;
+until then the legacy JSON is read directly, and the first locked save (or
+``wt migrate-store``) imports it into SQLite. JSON remains the interchange
+format (``wt export-json``). Design:
+docs/superpowers/specs/2026-08-20-sqlite-store-design.md
+
 Concurrency: writers from different processes are serialised with an ``fcntl``
-lock file; writes are atomic via temp-file + ``os.replace``.
+lock file (unchanged); saves diff per-item rows so a claim/close writes one
+row instead of the whole store.
 
 Item shape::
 
@@ -63,6 +71,7 @@ from __future__ import annotations
 import json
 import os
 import re as _re
+import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -186,14 +195,29 @@ def _resolve_store_path() -> Path:
     env = os.environ.get("WATCHTOWER_STORE")
     if env:
         return Path(env).expanduser()
-    if _CCC_LEGACY_STORE.exists():
+    # The .db check keeps resolution stable if someone deletes the frozen
+    # legacy JSON after its store has migrated to SQLite.
+    if _CCC_LEGACY_STORE.exists() or _CCC_LEGACY_STORE.with_suffix(".db").exists():
         return _CCC_LEGACY_STORE
     return _WT_DEFAULT_STORE
 
 
+def _db_path() -> Path:
+    """The SQLite store beside the (possibly legacy) JSON path.
+
+    Once this file exists it is authoritative and the JSON file is frozen;
+    checked fresh on every load/save so long-running processes flip to the
+    DB the moment a migration creates it, with no restart."""
+    return _resolve_store_path().with_suffix(".db")
+
+
 def store_path() -> Path:
-    """Public accessor — handy for `wt status` to print which file it read."""
-    return _resolve_store_path()
+    """Public accessor for the authoritative store file.
+
+    CCC's queue-events SSE stats this path for changes, so it must track the
+    live backend: the SQLite DB once it exists, else the JSON file."""
+    db = _db_path()
+    return db if db.exists() else _resolve_store_path()
 
 
 def _lock_path() -> Path:
@@ -386,16 +410,176 @@ def _matches(it: Dict[str, Any], ident: Any) -> bool:
     return str(it.get("ref", "")).upper() == s.upper()
 
 
-def _load_unlocked(*, strict: bool = False) -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# SQLite backend (docs/superpowers/specs/2026-08-20-sqlite-store-design.md).
+#
+# The .db beside the JSON path is authoritative once it exists; the JSON file
+# then stays frozen as a migration-time snapshot (kept so path resolution and
+# pre-migration readers stay stable). ``item_json`` is the authoritative
+# per-item payload; project/ref/status/updated_at are denormalized copies for
+# indexes and ad-hoc ``sqlite3`` inspection.
+
+_SCHEMA_VERSION = 1
+
+
+def _connect(path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path), timeout=5.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+def _ensure_schema(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS items ("
+        " number INTEGER PRIMARY KEY,"
+        " project TEXT NOT NULL DEFAULT '',"
+        " ref TEXT NOT NULL DEFAULT '',"
+        " status TEXT NOT NULL DEFAULT 'open',"
+        " updated_at TEXT NOT NULL DEFAULT '',"
+        " item_json TEXT NOT NULL)"
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_project_status ON items(project, status)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_ref ON items(ref)")
+
+
+def _meta_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else default
+
+
+def _canon(it: Dict[str, Any]) -> str:
+    """Canonical per-item serialization; stable so saves can diff rows."""
+    return json.dumps(it, sort_keys=True, separators=(",", ":"))
+
+
+def _item_row(it: Dict[str, Any]) -> tuple:
+    return (
+        int(it.get("number", 0)),
+        str(it.get("project", "")),
+        str(it.get("ref", "")),
+        str(it.get("status", "")),
+        str(it.get("updated_at", "")),
+        _canon(it),
+    )
+
+
+_ITEM_UPSERT = (
+    "INSERT INTO items (number, project, ref, status, updated_at, item_json)"
+    " VALUES (?, ?, ?, ?, ?, ?)"
+    " ON CONFLICT(number) DO UPDATE SET project=excluded.project,"
+    " ref=excluded.ref, status=excluded.status,"
+    " updated_at=excluded.updated_at, item_json=excluded.item_json"
+)
+_META_UPSERT = (
+    "INSERT INTO meta (key, value) VALUES (?, ?)"
+    " ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+)
+
+
+def _read_db(db: Path, *, strict: bool = False) -> Dict[str, Any]:
     try:
-        with open(_resolve_store_path(), "r") as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return _empty_store()
-    except (OSError, json.JSONDecodeError):
+        conn = _connect(db)
+        try:
+            counter = int(_meta_get(conn, "counter", "0") or 0)
+            items = [
+                json.loads(row[0])
+                for row in conn.execute("SELECT item_json FROM items ORDER BY number")
+            ]
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError, json.JSONDecodeError):
         if strict:
             raise
         return _empty_store()
+    return {"counter": counter, "items": items}
+
+
+def _create_db(db: Path, data: Dict[str, Any]) -> None:
+    """Build a fresh DB at a temp path and atomically move it into place.
+
+    This IS the JSON→SQLite migration when the loaded ``data`` came from a
+    legacy JSON store. Callers hold the writer flock; the temp+replace makes
+    the flip atomic for lock-free readers too."""
+    db.parent.mkdir(parents=True, exist_ok=True)
+    tmp = db.with_name(db.name + f".tmp{os.getpid()}")
+    try:
+        tmp.unlink()
+    except FileNotFoundError:
+        pass
+    conn = sqlite3.connect(str(tmp))
+    try:
+        _ensure_schema(conn)
+        with conn:
+            conn.executemany(_ITEM_UPSERT, [_item_row(it) for it in data.get("items", [])])
+            conn.executemany(
+                _META_UPSERT,
+                [
+                    ("counter", str(int(data.get("counter", 0)))),
+                    ("revision", "1"),
+                    ("schema_version", str(_SCHEMA_VERSION)),
+                ],
+            )
+    finally:
+        conn.close()
+    os.replace(tmp, db)
+
+
+def revision() -> int:
+    """Monotonic store change-token (0 while the store is still JSON).
+
+    Bumped by every save; lets watchers poll for change cheaply instead of
+    stat()ing file mtimes."""
+    db = _db_path()
+    if not db.exists():
+        return 0
+    try:
+        conn = _connect(db)
+        try:
+            return int(_meta_get(conn, "revision", "0") or 0)
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        return 0
+
+
+def migrate_store() -> Dict[str, Any]:
+    """Ensure the SQLite store exists, importing the JSON store if present.
+
+    Returns ``{"migrated": bool, "items": int, "db": str}``. Raises if the
+    JSON source is corrupt (a bad source must never silently become an empty
+    authoritative DB)."""
+    db = _db_path()
+    if db.exists():
+        return {"migrated": False, "items": len(_load_unlocked()["items"]), "db": str(db)}
+    with _FileLock(_lock_path()):
+        data = _load_unlocked(strict=True)
+        _save_unlocked(data)
+    return {"migrated": True, "items": len(data["items"]), "db": str(db)}
+
+
+def export_data() -> Dict[str, Any]:
+    """The full store in the classic JSON shape — the interchange format."""
+    data = _load_unlocked(strict=True)
+    return {"counter": int(data.get("counter", 0)), "items": data.get("items", [])}
+
+
+def _load_unlocked(*, strict: bool = False) -> Dict[str, Any]:
+    db = _db_path()
+    if db.exists():
+        data = _read_db(db, strict=strict)
+    else:
+        try:
+            with open(_resolve_store_path(), "r") as f:
+                data = json.load(f)
+        except FileNotFoundError:
+            return _empty_store()
+        except (OSError, json.JSONDecodeError):
+            if strict:
+                raise
+            return _empty_store()
     if not isinstance(data, dict):
         if strict:
             raise ValueError("queue store root must be a JSON object")
@@ -423,12 +607,48 @@ def _load_unlocked(*, strict: bool = False) -> Dict[str, Any]:
 
 
 def _save_unlocked(data: Dict[str, Any]) -> None:
-    path = _resolve_store_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = str(path) + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+    """Persist the store to SQLite, diffing so a mutation writes one row.
+
+    First save on a machine (no .db yet) builds the DB from ``data`` — which
+    the caller just loaded from the legacy JSON if one existed, so that
+    build is the one-time migration. Callers hold ``_FileLock`` (same
+    contract as the JSON era), so load→diff→write is race-free."""
+    db = _db_path()
+    if not db.exists():
+        _create_db(db, data)
+        return
+    conn = _connect(db)
+    try:
+        _ensure_schema(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        existing = dict(conn.execute("SELECT number, item_json FROM items").fetchall())
+        seen = set()
+        for it in data.get("items", []):
+            row = _item_row(it)
+            seen.add(row[0])
+            if existing.get(row[0]) != row[5]:
+                conn.execute(_ITEM_UPSERT, row)
+        gone = set(existing) - seen
+        if gone:
+            conn.executemany("DELETE FROM items WHERE number = ?", [(n,) for n in gone])
+        rev = int(_meta_get(conn, "revision", "0") or 0) + 1
+        conn.executemany(
+            _META_UPSERT,
+            [
+                ("counter", str(int(data.get("counter", 0)))),
+                ("revision", str(rev)),
+                ("schema_version", str(_SCHEMA_VERSION)),
+            ],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    # WAL commits land in the -wal sidecar, so the DB file's mtime would go
+    # stale; bump it so mtime-watchers (CCC's queue-events SSE) keep working.
+    try:
+        os.utime(db)
+    except OSError:
+        pass
 
 
 def _norm_choice(value: Any, valid_values: tuple, default: str = "") -> str:
