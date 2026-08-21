@@ -195,6 +195,21 @@ def _event_summary(event: dict) -> str:
     return name or "event"
 
 
+def _default_worker_id() -> str:
+    """Stable default worker id for bare CLI use (WATCHTOWER-9).
+
+    Derived from the parent process (the interactive shell), NOT this process's
+    pid. Every ``wt`` invocation is a fresh pid, so a pid-based default made a
+    bare ``wt claim`` then bare ``wt close`` un-composable: the close ran under
+    a different id than the claim and was refused as another worker's ticket
+    (the README's own claim->close example dead-ended without --force). The
+    parent shell is stable across invocations typed in the same terminal, and
+    differs between terminals, so claim/close/release/find compose within one
+    session without leaking identity across sessions.
+    """
+    return f"wt-cli-{os.getppid()}"
+
+
 def _caller_identity(args: argparse.Namespace) -> Tuple[str, str]:
     """``(worker_id, session_id)`` identifying the CALLER, for self-attribution.
 
@@ -205,8 +220,13 @@ def _caller_identity(args: argparse.Namespace) -> Tuple[str, str]:
     comes from ``--worker`` or a ``WT_WORKER`` env a spawner may export;
     session id from the same harness env vars the claim path records into
     ``claimed_session_id``, so hosted workers get marks with no flag at all.
+    Falling back to the same stable default the write commands use means a bare
+    ``wt find`` from the terminal that claimed the ticket marks it "(you)" too,
+    instead of the claim/close and find disagreeing about who you are.
     """
     worker = str(getattr(args, "worker", "") or os.environ.get("WT_WORKER", "")).strip()
+    if not worker:
+        worker = _default_worker_id()
     session = (
         os.environ.get("CODEX_THREAD_ID", "").strip()
         or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
@@ -443,7 +463,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     # entirely -- an already-claimed ticket is in_progress, not open, so nudging
     # or spawning a worker would be a no-op at best.
     if getattr(args, "claim", False):
-        worker = args.worker or f"wt-cli-{os.getpid()}"
+        worker = args.worker or _default_worker_id()
         try:
             q.claim_by_ref(item["ref"], worker)
             print(f"CLAIMED: {item['ref']} -> {worker}")
@@ -565,7 +585,7 @@ def cmd_take(args: argparse.Namespace) -> int:
 
 
 def cmd_claim(args: argparse.Namespace) -> int:
-    worker = args.worker or f"wt-cli-{os.getpid()}"
+    worker = args.worker or _default_worker_id()
     ref = getattr(args, "ref", None) or None
     session_uuid = (
         os.environ.get("CODEX_THREAD_ID", "").strip()
@@ -833,7 +853,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             print(error, file=sys.stderr)
             return 1
         args.commit = verified
-    worker = args.worker or f"wt-cli-{os.getpid()}"
+    worker = args.worker or _default_worker_id()
     resolution = _resolution_from_args(args)
     try:
         item = q.close(args.ref, worker, resolution=resolution,
@@ -869,7 +889,7 @@ def cmd_release(args: argparse.Namespace) -> int:
     pool (WT-86) -- e.g. it was claimed defensively to stop other workers
     grabbing it mid-investigation, and turns out better left for the normal
     pool to pick up."""
-    worker = args.worker or f"wt-cli-{os.getpid()}"
+    worker = args.worker or _default_worker_id()
     try:
         item = q.release(args.ref, session_id=worker, force=args.force)
     except ValueError as exc:
@@ -2366,8 +2386,15 @@ def cmd_config(args: argparse.Namespace) -> int:
         config.set_github_assignee(args.queue, args.github_assignee)
         changed.append(f"github_assignee={config.github_assignee(args.queue)}")
     if getattr(args, "workers_local_path", None) is not None:
-        config.set_repo_path(args.queue, args.workers_local_path)
-        changed.append(f"workers_local_path={args.workers_local_path}")
+        expanded_path = os.path.expanduser(args.workers_local_path)
+        if not os.path.isdir(expanded_path):
+            print(
+                f"error: workers_local_path {args.workers_local_path!r} is not a directory",
+                file=sys.stderr,
+            )
+            return 1
+        config.set_repo_path(args.queue, expanded_path)
+        changed.append(f"workers_local_path={expanded_path}")
     if getattr(args, "grace_s", None) is not None:
         try:
             config.set_grace_s(args.queue, args.grace_s)
@@ -3526,7 +3553,8 @@ def build_parser() -> argparse.ArgumentParser:
                                     "blocker at filing time")
         subparser.add_argument("--worker", default="",
                                help="worker/owner id to claim under when --claim is "
-                                    "set; defaults to wt-cli-<pid>")
+                                    "set; defaults to wt-cli-<shell> (stable per "
+                                    "terminal so a later bare close composes)")
 
     s = sub.add_parser("add")
     _add_common_ticket_args(s)

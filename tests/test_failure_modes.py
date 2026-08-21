@@ -314,24 +314,12 @@ def test_missing_folder_failure_names_the_folder_not_the_engine(wt_env, fake_bin
     assert "executable" not in reason
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "GAP: `wt config --workers-local-path` accepts any string. A typo is "
-        "only discovered later, as a launch failure with a 5-minute cooldown, "
-        "on a queue that looks correctly configured."
-    ),
-)
 def test_configuring_a_nonexistent_workers_local_path_is_refused(wt_env, run_cli):
     res = run_cli("config", "-q", QUEUE, "--workers-local-path", "/no/such/folder")
     assert res.code == 1
     assert wt_env.config.repo_path(QUEUE) == ""
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: a file (not a directory) is accepted as workers-local-path.",
-)
 def test_configuring_a_file_as_the_workers_local_path_is_refused(wt_env, run_cli, tmp_path):
     target = tmp_path / "not-a-dir.txt"
     target.write_text("hello")
@@ -339,13 +327,6 @@ def test_configuring_a_file_as_the_workers_local_path_is_refused(wt_env, run_cli
     assert res.code == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "GAP: a literal '~/repo' is stored unexpanded, so the spawn cwd is a "
-        "directory named '~' relative to wherever the daemon happens to run."
-    ),
-)
 def test_tilde_in_workers_local_path_is_expanded_at_write_time(wt_env, run_cli):
     run_cli("config", "-q", QUEUE, "--workers-local-path", "~/some-repo")
     assert not wt_env.config.repo_path(QUEUE).startswith("~")
