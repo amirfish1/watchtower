@@ -3281,14 +3281,15 @@ def _only_item(wt, queue):
 
 def test_add_claim_marks_in_progress_and_skips_dispatch(wt, monkeypatch):
     """`add --claim` (no --worker): item is in_progress, claimed by the default
-    wt-cli-<pid> worker, and dispatch_after_enqueue is NOT called."""
+    shell-stable wt-cli-<shell> worker (WATCHTOWER-9), and dispatch_after_enqueue
+    is NOT called."""
     cli = _reloaded_cli(wt)
     calls = _spy_dispatch(wt, monkeypatch)
     rc = cli.cmd_add(_add_ns("Q", claim=True))
     assert rc == 0
     it = _only_item(wt, "Q")
     assert it["status"] == "in_progress"
-    assert it["claimed_by"] == f"wt-cli-{os.getpid()}"
+    assert it["claimed_by"] == cli._default_worker_id()
     assert calls == []  # already claimed -> no worker nudged/spawned
 
 
