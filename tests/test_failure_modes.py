@@ -560,10 +560,6 @@ def test_config_writes_are_atomic(wt_env):
     assert not list(wt_env.config.CONFIG_FILE.parent.glob("*.tmp"))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="GAP: a negative worker count is stored as-is instead of being refused.",
-)
 def test_negative_worker_count_is_refused(wt_env, run_cli):
     res = run_cli("config", "-q", QUEUE, "--workers", "-2")
     assert res.code == 1

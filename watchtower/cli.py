@@ -2250,7 +2250,11 @@ def cmd_set(args: argparse.Namespace) -> int:
         config.set_effort(args.queue, args.effort)
         changed.append(f"effort={args.effort or '(engine default)'}")
     if args.desired_workers is not None:
-        config.set_desired_workers(args.queue, args.desired_workers)
+        try:
+            config.set_desired_workers(args.queue, args.desired_workers)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         changed.append(f"desired_workers={args.desired_workers}")
     if not changed:
         cfg = config.get_queue_config(args.queue)
@@ -2412,7 +2416,11 @@ def cmd_config(args: argparse.Namespace) -> int:
         config.set_effort(args.queue, args.effort)
         changed.append(f"effort={args.effort or '(engine default)'}")
     if getattr(args, "workers", None) is not None:
-        config.set_desired_workers(args.queue, args.workers)
+        try:
+            config.set_desired_workers(args.queue, args.workers)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
         changed.append(f"workers={args.workers}")
     if not changed:
         cfg = config.get_queue_config(args.queue)

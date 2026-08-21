@@ -694,9 +694,12 @@ def is_approved_effort(eng: str, model: str, value: str) -> bool:
 
 
 def set_desired_workers(queue: str, n: int) -> Dict[str, Any]:
+    value = int(n)
+    if value < 0:
+        raise ValueError("desired_workers must be >= 0")
     data = _load()
     q = data.setdefault(queue, {})
-    q["desired_workers"] = int(n)
+    q["desired_workers"] = value
     _save(data)
     return q
 
