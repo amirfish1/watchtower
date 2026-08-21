@@ -165,13 +165,25 @@ def backend(queue: str) -> str:
     return value if value in VALID_BACKENDS else "file"
 
 
+_GITHUB_REPO_SHAPE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+
 def _validate_github_repo(repo: str) -> None:
-    """Reject common placeholder values so they cannot be saved as a real repo."""
+    """Reject common placeholder values and malformed shapes.
+
+    Catches a bad value at config time instead of leaving it to fail much
+    later as an opaque ``gh`` error on every poll.
+    """
     placeholder = str(repo or "").strip().lower()
     if placeholder in {"owner/repo", "acme/repo"}:
         raise ValueError(
             f"github_repo cannot be the literal placeholder '{repo}'; "
             "use a real OWNER/REPO value"
+        )
+    if not _GITHUB_REPO_SHAPE.match(str(repo or "").strip()):
+        raise ValueError(
+            f"github_repo {repo!r} must look like OWNER/REPO (no scheme, "
+            "spaces, or extra path segments)"
         )
 
 

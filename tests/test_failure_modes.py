@@ -506,14 +506,6 @@ def test_placeholder_repo_from_the_readme_is_refused(wt_env, run_cli, placeholde
     assert "placeholder" in res.err
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "GAP: github_repo accepts any string. 'https://github.com/o/r', "
-        "'justname' and 'a / b' are all stored, and only fail much later as an "
-        "opaque `gh` error on every poll."
-    ),
-)
 @pytest.mark.parametrize(
     "bad", ["justname", "https://github.com/acme/widgets", "acme / widgets", "a/b/c"]
 )
