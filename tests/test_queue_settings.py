@@ -171,14 +171,6 @@ def test_empty_effort_clears_the_override(wt_env, run_cli):
     assert wt_env.config.effort(QUEUE) == ""
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "GAP: --model '' clears the model, but --effort '' is rejected by "
-        "argparse's choices list, so an effort override can only be removed by "
-        "hand-editing queue-config.json."
-    ),
-)
 def test_effort_can_be_cleared_from_the_cli_like_model(wt_env, run_cli):
     run_cli("config", "-q", QUEUE, "--effort", "max")
     assert run_cli("config", "-q", QUEUE, "--effort", "").code == 0

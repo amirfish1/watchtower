@@ -3970,8 +3970,11 @@ def build_parser() -> argparse.ArgumentParser:
                        "Empty string clears it (workers use the CLI's own default)."
                    ))
     s.add_argument("--effort", default=None,
-                   choices=["low", "medium", "high", "xhigh", "max"],
-                   help="reasoning effort for queue workers; omit for the engine default")
+                   choices=["low", "medium", "high", "xhigh", "max", ""],
+                   help=(
+                       "reasoning effort for queue workers; omit for the engine "
+                       "default. Empty string clears an override, like --model."
+                   ))
     s.add_argument("--desired-workers", default=None, type=int, dest="desired_workers",
                    help="number of concurrent workers the reconciler should maintain")
     s.set_defaults(func=cmd_set)
@@ -4011,8 +4014,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model", default=None,
                    help="model workers are spawned with (e.g. claude-sonnet-5)")
     s.add_argument("--effort", default=None,
-                   choices=["low", "medium", "high", "xhigh", "max"],
-                   help="reasoning effort for queue workers; omit for the engine default")
+                   choices=["low", "medium", "high", "xhigh", "max", ""],
+                   help=(
+                       "reasoning effort for queue workers; omit for the engine "
+                       "default. Empty string clears an override, like --model."
+                   ))
     s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
                    help="restrict auto-drain to these ticket types (requires --auto-drain on)")
     s.add_argument("--grace-s", default=None, type=int, dest="grace_s",
