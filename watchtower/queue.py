@@ -71,11 +71,25 @@ from __future__ import annotations
 import json
 import os
 import re as _re
-import sqlite3
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+try:  # stdlib, but missing on Pythons built without libsqlite3-dev present
+    # at build time (a common pyenv/asdf-on-fresh-Linux gotcha) -- fail with
+    # an actionable message instead of a bare "No module named 'sqlite3'"
+    # traceback, since this is the store's only backend (no JSON fallback).
+    import sqlite3
+except ImportError as _sqlite_err:  # pragma: no cover - unusual Python builds
+    raise ImportError(
+        "watchtower requires a Python built with sqlite3 support (stdlib "
+        "module 'sqlite3' is missing). This is usually a Python built from "
+        "source without libsqlite3-dev/sqlite-devel installed first (common "
+        "with pyenv/asdf) -- install the sqlite dev headers and rebuild "
+        "Python, or use a distribution that ships sqlite3 (python.org "
+        "installer, Homebrew, or your OS package manager's python3)."
+    ) from _sqlite_err
 
 try:  # POSIX cross-process locking; degrade gracefully if unavailable.
     import fcntl  # type: ignore
