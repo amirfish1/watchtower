@@ -3764,6 +3764,126 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
         return _reconcile_once_locked(dry_run)
 
 
+def bump_timeboxed_model_floor_blocks(
+    reconcile_id: str = "",
+) -> List[Dict[str, Any]]:
+    """SIDE-39 -- per-ticket watchdog for model-floor auto-parks.
+
+    A ticket whose ``model_floor`` exceeds its queue's model is parked
+    blocked at claim time (FEAT-NEXT-120, see ``cli.cmd_claim``) and then
+    waits on a human indefinitely. Once such a ticket has sat blocked past
+    ``config.model_floor_bump_minutes(queue)`` (keyed off ``blocked_at``,
+    which ``queue.block()`` stamps), this bumps the queue's configured model
+    ONE same-engine tier up ``config.MODEL_FLOOR_TIERS``, records the
+    auto-answer on the ticket, and reopens it so the now-stronger queue
+    re-claims it.
+
+    Deliberately conservative:
+      - Only blocks carrying the recognizable claim-time question
+        (``config.MODEL_FLOOR_BLOCK_PREFIX``) on a ticket with a non-empty
+        ``model_floor`` are touched. An ordinary human-decision block is
+        NEVER auto-answered -- that would silently erase a real question.
+      - At most one tier bump per queue per pass. A still-unmet floor simply
+        re-parks at the next claim with a fresh ``blocked_at``, so escalation
+        proceeds one tier per timebox, each step logged.
+      - No higher same-engine tier (queue already at its engine's top, or
+        running an unranked model): the ticket stays blocked for a human.
+      - If the floor is already met (a human raised the queue's model after
+        the park), the ticket is answered + reopened without any bump.
+
+    Distinct from ``health.STUCK_MINUTES``, which is queue-level ("no close
+    anywhere in the queue lately"); this watchdog is per-ticket.
+    """
+    from . import config, health
+    from . import queue as q
+
+    out: List[Dict[str, Any]] = []
+    now = datetime.now(timezone.utc)
+    actor = reconcile_id or "watchtower-reconciler"
+    bumped_queues: Set[str] = set()
+    try:
+        blocked = q.list_blocked() or []
+    except Exception:
+        return out
+    for it in blocked:
+        ref = str(it.get("ref") or "")
+        queue_name = str(it.get("project") or "")
+        floor = str(it.get("model_floor") or "").strip()
+        question = str(it.get("block_question") or "")
+        if not ref or not queue_name or not floor:
+            continue
+        if not question.startswith(config.MODEL_FLOOR_BLOCK_PREFIX):
+            # A human-decision block that happens to sit on a floor-carrying
+            # ticket. Not ours to answer.
+            continue
+        age_s = health._age_seconds(it.get("blocked_at"), now)
+        if age_s is None or age_s < config.model_floor_bump_minutes(queue_name) * 60:
+            continue
+        eng = config.engine(queue_name)
+        queue_model = config.canonical_model(eng, config.model(queue_name))
+        bumped_to = ""
+        if config.model_floor_met(queue_name, floor):
+            # Human already raised the queue since the park; just unblock.
+            pass
+        elif queue_name in bumped_queues:
+            # One tier per queue per pass; this ticket gets the next pass.
+            continue
+        else:
+            bumped_to = config.next_model_floor_tier(eng, queue_model)
+            if not bumped_to:
+                out.append({
+                    "ref": ref, "queue": queue_name, "action": "left_blocked",
+                    "reason": (
+                        f"no {eng} tier above {queue_model or '(unset)'!r} "
+                        f"to meet floor {floor!r}"
+                    ),
+                })
+                continue
+            config.set_model(queue_name, bumped_to)
+            bumped_queues.add(queue_name)
+        answer_text = (
+            f"[auto] Model-floor timebox: blocked {age_s // 60} min on floor "
+            f"{floor!r} with queue model {queue_model or '(unset)'!r}. "
+            + (
+                f"Bumped queue {queue_name!r} model to {bumped_to!r} and reopened "
+                f"for a stronger worker. (SIDE-39 reconciler watchdog)"
+                if bumped_to else
+                f"Queue model now satisfies the floor; reopened for re-claim. "
+                f"(SIDE-39 reconciler watchdog)"
+            )
+        )
+        try:
+            q.answer(ref, answer_text, session_id=actor)
+            # answer() reopens on its own when no resumable session is bound;
+            # otherwise the ticket is still in_progress -- CAS it back to open
+            # so the pool (not the stale claim) owns it. A CAS miss just means
+            # answer() already reopened it (or someone else raced us): fine.
+            q.update_status(
+                ref, "open", actor, require_status="in_progress",
+                reason="model-floor timebox auto-bump (SIDE-39)",
+            )
+        except Exception:
+            continue
+        q._log(
+            "FLOOR_BUMP",
+            (
+                f"{ref} — blocked {age_s // 60}m on floor {floor!r}; "
+                + (
+                    f"queue model {queue_model or '(unset)'!r} -> {bumped_to!r}, reopened"
+                    if bumped_to else
+                    f"floor now met by {queue_model or '(unset)'!r}, reopened"
+                )
+            ),
+            queue=queue_name,
+        )
+        out.append({
+            "ref": ref, "queue": queue_name,
+            "action": "bumped" if bumped_to else "reopened",
+            "floor": floor, "from_model": queue_model, "to_model": bumped_to,
+        })
+    return out
+
+
 def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     from . import config, health
     import sys
@@ -3791,6 +3911,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
                               "released": [], "zombies_released": [],
                               "reaped": [], "requeued": [],
+                              "model_floor_bumped": [],
                               "stop_signals_swept": [],
                               "backfilled": [],
                               "session_title_backfilled": [],
@@ -3869,6 +3990,16 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                     f"--worker <your-id>{claim_filter} --json` and keep draining."
                 )
                 notify_workers(q_name, nudge)
+        except Exception:
+            pass
+        # SIDE-39: per-ticket watchdog for model-floor auto-parks. Runs before
+        # the depth reads below so a ticket it reopens counts as claimable on
+        # this same pass (the spawn decision then staffs the bumped queue
+        # immediately instead of one tick later).
+        try:
+            result["model_floor_bumped"] = bump_timeboxed_model_floor_blocks(
+                reconcile_id=reconcile_id
+            )
         except Exception:
             pass
         # Propagate live workers' cloud session UUIDs onto the tickets they hold

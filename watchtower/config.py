@@ -563,6 +563,64 @@ def model_floor_met(queue: str, floor: str) -> bool:
     return MODEL_FLOOR_TIERS.index(queue_model) >= MODEL_FLOOR_TIERS.index(floor)
 
 
+# SIDE-39 -- the recognizable opening of the claim-time model-floor auto-park
+# question. cli.py's claim path builds the block question from this constant,
+# and workers.bump_timeboxed_model_floor_blocks() matches on it to tell a
+# floor-park apart from an ordinary human-decision block (which must never be
+# auto-answered). Single source of truth so detection cannot drift from the
+# text the block actually writes.
+MODEL_FLOOR_BLOCK_PREFIX = "This ticket's model floor is"
+
+# SIDE-39 -- minutes a model-floor-parked ticket may sit blocked before the
+# reconciler auto-bumps its queue's model one tier (see
+# workers.bump_timeboxed_model_floor_blocks). Distinct from
+# health.STUCK_MINUTES, which is queue-level (no close anywhere in the
+# queue); this timebox is per-ticket, keyed off ``blocked_at``.
+DEFAULT_MODEL_FLOOR_BUMP_MINUTES = 30
+
+
+def model_floor_bump_minutes(queue: str) -> int:
+    """Per-queue override for the model-floor auto-bump timebox.
+
+    A ``model_floor_bump_minutes`` key on the queue's config entry wins;
+    anything missing or unparseable falls back to
+    ``DEFAULT_MODEL_FLOOR_BUMP_MINUTES``. Zero/negative values also fall
+    back rather than meaning "bump instantly" -- an accidental 0 turning
+    every floor-park into an immediate escalation is worse than a slow one.
+    """
+    raw = _load().get(queue, {}).get(
+        "model_floor_bump_minutes", DEFAULT_MODEL_FLOOR_BUMP_MINUTES
+    )
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MODEL_FLOOR_BUMP_MINUTES
+    return value if value > 0 else DEFAULT_MODEL_FLOOR_BUMP_MINUTES
+
+
+def next_model_floor_tier(eng: str, current_model: str) -> str:
+    """The next ``MODEL_FLOOR_TIERS`` entry above ``current_model`` that
+    belongs to engine ``eng``, or "" when there is none.
+
+    The global ladder is cross-engine on purpose (see its comment), so a
+    naive index+1 could hand a claude queue a kimi model id -- which the
+    claude CLI rejects at spawn, killing every worker on the queue. Climbing
+    is therefore restricted to the same engine's models: "" comes back when
+    ``current_model`` is unranked or already this engine's top ranked tier,
+    and the caller leaves the ticket blocked for a human.
+    """
+    current = str(current_model or "").strip()
+    if current not in MODEL_FLOOR_TIERS:
+        return ""
+    engine_models = {
+        m for m, _ in MODEL_EFFORTS.get(str(eng or "").strip().lower(), ())
+    }
+    for candidate in MODEL_FLOOR_TIERS[MODEL_FLOOR_TIERS.index(current) + 1:]:
+        if candidate in engine_models:
+            return candidate
+    return ""
+
+
 def is_approved_model(eng: str, value: str) -> bool:
     """Whether ``value`` is empty or is an approved model/alias for ``eng``.
 
