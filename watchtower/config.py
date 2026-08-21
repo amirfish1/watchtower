@@ -129,8 +129,21 @@ def _save(data: Dict[str, Any]) -> None:
     os.replace(tmp, CONFIG_FILE)
 
 
+def _queue_entry(queue: str) -> Dict[str, Any]:
+    """The raw config dict for ``queue``, or ``{}`` for a missing/non-dict entry.
+
+    A hand-edited or merge-mangled config file can leave a queue's value as a
+    scalar (e.g. ``{"WT": "oops"}``) instead of a dict. Every getter reads
+    through this instead of ``_load().get(queue, {})`` directly, so a mangled
+    entry degrades to defaults everywhere instead of raising ``AttributeError``
+    in whichever getter happens to be called first.
+    """
+    entry = _load().get(queue, {})
+    return entry if isinstance(entry, dict) else {}
+
+
 def get_queue_config(queue: str) -> Dict[str, Any]:
-    return dict(_load().get(queue, {}))
+    return dict(_queue_entry(queue))
 
 
 def set_backend(queue: str, backend: str) -> Dict[str, Any]:
@@ -148,7 +161,7 @@ def set_backend(queue: str, backend: str) -> Dict[str, Any]:
 
 
 def backend(queue: str) -> str:
-    value = str(_load().get(queue, {}).get("backend") or "file").strip().lower()
+    value = str(_queue_entry(queue).get("backend") or "file").strip().lower()
     return value if value in VALID_BACKENDS else "file"
 
 
@@ -176,7 +189,7 @@ def set_github_repo(queue: str, repo: str) -> Dict[str, Any]:
 
 
 def github_repo(queue: str) -> str:
-    return str(_load().get(queue, {}).get("github_repo") or "")
+    return str(_queue_entry(queue).get("github_repo") or "")
 
 
 def set_github_assignee(queue: str, assignee: str) -> Dict[str, Any]:
@@ -192,7 +205,7 @@ def set_github_assignee(queue: str, assignee: str) -> Dict[str, Any]:
 
 
 def github_assignee(queue: str) -> str:
-    return str(_load().get(queue, {}).get("github_assignee") or "@me")
+    return str(_queue_entry(queue).get("github_assignee") or "@me")
 
 
 def set_auto_drain(queue: str, enabled: bool) -> Dict[str, Any]:
@@ -218,7 +231,7 @@ def set_auto_drain(queue: str, enabled: bool) -> Dict[str, Any]:
 def auto_drain(queue: str) -> bool:
     """False unless explicitly opted in. Default-off so a fresh queue is a
     backlog until you run ``wt drain on <queue>``."""
-    return bool(_load().get(queue, {}).get("auto_drain", False))
+    return bool(_queue_entry(queue).get("auto_drain", False))
 
 
 def set_grace_s(queue: str, seconds: Any) -> Dict[str, Any]:
@@ -241,7 +254,7 @@ def set_grace_s(queue: str, seconds: Any) -> Dict[str, Any]:
 
 def grace_s(queue: str) -> int:
     """Seconds a ticket must age before auto-drain may claim it."""
-    raw = _load().get(queue, {}).get("grace_s", DEFAULT_GRACE_S)
+    raw = _queue_entry(queue).get("grace_s", DEFAULT_GRACE_S)
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -290,7 +303,7 @@ def set_claim_types(queue: str, types: Any) -> Dict[str, Any]:
 
 def claim_types(queue: str) -> list:
     """Return the configured claim-type restriction for a queue, or [] (all)."""
-    v = _load().get(queue, {}).get("claim_types", [])
+    v = _queue_entry(queue).get("claim_types", [])
     return list(v) if isinstance(v, list) else []
 
 
@@ -304,7 +317,7 @@ def set_repo_path(queue: str, path: str) -> Dict[str, Any]:
 
 def repo_path(queue: str) -> str:
     """Return the configured repo_path for a queue, or empty string."""
-    return _load().get(queue, {}).get("repo_path", "")
+    return _queue_entry(queue).get("repo_path", "")
 
 
 def set_engine(queue: str, eng: str) -> Dict[str, Any]:
@@ -356,7 +369,7 @@ def engine(queue: str) -> str:
     `codex` (WT-105). Codex workers don't get the WT-49 ticket-context
     session rename (`messages.set_session_title` is claude-transcript-only)
     -- accepted tradeoff, tracked as a follow-up."""
-    explicit = _load().get(queue, {}).get("engine", "")
+    explicit = _queue_entry(queue).get("engine", "")
     if explicit:
         return explicit
     worker_default = _ccc_worker_engine_default()
@@ -467,7 +480,7 @@ def model(queue: str) -> str:
     Supported aliases are resolved to their canonical engine-CLI identifiers.
     """
     eng = engine(queue)
-    explicit = _load().get(queue, {}).get("model", "")
+    explicit = _queue_entry(queue).get("model", "")
     if explicit:
         return canonical_model(eng, explicit)
     return canonical_model(eng, _ccc_worker_model_default(eng) or default_model(eng))
@@ -490,7 +503,7 @@ def set_effort(queue: str, value: str) -> Dict[str, Any]:
 
 def effort(queue: str) -> str:
     """Return a queue override, CCC worker default, or engine default."""
-    value = str(_load().get(queue, {}).get("effort") or "").strip().lower()
+    value = str(_queue_entry(queue).get("effort") or "").strip().lower()
     if value in VALID_EFFORTS:
         return value
     return _ccc_worker_effort_default()
@@ -601,7 +614,7 @@ def model_floor_bump_minutes(queue: str) -> int:
     back rather than meaning "bump instantly" -- an accidental 0 turning
     every floor-park into an immediate escalation is worse than a slow one.
     """
-    raw = _load().get(queue, {}).get(
+    raw = _queue_entry(queue).get(
         "model_floor_bump_minutes", DEFAULT_MODEL_FLOOR_BUMP_MINUTES
     )
     try:
@@ -677,7 +690,7 @@ def set_desired_workers(queue: str, n: int) -> Dict[str, Any]:
 
 
 def desired_workers(queue: str) -> int:
-    return int(_load().get(queue, {}).get("desired_workers", 1))
+    return int(_queue_entry(queue).get("desired_workers", 1))
 
 
 def all_queues() -> Dict[str, Any]:

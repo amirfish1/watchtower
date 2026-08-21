@@ -541,16 +541,6 @@ def test_reconciler_survives_a_corrupt_config_file(wt_env, fake_bin):
     assert isinstance(wt_env.workers.reconcile_once(dry_run=True), dict)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "GAP: a queue entry that is not a dict (hand-edited, or a merge "
-        "artefact) makes every per-queue getter raise AttributeError, which "
-        "takes down `wt status` and the reconciler tick. "
-        "github_queues_for_repo() already guards this with isinstance; the "
-        "scalar getters do not."
-    ),
-)
 @pytest.mark.parametrize("reader", ["backend", "auto_drain", "desired_workers", "grace_s"])
 def test_non_dict_config_entry_is_ignored_rather_than_fatal(wt_env, reader):
     wt_env.config.CONFIG_FILE.write_text(json.dumps({QUEUE: "not-a-dict"}))
