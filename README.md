@@ -461,15 +461,21 @@ Idle agent sessions lose their prompt cache at the 60-minute cliff, forcing an e
 
 ## Where the queue lives
 
-WatchTower resolves its store in this order:
+WatchTower resolves its store *base path* in this order:
 
 1. `$WATCHTOWER_STORE`: explicit override (used by tests/CI).
 2. The existing CCC store at `~/.claude/command-center/ux-fixes-queue.json`
-   **if it already exists** on this machine, so WatchTower drains real work
-   today without migration.
+   **if it (or its migrated `.db`) already exists** on this machine, so
+   WatchTower drains real work today without migration.
 3. `~/.watchtower/queues.json`: WatchTower's own default, used whenever no CCC
    store is present. A fresh install with no CCC on the machine always lands
    here.
+
+The authoritative store is that path with a `.db` suffix (SQLite, stdlib
+`sqlite3`) once it exists. Legacy JSON stores are imported by the first
+mutation or `wt migrate-store`; JSON remains the interchange format via
+`wt export-json`. See
+`docs/superpowers/specs/2026-08-20-sqlite-store-design.md`.
 
 Tracked workers live in `~/.watchtower/workers.json`; the watcher daemon's
 pidfile is `~/.watchtower/daemon.pid`, and the background dashboard server's is

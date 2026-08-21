@@ -333,10 +333,12 @@ bundles and keeps a released conversation out of eligible staffing.
 
 ### `_CCC_LEGACY_STORE`
 
-WatchTower resolves its queue store in order: `$WATCHTOWER_STORE` →
-`~/.claude/command-center/ux-fixes-queue.json` (if it exists) →
+WatchTower resolves its queue store base path in order: `$WATCHTOWER_STORE` →
+`~/.claude/command-center/ux-fixes-queue.json` (if it or its `.db` exists) →
 `~/.watchtower/queues.json`. The middle path is the CCC legacy store — this
-lets WatchTower drain real CCC work without migration (WT-26 Phase 0).
+lets WatchTower drain real CCC work without migration (WT-26 Phase 0). The
+authoritative file is the base path with a `.db` suffix once the SQLite
+migration has run (2026-08-20 spec).
 
 ---
 
@@ -344,7 +346,7 @@ lets WatchTower drain real CCC work without migration (WT-26 Phase 0).
 
 - **`wt close` vs `wt resolve`** — should ticket close be renamed to `resolve`
   to avoid collision with service `stop`? Not yet decided.
-- **`item` vs `ticket`** — the JSON store says `items`; the CLI and docs say
+- **`item` vs `ticket`** — the store says `items`; the CLI and docs say
   `tickets`. Should standardize on `ticket` everywhere.
 - **`desired_workers > 1`** — registry field for parallel drain. Exists in
   design; reconciler defaults to 1. Not specced beyond that.

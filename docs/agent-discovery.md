@@ -19,8 +19,9 @@ knows the CLI or reverse-engineers it from the raw JSON.
 Current state, for reference:
 - `wt` is a stdlib-only Python CLI (`watchtower/cli.py`) — no daemon
   required to read data (`wt ls -q <QUEUE> --json`, `wt status --json`).
-- Tickets live in one JSON store (`~/.watchtower/queues.json` by default,
-  see `store_path()` in `watchtower/queue.py`), keyed by queue/ref.
+- Tickets live in one SQLite store (`~/.watchtower/queues.db` by default,
+  see `store_path()` in `watchtower/queue.py`), keyed by queue/ref;
+  `wt export-json` produces the classic JSON shape.
 - There's a local HTTP API (`watchtower/dashboard.py`), but only when the
   service is running (`wt start`/`wt dashboard`): `GET /api/queue/<name>`,
   `GET /api/status`, `POST /api/queue/<name>/add`, `POST
@@ -108,7 +109,7 @@ uses.
 
 ## Option 4 — Total Recall indexing
 
-Ingest `~/.watchtower/queues.json` (or the per-queue exports) into Total
+Ingest `wt export-json` output (or the per-queue exports) into Total
 Recall so `/recall HERMES-20` surfaces it from any session's memory layer.
 
 - **Pros:** No new server or install step — reuses infrastructure already
