@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WatchTower CLI reference</title>
-<meta name="description" content="Every WatchTower command and flag: status, queues, enqueue, wait, serve, import. Verified against wt --help.">
+<meta name="description" content="Every WatchTower command and flag: queues, tickets, agent messaging, worker protocol. Verified against wt --help.">
 <link rel="stylesheet" href="styles.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='38' fill='%23f6b545'/></svg>">
 </head>
@@ -25,7 +25,7 @@
 
 <section style="padding-top:56px">
   <div class="wrap">
-    <p class="eyebrow">CLI reference &nbsp;&middot;&nbsp; wt 0.1.0</p>
+    <p class="eyebrow">CLI reference &nbsp;&middot;&nbsp; wt 0.4.0</p>
     <h2>Every command, every flag.</h2>
     <p class="lede">
       This page is generated against <code class="inline-code">wt --help</code>, so the flags below match the
@@ -37,6 +37,7 @@
       <a href="#add">enqueue (add)</a>
       <a href="#import">import</a>
       <a href="#wait">wait</a>
+      <a href="#messaging">agent messaging</a>
       <a href="#serve">serve (dashboard)</a>
       <a href="#worker">worker protocol</a>
     </div>
@@ -86,8 +87,8 @@
       <h3><span class="verb">wt</span> config</h3>
       <div class="sig">wt config -q QUEUE [--auto-drain {on,off}] [--workers N] [--workers-local-path PATH]
        [--backend {file,github}] [--github-repo REPO] [--github-assignee WHO]
-       [--engine {claude,codex}] [--model MODEL] [--effort {low,medium,high,xhigh,max}]
-       [--type {bug,feature}]</div>
+       [--engine {claude,codex,kimi}] [--model MODEL] [--effort {low,medium,high,xhigh,max}]
+       [--type {bug,feature}] [--grace-s N]</div>
       <p>The recommended queue configuration command. It combines the basic settings with auto-drain policy,
          so one call sets the engine, worker count, backend, and whether the queue self-staffs.</p>
       <table class="flags">
@@ -97,15 +98,24 @@
         <tr><td>--workers-local-path</td><td>Local repo path workers run in.</td></tr>
         <tr><td>--backend</td><td><code>file</code> (the default JSON queue) or <code>github</code> (GitHub Issues).</td></tr>
         <tr><td>--github-repo / --github-assignee</td><td>Target repo and assignee when the backend is GitHub.</td></tr>
-        <tr><td>--engine</td><td><code>claude</code> (default) or <code>codex</code>.</td></tr>
-        <tr><td>--model / --effort</td><td>Model identifier and reasoning effort for spawned workers.</td></tr>
+        <tr><td>--engine</td><td><code>claude</code> (default), <code>codex</code>, or <code>kimi</code>.</td></tr>
+        <tr><td>--model / --effort</td><td>Model identifier and reasoning effort for spawned workers. See <code class="inline-code">wt models</code> for approved ids.</td></tr>
         <tr><td>--type</td><td>Restrict auto-drain workers to a ticket type.</td></tr>
+        <tr><td>--grace-s</td><td>Seconds a new ticket is left alone before auto-drain may claim it (default 180); <code>0</code> drains immediately.</td></tr>
       </table>
+    </div>
+    <div class="cli-cmd">
+      <h3><span class="verb">wt</span> models</h3>
+      <div class="sig">wt models --engine {claude,codex,kimi,antigravity} [--json]</div>
+      <p>List the WatchTower-approved model identifiers for one engine: the values
+         <code class="inline-code">wt config --model</code> and <code class="inline-code">wt spawn --model</code> accept.
+         <code>antigravity</code> is spawn-only; its Gemini ids carry effort in the suffix, so they take no
+         <code class="inline-code">--effort</code>.</p>
     </div>
     <div class="cli-cmd">
       <h3><span class="verb">wt</span> set</h3>
       <div class="sig">wt set -q QUEUE [--backend {file,github}] [--github-repo REPO] [--github-assignee WHO]
-       [--repo-path PATH] [--engine {claude,codex}] [--model MODEL]
+       [--repo-path PATH] [--engine {claude,codex,kimi}] [--model MODEL]
        [--effort {low,medium,high,xhigh,max}] [--desired-workers N]</div>
       <p>Compatibility alias for the basic queue settings that predate <code class="inline-code">wt config</code>.
          Prefer <code class="inline-code">wt config</code> for new scripts; <code class="inline-code">--repo-path</code> lives here.</p>
@@ -140,7 +150,7 @@
       <div class="sig">wt add -q QUEUE [--title T] [--note N] [--text T] [--url U] [--lane {normal,express}]
        [--type {bug,feature}] [--readiness {ready,needs-shaping,needs-spec}]
        [--priority {p0,p1,p2,p3,p4}] [--value {H,M,L}] [--confidence {H,M,L}]
-       [--worker W] [--claim]</div>
+       [--model-floor MODEL] [--worker W] [--claim]</div>
       <p>File a ticket into a queue. The core enqueue primitive: pure by design, with no spawn side effects, so it
          is safe to call from automation and agents. The ticket gets a stable ref like <code class="inline-code">MYAPP-1</code>.</p>
       <table class="flags">
@@ -152,6 +162,7 @@
         <tr><td>--readiness</td><td><code>ready</code>, <code>needs-shaping</code>, or <code>needs-spec</code>.</td></tr>
         <tr><td>--priority</td><td><code>p0</code> (highest) through <code>p4</code> (lowest).</td></tr>
         <tr><td>--value / --confidence</td><td>Business value and confidence: <code>H</code>, <code>M</code>, or <code>L</code>.</td></tr>
+        <tr><td>--model-floor</td><td>Filer's best-guess minimum model this ticket needs (an approved model id from any engine). Empty is fine; never a blocker at filing time.</td></tr>
         <tr><td>--worker</td><td>Worker id to claim under when <code>--claim</code> is set. Defaults to <code>wt-cli-&lt;pid&gt;</code>.</td></tr>
         <tr><td>--claim</td><td>Immediately claim the new ticket so no auto-drain worker picks it up. Use when you are already working it.</td></tr>
       </table>
@@ -163,12 +174,33 @@
     </div>
     <div class="cli-cmd">
       <h3><span class="verb">wt</span> edit / ls / find</h3>
-      <div class="sig">wt edit REF [--priority ...] [--type ...] [--queue OTHER]
+      <div class="sig">wt edit REF [--priority ...] [--type ...] [--model-floor MODEL] [--queue OTHER] [--json]
 wt ls   -q QUEUE [--status {active,open,in_progress,blocked,closed,all}] [--limit N] [--json]
-wt find REF [--json]</div>
-      <p><code class="inline-code">edit</code> patches fields on an existing ticket (or moves it to another queue in place).
-         <code class="inline-code">ls</code> lists a queue's tickets; <code class="inline-code">find</code> looks one up by ref across all queues, no
-         <code>-q</code> needed.</p>
+wt find REF [--worker W] [--json]</div>
+      <p><code class="inline-code">edit</code> patches fields on an existing ticket, or moves it to another queue in place with
+         <code class="inline-code">--queue</code>. <code class="inline-code">ls</code> lists a queue's tickets;
+         <code class="inline-code">find</code> looks one up by ref across all queues, no <code>-q</code> needed
+         (<code class="inline-code">--worker</code> marks events you performed as "you").</p>
+    </div>
+    <div class="cli-cmd">
+      <h3><span class="verb">wt</span> ready / blocked / answer / discuss</h3>
+      <div class="sig">wt ready   REF [--no-dispatch] [--cancel]   (alias: wt run)
+wt blocked [-q QUEUE] [--json]
+wt answer  REF TEXT [--engine {claude,codex,kimi}] [--worker W]
+wt discuss REF [--engine {claude,codex,kimi}] [--print]</div>
+      <p><code class="inline-code">ready</code> marks a ticket ready for workers and dispatches its queue.
+         <code class="inline-code">blocked</code> lists tickets parked for a human;
+         <code class="inline-code">answer</code> answers one and auto-resumes its worker session;
+         <code class="inline-code">discuss</code> attaches you to the blocked ticket's session interactively
+         (<code class="inline-code">--print</code> shows the resume command instead of running it).</p>
+    </div>
+    <div class="cli-cmd">
+      <h3><span class="verb">wt</span> comment / dedup</h3>
+      <div class="sig">wt comment REF TEXT [--by {human,worker,system}]
+wt dedup   [-q QUEUE] [--apply]</div>
+      <p><code class="inline-code">comment</code> appends a ticket activity comment.
+         <code class="inline-code">dedup</code> closes exact-duplicate open tickets; preview is the default,
+         <code class="inline-code">--apply</code> closes them.</p>
     </div>
   </div>
 </section>
@@ -218,6 +250,54 @@ wt find REF [--json]</div>
   </div>
 </section>
 
+<!-- AGENT MESSAGING -->
+<section id="messaging">
+  <div class="wrap">
+    <p class="eyebrow">Agent messaging</p>
+    <div class="cli-cmd">
+      <h3><span class="verb">wt</span> send</h3>
+      <div class="sig">wt send TARGET TEXT [--mode {send,steer}] [--no-queue] [--ttl SECONDS] [--json]</div>
+      <p>Push a message to a worker, agent, or session. TARGET is a worker id, <code>@agent</code> name, or session
+         UUID/prefix; TEXT of <code>-</code> reads the body from stdin (quote-safe for long, multi-line messages).
+         Undeliverable messages park in the outbox instead of failing.</p>
+      <table class="flags">
+        <tr><td>--mode</td><td>Delivery mode hint; delegate transports honor <code>steer</code>.</td></tr>
+        <tr><td>--no-queue</td><td>Fail immediately instead of parking in the outbox.</td></tr>
+        <tr><td>--ttl</td><td>Seconds before a queued outbox message expires.</td></tr>
+      </table>
+    </div>
+    <div class="cli-cmd">
+      <h3><span class="verb">wt</span> ask</h3>
+      <div class="sig">wt ask TARGET TEXT [--timeout SECONDS] [--notify-webhook URL] [--json]</div>
+      <p>Ask a target and wait for its reply (default 30 s). <code class="inline-code">--notify-webhook</code> returns
+         immediately and POSTs the answer to your URL when it arrives, mirroring
+         <code class="inline-code">wt wait --notify-webhook</code>.</p>
+    </div>
+    <div class="cli-cmd">
+      <h3><span class="verb">wt</span> spawn / critique</h3>
+      <div class="sig">wt spawn    GOAL [--engine {claude,codex,antigravity,kimi}] [--model M] [--repo DIR]
+            [--name N] [--report-to WHO] [--dry-run] [--json]
+wt critique GOAL [--family {claude,codex,antigravity}] [--engine1 M] [--engine2 M]
+            [--report-to WHO] [--cwd DIR] [--dry-run] [--json]</div>
+      <p><code class="inline-code">spawn</code> launches one ad-hoc one-shot agent on a goal; it reports back to
+         <code class="inline-code">--report-to</code> via <code class="inline-code">wt send</code> when done.
+         <code class="inline-code">critique</code> spawns two critique agents from families other than your own
+         (<code class="inline-code">--family</code> is auto-detected from harness env) so the review is cross-model.</p>
+    </div>
+    <div class="cli-cmd">
+      <h3><span class="verb">wt</span> outbox / agents / chat / snapshot</h3>
+      <div class="sig">wt outbox   {ls,retry,rm}
+wt agents   [--json] [register|set-name|rm ...]
+wt chat     {new,post,read,ls,nudge,add,leave,archive,close,set} ...
+wt snapshot {arm,disarm,status,fire,path,record,latest,consume,sessions} ...</div>
+      <p><code class="inline-code">outbox</code> inspects and retries undelivered messages.
+         <code class="inline-code">agents</code> is the address book: list reachable agents, or name a session UUID.
+         <code class="inline-code">chat</code> runs multi-agent group chats.
+         <code class="inline-code">snapshot</code> manages session auto-snapshots taken before prompt-cache expiration.</p>
+    </div>
+  </div>
+</section>
+
 <!-- SERVE -->
 <section id="serve">
   <div class="wrap">
@@ -237,7 +317,7 @@ wt find REF [--json]</div>
     </div>
     <div class="cli-cmd">
       <h3><span class="verb">wt</span> start / stop</h3>
-      <div class="sig">wt start [--interval N] [--stuck-minutes N] [--engine {claude,codex}] [--auto-spawn]
+      <div class="sig">wt start [--interval N] [--stuck-minutes N] [--engine {claude,codex,kimi}] [--auto-spawn]
        [--dry-run] [--host HOST] [--port PORT]
 wt stop</div>
       <p>Start or stop the background service (watcher plus reconciler plus HTTP API). The first
@@ -251,6 +331,15 @@ wt stop</div>
         <tr><td>--host / --port</td><td>HTTP API bind host and port (default 127.0.0.1:8787).</td></tr>
       </table>
     </div>
+    <div class="cli-cmd">
+      <h3><span class="verb">wt</span> skills / uninstall</h3>
+      <div class="sig">wt skills [sync|status|remove]
+wt uninstall</div>
+      <p><code class="inline-code">skills</code> symlinks the bundled skills into every installed agent harness
+         (<code>sync</code> is the default and also runs on install; <code>status</code> inspects,
+         <code>remove</code> unlinks). <code class="inline-code">uninstall</code> removes the LaunchAgent so the
+         service stops auto-starting on login.</p>
+    </div>
   </div>
 </section>
 
@@ -263,17 +352,21 @@ wt stop</div>
        drive a queue by hand or watch an autonomous worker do it.</p>
     <div class="term" style="margin-top:24px">
       <div class="term-body"><pre><span class="cmd">wt claim  -q DEMO</span>              <span class="cm"># claim next open ticket (smart sort: priority + type + age)</span>
-<span class="cmd">wt claim  -q DEMO DEMO-1</span>       <span class="cm"># or claim a specific ticket by ref</span>
+<span class="cmd">wt claim  -q DEMO DEMO-1</span>       <span class="cm"># or claim a specific ticket by ref (--oldest = FIFO;</span>
+                               <span class="cm">#   --type / --readiness filter what you'll take)</span>
 <span class="cmd">wt close  DEMO-1 --summary "fixed the overlap" --commit &lt;SHA&gt; \</span>
 <span class="cmd">          --caveat "only tested on iOS" --follow-up "add a regression test"</span>
 <span class="cmd">wt release DEMO-1</span>              <span class="cm"># give up a claim without closing; returns it to open</span>
-<span class="cmd">wt block   DEMO-1</span>              <span class="cm"># park a ticket that needs a human decision</span></pre></div>
+<span class="cmd">wt block   DEMO-1 --question "ship behind a flag?" \</span>
+<span class="cmd">          --progress "root cause found; fix drafted"</span>  <span class="cm"># park for a human decision</span></pre></div>
     </div>
     <div class="note">
       <b>Closes carry how it was fixed.</b> <code class="inline-code">wt close</code> requires <code>--summary</code>
       and either a verified <code>--commit &lt;SHA&gt;</code> or explicit <code>--no-code</code>, plus optional
       <code>--caveat</code>, <code>--follow-up</code>, and <code>--unresolved</code>. Pass
-      <code>--enqueue-follow-ups</code> to auto-file the follow-ups as new tickets.
+      <code>--enqueue-follow-ups</code> to auto-file the follow-ups as new tickets. A blocked ticket comes back
+      through <code class="inline-code">wt answer</code>; releasing a blocked claim is refused without
+      <code>--force</code> so the open question is not erased.
     </div>
     <div class="cta-row">
       <a class="btn btn-primary" href="index.html#quickstart">Back to quickstart</a>
@@ -286,7 +379,7 @@ wt stop</div>
   <div class="wrap foot-inner">
     <div>
       <div class="brand" style="margin-bottom:8px"><span class="beacon"></span>WatchTower</div>
-      <div>Flags on this page verified against <code class="inline-code">wt --help</code>, wt 0.1.0.</div>
+      <div>Flags on this page verified against <code class="inline-code">wt --help</code>, wt 0.4.0.</div>
     </div>
     <div class="foot-links">
       <a href="index.html">Home</a>

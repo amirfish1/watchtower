@@ -7,9 +7,11 @@ GitHub Pages. Self-contained HTML/CSS, no build step, no framework, mobile-clean
 
 - `index.html` - hero (the `wt wait` signature move), what-it-is, install,
   quickstart, honest scope + engine matrix.
-- `cli.html` - full CLI reference. Flags verified against `wt --help` (wt 0.1.0):
-  status, workers, monitor, config, set, drain, add/take/edit/ls/find, import,
-  wait, dashboard (serve), start/stop, and the worker protocol.
+- `cli.html` - full CLI reference. Flags verified against `wt --help` (wt 0.4.0):
+  status, workers, monitor, models, config, set, drain, add/take/edit/ls/find,
+  ready/blocked/answer/discuss, comment/dedup, import, wait, agent messaging
+  (send/ask/spawn/critique/outbox/agents/chat/snapshot), dashboard (serve),
+  start/stop, skills/uninstall, and the worker protocol.
 - `integration.html` - WT / CCC ownership boundary: WT owns the durable control
   plane, CCC is one client. Call direction, loop prevention, delivery states.
 - `styles.css` - shared stylesheet (control-room theme; green = draining,
