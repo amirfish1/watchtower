@@ -3404,8 +3404,51 @@ def _install_provenance() -> str:
 
 
 # --------------------------------------------------------------------------- main
+class _WtArgumentParser(argparse.ArgumentParser):
+    """argparse parser that keeps error output legible (WATCHTOWER-3).
+
+    A rejected `wt comment -q <QUEUE> <REF> "<800-char text>"` used to echo the
+    entire argument payload back through stderr as part of argparse's
+    "unrecognized arguments: ..." message. Piped through `head`/`tail` -- normal
+    when you expect one confirmation line -- the tail of your own comment reads
+    exactly like a success confirmation, so a *failed* command looks *succeeded*
+    and the write is silently lost.
+
+    Fix: cap the error message length so a rejected multi-kilobyte value can
+    never bury (or masquerade as) the actual diagnostic. Subparsers created by
+    add_subparsers inherit this class automatically (parser_class defaults to
+    type(self)), so a subcommand error also prints that subcommand's own usage.
+    """
+
+    _MAX_ERROR_LEN = 200
+
+    def error(self, message: str):  # type: ignore[override]
+        if len(message) > self._MAX_ERROR_LEN:
+            elided = len(message) - self._MAX_ERROR_LEN
+            message = (
+                message[: self._MAX_ERROR_LEN]
+                + f" …[+{elided} chars elided]"
+            )
+        super().error(message)
+
+
+def _add_redundant_queue_flag(subparser: argparse.ArgumentParser) -> None:
+    """Accept -q/--queue on ref-based commands and ignore it (WATCHTOWER-3).
+
+    `wt add`/`wt claim` require -q, but ref-based commands (`comment`, `find`,
+    `close`, ...) resolve a globally-unique ref and never needed it. Passing -q
+    out of habit used to be rejected as an unrecognized argument; accepting and
+    ignoring it removes the three-different-conventions footgun the ticket
+    flagged. `edit` is the exception: there --queue *moves* the ticket, so it is
+    a real flag, not a redundant one."""
+    subparser.add_argument(
+        "-q", "--queue", dest="_ignored_queue", default=None, metavar="QUEUE",
+        help="accepted but ignored; a ref is globally unique so no queue is needed",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _WtArgumentParser(
         prog="wt",
         usage="wt <command> [options]",
         description="WatchTower queue CLI",
@@ -3453,6 +3496,7 @@ def build_parser() -> argparse.ArgumentParser:
              "another worker's (also honors $WT_WORKER and harness session env)",
     )
     s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_find)
 
     # Shared arg registration so `add` and its `take` shorthand can't drift.
@@ -3601,6 +3645,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true",
                    help="close even if the ticket is already closed or claimed by "
                         "another worker (bypasses the reap-induced duplicate-close guard)")
+    _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_close)
 
     s = sub.add_parser("release")
@@ -3610,6 +3655,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="release even if the ticket is blocked (needs_input) -- "
                         "normally refused because it erases the open question; "
                         "prefer `wt answer` to resolve a block")
+    _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_release)
 
     s = sub.add_parser("block")
@@ -3619,6 +3665,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--progress", default="",
                    help="analysis-so-far note (backstop if the session is lost)")
     s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_block)
 
     s = sub.add_parser("blocked")
@@ -3632,6 +3679,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--worker", default="")
     s.add_argument("--engine", choices=["claude", "codex", "kimi"],
                    help="override the blocked session engine")
+    _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_answer)
 
     s = sub.add_parser("comment")
@@ -3639,6 +3687,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("text", help="comment text")
     s.add_argument("--worker", default="")
     s.add_argument("--by", default="human", choices=["human", "worker", "system"])
+    _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_comment)
 
     s = sub.add_parser("discuss")
@@ -3646,6 +3695,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi"])
     s.add_argument("--print", action="store_true", dest="print",
                    help="print the resume command instead of running it")
+    _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_discuss)
 
     s = sub.add_parser("workers")
