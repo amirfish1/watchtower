@@ -302,14 +302,6 @@ def test_spawn_into_a_missing_folder_fails_without_registering_a_worker(
     assert wt_env.workers.list_workers() == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "GAP: a missing workers-local-path is reported as 'engine executable "
-        "unavailable: [Errno 2]', which sends the operator to reinstall a CLI "
-        "that is fine. The cwd is the broken thing and the message should say so."
-    ),
-)
 def test_missing_folder_failure_names_the_folder_not_the_engine(wt_env, fake_bin):
     fake_bin("codex")
     failures = []

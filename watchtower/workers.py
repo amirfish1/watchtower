@@ -4748,6 +4748,27 @@ def spawn_workers(
             continue
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{worker_id}.log"
+        # Popen(cwd=...) raises a bare OSError indistinguishable from "the
+        # engine binary itself is missing" -- precheck so a bad repo_path is
+        # reported as the broken thing instead of sending the operator to
+        # reinstall a CLI that's fine.
+        if not os.path.isdir(repo_path):
+            reason = f"repo_path not found: {repo_path}"
+            with open(log_path, "ab") as logf:
+                logf.write(f"LAUNCH FAILED: {reason}\n".encode("utf-8"))
+            failure = _record_launch_failure(
+                queue=queue,
+                engine=engine,
+                worker_id=worker_id,
+                pid=0,
+                log_path=log_path,
+                reason=reason,
+                model=model,
+            )
+            failure["_spawn_index"] = spawn_index
+            if launch_failures is not None:
+                launch_failures.append(failure)
+            continue
         logf = open(log_path, "ab")
         # claude workers get a stream-json FIFO stdin so they stay live and
         # pushable; one-shot engines (codex exec, kimi -p) keep the goal in
