@@ -43,7 +43,8 @@ wt claim -q "$QUEUE" --worker demo-worker
 
 section "4. The worker closes it, recording how it was fixed"
 sleep 1
-wt close "${QUEUE}-1" --worker demo-worker --summary "fixed the login redirect bug"
+wt close "${QUEUE}-1" --worker demo-worker --no-code \
+    --summary "fixed the login redirect bug"
 
 section "5. wt wait unblocks now that the queue is empty"
 wait "$WAIT_PID"
