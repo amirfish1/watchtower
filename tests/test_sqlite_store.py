@@ -139,6 +139,30 @@ def test_migrate_store_cli(wt, capsys):
     assert wt.cli.main(["migrate-store"]) == 0
 
 
+def test_migration_renumbers_duplicate_numbers_instead_of_collapsing(wt):
+    # The CCC/WT dual-writer era left real stores with distinct tickets
+    # sharing a number (e.g. CCC-236 and OPS-4 both number 346). Migration
+    # must keep every ticket: refs are the human-facing ids and stay
+    # untouched; the later duplicate gets a fresh internal number.
+    _seed_legacy_json(
+        wt,
+        counter=10,
+        items=[
+            {"number": 4, "project": "CCC", "seq": 1, "ref": "CCC-1", "status": "closed", "note": "first"},
+            {"number": 4, "project": "OPS", "seq": 1, "ref": "OPS-1", "status": "closed", "note": "second"},
+            {"number": 10, "project": "CCC", "seq": 2, "ref": "CCC-2", "status": "open", "note": "third"},
+        ],
+    )
+    assert wt.cli.main(["migrate-store"]) == 0
+    rows = _db_rows(wt.db)
+    assert len(rows) == 3
+    assert wt.q.get("CCC-1")["number"] == 4
+    assert wt.q.get("OPS-1")["number"] == 11
+    assert wt.q.get("CCC-2")["number"] == 10
+    # Counter cleared the renumbered range so new tickets stay unique.
+    assert wt.q.enqueue(project="CCC", note="fresh")["number"] == 12
+
+
 # ------------------------------------------------------------------ diff saves
 
 

@@ -502,7 +502,27 @@ def _create_db(db: Path, data: Dict[str, Any]) -> None:
 
     This IS the JSON→SQLite migration when the loaded ``data`` came from a
     legacy JSON store. Callers hold the writer flock; the temp+replace makes
-    the flip atomic for lock-free readers too."""
+    the flip atomic for lock-free readers too.
+
+    Duplicate numbers (real stores have them from the CCC/WT dual-writer
+    era: distinct tickets sharing an internal number) are renumbered, never
+    collapsed — refs are the human-facing ids and stay untouched; the later
+    duplicate gets a fresh number past the counter."""
+    items = data.get("items", [])
+    counter = int(data.get("counter", 0))
+    next_num = max([counter] + [int(it.get("number", 0)) for it in items])
+    seen: set = set()
+    rows = []
+    for it in items:
+        num = int(it.get("number", 0))
+        if num in seen:
+            next_num += 1
+            it = dict(it, number=next_num)
+            num = next_num
+        seen.add(num)
+        rows.append(_item_row(it))
+    counter = max(counter, next_num)
+
     db.parent.mkdir(parents=True, exist_ok=True)
     tmp = db.with_name(db.name + f".tmp{os.getpid()}")
     try:
@@ -513,11 +533,11 @@ def _create_db(db: Path, data: Dict[str, Any]) -> None:
     try:
         _ensure_schema(conn)
         with conn:
-            conn.executemany(_ITEM_UPSERT, [_item_row(it) for it in data.get("items", [])])
+            conn.executemany(_ITEM_UPSERT, rows)
             conn.executemany(
                 _META_UPSERT,
                 [
-                    ("counter", str(int(data.get("counter", 0)))),
+                    ("counter", str(counter)),
                     ("revision", "1"),
                     ("schema_version", str(_SCHEMA_VERSION)),
                 ],
