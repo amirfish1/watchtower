@@ -1868,7 +1868,9 @@ def test_drain_goal_content(wt):
     assert "released from queue staffing" in goal
     assert "complete this queue's drain goal" not in goal.lower()
     runbook = str(wt.workers._WORKER_RUNBOOK_PATH)
-    assert goal.count(runbook) == 2  # one trigger each for Resume Check + Idle
+    # One trigger each for Resume Check, Idle, and the STOP SIGNAL learnings
+    # hand-off (WATCHTOWER-11: a recycle must update learnings before exit).
+    assert goal.count(runbook) == 3
     # Push policy must not override queue-specific ticket instructions such as
     # CHUCK's "commit and push main" workflow.
     assert "Do not push unless explicitly asked" not in goal

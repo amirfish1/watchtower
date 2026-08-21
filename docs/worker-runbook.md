@@ -64,10 +64,15 @@ prefix is ever missing.
 
 ## Idle Protocol
 
-Do this when `wt claim` reports the queue is drained (returns nothing), FIRST —
-before ending your turn. A Claude conversation may later be released from queue
-staffing, while a Codex worker exits immediately after this audit. Either way,
-the audit is not optional and not deferrable to "next time."
+Do this when `wt claim` reports the queue is drained (returns nothing) FIRST,
+before ending your turn — AND equally when `wt claim` returns a stop signal
+(`{"stop": true}`, including the `{"reason": "context_budget"}` recycle that
+replaces you with a fresh worker). The stop path is where this matters most: a
+recycled worker is torn down and its successor starts cold, so skipping the
+learnings hand-off on a stop throws away the whole session's wisdom. A Claude
+conversation may later be released from queue staffing, while a Codex worker
+exits immediately after this audit. Either way, the audit is not optional and
+not deferrable to "next time" — run it before you exit on a stop, too.
 
 1. Read the queue's learnings file at `~/.watchtower/learnings/{queue}.md`
    (create it if it doesn't exist).
@@ -90,8 +95,10 @@ the audit is not optional and not deferrable to "next time."
 6. THEN follow the lifecycle for your engine:
    - **Claude (stream-json over FIFO):** end your turn. Do NOT poll, do NOT
      sleep-loop, and do NOT exit the process yourself. Stdin is a live input
-     channel; a new ticket arrives as a fresh instruction and resumes the
-     conversation with full warm context.
+     channel; on a *drained* queue a new ticket arrives as a fresh instruction
+     and resumes the conversation with full warm context. On a *stop/recycle*
+     you have been released — end your turn after the audit; deficit staffing
+     spawns a fresh worker to take over, so do not expect to be re-engaged.
    - **Codex (`codex exec`):** complete this queue's active drain goal (or clear
      it if the harness has no completion state), then exit immediately. There
      is no live stdin channel and no wake message to wait for.

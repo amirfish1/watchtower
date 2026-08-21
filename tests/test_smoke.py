@@ -393,6 +393,30 @@ def test_spawn_worker_kimi_one_shot(store):
     assert "one-shot run (kimi -p)" in goal  # kimi idle contract, not FIFO one
 
 
+def test_stop_signal_runs_idle_protocol_before_exit():
+    """WATCHTOWER-11: a stop/recycle must hand off learnings, not bare-exit.
+
+    When the reconciler recycles an over-context-budget drain worker, `wt claim`
+    returns {"stop": true, "reason": "context_budget"} and a fresh worker
+    replaces it cold. The old prompt said "exit immediately ... just exit", so
+    the worker skipped the Idle Protocol and the session's learnings were lost.
+    The stop path must now route through the same learnings update as a drained
+    queue, for every engine.
+    """
+    from watchtower import workers
+
+    for engine in ("claude", "codex", "kimi"):
+        goal = workers.drain_goal("DEMO", "w-1", repo_path="/tmp/repo", engine=engine)
+        stop = goal[goal.index("STOP SIGNAL"):]
+        stop = stop[: stop.index("Read the ticket")]
+        assert "Idle Protocol" in stop, engine
+        assert "learnings" in stop, engine
+        assert 'context_budget' in stop, engine
+        # The regressed phrasing told the worker to leave without the hand-off.
+        assert "exit immediately -- the reconciler has determined" not in stop, engine
+        assert "just exit. " not in stop, engine
+
+
 def test_spawn_worker_kimi_model_and_effort(store):
     """A queue's kimi model reaches the argv; effort config is ignored (kimi
     has no --effort flag)."""
