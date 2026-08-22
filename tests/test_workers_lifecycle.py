@@ -275,17 +275,17 @@ def test_config_ensure_entries_is_batched_and_idempotent(wt):
     assert wt.config.ensure_entries(["A"]) == []  # already exists -> no-op
 
 
-def test_enqueue_registers_a_brand_new_queue(wt):
-    """A queue's very first-ever ticket must make it visible to the
-    reconciler, or a later ▶ press silently no-ops forever (WT-131): dispatch
-    nudges no live worker (there's never been one), reconcile_once() skips a
-    queue with no config entry entirely -- not even into its own `skipped`
-    list -- so the reason surfaced is the generic "no live worker accepted
-    and none spawned" with no hint the real cause is "never registered"."""
+def test_enqueue_alone_does_not_register_a_brand_new_queue(wt):
+    """OPS-563: `wt add` must not persist a config row for every queue name
+    it is ever pointed at -- that left dead entries behind for ephemeral
+    queues (e.g. a session-tracking name re-derived per invocation) that
+    were never run or drain-enabled. See
+    test_manual_run_spawns_worker_for_never_configured_queue below for the
+    WT-131 guarantee this used to provide: registration now happens lazily,
+    at ▶/`wt run` time, via mark_runnable."""
     assert "NEWQ" not in wt.config.all_queues()
     wt.q.enqueue(project="NEWQ", note="first ever ticket")
-    assert "NEWQ" in wt.config.all_queues()
-    assert wt.config.auto_drain("NEWQ") is False  # unchanged default
+    assert "NEWQ" not in wt.config.all_queues()
 
 
 def test_manual_run_spawns_worker_for_never_configured_queue(wt):

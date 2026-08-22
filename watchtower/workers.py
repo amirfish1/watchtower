@@ -2076,14 +2076,24 @@ def _legacy_claude_continuity(worker_id: str, session_id: str) -> Dict[str, Any]
     log_path = WORKERS_FILE.parent / "logs" / f"{worker_id}.log"
     if resolve_session_id_from_log(str(log_path)) != session_id:
         return {}
+    # Known queue names come from both config (explicitly registered) and
+    # actual tickets (OPS-563: a queue with tickets but no run/drain yet has
+    # no config entry anymore, since enqueue() no longer registers it).
+    known_names: set = set()
     try:
         from . import config
-        queues = [
-            str(name) for name in config.all_queues()
-            if worker_id.startswith(f"{str(name).lower()}-")
-        ]
+        known_names |= set(config.all_queues())
     except Exception:
-        queues = []
+        pass
+    try:
+        from . import queue as _queue
+        known_names |= set(_queue.queues())
+    except Exception:
+        pass
+    queues = [
+        str(name) for name in known_names
+        if worker_id.startswith(f"{str(name).lower()}-")
+    ]
     if not queues:
         return {}
     queue_name = max(queues, key=len)

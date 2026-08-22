@@ -87,6 +87,30 @@ def test_fresh_queue_is_a_backlog_not_a_worksite(wt_env, run_cli):
     assert _entry(wt_env) == {}
 
 
+def test_enqueue_alone_leaves_no_config_entry(wt_env):
+    """OPS-563/OPS-559: a plain enqueue must not persist a config row.
+
+    Regression for a caller that re-derives a session-tracking queue name
+    per invocation (never run, never drain-enabled) — before this fix, every
+    such enqueue left a dead entry behind in queue-config.json forever."""
+    wt_env.queue.enqueue(project=QUEUE, note="never run", source="test")
+    assert QUEUE not in wt_env.config.all_queues()
+    assert _entry(wt_env) == {}
+
+
+def test_run_request_registers_a_previously_unconfigured_queue(wt_env):
+    """WT-131: an unregistered queue is invisible to the reconciler, so
+    pressing ▶ on its very first ticket must register it (unlike a plain
+    enqueue, see test_enqueue_alone_leaves_no_config_entry) or the run
+    silently no-ops forever."""
+    item = wt_env.queue.enqueue(project=QUEUE, note="press play", source="test")
+    assert QUEUE not in wt_env.config.all_queues()
+
+    wt_env.queue.mark_runnable(item["ref"])
+    assert QUEUE in wt_env.config.all_queues()
+    assert wt_env.config.auto_drain(QUEUE) is False
+
+
 # --------------------------------------------------------------------------- 2. round trip
 # (flag, value, reader, expected-read-back)
 SETTINGS_MATRIX = [

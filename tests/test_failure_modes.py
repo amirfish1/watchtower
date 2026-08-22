@@ -619,10 +619,18 @@ def test_a_brand_new_ticket_is_left_alone_for_the_grace_period(wt_env, fake_bin)
 
 
 def test_an_unregistered_queue_is_invisible_to_the_reconciler(wt_env, fake_bin):
-    """WT-131: a queue with no config entry is skipped entirely, so `wt add`
-    has to register it or a run press no-ops forever."""
+    """WT-131: a queue with no config entry is skipped entirely, so a run
+    press has to register it or it no-ops forever.
+
+    OPS-563: `wt add` itself no longer registers the queue (that persisted a
+    config row for every queue name ever enqueued to, including ones nobody
+    ran) — only `mark_runnable` (the ▶ path) does, right when the guarantee
+    is actually needed."""
     fake_bin("codex")
     assert "GHOSTQ" not in wt_env.config.all_queues()
-    wt_env.queue.enqueue(note="first ever ticket", project="GHOSTQ", source="test")
+    item = wt_env.queue.enqueue(note="first ever ticket", project="GHOSTQ", source="test")
+    assert "GHOSTQ" not in wt_env.config.all_queues()
+
+    wt_env.queue.mark_runnable(item["ref"])
     assert "GHOSTQ" in wt_env.config.all_queues()
     assert wt_env.config.auto_drain("GHOSTQ") is False

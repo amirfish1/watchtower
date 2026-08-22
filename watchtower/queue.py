@@ -941,20 +941,13 @@ def enqueue(
         raise ValueError("note or text is required")
     lane = lane if lane in VALID_LANES else "normal"
     proj = _project_for(source, repo_path, project)
-    # A queue's first-ever ticket must make it visible to the reconciler
-    # (workers._reconcile_once_locked() only iterates config.all_queues()),
-    # or a ▶ press on it silently no-ops forever: dispatch_after_enqueue()
-    # nudges no live worker (there's never been one), falls through to
-    # reconcile_once(), which skips a queue with no config entry entirely --
-    # not even into its own `skipped` list -- so the dispatch reason comes
-    # back as the generic "no live worker accepted and none spawned" with no
-    # indication the real cause is "this queue was never registered" (WT-131).
-    # auto_drain stays default-off; this only makes the queue exist.
-    try:
-        from . import config
-        config.ensure_entry(proj)
-    except Exception:
-        pass
+    # Registration for the reconciler (WT-131, see mark_runnable's docstring)
+    # happens lazily at run/drain time, not here -- OPS-563: registering on
+    # every enqueue persisted a config row for every ephemeral queue name a
+    # caller ever derived, even ones that were never run (observed: a
+    # session-tracking queue re-derived per invocation left 4 dead config
+    # entries behind). A queue that is never run or drain-enabled leaves no
+    # trace in queue-config.json.
     backend = _github_backend_for_project(proj)
     if backend is not None:
         saved = backend.enqueue(
@@ -1103,8 +1096,24 @@ def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
     so both backends leave the same observable state behind. A closed
     file-backed ticket is reopened first — asking to run a closed ticket can
     only mean "work it again", and there is nothing to run while it is closed.
+
+    Registers the queue with config.ensure_entry() first (OPS-563): a queue
+    with no config entry is invisible to workers._reconcile_once_locked()
+    (it only iterates config.all_queues()), so running its very first ticket
+    would otherwise silently no-op forever -- dispatch_after_enqueue() nudges
+    no live worker (there's never been one), falls through to
+    reconcile_once(), which skips an unregistered queue entirely, not even
+    into its own `skipped` list (WT-131). auto_drain stays default-off; this
+    only makes the queue exist for the reconciler to see.
     """
-    backend = _github_backend_for_project(_project_from_ident(ident))
+    proj = _project_from_ident(ident)
+    if proj:
+        try:
+            from . import config
+            config.ensure_entry(proj)
+        except Exception:
+            pass
+    backend = _github_backend_for_project(proj)
     if backend is not None:
         item = backend.mark_runnable(ident)
         if item:
