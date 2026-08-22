@@ -6,7 +6,11 @@ description: Write a durable state snapshot of this session immediately (no time
 # Snapshot now
 
 1. Determine your session id and engine (same as auto-snapshot-on step 1;
-   any engine is fine here).
+   any engine is fine here). On engines other than claude/codex (kimi,
+   grok, devin, ...) there is no auto-fire, so any stable unique id works:
+   use your engine's real session/thread id if you know it, otherwise
+   invent one (e.g. `<engine>-YYYYMMDD-HHMMSS`) and use that same id in
+   steps 2 and 4.
 2. Get the canonical path: `wt snapshot path --session <SID>`
 3. Write that file with YAML frontmatter — `session_id`, `engine`, `cwd`
    (absolute), `git_branch`, `git_commit`, `trigger: manual`, `created_at`

@@ -457,7 +457,7 @@ Idle agent sessions lose their prompt cache at the 60-minute cliff, forcing an e
 |---|---|
 | Claude | Auto-fire (live TUI keystroke / headless resume) |
 | Codex | Auto-fire (app-server transport) |
-| Kimi / Grok | Manual (`/snapshot-now`, `/resume-from-snapshot`) |
+| Kimi / Grok / Devin | Manual (`/snapshot-now`, `/resume-from-snapshot`) |
 
 ## Where the queue lives
 

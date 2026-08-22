@@ -21,4 +21,4 @@ pipx install git+https://github.com/amirfish1/watchtower.git
 
 - **Claude**: Full auto-fire via live TUI keystrokes (Terminal.app/iTerm2) or headless resume.
 - **Codex**: Auto-fire via headless app-server delivery.
-- **Kimi / Grok**: Manual `/snapshot-now` and `/resume-from-snapshot` commands (auto-fire unsupported).
+- **Kimi / Grok / Devin**: Manual `/snapshot-now` and `/resume-from-snapshot` commands (auto-fire unsupported). Skills install into each harness's user-skills dir via `wt skills sync` (`~/.kimi-code/skills`, `~/.grok/skills`, `~/.config/devin/skills`).

@@ -14,8 +14,8 @@ idle minutes (default 55; must be below 60, the cache TTL).
      `~/.claude/projects/<slugified-cwd>/` (slug: `/` and `.` become `-`).
      Engine is `claude`.
    - Codex: your thread id; engine is `codex`.
-   - Any other engine (kimi, grok, ...): auto-fire is not supported — tell
-     the user to run /snapshot-now before stepping away, and stop.
+   - Any other engine (kimi, grok, devin, ...): auto-fire is not supported —
+     tell the user to run /snapshot-now before stepping away, and stop.
 2. Run (network sandbox not required, but run outside any restricted shell):
    `wt snapshot arm --session <SID> --engine <ENGINE> --cwd "$PWD" --idle <MIN>`
 3. Relay the confirmation (including the fire window) and any warning about

@@ -21,7 +21,7 @@ EXPECTED_SKILLS = (
     "resume-from-snapshot",
     "resume-from-session",
 )
-ALL_ENGINES = ("claude", "codex", "antigravity", "kimi")
+ALL_ENGINES = ("claude", "codex", "antigravity", "kimi", "grok", "devin")
 
 
 def _homes(tmp_path, present=ALL_ENGINES):
@@ -54,11 +54,15 @@ def test_sync_links_into_every_present_harness(tmp_path):
             assert target.resolve() == skills_sync.source_dir(skill_name).resolve()
 
 
-def test_default_homes_cover_all_four_harnesses():
+def test_default_homes_cover_all_six_harnesses():
     """Antigravity (agy) reads skills from ~/.gemini -- its omission from
-    ENGINE_HOMES meant `wt skills sync` never distributed skills to it."""
+    ENGINE_HOMES meant `wt skills sync` never distributed skills to it.
+    Grok (~/.grok/skills) and Devin (~/.config/devin/skills) were the same
+    gap for token-sitter's Tier-3 manual commands."""
     assert set(skills_sync.ENGINE_HOMES) == set(ALL_ENGINES)
     assert skills_sync.ENGINE_HOMES["antigravity"] == Path.home() / ".gemini"
+    assert skills_sync.ENGINE_HOMES["grok"] == Path.home() / ".grok"
+    assert skills_sync.ENGINE_HOMES["devin"] == Path.home() / ".config" / "devin"
 
 
 def test_sync_skips_harness_with_no_home(tmp_path):

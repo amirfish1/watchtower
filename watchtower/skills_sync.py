@@ -36,6 +36,11 @@ ENGINE_HOMES: Dict[str, Path] = {
     "antigravity": Path.home() / ".gemini",
     # Kimi Code CLI reads user skills from $KIMI_CODE_HOME/skills.
     "kimi": Path(os.environ.get("KIMI_CODE_HOME") or Path.home() / ".kimi-code"),
+    # Grok CLI reads user skills from ~/.grok/skills.
+    "grok": Path.home() / ".grok",
+    # Devin CLI reads user skills from ~/.config/devin/skills (it also reads
+    # ~/.config/cognition/skills and the shared ~/.agents/skills).
+    "devin": Path.home() / ".config" / "devin",
 }
 
 
