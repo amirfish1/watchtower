@@ -681,6 +681,148 @@ def test_github_backend_answer_releases_claim_without_session(tmp_path, monkeypa
     )
 
 
+# --- Owner-answer ingestion (WATCHTOWER-5) -------------------------------
+
+def _add_issue_comment(state_path, number, login, body):
+    """Append a raw comment (as if typed on GitHub) to the fake gh state."""
+    data = json.loads(state_path.read_text())
+    for issue in data["issues"]:
+        if int(issue["number"]) == int(number):
+            issue.setdefault("comments", []).append(
+                {"author": {"login": login}, "body": body}
+            )
+    state_path.write_text(json.dumps(data, indent=2))
+
+
+def _setup_blocked_github_ticket(tmp_path, monkeypatch, *, with_session):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="needs a decision")
+    if with_session:
+        q.claim_by_ref(item["ref"], "worker-1", session_uuid="session-abc")
+    else:
+        q.claim_by_ref(item["ref"], "worker-1")
+    q.block("GHI-1", session_id="worker-1", question="A or B?")
+    return state, config, q
+
+
+def test_ingest_owner_answer_requeues_blocked_ticket_without_session(
+    tmp_path, monkeypatch,
+):
+    """A repo-owner comment carrying the marker clears the block and, with no
+    resumable session, requeues the ticket -- the WATCHTOWER-5 gap."""
+    import watchtower.github_backend as github_backend
+
+    state, config, q = _setup_blocked_github_ticket(
+        tmp_path, monkeypatch, with_session=False
+    )
+    _add_issue_comment(state, 1, "test-owner", "OWNER ANSWER: go with A")
+
+    backend = q._github_backend_for_project("GHI")
+    updated = backend.ingest_owner_answer("GHI-1")
+
+    assert updated is not None
+    assert updated["needs_input"] is False
+    assert updated["status"] == "open"          # requeued for a fresh worker
+    assert updated.get("claimed_by") is None
+    assert [e["event"] for e in updated["history"]] == [
+        "claim", "block", "answer", "reopen",
+    ]
+    issue = json.loads(state.read_text())["issues"][0]
+    assert "ingested_answer_keys" in issue["body"]
+    # The owner's own comment must NOT be echoed back as a duplicate; only the
+    # best-effort "[watchtower] Ingested owner answer" ack is added.
+    watchtower_comments = [
+        c for c in issue["comments"]
+        if isinstance(c, dict) and c.get("author", {}).get("login") == "watchtower"
+    ]
+    assert len(watchtower_comments) == 1
+    assert "Ingested owner answer" in watchtower_comments[0]["body"]
+    assert "requeued" in watchtower_comments[0]["body"]
+
+
+def test_ingest_owner_answer_keeps_claim_when_session_resumable(
+    tmp_path, monkeypatch,
+):
+    """With a resumable session the block clears but the claim is kept, so the
+    live worker resumes rather than the ticket being requeued."""
+    state, config, q = _setup_blocked_github_ticket(
+        tmp_path, monkeypatch, with_session=True
+    )
+    _add_issue_comment(state, 1, "test-owner", "OWNER ANSWER: proceed")
+
+    backend = q._github_backend_for_project("GHI")
+    updated = backend.ingest_owner_answer("GHI-1")
+
+    assert updated is not None
+    assert updated["needs_input"] is False
+    assert updated["status"] == "in_progress"
+    assert updated["claimed_session_id"] == "session-abc"
+    assert [e["event"] for e in updated["history"]] == ["claim", "block", "answer"]
+    issue = json.loads(state.read_text())["issues"][0]
+    ack = [
+        c for c in issue["comments"]
+        if isinstance(c, dict) and c.get("author", {}).get("login") == "watchtower"
+    ]
+    assert len(ack) == 1 and "resume" in ack[0]["body"]
+
+
+def test_ingest_owner_answer_is_idempotent(tmp_path, monkeypatch):
+    """The same owner comment can never clear a block twice."""
+    import watchtower.github_backend as github_backend
+
+    state, config, q = _setup_blocked_github_ticket(
+        tmp_path, monkeypatch, with_session=True
+    )
+    _add_issue_comment(state, 1, "test-owner", "OWNER ANSWER: proceed")
+
+    backend = q._github_backend_for_project("GHI")
+    assert backend.ingest_owner_answer("GHI-1") is not None
+    # Second sweep: block already cleared -> nothing to do.
+    assert backend.ingest_owner_answer("GHI-1") is None
+
+    # Even if the ticket is somehow blocked again while the SAME comment sits
+    # there, the recorded key prevents a re-trigger (the direct idempotency
+    # guarantee, independent of needs_input clearing).
+    q.block("GHI-1", session_id="worker-1", question="again?")
+    assert backend.ingest_owner_answer("GHI-1") is None
+    # exactly one 'answer' event across the whole history
+    hist = backend.get("GHI-1")["history"]
+    assert [e["event"] for e in hist].count("answer") == 1
+
+
+def test_ingest_owner_answer_ignores_nonowner_and_unmarked(tmp_path, monkeypatch):
+    """A non-owner comment, or an owner comment without the marker, is ignored."""
+    state, config, q = _setup_blocked_github_ticket(
+        tmp_path, monkeypatch, with_session=False
+    )
+    _add_issue_comment(state, 1, "random-contributor", "OWNER ANSWER: do X")
+    _add_issue_comment(state, 1, "test-owner", "looks good, thanks!")
+
+    backend = q._github_backend_for_project("GHI")
+    assert backend.ingest_owner_answer("GHI-1") is None
+    assert backend.get("GHI-1")["needs_input"] is True
+
+
+def test_poll_owner_answers_once_sweeps_blocked_tickets(tmp_path, monkeypatch):
+    """The module sweep enumerates github queues, finds blocked tickets, and
+    ingests owner answers -- the path wired into the daemon poller."""
+    import watchtower.github_backend as github_backend
+
+    state, config, q = _setup_blocked_github_ticket(
+        tmp_path, monkeypatch, with_session=False
+    )
+    _add_issue_comment(state, 1, "test-owner", "OWNER ANSWER: ship it")
+
+    github_backend.poll_owner_answers_once()
+
+    assert q.get("GHI-1")["needs_input"] is False
+    assert q.get("GHI-1")["status"] == "open"
+
+
 def test_github_backend_comment_posts_issue_comment_and_records_history(
     tmp_path, monkeypatch,
 ):

@@ -10,6 +10,7 @@ store for a queue configured with ``backend=github`` and uses the installed
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -227,6 +228,34 @@ def poll_list_caches_once() -> None:
             pass  # one bad repo must not stop the sweep or kill the poller
 
 
+def poll_owner_answers_once() -> None:
+    """One sweep: ingest owner-authored answer comments on blocked tickets for
+    every github-backed queue (WATCHTOWER-5).
+
+    Cheap by construction: the blocked set comes from the already-warm list
+    cache (issue bodies carry ``needs_input``), so a live ``gh issue view`` is
+    spent only on tickets that are actually blocked — normally zero. Each step
+    is best-effort; one bad queue or ticket must never stop the sweep."""
+    from . import config
+    from . import queue as _queue
+    for qname in config.all_queues():
+        try:
+            if config.backend(qname) != "github":
+                continue
+            backend = _queue._github_backend_for_project(qname)
+            if backend is None:
+                continue
+            for item in backend.list_items(status="in_progress"):
+                if not item.get("needs_input"):
+                    continue
+                try:
+                    backend.ingest_owner_answer(item.get("ref") or item.get("number"))
+                except Exception:
+                    pass  # one wedged ticket must not stop the queue's sweep
+        except Exception:
+            pass  # one bad queue must not stop the whole sweep
+
+
 def poll_list_caches_forever(interval_s: float = 5.0, *, stop_event=None) -> None:
     """Background loop for the foreground daemon: keep every github-backed
     queue's list cache warm on disk so the reconciler's reads never block on
@@ -246,6 +275,10 @@ def poll_list_caches_forever(interval_s: float = 5.0, *, stop_event=None) -> Non
     while not event.is_set():
         try:
             poll_list_caches_once()
+        except Exception:
+            pass
+        try:
+            poll_owner_answers_once()
         except Exception:
             pass
         event.wait(interval_s)
@@ -431,6 +464,28 @@ def _clip(value: Any, max_len: int) -> str:
     s = "" if value is None else str(value)
     s = " ".join(s.split()) if max_len <= 240 else s
     return s if len(s) <= max_len else s[:max_len].rstrip() + "..."
+
+
+# Owner-answer ingestion (WATCHTOWER-5): a repo owner can answer a blocked
+# ticket by typing a comment straight onto the GitHub issue, marked with this
+# phrase (case-insensitive). We require BOTH the marker AND author==repo owner
+# so an ordinary owner comment ("looks good!") can never silently clear a block.
+_OWNER_ANSWER_MARKER = "OWNER ANSWER"
+
+
+def _owner_answer_comment_key(comment: Dict[str, Any]) -> str:
+    """Stable idempotency key for one issue comment.
+
+    Prefers GitHub's own node id / url; falls back to a content fingerprint for
+    comment payloads that omit them (older gh, test fakes). The key is recorded
+    in issue metadata once the comment is ingested so re-polling the same
+    comment can never clear the block a second time (WATCHTOWER-5)."""
+    cid = str(comment.get("id") or comment.get("url") or "").strip()
+    if cid:
+        return cid
+    author = str((comment.get("author") or {}).get("login") or "")
+    raw = f"{author}|{comment.get('createdAt', '')}|{comment.get('body', '')}"
+    return "sha:" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
 def _append_history(meta: Dict[str, Any], event: str, **fields: Any) -> None:
@@ -930,6 +985,14 @@ class GitHubIssuesBackend:
             # consumers follow the new rules without knowing about them.
             "claimable": work_it,
             "_github_body": str(issue.get("body") or ""),
+            # Only get() requests comments; the list path omits them, so this is
+            # [] for list-produced items and the real comment array for get().
+            # Owner-answer ingestion (WATCHTOWER-5) reads it to detect a human's
+            # answer typed straight onto the issue.
+            "_github_comments": (
+                issue.get("comments")
+                if isinstance(issue.get("comments"), list) else []
+            ),
         }
         if status == "closed":
             item["closed_by"] = meta.get("closed_by") or item.get("claimed_by")
@@ -1599,6 +1662,9 @@ class GitHubIssuesBackend:
         ident: Any,
         text: str,
         session_id: str = "",
+        *,
+        post_comment: bool = True,
+        source_comment_key: str = "",
     ) -> Optional[Dict[str, Any]]:
         """Record a human answer on a blocked GitHub-backed ticket and post it
         as an issue comment.
@@ -1606,6 +1672,13 @@ class GitHubIssuesBackend:
         Clears ``needs_input``. When the ticket has no resumable session, the
         claim is released so the worker pool can pick the answer back up —
         mirroring the file-backed queue's release/requeue behaviour.
+
+        ``post_comment=False`` skips echoing the answer back as a new issue
+        comment — used by owner-answer ingestion (WATCHTOWER-5), where the
+        answer text IS an existing owner comment and re-posting it would
+        duplicate the discussion. ``source_comment_key`` records that comment's
+        idempotency key in metadata, in the same atomic body edit, so the same
+        comment can never be ingested twice.
         """
         item = self.get(ident)
         if item is None:
@@ -1616,12 +1689,20 @@ class GitHubIssuesBackend:
         answer_text = _clip(text, 24000)
         meta["needs_input"] = False
         meta["answered_at"] = now
+        if source_comment_key:
+            keys = meta.get("ingested_answer_keys")
+            if not isinstance(keys, list):
+                keys = []
+            if source_comment_key not in keys:
+                keys.append(source_comment_key)
+            meta["ingested_answer_keys"] = keys[-50:]
         _append_history(
             meta,
             "answer",
             kind="human",
             worker=str(session_id or ""),
             text=answer_text,
+            source="github-owner-comment" if source_comment_key else "",
         )
         releasing = bool(
             item.get("status") == "in_progress"
@@ -1653,13 +1734,98 @@ class GitHubIssuesBackend:
             ])
             self._run(["issue", "reopen", number, *self._repo_args()], check=False)
         # Post the answer as a real GitHub issue comment so it is visible in
-        # the issue discussion and the worker session can resume from it.
-        self._run([
-            "issue", "comment", number,
-            *self._repo_args(),
-            "--body", answer_text,
-        ])
+        # the issue discussion and the worker session can resume from it. Skipped
+        # for owner-answer ingestion, where the answer already IS an issue
+        # comment and re-posting it would duplicate the discussion.
+        if post_comment:
+            self._run([
+                "issue", "comment", number,
+                *self._repo_args(),
+                "--body", answer_text,
+            ])
         return self.get(ident)
+
+    def _repo_owner(self) -> str:
+        """The repo owner login (``amirfish1`` for ``amirfish1/BYM-Finie``).
+
+        This is the identity authorized to answer a blocked ticket by commenting
+        straight on the issue. Empty when the repo string is not ``owner/name``.
+        """
+        repo = self.repo or ""
+        return repo.split("/", 1)[0].strip() if "/" in repo else ""
+
+    def ingest_owner_answer(self, ident: Any) -> Optional[Dict[str, Any]]:
+        """Ingest an owner-authored answer comment on a blocked ticket, once.
+
+        The gap this closes (WATCHTOWER-5): a repo owner who answers a blocked
+        ticket by commenting straight on the GitHub issue (rather than via
+        ``wt answer``) was never picked up — the ticket stayed blocked under an
+        idle worker with no progress. This detects such a comment and routes it
+        through :meth:`answer`, which clears ``needs_input`` and resumes or
+        requeues exactly as ``wt answer`` does.
+
+        Detection is deliberately conservative: the comment author must be the
+        repo owner AND the body must carry the ``OWNER ANSWER`` marker AND (when
+        timestamps are available) post-date the block. Idempotent: the source
+        comment's key is recorded in metadata, so re-polling can never clear the
+        block twice. Returns the updated item when it ingested one, else None.
+        """
+        owner = self._repo_owner()
+        if not owner:
+            return None
+        item = self.get(ident)  # get() is the only path that fetches comments
+        if item is None or not item.get("needs_input"):
+            return None
+        _body, meta = _split_body(item.get("_github_body") or "")
+        blocked_at = str(meta.get("blocked_at") or "")
+        already = set(meta.get("ingested_answer_keys") or [])
+        owner_l = owner.lower()
+
+        def _is_owner_answer(c: Dict[str, Any]) -> bool:
+            author = str((c.get("author") or {}).get("login") or "").lower()
+            if author != owner_l:
+                return False
+            if _OWNER_ANSWER_MARKER not in str(c.get("body") or "").upper():
+                return False
+            created = str(c.get("createdAt") or "")
+            # A comment from before the block can't be answering it. Only
+            # enforce this when both timestamps are present.
+            if blocked_at and created and created < blocked_at:
+                return False
+            return True
+
+        comments = item.get("_github_comments") or []
+        candidates = [
+            c for c in comments
+            if _is_owner_answer(c) and _owner_answer_comment_key(c) not in already
+        ]
+        if not candidates:
+            return None
+        # If the owner posted more than one answer, the most recent wins.
+        chosen = max(candidates, key=lambda c: str(c.get("createdAt") or ""))
+        key = _owner_answer_comment_key(chosen)
+        updated = self.answer(
+            item.get("ref") or ident,
+            str(chosen.get("body") or ""),
+            session_id="",
+            post_comment=False,
+            source_comment_key=key,
+        )
+        # Human-visible confirmation on the issue itself, distinguishing the two
+        # outcomes the ticket asked to surface. Best-effort: a failed ack must
+        # not undo the ingestion (needs_input is already cleared).
+        requeued = bool(updated and updated.get("status") == "open")
+        outcome = (
+            "requeued for a fresh worker (no live session was attached)"
+            if requeued else
+            "cleared the block so the claimed worker can resume"
+        )
+        self._run([
+            "issue", "comment", str(item["number"]),
+            *self._repo_args(),
+            "--body", f"[watchtower] Ingested owner answer ({key}); {outcome}.",
+        ], check=False)
+        return updated
 
     def comment(
         self,
