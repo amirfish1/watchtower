@@ -3431,7 +3431,10 @@ def _install_provenance() -> str:
             capture_output=True, text=True, timeout=2,
         )
         sha = result.stdout.strip() if result.returncode == 0 else ""
-    except (OSError, subprocess.SubprocessError):
+    except Exception:  # noqa: BLE001 - best-effort label; must never break the CLI
+        # OSError / SubprocessError in the wild, but also anything a test
+        # harness does to subprocess.Popen (a non-context-manager fake raises
+        # TypeError from inside subprocess.run). --version is cosmetic.
         sha = ""
     if sha:
         return f"{src} @ {sha}"
@@ -3482,6 +3485,26 @@ def _add_redundant_queue_flag(subparser: argparse.ArgumentParser) -> None:
     )
 
 
+class _VersionAction(argparse.Action):
+    """``--version`` that resolves the install provenance lazily.
+
+    ``_install_provenance`` forks ``git``; doing that eagerly at parser-build
+    time charged every ``wt`` invocation for a label only ``--version``
+    prints, and made any test that stubs ``subprocess.Popen`` see a stray
+    git call. Compute it only when the flag is actually hit."""
+
+    def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                 default=argparse.SUPPRESS, help="show version and exit"):
+        super().__init__(option_strings=option_strings, dest=dest,
+                         default=default, nargs=0, help=help)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        parser._print_message(
+            f"wt {__version__}\nsource: {_install_provenance()}\n", sys.stdout
+        )
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = _WtArgumentParser(
         prog="wt",
@@ -3490,10 +3513,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=_build_command_epilog(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument(
-        "--version", action="version",
-        version=f"wt {__version__}\nsource: {_install_provenance()}",
-    )
+    p.add_argument("--version", action=_VersionAction)
     sub = p.add_subparsers(dest="command", metavar="<command>", help=argparse.SUPPRESS)
 
     s = sub.add_parser("status")
