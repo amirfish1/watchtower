@@ -166,3 +166,30 @@ a one-paragraph "here's where we were," archives the snapshot, continues.
 
 - Exact `codex exec resume` prompt-size/escaping limits — verify during
   implementation.
+
+## Addendum 2026-08-24: fire mode (`mdfile` / `compact` / `both`)
+
+v1 always fired the mdfile flow above. `wt snapshot arm` now takes
+`--mode {mdfile,compact,both}` (default `mdfile`, unchanged behavior):
+
+- `mdfile` — the flow described in this spec, unchanged.
+- `compact` — delivers a literal `/compact` instead of the snapshot prompt.
+  Claude only (rejected for any other engine at `arm` time): keeps the SAME
+  session cheap to resume in place, by running the harness's own compaction
+  before the cache TTL lapses (so the compaction's own big input read is
+  still cache-priced, not a cold re-read). Does nothing for a process that
+  no longer exists when the user returns — this mode trades that durability
+  for staying in-session.
+- `both` — delivers `/compact`, waits (fixed step schedule, ~100s total,
+  covering the 0:25–1:07 compaction durations observed in practice) for it
+  to land, then delivers the ordinary mdfile prompt as a second message.
+  Belt-and-suspenders: cheap in-place resume from `compact`, plus the
+  process-independent durability from `mdfile` if the session doesn't
+  survive the gap.
+
+Mode is stored on the timer's state file (`mode` key) and read back by
+`fire()`; old state files without the key default to `mdfile`. CCC's
+status-bar toggle (`toggleAutoHandoverForPane` → renamed
+`cycleAutoHandoverModeForPane` in `static/app.js`) now cycles the pill
+through compact → md → both → off per click instead of a plain on/off
+toggle, debounced ~450ms so a fast click-through settles once.

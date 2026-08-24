@@ -134,12 +134,23 @@ def _spawn_timer(session_id: str) -> int:
     return proc.pid
 
 
+MODES = ("mdfile", "compact", "both")
+
+
 def arm(session_id: str, engine: str, cwd: str,
-        idle_min: float = DEFAULT_IDLE_MIN, spawn: bool = True) -> Dict[str, Any]:
+        idle_min: float = DEFAULT_IDLE_MIN, spawn: bool = True,
+        mode: str = "mdfile") -> Dict[str, Any]:
     if engine not in ("claude", "codex"):
         return {"ok": False,
                 "error": f"auto-fire is not supported for engine '{engine}' yet; "
                          "use /snapshot-now before stepping away"}
+    if mode not in MODES:
+        return {"ok": False,
+                "error": f"--mode must be one of {', '.join(MODES)} (got '{mode}')"}
+    if mode in ("compact", "both") and engine != "claude":
+        return {"ok": False,
+                "error": f"--mode {mode} needs Claude Code's /compact, which engine "
+                         f"'{engine}' doesn't support yet; use --mode mdfile"}
     if idle_min >= CACHE_TTL_MIN:
         return {"ok": False,
                 "error": f"--idle {idle_min:g} is at/past the {CACHE_TTL_MIN}-min "
@@ -153,6 +164,7 @@ def arm(session_id: str, engine: str, cwd: str,
         "session_id": session_id, "engine": engine, "cwd": cwd,
         "idle_min": float(idle_min), "armed_at": time.time(),
         "pid": 0, "outcome": "armed", "detail": "", "fired_at": None,
+        "mode": mode,
     }
     save_state(session_id, state)
     if spawn:
@@ -191,7 +203,12 @@ def status(session_id: Optional[str] = None) -> list:
     return out
 
 
-def build_fire_prompt(session_id: str, engine: str, cwd: str, idle_min: float) -> str:
+def build_fire_prompt(session_id: str, engine: str, cwd: str, idle_min: float,
+                       mode: str = "mdfile") -> str:
+    if mode == "compact":
+        # Literal slash command: delivered as if the user typed it, so the
+        # harness's own /compact handler runs -- no model turn involved.
+        return "/compact"
     path = snapshot_path(session_id)
     return (
         f"[auto-snapshot] This session has been idle ~{idle_min:.0f} minutes; "
@@ -210,17 +227,48 @@ def build_fire_prompt(session_id: str, engine: str, cwd: str, idle_min: float) -
     )
 
 
-def fire(session_id: str) -> Dict[str, Any]:
+
+# "both" mode delivers /compact, then waits for it to land before asking for
+# a written snapshot too -- compaction blocks the session for tens of
+# seconds (observed 0:25-1:07 on real sessions), so firing the second
+# message immediately would just queue it mid-compaction. These sum to
+# ~100s, comfortably past the slower observed runs.
+_BOTH_MODE_WAIT_STEPS_S = (10, 15, 20, 25, 30)
+
+
+def fire(session_id: str, *, sleep_fn=None) -> Dict[str, Any]:
     from . import messages
+    sleep_fn = sleep_fn or time.sleep
     state = load_state(session_id)
     if not state:
         return {"ok": False, "error": f"no timer state for session {session_id}"}
     engine = str(state.get("engine") or "claude")
     cwd = str(state.get("cwd") or "")
+    mode = str(state.get("mode") or "mdfile")
     mtime = transcript_mtime(session_id, engine)
     idle_min = ((time.time() - mtime) / 60.0) if mtime else 0.0
-    prompt = build_fire_prompt(session_id, engine, cwd, idle_min)
     resolved = {"session_id": session_id, "engine": engine, "cwd": cwd}
+
+    if mode == "compact":
+        return messages.deliver(resolved, build_fire_prompt(
+            session_id, engine, cwd, idle_min, mode="compact"))
+
+    if mode == "both":
+        compact_result = messages.deliver(resolved, build_fire_prompt(
+            session_id, engine, cwd, idle_min, mode="compact"))
+        if not compact_result.get("ok"):
+            return compact_result
+        for wait_s in _BOTH_MODE_WAIT_STEPS_S:
+            sleep_fn(wait_s)
+        snapshot_result = messages.deliver(resolved, build_fire_prompt(
+            session_id, engine, cwd, idle_min, mode="mdfile"))
+        if not snapshot_result.get("ok"):
+            return {"ok": False, "compact": compact_result,
+                    "error": "compact delivered but snapshot follow-up failed: "
+                             f"{snapshot_result.get('error')}"}
+        return {"ok": True, "compact": compact_result, "snapshot": snapshot_result}
+
+    prompt = build_fire_prompt(session_id, engine, cwd, idle_min, mode="mdfile")
     return messages.deliver(resolved, prompt)
 
 

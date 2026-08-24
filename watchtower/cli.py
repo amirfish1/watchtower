@@ -3088,6 +3088,7 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
             args.engine,
             args.cwd,
             idle_min=args.idle if args.idle is not None else snap.DEFAULT_IDLE_MIN,
+            mode=args.mode,
         )
         if r.get("ok"):
             if r.get("ccc_handover_armed"):
@@ -3098,8 +3099,9 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
                 )
             st = r["state"]
             print(
-                f"armed: snapshots after {st['idle_min']:g} idle minutes; "
-                f"window closes at {snap.CACHE_TTL_MIN} (timer pid {st['pid']})"
+                f"armed ({st.get('mode', 'mdfile')}): fires after {st['idle_min']:g} "
+                f"idle minutes; window closes at {snap.CACHE_TTL_MIN} "
+                f"(timer pid {st['pid']})"
             )
             return 0
         print(r.get("error"), file=sys.stderr)
@@ -3116,6 +3118,7 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         for s_ in rows:
             print(
                 f"{s_['session_id'][:8]}  {s_.get('engine','?'):7} "
+                f"{s_.get('mode','mdfile'):7} "
                 f"{s_.get('outcome','?'):18} idle_min={s_.get('idle_min','?')} "
                 f"alive={s_.get('timer_alive')}"
             )
@@ -4123,6 +4126,7 @@ def build_parser() -> argparse.ArgumentParser:
     sa.add_argument("--engine", required=True)
     sa.add_argument("--cwd", required=True)
     sa.add_argument("--idle", type=float, default=None)
+    sa.add_argument("--mode", default="mdfile", choices=["mdfile", "compact", "both"])
     sa.set_defaults(func=cmd_snapshot)
 
     sd = ssub.add_parser("disarm")

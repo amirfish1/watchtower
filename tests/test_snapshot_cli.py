@@ -18,6 +18,22 @@ def test_arm_status_disarm_roundtrip(run_cli, monkeypatch):
     assert "disarmed" in run_cli("snapshot", "status").out
 
 
+def test_arm_accepts_mode_flag(run_cli, monkeypatch):
+    monkeypatch.setattr(snapshot, "_spawn_timer", lambda sid: 4242)
+    r = run_cli("snapshot", "arm", "--session", "s1", "--engine", "claude",
+                "--cwd", "/tmp/proj", "--mode", "both")
+    assert r.code == 0 and "armed (both)" in r.out
+    r2 = run_cli("snapshot", "status", "--session", "s1")
+    assert r2.code == 0 and "both" in r2.out
+
+
+def test_arm_rejects_compact_mode_on_unsupported_engine(run_cli, monkeypatch):
+    monkeypatch.setattr(snapshot, "_spawn_timer", lambda sid: 4242)
+    r = run_cli("snapshot", "arm", "--session", "s1", "--engine", "codex",
+                "--cwd", "/tmp/proj", "--mode", "compact")
+    assert r.code == 1 and "/compact" in r.err
+
+
 def test_arm_rejects_bad_engine_and_threshold(run_cli):
     r = run_cli("snapshot", "arm", "--session", "s1", "--engine", "kimi",
                 "--cwd", "/tmp/x")

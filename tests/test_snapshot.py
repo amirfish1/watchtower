@@ -51,6 +51,31 @@ def test_arm_rejects_threshold_at_or_past_ttl(wt_env):
     assert not r["ok"] and "60" in r["error"]
 
 
+def test_arm_defaults_to_mdfile_mode(wt_env):
+    r = snapshot.arm("s1", "claude", "/tmp/x", idle_min=10, spawn=False)
+    assert r["ok"] and r["state"]["mode"] == "mdfile"
+
+
+def test_arm_accepts_compact_and_both_modes_on_claude(wt_env):
+    for mode in ("compact", "both"):
+        r = snapshot.arm("s1", "claude", "/tmp/x", idle_min=10, spawn=False, mode=mode)
+        assert r["ok"] and r["state"]["mode"] == mode
+
+
+def test_arm_rejects_unknown_mode(wt_env):
+    r = snapshot.arm("s1", "claude", "/tmp/x", idle_min=10, spawn=False, mode="bogus")
+    assert not r["ok"] and "mode" in r["error"]
+
+
+def test_arm_rejects_compact_modes_on_non_claude_engine(wt_env):
+    for mode in ("compact", "both"):
+        r = snapshot.arm("s1", "codex", "/tmp/x", idle_min=10, spawn=False, mode=mode)
+        assert not r["ok"] and "/compact" in r["error"]
+    # mdfile still works on codex
+    r = snapshot.arm("s1", "codex", "/tmp/x", idle_min=10, spawn=False, mode="mdfile")
+    assert r["ok"]
+
+
 def test_arm_writes_state_and_disarm_marks_it(wt_env):
     r = snapshot.arm("s1", "claude", "/tmp/x", idle_min=10, spawn=False)
     assert r["ok"] and snapshot.load_state("s1")["outcome"] == "armed"
@@ -122,6 +147,40 @@ def test_fire_delivers_prompt_with_paths(wt_env, monkeypatch):
     assert sent["resolved"]["engine"] == "claude"
     assert str(snapshot.snapshot_path("s1")) in sent["text"]
     assert "wt snapshot record" in sent["text"]
+
+
+def test_fire_compact_mode_delivers_literal_compact(wt_env, monkeypatch):
+    sent = []
+    snapshot.arm("s1", "claude", "/tmp/proj", idle_min=55, spawn=False, mode="compact")
+    monkeypatch.setattr(snapshot, "transcript_mtime", lambda sid, eng: 0.0)
+    monkeypatch.setattr("watchtower.messages.deliver",
+                        lambda resolved, text: sent.append(text) or {"ok": True})
+    r = snapshot.fire("s1")
+    assert r["ok"]
+    assert sent == ["/compact"]
+
+
+def test_fire_both_mode_delivers_compact_then_snapshot_prompt(wt_env, monkeypatch):
+    sent = []
+    waited = []
+    snapshot.arm("s1", "claude", "/tmp/proj", idle_min=55, spawn=False, mode="both")
+    monkeypatch.setattr(snapshot, "transcript_mtime", lambda sid, eng: 0.0)
+    monkeypatch.setattr("watchtower.messages.deliver",
+                        lambda resolved, text: sent.append(text) or {"ok": True})
+    r = snapshot.fire("s1", sleep_fn=lambda s: waited.append(s))
+    assert r["ok"]
+    assert sent[0] == "/compact"
+    assert "wt snapshot record" in sent[1]
+    assert sum(waited) > 60  # waited for compaction to plausibly finish
+
+
+def test_fire_both_mode_stops_if_compact_delivery_fails(wt_env, monkeypatch):
+    snapshot.arm("s1", "claude", "/tmp/proj", idle_min=55, spawn=False, mode="both")
+    monkeypatch.setattr(snapshot, "transcript_mtime", lambda sid, eng: 0.0)
+    monkeypatch.setattr("watchtower.messages.deliver",
+                        lambda resolved, text: {"ok": False, "error": "busy"})
+    r = snapshot.fire("s1", sleep_fn=lambda s: None)
+    assert not r["ok"]
 
 
 def test_record_and_find_latest_and_consume(wt_env):
