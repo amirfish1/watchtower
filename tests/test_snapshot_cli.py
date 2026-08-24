@@ -43,15 +43,6 @@ def test_arm_rejects_bad_engine_and_threshold(run_cli):
     assert r.code == 1 and "TTL" in r.err
 
 
-def test_arm_warns_on_ccc_handover_armed(run_cli, monkeypatch):
-    monkeypatch.setattr(snapshot, "_spawn_timer", lambda sid: 4242)
-    monkeypatch.setattr(snapshot, "ccc_handover_flag_set", lambda sid: True)
-    r = run_cli("snapshot", "arm", "--session", "s1", "--engine", "claude",
-                "--cwd", "/tmp/proj")
-    assert r.code == 0
-    assert "warning: CCC auto-handover is also armed" in r.err
-
-
 def test_path_record_latest_consume_flow(run_cli):
     p_out = run_cli("snapshot", "path", "--session", "s1")
     assert p_out.code == 0

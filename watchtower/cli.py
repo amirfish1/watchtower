@@ -3091,12 +3091,6 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
             mode=args.mode,
         )
         if r.get("ok"):
-            if r.get("ccc_handover_armed"):
-                print(
-                    "warning: CCC auto-handover is also armed for this "
-                    "session; expect a double snapshot",
-                    file=sys.stderr,
-                )
             st = r["state"]
             print(
                 f"armed ({st.get('mode', 'mdfile')}): fires after {st['idle_min']:g} "

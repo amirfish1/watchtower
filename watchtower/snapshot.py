@@ -96,17 +96,6 @@ def transcript_mtime(session_id: str, engine: str) -> Optional[float]:
         return None
 
 
-def ccc_handover_flag_set(session_id: str) -> bool:
-    flag_file = Path.home() / ".claude" / "command-center" / "auto-handover.json"
-    try:
-        with open(flag_file) as f:
-            flags = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return False
-    entry = flags.get(session_id) if isinstance(flags, dict) else None
-    return bool(isinstance(entry, dict) and entry.get("enabled"))
-
-
 def _pid_alive(pid: int) -> bool:
     if not pid:
         return False
@@ -170,8 +159,7 @@ def arm(session_id: str, engine: str, cwd: str,
     if spawn:
         state["pid"] = _spawn_timer(session_id)
         save_state(session_id, state)
-    return {"ok": True, "state": state,
-            "ccc_handover_armed": ccc_handover_flag_set(session_id)}
+    return {"ok": True, "state": state}
 
 
 def disarm(session_id: str) -> Dict[str, Any]:

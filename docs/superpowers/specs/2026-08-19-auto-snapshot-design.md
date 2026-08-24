@@ -192,4 +192,22 @@ Mode is stored on the timer's state file (`mode` key) and read back by
 status-bar toggle (`toggleAutoHandoverForPane` → renamed
 `cycleAutoHandoverModeForPane` in `static/app.js`) now cycles the pill
 through compact → md → both → off per click instead of a plain on/off
-toggle, debounced ~450ms so a fast click-through settles once.
+toggle, debounced ~450ms so a fast click-through settles once. If the
+settled state matches what the server already has committed (a flurry that
+lands back where it started), the debounce is a pure no-op: no POST, no
+chat injection — tracked via `_autoHandoverConfirmedState` in `app.js`,
+seeded from each usage-poll response and updated on every real commit.
+
+**`ccc_handover_flag_set()` / the "CCC auto-handover is also armed" warning
+removed (2026-08-24).** `arm()` used to check
+`~/.claude/command-center/auto-handover.json` and warn on a second,
+independent CCC-side firing risk. CCC's own auto-handover watchdog
+(`_run_auto_handover_watchdog_once` in `server.py`) has been a documented
+no-op since the toggle switched to injecting `token-sitter auto-snapshot
+on` directly — so that flag file is now purely the pill's own UI-state
+mirror, written by the very same click that arms the `wt` timer. Checking
+it after the mode toggle shipped meant the warning fired on every single
+use of the CCC pill (a false positive against yourself), not a real
+double-fire risk. Removed from `arm()`'s return and the CLI's warning
+print; the flag file itself is untouched since CCC still reads it back to
+paint the pill's initial state.
