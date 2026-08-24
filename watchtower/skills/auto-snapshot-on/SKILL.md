@@ -32,10 +32,9 @@ idle minutes (default 55; must be below 60, the cache TTL) and a mode.
    `wt snapshot arm --session <SID> --engine <ENGINE> --cwd "$PWD" --idle <MIN> --mode <MODE>`
    (omit `--mode` for the `mdfile` default). `compact`/`both` are rejected
    for any engine other than `claude` — fall back to `mdfile` there.
-3. Relay the confirmation (including the mode and fire window) and any
-   warning about CCC auto-handover being armed too. If the command errors,
-   show the error verbatim — do not retry with different numbers unless the
-   user asks.
+3. Relay the confirmation, including the mode and fire window. If the
+   command errors, show the error verbatim — do not retry with different
+   numbers unless the user asks.
 
 The timer is one-shot: after it fires (or skips because you were idle past
 the 60-min TTL), it will not fire again until re-armed.
