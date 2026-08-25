@@ -437,6 +437,9 @@ def _resolve_antigravity_bin() -> str:
         found = shutil.which(cmd)
         if found:
             return found
+        user_local = Path.home() / ".local" / "bin" / cmd
+        if user_local.is_file() and os.access(user_local, os.X_OK):
+            return str(user_local)
     return ""
 
 
