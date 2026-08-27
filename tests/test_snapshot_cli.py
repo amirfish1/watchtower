@@ -78,7 +78,11 @@ def test_sessions_verb_lists_and_handles_empty(run_cli, tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_CLAUDE_PROJECTS_DIR", str(tmp_path))
     r = run_cli("snapshot", "sessions", "--cwd", "/tmp/proj")
     assert r.code == 0 and "no sessions found" in r.out
-    from tests.test_snapshot import _write_transcript
+    # tests/ is not a package (no __init__.py); pytest puts it on sys.path,
+    # so sibling modules import by bare name. `from tests.test_snapshot ...`
+    # only works when the repo root happens to be on sys.path (e.g. under
+    # `python -m pytest`) and fails under the `pytest` console script.
+    from test_snapshot import _write_transcript
     from watchtower import snapshot as snap
     _write_transcript(tmp_path, snap.cwd_slug("/tmp/proj"), "abc12345-full-id",
                       5000.0, "build the widget")
