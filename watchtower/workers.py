@@ -3245,6 +3245,54 @@ def request_stop(worker_id: str) -> Path:
     return signal_path
 
 
+def release_workers(
+    *, engine: str = "", queue: str = "", mismatched: bool = False
+) -> List[Dict[str, Any]]:
+    """Gracefully retire selected workers after their current claim.
+
+    A retirement writes the normal stop sentinel and immediately removes the
+    worker from staffing counts. It deliberately does not deliver a message or
+    signal the process: an active worker finishes its current ticket, then its
+    next ``wt claim`` returns ``{"stop": true}`` before it can take another.
+
+    ``mismatched`` compares each worker record with its queue's resolved engine
+    and model, which is used after queue settings change. Otherwise ``engine``
+    selects records explicitly for an operator-requested rotation.
+    """
+    from . import config
+
+    wanted_engine = str(engine or "").strip().lower()
+    released: List[Dict[str, Any]] = []
+    for worker in list_workers(prune=False):
+        if (
+            not worker.get("alive")
+            or worker.get("kind") == "adhoc"
+            or _worker_released(worker)
+        ):
+            continue
+        worker_queue = str(worker.get("queue") or "")
+        if queue and worker_queue != queue:
+            continue
+        if wanted_engine and str(worker.get("engine") or "").lower() != wanted_engine:
+            continue
+        if mismatched:
+            configured_engine = str(config.engine(worker_queue) or "").lower()
+            configured_model = str(config.model(worker_queue) or "")
+            if (
+                str(worker.get("engine") or "").lower() == configured_engine
+                and str(worker.get("model") or "") == configured_model
+            ):
+                continue
+
+        worker_id = str(worker.get("worker_id") or "")
+        if not worker_id:
+            continue
+        request_stop(worker_id)
+        worker["released_at"] = _released_at(worker_id)
+        released.append(worker)
+    return released
+
+
 def _answer_in_flight(
     answered_at: Any, sid: str, now: float, grace_s: float
 ) -> bool:

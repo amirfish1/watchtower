@@ -1627,6 +1627,33 @@ def test_request_stop_makes_claim_return_stop(wt):
     assert item and item.get("ref") == "Q-1"
 
 
+def test_release_workers_by_engine_keeps_active_ticket_for_worker(wt):
+    """A requested engine rotation finishes the active ticket, then stops."""
+    rec = _live_worker(wt, "Q")
+    item = wt.q.enqueue(project="Q", note="finish this before rotating")
+    wt.q.claim_next(rec["worker_id"], project="Q")
+
+    released = wt.workers.release_workers(engine="claude")
+
+    assert [row["worker_id"] for row in released] == [rec["worker_id"]]
+    assert wt.q.get(item["ref"])["status"] == "in_progress"
+    assert wt.q.claim_next(rec["worker_id"], project="Q") == {"stop": True}
+
+
+def test_release_workers_retires_engine_or_model_mismatches(wt):
+    rec = _live_worker(wt, "Q")
+    wt.config.set_engine("Q", "kimi")
+    wt.config.set_model("Q", "kimi-code/k3")
+
+    released = wt.workers.release_workers(queue="Q", mismatched=True)
+
+    assert [row["worker_id"] for row in released] == [rec["worker_id"]]
+    assert rec["worker_id"] not in {
+        row["worker_id"] for row in wt.workers.list_workers()
+        if row.get("alive") and not row.get("released_at")
+    }
+
+
 # ============================================ GC released-but-alive (GH issue #1)
 def _spawn_sleeper():
     """A real, long-lived child process to stand in for a released worker."""
