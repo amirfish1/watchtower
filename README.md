@@ -135,6 +135,7 @@ wt drain off DEMO                      # disable auto-drain
 wt set -q DEMO --repo-path /path/to/repo --engine claude
 
 wt workers                             # list workers the watcher started
+wt workers release --engine claude      # finish active tickets, then retire Claude workers
 wt wait   -q DEMO --timeout 600 --cmd "say done" # block until drained, then run cmd
 
 wt start                               # start the watcher; installs the LaunchAgent on first run
@@ -173,16 +174,20 @@ duplicates, while newly inferred document tasks create new tickets.
 
 ### Agent engines
 
-WatchTower supports two agent engines. Set the engine per queue with `wt set`:
+WatchTower supports three agent engines. Set the engine per queue with `wt set`:
 
 ```bash
-wt set -q MYAPP --engine claude    # default: Claude Code (stream-json, FIFO, live)
+wt set -q MYAPP --engine claude    # Claude Code (stream-json, FIFO, live)
 wt set -q MYAPP --engine codex     # OpenAI Codex (one-shot exec)
+wt set -q MYAPP --engine kimi      # Kimi Code (one-shot prompt)
 ```
 
 The engine is stored in `~/.watchtower/queue-config.json` and picked up by the
-reconciler on the next spawn. Existing live workers are unaffected until they
-are released from queue staffing and a replacement is started.
+reconciler on the next spawn. Changing a queue's engine or model gracefully
+retires live workers that no longer match: they finish their current ticket,
+then stop before their next claim, allowing the reconciler to replace them with
+the new settings. To rotate a specific old engine across queues manually, run
+`wt workers release --engine claude` (optionally add `-q QUEUE`).
 
 #### `claude` (default)
 
@@ -225,15 +230,21 @@ goal, and exits immediately. New tickets filed while it is running are picked up
 on the next `wt claim` loop iteration. `wt add` notifications are not delivered
 to a running codex worker.
 
+#### `kimi`
+
+Requires the Kimi Code CLI (`kimi` on `$PATH`). Workers are spawned as
+`kimi -p <drain-goal>` and, like Codex workers, are one-shot processes without
+FIFO input or live push notifications.
+
 #### Comparison
 
-| | `claude` | `codex` |
-|---|---|---|
-| Spawn mode | stream-json over FIFO | `exec <goal>` |
-| Live push (`wt add`) | yes, via FIFO | no |
-| Prompt cache warm wake | yes (~5 min) | no |
-| Multi-ticket session | yes, one process, warm ctx | one process, warm ctx |
-| Requires | Claude Code CLI | OpenAI Codex CLI |
+| | `claude` | `codex` | `kimi` |
+|---|---|---|---|
+| Spawn mode | stream-json over FIFO | `exec <goal>` | `-p <goal>` |
+| Live push (`wt add`) | yes, via FIFO | no | no |
+| Prompt cache warm wake | yes (~5 min) | no | no |
+| Multi-ticket session | yes, one process, warm ctx | one process | one process |
+| Requires | Claude Code CLI | OpenAI Codex CLI | Kimi Code CLI |
 
 ### GitHub Issues backend (optional)
 

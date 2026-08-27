@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 
 import pytest
 
@@ -33,6 +34,16 @@ def _cfg_file(wt_env) -> dict:
 
 def _entry(wt_env, queue: str = QUEUE) -> dict:
     return _cfg_file(wt_env).get(queue, {})
+
+
+def _live_worker(wt_env, queue: str, engine: str, model: str) -> dict:
+    """Create a tracked worker backed by this test process."""
+    log = wt_env.tmp / f"{queue.lower()}-{engine}.log"
+    log.write_text("")
+    return wt_env.workers.record_worker(
+        os.getpid(), queue, engine, f"{queue.lower()}-{engine}",
+        log=str(log), model=model,
+    )
 
 
 def _write_ccc_defaults(wt_env, payload: dict) -> None:
@@ -186,6 +197,53 @@ def test_empty_model_clears_the_override(wt_env, run_cli):
     assert run_cli("config", "-q", QUEUE, "--model", "").code == 0
     assert "model" not in _entry(wt_env)
     assert wt_env.config.model(QUEUE) == ""
+
+
+def test_config_engine_change_gracefully_retires_mismatched_worker(wt_env, run_cli):
+    wt_env.config.set_engine(QUEUE, "claude")
+    wt_env.config.set_model(QUEUE, "claude-sonnet-5")
+    worker = _live_worker(wt_env, QUEUE, "claude", "claude-sonnet-5")
+
+    result = run_cli(
+        "config", "-q", QUEUE, "--engine", "kimi", "--model", "kimi-code/k3"
+    )
+
+    assert result.code == 0, result.output
+    assert worker["worker_id"] not in {
+        row["worker_id"] for row in wt_env.workers.list_workers()
+        if row.get("alive") and not row.get("released_at")
+    }
+
+
+def test_set_model_change_gracefully_retires_mismatched_worker(wt_env, run_cli):
+    wt_env.config.set_engine(QUEUE, "kimi")
+    wt_env.config.set_model(QUEUE, "kimi-code/k3")
+    worker = _live_worker(wt_env, QUEUE, "kimi", "kimi-code/k3")
+
+    result = run_cli("set", "-q", QUEUE, "--model", "kimi-code/kimi-for-coding")
+
+    assert result.code == 0, result.output
+    assert worker["worker_id"] not in {
+        row["worker_id"] for row in wt_env.workers.list_workers()
+        if row.get("alive") and not row.get("released_at")
+    }
+
+
+def test_workers_release_engine_targets_only_that_engine(wt_env, run_cli):
+    claude = _live_worker(wt_env, "CLAUDEQ", "claude", "claude-sonnet-5")
+    kimi = _live_worker(wt_env, "KIMIQ", "kimi", "kimi-code/k3")
+
+    result = run_cli("workers", "release", "--engine", "claude", "--json")
+
+    assert result.code == 0, result.output
+    assert [row["worker_id"] for row in json.loads(result.out)["released"]] == [
+        claude["worker_id"]
+    ]
+    live = {
+        row["worker_id"] for row in wt_env.workers.list_workers()
+        if row.get("alive") and not row.get("released_at")
+    }
+    assert kimi["worker_id"] in live
 
 
 def test_empty_effort_clears_the_override(wt_env, run_cli):

@@ -1244,6 +1244,21 @@ def cmd_workers(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_workers_release(args: argparse.Namespace) -> int:
+    """Gracefully retire selected workers before their next claim."""
+    released = workers.release_workers(engine=args.engine, queue=args.queue or "")
+    if args.json:
+        print(json.dumps({"released": released}, indent=2))
+        return 0
+    if not released:
+        print("no matching live workers")
+        return 0
+    print("gracefully retiring: " + ", ".join(
+        str(worker.get("worker_id") or "") for worker in released
+    ))
+    return 0
+
+
 def cmd_session_names(args: argparse.Namespace) -> int:
     """Maintenance helpers for worker session display names."""
     if args.session_names_command != "backfill":
@@ -2246,6 +2261,14 @@ def cmd_set(args: argparse.Namespace) -> int:
     if args.model is not None:
         config.set_model(args.queue, args.model)
         changed.append(f"model={str(args.model or '').strip() or '(engine default)'}")
+    if args.engine is not None or args.model is not None:
+        released = workers.release_workers(queue=args.queue, mismatched=True)
+        if released:
+            changed.append(
+                "retiring=" + ",".join(
+                    str(worker.get("worker_id") or "") for worker in released
+                )
+            )
     if args.effort is not None:
         config.set_effort(args.queue, args.effort)
         changed.append(f"effort={args.effort or '(engine default)'}")
@@ -2412,6 +2435,14 @@ def cmd_config(args: argparse.Namespace) -> int:
     if getattr(args, "model", None) is not None:
         config.set_model(args.queue, args.model)
         changed.append(f"model={str(args.model or '').strip() or '(engine default)'}")
+    if getattr(args, "engine", None) is not None or getattr(args, "model", None) is not None:
+        released = workers.release_workers(queue=args.queue, mismatched=True)
+        if released:
+            changed.append(
+                "retiring=" + ",".join(
+                    str(worker.get("worker_id") or "") for worker in released
+                )
+            )
     if getattr(args, "effort", None) is not None:
         config.set_effort(args.queue, args.effort)
         changed.append(f"effort={args.effort or '(engine default)'}")
@@ -3754,6 +3785,19 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("workers")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_workers)
+    workers_sub = s.add_subparsers(dest="workers_command")
+    release_workers_parser = workers_sub.add_parser(
+        "release", help="gracefully stop selected workers before their next claim"
+    )
+    release_workers_parser.add_argument(
+        "--engine", required=True, choices=["claude", "codex", "kimi"],
+        help="release live workers running this engine",
+    )
+    release_workers_parser.add_argument(
+        "-q", "--queue", default="", help="limit release to one queue"
+    )
+    release_workers_parser.add_argument("--json", action="store_true")
+    release_workers_parser.set_defaults(func=cmd_workers_release)
 
     s = sub.add_parser("session-names", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_session_names)
