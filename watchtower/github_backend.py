@@ -127,12 +127,34 @@ def _claim_locks_dir() -> Path:
     return Path.home() / ".watchtower" / "gh-claim-locks"
 
 
+_PERSISTED_LIST_MEM_CACHE: Dict[str, Any] = {"mtime_ns": 0, "size": -1, "data": {}}
+_PERSISTED_LIST_MEM_LOCK = threading.Lock()
+
+
 def _read_persisted_list_cache() -> Dict[str, Any]:
+    path = _list_cache_path()
     try:
-        data = json.loads(_list_cache_path().read_text())
-    except (OSError, json.JSONDecodeError):
+        st = path.stat()
+        mtime_ns, size = st.st_mtime_ns, st.st_size
+    except OSError:
         return {}
-    return data if isinstance(data, dict) else {}
+    with _PERSISTED_LIST_MEM_LOCK:
+        if (
+            _PERSISTED_LIST_MEM_CACHE["mtime_ns"] == mtime_ns
+            and _PERSISTED_LIST_MEM_CACHE["size"] == size
+        ):
+            return dict(_PERSISTED_LIST_MEM_CACHE["data"])
+        try:
+            raw = path.read_text()
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            data = {}
+        _PERSISTED_LIST_MEM_CACHE["mtime_ns"] = mtime_ns
+        _PERSISTED_LIST_MEM_CACHE["size"] = size
+        _PERSISTED_LIST_MEM_CACHE["data"] = data
+        return dict(data)
 
 
 def _rewrite_persisted_list_cache(mutate) -> None:
@@ -238,6 +260,7 @@ def poll_owner_answers_once() -> None:
     is best-effort; one bad queue or ticket must never stop the sweep."""
     from . import config
     from . import queue as _queue
+    seen_targets = set()
     for qname in config.all_queues():
         try:
             if config.backend(qname) != "github":
@@ -245,6 +268,14 @@ def poll_owner_answers_once() -> None:
             backend = _queue._github_backend_for_project(qname)
             if backend is None:
                 continue
+            dedup_key = (
+                backend.repo,
+                bool(backend.partition_by_label),
+                getattr(backend, "project_label", None) if backend.partition_by_label else None,
+            )
+            if dedup_key in seen_targets:
+                continue
+            seen_targets.add(dedup_key)
             for item in backend.list_items(status="in_progress"):
                 if not item.get("needs_input"):
                     continue
