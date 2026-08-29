@@ -624,6 +624,55 @@ def test_deliver_codex_falls_through_when_binary_missing(wt, monkeypatch):
     assert "codex" in res["error"]
 
 
+# ================================================== codex compact (thread/compact/start)
+def test_compact_codex_via_app_server(wt, monkeypatch):
+    """With no delegate configured, compact_codex reaches WT's own codex
+    app-server subprocess via the dedicated thread/compact/start RPC."""
+    script = _write_fake_codex_bin(wt.tmp)
+    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(script))
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
+
+    res = wt.messages.compact_codex({"session_id": SID_D, "cwd": "/repo"})
+
+    assert res["ok"] is True
+    assert res["transport"] == "codex-app-server-compact"
+    assert res["codex_app_server_warm"] is False
+    assert res["codex_resume_ms"] >= 0
+    assert res["codex_compact_ms"] >= 0
+    assert res["codex_total_ms"] >= res["codex_resume_ms"]
+
+
+def test_compact_codex_refuses_when_delegate_first_is_configured(wt, delegate, monkeypatch):
+    """CCC's /api/inject-input can only inject chat text, not forward the
+    structural thread/compact/start RPC -- and WT must not open a second,
+    competing app-server against a thread CCC already brokers. So compact
+    mode fails closed here rather than silently doing the wrong thing."""
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(_write_fake_codex_bin(wt.tmp)))
+
+    def _private_should_not_run(*_args, **_kwargs):
+        raise AssertionError("private codex app-server should not be used")
+
+    monkeypatch.setattr(wt.codex_rpc, "compact", _private_should_not_run)
+
+    res = wt.messages.compact_codex({"session_id": SID_D, "cwd": "/repo"})
+
+    assert res["ok"] is False
+    assert "delegate" in res["error"]
+    assert srv.requests == []
+
+
+def test_compact_codex_falls_through_when_binary_missing(wt, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
+    monkeypatch.delenv("WATCHTOWER_CODEX_BIN", raising=False)
+    monkeypatch.setenv("PATH", "/nonexistent-bin-dir")
+
+    res = wt.messages.compact_codex({"session_id": SID_D, "cwd": "/repo"})
+
+    assert res["ok"] is False and "codex" in res["error"]
+
+
 # ========================================================= gemini delivery (WT-80)
 def _write_fake_gemini_bin(tmp_path):
     """A minimal fake gemini binary: exits 0 immediately (accepts any argv)."""

@@ -136,10 +136,10 @@ def arm(session_id: str, engine: str, cwd: str,
     if mode not in MODES:
         return {"ok": False,
                 "error": f"--mode must be one of {', '.join(MODES)} (got '{mode}')"}
-    if mode in ("compact", "both") and engine != "claude":
-        return {"ok": False,
-                "error": f"--mode {mode} needs Claude Code's /compact, which engine "
-                         f"'{engine}' doesn't support yet; use --mode mdfile"}
+    # No further per-engine mode check needed: both auto-fire engines above
+    # (claude, codex) now support compact/both -- claude via the TUI's
+    # /compact keystroke, codex via codex_rpc.compact()'s thread/compact/start
+    # RPC (see messages.compact_codex).
     if idle_min >= CACHE_TTL_MIN:
         return {"ok": False,
                 "error": f"--idle {idle_min:g} is at/past the {CACHE_TTL_MIN}-min "
@@ -237,13 +237,17 @@ def fire(session_id: str, *, sleep_fn=None) -> Dict[str, Any]:
     idle_min = ((time.time() - mtime) / 60.0) if mtime else 0.0
     resolved = {"session_id": session_id, "engine": engine, "cwd": cwd}
 
-    if mode == "compact":
+    def _fire_compact() -> Dict[str, Any]:
+        if engine == "codex":
+            return messages.compact_codex(resolved)
         return messages.deliver(resolved, build_fire_prompt(
             session_id, engine, cwd, idle_min, mode="compact"))
 
+    if mode == "compact":
+        return _fire_compact()
+
     if mode == "both":
-        compact_result = messages.deliver(resolved, build_fire_prompt(
-            session_id, engine, cwd, idle_min, mode="compact"))
+        compact_result = _fire_compact()
         if not compact_result.get("ok"):
             return compact_result
         for wait_s in _BOTH_MODE_WAIT_STEPS_S:

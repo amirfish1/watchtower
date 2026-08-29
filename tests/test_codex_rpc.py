@@ -59,6 +59,8 @@ def main():
             result = {"turnId": expected}
         elif method == "turn/start":
             result = {"turn": {"id": "turn-new"}}
+        elif method == "thread/compact/start":
+            result = {}
         else:
             result = {}
 
@@ -185,6 +187,40 @@ def test_deliver_without_a_binary_fails_fast(rpc, monkeypatch, tmp_path):
     assert result["error"] == "codex binary not found"
     assert result["stage"] == "resolve"
     assert result["latency_ms"] >= 0
+
+
+# ---------------------------------------------------------------------- compact
+def test_compact_resumes_then_starts_compaction(rpc):
+    result = rpc.compact("thread-abc")
+    assert result["ok"] is True
+    assert result["app_server_warm"] is False
+    assert result["resume_ms"] >= 0
+    assert result["compact_ms"] >= 0
+    assert result["latency_ms"] >= result["resume_ms"]
+
+
+def test_compact_without_a_binary_fails_fast(rpc, monkeypatch, tmp_path):
+    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(tmp_path / "missing"))
+    result = rpc.compact("thread-abc")
+    assert result["ok"] is False
+    assert result["error"] == "codex binary not found"
+    assert result["stage"] == "resolve"
+
+
+def test_compact_reports_resume_failure(rpc, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_FAIL_METHOD", "thread/resume")
+    result = rpc.compact("thread-abc")
+    assert result["ok"] is False
+    assert "fake failure" in result["error"]
+    assert result["stage"] == "thread/resume"
+
+
+def test_compact_reports_compact_start_failure(rpc, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_FAIL_METHOD", "thread/compact/start")
+    result = rpc.compact("thread-abc")
+    assert result["ok"] is False
+    assert "fake failure" in result["error"]
+    assert result["stage"] == "thread/compact/start"
 
 
 # ---------------------------------------------------------------------- timeout

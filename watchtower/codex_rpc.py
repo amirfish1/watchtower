@@ -16,13 +16,17 @@ first so one local owner drives user-visible Codex threads.
 This module ports the pattern proven in Claude Command Center's
 ``server.py`` (``_ensure_codex_app_server`` / ``_codex_app_server_request_to_proc``
 / ``_codex_resume_or_steer_via_app_server``), not the code verbatim: WT has no
-HTTP endpoint layer here, just a small lazy client with three public verbs:
+HTTP endpoint layer here, just a small lazy client with four public verbs:
 
   * ``is_available()``: is a codex binary reachable (env override or PATH)?
   * ``ensure_server()``: lazily start + initialize the subprocess; idempotent.
   * ``deliver(thread_id, text)``: ``thread/resume`` the thread, then
     ``turn/steer`` into an active turn if one is running, else ``turn/start``
     a fresh one.
+  * ``compact(thread_id)``: ``thread/resume`` the thread, then
+    ``thread/compact/start`` -- real context compaction via a dedicated RPC,
+    not a chat message (see ``compact``'s docstring for why "/compact" text
+    alone doesn't work here the way it does for Claude).
   * ``shutdown()``: terminate the subprocess; also runs at interpreter exit.
 
 Every RPC has a timeout (default ``DEFAULT_TIMEOUT_S``) so a stuck app-server
@@ -504,5 +508,72 @@ def deliver(
         "app_server_warm": app_server_warm,
         "resume_ms": resume_ms,
         "turn_ms": turn_ms,
+        "latency_ms": _elapsed_ms(total_start),
+    }
+
+
+def compact(
+    thread_id: str,
+    cwd: Optional[str] = None,
+    timeout: float = DEFAULT_TIMEOUT_S,
+) -> Dict[str, Any]:
+    """Trigger real context compaction on a live codex thread.
+
+    Unlike Claude, where the ``/compact`` slash command is intercepted
+    client-side by the TUI's keystroke parser before it ever reaches the
+    model, codex's app-server has no such client to type into -- ``deliver``
+    sends plain text as a turn's input, so injecting the literal string
+    "/compact" there would just be an ordinary chat message. The app-server
+    protocol has a dedicated RPC for this instead: ``thread/compact/start``
+    (params: ``{"threadId": ...}``), found via ``codex app-server
+    generate-json-schema --experimental`` (undocumented as of codex-cli
+    0.148.0-alpha.21). Resumes the thread first, same as ``deliver``, since
+    the call needs a live thread handle.
+
+    Returns ``{"ok": True, ...}`` or ``{"ok": False, "error": ...}``; never
+    raises."""
+    total_start = time.monotonic()
+    app_server_warm = is_running()
+    if not is_available():
+        return {
+            "ok": False,
+            "error": "codex binary not found",
+            "stage": "resolve",
+            "app_server_warm": app_server_warm,
+            "latency_ms": _elapsed_ms(total_start),
+        }
+    resume_params: Dict[str, Any] = {"threadId": thread_id, "excludeTurns": False}
+    if cwd:
+        resume_params["cwd"] = cwd
+    resume_start = time.monotonic()
+    resumed = request("thread/resume", resume_params, timeout=timeout)
+    resume_ms = _elapsed_ms(resume_start)
+    if not _response_succeeded(resumed):
+        return {
+            "ok": False,
+            "error": _error_text(resumed) or "thread/resume failed",
+            "stage": "thread/resume",
+            "app_server_warm": app_server_warm,
+            "resume_ms": resume_ms,
+            "latency_ms": _elapsed_ms(total_start),
+        }
+    compact_start = time.monotonic()
+    started = request("thread/compact/start", {"threadId": thread_id}, timeout=timeout)
+    compact_ms = _elapsed_ms(compact_start)
+    if not _response_succeeded(started):
+        return {
+            "ok": False,
+            "error": _error_text(started) or "thread/compact/start failed",
+            "stage": "thread/compact/start",
+            "app_server_warm": app_server_warm,
+            "resume_ms": resume_ms,
+            "compact_ms": compact_ms,
+            "latency_ms": _elapsed_ms(total_start),
+        }
+    return {
+        "ok": True,
+        "app_server_warm": app_server_warm,
+        "resume_ms": resume_ms,
+        "compact_ms": compact_ms,
         "latency_ms": _elapsed_ms(total_start),
     }

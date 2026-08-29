@@ -62,18 +62,23 @@ def test_arm_accepts_compact_and_both_modes_on_claude(wt_env):
         assert r["ok"] and r["state"]["mode"] == mode
 
 
+def test_arm_accepts_compact_and_both_modes_on_codex(wt_env):
+    for mode in ("compact", "both"):
+        r = snapshot.arm("s1", "codex", "/tmp/x", idle_min=10, spawn=False, mode=mode)
+        assert r["ok"] and r["state"]["mode"] == mode
+
+
 def test_arm_rejects_unknown_mode(wt_env):
     r = snapshot.arm("s1", "claude", "/tmp/x", idle_min=10, spawn=False, mode="bogus")
     assert not r["ok"] and "mode" in r["error"]
 
 
-def test_arm_rejects_compact_modes_on_non_claude_engine(wt_env):
-    for mode in ("compact", "both"):
-        r = snapshot.arm("s1", "codex", "/tmp/x", idle_min=10, spawn=False, mode=mode)
-        assert not r["ok"] and "/compact" in r["error"]
-    # mdfile still works on codex
-    r = snapshot.arm("s1", "codex", "/tmp/x", idle_min=10, spawn=False, mode="mdfile")
-    assert r["ok"]
+def test_arm_rejects_any_mode_on_engines_without_auto_fire_support(wt_env):
+    # gemini isn't in the auto-fire engine allowlist at all yet, regardless
+    # of mode -- compact/both aren't a narrower carve-out from that.
+    for mode in ("mdfile", "compact", "both"):
+        r = snapshot.arm("s1", "gemini", "/tmp/x", idle_min=10, spawn=False, mode=mode)
+        assert not r["ok"] and "auto-fire" in r["error"]
 
 
 def test_arm_writes_state_and_disarm_marks_it(wt_env):
@@ -179,6 +184,50 @@ def test_fire_both_mode_stops_if_compact_delivery_fails(wt_env, monkeypatch):
     monkeypatch.setattr(snapshot, "transcript_mtime", lambda sid, eng: 0.0)
     monkeypatch.setattr("watchtower.messages.deliver",
                         lambda resolved, text: {"ok": False, "error": "busy"})
+    r = snapshot.fire("s1", sleep_fn=lambda s: None)
+    assert not r["ok"]
+
+
+def test_fire_compact_mode_on_codex_uses_compact_rpc_not_literal_text(wt_env, monkeypatch):
+    # Codex has no client-side slash-command parser to intercept literal
+    # "/compact" text the way Claude's TUI does, so compact mode must route
+    # through messages.compact_codex (thread/compact/start), never
+    # messages.deliver with "/compact" as plain turn input.
+    compacted = []
+    delivered = []
+    snapshot.arm("s1", "codex", "/tmp/proj", idle_min=55, spawn=False, mode="compact")
+    monkeypatch.setattr(snapshot, "transcript_mtime", lambda sid, eng: 0.0)
+    monkeypatch.setattr("watchtower.messages.compact_codex",
+                        lambda resolved: compacted.append(resolved) or {"ok": True})
+    monkeypatch.setattr("watchtower.messages.deliver",
+                        lambda resolved, text: delivered.append(text) or {"ok": True})
+    r = snapshot.fire("s1")
+    assert r["ok"]
+    assert compacted and compacted[0]["session_id"] == "s1"
+    assert delivered == []
+
+
+def test_fire_both_mode_on_codex_compacts_then_delivers_snapshot_prompt(wt_env, monkeypatch):
+    delivered = []
+    waited = []
+    snapshot.arm("s1", "codex", "/tmp/proj", idle_min=55, spawn=False, mode="both")
+    monkeypatch.setattr(snapshot, "transcript_mtime", lambda sid, eng: 0.0)
+    monkeypatch.setattr("watchtower.messages.compact_codex",
+                        lambda resolved: {"ok": True})
+    monkeypatch.setattr("watchtower.messages.deliver",
+                        lambda resolved, text: delivered.append(text) or {"ok": True})
+    r = snapshot.fire("s1", sleep_fn=lambda s: waited.append(s))
+    assert r["ok"]
+    assert len(delivered) == 1
+    assert "wt snapshot record" in delivered[0]
+    assert sum(waited) > 60
+
+
+def test_fire_both_mode_on_codex_stops_if_compact_rpc_fails(wt_env, monkeypatch):
+    snapshot.arm("s1", "codex", "/tmp/proj", idle_min=55, spawn=False, mode="both")
+    monkeypatch.setattr(snapshot, "transcript_mtime", lambda sid, eng: 0.0)
+    monkeypatch.setattr("watchtower.messages.compact_codex",
+                        lambda resolved: {"ok": False, "error": "no delegate"})
     r = snapshot.fire("s1", sleep_fn=lambda s: None)
     assert not r["ok"]
 

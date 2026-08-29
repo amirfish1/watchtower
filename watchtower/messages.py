@@ -1111,6 +1111,51 @@ def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, 
     }
 
 
+def compact_codex(resolved: Dict[str, Any]) -> Dict[str, Any]:
+    """Trigger real context compaction on a codex thread via the app-server's
+    native ``thread/compact/start`` RPC (``codex_rpc.compact``).
+
+    Standalone-only for now, unlike ``deliver``'s adapter chain: when a
+    delegate (CCC) is configured for delegate-first codex brokering, WT must
+    not open a second app-server against a thread CCC already owns (same
+    invariant ``_deliver_codex_app_server`` protects for plain delivery), and
+    CCC's ``/api/inject-input`` delegate endpoint only injects chat text --
+    it has no way to forward a structural RPC like ``thread/compact/start``.
+    So compact mode is unavailable in that configuration until CCC grows its
+    own compact-forwarding endpoint; callers should fall back to
+    ``--mode mdfile`` there instead of guessing at a workaround."""
+    if _codex_delegate_first_enabled() and _delegate_base():
+        return {
+            "ok": False,
+            "error": "compact mode isn't available for Codex when a delegate "
+                     "(CCC) is configured for delegate-first brokering; "
+                     "use --mode mdfile instead",
+        }
+    sid = str(resolved.get("session_id") or "")
+    if not sid:
+        return {"ok": False, "error": "codex compact needs a thread/session id"}
+    try:
+        from . import codex_rpc
+    except ImportError:
+        return {"ok": False, "error": "codex_rpc module unavailable"}
+    if not codex_rpc.is_available():
+        return {"ok": False, "error": "codex binary not found"}
+    result = codex_rpc.compact(sid, cwd=str(resolved.get("cwd") or "") or None)
+    if result.get("ok"):
+        return {
+            "ok": True,
+            "transport": "codex-app-server-compact",
+            "codex_app_server_warm": result.get("app_server_warm"),
+            "codex_resume_ms": result.get("resume_ms"),
+            "codex_compact_ms": result.get("compact_ms"),
+            "codex_total_ms": result.get("latency_ms"),
+        }
+    return {
+        "ok": False,
+        "error": result.get("error") or "codex compact failed",
+    }
+
+
 def _gemini_bin() -> str:
     """Return the Gemini CLI binary path, or empty string if not found.
 

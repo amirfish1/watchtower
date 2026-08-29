@@ -27,11 +27,11 @@ def test_arm_accepts_mode_flag(run_cli, monkeypatch):
     assert r2.code == 0 and "both" in r2.out
 
 
-def test_arm_rejects_compact_mode_on_unsupported_engine(run_cli, monkeypatch):
+def test_arm_accepts_compact_mode_on_codex(run_cli, monkeypatch):
     monkeypatch.setattr(snapshot, "_spawn_timer", lambda sid: 4242)
     r = run_cli("snapshot", "arm", "--session", "s1", "--engine", "codex",
                 "--cwd", "/tmp/proj", "--mode", "compact")
-    assert r.code == 1 and "/compact" in r.err
+    assert r.code == 0 and "armed (compact)" in r.out
 
 
 def test_arm_rejects_bad_engine_and_threshold(run_cli):
