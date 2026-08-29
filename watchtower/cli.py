@@ -441,6 +441,25 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
+    submitter = (getattr(args, "submitter", "") or "").strip()
+    if not submitter:
+        # Same auto-detection --report-to already relies on: a Claude session
+        # UUID is directly addressable; a Codex thread id gets registered as
+        # an addressable @name (see _default_report_to's docstring). Silent by
+        # design here -- a submitter is best-effort metadata, not something
+        # worth a print for every `wt add`.
+        submitter, _rnote = _default_report_to()
+    elif submitter:
+        from . import messages
+        try:
+            messages.resolve_target(submitter)
+        except ValueError as e:
+            print(
+                f"warning: --submitter {submitter!r} does not resolve yet "
+                f"({e}) -- it will still be recorded on the ticket, but "
+                "notifications sent before it's known/registered will fail",
+                file=sys.stderr,
+            )
     item = q.enqueue(
         project=args.queue,
         title=args.title or "",
@@ -455,6 +474,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         value=getattr(args, "value", "") or "",
         confidence=getattr(args, "confidence", "") or "",
         model_floor=getattr(args, "model_floor", "") or "",
+        submitter=submitter,
     )
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
     # Enqueue-and-claim: file the ticket, then immediately mark it in_progress so
@@ -2350,6 +2370,57 @@ def cmd_drain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_subscribe(args: argparse.Namespace) -> int:
+    """Register a target to hear about every enqueue/claim/close/needs-input
+    event on a queue (`wt subscribe <queue> <target>`), or list current
+    subscribers when ``target`` is omitted.
+
+    Delivery reuses the exact ``messages.send`` path a ticket's own
+    ``submitter`` (see ``cmd_add``'s ``--submitter``) is notified through --
+    see ``queue._notify_ticket_event``, which unions the two so a target
+    that's both gets one send, not two."""
+    from . import config
+    queue = q._norm_project(args.queue)
+    target = (args.target or "").strip()
+    if not target:
+        subs = config.subscribers(queue)
+        if args.json:
+            print(json.dumps(subs, indent=2))
+        elif subs:
+            print(f"{queue} subscribers:")
+            for sub in subs:
+                print(f"  {sub}")
+        else:
+            print(f"{queue} has no subscribers")
+        return 0
+    from . import messages
+    try:
+        messages.resolve_target(target)
+    except ValueError as e:
+        print(
+            f"warning: {target!r} does not resolve yet ({e}) -- it will "
+            "still be subscribed, but notifications sent before it's "
+            "known/registered will fail",
+            file=sys.stderr,
+        )
+    config.add_subscriber(queue, target)
+    print(f"SUBSCRIBED: {target} -> {queue}")
+    return 0
+
+
+def cmd_unsubscribe(args: argparse.Namespace) -> int:
+    """Remove a target's subscription to a queue (`wt unsubscribe <queue> <target>`)."""
+    from . import config
+    queue = q._norm_project(args.queue)
+    target = (args.target or "").strip()
+    if not target:
+        print("error: target is required", file=sys.stderr)
+        return 1
+    config.remove_subscriber(queue, target)
+    print(f"UNSUBSCRIBED: {target} -> {queue}")
+    return 0
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     """Unified queue configuration — combines ``wt set`` + ``wt drain`` (WT-97).
 
@@ -3316,6 +3387,8 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Queues", "config"),
     ("Queues", "set"),
     ("Queues", "drain"),
+    ("Queues", "subscribe"),
+    ("Queues", "unsubscribe"),
     ("Queues", "wait"),
     ("Queues", "monitor"),
     ("Queues", "workers"),
@@ -3376,6 +3449,8 @@ COMMAND_HELP: Dict[str, str] = {
     "config": "recommended queue configuration: settings plus auto-drain policy",
     "set": "compatibility alias for basic queue settings; prefer `wt config`",
     "drain": "enable or disable auto-drain for a queue",
+    "subscribe": "register a target for every event on a queue (or list subscribers)",
+    "unsubscribe": "remove a target's subscription to a queue",
     "wait": "block until the queue is drained",
     "monitor": "run a check; file a ticket if it fails",
     "workers": "list workers this CLI started",
@@ -3611,6 +3686,15 @@ def build_parser() -> argparse.ArgumentParser:
                                help="worker/owner id to claim under when --claim is "
                                     "set; defaults to wt-cli-<shell> (stable per "
                                     "terminal so a later bare close composes)")
+        subparser.add_argument(
+            "--submitter", default="",
+            help="addressable target (worker id / @agent name / session UUID) "
+                 "to notify when this ticket is claimed/closed/needs input; "
+                 "defaults to your own session ($CLAUDE_CODE_SESSION_ID / "
+                 "$CODEX_THREAD_ID) like --report-to does. Omit entirely (pass "
+                 "no flag and run with neither env var set) to file with no "
+                 "submitter -- notifications are then skipped silently.",
+        )
 
     s = sub.add_parser("add")
     _add_common_ticket_args(s)
@@ -4046,6 +4130,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
                    help="restrict auto-drain workers to these ticket types (repeatable); omit to clear")
     s.set_defaults(func=cmd_drain)
+
+    s = sub.add_parser(
+        "subscribe",
+        help="register a target for every event on a queue",
+        description=(
+            "Register a target (worker id / @agent name / session UUID) to "
+            "hear about every enqueue/claim/close/needs-input event on a "
+            "queue -- not just tickets it filed itself. Omit the target to "
+            "list current subscribers."
+        ),
+    )
+    s.add_argument("queue", metavar="QUEUE", help="queue name (e.g. CCC, WT)")
+    s.add_argument("target", nargs="?", default="",
+                   help="worker id / @agent name / session UUID; omit to list")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_subscribe)
+
+    s = sub.add_parser(
+        "unsubscribe",
+        help="remove a target's subscription to a queue",
+    )
+    s.add_argument("queue", metavar="QUEUE", help="queue name (e.g. CCC, WT)")
+    s.add_argument("target", help="target previously passed to `wt subscribe`")
+    s.set_defaults(func=cmd_unsubscribe)
 
     s = sub.add_parser(
         "config",
