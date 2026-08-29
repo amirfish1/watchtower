@@ -992,6 +992,7 @@ class GitHubIssuesBackend:
             "confidence": _norm_choice(meta.get("confidence", ""), VALID_CONFIDENCES),
             "needs_input": bool(meta.get("needs_input", False)),
             "block_question": str(meta.get("block_question") or ""),
+            "submitter": str(meta.get("submitter") or ""),
             "claimed_by": (
                 meta.get("claimed_by")
                 or (",".join(assignees) if queue_member and status == "in_progress" and assignees else None)
@@ -1249,6 +1250,7 @@ class GitHubIssuesBackend:
         priority: str = "",
         value: str = "",
         confidence: str = "",
+        submitter: str = "",
     ) -> Dict[str, Any]:
         note = _clip(note, 4000)
         text = _clip(text or note, 24000)
@@ -1270,6 +1272,12 @@ class GitHubIssuesBackend:
             "priority": _norm_choice(priority, VALID_PRIORITIES),
             "value": _norm_choice(value, VALID_VALUES),
             "confidence": _norm_choice(confidence, VALID_CONFIDENCES),
+            # Addressable filer target (WT submitter-notify design, see
+            # queue._notify_ticket_event) -- stored in the issue-body metadata
+            # block like every other ticket field that has no natural GitHub
+            # home (labels only carry booleans/enums cheaply; a free-form
+            # target string belongs in the body, same as `note`/`resolution`).
+            "submitter": str(submitter or ""),
         }
         issue_title = _clip(title or note or "WatchTower ticket", 200)
         body = _body_with_metadata(text, meta)
@@ -1295,6 +1303,7 @@ class GitHubIssuesBackend:
             "type": meta["type"],
             "readiness": meta["readiness"],
             "priority": meta["priority"],
+            "submitter": meta["submitter"],
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }

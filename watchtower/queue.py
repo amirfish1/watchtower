@@ -46,6 +46,9 @@ Item shape::
       "text": "...",                     # full prompt for a worker
       "url": "...", "title": "...", "selector": "...",
       "screenshot_path": "...", "repo_path": "...",
+      "submitter": "",                    # addressable filer target (optional,
+                                          # see enqueue's submitter param) --
+                                          # notified on claim/close/needs-input
       "claimed_by": null, "claimed_at": null, "closed_at": null,
       "claimed_session_id": null,        # real worker/session id, when known
       "resolution": {                    # HOW it was fixed (set on close, optional)
@@ -915,6 +918,79 @@ def timeline(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     return result
 
 
+# Verb shown in a push-back notification for each state transition. Kept
+# separate from the internal event names (see ``_append_history``'s "claim"/
+# "close"/"block") since this text is user-facing, sent verbatim to whoever
+# filed the ticket or subscribed to the queue.
+_NOTIFY_VERBS = {
+    "claimed": "claimed",
+    "closed": "closed",
+    "needs_input": "needs input",
+}
+
+
+def _notify_ticket_event(
+    item: Optional[Dict[str, Any]], event: str, detail: str = ""
+) -> None:
+    """Best-effort push-back to whoever should hear about a ticket's state
+    change.
+
+    Targets = {ticket's own ``submitter`` (captured at file time, see
+    ``enqueue``'s ``submitter`` param)} UNION {this queue's ``subscribers``
+    (``config.subscribers`` -- see ``wt subscribe``/``wt unsubscribe``)},
+    deduplicated so a target that is both gets exactly one send. Delivery
+    reuses the exact path ``--report-to`` already uses: ``messages.send``
+    (resolve + deliver, parking in the outbox on transient failure) -- this
+    is intentionally the *only* place that talks to ``messages``/``config``
+    for this purpose.
+
+    Called from ``claim_next``/``claim_by_ref``/``close``/``block`` -- the
+    four choke points every state transition already funnels through for
+    both the file and the GitHub backend, so no other caller (``cli.py``,
+    ``dashboard.py``, the reconciler) needs to know this exists.
+
+    ``event`` is one of ``"claimed"`` / ``"closed"`` / ``"needs_input"``.
+    Never raises: a missing/unresolvable target, an import hiccup, or a
+    delivery failure must never fail the underlying claim/close/block --
+    notification is strictly best-effort, exactly like the rest of this
+    module's optional side effects (see ``_log``).
+    """
+    if not item or not event:
+        return
+    try:
+        from . import messages
+        from . import config as _config
+    except Exception:
+        return
+    targets: List[str] = []
+    seen: set = set()
+
+    def _add(raw: Any) -> None:
+        t = str(raw or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            targets.append(t)
+
+    _add(item.get("submitter"))
+    try:
+        for target in _config.subscribers(str(item.get("project") or "")):
+            _add(target)
+    except Exception:
+        pass
+    if not targets:
+        return
+    ref = str(item.get("ref") or item.get("number") or "?")
+    verb = _NOTIFY_VERBS.get(event, event)
+    text = f"[watchtower] {ref} {verb}"
+    if detail:
+        text += f" — {_clip(detail, 200)}"
+    for target in targets:
+        try:
+            messages.send(target, text)
+        except Exception:
+            pass  # best-effort -- a delivery hiccup never fails the transition
+
+
 def enqueue(
     *,
     note: str,
@@ -934,8 +1010,18 @@ def enqueue(
     value: str = "",
     confidence: str = "",
     model_floor: str = "",
+    submitter: str = "",
 ) -> Dict[str, Any]:
-    """Append a new ``open`` item and return it (with its assigned ref)."""
+    """Append a new ``open`` item and return it (with its assigned ref).
+
+    ``submitter``: an addressable target (worker id / ``@agent`` name /
+    session UUID -- the same shape ``messages.resolve_target`` already
+    resolves for ``--report-to``) identifying whoever filed this ticket, so
+    ``_notify_ticket_event`` can push claim/close/needs-input status back to
+    them. Optional and best-effort: a caller with no addressable identity at
+    filing time (a legacy caller, an anonymous annotate-widget POST) leaves it
+    "" and the ticket simply gets no submitter notifications -- this never
+    blocks filing."""
     note = _clip(note, 4000)
     if not note and not text:
         raise ValueError("note or text is required")
@@ -966,6 +1052,7 @@ def enqueue(
             priority=priority,
             value=value,
             confidence=confidence,
+            submitter=submitter,
         )
         _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
         return saved
@@ -1001,6 +1088,7 @@ def enqueue(
             # booleans, so both backends hand downstream code the same shape.
             "no_auto_drain": False,
             "run_requested": False,
+            "submitter": str(submitter or ""),
             "claimed_by": None,
             "claimed_at": None,
             "closed_at": None,
@@ -1519,6 +1607,7 @@ def claim_next(
         )
         if item and not item.get("stop"):
             _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
+            _notify_ticket_event(item, "claimed")
         return item
 
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
@@ -1541,6 +1630,7 @@ def claim_next(
         _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
+    _notify_ticket_event(item, "claimed")
     return item
 
 
@@ -1562,6 +1652,7 @@ def claim_by_ref(
         item = backend.claim_by_ref(ref, session_id, session_uuid=session_uuid)
         if item:
             _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
+            _notify_ticket_event(item, "claimed")
         return item
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
     with _FileLock(_lock_path()):
@@ -1581,6 +1672,7 @@ def claim_by_ref(
         _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
+    _notify_ticket_event(item, "claimed")
     return item
 
 
@@ -1859,10 +1951,17 @@ def close(
     ``expect_owner``). Callers that close by ref without asserting ownership
     (e.g. dedup-close) pass no ``session_id`` and are unaffected. ``force=True``
     bypasses the guard for a human deliberately force-closing someone's ticket."""
-    return update_status(
+    item = update_status(
         ident, "closed", session_id, resolution=resolution,
         expect_owner="" if force else str(session_id or ""),
     )
+    if item and item.get("status") == "closed":
+        res = item.get("resolution") or {}
+        summary = res.get("summary", "") if isinstance(res, dict) else (
+            res if isinstance(res, str) else ""
+        )
+        _notify_ticket_event(item, "closed", detail=summary)
+    return item
 
 
 def release(ident: Any, session_id: str = "", force: bool = False) -> Optional[Dict[str, Any]]:
@@ -1922,9 +2021,12 @@ def block(
     """
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
-        return backend.block(
+        item = backend.block(
             ident, session_id=session_id, question=question, progress=progress,
         )
+        if item:
+            _notify_ticket_event(item, "needs_input", detail=question)
+        return item
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -1957,6 +2059,7 @@ def block(
                     f"{it.get('ref', '?')} — {_clip(question, 240)}",
                     queue=it.get("project", ""),
                 )
+                _notify_ticket_event(it, "needs_input", detail=question)
                 return it
     return None
 
