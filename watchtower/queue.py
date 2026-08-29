@@ -1491,9 +1491,23 @@ def _verify_worker_live(session_id: str, session_uuid: str = "") -> None:
         if session_id not in live_ids:
             if _hosted_codex_thread_owns_worker(session_id, session_uuid):
                 return
+            dead = next(
+                (w for w in known if str(w.get("worker_id", "")) == session_id),
+                {},
+            )
+            pid_hint = (
+                f" (recorded pid {dead['pid']} — verify with `ps -p {dead['pid']}`)"
+                if dead.get("pid")
+                else ""
+            )
             raise ValueError(
                 f"worker {session_id!r} is registered as a spawned worker but is "
-                "not currently alive — claim rejected to prevent a silent requeue"
+                f"not currently alive{pid_hint} — claim rejected to prevent a "
+                "silent requeue. This almost always means the worker was "
+                "released/reaped and its process exited; the reconciler spawns "
+                "a fresh worker with a new id when staffing is needed. If you "
+                "are a resumed session from that dead worker: do not retry the "
+                "claim and do not file a bug about this message — end your turn."
             )
     except ValueError:
         raise

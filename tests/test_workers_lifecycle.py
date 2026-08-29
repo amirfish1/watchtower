@@ -1056,6 +1056,22 @@ def test_claim_by_ref_rejects_dead_spawned_worker(wt):
     assert wt.q.get(item["ref"])["status"] == "open"
 
 
+def test_dead_worker_rejection_message_guides_resumed_sessions(wt):
+    """OPS-832: a stale resumed session retried the rejection 3x and filed a
+    bug because the message read as transient. The message must name the
+    recorded pid and tell the caller not to retry or file."""
+    import pytest
+    rec = _dead_worker(wt, "Q")
+    dead_id = rec["worker_id"]
+    wt.q.enqueue(project="Q", note="work")
+    with pytest.raises(ValueError) as excinfo:
+        wt.q.claim_next(dead_id, project="Q")
+    msg = str(excinfo.value)
+    assert "not currently alive" in msg
+    assert f"ps -p {rec['pid']}" in msg
+    assert "do not retry" in msg
+
+
 def test_claim_rebinds_continued_codex_worker_to_new_process(wt, monkeypatch, capsys):
     """A Codex goal continuation keeps its thread id but gets a new process.
 
