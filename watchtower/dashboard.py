@@ -1500,6 +1500,17 @@ class _Handler(BaseHTTPRequestHandler):
                     source=str(data.get("source") or "api"),
                     text=str(data.get("text") or ""),
                     project=q._norm_project(name),
+                    # Optional addressable filer target (worker id / @agent
+                    # name / session UUID) so this ticket's claim/close/
+                    # needs-input events push back to whoever filed it (see
+                    # queue._notify_ticket_event). The annotate widget itself
+                    # (contrib/annotate-widget.js) POSTs anonymously from any
+                    # third-party page today and has no session identity to
+                    # supply -- an authenticated caller (e.g. a CCC session
+                    # that knows its own worker/session id) can pass one; an
+                    # anonymous POST simply omits it and gets no
+                    # notifications, same as any legacy ticket.
+                    submitter=str(data.get("submitter") or ""),
                 )
             except Exception as exc:  # noqa: BLE001
                 self._json(500, {"error": str(exc)})
