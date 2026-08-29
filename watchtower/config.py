@@ -13,6 +13,14 @@ surprise worker spawns on queues that are just parking lots.
 It also holds ``grace_s`` (see :data:`DEFAULT_GRACE_S`), the other queue-level
 input to a GitHub-backed ticket's eligibility.
 
+It also holds ``subscribers``: a list of addressable targets (worker id /
+``@agent`` name / session UUID -- the same shape ``messages.resolve_target``
+already resolves for a ticket's ``submitter`` and for ``--report-to``) that
+hear about every enqueue/claim/close/needs-input event on a queue, not just
+their own tickets. Managed via ``wt subscribe``/``wt unsubscribe``; delivered
+by ``queue._notify_ticket_event``, the same helper that pushes a ticket's own
+``submitter`` its status changes.
+
 Stored as ``~/.watchtower/queue-config.json`` = ``{queue: {auto_drain: bool}}``.
 """
 
@@ -317,6 +325,78 @@ def claim_types(queue: str) -> list:
     """Return the configured claim-type restriction for a queue, or [] (all)."""
     v = _queue_entry(queue).get("claim_types", [])
     return list(v) if isinstance(v, list) else []
+
+
+def _norm_subscriber_targets(values: Any) -> list:
+    """Trimmed, order-preserving, de-duplicated list of subscriber targets.
+
+    A target is opaque here (worker id / ``@agent`` name / session UUID) --
+    the same shape ``messages.resolve_target`` resolves for a ticket's
+    ``submitter`` and for ``--report-to``. This module never imports
+    ``messages`` (it would be circular: ``messages`` imports ``queue``, which
+    can import ``config``), so a target is stored as typed and only resolved
+    at send time by ``queue._notify_ticket_event``."""
+    out: list = []
+    seen: set = set()
+    for raw in values or []:
+        t = str(raw or "").strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def set_subscribers(queue: str, targets: Any) -> Dict[str, Any]:
+    """Replace this queue's subscriber list wholesale (see ``subscribers``).
+
+    Empty/None clears the list. Subscribers hear about every enqueue/claim/
+    close/needs-input event on the queue, not just tickets they filed
+    themselves (see ``add_subscriber``/``remove_subscriber`` for the
+    subscribe/unsubscribe CLI's incremental counterpart)."""
+    data = _load()
+    q = data.setdefault(queue, {})
+    norm = _norm_subscriber_targets(targets)
+    if norm:
+        q["subscribers"] = norm
+    else:
+        q.pop("subscribers", None)
+    _save(data)
+    return q
+
+
+def subscribers(queue: str) -> list:
+    """Return the configured subscriber targets for a queue, or [] (none)."""
+    v = _queue_entry(queue).get("subscribers", [])
+    return list(v) if isinstance(v, list) else []
+
+
+def add_subscriber(queue: str, target: str) -> Dict[str, Any]:
+    """Add one target to a queue's subscriber list (idempotent)."""
+    target = str(target or "").strip()
+    if not target:
+        raise ValueError("target is required")
+    data = _load()
+    q = data.setdefault(queue, {})
+    subs = _norm_subscriber_targets(q.get("subscribers"))
+    if target not in subs:
+        subs.append(target)
+    q["subscribers"] = subs
+    _save(data)
+    return q
+
+
+def remove_subscriber(queue: str, target: str) -> Dict[str, Any]:
+    """Remove one target from a queue's subscriber list, if present."""
+    target = str(target or "").strip()
+    data = _load()
+    q = data.setdefault(queue, {})
+    subs = [t for t in _norm_subscriber_targets(q.get("subscribers")) if t != target]
+    if subs:
+        q["subscribers"] = subs
+    else:
+        q.pop("subscribers", None)
+    _save(data)
+    return q
 
 
 def set_repo_path(queue: str, path: str) -> Dict[str, Any]:
