@@ -323,6 +323,84 @@ Each is flagged inline in the row it affects, in the Desired column above.
   guarantee that `c115c5cc` says the harness does not currently make.
 
 
+## Which verb each use case needs
+
+Arrows are labelled with the verb that use case actually needs, plus any
+`on_busy` / `expire` / `position` modifier. Rows 10, 11 and 18-20 are omitted —
+per the note above they are a transport, an inbound path, and API entry points,
+not use cases.
+
+```mermaid
+flowchart LR
+  subgraph WTC["WatchTower callers"]
+    R1["#1 ticket notify"]
+    R2["#2 wt send"]
+    R3["#3 wt steer"]
+    R5["#5 wt ask"]
+    R15["#15 release instruction"]
+    R16["#16 queue nudge"]
+    R17["#17 spawn-time goal"]
+  end
+
+  subgraph CCCC["CCC callers"]
+    R4["#4 ticket comment / answered question"]
+    R6["#6 dashboard textbox"]
+    R7["#7 Esc / Kill button"]
+    R8["#8 Codex steer"]
+    R9["#9 ACP steer (Grok / Kimi)"]
+    R13["#13 /compact"]
+    R14["#14 /clear"]
+  end
+
+  subgraph HARN["worker harness"]
+    R12["#12 child completion report"]
+  end
+
+  STEER{{"steer<br/>next safe seam<br/>work survives"}}
+  QUEUE{{"queue<br/>after the turn ends"}}
+  ENGD{{"engine_default<br/>native per-engine behaviour"}}
+  ABORT{{"abort<br/>control verb, no text"}}
+
+  R1  -->|steer| STEER
+  R2  -->|steer| STEER
+  R3  -->|steer| STEER
+  R4  -->|steer| STEER
+  R5  -->|"steer · on_busy reject"| STEER
+  R12 -->|steer| STEER
+  R16 -->|"steer · expire 30s"| STEER
+  R8  -->|"steer ✓ already correct"| STEER
+  R9  -->|"steer · only fakeable"| STEER
+
+  R13 -->|"queue · expire 5m"| QUEUE
+  R14 -->|"queue · expire 5m"| QUEUE
+  R15 -->|queue| QUEUE
+  R17 -->|queue| QUEUE
+
+  R6  -->|"engine_default ✓ do not change"| ENGD
+
+  R7  -->|"abort ✓ already correct"| ABORT
+
+  STEER --> NATIVE["Native seam exists<br/>Codex turn/steer<br/>Claude tool boundary"]
+  STEER --> NOSEAM["No seam<br/>#9 ACP: only session/cancel<br/>#3 WT: no interrupt primitive"]
+  QUEUE --> DURABLE["CCC terminal_queue<br/>hold + retry + expire<br/>CCC-1002 shipped the expiry"]
+  ENGD  --> PASS["pass through unchanged"]
+  ABORT --> CTRL["interrupt control request<br/>or engine-native cancel"]
+
+  classDef ok fill:#1b3a1b,stroke:#4c8c4c,color:#dfe;
+  classDef gap fill:#3a1b1b,stroke:#8c4c4c,color:#fde;
+  class NATIVE,DURABLE,PASS,CTRL ok;
+  class NOSEAM gap;
+```
+
+**Reading it:** nine of the fifteen use cases want the same verb — `steer`. Four
+want `queue`. One wants `engine_default` and one wants `abort`, and both of those
+are already correct today.
+
+The single red box is the whole remaining problem: **two callers ask for `steer`
+on a transport with no seam.** #9 (ACP) can only fake it with
+`session/cancel` + resend; #3 (`wt steer`) owns no interrupt primitive at all.
+Everything else already has an implementation or needs only a rename.
+
 ## Call graph — where the 17 paths converge
 
 Four chokepoints. Everything else is an entry point feeding one of them.
