@@ -514,6 +514,27 @@ The second should carry the same warning the first does.
 > The sender receives a transcript-confirmed `delivered` receipt. Nothing
 > executes, and neither side sees an error. `wt send <session> "/code-review"`
 > reports success and delivers the string `/code-review`.
+>
+> **Measured, 2026-08-30** (own session, pid 98351, CC 2.1.251, authenticated,
+> `priority: next`; full log in `~/dev/scratch/uds-slash-test/results.md`).
+> Two variants, both `send_lines -> {"ok": True}`, **neither executed**:
+>
+> | Variant | Frame `message.content` | Result |
+> |---|---|---|
+> | Wrapped — what CCC/WT actually send | `<cross-session-message …>\n/compact\n</cross-session-message>` | delivered as inbound peer text, no compaction |
+> | Raw, unwrapped — diagnostic only | `/compact` | delivered as inbound peer text, no compaction |
+>
+> **The `<cross-session-message>` wrapper is not the cause.** An earlier draft of
+> this section inferred that the wrapper's leading newline hid the slash;
+> stripping the wrapper changes nothing. Claude Code's peer listener injects the
+> frame's `message.content` as user *message content* and never runs it through
+> the slash-command parser. There is no framing that makes a slash command
+> execute over the peer socket.
+>
+> **Consequence for the Phase 4 guard** (`docs/ccc-1000-implementation-plan.md`):
+> the fix cannot be "unwrap before sending" — that is still a silent no-op. Any
+> `/command` bound for UDS must be **refused at the sender** and routed to a
+> transport that can execute it.
 
 **UDS is `steer`, structurally.** A frame delivered over Claude Code's native
 peer socket lands at *"the receiver's next tool boundary or turn end"* and
