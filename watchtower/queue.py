@@ -2054,11 +2054,29 @@ def ack_resolution(
     already-acked entry refreshes nothing and re-unacking is a no-op.
 
     Returns the updated item, None when no item matches, and raises
-    ``ValueError`` for a ticket with no resolution or an out-of-range index."""
-    if _github_backend_for_project(_project_from_ident(ident)) is not None:
-        raise ValueError(
-            f"{ident} is in a GitHub-backed queue; resolution acks aren't supported there"
+    ``ValueError`` for a ticket with no resolution or an out-of-range index.
+
+    Works the same on GitHub-backed queues, where the ack maps round-trip
+    through the issue's metadata block instead of the local store."""
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        # GitHub-backed queues keep the same index-keyed ack maps in the
+        # issue's metadata block (github_backend.ack_resolution).
+        item = backend.ack_resolution(
+            ident,
+            targets=targets,
+            all_items=all_items,
+            by=by,
+            session_id=session_id,
+            undo=undo,
         )
+        if item:
+            _log(
+                "UNACK" if undo else "ACK",
+                f"{item.get('ref', ident)}",
+                queue=item.get("project", ""),
+            )
+        return item
     actor_kind = by if by in ("worker", "human", "system") else "human"
     pairs = [] if targets is None else [(str(f), int(i)) for f, i in targets]
     for field, _idx in pairs:

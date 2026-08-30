@@ -2414,3 +2414,84 @@ def test_cli_status_prints_warning_when_github_alert_active(tmp_path, monkeypatc
     out = capsys.readouterr().out
     assert "GitHub unreachable" in out
     assert "gh auth login required" in out
+
+
+def test_github_backend_acks_resolution_chips_in_issue_metadata(tmp_path, monkeypatch):
+    """WATCHTOWER-13: `wt ack` works on GitHub-backed queues.
+
+    The ack maps round-trip through the issue-body metadata block exactly like
+    the resolution lists themselves, so a chip a human cleared stays cleared
+    across re-reads -- and acking must not post a comment or re-close.
+    """
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    q.enqueue(project="GHI", title="acked chips", note="n", text="b")
+    q.claim_next("worker-1", project="GHI")
+    q.close(
+        "GHI-1",
+        "worker-1",
+        resolution={
+            "summary": "done",
+            "unresolved": ["stale one", "still live"],
+            "caveats": ["watch out"],
+        },
+    )
+    comments_before = len(json.loads(state.read_text())["issues"][0]["comments"])
+
+    item = q.ack_resolution("GHI-1", targets=[("unresolved", 0)], by="amir")
+    res = item["resolution"]
+    assert q.is_acked(res, "unresolved", 0)
+    assert not q.is_acked(res, "unresolved", 1)
+    assert res["unresolved_ack"]["0"]["by"] == "amir"
+    assert res["unresolved"] == ["stale one", "still live"]
+    assert item["status"] == "closed"
+    # Bookkeeping only: no new issue comment, no re-close.
+    assert len(json.loads(state.read_text())["issues"][0]["comments"]) == comments_before
+
+    # Survives a fresh read of the issue, and is idempotent.
+    reread = q.get("GHI-1")["resolution"]
+    assert reread["unresolved_ack"] == res["unresolved_ack"]
+    again = q.ack_resolution("GHI-1", targets=[("unresolved", 0)], by="amir")
+    assert again["resolution"]["unresolved_ack"]["0"]["at"] == res["unresolved_ack"]["0"]["at"]
+
+    # --all covers every field; undo removes it again.
+    every = q.ack_resolution("GHI-1", all_items=True)["resolution"]
+    assert every["caveats_ack"].keys() == {"0"}
+    assert every["unresolved_ack"].keys() == {"0", "1"}
+    undone = q.ack_resolution("GHI-1", targets=[("caveats", 0)], undo=True)["resolution"]
+    assert "caveats_ack" not in undone
+
+    assert [e["event"] for e in q.get("GHI-1")["history"]][-4:] == [
+        "close", "ack", "ack", "unack",
+    ]
+
+
+def test_github_backend_ack_rejects_bad_field_index_and_ticket(tmp_path, monkeypatch):
+    import watchtower.github_backend as github_backend_mod
+
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    q.enqueue(project="GHI", title="no resolution yet", note="n", text="b")
+    with pytest.raises(ValueError, match="no caveat/follow-up/unresolved"):
+        q.ack_resolution("GHI-1", all_items=True)
+
+    q.claim_next("worker-1", project="GHI")
+    q.close("GHI-1", "worker-1", resolution={"summary": "s", "unresolved": ["a"]})
+    with pytest.raises(ValueError, match="unknown resolution field"):
+        q.ack_resolution("GHI-1", targets=[("bogus", 0)])
+    with pytest.raises(ValueError, match="no index 4"):
+        q.ack_resolution("GHI-1", targets=[("unresolved", 3)])
+    with pytest.raises(ValueError, match="nothing selected"):
+        q.ack_resolution("GHI-1", targets=[])
+    # A ref with no issue behind it surfaces the backend's own not-found
+    # error, as every other GitHub-backed operation does.
+    with pytest.raises(github_backend_mod.GitHubBackendError):
+        q.ack_resolution("GHI-999", all_items=True)

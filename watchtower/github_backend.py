@@ -576,6 +576,11 @@ def _type_rank(it: Dict[str, Any]) -> int:
     return {"bug": 0, "feature": 1}.get(_effective_type(it.get("type")), 2)
 
 
+# Mirrors queue.RESOLUTION_LIST_FIELDS (defined here rather than imported:
+# queue imports this module, not the other way round).
+RESOLUTION_LIST_FIELDS = ("caveats", "follow_ups", "unresolved")
+
+
 def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
     if resolution is None:
         return None
@@ -596,6 +601,19 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
         vals = [_clip(v, 4000) for v in raw if str(v or "").strip()]
         if vals:
             out[field] = vals
+    # Acknowledgements (queue.ack_resolution) ride alongside their list as
+    # ``<field>_ack``; keep them through normalization so a re-read of the
+    # issue metadata doesn't silently un-acknowledge every chip a human
+    # cleared. Mirrors queue._normalize_resolution.
+    for field in ("caveats", "follow_ups", "unresolved"):
+        acks = resolution.get(f"{field}_ack")
+        if isinstance(acks, dict) and acks and out.get(field):
+            kept = {
+                str(k): v for k, v in acks.items()
+                if str(k).isdigit() and int(k) < len(out[field])
+            }
+            if kept:
+                out[f"{field}_ack"] = kept
     return out or None
 
 
@@ -967,6 +985,9 @@ class GitHubIssuesBackend:
             "caveats": meta.get("resolution_caveats", []),
             "follow_ups": meta.get("resolution_follow_ups", []),
             "unresolved": meta.get("resolution_unresolved", []),
+            "caveats_ack": meta.get("resolution_caveats_ack") or {},
+            "follow_ups_ack": meta.get("resolution_follow_ups_ack") or {},
+            "unresolved_ack": meta.get("resolution_unresolved_ack") or {},
         })
 
         item: Dict[str, Any] = {
@@ -1618,6 +1639,8 @@ class GitHubIssuesBackend:
                 "claimed_by", "claimed_at", "closed_by", "closed_at",
                 "resolution_summary", "resolution_caveats",
                 "resolution_follow_ups", "resolution_unresolved",
+                "resolution_caveats_ack", "resolution_follow_ups_ack",
+                "resolution_unresolved_ack",
                 "needs_input", "block_question",
             ):
                 meta.pop(key, None)
@@ -1646,6 +1669,15 @@ class GitHubIssuesBackend:
             meta["resolution_caveats"] = norm.get("caveats", [])
             meta["resolution_follow_ups"] = norm.get("follow_ups", [])
             meta["resolution_unresolved"] = norm.get("unresolved", [])
+            # A (re-)close writes a fresh resolution, so acks carry over only
+            # when the caller handed them back -- same as the local backend,
+            # where close replaces `resolution` wholesale.
+            for field in ("caveats", "follow_ups", "unresolved"):
+                acks = norm.get(f"{field}_ack")
+                if acks:
+                    meta[f"resolution_{field}_ack"] = acks
+                else:
+                    meta.pop(f"resolution_{field}_ack", None)
         _append_history(meta, "close", session_id=str(session_uuid or ""),
                          worker=str(session_id or meta.get("closed_by") or ""),
                          resolution=norm)
@@ -1666,6 +1698,98 @@ class GitHubIssuesBackend:
             if norm:
                 closed["resolution"] = norm
         return closed
+
+    def ack_resolution(
+        self,
+        ident: Any,
+        targets: Any = None,
+        all_items: bool = False,
+        by: str = "human",
+        session_id: str = "",
+        undo: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Acknowledge (or un-acknowledge) resolution warnings on an issue.
+
+        The GitHub twin of ``queue.ack_resolution``: same index-keyed
+        ``<field>_ack`` maps, same idempotence, same errors. Acks are stored
+        in the issue's metadata block as ``resolution_<field>_ack`` — the same
+        round-trip the resolution lists themselves already use — so acking
+        edits the body only and never touches the close comment or re-fires a
+        close. No issue comment is posted: an ack is bookkeeping about noise,
+        and a comment per dismissed chip is exactly the noise it removes.
+        """
+        pairs = [] if targets is None else [(str(f), int(i)) for f, i in targets]
+        for field, _idx in pairs:
+            if field not in RESOLUTION_LIST_FIELDS:
+                raise ValueError(
+                    f"unknown resolution field {field!r}; expected one of "
+                    f"{', '.join(RESOLUTION_LIST_FIELDS)}"
+                )
+        item = self.get(ident)
+        if item is None:
+            return None
+        ref = item.get("ref", ident)
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        lists = {
+            field: list(meta.get(f"resolution_{field}") or [])
+            for field in RESOLUTION_LIST_FIELDS
+        }
+        if not any(lists.values()):
+            raise ValueError(
+                f"{ref} has no caveat/follow-up/unresolved items to acknowledge"
+            )
+        wanted = list(pairs)
+        if all_items:
+            wanted = [
+                (field, i)
+                for field in RESOLUTION_LIST_FIELDS
+                for i in range(len(lists[field]))
+            ]
+        if not wanted:
+            raise ValueError(
+                "nothing selected: pass all_items=True or at least one "
+                "(field, index) target"
+            )
+        for field, idx in wanted:
+            n = len(lists[field])
+            if idx < 0 or idx >= n:
+                raise ValueError(
+                    f"{ref} has {n} {field} item{'' if n == 1 else 's'}; "
+                    f"no index {idx + 1}"
+                )
+        now = _now_iso()
+        changed = []
+        for field, idx in wanted:
+            key = f"resolution_{field}_ack"
+            acks = meta.get(key)
+            if not isinstance(acks, dict):
+                acks = {}
+            if undo:
+                if acks.pop(str(idx), None) is not None:
+                    changed.append((field, idx))
+            elif str(idx) not in acks:
+                acks[str(idx)] = {"at": now, "by": _clip(str(by or "human"), 128)}
+                changed.append((field, idx))
+            if acks:
+                meta[key] = acks
+            else:
+                meta.pop(key, None)
+        if not changed:
+            return item
+        detail = ", ".join(f"{f}#{i + 1}" for f, i in changed)
+        _append_history(
+            meta,
+            "unack" if undo else "ack",
+            worker=str(by or ""),
+            session_id=str(session_id or ""),
+            text=detail,
+        )
+        self._run([
+            "issue", "edit", str(item["number"]),
+            *self._repo_args(),
+            "--body", _body_with_metadata(body, meta),
+        ])
+        return self.get(ident)
 
     def block(
         self,
