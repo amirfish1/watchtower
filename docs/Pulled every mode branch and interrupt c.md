@@ -401,6 +401,48 @@ on a transport with no seam.** #9 (ACP) can only fake it with
 `session/cancel` + resend; #3 (`wt steer`) owns no interrupt primitive at all.
 Everything else already has an implementation or needs only a rename.
 
+## The UDS layer — which use cases can use the peer socket
+
+**UDS is `steer`, structurally.** A frame delivered over Claude Code's native
+peer socket lands at *"the receiver's next tool boundary or turn end"* and
+**cannot interrupt** — no such primitive exists on that transport. CCC sets
+`priority: "now" if mode == "steer" else "next"`, but either way the receiver's
+own harness picks the seam. That makes UDS the only transport that implements
+`steer` correctly *by construction* rather than by trying and hoping.
+
+**Eligibility is already gated on "is the sender an agent, not a human?"**
+(`server.py:59395`):
+
+```python
+_UDS_ELIGIBLE_SOURCES = ("ask", "group-chat-coordinate", "group-chat-auto-nudge",
+                         "group-chat-manual-nudge", "announced_from", "wt")
+```
+
+Two comments in that region state the principle outright: `group-chat-add-participant`
+is excluded because "adding a participant is **a human action taken in the
+dashboard UI, not an agent-to-agent relay**", and `_inject_source_for_request`
+classifies anything else as `"api"`, which "**stays on the legacy transports**".
+
+So the rule is: **everything except the clearly-human senders (#6 dashboard, #18
+plain api) is a candidate for UDS.**
+
+| Row | UDS today | Why |
+|---|---|---|
+| #1 #2 #3 #15 #16 #17 | eligible (`source="wt"`) | WT-origin, reaches CCC via the delegate |
+| #5 | eligible (`source="ask"`) | first entry in the list |
+| #12 | eligible (`source="announced_from"`) | the report-back footer carries the field |
+| #4 | eligible via `wt` | CCC calls `wt_messages.send`, which re-enters as WT-origin |
+| **#6** | **excluded by design** | dashboard UI is a human sender |
+| **#18** | **excluded by design** | plain `api` source |
+| #7 | impossible | `abort` has no UDS representation |
+| #8 #9 | impossible | target is Codex / ACP, not a Claude peer |
+| #13 #14 | impossible | slash-commands need CCC's own `compact_session_context` |
+
+**This closes most of the gap in the diagram above.** #3 (`wt steer`) is not
+blocked: it has no *interrupt* primitive, but it does not need one — it needs
+`steer`, and UDS is exactly that, and WT has already vendored `peer_uds.py`. The
+genuine remainder is #9 alone, where the target is not a Claude peer at all.
+
 ## Call graph — where the 17 paths converge
 
 Four chokepoints. Everything else is an entry point feeding one of them.
