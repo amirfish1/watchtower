@@ -48,20 +48,20 @@ That opt-in is `force_queue` (originally spelled `mode="send_queue"`).
 |---|---|---|---|---|---|---|
 | 1 | WT ticket notify (claim/close/block, FYI) | WT queue → ticket submitter/subscriber session | **WT** — `queue.py:_notify_ticket_event` → `messages.send` | No (WT's own fifo/tty/resume adapters) | `steer`, accidental — raw write, no turn-open check | `steer` — an orchestrator may need a ticket-close *while* mid-task |
 | 2 | `wt send` (ad-hoc chat) | User at CLI → any target session | **WT** — `messages.deliver`, mode=`send` | No | `steer`, accidental | `steer` |
-| 3 | `wt steer` (user says "redirect NOW") | User at CLI → live WT worker session | **WT** — `messages.deliver`, mode=`steer` → WT's own fifo/tty write; only reaches **CCC** via the delegate adapter | **No, unless** target is a CCC-owned session and delegate falls through to `/api/inject-input` | `steer`, accidental — never `override`, despite the name | `override` — **Q1**: WT owns no interrupt primitive. Fail loudly, or degrade and say so? |
-| 4 | CCC ticket-comment / answered-blocked-question (server.py:2515,2543) | CCC server → idle/blocked worker session | **CCC → WT** — CCC imports `watchtower.messages` and calls `wt_messages.send(mode="steer")` | Same as #3 — depends on delegate fallthrough | `override` requested, `steer` delivered | `steer` + `position: front` — target is idle; "steer" here only ever meant jump-the-queue |
+| 3 | `wt steer` (user says "redirect NOW") | User at CLI → live WT worker session | **WT** — `messages.deliver`, mode=`steer` → WT's own fifo/tty write; only reaches **CCC** via the delegate adapter | **No, unless** target is a CCC-owned session and delegate falls through to `/api/inject-input` | `steer`, accidental — it never destroys anything, despite the name | `steer` — **keep the name honest**: if it is called steer it must mean what Codex means. Stopping the worker is the separate `abort` verb, chosen explicitly. |
+| 4 | CCC ticket-comment / answered-blocked-question (server.py:2515,2543) | CCC server → idle/blocked worker session | **CCC → WT** — CCC imports `watchtower.messages` and calls `wt_messages.send(mode="steer")` | Same as #3 — depends on delegate fallthrough | `abort`+deliver requested, plain `steer` delivered | `steer` — a comment may arrive while the worker is *busy* and genuinely need to redirect it, so this must not assume an idle target. To stop it, call `abort` first. |
 | 5 | `wt ask` | Caller (CLI/agent) → target session, reply back to caller | **WT** — `cli.cmd_ask` → `messages.ask` (`messages.py:1805`); CCC's own parallel path is `ask_session_via_live_tail` / `ask_session_and_wait` | No | `steer`, accidental | `steer`, `on_busy: reject` — a caller is blocked waiting, so holding is worse than failing |
-| 6 | CCC dashboard textbox while session is actively running (headless, no tty, mode=steer) | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_inject_text_into_session` direct, gate at `server.py:60496` | **Yes** | `override` | `override` — ✓ correct today |
+| 6 | CCC dashboard textbox while session is actively running (headless, no tty, mode=steer) | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_inject_text_into_session` direct, gate at `server.py:60496` | **Yes** | `abort`+deliver, fused | `steer` — **not** a fused destroy. The abort here is a workaround for a missing seam (see below), not a decision about what steer means. |
 | 7 | Esc/Kill button | User in CCC dashboard → live CCC-owned headless session | **CCC** — the button on top of #19: `/api/inject-esc` → `_interrupt_session` → `_interrupt_claude_headless_local` (`server.py:61171`) is only **one branch** of six | Yes | `abort` | `abort` — ✓ correct today |
 | 8 | Codex steer | User in CCC dashboard → live Codex session | **CCC** — `resume_session_codex(steer=True)` | N/A — Codex-native | `steer` — native Codex `turn/steer` (`server.py:36307`) | `steer` — ✓ correct today. **Corrected 2026-08-30**: Codex steer preserves the turn |
-| 9 | ACP (Grok/Kimi) steer while busy | User in CCC dashboard → live ACP session | **CCC** — `session/cancel` + resend | N/A — ACP-native | `abort` + resend — kills the turn, no seam primitive | `steer` — **Q2**: ACP exposes no safe seam; can this be anything but faked? |
-| 10 | CCC→foreign session outbound (`_try_uds_peer_delivery`, used by ask + cross-model bridge) | CCC → foreign (non-CCC-owned) Claude session | **CCC** — `_try_uds_peer_delivery` (`server.py:59767`); sets `priority: "now"/"next"` in JSON body, delivered via receiver's native `SendMessage` inbox | No — foreign process, no FIFO CCC controls | `steer` / `queue` via the frame's `priority: now`/`next` | `steer` — `override` is structurally impossible on this transport |
+| 9 | ACP (Grok/Kimi) steer while busy | User in CCC dashboard → live ACP session | **CCC** — `session/cancel` + resend | N/A — ACP-native | `abort` + resend — kills the turn, no seam primitive | `steer`, emulated as `abort_first` — **Q2**: ACP exposes no seam, only `session/cancel`, so this is the one place the emulation is forced. |
+| 10 | CCC→foreign session outbound (`_try_uds_peer_delivery`, used by ask + cross-model bridge) | CCC → foreign (non-CCC-owned) Claude session | **CCC** — `_try_uds_peer_delivery` (`server.py:59767`); sets `priority: "now"/"next"` in JSON body, delivered via receiver's native `SendMessage` inbox | No — foreign process, no FIFO CCC controls | `steer` / `queue` via the frame's `priority: now`/`next` | `steer` — destruction is structurally impossible on this transport |
 | 11 | CCC inbound peer socket (Slice 3, another session → CCC) | Foreign peer session → CCC-owned session | **CCC** — `_ccc_peer_handle_connection` (`server.py:59701`) — only routes ask-replies + report envelopes | No — general chat frames get logged `CCC-PEER-UNROUTED` and dropped | dropped entirely (`CCC-PEER-UNROUTED`) | `queue` — **Q3**: should a peer frame ever be allowed to `steer`? |
 | 12 | Worker child → parent completion report | Spawned worker child → parent session | **worker harness → CCC** — curl footer to CCC's HTTP API, or the harness's own `SendMessage` | Sometimes (report envelope path) | `steer`, accidental | `queue` — parent is idle/polling anyway |
-| 13 | Steered `/compact` (variant of #6) | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_inject_text_into_session` → interrupt → `compact_session_context` (`server.py:60312`) | **Yes** | `override` | `override`, `on_busy: drop, expire 5m` — **Q4**: a 12-min-stale `/compact` broke session 4dbc1dfa today |
-| 14 | Steered `/clear` (variant of #6, CCC-935) | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_inject_text_into_session` → interrupt → `clear_session_context` (`server.py:60326`) | **Yes** | `override` | `override`, `on_busy: drop, expire 5m` — same rot as #13 |
+| 13 | Steered `/compact` (variant of #6) | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_inject_text_into_session` → interrupt → `compact_session_context` (`server.py:60312`) | **Yes** | `abort`+deliver, fused | `steer` + `abort_first: true`, `on_busy: drop, expire 5m` — **Q4**: a 12-min-stale `/compact` broke session 4dbc1dfa today |
+| 14 | Steered `/clear` (variant of #6, CCC-935) | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_inject_text_into_session` → interrupt → `clear_session_context` (`server.py:60326`) | **Yes** | `abort`+deliver, fused | `steer` + `abort_first: true`, `on_busy: drop, expire 5m` — same rot as #13 |
 | 15 | Reconciler release instruction ("you are no longer a worker for Q") | WT reconciler → verified-idle worker session | **WT** — `release_idle_workers` (`workers.py:1706`) → `_deliver_release_instruction` (`:1007`): UDS via `peer_uds` (claude engine only, receipt-gated) → fifo → `messages.send` | Only on the last `messages.send` fallback, via the delegate — and that call passes no mode, so it arrives as `send`, never `steer` | `queue` — since `edaa414` it defers when a turn is open | `queue` — release targets a verified-idle worker |
-| 16 | Reconciler queue nudge — enqueue instant-pickup, stuck-queue, reconcile tick | WT reconciler → every live non-released worker on that queue | **WT** — `notify_workers` (`workers.py:767`), FIFO only, no fallback. Three callers: `dispatch_after_enqueue` (`:3633`), `_maybe_nudge_stuck_queue` (`:836`), `_reconcile_once_locked` (`:4216`) | No — never leaves WT | `queue` — since `edaa414`; was `override` by accident (blind write to *warm* workers) | `steer`, `expire 30s` — **the clearest customer for real `steer`**; a stale nudge is worthless |
+| 16 | Reconciler queue nudge — enqueue instant-pickup, stuck-queue, reconcile tick | WT reconciler → every live non-released worker on that queue | **WT** — `notify_workers` (`workers.py:767`), FIFO only, no fallback. Three callers: `dispatch_after_enqueue` (`:3633`), `_maybe_nudge_stuck_queue` (`:836`), `_reconcile_once_locked` (`:4216`) | No — never leaves WT | `queue` — since `edaa414`; was destructive by accident (blind write to *warm* workers) | `steer`, `expire 30s` — **the clearest customer for real `steer`**; a stale nudge is worthless |
 | 17 | Reconciler spawn-time goal (first turn of a new worker) | WT reconciler → the worker child it just spawned | **WT** — `write_to_worker_fifo(fifo_path, goal)` (`workers.py:5049`, `:5145`) into the child's inherited stdin fd | No | n/a — the child has no turn yet | `queue` — nothing exists to steer into |
 | 18 | `POST /api/inject-input` — the public front door | Any local HTTP caller (WT's delegate, the curl footer, the ccc-orchestration skill, dashboard JS, any script) → any session CCC can reach | **CCC** — `server.py:75775` → `_inject_text_into_session`. Accepts `mode` = `answer\ | send\ steer` (and legacy `steer: true`); anything else is a 400 **Yes — it *is* the front door to the chokepoint** | caller's `mode` (`send`/`steer`) | all four values + `on_busy` + `position` — this is the front door the enum is for |
 | 19 | `POST /api/inject-esc` — pure interrupt, no text | Dashboard Esc button (#7) or any local caller → live session | **CCC** — `server.py:75992` → `_interrupt_session` (`:61212`), which has **its own six-way fall-through**, not `_inject_text_into_session`'s | N/A — different router | `abort` | `abort` — ✓ correct today |
@@ -114,12 +114,27 @@ to decide anyway.
 Named to match the industry, **not** CCC's current vocabulary. Verified against
 OpenAI Codex on 2026-08-30 (sources below).
 
-| Value | Lands | In-flight work | Industry name |
-|---|---|---|---|
-| `queue` | after the turn ends | untouched | queue (Codex `Tab`) |
-| `steer` | at the next safe seam (tool-call boundary) | **untouched** | steer (Codex `Enter`) |
-| `override` | immediately | **destroyed** | *(no standard name — this is CCC's current `mode="steer"`)* |
-| `abort` | nothing delivered | **destroyed** | interrupt / cancel (Esc, Ctrl-C) |
+**Two delivery verbs, one control verb.** Destruction is not a delivery
+priority, so it does not belong in the same field:
+
+| Verb | Kind | Lands | In-flight work | Industry name |
+|---|---|---|---|---|
+| `queue` | delivery | after the turn ends | untouched | queue (Codex `Tab`) |
+| `steer` | delivery | at the next safe seam | **untouched** | steer (Codex `Enter`) |
+| `abort` | **control** | nothing delivered | **destroyed** | interrupt / cancel (Esc, Ctrl-C) |
+
+"Stop and steer" is `abort` then `steer`. Because two separate calls leave a
+window in which something else can start, CCC should expose the pair as a single
+call with a flag:
+
+```
+steer + abort_first: true
+```
+
+The flag is honest: it names a **pre-step**, not a delivery priority. An earlier
+draft of this doc had a fused `override` value for the same behavior; it is gone,
+because welding a control action into the delivery enum is what produced the
+original `mode` confusion in the first place.
 
 **The correction that produced this shape.** An earlier draft had `steer` meaning
 "destroy the in-flight response." That is not what the rest of the industry means
@@ -143,8 +158,9 @@ Two consequences:
 
 So CCC's `mode="steer"` is a **name collision that inverts the guarantee**: the
 industry's steer promises your work survives; CCC's promises it does not. Hence
-`override` for the destructive variant — an honest name for a real capability
-that simply is not what anyone else calls "steer".
+`abort` as a **separate control verb** for the destructive capability — a real
+and necessary thing, but not a delivery priority, and emphatically not what
+anyone else calls "steer".
 
 Plus two fields that are **not** the enum, and that `mode` wrongly absorbs today:
 
@@ -157,9 +173,31 @@ And a result contract, which is arguably the bigger half of the fix — the call
 must be told what actually happened, not what it asked for:
 
 ```
-{"requested": "override", "effect": "delivered", "aborted": false,
+{"requested": "steer", "effect": "delivered", "aborted": false,
  "reason": "target was idle; nothing to interrupt"}
 ```
+
+### Why #6 aborts — and why that is not a definition of "steer"
+
+CCC's dashboard steer destroys the turn. That looks like a semantic choice about
+what steer means. It is not. From `server.py:60680`:
+
+> Without this, a turn wedged on a long-running tool child (a `while true` poll
+> loop, a slow build) never reaches a turn boundary, so
+> `_spawn_entry_active_tool_child` holds every queued inject indefinitely — the
+> UI sits on "sending…" for hours with no failure to report, because nothing
+> actually failed.
+>
+> The interrupt control request **manufactures the missing boundary**.
+
+**Codex has a seam; headless Claude does not.** Codex injects at the end of the
+current tool call. Claude's stream-json protocol exposes no equivalent, so CCC
+destroys the turn to create a boundary it can deliver into.
+
+That reframes the whole problem. #6 is not mis-named, it is **under-served**: it
+wants `steer` and settles for destruction because the primitive it needs does not
+exist. The fix is not vocabulary — it is a seam. The same missing primitive is
+what row #16 needs (Q5), which makes it one problem with two customers, not two.
 
 ### Caveats carried into the spec
 
@@ -176,9 +214,10 @@ must be told what actually happened, not what it asked for:
 
 Each is flagged inline in the row it affects, in the Desired column above.
 
-- **Q1 (#3)** — `wt steer` asks for `override`, but WT owns no interrupt
-  primitive. Fail loudly, or degrade to `steer` and report it? *Lean: degrade and
-  report* — the result contract exists precisely so the caller learns the truth.
+- **Q1 (#3)** — `wt steer` now keeps industry `steer` semantics, so the open
+  question moves: does WT need its own `abort` verb at all, and can it implement
+  one? WT owns no interrupt primitive today, so `abort` would have to route
+  through CCC or report `unsupported`.
 - **Q2 (#9)** — ACP (Grok/Kimi) exposes no safe seam, only `session/cancel`. Can
   `steer` be anything but faked there?
 - **Q3 (#11)** — should an inbound peer frame ever be allowed to `steer`, or is
