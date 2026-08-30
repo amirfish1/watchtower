@@ -2495,3 +2495,149 @@ def test_github_backend_ack_rejects_bad_field_index_and_ticket(tmp_path, monkeyp
     # error, as every other GitHub-backed operation does.
     with pytest.raises(github_backend_mod.GitHubBackendError):
         q.ack_resolution("GHI-999", all_items=True)
+
+
+def test_fresh_read_seeds_from_persisted_cache_and_revalidates_with_etag(
+    tmp_path, monkeypatch
+):
+    """WATCHTOWER-16: a cold `fresh=True` process (wt claim / wt ls / the
+    reconciler's dispatch path) must inherit the poller's ETag validator from
+    the persisted cache instead of paying an uncapped GraphQL `gh issue list`.
+
+    A 304 proves the snapshot is current, so `fresh` still means fresh -- it
+    just costs a conditional REST probe rather than GraphQL quota.
+    """
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json")
+    )
+    github_backend._LIST_CACHE.clear()
+
+    repo = "acme/fresh-seed-test"
+    issue = {
+        "number": 1, "title": "cached", "body": "", "state": "OPEN",
+        "url": f"https://github.com/{repo}/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+    github_backend._write_persisted_list_entry(
+        f"{repo}:open",
+        {
+            "at": time.time(),
+            "data": [issue],
+            "etag": '"v1"',
+            "fetched_at": time.time(),
+        },
+    )
+
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    probes = []
+
+    def unexpected_run(args, *, check=True):
+        raise AssertionError("fresh read must not spend a GraphQL list here")
+
+    monkeypatch.setattr(backend, "_run", unexpected_run)
+    monkeypatch.setattr(
+        backend, "_run_raw", lambda args: (probes.append(list(args)), _not_modified())[1]
+    )
+
+    assert backend._list_issues("open", fresh=True) == [issue]
+    assert 'If-None-Match: "v1"' in probes[-1]
+
+
+def test_fresh_read_seeded_from_persisted_cache_honors_the_fetch_rate_cap(
+    tmp_path, monkeypatch
+):
+    """Same seed, but the repo genuinely changed (probe 200). The heavy-fetch
+    rate cap -- previously invisible to a cold CLI process -- now applies:
+    within the cap the seeded snapshot is served, past it the fetch runs."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json")
+    )
+    monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 60.0)
+    github_backend._LIST_CACHE.clear()
+
+    repo = "acme/fresh-seed-cap-test"
+    issue = {
+        "number": 1, "title": "cached", "body": "", "state": "OPEN",
+        "url": f"https://github.com/{repo}/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+    entry = {
+        "at": time.time(), "data": [issue], "etag": '"v1"',
+        "fetched_at": time.time(),
+    }
+    github_backend._write_persisted_list_entry(f"{repo}:open", dict(entry))
+
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    counts = {"fetch": 0}
+
+    def fake_run(args, *, check=True):
+        counts["fetch"] += 1
+        return json.dumps([issue])
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    monkeypatch.setattr(backend, "_run_raw", lambda args: _ok(etag="v2"))
+
+    assert backend._list_issues("open", fresh=True) == [issue]
+    assert counts["fetch"] == 0  # changed, but capped by the poller's clock
+
+    # Past the cap, the same cold-process read does pay for the real list.
+    github_backend._LIST_CACHE.clear()
+    entry["fetched_at"] = time.time() - 61.0
+    github_backend._write_persisted_list_entry(f"{repo}:open", dict(entry))
+    assert backend._list_issues("open", fresh=True) == [issue]
+    assert counts["fetch"] == 1
+
+
+def test_poller_persists_the_etag_and_fetch_clock_for_other_processes(
+    tmp_path, monkeypatch
+):
+    """The seed above only works if the poller writes its validator and
+    fetch clock to the shared file, not just the data."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 0.0)
+    github_backend._LIST_CACHE.clear()
+
+    repo = "acme/poller-etag-persist-test"
+    issue = {
+        "number": 1, "title": "one", "body": "", "state": "OPEN",
+        "url": f"https://github.com/{repo}/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+
+    monkeypatch.setattr(
+        github_backend.GitHubIssuesBackend,
+        "_run",
+        lambda self, args, check=True: json.dumps(
+            [issue] if args[args.index("--state") + 1] == "open" else []
+        ),
+    )
+    monkeypatch.setattr(
+        github_backend.GitHubIssuesBackend,
+        "_run_raw",
+        lambda self, args, **kw: _ok(etag="v7"),
+    )
+
+    # First sweep bootstraps (nothing to validate yet); the second one probes.
+    github_backend.refresh_persisted_list_cache(repo)
+    github_backend.refresh_persisted_list_cache(repo)
+
+    persisted = github_backend._read_persisted_list_cache()[f"{repo}:open"]
+    assert persisted["etag"] == '"v7"'
+    assert persisted["fetched_at"] > 0

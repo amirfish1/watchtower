@@ -228,8 +228,18 @@ def refresh_persisted_list_cache(repo: str) -> None:
             continue
         entry = _LIST_CACHE.get(key)
         if entry is not None and entry.get("data") is not None:
+            # `etag`/`fetched_at` ride along so a short-lived CLI process can
+            # seed its empty `_LIST_CACHE` from this file and inherit the
+            # poller's validator and heavy-fetch clock (see `_list_issues`)
+            # instead of paying an uncapped GraphQL list of its own.
             _write_persisted_list_entry(
-                key, {"at": entry["at"], "data": entry["data"]}
+                key,
+                {
+                    "at": entry["at"],
+                    "data": entry["data"],
+                    "etag": str(entry.get("etag") or ""),
+                    "fetched_at": float(entry.get("fetched_at") or 0),
+                },
             )
 
 
@@ -1148,9 +1158,38 @@ class GitHubIssuesBackend:
                 ):
                     _LIST_CACHE[key] = {
                         "at": persisted["at"], "data": persisted["data"],
-                        "error": None, "etag": "",
+                        "error": None,
+                        "etag": str(persisted.get("etag") or ""),
+                        "fetched_at": float(persisted.get("fetched_at") or 0),
                     }
                     return persisted["data"]
+        elif not strict and (cached is None or cached.get("data") is None):
+            # `fresh=True`, non-strict (`wt claim`, `wt ls`, `wt status`, the
+            # reconciler's dispatch path): the caller asked for current state,
+            # so the snapshot above is NOT served as-is -- but it is still
+            # loaded as this process's cache seed. Without it, every one of
+            # these short-lived processes started with an empty `_LIST_CACHE`,
+            # skipped the ETag probe AND the heavy-fetch rate cap below (both
+            # require a cached entry), and went straight to a full GraphQL
+            # `gh issue list` per state. Fleet-wide that was the single
+            # largest GraphQL consumer -- uncapped by construction, since the
+            # caps only ever lived in a process that had already fetched once
+            # (WATCHTOWER-16 / OPS-838/839). Seeded, the same call revalidates
+            # with a conditional REST probe that costs no GraphQL quota, and a
+            # 304 proves the snapshot is current -- so `fresh` still means
+            # fresh. Only a genuinely-changed repo re-fetches, subject to the
+            # shared cap.
+            persisted = _read_persisted_list_cache().get(key)
+            if persisted is not None and persisted.get("data") is not None:
+                if now - float(persisted.get("at") or 0) < _PERSISTED_LIST_STALE_S:
+                    cached = {
+                        "at": float(persisted.get("at") or 0),
+                        "data": persisted["data"],
+                        "error": None,
+                        "etag": str(persisted.get("etag") or ""),
+                        "fetched_at": float(persisted.get("fetched_at") or 0),
+                    }
+                    _LIST_CACHE[key] = cached
         # Pre-emptive GraphQL quota guard. If we're close to the hourly limit,
         # skip the expensive rich fetch (and the ETag probe that would only tell
         # us to do it) and serve whatever cached data we have. This keeps a
