@@ -22,9 +22,12 @@ import json
 import os
 import select
 import shutil
+import socket
 import subprocess
 import sys
+import threading
 import time
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -3601,3 +3604,76 @@ def test_find_claude_session_row_matches_by_session_id(wt, monkeypatch, tmp_path
     assert found == row
     assert wt.workers._find_claude_session_row("no-such-session") is None
     assert wt.workers._find_claude_session_row("") is None
+
+
+def test_deliver_release_instruction_uses_uds_when_worker_is_dialable(
+    wt, monkeypatch, tmp_path
+):
+    claude_home = tmp_path / "claude-home"
+    sessions_dir = claude_home / "sessions"
+    sessions_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+
+    # macOS caps AF_UNIX sun_path at 108 bytes; pytest's default tmp_path
+    # nests too deep to stay under it (found the hard way in Task 1's
+    # review). Bind under a short, fixed path instead.
+    sock_path = f"/tmp/wt-peer-uds-test-{uuid.uuid4().hex[:8]}.sock"
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    srv.listen(1)
+    received = {}
+
+    def accept_once():
+        conn, _ = srv.accept()
+        data = b""
+        conn.settimeout(2.0)
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        except socket.timeout:
+            pass
+        received["lines"] = data.splitlines()
+        conn.close()
+
+    t = threading.Thread(target=accept_once, daemon=True)
+    t.start()
+
+    (sessions_dir / "55555.json").write_text(json.dumps({
+        "pid": 55555,
+        "sessionId": "sess-worker-1",
+        "messagingSocketPath": sock_path,
+        "peerProtocol": 1,
+        "version": "2.1.251",
+    }))
+
+    w = {"engine": "claude", "session_id": "sess-worker-1", "queue": "Q", "fifo": ""}
+    try:
+        result = wt.workers._deliver_release_instruction(w, "you are released")
+        t.join(timeout=2.0)
+    finally:
+        srv.close()
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+
+    assert result == {"transport": "uds", "delivered": True, "error": ""}
+    user_frame = json.loads(received["lines"][-1])
+    assert "you are released" in user_frame["message"]["content"]
+    assert "<cross-session-message" in user_frame["message"]["content"]
+
+
+def test_deliver_release_instruction_falls_back_when_no_registry_row(
+    wt, monkeypatch, tmp_path
+):
+    claude_home = tmp_path / "claude-home"
+    (claude_home / "sessions").mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+
+    w = {"engine": "claude", "session_id": "sess-no-row", "queue": "Q", "fifo": ""}
+    result = wt.workers._deliver_release_instruction(w, "you are released")
+
+    assert result["transport"] != "uds"

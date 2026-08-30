@@ -877,9 +877,51 @@ def _release_instruction(w: Dict[str, Any]) -> str:
     )
 
 
+def _deliver_release_instruction_via_uds(
+    w: Dict[str, Any], text: str
+) -> Optional[Dict[str, Any]]:
+    """Try the worker's native Claude Code peer socket.
+
+    Returns a result dict on success, None on ANY failure (no registry row,
+    stale/invalid target, connect/send failure) -- callers must fall through
+    to the existing fifo/messages.send path unchanged, never surface a UDS
+    failure as a release failure.
+    """
+    session_id = str(w.get("session_id") or "").strip()
+    if not session_id:
+        return None
+    row = _find_claude_session_row(session_id)
+    if row is None:
+        return None
+    from . import peer_uds
+    target = peer_uds.resolve_target(row)
+    if not target.get("ok"):
+        return None
+    claude_home = Path(
+        os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")
+    )
+    token = peer_uds.load_peer_token(
+        claude_home / "sessions", target["pid"], target["socket_path"]
+    )
+    try:
+        lines = peer_uds.build_frame_lines(
+            peer_uds.wrap(text), token=token, msg_id=str(uuid.uuid4())
+        )
+    except ValueError:
+        return None
+    result = peer_uds.send_lines(target["socket_path"], lines)
+    if not result.get("ok"):
+        return None
+    return {"transport": "uds", "delivered": True, "error": ""}
+
+
 def _deliver_release_instruction(
     w: Dict[str, Any], text: str
 ) -> Dict[str, Any]:
+    if str(w.get("engine") or "") == "claude":
+        uds_result = _deliver_release_instruction_via_uds(w, text)
+        if uds_result is not None:
+            return uds_result
     fifo = str(w.get("fifo") or "")
     if fifo:
         try:
