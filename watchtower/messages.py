@@ -1345,8 +1345,29 @@ def _deliver_antigravity_language_server(
     return {"ok": False, "error": f"antigravity: {last_error}"}
 
 
+def _delegate_payload(
+    sid: str, text: str, mode: str, force_queue: bool
+) -> Dict[str, Any]:
+    """Body for the delegate's /api/inject-input.
+
+    ``mode`` is always a *legacy* value (send/steer/answer), never a CCC-1000
+    verb: an older delegate rejects unknown modes outright, and WT must keep
+    working against whichever CCC is deployed. The verb vocabulary stays on
+    WT's side of the boundary -- see ``deliver_message``.
+    """
+    # origin=wt (WT-78): tells the delegate this request came from wt's own
+    # adapter chain, so it must not call back into `wt send` -- the
+    # protocol-level guard against the CCC -> wt -> CCC delegation loop.
+    payload: Dict[str, Any] = {
+        "session_id": sid, "text": text, "mode": mode, "origin": "wt",
+    }
+    if force_queue:
+        payload["force_queue"] = True
+    return payload
+
+
 def _deliver_delegate(
-    resolved: Dict[str, Any], text: str, mode: str
+    resolved: Dict[str, Any], text: str, mode: str, *, force_queue: bool = False
 ) -> Dict[str, Any]:
     """Adapter 3 (optional, last): hand delivery to a configured delegate."""
     base = _delegate_base()
@@ -1358,11 +1379,7 @@ def _deliver_delegate(
     try:
         data = _post_json(
             base + "/api/inject-input",
-            # origin=wt (WT-78): tells the delegate this request came from
-            # wt's own adapter chain, so it must not call back into
-            # `wt send` — the protocol-level guard against the
-            # CCC -> wt -> CCC delegation loop.
-            {"session_id": sid, "text": text, "mode": mode, "origin": "wt"},
+            _delegate_payload(sid, text, mode, force_queue),
             timeout_s=5,
         )
     except Exception as e:  # noqa: BLE001 - any transport failure means fall through
@@ -1373,7 +1390,8 @@ def _deliver_delegate(
 
 
 def deliver(
-    resolved: Dict[str, Any], text: str, mode: str = "send"
+    resolved: Dict[str, Any], text: str, mode: str = "send",
+    *, force_queue: bool = False,
 ) -> Dict[str, Any]:
     """Try each adapter in order.
 
@@ -1388,7 +1406,7 @@ def deliver(
     Every success is recorded as a delivery receipt (WT-77) so "delivered"
     can later be verified against the target transcript — the result
     carries ``receipt_id``."""
-    result = _deliver_unreceipted(resolved, text, mode)
+    result = _deliver_unreceipted(resolved, text, mode, force_queue=force_queue)
     sid = str(resolved.get("session_id") or "")
     if result.get("ok") and sid:
         try:
@@ -1413,7 +1431,8 @@ def deliver(
 
 
 def _deliver_unreceipted(
-    resolved: Dict[str, Any], text: str, mode: str = "send"
+    resolved: Dict[str, Any], text: str, mode: str = "send",
+    *, force_queue: bool = False,
 ) -> Dict[str, Any]:
     errors: List[str] = []
     busy = False
@@ -1439,7 +1458,7 @@ def _deliver_unreceipted(
         and _delegate_base()
     ):
         delegate_tried = True
-        r = _deliver_delegate(resolved, text, mode)
+        r = _deliver_delegate(resolved, text, mode, force_queue=force_queue)
         if r.get("ok"):
             return r
         errors.append(f"delegate: {r.get('error', 'failed')}")
@@ -1460,7 +1479,7 @@ def _deliver_unreceipted(
             return r
         errors.append(f"antigravity: {r.get('error', 'failed')}")
     if not delegate_tried:
-        r = _deliver_delegate(resolved, text, mode)
+        r = _deliver_delegate(resolved, text, mode, force_queue=force_queue)
         if r.get("ok"):
             return r
         errors.append(f"delegate: {r.get('error', 'failed')}")
@@ -1684,6 +1703,7 @@ def send(
     queue_on_fail: bool = True,
     ttl_s: Optional[float] = None,
     engine: str = "",
+    force_queue: bool = False,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
@@ -1698,7 +1718,11 @@ def send(
         return {"ok": False, "error": str(e)}
     if engine:
         resolved["engine"] = str(engine)
-    result = deliver(resolved, text, mode)
+    # Only pass force_queue when it is actually set: `deliver` is monkeypatched
+    # by tests with the historical three-argument signature, and an unsolicited
+    # keyword would break every one of them for no behavioural gain.
+    extra = {"force_queue": True} if force_queue else {}
+    result = deliver(resolved, text, mode, **extra)
     if result.get("ok"):
         out = {"ok": True, "transport": result.get("transport", "?")}
         if result.get("log"):
@@ -1800,6 +1824,110 @@ def _await_reply(
                 "source": source,
             }
         time.sleep(0.2)
+
+
+# --------------------------------------------------------------- CCC-1000
+DELIVERY_VERBS = ("engine_default", "queue", "steer", "abort")
+ON_BUSY_CHOICES = ("hold", "drop", "reject")
+
+# Verb -> the legacy `mode` the adapters and the delegate already understand.
+# `queue` rides on send + force_queue rather than a mode of its own, because
+# `send_queue` is internal to CCC and is rejected on the wire.
+_VERB_TO_MODE = {
+    "engine_default": "send",
+    "queue": "send",
+    "steer": "steer",
+}
+
+
+def deliver_message(
+    target: str,
+    text: str,
+    verb: str = "engine_default",
+    *,
+    on_busy: str = "hold",
+    expire: Optional[float] = None,
+    position: str = "back",
+    await_reply: bool = False,
+    abort_first: bool = False,
+    timeout_ms: int = 30000,
+    engine: str = "",
+) -> Dict[str, Any]:
+    """One delivery entry point for every WT caller (CCC-1000 Phase 3).
+
+    WT grew four parallel delivery implementations -- ``send``, ``ask``,
+    ``workers.notify_workers`` and ``workers._deliver_release_instruction`` --
+    because ``mode`` could not express per-caller timing. Only ``send`` used
+    the full adapter chain, so the other three silently lost every fallback.
+    This function is the single path; callers declare intent as a verb and the
+    orthogonal fields, and the transport is chosen for them.
+
+    Named ``deliver_message`` rather than ``deliver`` because ``deliver`` is
+    already the adapter chain over a *resolved* target and is monkeypatched by
+    the snapshot tests; renaming it would be a gratuitous break.
+
+    Verbs: ``engine_default`` (whatever the engine natively does -- the safe
+    default), ``queue`` (after the turn ends), ``steer`` (at the next safe
+    seam), ``abort`` (control: interrupt, deliver nothing).
+
+    ``on_busy`` picks what happens when nothing can take the message now:
+    ``hold`` parks it in the outbox for the daemon to retry (optionally with
+    ``expire`` seconds of TTL), ``drop`` discards it, ``reject`` fails fast so
+    the caller can react rather than waiting on a timeout it cannot see.
+    """
+    verb = str(verb or "engine_default").strip().lower()
+    if verb not in DELIVERY_VERBS:
+        return {"ok": False, "error": f"unknown delivery verb: {verb!r}"}
+    on_busy = str(on_busy or "hold").strip().lower()
+    if on_busy not in ON_BUSY_CHOICES:
+        return {"ok": False, "error": f"unknown on_busy: {on_busy!r}"}
+    if verb == "abort":
+        return _deliver_abort(target)
+    if abort_first:
+        _deliver_abort(target)
+    if await_reply:
+        # ask() owns the reply-correlation protocol; nothing else here does.
+        return ask(target, text, timeout_ms=timeout_ms)
+    result = send(
+        target,
+        text,
+        mode=_VERB_TO_MODE[verb],
+        queue_on_fail=(on_busy == "hold"),
+        ttl_s=expire,
+        engine=engine,
+        force_queue=(verb == "queue" or position == "front"),
+    )
+    if not result.get("ok") and on_busy == "drop":
+        return {"ok": False, "dropped": True,
+                "error": str(result.get("error") or "delivery failed")}
+    result.setdefault("verb", verb)
+    return result
+
+
+def _deliver_abort(target: str) -> Dict[str, Any]:
+    """Control verb: interrupt the target's turn, deliver nothing (D3).
+
+    Routed through the delegate's ``/api/inject-esc``, which predates the
+    CCC-1000 verb vocabulary, so this works against an un-upgraded CCC too.
+    """
+    base = _delegate_base()
+    if not base:
+        return {"ok": False, "error": "abort needs a delegate; none configured"}
+    try:
+        resolved = resolve_target(target)
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    sid = str(resolved.get("session_id") or "")
+    if not sid:
+        return {"ok": False, "error": "abort needs a session_id"}
+    try:
+        data = _post_json(base + "/api/inject-esc", {"session_id": sid}, timeout_s=5)
+    except Exception as e:  # noqa: BLE001 - transport failure is a failed abort
+        return {"ok": False, "error": f"abort: {e}"}
+    if data.get("ok") is False:
+        return {"ok": False, "error": str(data.get("error") or "abort rejected")}
+    return {"ok": True, "verb": "abort", "transport": "delegate-esc",
+            "aborted": True, "effect": "aborted"}
 
 
 def ask(target: str, text: str, timeout_ms: int = 30000) -> Dict[str, Any]:
