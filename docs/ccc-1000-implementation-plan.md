@@ -1,5 +1,27 @@
 # CCC-1000 — implementation plan
 
+> **STATUS: shipped 2026-08-30.** All five phases are implemented, deployed and
+> pushed. CCC `d5a59c1e`, WatchTower `1c4b3f8`. WT suite 1002 pass (998 + 4 new);
+> CCC peer-router suite 30 pass (28 + 2 new). Both daemons restarted, so the
+> code is live, not just committed: `com.github.claude-command-center` and
+> `ai.watchtower.watcher`.
+>
+> Three things the build changed about the plan itself:
+> 1. **Phase 3 is `deliver_message`, not `deliver`.** `messages.deliver` was
+>    already the adapter chain over a resolved target, and is monkeypatched by
+>    the snapshot tests. Renaming it would have been a gratuitous break.
+> 2. **The two-repo ordering constraint (risk 3) is gone.** WT translates verbs
+>    to legacy modes at the delegate boundary and never puts a verb on the wire,
+>    so it works against any CCC.
+> 3. **The Phase 4 guard needed a second fix.** `announced_from` prefixes the
+>    text at the endpoint, before the router runs, so the guard saw no leading
+>    slash and never fired — blinded in precisely the agent-origin case that
+>    makes a send UDS-eligible. Slash commands are now never wrapped.
+>
+> Known unresolved: `later` priority is still untested, and
+> `test_inject_worker_handoff_sends_once_dashboard_side` fails in CCC — verified
+> failing before this work, untouched by it.
+
 Delivery-semantics rework across CCC + WatchTower. Design rationale and full
 evidence live in `docs/Pulled every mode branch and interrupt c.md`; this file is
 the build order. Written 2026-08-30.
