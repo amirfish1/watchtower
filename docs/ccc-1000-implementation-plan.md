@@ -29,14 +29,25 @@ await_reply:              bool                     (what makes messages.ask() a 
 native steer. Not building a tool-call seam for headless Claude (cosmetic — see
 "Why #6 aborts" in the design doc).
 
-## Open decisions — answer before the phase that needs them
+## Open decisions — RESOLVED 2026-08-30
 
-| # | Decision | Needed by | Lean |
-|---|---|---|---|
-| D1 | `steer` on a transport with no seam (#9 ACP): degrade + report, or reject? | Phase 2 | degrade + report |
-| D2 | Slash commands over UDS: execute, reject, or keep delivering as text? | Phase 4 | reject with `unsupported` |
-| D3 | Does WT get its own `abort`, or route through CCC / report unsupported? | Phase 3 | report unsupported |
-| D4 | `engine_default` for ACP — is Kimi/Grok really `queue`? **UNVERIFIED** | Phase 2 | verify first |
+| # | Decision | Resolution |
+|---|---|---|
+| D1 | `steer` on a transport with no seam (#9 ACP) | **degrade + report.** A *seam* is a point where input can be inserted without cutting anything off. Codex has one (end of tool call); Claude's stream-json exposes none; ACP exposes only `session/cancel`, i.e. wait or destroy, nothing between. So ACP can only emulate `steer`, and the result contract must say so. |
+| D2 | Slash commands over UDS | **execute them; intercept only what mutates CCC-tracked state.** Per `server.py:60494`, a slash command written to the FIFO as user text *does* execute — "Claude executes it, but CCC then has no idea the session was reset". `/compact` and `/clear` are intercepted because they change session identity. `/model`, `/cost` etc. are harmless and should just run. |
+| D3 | Does WT get its own `abort`? | **yes, support it.** |
+| D4 | Is Grok `queue` like Kimi? | **yes — settled by code, not testing.** `_terminal_queue_waits_for_active_acp` (`server.py:44362`) gates on `status["kind"] == "acp"`, generic across harnesses. Kimi and Grok share one path and cannot differ. |
+
+## The real slash-command bug (revised)
+
+Not "commands silently become text" — it is narrower and stranger:
+
+**The same command executes over FIFO and silently does not over UDS.** The
+`<cross-session-message>` wrapper (`peer_uds.wrap()`) puts the command inside XML,
+so there is no leading slash to parse. Identical input, transport-dependent
+behaviour, success receipt either way.
+
+Phase 4 must make the two transports agree.
 
 ## Phase 1 — the result contract (CCC, no behaviour change)
 
