@@ -905,7 +905,9 @@ def _deliver_release_instruction_via_uds(
     )
     try:
         lines = peer_uds.build_frame_lines(
-            peer_uds.wrap(text), token=token, msg_id=str(uuid.uuid4())
+            peer_uds.wrap(text, from_name="watchtower-reconciler", from_mode="bypass"),
+            token=token,
+            msg_id=str(uuid.uuid4()),
         )
     except ValueError:
         return None
