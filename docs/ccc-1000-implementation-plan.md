@@ -42,12 +42,20 @@ native steer. Not building a tool-call seam for headless Claude (cosmetic — se
 
 Not "commands silently become text" — it is narrower and stranger:
 
-**The same command executes over FIFO and silently does not over UDS.** The
-`<cross-session-message>` wrapper (`peer_uds.wrap()`) puts the command inside XML,
-so there is no leading slash to parse. Identical input, transport-dependent
-behaviour, success receipt either way.
+**The same slash command behaves three different ways depending on transport.**
+Taking `/compact` as the worked example:
 
-Phase 4 must make the two transports agree.
+| Path | Outcome |
+|---|---|
+| CCC API (`/api/inject-input`) | intercepted at `server.py:60475`, returns `compact_session_context()` **before** the UDS attempt at `:60553` — works, and CCC re-keys its own state |
+| Direct FIFO write (WT worker with a fifo) | lands as stream-json user text with a leading slash, so **Claude executes it** — but CCC never observes the change and the dashboard goes stale (`server.py:60494`) |
+| UDS peer socket (native SendMessage, or WT `peer_uds`) | wrapped by `peer_uds.wrap()` into `<cross-session-message>`, no leading slash, **does not execute** — inert text with a `delivered` receipt |
+
+So `/compact` never reaches UDS *through CCC's API* — the intercept fires first.
+It only gets there when something dials the socket directly.
+
+Three transports, three outcomes: correct, correct-but-unobserved, and silent
+no-op. Phase 4 must make all three agree, not two.
 
 ## Phase 1 — the result contract (CCC, no behaviour change)
 
