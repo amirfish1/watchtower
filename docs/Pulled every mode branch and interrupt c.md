@@ -121,7 +121,29 @@ priority, so it does not belong in the same field:
 |---|---|---|---|---|
 | `queue` | delivery | after the turn ends | untouched | queue (Codex `Tab`) |
 | `steer` | delivery | at the next safe seam | **untouched** | steer (Codex `Enter`) |
-| `abort` | **control** | nothing delivered | **destroyed** | interrupt / cancel (Esc, Ctrl-C) |
+| `abort` | **control** | nothing delivered | turn ends early — see below | interrupt / cancel (Esc, Ctrl-C) |
+
+**"Aborts the turn" does not mean "destroys the work."** Measured in session
+`4dbc1dfa` on 2026-08-30 (7 aborts in one session, from the steer storm that
+prompted this correction). At the abort point the log reads:
+
+```
+965  assistant  TOOL:Bash
+966  user       tool_result                      <- survives
+967  control_response                            <- the interrupt ack
+969  user       "[Request interrupted by user]"
+970  result     terminal_reason=aborted_streaming
+```
+
+The completed tool call and its result both persist, and the next turn opens
+with the full transcript. What is actually lost is narrow: the tokens being
+generated at that instant (a truncated sentence), plus the turn being marked
+`is_error: true` / `error_during_execution` and a synthetic
+`[Request interrupted by user]` entry in the transcript.
+
+So the cost of `abort` is a cut-off sentence and a dirty result code — not lost
+work. An earlier draft of this doc said "destroyed", which overstated it and made
+#6 look worse than it is.
 
 "Stop and steer" is `abort` then `steer`. Because two separate calls leave a
 window in which something else can start, CCC should expose the pair as a single
@@ -194,10 +216,13 @@ what steer means. It is not. From `server.py:60680`:
 current tool call. Claude's stream-json protocol exposes no equivalent, so CCC
 destroys the turn to create a boundary it can deliver into.
 
-That reframes the whole problem. #6 is not mis-named, it is **under-served**: it
-wants `steer` and settles for destruction because the primitive it needs does not
-exist. The fix is not vocabulary — it is a seam. The same missing primitive is
-what row #16 needs (Q5), which makes it one problem with two customers, not two.
+That reframes the problem, though less dramatically than it first appears. #6 is
+not mis-named, it is **under-served**: it wants `steer` and settles for an early
+turn boundary because the primitive it needs does not exist. But per the
+measurement above, that boundary costs a truncated sentence and a dirty result
+code — not lost work. The fix is a seam, and it is a polish problem rather than a
+correctness one. The same missing primitive is what row #16 needs (Q5), so it is
+one problem with two customers.
 
 ### Caveats carried into the spec
 
