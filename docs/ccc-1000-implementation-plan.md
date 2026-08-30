@@ -18,6 +18,17 @@
 >    slash and never fired — blinded in precisely the agent-origin case that
 >    makes a send UDS-eligible. Slash commands are now never wrapped.
 >
+> **Deliberately not done: collapsing `ask()` into the outbox path.** The plan
+> had `ask()` become `await_reply=True` and "gain outbox + tty/codex/gemini/
+> antigravity adapters". The single entry point exists and `await_reply=True`
+> routes through `ask()`, but `ask()` keeps its own chain. Giving it the outbox
+> would be wrong, not merely risky: `await_reply` means a caller is blocked
+> waiting for a reply, and parking that request for the daemon to retry later
+> produces exactly the failure the design doc already rejected — the caller sits
+> there until its timeout and gets nothing, which is worse than an immediate
+> failure it could react to. The two semantics genuinely conflict; the plan did
+> not notice. Revisit only with an explicit "fail fast when await_reply" rule.
+>
 > Known unresolved: `later` priority is still untested, and
 > `test_inject_worker_handoff_sends_once_dashboard_side` fails in CCC — verified
 > failing before this work, untouched by it.
