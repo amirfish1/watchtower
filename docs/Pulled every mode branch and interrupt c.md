@@ -401,6 +401,101 @@ on a transport with no seam.** #9 (ACP) can only fake it with
 `session/cancel` + resend; #3 (`wt steer`) owns no interrupt primitive at all.
 Everything else already has an implementation or needs only a rename.
 
+## Code paths and chokepoints — where consolidation is possible
+
+Same use cases, but each arrow now carries the **verb needed**, and the boxes are
+the **actual functions**. Red nodes bypass a chokepoint that should have been
+mandatory.
+
+```mermaid
+flowchart TD
+  R1["#1 ticket notify"] -->|steer| SEND
+  R2["#2 wt send"] -->|steer| SEND
+  R3["#3 wt steer<br/>(cmd_send --mode steer)"] -->|steer| SEND
+  R4["#4 ticket comment"] -->|steer| SEND
+  R12["#12 child report"] -->|steer| HTTP
+  R15["#15 release instruction"] -->|queue| DRI
+  R16["#16 queue nudge"] -->|"steer · expire 30s"| NOTIFY
+  R17["#17 spawn-time goal"] -->|queue| RAWFIFO
+  R5["#5 wt ask"] -->|"steer · reject"| ASK
+
+  R6["#6 dashboard textbox"] -->|engine_default| HTTP
+  R7["#7 Esc / Kill"] -->|abort| ESC
+  R13["#13 /compact"] -->|"queue · expire"| HTTP
+  R14["#14 /clear"] -->|"queue · expire"| HTTP
+
+  SEND["messages.send()<br/>messages.py:1680<br/>+ outbox fallback"]
+  ASK["messages.ask()<br/>messages.py:1805<br/>OWN chain, bypasses deliver()"]
+  DRI["_deliver_release_instruction()<br/>workers.py:1092<br/>OWN mini-chain: uds - fifo - send"]
+  NOTIFY["notify_workers()<br/>workers.py<br/>raw fifo, no adapter chain"]
+  RAWFIFO["write_to_worker_fifo()<br/>workers.py:593<br/>raw"]
+
+  SEND --> RESOLVE
+  RESOLVE["resolve_target()<br/>messages.py:422"] --> DELIVER
+  DELIVER["deliver()<br/>messages.py:1375<br/>THE ADAPTER CHAIN"]
+  DELIVER --> AD["_deliver_fifo / _deliver_resume<br/>_deliver_codex_app_server<br/>_deliver_gemini_resume<br/>_deliver_antigravity<br/>_deliver_delegate"]
+  AD --> HTTP
+
+  ASK -.->|skips| DELIVER
+  DRI -.->|skips| DELIVER
+  NOTIFY -.->|skips| DELIVER
+  RAWFIFO -.->|skips| DELIVER
+
+  HTTP["POST /api/inject-input<br/>server.py:75775"] --> ROUTER
+  ROUTER["_inject_text_into_session()<br/>THE CCC ROUTER"]
+  ROUTER --> UDS["_try_uds_peer_delivery()<br/>server.py:59941<br/>= steer, cannot interrupt"]
+  ROUTER --> GATE["steer gate<br/>server.py:60674"]
+  GATE --> INT["_write_stream_json_interrupt()<br/>server.py:53081"]
+  ROUTER --> TQ["terminal_queue<br/>pending-inputs.json<br/>= queue, hold + retry + expire"]
+  ESC["POST /api/inject-esc"] --> ISESS["_interrupt_session()<br/>six-way fallback"]
+
+  classDef choke fill:#1b2a3a,stroke:#4c7c9c,color:#def,stroke-width:3px;
+  classDef bypass fill:#3a1b1b,stroke:#8c4c4c,color:#fde;
+  class RESOLVE,DELIVER,ROUTER,HTTP choke;
+  class ASK,DRI,NOTIFY,RAWFIFO bypass;
+```
+
+### What the red nodes cost
+
+WT has **four** delivery implementations where it should have one. Only
+`messages.send()` goes through `resolve_target()` → `deliver()` → the adapter
+chain. The other three each reimplement a subset:
+
+| Bypass | Reimplements | What it loses |
+|---|---|---|
+| `ask()` | its own fifo → resume → delegate chain | no outbox fallback, no tty adapter, no codex/gemini/antigravity adapters |
+| `_deliver_release_instruction()` | uds → fifo → `send` | duplicates the chain it then falls back into |
+| `notify_workers()` | raw fifo only | no fallback at all; a fifo-less worker silently gets nothing (WATCHTOWER-14) |
+| `write_to_worker_fifo()` | nothing | raw write, correct here — the child has no other channel yet |
+
+**The consolidation.** One entry point:
+
+```
+messages.deliver(target, text, verb, *, on_busy=..., expire=..., await_reply=False)
+```
+
+`ask()` becomes `await_reply=True` on the same chain. `_deliver_release_instruction()`
+disappears — its uds-first preference is just `verb="steer"`, which the chain
+should already prefer UDS for. `notify_workers()` becomes a loop over
+`deliver(verb="steer", expire=30)`, which fixes WATCHTOWER-14 for free by
+inheriting the fallback chain.
+
+That is the real prize in CCC-1000: **the enum is what makes one delivery
+function possible.** Today the four paths exist precisely because each caller
+needed different timing behaviour and `mode` could not express it, so each grew
+its own chain.
+
+### Duplication across the two repos
+
+Two functions are maintained in parallel and must not drift:
+
+| WT | CCC | Sync note? |
+|---|---|---|
+| `peer_uds.py` | `ccc_peer_uds.py` | **yes** — explicit "update together" header |
+| `worker_turn_open()` | `_headless_log_turn_open()` | **no** — added `edaa414`, character-identical, no warning |
+
+The second should carry the same warning the first does.
+
 ## The UDS layer — which use cases can use the peer socket
 
 **UDS is `steer`, structurally.** A frame delivered over Claude Code's native
