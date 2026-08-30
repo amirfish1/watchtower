@@ -1625,6 +1625,107 @@ def test_notify_mixed_live_and_dead(wt):
     assert wt.workers.notify_workers("Q", "reach the living") == 1
 
 
+# ============================================================ mid-turn guard
+def _write_log(wt, rec, events):
+    """Write stream-json lines to a worker's stdout log (its turn-state log)."""
+    path = Path(rec["log"])
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return path
+
+
+def test_turn_open_true_when_log_ends_mid_turn(wt):
+    rec = _live_worker(wt, "Q")
+    _write_log(wt, rec, [
+        {"type": "user"},
+        {"type": "result", "subtype": "success"},
+        {"type": "assistant"},  # next turn already generating
+    ])
+    assert wt.workers.worker_turn_open(rec) is True
+
+
+def test_turn_open_false_when_log_ends_on_result(wt):
+    rec = _live_worker(wt, "Q")
+    _write_log(wt, rec, [
+        {"type": "assistant"},
+        {"type": "result", "subtype": "success"},
+    ])
+    assert wt.workers.worker_turn_open(rec) is False
+
+
+def test_turn_open_ignores_benign_post_result_trailers(wt):
+    """Events that can trail a completed result must not reopen the turn --
+    otherwise a nudge is stranded forever."""
+    rec = _live_worker(wt, "Q")
+    _write_log(wt, rec, [
+        {"type": "assistant"},
+        {"type": "result", "subtype": "success"},
+        {"type": "command_lifecycle"},
+        {"type": "system", "subtype": "rate_limit"},
+    ])
+    assert wt.workers.worker_turn_open(rec) is False
+
+
+def test_turn_open_fails_open_on_empty_or_missing_log(wt):
+    rec = _live_worker(wt, "Q")  # log exists but is empty
+    assert wt.workers.worker_turn_open(rec) is False
+    assert wt.workers.worker_turn_open({"engine": "claude", "log": "/no/such/log"}) is False
+    assert wt.workers.worker_turn_open({"engine": "claude"}) is False
+
+
+def test_turn_open_only_applies_to_claude_workers(wt):
+    rec = _live_worker(wt, "Q")
+    _write_log(wt, rec, [{"type": "assistant"}])
+    assert wt.workers.worker_turn_open(dict(rec, engine="codex")) is False
+
+
+def test_notify_defers_worker_that_is_mid_turn(wt):
+    """The warm-worker filter preferentially picks mid-turn workers; writing to
+    one can steer/truncate its in-flight response, so it is skipped."""
+    rec = _live_worker(wt, "Q")
+    _write_log(wt, rec, [
+        {"type": "result", "subtype": "success"},
+        {"type": "assistant"},
+    ])
+    assert wt.workers.notify_workers("Q", "do not interrupt me") == 0
+    # Nothing was pushed to the FIFO at all.
+    fd = wt._readers[-1]
+    os.set_blocking(fd, False)
+    try:
+        data = os.read(fd, 65536)
+    except BlockingIOError:
+        data = b""
+    assert data == b""
+
+
+def test_notify_delivers_once_the_turn_has_closed(wt):
+    rec = _live_worker(wt, "Q")
+    _write_log(wt, rec, [
+        {"type": "assistant"},
+        {"type": "result", "subtype": "success"},
+    ])
+    assert wt.workers.notify_workers("Q", "safe to deliver") == 1
+
+
+def test_release_instruction_skips_fifo_while_turn_is_open(wt, monkeypatch):
+    """The release fallback must not interrupt either -- it falls through to
+    messages.send, which holds/queues on a busy target instead of steering."""
+    rec = _live_worker(wt, "Q")
+    _write_log(wt, rec, [
+        {"type": "result", "subtype": "success"},
+        {"type": "assistant"},
+    ])
+    monkeypatch.setattr(
+        wt.workers, "_deliver_release_instruction_via_uds", lambda w, t: None
+    )
+    from watchtower import messages
+    monkeypatch.setattr(messages, "send", lambda target, text: {"ok": True})
+
+    result = wt.workers._deliver_release_instruction(rec, "you are released")
+
+    assert result["transport"] == "native_session"
+    assert result["delivered"] is True
+
+
 # ============================================================ session-id handle
 def test_claim_with_worker_id_leaves_session_id_empty(wt):
     """The documented gap: claiming with a non-UUID worker id does NOT populate

@@ -525,6 +525,71 @@ def _stream_json_user_line(text: str) -> bytes:
     return (json.dumps(msg) + "\n").encode("utf-8")
 
 
+# ── mid-turn interrupt guard ────────────────────────────────────────────────
+# A plain write to a headless Claude's stream-json FIFO is NOT guaranteed to be
+# buffered until the next turn boundary -- landing mid-turn it can act as
+# steering and truncate the response in flight (Anthropic issues #41230,
+# #63190). CCC hit this and fixed it by reading the headless session's own
+# stdout log: a completed turn ends with exactly one {"type":"result"} line, so
+# any later assistant/user/stream event means the next turn is already open.
+# A tool-child check is not enough -- the commonest case is a turn generating
+# text with no tool running at all.
+_TURN_OPEN_TAIL_BYTES = 65536
+# Events that can legitimately trail a completed result without reopening the
+# turn. Treating every trailing event as busy would strand nudges forever.
+_TURN_OPEN_ACTIVE_SYSTEM_SUBTYPES = frozenset({"init", "status", "thinking_tokens"})
+
+
+def worker_turn_open(w: Dict[str, Any]) -> bool:
+    """True if this claude worker's stream-json log ends mid-turn.
+
+    Only meaningful for ``engine=claude`` workers, which are the ones whose
+    FIFO write can be interpreted as steering. Fails OPEN (returns False, i.e.
+    "not busy") when the log is missing, empty or unreadable -- an unknown
+    state must not permanently strand delivery.
+    """
+    if not isinstance(w, dict):
+        return False
+    if str(w.get("engine") or "") != "claude":
+        return False
+    log = w.get("log")
+    if not log:
+        return False
+    turn_open = False
+    try:
+        with open(log, "rb") as f:
+            try:
+                size = os.fstat(f.fileno()).st_size
+            except OSError:
+                size = 0
+            if size > _TURN_OPEN_TAIL_BYTES:
+                f.seek(size - _TURN_OPEN_TAIL_BYTES)
+                f.readline()  # discard the partial first line
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    ev = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if not isinstance(ev, dict):
+                    continue
+                event_type = ev.get("type")
+                if event_type == "result":
+                    turn_open = False
+                elif event_type in ("assistant", "user", "stream_event"):
+                    turn_open = True
+                elif (
+                    event_type == "system"
+                    and ev.get("subtype") in _TURN_OPEN_ACTIVE_SYSTEM_SUBTYPES
+                ):
+                    turn_open = True
+    except OSError:
+        return False
+    return turn_open
+
+
 def write_to_worker_fifo(fifo_path: str, text: str) -> bool:
     """Push a stream-json user message to a live worker's FIFO. Returns True on
     delivery, False if the worker isn't listening (no reader / closed)."""
@@ -771,10 +836,17 @@ def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) ->
     is still the queue's valid worker and must be woken for new work; only a
     separately verified/released worker is skipped. Callers may pass a smaller
     bound when they specifically want warm-cache-only routing.
+
+    A worker whose turn is still open is SKIPPED, not written to: the idle
+    filter above preferentially selects warm workers, i.e. exactly the ones
+    most likely to be mid-response, and a mid-turn FIFO write can truncate it.
+    This path is a best-effort optimization whose miss is well-defined -- the
+    worker picks the work up on the next reconcile tick.
     """
     if max_idle_s is None:
         max_idle_s = RELEASE_IDLE_S
     n = 0
+    deferred = 0
     for w in list_workers():
         if not w.get("alive"):
             continue
@@ -784,9 +856,22 @@ def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) ->
             continue  # already released from queue staffing
         if _worker_idle_s(w) >= max_idle_s:
             continue
+        if worker_turn_open(w):
+            deferred += 1
+            continue  # mid-turn: defer to the next tick rather than interrupt
         fifo = w.get("fifo")
         if fifo and write_to_worker_fifo(fifo, text):
             n += 1
+    if deferred:
+        try:
+            from .queue import _log
+            _log(
+                "NUDGE",
+                f"{queue}: deferred {deferred} mid-turn worker(s); "
+                "will retry on the next tick",
+            )
+        except Exception:
+            pass
     return n
 
 
@@ -1012,7 +1097,10 @@ def _deliver_release_instruction(
         if uds_result is not None:
             return uds_result
     fifo = str(w.get("fifo") or "")
-    if fifo:
+    # A mid-turn FIFO write can steer (and truncate) the response in flight.
+    # messages.send below is the safe alternative: it holds/queues on a busy
+    # target and retries, instead of interrupting.
+    if fifo and not worker_turn_open(w):
         try:
             if write_to_worker_fifo(fifo, text):
                 return {"transport": "fifo", "delivered": True, "error": ""}
