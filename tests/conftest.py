@@ -28,6 +28,30 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
+    """Keep the real outbox and the real caller identity out of every test.
+
+    Two leaks closed here (OPS-835: live sessions spammed with
+    "[watchtower] Q-1 claimed" after any pytest run under an agent harness):
+
+    * ``messages._outbox_file()`` reads ``$WATCHTOWER_OUTBOX_FILE`` fresh per
+      call, and module-local fixtures (e.g. test_workers_lifecycle's ``wt``)
+      never set it -- so a notification send from any test parked in the
+      developer's real ``~/.watchtower/outbox.json`` and the live daemon kept
+      delivering it. Point it at tmp_path for every test; tests that set
+      their own (test_messages, test_chat_cli, test_chat_policy) simply
+      override this again.
+    * ``cmd_add`` defaults a ticket's ``submitter`` from the ambient
+      ``CLAUDE_CODE_SESSION_ID``/``CODEX_THREAD_ID`` (``_default_report_to``),
+      so a claim inside a test notified whatever real session ran pytest.
+      Tests that exercise that defaulting set the var themselves.
+    """
+    monkeypatch.setenv("WATCHTOWER_OUTBOX_FILE", str(tmp_path / "outbox.json"))
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+
+
+@pytest.fixture(autouse=True)
 def inert_codex_binary(tmp_path, monkeypatch):
     """Keep a test from resolving the developer's real Codex executable."""
     bin_dir = tmp_path / "watchtower-test-bin"
