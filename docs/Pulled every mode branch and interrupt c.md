@@ -519,10 +519,19 @@ The second should carry the same warning the first does.
 > `priority: next`; full log in `~/dev/scratch/uds-slash-test/results.md`).
 > Two variants, both `send_lines -> {"ok": True}`, **neither executed**:
 >
-> | Variant | Frame `message.content` | Result |
-> |---|---|---|
-> | Wrapped — what CCC/WT actually send | `<cross-session-message …>\n/compact\n</cross-session-message>` | delivered as inbound peer text, no compaction |
-> | Raw, unwrapped — diagnostic only | `/compact` | delivered as inbound peer text, no compaction |
+> | Variant | Frame `message.content` | Priority | Result |
+> |---|---|---|---|
+> | Wrapped — what CCC/WT actually send | `<cross-session-message …>\n/compact\n</cross-session-message>` | next | delivered as inbound peer text, no compaction |
+> | Raw, unwrapped — diagnostic only | `/compact` | next | delivered as inbound peer text, no compaction |
+> | Raw, re-run to rule out priority | `/compact` | **now** | delivered as inbound peer text, no compaction |
+> | Raw control, no precondition | `/status` | now | delivered as inbound peer text, **no status output** |
+>
+> The `/status` control matters: unlike `/compact`, it cannot no-op for lack of
+> anything to do — it always renders output when it executes, and rendered none.
+> The `compact_boundary` count in the session transcript was 2 before the round
+> and 2 after. The decisive discriminator across all four sends is that the
+> receiving session *sees the text in its own message stream*; a parsed slash
+> command would never surface as a peer message.
 >
 > **The `<cross-session-message>` wrapper is not the cause.** An earlier draft of
 > this section inferred that the wrapper's leading newline hid the slash;
