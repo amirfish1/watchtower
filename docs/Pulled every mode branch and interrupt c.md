@@ -245,6 +245,33 @@ earlier drafts of this doc (which called it the keystone fix) were wrong.
 > is CCC *observing* `[Request interrupted by user]` while parsing transcripts.
 > The log line is a symptom, not the action.
 
+### Defaults already diverge by engine — the strongest argument for the enum
+
+Submitting text in the composer while a turn is running does **not** mean the
+same thing across engines:
+
+| Engine | Default on composer submit | Effective verb |
+|---|---|---|
+| Codex | holds until the turn ends | `queue` |
+| Kimi (ACP) | holds until the turn ends | `queue` |
+| Grok (ACP) | holds until the turn ends | `queue` |
+| **Claude** | lands inside the running turn | **closer to `steer`** |
+
+Measured for Claude in session `4dbc1dfa` at 17:52:30-17:52:34: three messages
+posted `mode=send` during a live turn, surfaced *within* that turn at the next
+tool boundary, no hold. Codex's own docs describe the opposite default -- see
+[openai/codex#13595](https://github.com/openai/codex/issues/13595), where users
+complain that `Enter` queues rather than sending.
+
+CCC passes `mode` through rather than normalising it, so a user with a Claude
+pane and a Codex pane open types the same text, presses the same button, and
+gets opposite semantics. No mental model survives that.
+
+**This is the real value of the enum.** Earlier sections argue it fixes specific
+callers (#3, #4, #16). The larger win is that CCC can state one behaviour and
+hold every engine to it -- or, where an engine genuinely cannot comply, report
+`unsupported` instead of silently doing the other thing.
+
 ### Caveats carried into the spec
 
 - **`codex exec` has no mid-turn steering, by design** — headless has no human to
