@@ -1023,6 +1023,97 @@ def _print_resolution_items(item: dict) -> None:
     print("\n  ack one with: wt ack <ref> --unresolved N   (or --all)")
 
 
+def _resolution_haystack(item: dict) -> str:
+    """All of a closed ticket's resolution prose, lowercased, for --matching.
+
+    Includes the summary as well as the individual entries: verdicts like
+    "closed as not-applicable" are usually written in the summary, not
+    repeated in each unresolved bullet.
+    """
+    res = item.get("resolution")
+    if not isinstance(res, dict):
+        return ""
+    parts = [str(res.get("summary") or "")]
+    for field in q.RESOLUTION_LIST_FIELDS:
+        parts.extend(str(x) for x in (res.get(field) or []))
+    return "\n".join(parts).lower()
+
+
+def _has_resolution_items(item: dict) -> bool:
+    res = item.get("resolution")
+    if not isinstance(res, dict):
+        return False
+    return any(res.get(f) for f in q.RESOLUTION_LIST_FIELDS)
+
+
+def _cmd_ack_bulk(args: argparse.Namespace) -> int:
+    """`wt ack -q QUEUE --all [--matching TEXT]` — ack a whole queue at once.
+
+    Per-ref ack is already scriptable, but the case that motivated this
+    (WATCHTOWER-18) is a backlog of closed tickets whose unresolved entries
+    are terminal verdicts -- "not-applicable", "guide-only by policy",
+    "false positive" -- each of which keeps its row amber forever. Acking
+    them one ref at a time is the chore, not the decision.
+
+    Bulk mode is deliberately --all only: a 1-based index into one ticket's
+    caveat list means nothing applied across a hundred different tickets.
+    """
+    queue = getattr(args, "_ignored_queue", None)
+    if not queue:
+        print("error: bulk ack needs -q QUEUE (or pass a ticket ref)",
+              file=sys.stderr)
+        return 1
+    if not args.all:
+        print("error: bulk ack needs --all; per-index flags (--caveat/"
+              "--follow-up/--unresolved) only make sense for a single ticket",
+              file=sys.stderr)
+        return 1
+    items = [
+        it for it in q.list_items(project=queue, fresh=True)
+        if it.get("status") == "closed" and _has_resolution_items(it)
+    ]
+    needle = args.matching.strip().lower()
+    if needle:
+        items = [it for it in items if needle in _resolution_haystack(it)]
+    if not items:
+        why = f" matching {args.matching!r}" if needle else ""
+        print(f"(no closed tickets in {queue} with resolution items{why})")
+        return 0
+    verb = "UNACK" if args.undo else "ACK"
+    if args.dry_run:
+        print(f"would {verb.lower()} {len(items)} "
+              f"{'ticket' if len(items) == 1 else 'tickets'} in {queue}:")
+        for it in items:
+            print(f"  {str(it.get('ref','')):<14}"
+                  f"{_oneline(it.get('title') or it.get('note') or '')[:56]}")
+        return 0
+    by = args.by or _default_worker_id()
+    updated, failed = [], []
+    for it in items:
+        try:
+            res = q.ack_resolution(
+                it.get("ref"), all_items=True, by=by, undo=bool(args.undo)
+            )
+        except ValueError as exc:
+            # e.g. a GitHub-backed queue that has no ack representation --
+            # report it rather than aborting a half-applied bulk run.
+            failed.append((it.get("ref"), str(exc)))
+            continue
+        if res:
+            updated.append(res)
+    if args.json:
+        print(json.dumps(updated, indent=2))
+        return 1 if failed and not updated else 0
+    print(f"{verb}ED: {len(updated)} "
+          f"{'ticket' if len(updated) == 1 else 'tickets'} in {queue}")
+    for it in updated:
+        print(f"  {str(it.get('ref','')):<14}"
+              f"{_oneline(it.get('title') or it.get('note') or '')[:56]}")
+    for ref, err in failed:
+        print(f"  {str(ref):<14}SKIPPED — {err}", file=sys.stderr)
+    return 1 if failed and not updated else 0
+
+
 def cmd_ack(args: argparse.Namespace) -> int:
     """Acknowledge resolution warnings without rewriting the close record.
 
@@ -1030,7 +1121,15 @@ def cmd_ack(args: argparse.Namespace) -> int:
     entries as chips; before this the only way to clear a stale one was
     `wt close --force` with a rebuilt resolution, which rewrites history and
     re-fires close notifications. `wt ack` marks the entry seen instead: the
-    text is preserved verbatim and the chip renders dimmed."""
+    text is preserved verbatim and the chip renders dimmed.
+
+    With no ref this dispatches to the bulk form over a whole queue."""
+    if not args.ref:
+        return _cmd_ack_bulk(args)
+    if args.matching:
+        print("error: --matching is bulk mode; drop the ref (and pass -q QUEUE)",
+              file=sys.stderr)
+        return 1
     targets = []
     for field, dest, _flag in _ACK_FIELDS:
         for n in (getattr(args, dest, None) or []):
@@ -3994,7 +4093,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_close)
 
     s = sub.add_parser("ack", help=COMMAND_HELP.get("ack", ""))
-    s.add_argument("ref")
+    s.add_argument("ref", nargs="?", default="",
+                   help="ticket ref; omit it (with -q and --all) to bulk-ack a queue")
     s.add_argument("--all", action="store_true",
                    help="acknowledge every caveat/follow-up/unresolved item")
     s.add_argument("--caveat", action="append", type=int, metavar="N",
@@ -4007,7 +4107,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="remove the acknowledgement instead of adding it")
     s.add_argument("--by", default="", help="who is acknowledging (default: your worker id)")
     s.add_argument("--json", action="store_true", help="print the updated ticket as JSON")
-    _add_redundant_queue_flag(s)
+    s.add_argument("--matching", default="", metavar="TEXT",
+                   help="bulk mode: only tickets whose resolution text contains "
+                        "TEXT (case-insensitive substring, e.g. not-applicable)")
+    s.add_argument("--dry-run", action="store_true", dest="dry_run",
+                   help="bulk mode: list what would be acked, change nothing")
+    # Unlike other ref-based commands, -q is NOT purely decorative here: with
+    # no ref it selects the queue to bulk-ack. It stays ignored in ref mode.
+    s.add_argument("-q", "--queue", dest="_ignored_queue", default=None,
+                   metavar="QUEUE",
+                   help="with a ref: accepted but ignored (refs are globally "
+                        "unique). With no ref: the queue to bulk-ack.")
     s.set_defaults(func=cmd_ack)
 
     s = sub.add_parser("release")

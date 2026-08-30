@@ -418,6 +418,20 @@ wt ack DEMO-1 --all                # acknowledge every caveat/follow-up/unresolv
 wt ack DEMO-1 --unresolved 1 --undo
 ```
 
+Drop the ref for the bulk form, for the case where a queue has accumulated a
+backlog of terminal verdicts ("not-applicable", "guide-only by policy") that
+each keep a row amber forever:
+
+```bash
+wt ack -q DEMO --all --dry-run                     # list what would be acked
+wt ack -q DEMO --all --matching not-applicable     # only those verdicts
+wt ack -q DEMO --all --matching not-applicable --undo
+```
+
+`--matching` is a case-insensitive substring over the whole resolution — the
+summary as well as each entry. Bulk mode is `--all` only, since a 1-based
+index into one ticket's caveat list means nothing across a hundred tickets.
+
 Indexes are 1-based and match the `wt ack <ref>` listing. An acknowledged chip
 renders dimmed rather than disappearing, and its ✓ toggle on the dashboard
 does the same thing over `POST /api/ticket/<ref>/ack`

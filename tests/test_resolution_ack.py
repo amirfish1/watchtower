@@ -234,3 +234,123 @@ def test_queue_page_ships_the_ack_toggle_even_with_no_active_tickets(wt_env):
     assert "No active tickets" in page
     assert "async function wtAck" in page
     assert 'class="chip unresolved acked"' in page
+
+
+# --------------------------------------------------------- bulk ack (WATCHTOWER-18)
+
+def _closed_in(wt_env, project, note, **resolution):
+    q = wt_env.queue
+    item = q.enqueue(project=project, note=note)
+    q.claim_next("w1", project=project)
+    q.close(item["ref"], "w1", resolution={"summary": "did it", **resolution})
+    return item["ref"]
+
+
+def test_bulk_ack_covers_every_closed_ticket_in_the_queue(wt_env, run_cli):
+    a = _closed_in(wt_env, "BULKQ", "a", unresolved=["not-applicable"])
+    b = _closed_in(wt_env, "BULKQ", "b", caveats=["watch out"])
+    wt_env.queue.enqueue(project="BULKQ", note="still open")
+
+    out = run_cli("ack", "-q", "BULKQ", "--all").out
+
+    assert "ACKED: 2 tickets in BULKQ" in out
+    for ref in (a, b):
+        res = wt_env.queue.get(ref)["resolution"]
+        field = "unresolved" if ref == a else "caveats"
+        assert wt_env.queue.is_acked(res, field, 0)
+
+
+def test_bulk_ack_matching_narrows_by_resolution_text(wt_env, run_cli):
+    hit = _closed_in(wt_env, "BULKQ", "a", unresolved=["closed as not-applicable"])
+    miss = _closed_in(wt_env, "BULKQ", "b", unresolved=["the flaky test"])
+
+    run_cli("ack", "-q", "BULKQ", "--all", "--matching", "NOT-APPLICABLE")
+
+    assert wt_env.queue.is_acked(wt_env.queue.get(hit)["resolution"], "unresolved", 0)
+    assert not wt_env.queue.is_acked(
+        wt_env.queue.get(miss)["resolution"], "unresolved", 0
+    )
+
+
+def test_bulk_ack_matching_also_searches_the_summary(wt_env, run_cli):
+    """Terminal verdicts are usually written in the summary, not each bullet."""
+    q = wt_env.queue
+    item = q.enqueue(project="BULKQ", note="a")
+    q.claim_next("w1", project="BULKQ")
+    q.close(item["ref"], "w1", resolution={
+        "summary": "closed as not-applicable", "unresolved": ["see above"],
+    })
+
+    run_cli("ack", "-q", "BULKQ", "--all", "--matching", "not-applicable")
+
+    assert q.is_acked(q.get(item["ref"])["resolution"], "unresolved", 0)
+
+
+def test_bulk_ack_dry_run_changes_nothing(wt_env, run_cli):
+    ref = _closed_in(wt_env, "BULKQ", "a", unresolved=["not-applicable"])
+
+    out = run_cli("ack", "-q", "BULKQ", "--all", "--dry-run").out
+
+    assert "would ack 1 ticket in BULKQ" in out
+    assert ref in out
+    assert not wt_env.queue.is_acked(
+        wt_env.queue.get(ref)["resolution"], "unresolved", 0
+    )
+
+
+def test_bulk_ack_undo_reverses_it(wt_env, run_cli):
+    ref = _closed_in(wt_env, "BULKQ", "a", unresolved=["not-applicable"])
+    run_cli("ack", "-q", "BULKQ", "--all")
+
+    out = run_cli("ack", "-q", "BULKQ", "--all", "--undo").out
+
+    assert "UNACKED: 1 ticket in BULKQ" in out
+    assert not wt_env.queue.is_acked(
+        wt_env.queue.get(ref)["resolution"], "unresolved", 0
+    )
+
+
+def test_bulk_ack_skips_closed_tickets_with_no_resolution_items(wt_env, run_cli):
+    """A clean close raises ValueError on ack; it must not be selected at all."""
+    _closed_in(wt_env, "BULKQ", "clean")
+
+    out = run_cli("ack", "-q", "BULKQ", "--all").out
+
+    assert "no closed tickets in BULKQ with resolution items" in out
+
+
+def test_bulk_ack_requires_a_queue(wt_env, run_cli):
+    res = run_cli("ack", "--all")
+
+    assert res.code == 1
+    assert "needs -q QUEUE" in res.err
+
+
+def test_bulk_ack_requires_all(wt_env, run_cli):
+    _closed_in(wt_env, "BULKQ", "a", unresolved=["x"])
+
+    res = run_cli("ack", "-q", "BULKQ", "--unresolved", "1")
+
+    assert res.code == 1
+    assert "needs --all" in res.err
+
+
+def test_matching_is_rejected_with_a_ref(wt_env, run_cli):
+    ref = _closed_in(wt_env, "BULKQ", "a", unresolved=["x"])
+
+    res = run_cli("ack", ref, "--all", "--matching", "x")
+
+    assert res.code == 1
+    assert "--matching is bulk mode" in res.err
+
+
+def test_single_ref_ack_still_works_unchanged(wt_env, run_cli):
+    """The ref form must not regress now that `ref` is optional."""
+    ref = _closed(wt_env, unresolved=["stale thing"])
+
+    out = run_cli("ack", ref, "--unresolved", "1").out
+
+    assert f"ACKED: {ref}" in out
+    assert wt_env.queue.is_acked(
+        wt_env.queue.get(ref)["resolution"], "unresolved", 0
+    )
