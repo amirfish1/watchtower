@@ -498,6 +498,23 @@ The second should carry the same warning the first does.
 
 ## The UDS layer — which use cases can use the peer socket
 
+> **Slash commands over UDS silently become text.** `/compact` and `/clear` are
+> safe: `compact_command` / `clear_command` return unconditionally at
+> `server.py:60487` and `:60498`, *above* the UDS attempt at `:60553`. The
+> comment there states why — "`/compact` written to a FIFO as user text is
+> **prompt text, not a command**".
+>
+> **Every other slash command is unguarded.** `slash_command` is computed at
+> `:60472` but only consulted for Codex (`:60562`), and only *after* UDS has
+> already run. So `/model`, `/cost`, `/status`, `/resume`, `/code-review` and any
+> custom skill, sent to a Claude target from an eligible source (`wt`, `ask`,
+> `announced_from`, group-chat), fall through to `_try_uds_peer_delivery`, get
+> wrapped in `<cross-session-message>`, and arrive as literal text.
+>
+> The sender receives a transcript-confirmed `delivered` receipt. Nothing
+> executes, and neither side sees an error. `wt send <session> "/code-review"`
+> reports success and delivers the string `/code-review`.
+
 **UDS is `steer`, structurally.** A frame delivered over Claude Code's native
 peer socket lands at *"the receiver's next tool boundary or turn end"* and
 **cannot interrupt** — no such primitive exists on that transport. CCC sets
