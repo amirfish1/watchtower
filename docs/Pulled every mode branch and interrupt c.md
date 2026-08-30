@@ -44,6 +44,19 @@ That opt-in is `force_queue` (originally spelled `mode="send_queue"`).
 
 ## Use-case map
 
+> **These rows are not all the same kind of thing.** Rows 1-9 and 12-17 are
+> genuine use cases: somebody wants something. The rest were added later and sit
+> at different layers, which is worth knowing before reading the Desired column:
+>
+> | Row | Actually a… |
+> |---|---|
+> | **10** | **transport** — `_try_uds_peer_delivery` is a rung in a fallback chain (`server.py:60553`, `:61949`), never something a caller asks for by name |
+> | **11** | **inbound** — every other row delivers *to* a session; this one receives |
+> | **18, 19, 20** | **API entry points** — doors, not intentions. They carry mode semantics so they belong in the doc, but they are not peers of "user types in the dashboard textbox" |
+>
+> Numbers are kept as-is because #3, #6, #13 and others are cross-referenced
+> throughout this document.
+
 | # | Use case | From → To | Path today | Reaches `_inject_text_into_session`? | **Current** | **Desired** (open questions inline) |
 |---|---|---|---|---|---|---|
 | 1 | WT ticket notify (claim/close/block, FYI) | WT queue → ticket submitter/subscriber session | **WT** — `queue.py:_notify_ticket_event` → `messages.send` | No (WT's own fifo/tty/resume adapters) | `steer`, accidental — raw write, no turn-open check | `steer` — an orchestrator may need a ticket-close *while* mid-task |
@@ -55,7 +68,7 @@ That opt-in is `force_queue` (originally spelled `mode="send_queue"`).
 | 7 | Esc/Kill button | User in CCC dashboard → live CCC-owned headless session | **CCC** — the button on top of #19: `/api/inject-esc` → `_interrupt_session` → `_interrupt_claude_headless_local` (`server.py:61171`) is only **one branch** of six | Yes | `abort` | `abort` — ✓ correct today |
 | 8 | Codex steer | User in CCC dashboard → live Codex session | **CCC** — `resume_session_codex(steer=True)` | N/A — Codex-native | `steer` — native Codex `turn/steer` (`server.py:36307`) | `steer` — ✓ correct today. **Corrected 2026-08-30**: Codex steer preserves the turn |
 | 9 | ACP (Grok/Kimi) steer while busy | User in CCC dashboard → live ACP session | **CCC** — `session/cancel` + resend | N/A — ACP-native | `abort` + resend — kills the turn, no seam primitive | `steer`, emulated as `abort_first` — **Q2**: ACP exposes no seam, only `session/cancel`, so this is the one place the emulation is forced. |
-| 10 | CCC→foreign session outbound (`_try_uds_peer_delivery`, used by ask + cross-model bridge) | CCC → foreign (non-CCC-owned) Claude session | **CCC** — `_try_uds_peer_delivery` (`server.py:59767`); sets `priority: "now"/"next"` in JSON body, delivered via receiver's native `SendMessage` inbox | No — foreign process, no FIFO CCC controls | `steer` / `queue` via the frame's `priority: now`/`next` | `steer` — destruction is structurally impossible on this transport |
+| 10 | CCC→foreign session outbound (`_try_uds_peer_delivery`, used by ask + cross-model bridge) | CCC → foreign (non-CCC-owned) Claude session | **CCC** — `_try_uds_peer_delivery` (`server.py:59767`); sets `priority: "now"/"next"` in JSON body, delivered via receiver's native `SendMessage` inbox | No — foreign process, no FIFO CCC controls | `steer` / `queue` via the frame's `priority: now`/`next` | *(not a use case — a **transport**. Two call sites, `server.py:60553` and `:61949`, both pick it inside a fallback chain. Its use case is whichever row is being served when the target is foreign.)* |
 | 11 | CCC inbound peer socket (Slice 3, another session → CCC) | Foreign peer session → CCC-owned session | **CCC** — `_ccc_peer_handle_connection` (`server.py:59701`) — only routes ask-replies + report envelopes | No — general chat frames get logged `CCC-PEER-UNROUTED` and dropped | dropped entirely (`CCC-PEER-UNROUTED`) | *(out of scope — this row is **inbound**; every other row delivers text to a session)* |
 | 12 | Worker child → parent completion report | Spawned worker child → parent session | **worker harness → CCC** — curl footer to CCC's HTTP API, or the harness's own `SendMessage` | Sometimes (report envelope path) | `steer`, accidental | `steer` — a parent orchestrator may want to act on "child finished" immediately, same argument as #1 |
 | 13 | Steered `/compact` (variant of #6) | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_inject_text_into_session` → interrupt → `compact_session_context` (`server.py:60312`) | **Yes** | `abort`+deliver, fused | `queue`, `expire 5m` — compact **already** supports waiting for turn end (`compact_session_context(_from_terminal_queue=)`, `server.py:59069`). **Q4**: the bug was never the wait, it was the missing expiry |
