@@ -187,6 +187,9 @@ def _event_summary(event: dict) -> str:
         res = event.get("resolution") or {}
         summary = res.get("summary") if isinstance(res, dict) else ""
         return f"closed: {summary or ''}".rstrip()
+    if name in ("ack", "unack"):
+        verb = "acknowledged" if name == "ack" else "un-acknowledged"
+        return f"{verb}: {event.get('text') or ''}".rstrip()
     if name == "edit":
         fields = event.get("fields") or {}
         return "edited: " + ", ".join(sorted(fields)) if fields else "edited"
@@ -338,7 +341,12 @@ def cmd_ls(args: argparse.Namespace) -> int:
                                ("unresolved", "unresolved")):
                 n = len(res.get(key) or [])
                 if n:
-                    extras.append(f"{n} {label}{'s' if n != 1 else ''}")
+                    # An acknowledged item still counts -- the record is never
+                    # rewritten -- but says so, so a line of stale warnings
+                    # reads as handled rather than outstanding (`wt ack`).
+                    acked = sum(1 for i in range(n) if q.is_acked(res, key, i))
+                    suffix = f", {acked} acked" if acked else ""
+                    extras.append(f"{n} {label}{'s' if n != 1 else ''}{suffix}")
             if extras:
                 line += f" [{', '.join(extras)}]"
         print(line)
@@ -901,6 +909,71 @@ def cmd_close(args: argparse.Namespace) -> int:
                 source="wt-followup",
             )
             print(f"  FILED follow-up: {new['ref']}  {note}")
+    return 0
+
+
+_ACK_FIELDS = (
+    ("caveats", "caveat", "--caveat"),
+    ("follow_ups", "follow_up", "--follow-up"),
+    ("unresolved", "unresolved", "--unresolved"),
+)
+
+
+def _print_resolution_items(item: dict) -> None:
+    """Numbered listing of a closed ticket's caveat/follow-up/unresolved
+    entries, with their ack state -- what `wt ack <ref>` prints when no
+    selector was given, so the caller can see which index to ack."""
+    res = item.get("resolution") or {}
+    print(f"{item.get('ref', '')}  {res.get('summary') or item.get('title') or ''}")
+    for field, _dest, flag in _ACK_FIELDS:
+        vals = res.get(field) or []
+        for i, val in enumerate(vals):
+            mark = "[acked]" if q.is_acked(res, field, i) else "[     ]"
+            print(f"  {mark} {flag} {i + 1}  {_oneline(str(val))[:100]}")
+    print("\n  ack one with: wt ack <ref> --unresolved N   (or --all)")
+
+
+def cmd_ack(args: argparse.Namespace) -> int:
+    """Acknowledge resolution warnings without rewriting the close record.
+
+    The dashboard renders a closed ticket's caveats / follow-ups / unresolved
+    entries as chips; before this the only way to clear a stale one was
+    `wt close --force` with a rebuilt resolution, which rewrites history and
+    re-fires close notifications. `wt ack` marks the entry seen instead: the
+    text is preserved verbatim and the chip renders dimmed."""
+    targets = []
+    for field, dest, _flag in _ACK_FIELDS:
+        for n in (getattr(args, dest, None) or []):
+            if n < 1:
+                print(f"error: indexes are 1-based; got {n}", file=sys.stderr)
+                return 1
+            targets.append((field, n - 1))
+    if not targets and not args.all:
+        item = q.get(args.ref)
+        if not item:
+            print(f"not found: {args.ref}", file=sys.stderr)
+            return 1
+        _print_resolution_items(item)
+        return 0
+    try:
+        item = q.ack_resolution(
+            args.ref,
+            targets=targets,
+            all_items=bool(args.all),
+            by=args.by or _default_worker_id(),
+            undo=bool(args.undo),
+        )
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
+    print(f"{'UNACKED' if args.undo else 'ACKED'}: {item['ref']}")
+    _print_resolution_items(item)
     return 0
 
 
@@ -3417,6 +3490,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Worker protocol", "claim"),
     ("Worker protocol", "release"),
     ("Worker protocol", "close"),
+    ("Worker protocol", "ack"),
     ("Worker protocol", "block"),
 ]
 # `install` is intentionally absent: it's a hidden alias folded into `wt start`
@@ -3432,6 +3506,7 @@ COMMAND_HELP: Dict[str, str] = {
     "claim": "claim next open ticket (smart sort: priority + type + age)",
     "release": "give up a claim without closing it; returns the ticket to open",
     "close": "close a ticket (record how you fixed it)",
+    "ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
     "block": "park a ticket that needs a human decision",
     "blocked": "list tickets parked for a human",
     "answer": "answer a blocked ticket; auto-resumes its session",
@@ -3815,6 +3890,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "another worker (bypasses the reap-induced duplicate-close guard)")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_close)
+
+    s = sub.add_parser("ack", help=COMMAND_HELP.get("ack", ""))
+    s.add_argument("ref")
+    s.add_argument("--all", action="store_true",
+                   help="acknowledge every caveat/follow-up/unresolved item")
+    s.add_argument("--caveat", action="append", type=int, metavar="N",
+                   help="acknowledge caveat N (1-based, repeatable)")
+    s.add_argument("--follow-up", action="append", type=int, dest="follow_up",
+                   metavar="N", help="acknowledge follow-up N (1-based, repeatable)")
+    s.add_argument("--unresolved", action="append", type=int, metavar="N",
+                   help="acknowledge unresolved item N (1-based, repeatable)")
+    s.add_argument("--undo", action="store_true",
+                   help="remove the acknowledgement instead of adding it")
+    s.add_argument("--by", default="", help="who is acknowledging (default: your worker id)")
+    s.add_argument("--json", action="store_true", help="print the updated ticket as JSON")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_ack)
 
     s = sub.add_parser("release")
     s.add_argument("ref")

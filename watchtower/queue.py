@@ -1741,6 +1741,18 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
         vals = [_clip(v, 4000) for v in raw if str(v or "").strip()]
         if vals:
             out[field] = vals
+    # Acknowledgements (see ``ack_resolution``) live alongside their list as
+    # ``<field>_ack``; carry them through so re-normalizing a stored
+    # resolution doesn't silently un-acknowledge every chip a human cleared.
+    for field in ("caveats", "follow_ups", "unresolved"):
+        acks = resolution.get(f"{field}_ack")
+        if isinstance(acks, dict) and acks and out.get(field):
+            out[f"{field}_ack"] = {
+                str(k): v for k, v in acks.items()
+                if str(k).isdigit() and int(k) < len(out[field])
+            }
+            if not out[f"{field}_ack"]:
+                out.pop(f"{field}_ack")
     return out or None
 
 
@@ -2013,6 +2025,123 @@ def release(ident: Any, session_id: str = "", force: bool = False) -> Optional[D
             )
     return update_status(ident, "open", session_id, require_status="in_progress",
                           reason="released")
+
+
+RESOLUTION_LIST_FIELDS = ("caveats", "follow_ups", "unresolved")
+
+
+def ack_resolution(
+    ident: Any,
+    targets: Any = None,
+    all_items: bool = False,
+    by: str = "human",
+    session_id: str = "",
+    undo: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Acknowledge (or un-acknowledge) individual resolution warnings.
+
+    A closed ticket's ``caveats`` / ``follow_ups`` / ``unresolved`` entries
+    render as coloured chips on the dashboard, and used to have exactly one
+    removal path: ``wt close --force`` with a rebuilt resolution, which
+    rewrites the close record and re-fires close notifications just to clear
+    visual noise. An ack is the non-destructive alternative: the text stays
+    exactly as the worker wrote it, and a parallel ``<field>_ack`` map records
+    who acknowledged which entry and when, so the dashboard can dim it.
+
+    ``targets`` is an iterable of ``(field, index)`` pairs with a 0-based
+    index into that field's list; ``all_items=True`` acks every entry in every
+    field. ``undo=True`` removes the acks instead. Idempotent: re-acking an
+    already-acked entry refreshes nothing and re-unacking is a no-op.
+
+    Returns the updated item, None when no item matches, and raises
+    ``ValueError`` for a ticket with no resolution or an out-of-range index."""
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        raise ValueError(
+            f"{ident} is in a GitHub-backed queue; resolution acks aren't supported there"
+        )
+    actor_kind = by if by in ("worker", "human", "system") else "human"
+    pairs = [] if targets is None else [(str(f), int(i)) for f, i in targets]
+    for field, _idx in pairs:
+        if field not in RESOLUTION_LIST_FIELDS:
+            raise ValueError(
+                f"unknown resolution field {field!r}; expected one of "
+                f"{', '.join(RESOLUTION_LIST_FIELDS)}"
+            )
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            res = it.get("resolution")
+            if not isinstance(res, dict) or not any(
+                res.get(f) for f in RESOLUTION_LIST_FIELDS
+            ):
+                raise ValueError(
+                    f"{it.get('ref', ident)} has no caveat/follow-up/unresolved "
+                    "items to acknowledge"
+                )
+            wanted = list(pairs)
+            if all_items:
+                wanted = [
+                    (f, i)
+                    for f in RESOLUTION_LIST_FIELDS
+                    for i in range(len(res.get(f) or []))
+                ]
+            if not wanted:
+                raise ValueError(
+                    "nothing selected: pass all_items=True or at least one "
+                    "(field, index) target"
+                )
+            for field, idx in wanted:
+                n = len(res.get(field) or [])
+                if idx < 0 or idx >= n:
+                    raise ValueError(
+                        f"{it.get('ref', ident)} has {n} {field} "
+                        f"item{'' if n == 1 else 's'}; no index {idx + 1}"
+                    )
+            now = _now_iso()
+            changed = []
+            for field, idx in wanted:
+                key = f"{field}_ack"
+                acks = res.get(key)
+                if not isinstance(acks, dict):
+                    acks = {}
+                if undo:
+                    if acks.pop(str(idx), None) is not None:
+                        changed.append((field, idx))
+                elif str(idx) not in acks:
+                    acks[str(idx)] = {"at": now, "by": _clip(str(by or "human"), 128)}
+                    changed.append((field, idx))
+                if acks:
+                    res[key] = acks
+                else:
+                    res.pop(key, None)
+            if not changed:
+                return it
+            it["resolution"] = res
+            it["updated_at"] = now
+            detail = ", ".join(f"{f}#{i + 1}" for f, i in changed)
+            _append_history(
+                it,
+                "ack" if not undo else "unack",
+                by=_by(actor_kind, str(by or ""), str(session_id or "")),
+                at=now,
+                text=detail,
+            )
+            _save_unlocked(data)
+            _log(
+                "UNACK" if undo else "ACK",
+                f"{it.get('ref', '?')} — {detail}",
+                queue=it.get("project", ""),
+            )
+            return it
+    return None
+
+
+def is_acked(res: Dict[str, Any], field: str, index: int) -> bool:
+    """True when entry ``index`` of ``res[field]`` has been acknowledged."""
+    acks = (res or {}).get(f"{field}_ack")
+    return isinstance(acks, dict) and str(index) in acks
 
 
 def block(

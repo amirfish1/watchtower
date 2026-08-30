@@ -403,6 +403,27 @@ section (most-recent first) where each row shows its summary with small chips fo
 caveats / follow-ups / unresolved. `GET /api/queue/<name>` returns both the
 active `tickets` and the `closed` array (closed items carry their `resolution`).
 
+#### Acknowledging warnings
+
+A caveat or unresolved item that has been read and accepted — a standing
+limitation, something already handled elsewhere — can be acknowledged instead
+of erased. `wt ack` records who acknowledged which entry and when, alongside
+the original text; the close record itself is never rewritten and no close
+notification is re-fired.
+
+```bash
+wt ack DEMO-1                      # numbered listing of this ticket's warnings
+wt ack DEMO-1 --unresolved 1       # acknowledge the first unresolved item
+wt ack DEMO-1 --all                # acknowledge every caveat/follow-up/unresolved
+wt ack DEMO-1 --unresolved 1 --undo
+```
+
+Indexes are 1-based and match the `wt ack <ref>` listing. An acknowledged chip
+renders dimmed rather than disappearing, and its ✓ toggle on the dashboard
+does the same thing over `POST /api/ticket/<ref>/ack`
+(`{"field", "index", "undo"}` or `{"all": true}`). Closed `wt ls` rows report
+the tally as e.g. `[2 unresolveds, 1 acked]`.
+
 ### The signature feature: `wt wait`
 
 `wt wait -q DEMO` blocks (polling) until the queue has zero open tickets, then

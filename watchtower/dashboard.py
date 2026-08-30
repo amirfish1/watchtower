@@ -381,6 +381,18 @@ _STYLE = """
                        border-color: rgba(255,92,92,.25); }
     .chip.follow { background: rgba(111,179,255,.12); color: var(--beam);
                    border-color: rgba(111,179,255,.25); }
+    /* An acknowledged chip (see queue.ack_resolution) keeps its text -- the
+       close record is never rewritten -- but drops out of the alarm palette
+       so a wall of stale warnings stops shouting. */
+    .chip.acked { background: rgba(255,255,255,.04); color: var(--muted);
+                  border-color: rgba(255,255,255,.10); opacity: .7; }
+    .chip.acked .lbl { text-decoration: line-through; }
+    .chip .ackbtn {
+      margin-left: 6px; padding: 0 4px; font: inherit; font-size: 11px;
+      line-height: 1; cursor: pointer; color: inherit; opacity: .55;
+      background: transparent; border: 0; border-radius: 4px;
+    }
+    .chip .ackbtn:hover { opacity: 1; background: rgba(255,255,255,.08); }
 
     .foot { margin-top: 40px; font-size: 12px; color: var(--muted); }
     .foot .mono { color: var(--muted); }
@@ -966,10 +978,14 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
     return _page(title, header + layout + chats_section + foot)
 
 
-def _resolution_chips(res: Dict[str, Any]) -> str:
+def _resolution_chips(res: Dict[str, Any], ref: str = "") -> str:
     """Small palette chips for a resolution's caveats / follow-ups / unresolved.
 
-    Caveats/unresolved lean --warn/--alarm; follow-ups lean --beam."""
+    Caveats/unresolved lean --warn/--alarm; follow-ups lean --beam. An entry
+    a human has acknowledged (``queue.ack_resolution``) renders dimmed rather
+    than disappearing -- the point of the ack is to clear the visual alarm
+    without touching the close record. With ``ref`` given, each chip also
+    carries a toggle that POSTs to ``/api/ticket/<ref>/ack``."""
     specs = (
         ("caveats", "caveat", "caveat"),
         ("follow_ups", "follow", "follow-up"),
@@ -977,10 +993,20 @@ def _resolution_chips(res: Dict[str, Any]) -> str:
     )
     chips = []
     for key, cls, label in specs:
-        for val in res.get(key) or []:
+        for idx, val in enumerate(res.get(key) or []):
+            acked = q.is_acked(res, key, idx)
+            btn = ""
+            if ref:
+                title = "Un-acknowledge" if acked else "Acknowledge (keeps the record)"
+                btn = (
+                    f'<button class="ackbtn" title="{title}" '
+                    f"onclick=\"wtAck('{html.escape(ref, quote=True)}','{key}',{idx},"
+                    f'{"true" if acked else "false"})">'
+                    f'{"&#x21ba;" if acked else "&check;"}</button>'
+                )
             chips.append(
-                f'<span class="chip {cls}">'
-                f'<span class="lbl">{label}:</span> {html.escape(str(val))}</span>'
+                f'<span class="chip {cls}{" acked" if acked else ""}">'
+                f'<span class="lbl">{label}:</span> {html.escape(str(val))}{btn}</span>'
             )
     if not chips:
         return ""
@@ -1012,13 +1038,41 @@ def _closed_block(closed: List[Dict[str, Any]], total_closed: int) -> str:
             f'          <span class="tworker mono">{worker}</span>\n'
             f'          {summary_html}\n'
             f'        </div>\n'
-            f"{_resolution_chips(res)}"
+            f"{_resolution_chips(res, str(it.get('ref', '')))}"
             f"      </div>"
         )
     return (
         f'    <h2 class="closed-head">Closed{extra}</h2>\n'
         '    <div class="tickets">\n' + "\n".join(crows) + "\n    </div>\n"
     )
+
+
+_QUEUE_SCRIPT = (
+    "    <script>\n"
+    "    async function wtRun(ref) {\n"
+    "      const res = await fetch('/api/ticket/' + encodeURIComponent(ref) + '/run', {method: 'POST'});\n"
+    "      if (!res.ok) {\n"
+    "        let msg = 'Run failed';\n"
+    "        try { const data = await res.json(); msg = data.error || msg; } catch (_) {}\n"
+    "        alert(msg);\n"
+    "        return;\n"
+    "      }\n"
+    "      location.reload();\n"
+    "    }\n"
+    "    async function wtAck(ref, field, index, undo) {\n"
+    "      const res = await fetch('/api/ticket/' + encodeURIComponent(ref) + '/ack', {\n"
+    "        method: 'POST', headers: {'Content-Type': 'application/json'},\n"
+    "        body: JSON.stringify({field: field, index: index, undo: !!undo})});\n"
+    "      if (!res.ok) {\n"
+    "        let msg = 'Ack failed';\n"
+    "        try { const data = await res.json(); msg = data.error || msg; } catch (_) {}\n"
+    "        alert(msg);\n"
+    "        return;\n"
+    "      }\n"
+    "      location.reload();\n"
+    "    }\n"
+    "    </script>\n"
+)
 
 
 def render_queue(
@@ -1052,13 +1106,16 @@ def render_queue(
     closed_block = _closed_block(closed, total_closed)
 
     if not tickets:
+        # The ack toggles live on closed rows, so the script has to ship on
+        # the no-active-tickets page too -- a drained queue is exactly where
+        # you sit clearing old warning chips.
         body = header + (
             '    <div class="empty">\n'
             '      <div class="beacon dim" aria-hidden="true"></div>\n'
             '      <div class="line disp">No active tickets</div>\n'
             '      <div class="sub mono">This queue is clear.</div>\n'
             "    </div>\n"
-        ) + closed_block
+        ) + closed_block + _QUEUE_SCRIPT
         return _page(f"{name} · WatchTower", body)
 
     trows = [
@@ -1093,21 +1150,7 @@ def render_queue(
             f"      </div>"
         )
     tickets_block = '    <div class="tickets">\n' + "\n".join(trows) + "\n    </div>\n"
-    script = (
-        "    <script>\n"
-        "    async function wtRun(ref) {\n"
-        "      const res = await fetch('/api/ticket/' + encodeURIComponent(ref) + '/run', {method: 'POST'});\n"
-        "      if (!res.ok) {\n"
-        "        let msg = 'Run failed';\n"
-        "        try { const data = await res.json(); msg = data.error || msg; } catch (_) {}\n"
-        "        alert(msg);\n"
-        "        return;\n"
-        "      }\n"
-        "      location.reload();\n"
-        "    }\n"
-        "    </script>\n"
-    )
-    return _page(f"{name} · WatchTower", header + tickets_block + closed_block + script)
+    return _page(f"{name} · WatchTower", header + tickets_block + closed_block + _QUEUE_SCRIPT)
 
 
 def _chat_not_found_page(ref: str) -> str:
@@ -1366,6 +1409,50 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(500, {"error": str(exc)})
                 return
             self._json(200, {"ok": True, "ticket": item, "dispatch": reason})
+            return
+        # POST /api/ticket/<ref>/ack: {"field", "index", "undo"} | {"all": true}
+        # -> queue.ack_resolution. Dims a closed ticket's caveat/unresolved chip
+        # without rewriting the close record (the `wt close --force` rebuild
+        # this replaces re-fired close notifications just to clear noise).
+        if path.startswith("/api/ticket/") and path.endswith("/ack"):
+            if not _check_same_origin(self):
+                self._json(403, {"error": "cross-origin request rejected"})
+                return
+            if not _check_bearer_token(self):
+                self._json(401, {"error": "missing or invalid bearer token"})
+                return
+            ref = urllib.parse.unquote(path[len("/api/ticket/"):-len("/ack")])
+            data = self._read_json_body()
+            if not isinstance(data, dict):
+                self._json(400, {"error": "invalid JSON body"})
+                return
+            targets = []
+            if not data.get("all"):
+                field = str(data.get("field") or "")
+                try:
+                    index = int(data.get("index"))
+                except (TypeError, ValueError):
+                    self._json(400, {"error": "index must be an integer"})
+                    return
+                targets.append((field, index))
+            try:
+                item = q.ack_resolution(
+                    ref,
+                    targets=targets,
+                    all_items=bool(data.get("all")),
+                    by=str(data.get("by") or "dashboard"),
+                    undo=bool(data.get("undo")),
+                )
+            except ValueError as exc:
+                self._json(400, {"error": str(exc)})
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"error": str(exc)})
+                return
+            if item is None:
+                self._json(404, {"error": f"{ref} not found"})
+                return
+            self._json(200, {"ok": True, "ticket": item})
             return
         # POST /api/send: {"to", "text", "mode"} -> messages.send
         if path == "/api/send":
