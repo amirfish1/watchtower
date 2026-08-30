@@ -51,7 +51,7 @@ That opt-in is `force_queue` (originally spelled `mode="send_queue"`).
 | 3 | `wt steer` (user says "redirect NOW") | User at CLI → live WT worker session | **WT** — `messages.deliver`, mode=`steer` → WT's own fifo/tty write; only reaches **CCC** via the delegate adapter | **No, unless** target is a CCC-owned session and delegate falls through to `/api/inject-input` | **Only sometimes, by accident of routing** | **Yes** — this is the one case the whole feature name promises and mostly doesn't deliver |
 | 4 | CCC ticket-comment / answered-blocked-question (server.py:2515,2543) | CCC server → idle/blocked worker session | **CCC → WT** — CCC imports `watchtower.messages` and calls `wt_messages.send(mode="steer")` | Same as #3 — depends on delegate fallthrough | Irrelevant — target is already idle/blocked | **No** — nothing running to abort, "steer" here really means "jump the queue," not "abort" |
 | 5 | `wt ask` | Caller (CLI/agent) → target session, reply back to caller | **WT** — `cli.cmd_ask` → `messages.ask` (`messages.py:1805`); CCC's own parallel path is `ask_session_via_live_tail` / `ask_session_and_wait` | No | No | **No** — you want an answer without derailing current work |
-| 6 | CCC dashboard textbox while session is actively running (headless, no tty, mode=steer) | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_inject_text_into_session` direct, gate at `server.py:60496` | **Yes** | **Yes — real, already shipped** | **Yes**, and it works |
+| 6 | CCC dashboard textbox while session is actively running (headless, no tty, mode=steer) | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_inject_text_into_session` direct, gate at `server.py:60496` | **Yes** | **Yes — real, already shipped** | **Yes** — but for the right reason; see "What #6 actually is" below |
 | 7 | Esc/Kill button | User in CCC dashboard → live CCC-owned headless session | **CCC** — the button on top of #19: `/api/inject-esc` → `_interrupt_session` → `_interrupt_claude_headless_local` (`server.py:61171`) is only **one branch** of six | Yes | Yes | **Yes**, already shipped |
 | 8 | Codex steer | User in CCC dashboard → live Codex session | **CCC** — `resume_session_codex(steer=True)` | N/A — Codex-native | Yes, but coarser (cancels turn, doesn't resume mid-tool) | **Yes**, already shipped |
 | 9 | ACP (Grok/Kimi) steer while busy | User in CCC dashboard → live ACP session | **CCC** — `session/cancel` + resend | N/A — ACP-native | Yes, but coarsest (kills whole turn, fresh turn after) | **Yes**, already shipped |
@@ -66,6 +66,48 @@ That opt-in is `force_queue` (originally spelled `mode="send_queue"`).
 | 18 | `POST /api/inject-input` — the public front door | Any local HTTP caller (WT's delegate, the curl footer, the ccc-orchestration skill, dashboard JS, any script) → any session CCC can reach | **CCC** — `server.py:75775` → `_inject_text_into_session`. Accepts `mode` = `answer\|send\|steer` (and legacy `steer: true`); anything else is a 400 | **Yes — it *is* the front door to the chokepoint** | **Yes**, whenever `mode=steer` and the #6 gate holds | **Yes** — but this is the row that most needs the explicit capability answer: any local process can ask for an abort and gets no `unsupported` back when the gate doesn't hold, only a generic success |
 | 19 | `POST /api/inject-esc` — pure interrupt, no text | Dashboard Esc button (#7) or any local caller → live session | **CCC** — `server.py:75992` → `_interrupt_session` (`:61212`), which has **its own six-way fall-through**, not `_inject_text_into_session`'s | N/A — different router | **Yes** — and the only path that can be **destructive**: a live headless session with no reachable FIFO gets SIGINT to its pid, ending the spawn (no mid-conversation resume) | **Yes**, but the destructive branch and the survivable one currently return the same shape — the caller cannot tell whether the session survived |
 | 20 | `POST /api/ask` — synchronous inject + wait | Sibling session via curl (ccc-orchestration skill) → target session, reply returned in the response | **CCC** — `server.py:76005` → `ask_session_and_wait` (`:62217`), a **third router**: live-tail for an active target (spawns nothing), `claude --resume` for a dormant one, federation proxy if another node owns it, `ask_engine_session_and_wait` for non-claude | No — separate router | No | **No** — same as #5, you want an answer without derailing the turn |
+
+## What #6 actually is
+
+The obvious reading of #6 is "deliver my text **now** instead of making it wait."
+That reading is wrong, and it is the reason `mode` keeps producing surprises.
+
+**A plain `send` also arrives mid-turn.** Observed live in session
+`4dbc1dfa` on 2026-08-30 (activity log `17:52:30`–`17:52:34`): three messages
+posted with `mode=send` while a turn was running. No `INTERRUPT` row, no
+`Q_HELD`. Claude Code surfaced all three *inside* the running turn, attached to
+the next tool result. The turn was never suspended and nothing was truncated.
+
+So mid-turn arrival is not what distinguishes #6. Both modes do it. The single
+thing #6 does that `send` does not is **destroy the in-flight response before
+delivering** — `_write_stream_json_interrupt` discards whatever the model was
+part-way through emitting.
+
+The honest definition:
+
+> **#6 is not "deliver now". It is "discard the current answer, then deliver."**
+> Delivery timing is a side effect; abortion is the feature.
+
+That distinction matters because the two properties are independent, and the
+combination people usually want is the one `mode` cannot express:
+
+| | Lands mid-turn | Kills the turn | Expressible as a `mode`? |
+|---|---|---|---|
+| `send` (observed above) | Yes, at a tool boundary | No | `send` |
+| `steer` (#6) | Yes, immediately | **Yes** | `steer` |
+| *"land now, keep the turn"* | Yes | No | **no spelling for it** |
+| *"wait for the turn to end"* | No | No | **no spelling for it** — `send` does not guarantee this |
+
+Rows 3 and 4 are the damage. `wt steer` (#3) promises abortion and usually just
+delivers. CCC's ticket-comment path (#4) passes `mode="steer"` to a target that
+is already idle, where "steer" can only mean "jump the queue" — a meaning the
+field does not actually carry. Both are callers reaching for a property that has
+no name, and settling for the one word available.
+
+**The axis worth naming is turn-continuity, not send-vs-steer.** A caller should
+say whether it is willing to destroy work in progress. When it should *land* is
+a separate question, and — per the observation above — largely not the sender's
+to decide anyway.
 
 ## Call graph — where the 17 paths converge
 
