@@ -78,6 +78,24 @@ Add to every `/api/inject-input` response:
   the ccc-orchestration skill. Additive only; do not rename existing keys.
 - Verify: existing callers keep working unchanged; new fields present on all paths.
 
+## The UDS `priority` field maps directly onto the enum (measured 2026-08-30)
+
+Sent to a live session and observed in the transcript:
+
+| `priority` | Observed behaviour | Enum verb |
+|---|---|---|
+| `now` | Interrupts. Arrives as its own user turn and ends the turn in progress (rows 2789, 2816: `type=user`, standalone, followed by a fresh assistant turn). | `steer` |
+| `next` | Injected into the running turn; no abort, the turn continues (row 2860: "while you were working", preceding assistant `stop_reason=tool_use`). | `engine_default` for Claude |
+| `later` | **Untested.** Presumed true queue — verify before relying on it. | `queue` |
+
+`next` reproducing Claude's native composer behaviour is why #6 works correctly
+today and must not be changed. Agent-to-agent notification traffic defaults to
+`next`.
+
+Do not hard-code one priority. The caller declares a verb; the UDS adapter
+translates. Five sends of `/compact` at both `now` and `next` confirmed
+separately that no priority makes a slash command execute over UDS (see D2).
+
 ## Phase 2 — verb vocabulary at the API (CCC)
 
 - Accept the new verbs at `:75964` alongside today's `answer`/`send`/`steer`.
