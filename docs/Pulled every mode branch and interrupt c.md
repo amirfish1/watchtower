@@ -109,6 +109,82 @@ say whether it is willing to destroy work in progress. When it should *land* is
 a separate question, and — per the observation above — largely not the sender's
 to decide anyway.
 
+### The proposed enum
+
+One axis, monotonic — each value concedes more of the receiver's work than the
+one above it:
+
+| Value | Intent | In-flight response | Lands |
+|---|---|---|---|
+| `notify` | "read this whenever" | untouched | at turn end |
+| `deliver` | "get this to them soon" | untouched | turn end, or a safe mid-turn seam |
+| `interject` | "they need this *during* this work" | untouched | mid-turn, guaranteed, earliest safe seam |
+| `redirect` | "stop — do this instead" | **destroyed** | immediately |
+| `abort` | "just stop" | **destroyed** | nothing delivered |
+
+Plus two fields that are **not** the enum, and that `mode` wrongly absorbs today:
+
+```
+on_busy:  hold | drop | reject      (+ expire_after: <duration>)   # CCC-1002 lives here
+position: back | front                                              # replaces force_queue / send_queue
+```
+
+And a result contract, which is arguably the bigger half of the fix — the caller
+must be told what actually happened, not what it asked for:
+
+```
+{"requested": "redirect", "effect": "delivered", "aborted": false,
+ "reason": "target was idle; nothing to interrupt"}
+```
+
+### Per use-case mapping
+
+`Q?` flags a row where I need your call before speccing.
+
+| # | Use case | Sends today | Proposed | on_busy | position | Q? |
+|---|---|---|---|---|---|---|
+| 1 | WT ticket notify (claim/close/FYI) | `send` | `notify` | hold, expire 1h | back | **Q1** — or is this just `deliver`+`back`? |
+| 2 | `wt send` (ad-hoc chat) | `send` | `deliver` | hold | back | — |
+| 3 | `wt steer` | `steer` | `redirect` | reject | — | **Q3** — WT has no interrupt primitive. Must this fail loudly, or degrade to `deliver` and say so? |
+| 4 | CCC ticket-comment / answered-blocked-Q | `steer` | `deliver` | hold | **front** | **Q2** — target is idle, so "steer" here only ever meant "jump the queue" |
+| 5 | `wt ask` | n/a | `deliver` | reject | front | — reply is awaited, so holding is useless |
+| 6 | Dashboard steer, headless, no tty | `steer` | `redirect` | reject | — | ✓ correct today |
+| 7 | Esc/Kill button | esc | `abort` | reject | — | ✓ correct today |
+| 8 | Codex steer | codex-native | `redirect` | reject | — | ✓ — but Codex cancels the whole turn, coarser than `redirect` promises |
+| 9 | ACP (Grok/Kimi) steer | acp-native | `redirect` | reject | — | ✓ — coarsest of all: kills turn, fresh turn after |
+| 10 | CCC → foreign session (UDS peer) | `priority: now/next` | `deliver` | hold | back/front | **Q4** — `redirect` is structurally impossible here. Reject it at the API, or accept-and-downgrade? |
+| 11 | CCC inbound peer socket | dropped | `notify` | hold | back | **Q1** — general chat frames are currently dropped entirely (`CCC-PEER-UNROUTED`) |
+| 12 | Worker child → parent report | curl footer | `notify` | hold | back | — parent is idle/polling anyway |
+| 13 | Steered `/compact` | `steer` | `redirect` | **drop, expire 5m** | — | **Q5** — a stale `/compact` firing 12 min late is what broke session 4dbc1dfa today |
+| 14 | Steered `/clear` (CCC-935) | `steer` | `redirect` | drop, expire 5m | — | same as #13 |
+| 15 | Reconciler release instruction | `send` (no mode) | `notify` | hold | back | — worker is verified-idle first |
+| 16 | Reconciler queue nudge | raw fifo write | `interject` | drop, expire 30s | front | **Q6** — this is the one row that genuinely needs `interject`; a stale nudge is worthless |
+| 17 | Reconciler spawn-time goal | raw fifo write | `deliver` | reject | — | — no turn exists yet; nothing to interject into |
+| 18 | `POST /api/inject-input` | `mode` param | *all values* | caller's | caller's | — this is the front door the enum is for |
+| 19 | `POST /api/inject-esc` | n/a | `abort` | reject | — | ✓ correct today |
+| 20 | `POST /api/ask` | `send` | `deliver` | reject | front | — same reasoning as #5 |
+
+### Open questions, collected
+
+- **Q1 — keep `notify` at all?** Only rows 1, 11, 12, 15 want it, and every one is
+  "target is idle anyway." If `position: back` covers it, the enum drops to four
+  values. *My lean: collapse it.* Fewer values, and the distinction people will
+  most often get wrong is the one with zero blast radius.
+- **Q2 — `redirect` on an idle target: error, or degrade?** *My lean: degrade, but
+  report it* via the result contract above. Erroring would break #4 on a
+  technicality when delivery genuinely succeeded.
+- **Q3 — `wt steer` when the transport cannot interrupt.** Same shape as Q2 but
+  higher stakes: today it silently pretends. Whatever we choose, the user must
+  learn that nothing was aborted.
+- **Q4 — `redirect` over UDS to a foreign session** is structurally impossible
+  (no such primitive on that transport). Reject at the API, or accept and
+  downgrade with a reason?
+- **Q5 — should slash-commands expire faster than text?** #13/#14 carry an intent
+  that rots quickly; #16 rots in seconds.
+- **Q6 — is `interject` buildable?** Row 16 is its only clear customer. It needs a
+  receiver-side "buffer to the next safe seam, never truncate" guarantee that
+  `c115c5cc` says the harness does not currently make.
+
 ## Call graph — where the 17 paths converge
 
 Four chokepoints. Everything else is an entry point feeding one of them.
