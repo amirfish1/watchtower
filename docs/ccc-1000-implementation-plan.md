@@ -34,7 +34,7 @@ native steer. Not building a tool-call seam for headless Claude (cosmetic — se
 | # | Decision | Resolution |
 |---|---|---|
 | D1 | `steer` on a transport with no seam (#9 ACP) | **degrade + report.** A *seam* is a point where input can be inserted without cutting anything off. Codex has one (end of tool call); Claude's stream-json exposes none; ACP exposes only `session/cancel`, i.e. wait or destroy, nothing between. So ACP can only emulate `steer`, and the result contract must say so. |
-| D2 | Slash commands over UDS | **execute them; intercept only what mutates CCC-tracked state.** Per `server.py:60494`, a slash command written to the FIFO as user text *does* execute — "Claude executes it, but CCC then has no idea the session was reset". `/compact` and `/clear` are intercepted because they change session identity. `/model`, `/cost` etc. are harmless and should just run. |
+| D2 | Slash commands over UDS | **Revised after measurement (2026-08-30): they cannot execute over UDS at all — refuse and reroute.** The original answer ("execute them; intercept only what mutates CCC-tracked state") was extrapolated from the FIFO path, where `server.py:60494` says a slash command written as user text *does* execute. That does not generalise. Sending `/compact` over a live peer socket — both wrapped in `<cross-session-message>` and raw — transported cleanly and executed neither time; the peer listener injects `message.content` as message content and never parses it as a command. So the two transports genuinely differ: **FIFO executes, UDS does not.** A UDS-bound `/command` must be refused at the sender and rerouted to an executing transport, not unwrapped and hoped for. Evidence: `~/dev/scratch/uds-slash-test/results.md`. |
 | D3 | Does WT get its own `abort`? | **yes, support it.** |
 | D4 | Is Grok `queue` like Kimi? | **yes — settled by code, not testing.** `_terminal_queue_waits_for_active_acp` (`server.py:44362`) gates on `status["kind"] == "acp"`, generic across harnesses. Kimi and Grok share one path and cannot differ. |
 
@@ -122,8 +122,19 @@ only after UDS has run. `/model`, `/cost`, `/resume`, `/code-review` and custom
 skills arrive as literal text wrapped in `<cross-session-message>`, with a
 transcript-confirmed `delivered` receipt and no error either side.
 
-Fix per D2. Whatever is chosen, the sender must stop receiving a success receipt
-for something that did not execute.
+**Measured 2026-08-30:** a slash command sent over UDS never executes, in any
+framing. Both the wrapped and the raw form of `/compact` reached a live session
+with `{"ok": True}` and produced no compaction. Removing the
+`<cross-session-message>` wrapper is therefore not a fix.
+
+So the guard is: at the sender, before `_try_uds_peer_delivery` (`:59941`), test
+the outbound text for a leading slash. If it matches, **do not use UDS.** Either
+fall through to the FIFO path — which does execute slash commands (`:60494`) —
+or refuse with a typed error. Either way the sender must stop receiving a
+transcript-confirmed `delivered` receipt for something that did not execute.
+
+Note the guard belongs at the *sender*, in both CCC and WT, because the receiver
+has no way to distinguish an intentional literal `/foo` from a mis-sent command.
 
 ## Phase 5 — sync warnings
 
