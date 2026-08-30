@@ -44,6 +44,83 @@ Steer with a tty, steer to codex/cursor/hermes, or steer to a session CCC doesn'
 | 16 | Reconciler queue nudge — enqueue instant-pickup, stuck-queue, reconcile tick | WT reconciler → every live non-released worker on that queue | **WT** — `notify_workers` (`workers.py:767`), FIFO only, no fallback. Three callers: `dispatch_after_enqueue` (`:3633`), `_maybe_nudge_stuck_queue` (`:836`), `_reconcile_once_locked` (`:4216`) | No — never leaves WT | No | **No** — "a ticket is waiting, claim it when free" is the definition of a message that must not preempt. But note the real gap: a fifo-less worker (rebound after compaction/crash) gets **nothing at all**, not even a queued copy — WATCHTOWER-14 |
 | 17 | Reconciler spawn-time goal (first turn of a new worker) | WT reconciler → the worker child it just spawned | **WT** — `write_to_worker_fifo(fifo_path, goal)` (`workers.py:5049`, `:5145`) into the child's inherited stdin fd | No | N/A — nothing is running yet | N/A — this *is* the first turn, there is no in-flight tool to abort |
 
+## Call graph — where the 17 paths converge
+
+Four chokepoints. Everything else is an entry point feeding one of them.
+
+```mermaid
+flowchart TD
+  subgraph WTE["WT entry points"]
+    U2["#2 wt send"]; U3["#3 wt steer"]; U5["#5 wt ask"]
+    U1["#1 ticket notify"]; U15["#15 release instr"]
+    U16["#16 queue nudge"]; U17["#17 spawn goal"]
+  end
+  subgraph CCE["CCC entry points"]
+    U6["#6 dashboard textbox"]; U7["#7 Esc/Kill"]
+    U13["#13 steered /compact"]; U14["#14 steered /clear"]
+    U8["#8 codex steer"]; U9["#9 ACP steer"]
+    U4["#4 ticket-comment"]; U10["#10 outbound peer"]
+    U11["#11 inbound peer"]; U12["#12 worker report"]
+  end
+
+  U1 & U2 & U3 & U5 --> SEND
+  U4 -- "CCC imports watchtower.messages" --> SEND
+  U15 -. "3rd, last resort" .-> SEND
+
+  SEND["<b>CHOKEPOINT 1 — WT</b><br/>messages.send → messages.deliver"]
+  SEND --> CHAIN["adapter chain, in order:<br/>fifo → tty → resume →<br/>codex/gemini/antigravity → delegate"]
+
+  U15 -- "1st, claude only" --> UDS
+  U15 -. "2nd" .-> FIFO
+  U16 & U17 --> FIFO
+  FIFO["<b>CHOKEPOINT 2 — WT</b><br/>write_to_worker_fifo"]
+  UDS["<b>CHOKEPOINT 3</b><br/>peer_uds.send_lines<br/>(receipt-gated)"]
+  U10 --> UDS
+
+  CHAIN -- "last adapter only" --> BRIDGE
+  BRIDGE["<b>THE ONLY WT→CCC BRIDGE</b><br/>_deliver_delegate<br/>POST /api/inject-input"]
+  BRIDGE --> INJ
+  U6 & U13 & U14 --> INJ
+  U4 -. "same bridge as #3" .-> INJ
+
+  INJ["<b>CHOKEPOINT 4 — CCC</b><br/>_inject_text_into_session"]
+  INJ --> R1["tty AppleScript"]
+  INJ --> R2["spawn-fifo / wt-worker-fifo"]
+  INJ --> R3["headless claude --resume"]
+  INJ --> R4["_queue_terminal_input"]
+  INJ -- "mode=steer AND no tty<br/>AND claude AND CCC-owned" --> INT
+  INJ -- "steered /compact, /clear" --> INT
+  U7 --> ICL["_interrupt_claude_headless_local"] --> INT
+  U8 --> CX["resume_session_codex"]
+  U9 --> ACP["session/cancel + resend"]
+  U11 --> PEER["_ccc_peer_handle_connection<br/>(ask-replies + reports only)"]
+  U12 --> HTTP["CCC HTTP API"] --> INJ
+
+  INT["<b>THE INTERRUPT PRIMITIVE</b><br/>_write_stream_json_interrupt"]
+
+  style SEND fill:#1f3a5f,color:#fff
+  style FIFO fill:#1f3a5f,color:#fff
+  style UDS fill:#1f3a5f,color:#fff
+  style INJ fill:#5f3a1f,color:#fff
+  style BRIDGE fill:#5f1f3a,color:#fff
+  style INT fill:#7a1f1f,color:#fff
+```
+
+### Reading it
+
+| Chokepoint | Owner | Fed by | Can interrupt? |
+|---|---|---|---|
+| `messages.send` → `deliver` | WT | #1, #2, #3, #4, #5, #15(last) | No |
+| `write_to_worker_fifo` | WT | #15(2nd), #16, #17 | No |
+| `peer_uds.send_lines` | either | #15(1st), #10 | No |
+| `_inject_text_into_session` | CCC | #6, #13, #14 direct; #3/#4/#15 via bridge | **Yes** |
+
+**The three things the picture makes obvious:**
+
+1. **`messages.deliver` is the busiest node** — six of the seventeen. Change its adapter order and you change #1–#5 and #15 at once. That is also why the pytest leak reached a live CCC: a test touching *any* of those six walks the whole chain down to the delegate.
+2. **There is exactly one WT→CCC bridge** — `_deliver_delegate`, the *last* adapter in the chain. Every "sometimes it interrupts" story in this doc is really "did the message survive five earlier adapters and reach the bridge." That is the accident #3 depends on.
+3. **The interrupt primitive sits below CCC's chokepoint only.** Nothing in WT reaches it directly. `write_to_worker_fifo` — the path the reconciler actually uses for #16 and #17 — has no route to it at all.
+
 ## The actual bug in the model
 
 **"steer" is overloaded.** It means two unrelated things depending on caller:
