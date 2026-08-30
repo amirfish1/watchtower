@@ -1602,6 +1602,83 @@ def test_notify_live_worker_delivers(wt):
     assert msg["message"]["content"][0]["text"] == "hello worker"
 
 
+def test_notify_fifoless_worker_falls_back_to_adapter_chain(wt, monkeypatch):
+    """WATCHTOWER-14: a worker with no FIFO used to get nothing at all.
+
+    ``notify_workers`` was the one delivery path in WT with no fallback --
+    it wrote the FIFO or gave up silently. It now routes those workers
+    through the shared adapter chain (CCC-1000 Phase 3)."""
+    rec = _live_worker(wt, "Q", with_fifo=False)
+    assert not rec.get("fifo")
+    from watchtower import messages
+    calls = []
+    monkeypatch.setattr(
+        messages, "deliver_message",
+        lambda target, text, **kw: calls.append((target, text, kw)) or {"ok": True},
+    )
+
+    assert wt.workers.notify_workers("Q", "wake up") == 1
+
+    assert len(calls) == 1
+    target, text, kw = calls[0]
+    assert target == rec["session_id"]
+    assert text == "wake up"
+    # A nudge is only useful before the turn it nudges about ends, and a
+    # stale one is noise -- the next reconcile tick makes a fresh one.
+    assert kw["verb"] == "steer"
+    assert kw["expire"] == 30
+
+
+def test_notify_fifoless_worker_failure_is_not_counted(wt, monkeypatch):
+    """A failed fallback must not inflate the delivered count."""
+    _live_worker(wt, "Q", with_fifo=False)
+    from watchtower import messages
+    monkeypatch.setattr(
+        messages, "deliver_message",
+        lambda target, text, **kw: {"ok": False, "error": "nope"},
+    )
+    assert wt.workers.notify_workers("Q", "wake up") == 0
+
+
+def test_notify_fallback_never_breaks_reconcile(wt, monkeypatch):
+    """The nudge path runs inside the reconcile tick; an exception there must
+    not take the tick down with it."""
+    _live_worker(wt, "Q", with_fifo=False)
+    from watchtower import messages
+
+    def _boom(*a, **kw):
+        raise RuntimeError("delegate exploded")
+
+    monkeypatch.setattr(messages, "deliver_message", _boom)
+    assert wt.workers.notify_workers("Q", "wake up") == 0
+
+
+def test_release_uds_refuses_slash_commands(wt, monkeypatch):
+    """CCC-1000 Phase 4: a slash command cannot execute over UDS in any
+    framing, so WT must not dial the peer socket with one -- doing so returns
+    a delivery receipt for text that lands inert in the target's context.
+
+    Proven by making the first step *after* the guard explode: slash-shaped
+    text returns None without reaching it, ordinary text does reach it. A bare
+    "returns None" assertion would pass even with the guard deleted."""
+    rec = _live_worker(wt, "Q")
+
+    def _tripwire(session_id):
+        raise AssertionError("guard did not fire; UDS lookup was reached")
+
+    monkeypatch.setattr(wt.workers, "_find_claude_session_row", _tripwire)
+
+    for text in ("/compact", "  /model sonnet", "/code-review ultra",
+                 "/plugin:skill arg"):
+        assert wt.workers._deliver_release_instruction_via_uds(rec, text) is None
+
+    # Ordinary text must still take the normal path -- including text that
+    # merely contains a slash somewhere other than the start.
+    for text in ("hello", "see http://x/y", "use /compact later"):
+        with pytest.raises(AssertionError, match="guard did not fire"):
+            wt.workers._deliver_release_instruction_via_uds(rec, text)
+
+
 def test_notify_dead_worker_zero(wt):
     _dead_worker(wt, "Q")
     assert wt.workers.notify_workers("Q", "nobody home") == 0
@@ -1718,7 +1795,9 @@ def test_release_instruction_skips_fifo_while_turn_is_open(wt, monkeypatch):
         wt.workers, "_deliver_release_instruction_via_uds", lambda w, t: None
     )
     from watchtower import messages
-    monkeypatch.setattr(messages, "send", lambda target, text: {"ok": True})
+    monkeypatch.setattr(
+        messages, "send", lambda target, text, **kw: {"ok": True}
+    )
 
     result = wt.workers._deliver_release_instruction(rec, "you are released")
 
@@ -2384,7 +2463,7 @@ def test_release_injects_queue_scoped_instruction_into_codex_session(wt, monkeyp
     sent = []
     monkeypatch.setattr(
         messages, "send",
-        lambda target, text: sent.append((target, text)) or {"ok": True},
+        lambda target, text, **kw: sent.append((target, text)) or {"ok": True},
     )
     sid = "33333333-3333-3333-3333-333333333333"
     codex_home = wt.tmp / "codex-home"

@@ -547,6 +547,12 @@ def worker_turn_open(w: Dict[str, Any]) -> bool:
     FIFO write can be interpreted as steering. Fails OPEN (returns False, i.e.
     "not busy") when the log is missing, empty or unreadable -- an unknown
     state must not permanently strand delivery.
+
+    KEEP IN SYNC with ``_headless_log_turn_open()`` in claude-command-center's
+    server.py, which is a character-identical copy apart from the engine guard
+    above. The two are maintained in parallel with no shared import; if you
+    change the turn-open predicate here, change it there too. Same rule as
+    ``peer_uds.py`` / CCC's ``ccc_peer_uds.py``.
     """
     if not isinstance(w, dict):
         return False
@@ -862,6 +868,24 @@ def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) ->
         fifo = w.get("fifo")
         if fifo and write_to_worker_fifo(fifo, text):
             n += 1
+            continue
+        # WATCHTOWER-14: a worker with no fifo (or a failed write) used to get
+        # nothing at all -- this loop was the one delivery path in WT that had
+        # no fallback whatsoever. Route it through the shared adapter chain
+        # instead. verb=steer because a nudge is only useful before the turn
+        # it is nudging about ends, and expire=30 because a stale nudge is
+        # noise: the reconcile tick will produce a fresh one.
+        target = str(w.get("session_id") or "").strip()
+        if not target:
+            continue
+        try:
+            from . import messages
+            if messages.deliver_message(
+                target, text, verb="steer", expire=30,
+            ).get("ok"):
+                n += 1
+        except Exception:  # noqa: BLE001 - a nudge must never break reconcile
+            pass
     if deferred:
         try:
             from .queue import _log
@@ -1037,6 +1061,12 @@ def _uds_delivery_receipt(
         time.sleep(0.25)
 
 
+# Mirrors CCC's _SLASH_COMMAND_TRIGGER_RE (server.py). Keep the two in sync.
+_SLASH_COMMAND_RE = re.compile(
+    r"^\s*/[A-Za-z][A-Za-z0-9_-]*(?::[A-Za-z0-9_-]+)*(?=\s|$)"
+)
+
+
 def _deliver_release_instruction_via_uds(
     w: Dict[str, Any], text: str
 ) -> Optional[Dict[str, Any]]:
@@ -1049,6 +1079,14 @@ def _deliver_release_instruction_via_uds(
     failure, hold, ambiguity, or unconfirmed send so the caller falls
     through to the existing fifo/messages.send path unchanged.
     """
+    # CCC-1000 Phase 4: a slash command cannot execute over UDS in any framing
+    # (measured 2026-08-30 -- five sends, wrapped and raw, priority now and
+    # next, none executed). Claude's peer listener hands the frame's content to
+    # the session as message *content* and never parses it as a command, so
+    # sending one here would return a delivery receipt for text that just sits
+    # inert. Fall through to the fifo path, which does execute slash commands.
+    if _SLASH_COMMAND_RE.match(str(text or "")):
+        return None
     session_id = str(w.get("session_id") or "").strip()
     if not session_id:
         return None
@@ -1119,7 +1157,11 @@ def _deliver_release_instruction(
         }
     try:
         from . import messages
-        result = messages.send(target, text)
+        # verb=engine_default maps to today's mode="send" exactly. This path
+        # was hardened by the UDS release-delivery hotfix and works; the point
+        # of routing it through deliver_message is the single entry point and
+        # the shared adapter chain, not new timing semantics.
+        result = messages.deliver_message(target, text, verb="engine_default")
         delivered = bool(result.get("ok"))
         return {
             "transport": "native_session",
