@@ -862,6 +862,17 @@ def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) ->
             continue  # already released from queue staffing
         if _worker_idle_s(w) >= max_idle_s:
             continue
+        # UDS first. It is steer by construction -- the frame goes at peer
+        # priority `next`, which Claude injects into a running turn without
+        # aborting it -- so unlike a FIFO write it is safe even mid-turn, and
+        # it arrives as a proper cross-session message rather than as text
+        # indistinguishable from the user's own typing.
+        if str(w.get("engine") or "") == "claude" and deliver_via_uds(
+            str(w.get("session_id") or ""), text,
+            from_name="watchtower-reconciler",
+        ):
+            n += 1
+            continue
         if worker_turn_open(w):
             deferred += 1
             continue  # mid-turn: defer to the next tick rather than interrupt
@@ -1067,17 +1078,25 @@ _SLASH_COMMAND_RE = re.compile(
 )
 
 
-def _deliver_release_instruction_via_uds(
-    w: Dict[str, Any], text: str
+def deliver_via_uds(
+    session_id: str, text: str, *, from_name: str = "watchtower"
 ) -> Optional[Dict[str, Any]]:
-    """Try the worker's native Claude Code peer socket.
+    """Deliver `text` to a Claude session over its native peer socket.
 
     Returns a result dict ONLY when a delivery receipt confirms the frame
     actually reached the target -- a successful socket write alone is not
     delivery, since a bypass-mode receiver silently holds (and later
     expires) an unattested cross-session message. Returns None on any
     failure, hold, ambiguity, or unconfirmed send so the caller falls
-    through to the existing fifo/messages.send path unchanged.
+    through to the legacy transports unchanged.
+
+    Keyed by session id rather than a worker record so every WT caller can
+    reach it -- the release path and the reconciler nudge both need it.
+
+    UDS is *steer by construction*: the frame is sent at peer priority
+    ``next``, which Claude injects into a running turn without aborting it
+    (measured 2026-08-30). That is why callers may use this even on a worker
+    whose turn is open, where a raw FIFO write would truncate the response.
     """
     # CCC-1000 Phase 4: a slash command cannot execute over UDS in any framing
     # (measured 2026-08-30 -- five sends, wrapped and raw, priority now and
@@ -1087,7 +1106,7 @@ def _deliver_release_instruction_via_uds(
     # inert. Fall through to the fifo path, which does execute slash commands.
     if _SLASH_COMMAND_RE.match(str(text or "")):
         return None
-    session_id = str(w.get("session_id") or "").strip()
+    session_id = str(session_id or "").strip()
     if not session_id:
         return None
     row = _find_claude_session_row(session_id)
@@ -1106,7 +1125,7 @@ def _deliver_release_instruction_via_uds(
     msg_id = str(uuid.uuid4())
     try:
         lines = peer_uds.build_frame_lines(
-            peer_uds.wrap(text, from_name="watchtower-reconciler", from_mode="bypass"),
+            peer_uds.wrap(text, from_name=from_name, from_mode="bypass"),
             token=token,
             msg_id=msg_id,
         )
@@ -1119,12 +1138,21 @@ def _deliver_release_instruction_via_uds(
     verdict = _uds_delivery_receipt(session_id, msg_id, text, start_offset)
     if verdict not in ("delivered", "queued"):
         print(
-            f"[watchtower] uds release send to {session_id} reported ok but "
+            f"[watchtower] uds send to {session_id} reported ok but "
             f"receipt verdict={verdict!r} -- falling back",
             file=sys.stderr,
         )
         return None
     return {"transport": "uds", "delivered": True, "error": ""}
+
+
+def _deliver_release_instruction_via_uds(
+    w: Dict[str, Any], text: str
+) -> Optional[Dict[str, Any]]:
+    """Release-path wrapper over :func:`deliver_via_uds`."""
+    return deliver_via_uds(
+        str(w.get("session_id") or ""), text, from_name="watchtower-reconciler",
+    )
 
 
 def _deliver_release_instruction(

@@ -1602,6 +1602,69 @@ def test_notify_live_worker_delivers(wt):
     assert msg["message"]["content"][0]["text"] == "hello worker"
 
 
+def test_notify_prefers_uds_over_raw_fifo(wt, monkeypatch):
+    """The reconciler nudge must go over the peer socket when one exists.
+
+    A raw FIFO write arrives as text indistinguishable from the user's own
+    typing; UDS arrives as a cross-session message with sender attribution."""
+    rec = _live_worker(wt, "Q")
+    assert rec.get("fifo")
+    calls = []
+    monkeypatch.setattr(
+        wt.workers, "deliver_via_uds",
+        lambda sid, text, **kw: calls.append((sid, text, kw))
+        or {"transport": "uds", "delivered": True, "error": ""},
+    )
+    written = []
+    monkeypatch.setattr(
+        wt.workers, "write_to_worker_fifo",
+        lambda fifo, text: written.append(text) or True,
+    )
+
+    assert wt.workers.notify_workers("Q", "nudge") == 1
+
+    assert [c[0] for c in calls] == [rec["session_id"]]
+    assert calls[0][1] == "nudge"
+    assert calls[0][2]["from_name"] == "watchtower-reconciler"
+    assert written == [], "FIFO must not be used when UDS delivered"
+
+
+def test_notify_uses_uds_even_when_the_turn_is_open(wt, monkeypatch):
+    """UDS is steer by construction -- priority `next` is injected into a
+    running turn without aborting it -- so a mid-turn worker that would be
+    skipped for a FIFO write is still reachable over the socket."""
+    rec = _live_worker(wt, "Q")
+    _write_log(wt, rec, [
+        {"type": "result", "subtype": "success"},
+        {"type": "assistant"},
+    ])
+    assert wt.workers.worker_turn_open(rec) is True
+    monkeypatch.setattr(
+        wt.workers, "deliver_via_uds",
+        lambda sid, text, **kw: {"transport": "uds", "delivered": True, "error": ""},
+    )
+    monkeypatch.setattr(
+        wt.workers, "write_to_worker_fifo",
+        lambda fifo, text: pytest.fail("mid-turn FIFO write would truncate"),
+    )
+
+    assert wt.workers.notify_workers("Q", "nudge") == 1
+
+
+def test_notify_falls_back_to_fifo_when_uds_declines(wt, monkeypatch):
+    """No registry row, held frame, unconfirmed receipt -> None, and the
+    existing FIFO path must still run unchanged."""
+    _live_worker(wt, "Q")
+    monkeypatch.setattr(wt.workers, "deliver_via_uds", lambda sid, text, **kw: None)
+    written = []
+    monkeypatch.setattr(
+        wt.workers, "write_to_worker_fifo",
+        lambda fifo, text: written.append(text) or True,
+    )
+    assert wt.workers.notify_workers("Q", "nudge") == 1
+    assert written == ["nudge"]
+
+
 def test_notify_fifoless_worker_falls_back_to_adapter_chain(wt, monkeypatch):
     """WATCHTOWER-14: a worker with no FIFO used to get nothing at all.
 

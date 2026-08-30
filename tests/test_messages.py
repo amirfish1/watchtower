@@ -1611,3 +1611,60 @@ def test_session_names_backfill_cli_dry_run(wt, capsys):
             "updated": False,
         }
     ]
+
+
+# ------------------------------------------------- CCC-1000: steer prefers UDS
+def test_steer_verb_prefers_uds(monkeypatch, tmp_path):
+    """verb="steer" must try the peer socket before the FIFO.
+
+    UDS is steer by construction (priority `next` is injected into a running
+    turn without aborting it); a FIFO write is not, which is why FIFO callers
+    have to skip busy targets."""
+    import watchtower.messages as messages
+    import watchtower.workers as workers
+
+    seen = []
+    monkeypatch.setattr(
+        workers, "deliver_via_uds",
+        lambda sid, text, **kw: seen.append((sid, text)) or {"transport": "uds"},
+    )
+    monkeypatch.setattr(
+        messages, "_deliver_fifo",
+        lambda resolved, text: (_ for _ in ()).throw(
+            AssertionError("FIFO tried before UDS")),
+    )
+    monkeypatch.setattr(
+        messages, "resolve_target",
+        lambda target: {"session_id": target, "engine": "claude"},
+    )
+
+    sid = "11111111-1111-1111-1111-111111111111"
+    out = messages.deliver_message(sid, "nudge", verb="steer")
+
+    assert out["ok"] is True
+    assert out["transport"] == "uds"
+    assert seen == [(sid, "nudge")]
+
+
+def test_engine_default_verb_does_not_use_uds(monkeypatch):
+    """Only steer prefers the socket; engine_default keeps today's ordering."""
+    import watchtower.messages as messages
+    import watchtower.workers as workers
+
+    monkeypatch.setattr(
+        workers, "deliver_via_uds",
+        lambda sid, text, **kw: (_ for _ in ()).throw(
+            AssertionError("engine_default must not prefer UDS")),
+    )
+    monkeypatch.setattr(
+        messages, "resolve_target",
+        lambda target: {"session_id": target, "engine": "claude"},
+    )
+    monkeypatch.setattr(
+        messages, "_deliver_fifo", lambda resolved, text: {"ok": True, "transport": "fifo"},
+    )
+    monkeypatch.setattr(messages, "receipts", None, raising=False)
+
+    out = messages.deliver_message("22222222-2222-2222-2222-222222222222",
+                                   "hi", verb="engine_default")
+    assert out["ok"] is True

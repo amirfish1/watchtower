@@ -1391,7 +1391,7 @@ def _deliver_delegate(
 
 def deliver(
     resolved: Dict[str, Any], text: str, mode: str = "send",
-    *, force_queue: bool = False,
+    *, force_queue: bool = False, prefer_uds: bool = False,
 ) -> Dict[str, Any]:
     """Try each adapter in order.
 
@@ -1406,7 +1406,9 @@ def deliver(
     Every success is recorded as a delivery receipt (WT-77) so "delivered"
     can later be verified against the target transcript — the result
     carries ``receipt_id``."""
-    result = _deliver_unreceipted(resolved, text, mode, force_queue=force_queue)
+    result = _deliver_unreceipted(
+        resolved, text, mode, force_queue=force_queue, prefer_uds=prefer_uds,
+    )
     sid = str(resolved.get("session_id") or "")
     if result.get("ok") and sid:
         try:
@@ -1430,12 +1432,45 @@ def deliver(
     return result
 
 
+def _deliver_uds(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Adapter 0 (steer only): the target's native Claude Code peer socket.
+
+    Preferred for ``verb="steer"`` because UDS is steer by construction -- the
+    frame goes at peer priority ``next``, which Claude injects into a running
+    turn without aborting it. A FIFO write cannot make that promise: mid-turn
+    it truncates the response, which is why the FIFO callers have to skip busy
+    workers entirely.
+
+    Delegates to ``workers.deliver_via_uds`` rather than reimplementing the
+    protocol -- that one carries the receipt verification, bypass attestation
+    and ambiguous-match guard this transport needs to be trusted.
+    """
+    if str(resolved.get("engine") or "claude") != "claude":
+        return {"ok": False, "error": "uds is claude-only"}
+    sid = str(resolved.get("session_id") or "").strip()
+    if not sid:
+        return {"ok": False, "error": "uds needs a session_id"}
+    try:
+        from . import workers
+        result = workers.deliver_via_uds(sid, text, from_name="watchtower")
+    except Exception as exc:  # noqa: BLE001 - fall through to legacy transports
+        return {"ok": False, "error": f"uds: {exc}"}
+    if not result:
+        return {"ok": False, "error": "uds declined (no row, held, or unconfirmed)"}
+    return {"ok": True, "transport": "uds"}
+
+
 def _deliver_unreceipted(
     resolved: Dict[str, Any], text: str, mode: str = "send",
-    *, force_queue: bool = False,
+    *, force_queue: bool = False, prefer_uds: bool = False,
 ) -> Dict[str, Any]:
     errors: List[str] = []
     busy = False
+    if prefer_uds:
+        r = _deliver_uds(resolved, text)
+        if r.get("ok"):
+            return r
+        errors.append(f"uds: {r.get('error', 'failed')}")
     r = _deliver_fifo(resolved, text)
     if r.get("ok"):
         return r
@@ -1704,6 +1739,7 @@ def send(
     ttl_s: Optional[float] = None,
     engine: str = "",
     force_queue: bool = False,
+    prefer_uds: bool = False,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
@@ -1722,6 +1758,8 @@ def send(
     # by tests with the historical three-argument signature, and an unsolicited
     # keyword would break every one of them for no behavioural gain.
     extra = {"force_queue": True} if force_queue else {}
+    if prefer_uds:
+        extra["prefer_uds"] = True
     result = deliver(resolved, text, mode, **extra)
     if result.get("ok"):
         out = {"ok": True, "transport": result.get("transport", "?")}
@@ -1896,6 +1934,7 @@ def deliver_message(
         ttl_s=expire,
         engine=engine,
         force_queue=(verb == "queue" or position == "front"),
+        prefer_uds=(verb == "steer"),
     )
     if not result.get("ok") and on_busy == "drop":
         return {"ok": False, "dropped": True,
