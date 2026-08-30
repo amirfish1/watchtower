@@ -3581,3 +3581,23 @@ def test_reconcile_logs_zombie_release(wt):
     assert len(zombie_logs) == 1
     assert rec["worker_id"] in zombie_logs[0]
     assert wt.q._coerce_session_uuid("garbage") is None
+
+
+def test_find_claude_session_row_matches_by_session_id(wt, monkeypatch, tmp_path):
+    claude_home = tmp_path / "claude-home"
+    sessions_dir = claude_home / "sessions"
+    sessions_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+    row = {
+        "pid": 55555,
+        "sessionId": "sess-abc",
+        "messagingSocketPath": "/tmp/cc-socks/55555.sock",
+        "peerProtocol": 1,
+        "version": "2.1.251",
+    }
+    (sessions_dir / "55555.json").write_text(json.dumps(row))
+
+    found = wt.workers._find_claude_session_row("sess-abc")
+    assert found == row
+    assert wt.workers._find_claude_session_row("no-such-session") is None
+    assert wt.workers._find_claude_session_row("") is None

@@ -838,6 +838,33 @@ def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
     return delivered
 
 
+def _find_claude_session_row(session_id: str) -> Optional[Dict[str, Any]]:
+    """Find a live Claude Code session's peer-registry row by sessionId.
+
+    Scans $CLAUDE_CONFIG_DIR/sessions (or ~/.claude/sessions). Returns None
+    when nothing matches -- callers must treat that as "not dialable over
+    UDS right now", never as an error worth surfacing.
+    """
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return None
+    claude_home = Path(
+        os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")
+    )
+    try:
+        files = list((claude_home / "sessions").glob("*.json"))
+    except OSError:
+        return None
+    for f in files:
+        try:
+            data = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict) and data.get("sessionId") == session_id:
+            return data
+    return None
+
+
 def _release_instruction(w: Dict[str, Any]) -> str:
     queue = str(w.get("queue") or "this queue")
     return (
