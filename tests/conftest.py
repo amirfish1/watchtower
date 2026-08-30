@@ -29,9 +29,10 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
-    """Keep the real outbox and the real caller identity out of every test.
+    """Keep the real outbox, the real delegate and the real caller identity
+    out of every test.
 
-    Two leaks closed here (OPS-835: live sessions spammed with
+    Three leaks closed here (OPS-835: live sessions spammed with
     "[watchtower] Q-1 claimed" after any pytest run under an agent harness):
 
     * ``messages._outbox_file()`` reads ``$WATCHTOWER_OUTBOX_FILE`` fresh per
@@ -45,7 +46,20 @@ def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
       ``CLAUDE_CODE_SESSION_ID``/``CODEX_THREAD_ID`` (``_default_report_to``),
       so a claim inside a test notified whatever real session ran pytest.
       Tests that exercise that defaulting set the var themselves.
+    * ``messages._delegate_base()`` auto-detects a local CCC from
+      ``~/.claude/command-center/port.txt`` whenever
+      ``$WATCHTOWER_DELEGATE_URL`` is unset, so the delegate adapter -- the
+      last one in ``deliver()``'s chain, reached by every send to a target
+      no other adapter can serve -- POSTed the developer's *live* CCC on
+      ``/api/inject-input`` with ``origin=wt``. That is how the reconciler's
+      release instruction, addressed to a fabricated worker session_id
+      (``66666666-...``/``22222222-...`` from test_workers_lifecycle's
+      release tests), reached a real machine on every ``pytest`` run and
+      then parked in the outbox for the daemon to retry. Disable the
+      delegate for every test; the ones that exercise it (test_messages)
+      point it at their own stub server.
     """
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
     monkeypatch.setenv("WATCHTOWER_OUTBOX_FILE", str(tmp_path / "outbox.json"))
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)

@@ -88,6 +88,34 @@ def wt(tmp_path, monkeypatch):
             pass
 
 
+@pytest.fixture(autouse=True)
+def no_real_message_delivery(monkeypatch):
+    """No test in this file may put a message on a real wire.
+
+    The release tests hand ``release_idle_workers`` a fabricated session_id
+    (``66666666-...``, ``22222222-...``) and then run the *real*
+    ``_deliver_release_instruction``, whose last transport is
+    ``messages.send`` -> ``deliver()`` -> the CCC delegate. Sandboxing paths
+    is not enough: the delegate is a loopback HTTP POST, so every ``pytest``
+    run injected "you are no longer a WatchTower worker for HEALTHY" into a
+    live command centre (siblings of OPS-835). ``conftest``'s
+    ``WATCHTOWER_DELEGATE_URL=off`` closes that adapter fleet-wide; this
+    fixture is the belt to that braces, and keeps the next release test from
+    reaching *any* future transport. Returns the recorded sends so a test can
+    assert on them.
+    """
+    import watchtower.messages as messages
+
+    sent = []
+
+    def _refuse(target, text, *args, **kwargs):
+        sent.append((target, text))
+        return {"ok": False, "error": "delivery disabled in tests"}
+
+    monkeypatch.setattr(messages, "send", _refuse)
+    return sent
+
+
 # --------------------------------------------------------------------------- helpers
 def _dead_pid():
     """A pid guaranteed not to be running (a child we just reaped)."""
