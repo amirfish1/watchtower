@@ -32,7 +32,7 @@ Steer with a tty, steer to codex/cursor/hermes, or steer to a session CCC doesn'
 | 4 | CCC ticket-comment / answered-blocked-question (server.py:2515,2543) | CCC server → idle/blocked worker session | **CCC → WT** — CCC imports `watchtower.messages` and calls `wt_messages.send(mode="steer")` | Same as #3 — depends on delegate fallthrough | Irrelevant — target is already idle/blocked | **No** — nothing running to abort, "steer" here really means "jump the queue," not "abort" |
 | 5 | `wt ask` | Caller (CLI/agent) → target session, reply back to caller | **WT** — `cli.cmd_ask` → `messages.ask` (`messages.py:1805`); CCC's own parallel path is `ask_session_via_live_tail` / `ask_session_and_wait` | No | No | **No** — you want an answer without derailing current work |
 | 6 | CCC dashboard textbox while session is actively running (headless, no tty, mode=steer) | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_inject_text_into_session` direct, gate at `server.py:60496` | **Yes** | **Yes — real, already shipped** | **Yes**, and it works |
-| 7 | Esc/Kill button | User in CCC dashboard → live CCC-owned headless session | **CCC** — `_interrupt_claude_headless_local` (`server.py:61171`) | Yes | Yes | **Yes**, already shipped |
+| 7 | Esc/Kill button | User in CCC dashboard → live CCC-owned headless session | **CCC** — the button on top of #19: `/api/inject-esc` → `_interrupt_session` → `_interrupt_claude_headless_local` (`server.py:61171`) is only **one branch** of six | Yes | Yes | **Yes**, already shipped |
 | 8 | Codex steer | User in CCC dashboard → live Codex session | **CCC** — `resume_session_codex(steer=True)` | N/A — Codex-native | Yes, but coarser (cancels turn, doesn't resume mid-tool) | **Yes**, already shipped |
 | 9 | ACP (Grok/Kimi) steer while busy | User in CCC dashboard → live ACP session | **CCC** — `session/cancel` + resend | N/A — ACP-native | Yes, but coarsest (kills whole turn, fresh turn after) | **Yes**, already shipped |
 | 10 | CCC→foreign session outbound (`_try_uds_peer_delivery`, used by ask + cross-model bridge) | CCC → foreign (non-CCC-owned) Claude session | **CCC** — `_try_uds_peer_delivery` (`server.py:59767`); sets `priority: "now"/"next"` in JSON body, delivered via receiver's native `SendMessage` inbox | No — foreign process, no FIFO CCC controls | **Impossible**, structurally — confirmed by Anthropic's own docs, no such primitive exists on that transport | N/A — can't build what the receiving harness doesn't expose |
@@ -43,6 +43,9 @@ Steer with a tty, steer to codex/cursor/hermes, or steer to a session CCC doesn'
 | 15 | Reconciler release instruction ("you are no longer a worker for Q") | WT reconciler → verified-idle worker session | **WT** — `release_idle_workers` (`workers.py:1706`) → `_deliver_release_instruction` (`:1007`): UDS via `peer_uds` (claude engine only, receipt-gated) → fifo → `messages.send` | Only on the last `messages.send` fallback, via the delegate — and that call passes no mode, so it arrives as `send`, never `steer` | No | **No** — release explicitly lets the session keep its unrelated conversation work; aborting a live tool to say "you're off the queue" would be hostile |
 | 16 | Reconciler queue nudge — enqueue instant-pickup, stuck-queue, reconcile tick | WT reconciler → every live non-released worker on that queue | **WT** — `notify_workers` (`workers.py:767`), FIFO only, no fallback. Three callers: `dispatch_after_enqueue` (`:3633`), `_maybe_nudge_stuck_queue` (`:836`), `_reconcile_once_locked` (`:4216`) | No — never leaves WT | No | **No** — "a ticket is waiting, claim it when free" is the definition of a message that must not preempt. But note the real gap: a fifo-less worker (rebound after compaction/crash) gets **nothing at all**, not even a queued copy — WATCHTOWER-14 |
 | 17 | Reconciler spawn-time goal (first turn of a new worker) | WT reconciler → the worker child it just spawned | **WT** — `write_to_worker_fifo(fifo_path, goal)` (`workers.py:5049`, `:5145`) into the child's inherited stdin fd | No | N/A — nothing is running yet | N/A — this *is* the first turn, there is no in-flight tool to abort |
+| 18 | `POST /api/inject-input` — the public front door | Any local HTTP caller (WT's delegate, the curl footer, the ccc-orchestration skill, dashboard JS, any script) → any session CCC can reach | **CCC** — `server.py:75775` → `_inject_text_into_session`. Accepts `mode` = `answer\|send\|steer` (and legacy `steer: true`); anything else is a 400 | **Yes — it *is* the front door to the chokepoint** | **Yes**, whenever `mode=steer` and the #6 gate holds | **Yes** — but this is the row that most needs the explicit capability answer: any local process can ask for an abort and gets no `unsupported` back when the gate doesn't hold, only a generic success |
+| 19 | `POST /api/inject-esc` — pure interrupt, no text | Dashboard Esc button (#7) or any local caller → live session | **CCC** — `server.py:75992` → `_interrupt_session` (`:61212`), which has **its own six-way fall-through**, not `_inject_text_into_session`'s | N/A — different router | **Yes** — and the only path that can be **destructive**: a live headless session with no reachable FIFO gets SIGINT to its pid, ending the spawn (no mid-conversation resume) | **Yes**, but the destructive branch and the survivable one currently return the same shape — the caller cannot tell whether the session survived |
+| 20 | `POST /api/ask` — synchronous inject + wait | Sibling session via curl (ccc-orchestration skill) → target session, reply returned in the response | **CCC** — `server.py:76005` → `ask_session_and_wait` (`:62217`), a **third router**: live-tail for an active target (spawns nothing), `claude --resume` for a dormant one, federation proxy if another node owns it, `ask_engine_session_and_wait` for non-claude | No — separate router | No | **No** — same as #5, you want an answer without derailing the turn |
 
 ## Call graph — where the 17 paths converge
 
@@ -78,23 +81,37 @@ flowchart TD
   U10 --> UDS
 
   CHAIN -- "last adapter only" --> BRIDGE
-  BRIDGE["<b>THE ONLY WT→CCC BRIDGE</b><br/>_deliver_delegate<br/>POST /api/inject-input"]
-  BRIDGE --> INJ
+  BRIDGE["<b>THE ONLY WT→CCC BRIDGE</b><br/>_deliver_delegate"]
+  BRIDGE --> API18
+  U12 --> API18
+  subgraph HTTP["CCC HTTP API — the public front door"]
+    API18["#18 POST /api/inject-input<br/>mode = answer / send / steer"]
+    API19["#19 POST /api/inject-esc"]
+    API20["#20 POST /api/ask"]
+  end
+  API18 --> INJ
+  API19 --> ISESS
+  API20 --> ASK
+  U7 --> API19
   U6 & U13 & U14 --> INJ
-  U4 -. "same bridge as #3" .-> INJ
+  U4 -. "same bridge as #3" .-> API18
 
-  INJ["<b>CHOKEPOINT 4 — CCC</b><br/>_inject_text_into_session"]
+  INJ["<b>CHOKEPOINT 4a — CCC</b><br/>_inject_text_into_session"]
+  ISESS["<b>CHOKEPOINT 4b — CCC</b><br/>_interrupt_session<br/>6-way, one branch SIGINTs"]
+  ASK["<b>CHOKEPOINT 4c — CCC</b><br/>ask_session_and_wait<br/>live-tail / resume / federation"]
+  ISESS --> INT
+  ISESS -. "no reachable fifo" .-> KILL["SIGINT — spawn ends"]
   INJ --> R1["tty AppleScript"]
   INJ --> R2["spawn-fifo / wt-worker-fifo"]
   INJ --> R3["headless claude --resume"]
   INJ --> R4["_queue_terminal_input"]
   INJ -- "mode=steer AND no tty<br/>AND claude AND CCC-owned" --> INT
   INJ -- "steered /compact, /clear" --> INT
-  U7 --> ICL["_interrupt_claude_headless_local"] --> INT
+  ICL["_interrupt_claude_headless_local<br/>(1 of #19's 6 branches)"] --> INT
+  ISESS --> ICL
   U8 --> CX["resume_session_codex"]
   U9 --> ACP["session/cancel + resend"]
   U11 --> PEER["_ccc_peer_handle_connection<br/>(ask-replies + reports only)"]
-  U12 --> HTTP["CCC HTTP API"] --> INJ
 
   INT["<b>THE INTERRUPT PRIMITIVE</b><br/>_write_stream_json_interrupt"]
 
@@ -113,7 +130,9 @@ flowchart TD
 | `messages.send` → `deliver` | WT | #1, #2, #3, #4, #5, #15(last) | No |
 | `write_to_worker_fifo` | WT | #15(2nd), #16, #17 | No |
 | `peer_uds.send_lines` | either | #15(1st), #10 | No |
-| `_inject_text_into_session` | CCC | #6, #13, #14 direct; #3/#4/#15 via bridge | **Yes** |
+| `_inject_text_into_session` (4a) | CCC | #6, #13, #14 direct; #18 from the API; #3/#4/#15 via bridge→#18 | **Yes** |
+| `_interrupt_session` (4b) | CCC | #7, #19 | **Yes — and can SIGINT-kill** |
+| `ask_session_and_wait` (4c) | CCC | #20, and #5's CCC-side equivalent | No |
 
 **The three things the picture makes obvious:**
 
