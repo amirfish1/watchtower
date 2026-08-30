@@ -216,13 +216,34 @@ what steer means. It is not. From `server.py:60680`:
 current tool call. Claude's stream-json protocol exposes no equivalent, so CCC
 destroys the turn to create a boundary it can deliver into.
 
-That reframes the problem, though less dramatically than it first appears. #6 is
-not mis-named, it is **under-served**: it wants `steer` and settles for an early
-turn boundary because the primitive it needs does not exist. But per the
-measurement above, that boundary costs a truncated sentence and a dirty result
-code — not lost work. The fix is a seam, and it is a polish problem rather than a
-correctness one. The same missing primitive is what row #16 needs (Q5), so it is
-one problem with two customers.
+**But the turn boundary is a protocol artifact, not a behaviour.** Claude opens
+the next turn with the entire transcript and carries on with the same work. The
+task is not dropped, the thread is not lost, and the user sees a session that
+read their input, answered it, and continued.
+
+Scored on the three properties that actually matter, Claude's #6 is *ahead* of
+Codex steer, not behind it:
+
+| | Claude #6 | Codex steer |
+|---|---|---|
+| Completed work survives | yes | yes |
+| Original task continues afterwards | **yes** | **contested — [openai/codex#39998](https://github.com/openai/codex/issues/39998)** |
+| Response text not cut mid-sentence | no | yes |
+
+Codex users are actively filing bugs to get back the behaviour Claude already
+has: #39998 reports that after a steer Codex "respond[s] to that prompt but then
+stop[s] the task it was working on", and
+[#32931](https://github.com/openai/codex/issues/32931) requests an explicit
+"continue-working mode after user steering".
+
+So #6 is **not** under-served in any way that matters. The only thing a seam
+would buy is avoiding a truncated sentence — cosmetic. Q5 is a polish item, and
+earlier drafts of this doc (which called it the keystone fix) were wrong.
+
+> Note: the `INTERRUPT` rows in CCC's activity log are **not** CCC causing an
+> abort. `server.py:17190` dedupes on `sid:uuid` behind a freshness cutoff — it
+> is CCC *observing* `[Request interrupted by user]` while parsing transcripts.
+> The log line is a symptom, not the action.
 
 ### Caveats carried into the spec
 
