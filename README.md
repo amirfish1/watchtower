@@ -424,6 +424,24 @@ does the same thing over `POST /api/ticket/<ref>/ack`
 (`{"field", "index", "undo"}` or `{"all": true}`). Closed `wt ls` rows report
 the tally as e.g. `[2 unresolveds, 1 acked]`.
 
+#### Finding unresolved work
+
+The dashboard badges closed tickets that were flagged with unresolved items,
+and `wt unresolved` is the same question from the CLI — "what did we close
+without actually fixing?"
+
+```bash
+wt unresolved                      # every queue: count + one block per ticket
+wt unresolved -q DEMO --limit 10   # one queue, capped
+wt ls -q DEMO --unresolved         # the same rows in `wt ls` table form
+wt ls -q DEMO --status unresolved  # identical to --unresolved
+```
+
+Each entry is listed under its ticket with the resolution summary, and acked
+entries are marked `(acked)` so a deliberate close reads differently from live
+work. Any `wt ls` view of a queue that has unresolved closes prints the count
+as a header line, so it stays visible from the default active listing.
+
 ### The signature feature: `wt wait`
 
 `wt wait -q DEMO` blocks (polling) until the queue has zero open tickets, then

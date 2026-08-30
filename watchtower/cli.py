@@ -6,6 +6,7 @@
 
     wt status                 per-queue depth / age / drain / stuck flag
     wt ls -q Q [--status ..]  list the tickets in one queue
+    wt unresolved [-q Q]      closed tickets flagged with unresolved work
     wt find <ref>             look up one ticket by ref, across all queues
     wt add -q Q --title..     file a ticket
     wt import FILE -q Q       preview document tasks; file them with --apply
@@ -308,16 +309,56 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 
+def _unresolved_entries(item: dict) -> List[str]:
+    """The ``resolution.unresolved`` entries of a CLOSED ticket, else [].
+
+    Only closed tickets carry a resolution, so an open ticket is never
+    "unresolved" in this sense — the word means "the worker closed this and
+    flagged something it could not fix", which is exactly what the dashboard's
+    UNRESOLVED badge shows and what the CLI had no way to list (WATCHTOWER-17).
+    """
+    if item.get("status") != "closed":
+        return []
+    # Legacy rows store `resolution` as a bare summary string, never a dict.
+    res = item.get("resolution")
+    if not isinstance(res, dict):
+        return []
+    return [str(x) for x in (res.get("unresolved") or []) if str(x).strip()]
+
+
+def _unresolved_items(items: List[dict]) -> List[dict]:
+    return [it for it in items if _unresolved_entries(it)]
+
+
+def _ack_counts(item: dict) -> Tuple[int, int]:
+    """``(total, acked)`` unresolved entries for one closed ticket.
+
+    An acked entry still counts -- the record is never rewritten -- but says
+    so, so a triage pass can tell deliberate closes from live work.
+    """
+    entries = _unresolved_entries(item)
+    res = item.get("resolution") if isinstance(item.get("resolution"), dict) else {}
+    acked = sum(1 for i in range(len(entries)) if q.is_acked(res, "unresolved", i))
+    return len(entries), acked
+
+
 def cmd_ls(args: argparse.Namespace) -> int:
     """List the tickets in a single queue (the actual items, not just counts)."""
     # fresh=True for the same reason as `wt status`: a CLI read always
     # revalidates, so `wt ls` is never behind the repo.
     items = q.list_items(project=args.queue, fresh=True)
+    # Counted over the WHOLE queue, before the status filter, so the default
+    # (active) view still surfaces that closed-but-unresolved work exists.
+    unresolved_total = len(_unresolved_items(items))
     want = args.status
+    if getattr(args, "unresolved", False):
+        want = "unresolved"
     if want == "active":
         items = [i for i in items if i.get("status") in ("open", "in_progress")]
     elif want == "blocked":
         items = [i for i in items if i.get("needs_input")]
+    elif want == "unresolved":
+        items = _unresolved_items(items)
     elif want != "all":
         items = [i for i in items if i.get("status") == want]
     if args.json:
@@ -327,6 +368,10 @@ def cmd_ls(args: argparse.Namespace) -> int:
         print(f"(no {('' if want=='all' else want+' ')}items in {args.queue})")
         return 0
     limit = args.limit or len(items)
+    if unresolved_total and want != "unresolved":
+        print(f"{args.queue}: {unresolved_total} closed "
+              f"{'ticket' if unresolved_total == 1 else 'tickets'} with unresolved "
+              f"items (wt unresolved -q {args.queue})")
     print(f"{'REF':<14}{'STATUS':<12}{'WORKER':<22}TITLE")
     print("-" * 72)
     for it in items[:limit]:
@@ -352,6 +397,51 @@ def cmd_ls(args: argparse.Namespace) -> int:
         print(line)
     if len(items) > limit:
         print(f"... and {len(items) - limit} more (raise --limit)")
+    return 0
+
+
+def cmd_unresolved(args: argparse.Namespace) -> int:
+    """Summarise closed tickets that were flagged with unresolved items.
+
+    The dashboard has always shown an UNRESOLVED badge on these, but the CLI
+    had no query for them, so owners either eyeballed the web UI or piped
+    `wt ls --status closed --json` through their own filter (WATCHTOWER-17).
+    With no -q this scans every queue, because the question ("is there
+    anything I closed but did not actually fix?") is rarely per-queue.
+    """
+    items = q.list_items(project=args.queue or None, fresh=True)
+    rows = _unresolved_items(items)
+    rows.sort(key=lambda i: (str(i.get("project") or ""), i.get("seq") or 0))
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        where = f" in {args.queue}" if args.queue else ""
+        print(f"(no closed tickets with unresolved items{where})")
+        return 0
+    total = sum(_ack_counts(it)[0] for it in rows)
+    acked = sum(_ack_counts(it)[1] for it in rows)
+    scope = args.queue or "all queues"
+    tail = f", {acked} acked" if acked else ""
+    print(f"{scope}: {len(rows)} closed "
+          f"{'ticket' if len(rows) == 1 else 'tickets'} with {total} unresolved "
+          f"{'item' if total == 1 else 'items'}{tail}")
+    print()
+    limit = args.limit or len(rows)
+    for it in rows[:limit]:
+        n, n_acked = _ack_counts(it)
+        title = _oneline(it.get("title") or it.get("note") or "")[:56]
+        mark = f" [{n} unresolved{f', {n_acked} acked' if n_acked else ''}]"
+        print(f"{str(it.get('ref','')):<14}{title}{mark}")
+        res = it.get("resolution") if isinstance(it.get("resolution"), dict) else {}
+        summary = _oneline(str(res.get("summary") or ""))
+        if summary:
+            print(f"  resolution: {summary[:100]}")
+        for i, entry in enumerate(_unresolved_entries(it)):
+            flag = " (acked)" if q.is_acked(res, "unresolved", i) else ""
+            print(f"  - {_oneline(entry)[:100]}{flag}")
+    if len(rows) > limit:
+        print(f"... and {len(rows) - limit} more (raise --limit)")
     return 0
 
 
@@ -3712,13 +3802,25 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--status",
         default="active",
-        choices=["active", "open", "in_progress", "blocked", "closed", "all"],
+        choices=["active", "open", "in_progress", "blocked", "closed",
+                 "unresolved", "all"],
         help="which tickets to show (default: active = open + in_progress; "
-             "blocked = parked for human input)",
+             "blocked = parked for human input; unresolved = closed with "
+             "unresolved items flagged in the resolution)",
     )
     s.add_argument("--limit", type=int, default=0, help="max rows (0 = all)")
+    s.add_argument("--unresolved", action="store_true",
+                   help="shorthand for --status unresolved")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_ls)
+
+    s = sub.add_parser("unresolved",
+                       help="closed tickets whose resolution flagged unresolved work")
+    s.add_argument("-q", "--queue", default="",
+                   help="one queue (default: every queue)")
+    s.add_argument("--limit", type=int, default=0, help="max rows (0 = all)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_unresolved)
 
     s = sub.add_parser("find")
     s.add_argument("ref", help="ticket ref (e.g. WT-48) or bare number")
