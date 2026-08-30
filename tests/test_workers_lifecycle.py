@@ -3649,6 +3649,12 @@ def test_deliver_release_instruction_uses_uds_when_worker_is_dialable(
         "version": "2.1.251",
     }))
 
+    # A successful socket write alone is not proof of delivery (Claude Code
+    # silently holds an unattested cross-session message to a bypass-mode
+    # receiver) -- the real gate is a transcript receipt. Stub that check so
+    # this test isn't racing the receipt's sleep-loop/timeout.
+    monkeypatch.setattr(wt.workers, "_uds_delivery_receipt", lambda *a, **kw: "delivered")
+
     w = {"engine": "claude", "session_id": "sess-worker-1", "queue": "Q", "fifo": ""}
     try:
         result = wt.workers._deliver_release_instruction(w, "you are released")
@@ -3664,6 +3670,94 @@ def test_deliver_release_instruction_uses_uds_when_worker_is_dialable(
     user_frame = json.loads(received["lines"][-1])
     assert "you are released" in user_frame["message"]["content"]
     assert "<cross-session-message" in user_frame["message"]["content"]
+    assert 'from-mode="bypass"' in user_frame["message"]["content"]
+
+
+def test_deliver_release_instruction_falls_back_when_uds_receipt_is_held(
+    wt, monkeypatch, tmp_path
+):
+    claude_home = tmp_path / "claude-home"
+    sessions_dir = claude_home / "sessions"
+    sessions_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+
+    sock_path = f"/tmp/wt-peer-uds-test-{uuid.uuid4().hex[:8]}.sock"
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(sock_path)
+    srv.listen(1)
+    received = {}
+
+    def accept_once():
+        conn, _ = srv.accept()
+        data = b""
+        conn.settimeout(2.0)
+        try:
+            while True:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        except socket.timeout:
+            pass
+        received["lines"] = data.splitlines()
+        conn.close()
+
+    t = threading.Thread(target=accept_once, daemon=True)
+    t.start()
+
+    (sessions_dir / "55555.json").write_text(json.dumps({
+        "pid": 55555,
+        "sessionId": "sess-worker-1",
+        "messagingSocketPath": sock_path,
+        "peerProtocol": 1,
+        "version": "2.1.251",
+    }))
+
+    # The socket write succeeds, but the receiving Claude session held the
+    # unattested-looking (or otherwise unconfirmed) message -- the code must
+    # not report "uds" success and must fall through to the legacy path.
+    monkeypatch.setattr(wt.workers, "_uds_delivery_receipt", lambda *a, **kw: "held")
+
+    w = {"engine": "claude", "session_id": "sess-worker-1", "queue": "Q", "fifo": ""}
+    try:
+        result = wt.workers._deliver_release_instruction(w, "you are released")
+        t.join(timeout=2.0)
+    finally:
+        srv.close()
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
+
+    assert result["transport"] != "uds"
+
+
+def test_find_claude_session_row_returns_none_for_ambiguous_match(
+    wt, monkeypatch, tmp_path
+):
+    claude_home = tmp_path / "claude-home"
+    sessions_dir = claude_home / "sessions"
+    sessions_dir.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
+
+    row_a = {
+        "pid": 11111,
+        "sessionId": "sess-dup",
+        "messagingSocketPath": "/tmp/cc-socks/11111.sock",
+        "peerProtocol": 1,
+        "version": "2.1.251",
+    }
+    row_b = {
+        "pid": 22222,
+        "sessionId": "sess-dup",
+        "messagingSocketPath": "/tmp/cc-socks/22222.sock",
+        "peerProtocol": 1,
+        "version": "2.1.251",
+    }
+    (sessions_dir / "11111.json").write_text(json.dumps(row_a))
+    (sessions_dir / "22222.json").write_text(json.dumps(row_b))
+
+    assert wt.workers._find_claude_session_row("sess-dup") is None
 
 
 def test_deliver_release_instruction_falls_back_when_no_registry_row(
