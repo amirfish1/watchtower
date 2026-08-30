@@ -2,8 +2,10 @@
 
 import hashlib
 import json
+import os
 import socket
 import threading
+import uuid
 
 from watchtower import peer_uds as uds
 
@@ -41,8 +43,8 @@ def test_resolve_target_refusals(tmp_path):
     assert uds.resolve_target({})["reason"] == "no_socket_path"
 
 
-def test_build_and_send_lines_round_trip(tmp_path):
-    sock_path = str(tmp_path / "worker.sock")
+def test_build_and_send_lines_round_trip():
+    sock_path = f"/tmp/wt-peer-uds-test-{uuid.uuid4().hex[:8]}.sock"
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(sock_path)
     srv.listen(1)
@@ -63,20 +65,26 @@ def test_build_and_send_lines_round_trip(tmp_path):
         received["lines"] = data.splitlines()
         conn.close()
 
-    t = threading.Thread(target=accept_once, daemon=True)
-    t.start()
-    lines = uds.build_frame_lines(
-        uds.wrap("you are released"), token="tok-123", msg_id="m-1"
-    )
-    result = uds.send_lines(sock_path, lines)
-    t.join(timeout=2.0)
-    srv.close()
+    try:
+        t = threading.Thread(target=accept_once, daemon=True)
+        t.start()
+        lines = uds.build_frame_lines(
+            uds.wrap("you are released"), token="tok-123", msg_id="m-1"
+        )
+        result = uds.send_lines(sock_path, lines)
+        t.join(timeout=2.0)
 
-    assert result == {"ok": True, "error": ""}
-    assert len(received["lines"]) == 2
-    auth_frame = json.loads(received["lines"][0])
-    user_frame = json.loads(received["lines"][1])
-    assert auth_frame == {"type": "auth", "token": "tok-123"}
-    assert user_frame["type"] == "user"
-    assert "you are released" in user_frame["message"]["content"]
-    assert user_frame["msg_id"] == "m-1"
+        assert result == {"ok": True, "error": ""}
+        assert len(received["lines"]) == 2
+        auth_frame = json.loads(received["lines"][0])
+        user_frame = json.loads(received["lines"][1])
+        assert auth_frame == {"type": "auth", "token": "tok-123"}
+        assert user_frame["type"] == "user"
+        assert "you are released" in user_frame["message"]["content"]
+        assert user_frame["msg_id"] == "m-1"
+    finally:
+        srv.close()
+        try:
+            os.unlink(sock_path)
+        except FileNotFoundError:
+            pass
