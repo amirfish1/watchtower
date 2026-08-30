@@ -24,6 +24,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -842,8 +843,12 @@ def _find_claude_session_row(session_id: str) -> Optional[Dict[str, Any]]:
     """Find a live Claude Code session's peer-registry row by sessionId.
 
     Scans $CLAUDE_CONFIG_DIR/sessions (or ~/.claude/sessions). Returns None
-    when nothing matches -- callers must treat that as "not dialable over
-    UDS right now", never as an error worth surfacing.
+    when nothing matches, or when MORE THAN ONE registry file matches the
+    same sessionId -- two live rows can genuinely coexist (e.g. a --resume
+    fork of the same session running as a second process), and dialing an
+    arbitrary one of them risks reaching the wrong process. Callers must
+    treat None as "not dialable over UDS right now", never as an error
+    worth surfacing.
     """
     session_id = str(session_id or "").strip()
     if not session_id:
@@ -855,14 +860,17 @@ def _find_claude_session_row(session_id: str) -> Optional[Dict[str, Any]]:
         files = list((claude_home / "sessions").glob("*.json"))
     except OSError:
         return None
+    matches: List[Dict[str, Any]] = []
     for f in files:
         try:
             data = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
         if isinstance(data, dict) and data.get("sessionId") == session_id:
-            return data
-    return None
+            matches.append(data)
+    if len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def _release_instruction(w: Dict[str, Any]) -> str:
@@ -877,15 +885,84 @@ def _release_instruction(w: Dict[str, Any]) -> str:
     )
 
 
+def _uds_delivery_receipt(
+    session_id: str, msg_id: str, body: str, start_offset: int, timeout_s: float = 2.0
+) -> str:
+    """Delivery receipt for a peer-socket send: "delivered", "held", "queued", "unknown".
+
+    Ported from claude-command-center's server.py:_transcript_peer_receipt.
+    A successful socket write is NOT delivery -- Claude Code silently holds
+    (and later expires) an unattested cross-session message sent to a
+    bypass-mode receiver, so only an echo of our msg_id (or an explicit
+    "Held peer message" row) in the transcript counts as proof. Scans only
+    bytes appended at or after start_offset, so a stale row from an earlier
+    message can never be mistaken for this send's receipt.
+    """
+    msg_id = str(msg_id or "")
+    if not msg_id:
+        return "unknown"
+    claude_home = Path(
+        os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")
+    )
+    try:
+        paths = list((claude_home / "projects").glob(f"*/{session_id}.jsonl"))
+    except OSError:
+        paths = []
+    if len(paths) != 1:
+        return "unknown"
+    path = paths[0]
+    id_forms = (f'"msg_id": "{msg_id}"', f'"msg_id":"{msg_id}"')
+    preview = ""
+    for line in str(body or "").splitlines():
+        line = line.strip()
+        if line:
+            preview = line[:40]
+            break
+    preview_json = json.dumps(preview, ensure_ascii=False)[1:-1] if preview else ""
+    start_offset = max(0, int(start_offset or 0))
+    deadline = time.time() + timeout_s
+    queued = False
+    while True:
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, 2)
+                size = fh.tell()
+                if size > start_offset:
+                    fh.seek(start_offset)
+                    tail = fh.read().decode("utf-8", "replace")
+                else:
+                    tail = ""
+            if any(form in tail for form in id_forms):
+                return "delivered"
+            if preview_json and "Held peer message" in tail and preview_json in tail:
+                return "held"
+            if preview_json and not queued:
+                for line in tail.splitlines():
+                    if (
+                        ('"type": "queue-operation"' in line or '"type":"queue-operation"' in line)
+                        and ('"operation": "enqueue"' in line or '"operation":"enqueue"' in line)
+                        and preview_json in line
+                    ):
+                        queued = True
+                        break
+        except OSError:
+            pass
+        if time.time() >= deadline:
+            return "queued" if queued else "unknown"
+        time.sleep(0.25)
+
+
 def _deliver_release_instruction_via_uds(
     w: Dict[str, Any], text: str
 ) -> Optional[Dict[str, Any]]:
     """Try the worker's native Claude Code peer socket.
 
-    Returns a result dict on success, None on ANY failure (no registry row,
-    stale/invalid target, connect/send failure) -- callers must fall through
-    to the existing fifo/messages.send path unchanged, never surface a UDS
-    failure as a release failure.
+    Returns a result dict ONLY when a delivery receipt confirms the frame
+    actually reached the target -- a successful socket write alone is not
+    delivery, since a bypass-mode receiver silently holds (and later
+    expires) an unattested cross-session message. Returns None on any
+    failure, hold, ambiguity, or unconfirmed send so the caller falls
+    through to the existing fifo/messages.send path unchanged.
     """
     session_id = str(w.get("session_id") or "").strip()
     if not session_id:
@@ -903,14 +980,26 @@ def _deliver_release_instruction_via_uds(
     token = peer_uds.load_peer_token(
         claude_home / "sessions", target["pid"], target["socket_path"]
     )
+    msg_id = str(uuid.uuid4())
     try:
         lines = peer_uds.build_frame_lines(
-            peer_uds.wrap(text), token=token, msg_id=str(uuid.uuid4())
+            peer_uds.wrap(text, from_name="watchtower-reconciler", from_mode="bypass"),
+            token=token,
+            msg_id=msg_id,
         )
     except ValueError:
         return None
+    start_offset = _claude_transcript_bytes(session_id)
     result = peer_uds.send_lines(target["socket_path"], lines)
     if not result.get("ok"):
+        return None
+    verdict = _uds_delivery_receipt(session_id, msg_id, text, start_offset)
+    if verdict not in ("delivered", "queued"):
+        print(
+            f"[watchtower] uds release send to {session_id} reported ok but "
+            f"receipt verdict={verdict!r} -- falling back",
+            file=sys.stderr,
+        )
         return None
     return {"transport": "uds", "delivered": True, "error": ""}
 
