@@ -223,8 +223,9 @@ def test_enqueue_claim_close_status(store):
     assert claimed["status"] == "in_progress"
     assert claimed["claimed_by"] == "worker-1"
 
-    # nothing left to claim
-    assert q.claim_next("worker-1", project="DEMO") is None
+    # nothing left to claim (asked by a free worker -- worker-1 still holds
+    # DEMO-1, and claiming again before closing it is refused)
+    assert q.claim_next("worker-2", project="DEMO") is None
 
     # close
     closed = q.close("DEMO-1", "worker-1")
@@ -266,6 +267,47 @@ def test_close_keeps_original_claimant(store):
     closed = q.close(claimed["ref"], "worker-2", force=True)
     assert closed["closed_by"] == "worker-2"
     assert closed["claimed_by"] == "worker-1"
+
+
+def test_claim_refuses_while_worker_still_holds_a_ticket(store):
+    """WATCHTOWER-20: a worker that commits a fix and claims again without
+    ``wt close``/``wt block`` leaves the first ticket silently in_progress.
+    The claim boundary is the only place that catches it, so it refuses."""
+    import watchtower.queue as q
+    import pytest
+
+    first = q.enqueue(project="HOLD", note="first")
+    q.enqueue(project="HOLD", note="second")
+    claimed = q.claim_next("worker-1", project="HOLD")
+    assert claimed["ref"] == first["ref"]
+
+    with pytest.raises(ValueError, match=r"claim refused: you still hold HOLD-1"):
+        q.claim_next("worker-1", project="HOLD")
+
+    # A different worker is unaffected: the guard is per-worker, not a lock.
+    assert q.claim_next("worker-2", project="HOLD")["ref"] == "HOLD-2"
+
+    # And so is the same worker on another queue.
+    q.enqueue(project="OTHERQ", note="elsewhere")
+    assert q.claim_next("worker-1", project="OTHERQ")["ref"] == "OTHERQ-1"
+
+    # Recording the outcome clears the hold.
+    q.close(first["ref"], "worker-1", resolution="done")
+    q.enqueue(project="HOLD", note="third")
+    assert q.claim_next("worker-1", project="HOLD")["ref"] == "HOLD-3"
+
+
+def test_claim_allowed_while_a_ticket_is_blocked(store):
+    """A blocked ticket is parked on a human, not being worked -- it must not
+    strand its worker, which is why the guard reads active claims only."""
+    import watchtower.queue as q
+
+    first = q.enqueue(project="BLKHOLD", note="needs a decision")
+    q.enqueue(project="BLKHOLD", note="workable")
+    q.claim_next("worker-1", project="BLKHOLD")
+    q.block(first["ref"], "worker-1", question="which shape?", progress="looked")
+
+    assert q.claim_next("worker-1", project="BLKHOLD")["ref"] == "BLKHOLD-2"
 
 
 def test_queues_counts(store):
@@ -1896,6 +1938,7 @@ def test_priority_sort_in_claim(store):
     assert first["ref"] == high["ref"]
     assert first["priority"] == "p0"
 
+    q.close(first["ref"], "worker-1", resolution="done")
     second = q.claim_next("worker-1", project="PRIO")
     assert second is not None
     assert second["ref"] == low["ref"]
@@ -2082,11 +2125,11 @@ def test_context_budget_defers_recycle_while_worker_holds_a_claim(
     assert held["status"] == "in_progress"
 
     # A second claim_next() call is over budget, but must NOT recycle: the
-    # worker still holds CTXQ2-1 unfinished. Nothing else is open, so the
-    # call finds nothing claimable -- the point is it does NOT return the
-    # recycle-stop while abandoning the held ticket.
-    result = q.claim_next("ctx-worker-02", project="CTXQ2", session_uuid=session_uuid)
-    assert result != {"stop": True, "reason": "context_budget"}
+    # worker still holds CTXQ2-1 unfinished. It is refused outright (the
+    # held-claim guard) -- the point is it does NOT return the recycle-stop
+    # while abandoning the held ticket.
+    with pytest.raises(ValueError, match="claim refused: you still hold CTXQ2-1"):
+        q.claim_next("ctx-worker-02", project="CTXQ2", session_uuid=session_uuid)
     assert q.get("CTXQ2-1")["status"] == "in_progress"
 
     # Once the held ticket is closed, the worker is a clean boundary again

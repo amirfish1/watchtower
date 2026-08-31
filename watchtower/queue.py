@@ -1538,6 +1538,11 @@ def claim_next(
 
     Returns ``None`` when nothing matches.
 
+    Raises ``ValueError`` if ``session_id`` still holds an active (non-blocked)
+    claim on this queue: a ticket ends with ``close`` or ``block``, never with
+    a bare commit, and only the claim boundary can catch a worker that skipped
+    that step.
+
     Stop signal: if a reconciler has requested this worker to stop (by placing
     a sentinel file in the stop-signals directory keyed to ``session_id``), the
     file is deleted and ``{"stop": True}`` is returned so the conversation is
@@ -1570,6 +1575,14 @@ def claim_next(
     # transcript). The claim boundary is the only safe recycle point — never
     # mid-ticket — so an over-budget worker is stopped here exactly like a
     # reconciler release; deficit staffing then spawns a fresh worker.
+    # One ticket at a time. Committing a fix is not the same thing as
+    # finishing a ticket: a worker that commits and then claims again leaves
+    # the previous ticket silently ``in_progress``, and its own end-of-turn
+    # narrative ("committed, so it's done") reads as complete to the human.
+    # The claim boundary is the only place that can catch it, so resolve what
+    # this worker still holds before anything else decides what to hand it.
+    held = worker_active_claims(session_id, project)
+
     try:
         from . import workers as _workers
         over = _workers.context_budget_exceeded(
@@ -1588,11 +1601,8 @@ def claim_next(
         # alive, same as an idle release), so the ticket would sit stuck
         # until the released process is eventually reaped by
         # RELEASED_TTL_S, up to hours later. Defer the recycle to the next
-        # clean boundary instead of stranding it.
-        held = [
-            it for it in list_active_claims(project)
-            if str(it.get("claimed_by") or "") == str(session_id)
-        ]
+        # clean boundary instead of stranding it -- the guard below then
+        # tells the worker exactly which ticket to finish first.
         if not held:
             # This path itself tells the worker to exit, so persist the same
             # queue detachment that a reconciler stop signal establishes.
@@ -1607,6 +1617,19 @@ def claim_next(
                 queue=project or "",
             )
             return {"stop": True, "reason": "context_budget"}
+
+    if held:
+        refs = ", ".join(str(it.get("ref") or "?") for it in held)
+        ref0 = str(held[0].get("ref") or "<ref>")
+        raise ValueError(
+            f"claim refused: you still hold {refs} in_progress on this queue. "
+            "Committing a fix does not finish a ticket -- record its outcome "
+            "first, then claim again:\n"
+            f"  wt close {ref0} --worker {session_id} --summary \"...\" "
+            "--commit <SHA>   (--no-code if nothing was committed)\n"
+            f"  wt block {ref0} --worker {session_id} --question \"...\" "
+            "--progress \"...\"   (needs a human decision)"
+        )
 
     backend = _github_backend_for_project(project)
     if backend is not None:
@@ -2339,6 +2362,25 @@ def list_active_claims(project: Optional[str] = None) -> List[Dict[str, Any]]:
     return [
         it for it in list_items(status="in_progress", project=project)
         if not it.get("needs_input")
+    ]
+
+
+def worker_active_claims(
+    session_id: str, project: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """The active (non-blocked) ``in_progress`` tickets ``session_id`` holds.
+
+    A worker between tickets must have this empty -- that is the
+    one-ticket-at-a-time invariant ``claim_next`` enforces. Blocked tickets
+    are excluded (see ``list_active_claims``): parking a ticket on a human
+    decision is a legitimate way to move on to the next one.
+    """
+    sid = str(session_id or "")
+    if not sid:
+        return []
+    return [
+        it for it in list_active_claims(project)
+        if str(it.get("claimed_by") or "") == sid
     ]
 
 
