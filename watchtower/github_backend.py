@@ -1675,11 +1675,24 @@ class GitHubIssuesBackend:
                 return {"stop": True}
         if not candidates:
             return None
-        return self.claim_by_ref(
-            candidates[0]["ref"],
-            session_id,
-            session_uuid=session_uuid,
-        )
+        # A candidate can be stale by the time claim_by_ref re-reads it:
+        # closed or claimed between the listing snapshot and the claim, or
+        # served from a lagging list cache (e.g. while GraphQL quota guards
+        # pin the snapshot). claim_by_ref then raises "is not open" /
+        # "is not eligible" ValueErrors. Skip that entry and fall through to
+        # the next candidate instead of failing the whole claim and blocking
+        # the drain (OPS-841). Non-ValueError failures (gh outages, lock
+        # errors) still surface.
+        for candidate in candidates:
+            try:
+                item = self.claim_by_ref(
+                    candidate["ref"], session_id, session_uuid=session_uuid
+                )
+            except ValueError:
+                continue
+            if item is not None:
+                return item
+        return None
 
     def claim_by_ref(
         self,

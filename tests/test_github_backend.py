@@ -486,6 +486,59 @@ def test_github_backend_claim_by_ref_serializes_concurrent_claimants(tmp_path, m
     assert final["history"][0]["worker"] == winners[0]
 
 
+def test_claim_next_falls_through_stale_closed_candidate(tmp_path, monkeypatch):
+    """OPS-841: a candidate that is open in the listing snapshot but already
+    closed by the time claim_by_ref re-reads it (closed between list and
+    claim, or served from a lagging list cache) must be skipped in favour of
+    the next open candidate -- not fail the whole claim and block the drain.
+    When it is the only candidate, claim_next must report a drained queue
+    (None) instead of raising."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    stale = q.enqueue(project="GHI", note="closed behind the listing's back", source="test")
+    real = q.enqueue(project="GHI", note="real claimable work", source="test")
+    assert stale["ref"] == "GHI-1"
+    assert real["ref"] == "GHI-2"
+
+    # Capture the open-shaped snapshot of GHI-1, then close it directly in
+    # the fake GitHub state (a concurrent close the listing never saw).
+    stale_snapshot = next(
+        it for it in q.list_items(project="GHI") if it["ref"] == "GHI-1"
+    )
+    gh_state = json.loads(state.read_text())
+    gh_state["issues"][0]["state"] = "CLOSED"
+    gh_state["issues"][0]["closedAt"] = "2026-08-31T00:00:00Z"
+    state.write_text(json.dumps(gh_state))
+
+    # Serve the stale listing (GHI-1 still open) to every new backend.
+    import watchtower.github_backend as github_backend
+
+    orig_list_items = github_backend.GitHubIssuesBackend.list_items
+
+    def stale_listing(self, *args, **kwargs):
+        return [stale_snapshot] + [
+            it for it in orig_list_items(self, *args, **kwargs)
+            if it.get("ref") != "GHI-1"
+        ]
+
+    monkeypatch.setattr(
+        github_backend.GitHubIssuesBackend, "list_items", stale_listing
+    )
+
+    claimed = q.claim_next("worker-1", project="GHI")
+    assert claimed is not None
+    assert claimed["ref"] == "GHI-2"
+    assert claimed["claimed_by"] == "worker-1"
+
+    # Once the real ticket is claimed too, the stale GHI-1 is the only
+    # remaining listing entry: the queue must read as drained, not error.
+    assert q.claim_next("worker-2", project="GHI") is None
+
+
 def test_github_backend_rejects_crossworker_close(tmp_path, monkeypatch):
     _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
