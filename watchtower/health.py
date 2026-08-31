@@ -279,8 +279,15 @@ def github_connectivity(now: Optional[datetime] = None) -> Dict[str, Any]:
     broken_since = state.get("broken_since")
     outage_s = _age_seconds(broken_since, now) if broken_since else None
     alert = outage_s is not None and outage_s >= GH_ALERT_THRESHOLD_S
+    # A rate-limit hold is a distinct condition from "GitHub is unreachable":
+    # the API answers fine, the account is just out of quota (WATCHTOWER-19).
+    # Surfaced separately so the banner can say which one it is.
+    rate_limited_until = state.get("rate_limited_until")
+    parsed_hold = github_backend._parse_iso(rate_limited_until)
     return {
         "alert": alert,
+        "rate_limited": parsed_hold is not None and now < parsed_hold,
+        "rate_limited_until": rate_limited_until,
         "broken_since": broken_since,
         "outage_duration_s": outage_s,
         "outage_duration": _fmt_age(outage_s) if outage_s is not None else None,

@@ -376,6 +376,55 @@ def _graphql_rate_limit_remaining() -> Optional[int]:
     return None
 
 
+# Observed-evidence rate-limit hold. The pre-emptive guard above reads
+# `gh api rate_limit`, which only reports the per-token REST/GraphQL buckets.
+# GitHub also enforces a *user-level* aggregate limit across all of an
+# account's tokens, and that one is invisible to `rate_limit`: during the
+# 2026-08-30 storm it read 5000 remaining / 0 used while every GraphQL call
+# came back "API rate limit already exceeded for user ID ..." (WATCHTOWER-19).
+# So the guard passed exactly when it had to trip. The fix is to believe the
+# failures: when a real `gh` call reports a rate-limit error, hold live calls
+# off until the reset window passes and serve caches meanwhile. The generic
+# 60s->600s unreachability ladder is not enough -- a first rate-limit error
+# would only defer 60s, and the retry burns quota that is already spent.
+#
+# The hold length is clamped: GitHub's reported reset (whichever bucket resets
+# last) is a hint, not the user-level window, so we neither trust a reset a
+# second away nor black out for a full hour on one error.
+_GH_RATE_LIMIT_MIN_HOLD_S = 300.0
+_GH_RATE_LIMIT_MAX_HOLD_S = 900.0
+_RATE_LIMIT_ERROR_RE = re.compile(r"rate limit|abuse detection", re.IGNORECASE)
+
+
+def _is_rate_limit_error(error: Any) -> bool:
+    """Whether a gh error message is GitHub telling us we're out of quota."""
+    return bool(_RATE_LIMIT_ERROR_RE.search(str(error or "")))
+
+
+def _rate_limit_hold_seconds() -> float:
+    """How long to hold off live GitHub calls after a rate-limit error.
+
+    Asks GitHub when its buckets reset and clamps the answer into
+    ``[_GH_RATE_LIMIT_MIN_HOLD_S, _GH_RATE_LIMIT_MAX_HOLD_S]``. Any failure to
+    read the reset falls back to the minimum hold.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "api", "rate_limit", "--jq", "[.resources[].reset] | max"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            delta = float(result.stdout.strip()) - time.time()
+            return max(
+                _GH_RATE_LIMIT_MIN_HOLD_S, min(_GH_RATE_LIMIT_MAX_HOLD_S, delta)
+            )
+    except Exception:
+        pass
+    return _GH_RATE_LIMIT_MIN_HOLD_S
+
+
 def _connectivity_path() -> Path:
     env = os.environ.get("WATCHTOWER_GH_CONNECTIVITY_FILE")
     if env:
@@ -390,6 +439,7 @@ def _empty_connectivity() -> Dict[str, Any]:
         "consecutive_failures": 0,
         "next_retry_at": None,
         "last_error": "",
+        "rate_limited_until": None,
     }
 
 
@@ -428,6 +478,9 @@ def _record_gh_success() -> None:
     state["consecutive_failures"] = 0
     state["next_retry_at"] = None
     state["last_error"] = ""
+    # A live fetch that succeeded is direct proof the account is out of the
+    # penalty box, whatever the hold said.
+    state["rate_limited_until"] = None
     _save_connectivity(state)
 
 
@@ -443,6 +496,37 @@ def _record_gh_failure(error: str) -> None:
         datetime.now(timezone.utc) + timedelta(seconds=delay)
     ).strftime("%Y-%m-%dT%H:%M:%SZ")
     state["last_error"] = str(error)
+    if _is_rate_limit_error(error):
+        hold_until = datetime.now(timezone.utc) + timedelta(
+            seconds=_rate_limit_hold_seconds()
+        )
+        state["rate_limited_until"] = hold_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+        # The hold never shortens the generic ladder, only extends it.
+        if hold_until > (datetime.now(timezone.utc) + timedelta(seconds=delay)):
+            state["next_retry_at"] = state["rate_limited_until"]
+    _save_connectivity(state)
+
+
+def _record_gh_rate_limited(error: str) -> None:
+    """Record a rate-limit error observed on any live `gh` call.
+
+    Separate from ``_record_gh_failure`` because it fires from ``_run`` for
+    every gh verb (a ticket read, a comment write), not just the list fetch:
+    a quota wall applies to the whole account, so whichever call hits it first
+    should stop the rest. It sets the hold without escalating the
+    unreachability ladder -- GitHub is reachable, we're just out of budget.
+    """
+    state = _load_connectivity()
+    hold_until = datetime.now(timezone.utc) + timedelta(
+        seconds=_rate_limit_hold_seconds()
+    )
+    state["rate_limited_until"] = hold_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+    state["last_error"] = str(error)
+    if state.get("broken_since") is None:
+        state["broken_since"] = _now_iso()
+    existing = _parse_iso(state.get("next_retry_at"))
+    if existing is None or existing < hold_until:
+        state["next_retry_at"] = state["rate_limited_until"]
     _save_connectivity(state)
 
 
@@ -451,8 +535,12 @@ def _gh_backoff_active() -> "tuple[bool, Dict[str, Any]]":
     current persisted state (so the caller can reuse it for the error
     message without a second read)."""
     state = _load_connectivity()
+    now = datetime.now(timezone.utc)
     next_retry = _parse_iso(state.get("next_retry_at"))
-    active = next_retry is not None and datetime.now(timezone.utc) < next_retry
+    rate_limited_until = _parse_iso(state.get("rate_limited_until"))
+    active = (next_retry is not None and now < next_retry) or (
+        rate_limited_until is not None and now < rate_limited_until
+    )
     return active, state
 
 # Cheap change *detector* for the issue list. A conditional GET answers "did
@@ -894,6 +982,10 @@ class GitHubIssuesBackend:
         proc = self._run_raw(args)
         if check and proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
+            if _is_rate_limit_error(detail):
+                # Observed evidence beats `gh api rate_limit`, which cannot
+                # see the user-level aggregate limit (WATCHTOWER-19).
+                _record_gh_rate_limited(detail)
             raise GitHubBackendError(
                 f"gh {' '.join(args)} failed"
                 + (f": {detail}" if detail else "")

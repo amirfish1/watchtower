@@ -2641,3 +2641,111 @@ def test_poller_persists_the_etag_and_fetch_clock_for_other_processes(
     persisted = github_backend._read_persisted_list_cache()[f"{repo}:open"]
     assert persisted["etag"] == '"v7"'
     assert persisted["fetched_at"] > 0
+
+
+# ============================================ user-level rate-limit hold (WT-19)
+
+def test_rate_limit_error_on_any_gh_call_holds_off_live_calls(tmp_path, monkeypatch):
+    """`gh api rate_limit` cannot see GitHub's user-level aggregate limit, so
+    the pre-emptive guard passed while every GraphQL call failed. Observed
+    rate-limit errors must set a hold of their own."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json")
+    )
+    # Don't shell out for the reset window in a unit test.
+    monkeypatch.setattr(github_backend, "_rate_limit_hold_seconds", lambda: 300.0)
+    backend = github_backend.GitHubIssuesBackend("T", repo="acme/ratelimit-test")
+    monkeypatch.setattr(
+        backend,
+        "_run_raw",
+        lambda args, **kw: _proc(
+            1, stderr="API rate limit already exceeded for user ID 255024423."
+        ),
+    )
+
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend._run(["issue", "view", "1", "--repo", backend.repo])
+
+    state = github_backend._load_connectivity()
+    assert state["rate_limited_until"], "the hold must be persisted"
+    active, _ = github_backend._gh_backoff_active()
+    assert active is True, "a rate-limit error must suppress live calls"
+
+
+def test_rate_limit_hold_survives_when_the_generic_ladder_is_shorter(
+    tmp_path, monkeypatch
+):
+    """The 60s unreachability ladder is too short for a quota wall: retrying
+    in a minute just spends quota that is already gone."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json")
+    )
+    monkeypatch.setattr(github_backend, "_rate_limit_hold_seconds", lambda: 600.0)
+    monkeypatch.setattr(github_backend, "_GH_BACKOFF_BASE_S", 60.0)
+
+    github_backend._record_gh_failure("API rate limit exceeded for user ID 1234.")
+    state = github_backend._load_connectivity()
+    assert state["next_retry_at"] == state["rate_limited_until"]
+
+    delta = (
+        github_backend._parse_iso(state["next_retry_at"])
+        - datetime.now(timezone.utc)
+    ).total_seconds()
+    assert delta > 120, "a rate-limit hold must outlast the first backoff step"
+
+
+def test_a_successful_fetch_clears_the_rate_limit_hold(tmp_path, monkeypatch):
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json")
+    )
+    monkeypatch.setattr(github_backend, "_rate_limit_hold_seconds", lambda: 600.0)
+    github_backend._record_gh_rate_limited("API rate limit exceeded")
+    assert github_backend._gh_backoff_active()[0] is True
+
+    github_backend._record_gh_success()
+    state = github_backend._load_connectivity()
+    assert state["rate_limited_until"] is None
+    assert github_backend._gh_backoff_active()[0] is False
+
+
+def test_non_rate_limit_errors_do_not_set_a_hold(tmp_path, monkeypatch):
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_CONNECTIVITY_FILE", str(tmp_path / "gh-connectivity.json")
+    )
+    github_backend._record_gh_failure("HTTP 503: Service Unavailable")
+    assert github_backend._load_connectivity()["rate_limited_until"] is None
+
+
+def test_rate_limit_hold_is_clamped_between_the_min_and_max(monkeypatch):
+    """GitHub's reported reset is the wrong bucket's window, so it is a hint:
+    never shorter than the floor, never a full-hour blackout."""
+    import watchtower.github_backend as github_backend
+
+    def reset_in(seconds):
+        return lambda *a, **kw: _proc(0, stdout=str(int(time.time() + seconds)))
+
+    monkeypatch.setattr(github_backend.subprocess, "run", reset_in(5))
+    assert github_backend._rate_limit_hold_seconds() == pytest.approx(
+        github_backend._GH_RATE_LIMIT_MIN_HOLD_S, abs=1
+    )
+    monkeypatch.setattr(github_backend.subprocess, "run", reset_in(3600))
+    assert github_backend._rate_limit_hold_seconds() == pytest.approx(
+        github_backend._GH_RATE_LIMIT_MAX_HOLD_S, abs=1
+    )
+
+    def boom(*a, **kw):
+        raise OSError("gh missing")
+
+    monkeypatch.setattr(github_backend.subprocess, "run", boom)
+    assert (
+        github_backend._rate_limit_hold_seconds()
+        == github_backend._GH_RATE_LIMIT_MIN_HOLD_S
+    )
