@@ -125,6 +125,86 @@ def test_block_notifies_submitter_with_question(wt, monkeypatch):
     assert "ship it?" in text
 
 
+# --------------------------------------------------- no self-notify (actor)
+def test_self_claim_does_not_notify_the_claimer(wt, monkeypatch):
+    """A session that filed a ticket and then claims it must not be told it
+    claimed it -- that echo steers a worker with its own command."""
+    calls = _record_sends(monkeypatch, wt.messages)
+    item = wt.q.enqueue(project="SUB", note="mine", submitter="worker-a")
+
+    claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    assert claimed["status"] == "in_progress"
+    assert calls == []
+
+
+def test_self_claim_next_does_not_notify_the_claimer(wt, monkeypatch):
+    calls = _record_sends(monkeypatch, wt.messages)
+    wt.q.enqueue(project="SUB", note="mine too", submitter="worker-a")
+
+    assert wt.q.claim_next("worker-a", project="SUB") is not None
+    assert calls == []
+
+
+def test_self_claim_matches_on_session_uuid_too(wt, monkeypatch):
+    """The submitter may be registered under the harness session UUID rather
+    than the worker id; either name identifies the same actor."""
+    sid = "11111111-2222-3333-4444-555555555555"
+    calls = _record_sends(monkeypatch, wt.messages)
+    item = wt.q.enqueue(project="SUB", note="uuid submitter", submitter=sid)
+
+    wt.q.claim_by_ref(item["ref"], "worker-a", session_uuid=sid)
+
+    assert calls == []
+
+
+def test_self_close_does_not_notify_the_closer(wt, monkeypatch):
+    item = wt.q.enqueue(project="SUB", note="close my own", submitter="worker-a")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    closed = wt.q.close(item["ref"], "worker-a", resolution={"summary": "done"})
+
+    assert closed["status"] == "closed"
+    assert calls == []
+
+
+def test_self_block_does_not_notify_the_blocker(wt, monkeypatch):
+    item = wt.q.enqueue(project="SUB", note="block my own", submitter="worker-a")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.block(item["ref"], session_id="worker-a", question="ship it?")
+
+    assert calls == []
+
+
+def test_actor_is_dropped_from_subscribers_but_others_still_notified(wt, monkeypatch):
+    """Suppression is per-target, not all-or-nothing: a worker subscribed to
+    the queue it works loses only its own echo."""
+    wt.config.add_subscriber("SUB", "worker-a")
+    wt.config.add_subscriber("SUB", "watcher")
+    calls = _record_sends(monkeypatch, wt.messages)
+    item = wt.q.enqueue(project="SUB", note="two subscribers")
+
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    assert [t for t, _ in calls] == ["watcher"]
+
+
+def test_force_close_by_someone_else_still_notifies_the_claimant(wt, monkeypatch):
+    """The suppressed identity is the ACTOR of this transition, not the
+    ticket's claimant -- a human force-closing somebody's ticket is news."""
+    item = wt.q.enqueue(project="SUB", note="force closed", submitter="worker-a")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.close(item["ref"], "human-x", resolution={"summary": "taking over"},
+               force=True)
+
+    assert [t for t, _ in calls] == ["worker-a"]
+
+
 # ------------------------------------------------------- no identity: silent
 def test_no_submitter_and_no_subscribers_sends_nothing_and_never_raises(wt, monkeypatch):
     calls = _record_sends(monkeypatch, wt.messages)

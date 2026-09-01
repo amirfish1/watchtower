@@ -929,8 +929,31 @@ _NOTIFY_VERBS = {
 }
 
 
+def _actor_identities(*values: Any) -> set:
+    """The set of addressable strings that all mean "the actor who did this".
+
+    A transition's actor is known by up to two names -- a worker id
+    (``claimed_by``, ``wt close --worker``) and a harness session UUID
+    (``claimed_session_id``) -- and either one may be the string a submitter
+    or subscriber was registered under. Collecting both lets
+    ``_notify_ticket_event`` recognise its own actor whichever name the
+    target list happens to use.
+    """
+    out: set = set()
+    for value in values:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        out.add(raw)
+        coerced = _coerce_session_uuid(raw)
+        if coerced:
+            out.add(coerced)
+    return out
+
+
 def _notify_ticket_event(
-    item: Optional[Dict[str, Any]], event: str, detail: str = ""
+    item: Optional[Dict[str, Any]], event: str, detail: str = "",
+    actor: Any = None,
 ) -> None:
     """Best-effort push-back to whoever should hear about a ticket's state
     change.
@@ -938,11 +961,23 @@ def _notify_ticket_event(
     Targets = {ticket's own ``submitter`` (captured at file time, see
     ``enqueue``'s ``submitter`` param)} UNION {this queue's ``subscribers``
     (``config.subscribers`` -- see ``wt subscribe``/``wt unsubscribe``)},
-    deduplicated so a target that is both gets exactly one send. Delivery
+    MINUS ``actor`` -- the identity that performed this transition.
+    Deduplicated so a target that is both gets exactly one send. Delivery
     reuses the exact path ``--report-to`` already uses: ``messages.send``
     (resolve + deliver, parking in the outbox on transient failure) -- this
     is intentionally the *only* place that talks to ``messages``/``config``
     for this purpose.
+
+    ``actor`` is one or more identity strings (worker id and/or session
+    UUID; see ``_actor_identities``). A session that files a ticket is its
+    own submitter, and a session that subscribes to a queue it also works
+    is its own subscriber -- so without this a worker got "[watchtower]
+    Q-1 claimed" for its own claim and "Q-1 closed" for its own close, i.e.
+    steered mid-turn by an echo of the command it just ran (same class as
+    WATCHTOWER-21's comment echo). Telling somebody what they just did is
+    never news. Notification of *other* people's transitions is unchanged.
+    Matching is by exact string, so an actor reached only under an unrelated
+    ``@agent`` alias is not recognised and still gets the echo.
 
     Called from ``claim_next``/``claim_by_ref``/``close``/``block`` -- the
     four choke points every state transition already funnels through for
@@ -964,10 +999,11 @@ def _notify_ticket_event(
         return
     targets: List[str] = []
     seen: set = set()
+    actors = _actor_identities(*(actor if isinstance(actor, (list, tuple, set)) else (actor,)))
 
     def _add(raw: Any) -> None:
         t = str(raw or "").strip()
-        if t and t not in seen:
+        if t and t not in seen and t not in actors:
             seen.add(t)
             targets.append(t)
 
@@ -1653,7 +1689,10 @@ def claim_next(
         )
         if item and not item.get("stop"):
             _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
-            _notify_ticket_event(item, "claimed")
+            _notify_ticket_event(
+                item, "claimed",
+                actor=(item.get("claimed_by"), item.get("claimed_session_id")),
+            )
         return item
 
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
@@ -1676,7 +1715,10 @@ def claim_next(
         _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
-    _notify_ticket_event(item, "claimed")
+    _notify_ticket_event(
+        item, "claimed",
+        actor=(item.get("claimed_by"), item.get("claimed_session_id")),
+    )
     return item
 
 
@@ -1698,7 +1740,10 @@ def claim_by_ref(
         item = backend.claim_by_ref(ref, session_id, session_uuid=session_uuid)
         if item:
             _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
-            _notify_ticket_event(item, "claimed")
+            _notify_ticket_event(
+                item, "claimed",
+                actor=(item.get("claimed_by"), item.get("claimed_session_id")),
+            )
         return item
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
     with _FileLock(_lock_path()):
@@ -1718,7 +1763,10 @@ def claim_by_ref(
         _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
-    _notify_ticket_event(item, "claimed")
+    _notify_ticket_event(
+        item, "claimed",
+        actor=(item.get("claimed_by"), item.get("claimed_session_id")),
+    )
     return item
 
 
@@ -2019,7 +2067,7 @@ def close(
         summary = res.get("summary", "") if isinstance(res, dict) else (
             res if isinstance(res, str) else ""
         )
-        _notify_ticket_event(item, "closed", detail=summary)
+        _notify_ticket_event(item, "closed", detail=summary, actor=session_id)
     return item
 
 
@@ -2219,7 +2267,9 @@ def block(
             ident, session_id=session_id, question=question, progress=progress,
         )
         if item:
-            _notify_ticket_event(item, "needs_input", detail=question)
+            _notify_ticket_event(
+                item, "needs_input", detail=question, actor=session_id,
+            )
         return item
     with _FileLock(_lock_path()):
         data = _load_unlocked()
@@ -2253,7 +2303,9 @@ def block(
                     f"{it.get('ref', '?')} — {_clip(question, 240)}",
                     queue=it.get("project", ""),
                 )
-                _notify_ticket_event(it, "needs_input", detail=question)
+                _notify_ticket_event(
+                    it, "needs_input", detail=question, actor=session_id,
+                )
                 return it
     return None
 
