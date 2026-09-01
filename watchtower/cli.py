@@ -1479,7 +1479,8 @@ def cmd_comment(args: argparse.Namespace) -> int:
         return 1
     delivery = ""
     target = item.get("claimed_session_id") or item.get("claimed_by")
-    if _comment_author_is_claimant(item, args):
+    live = item.get("status") == "in_progress" and target
+    if live and _comment_author_is_claimant(item, args):
         # Recorded on the ticket, but not echoed back at its own author.
         target = ""
         delivery = " — you are the claimant; not injected back at you"
