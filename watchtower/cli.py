@@ -1445,6 +1445,33 @@ def cmd_answer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _comment_author_is_claimant(item: Dict[str, Any], args: argparse.Namespace) -> bool:
+    """True when the caller of ``wt comment`` IS the ticket's claimant.
+
+    Claimant notify exists to tell a working session that somebody ELSE said
+    something on its ticket. Injecting a session's own comment back at it is
+    pure noise: the worker gets steered mid-turn by a message it just wrote
+    (WATCHTOWER-21, seen on BYMPURCH-14, where a Codex worker ran
+    ``wt comment`` and was immediately interrupted with its own text).
+
+    Identity comes from ``_caller_identity``, which reads the same
+    ``--worker`` flag and ``CODEX_THREAD_ID``/``CLAUDE_CODE_SESSION_ID`` env
+    the claim path records into ``claimed_by``/``claimed_session_id`` -- so a
+    hosted worker matches with no extra flag. Either half matching is enough:
+    a worker id is per-run and never shared between live processes, and the
+    session id is the harness's own. The ``_default_worker_id`` fallback
+    (``wt-cli-<ppid>``) can never collide with a real claimant, so a bare
+    terminal ``wt comment`` on somebody else's ticket still notifies.
+    """
+    worker, session = _caller_identity(args)
+    claimed_by = str(item.get("claimed_by") or "").strip()
+    claimed_session = str(item.get("claimed_session_id") or "").strip()
+    return bool(
+        (worker and worker == claimed_by)
+        or (session and session == claimed_session)
+    )
+
+
 def cmd_comment(args: argparse.Namespace) -> int:
     item = q.comment(args.ref, args.text, by=args.by, session_id=args.worker)
     if not item:
@@ -1452,6 +1479,10 @@ def cmd_comment(args: argparse.Namespace) -> int:
         return 1
     delivery = ""
     target = item.get("claimed_session_id") or item.get("claimed_by")
+    if _comment_author_is_claimant(item, args):
+        # Recorded on the ticket, but not echoed back at its own author.
+        target = ""
+        delivery = " — you are the claimant; not injected back at you"
     if item.get("status") == "in_progress" and target:
         from . import messages
 

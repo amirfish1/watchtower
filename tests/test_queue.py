@@ -152,6 +152,65 @@ def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsy
     assert "injected into claimed worker via fifo" in capsys.readouterr().out
 
 
+def test_cli_comment_by_claimant_is_not_echoed_back(wt, monkeypatch, capsys):
+    """A session's own comment must not be steered back into that session
+    (WATCHTOWER-21). Matches on either the worker id or the harness session id."""
+    import watchtower.messages as messages
+
+    monkeypatch.setattr(
+        messages,
+        "send",
+        lambda *a, **kw: pytest.fail("author must not be injected with own comment"),
+    )
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+
+    by_worker = wt.q.enqueue(project="EVT", note="worker id match", source="test")
+    wt.q.claim_by_ref(by_worker["ref"], "worker-a")
+    assert wt.cli.main(
+        ["comment", by_worker["ref"], "ready for gate", "--worker", "worker-a"]
+    ) == 0
+    assert "not injected back at you" in capsys.readouterr().out
+
+    sid = "11111111-2222-3333-4444-555555555555"
+    by_session = wt.q.enqueue(project="EVT", note="session id match", source="test")
+    wt.q.claim_by_ref(by_session["ref"], "worker-b", session_uuid=sid)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+    assert wt.cli.main(["comment", by_session["ref"], "ready for gate"]) == 0
+    assert "not injected back at you" in capsys.readouterr().out
+
+    # The comment is still durably recorded — only the echo is suppressed.
+    events = [e for e in wt.q.get(by_session["ref"])["history"]
+              if e.get("event") == "comment"]
+    assert [e["text"] for e in events] == ["ready for gate"]
+
+
+def test_cli_comment_from_another_session_still_injects(wt, monkeypatch, capsys):
+    """The guard is author-scoped: a coordinator commenting on someone else's
+    claimed ticket must still reach the worker."""
+    item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
+    sid = "11111111-2222-3333-4444-555555555555"
+    claimed = wt.q.claim_by_ref(item["ref"], "worker-a", session_uuid=sid)
+    calls = []
+
+    import watchtower.messages as messages
+
+    monkeypatch.setattr(
+        messages,
+        "send",
+        lambda target, text, **kwargs: calls.append(target)
+        or {"ok": True, "transport": "fifo"},
+    )
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID",
+                       "99999999-8888-7777-6666-555555555555")
+
+    assert wt.cli.main(
+        ["comment", claimed["ref"], "Use the safer parser.", "--worker", "coordinator"]
+    ) == 0
+    assert calls == [sid]
+    assert "injected into claimed worker via fifo" in capsys.readouterr().out
+
+
 def test_cli_comment_on_unclaimed_ticket_does_not_send(wt, monkeypatch, capsys):
     item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
 
