@@ -443,6 +443,42 @@ def test_delegate_ok_false_body_is_failure(wt, delegate, monkeypatch):
     assert res["ok"] is False and res.get("queued") is False
 
 
+def test_delegate_inject_waits_longer_than_a_codex_steer_takes(wt, delegate, monkeypatch):
+    """The 5s ceiling made a slow-but-successful delivery look failed.
+
+    CCC answers /api/inject-input when the delivery completes, and a steer
+    that aborts a Codex turn to insert a long comment takes longer than that.
+    wt then parked the message in its outbox and retried with backoff, and
+    every retry delivered the same text again (observed 2026-09-01: five
+    copies of one gate comment into a single Codex session in nine minutes).
+    """
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    _disable_resume(wt, monkeypatch)
+    seen = {}
+    real_post = wt.messages._post_json
+
+    def _spy(url_, payload, timeout_s):
+        seen["timeout_s"] = timeout_s
+        return real_post(url_, payload, timeout_s)
+
+    monkeypatch.setattr(wt.messages, "_post_json", _spy)
+    assert wt.messages.send(SID_B, "slow steer", mode="steer")["ok"] is True
+    assert seen["timeout_s"] == 30.0
+
+
+def test_delegate_timeout_env_overrides_the_default(wt, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_TIMEOUT_S", "7.5")
+    assert wt.messages._delegate_timeout_s() == 7.5
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "0", "-1", "not-a-number"])
+def test_delegate_timeout_falls_back_on_unusable_env(wt, monkeypatch, raw):
+    """A zero, negative or unparseable value must not mean "give up instantly"."""
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_TIMEOUT_S", raw)
+    assert wt.messages._delegate_timeout_s() == 30.0
+
+
 def test_no_delegate_is_a_working_configuration(wt, monkeypatch):
     """WT standalone: DELEGATE_URL=off means no delegate, and send still works
     end to end via the native fifo path."""

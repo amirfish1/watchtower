@@ -1031,6 +1031,34 @@ def reap_resume_children(now: Optional[float] = None) -> Dict[str, Any]:
     return {"reaped": reaped, "cleared": cleared, "kept_count": len(remaining)}
 
 
+def _delegate_timeout_s() -> float:
+    """How long to wait for the delegate's inject reply.
+
+    Generous on purpose. CCC answers /api/inject-input when the delivery
+    completes, and a steer that aborts a Codex turn to insert a long comment
+    routinely takes more than a few seconds. The old 5s ceiling turned those
+    into false failures: the message HAD landed, but wt recorded the send as
+    failed, parked it in the outbox and retried with backoff -- delivering the
+    same text again on every retry. Observed 2026-09-01: one gate comment
+    injected into a single Codex session five times over nine minutes, each
+    copy burning a full 220k-token turn.
+
+    Waiting costs latency on a blocking `wt send` (and on the notification
+    `queue.close` fires per target); a wrong "failed" costs duplicate
+    deliveries, which is the more expensive of the two. $WATCHTOWER_DELEGATE_
+    TIMEOUT_S overrides for anyone who wants the old behaviour back.
+    """
+    raw = (os.environ.get("WATCHTOWER_DELEGATE_TIMEOUT_S") or "").strip()
+    if raw:
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = 0.0
+        if parsed > 0:
+            return parsed
+    return 30.0
+
+
 def _post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str, Any]:
     """POST JSON, return the parsed JSON response. Raises on transport/HTTP
     errors (urlopen raises HTTPError for any non-2xx status)."""
@@ -1380,7 +1408,7 @@ def _deliver_delegate(
         data = _post_json(
             base + "/api/inject-input",
             _delegate_payload(sid, text, mode, force_queue),
-            timeout_s=5,
+            timeout_s=_delegate_timeout_s(),
         )
     except Exception as e:  # noqa: BLE001 - any transport failure means fall through
         return {"ok": False, "error": f"delegate: {e}"}
