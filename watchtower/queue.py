@@ -1582,6 +1582,15 @@ def claim_next(
     # The claim boundary is the only place that can catch it, so resolve what
     # this worker still holds before anything else decides what to hand it.
     held = worker_active_claims(session_id, project)
+    if held:
+        # On a GitHub-backed queue the list above can be a stale snapshot:
+        # the worker's own `wt close` invalidates only ITS process's caches,
+        # while the poller's in-process copy (plus fetch caps / quota guards)
+        # can re-persist the pre-close listing seconds later -- the ticket
+        # then reads closed in `wt find` but this guard still refuses the
+        # next claim on it (OPS-854). Re-read each held ticket directly
+        # (a strict single-issue read) and trust that over the snapshot.
+        held = _reverify_held_claims(held)
 
     try:
         from . import workers as _workers
@@ -1858,6 +1867,7 @@ def update_status(
             resolution=resolution,
             reason=reason,
             expect_owner=expect_owner,
+            require_status=require_status,
         )
         if item:
             verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
@@ -2382,6 +2392,34 @@ def worker_active_claims(
         it for it in list_active_claims(project)
         if str(it.get("claimed_by") or "") == sid
     ]
+
+
+def _reverify_held_claims(claims: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Re-read each allegedly-held ticket and keep only those still held.
+
+    ``claim_next``'s one-ticket-at-a-time guard builds its ``held`` list from
+    a list snapshot, which on a GitHub-backed queue can lag the worker's own
+    close by up to minutes (persisted list cache re-seeded from the poller's
+    stale in-process copy; OPS-854). A direct per-ticket ``get`` is a strict
+    read (a single ``gh issue view``), so it always reflects the close the
+    worker just made. A ticket whose fresh read fails (GitHub hiccup) is kept
+    as held: refusing one claim is recoverable, double-staffing is not. For
+    the file backend ``get`` reads the same store the snapshot came from, so
+    this is a cheap no-op confirmation there.
+    """
+    verified: List[Dict[str, Any]] = []
+    for it in claims:
+        ref = it.get("ref")
+        try:
+            current = get(ref) if ref else None
+        except Exception:
+            current = None
+        if current is None:
+            verified.append(it)  # unreadable: trust the snapshot
+            continue
+        if current.get("status") == "in_progress" and not current.get("needs_input"):
+            verified.append(current)
+    return verified
 
 
 def next_item(

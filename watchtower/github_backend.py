@@ -1751,6 +1751,7 @@ class GitHubIssuesBackend:
         resolution: Any = None,
         reason: str = "",
         expect_owner: str = "",
+        require_status: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         if status not in ("open", "in_progress", "closed"):
             raise ValueError("status must be one of ('open', 'in_progress', 'closed')")
@@ -1759,6 +1760,15 @@ class GitHubIssuesBackend:
 
         item = self.get(ident)
         if item is None:
+            return None
+        # Compare-and-swap guard, same contract as the local backend's
+        # `require_status` (queue.update_status): a caller acting on a stale
+        # snapshot must not clobber a state that moved since. This is what
+        # stops `wt release` from REOPENING a ticket that was already closed
+        # (OPS-854: release's require_status="in_progress" was silently
+        # dropped at the backend boundary, so `gh issue reopen` ran on a
+        # closed ticket and the worker had to close it twice).
+        if require_status is not None and item.get("status") != require_status:
             return None
         # No queue-label guard on close: the label admitted nothing to begin
         # with, and refusing to close an issue a worker just finished because

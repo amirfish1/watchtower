@@ -2802,3 +2802,105 @@ def test_rate_limit_hold_is_clamped_between_the_min_and_max(monkeypatch):
         github_backend._rate_limit_hold_seconds()
         == github_backend._GH_RATE_LIMIT_MIN_HOLD_S
     )
+
+
+def test_github_release_refuses_to_reopen_a_closed_ticket(tmp_path, monkeypatch):
+    """OPS-854: `wt release` on a GitHub-backed ticket must honor the same
+    require_status="in_progress" compare-and-swap the local backend has.
+    The guard was silently dropped at the backend boundary, so releasing a
+    ticket that was already closed ran `gh issue reopen` on it -- and the
+    worker, told its close hadn't stuck, closed the ticket a second time
+    (BECKY-1141)."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    item = q.enqueue(project="GHI", note="released after close", source="test")
+    claimed = q.claim_next("worker-1", project="GHI")
+    assert claimed["ref"] == item["ref"]
+    closed = q.close(item["ref"], "worker-1", resolution={"summary": "done"})
+    assert closed["status"] == "closed"
+
+    # A release racing the close (or retrying after it) must be a no-op,
+    # not a reopen.
+    assert q.release(item["ref"], session_id="worker-1") is None
+    assert q.get(item["ref"])["status"] == "closed"
+    gh_state = json.loads(state.read_text())
+    assert gh_state["issues"][0]["state"] == "CLOSED"
+    assert not any(
+        cmd[:2] == ["issue", "reopen"] for cmd in gh_state["commands"]
+    )
+
+    # Releasing a genuinely in-progress claim still works.
+    item2 = q.enqueue(project="GHI", note="real release", source="test")
+    claimed2 = q.claim_next("worker-1", project="GHI")
+    assert claimed2["ref"] == item2["ref"]
+    released = q.release(item2["ref"], session_id="worker-1")
+    assert released is not None
+    assert released["status"] == "open"
+    assert q.get(item2["ref"])["status"] == "open"
+
+
+def test_claim_guard_reverifies_a_stale_held_listing(tmp_path, monkeypatch):
+    """OPS-854: after `wt close`, a GitHub queue's list snapshot can keep
+    showing the just-closed ticket as in_progress for minutes (the poller's
+    in-process cache survives the close's invalidation and re-persists the
+    pre-close listing). The one-ticket-at-a-time guard must re-read each
+    held ticket directly before refusing the worker's next claim."""
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    first = q.enqueue(project="GHI", note="closed by this worker", source="test")
+    second = q.enqueue(project="GHI", note="next ticket", source="test")
+    claimed = q.claim_next("worker-1", project="GHI")
+    assert claimed["ref"] == first["ref"]
+    stale_snapshot = dict(claimed)  # in_progress, claimed_by worker-1
+    closed = q.close(first["ref"], "worker-1", resolution={"summary": "done"})
+    assert closed["status"] == "closed"
+
+    import watchtower.github_backend as github_backend
+
+    orig_list_items = github_backend.GitHubIssuesBackend.list_items
+
+    def stale_listing(self, *args, **kwargs):
+        items = orig_list_items(self, *args, **kwargs)
+        if kwargs.get("status") == "in_progress":
+            return [stale_snapshot] + [
+                it for it in items if it.get("ref") != first["ref"]
+            ]
+        return items
+
+    monkeypatch.setattr(
+        github_backend.GitHubIssuesBackend, "list_items", stale_listing
+    )
+
+    # The stale listing alone would refuse with "you still hold GHI-1"; the
+    # direct re-read sees the close and the claim proceeds to GHI-2.
+    nxt = q.claim_next("worker-1", project="GHI")
+    assert nxt is not None
+    assert nxt["ref"] == second["ref"]
+    assert nxt["claimed_by"] == "worker-1"
+
+
+def test_claim_guard_still_refuses_a_genuinely_held_ticket(tmp_path, monkeypatch):
+    """The re-verification must not weaken the WATCHTOWER-20 guard: a ticket
+    that is still genuinely in_progress under this worker still refuses the
+    next claim."""
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    first = q.enqueue(project="GHI", note="still being worked", source="test")
+    q.enqueue(project="GHI", note="next ticket", source="test")
+    claimed = q.claim_next("worker-1", project="GHI")
+    assert claimed["ref"] == first["ref"]
+
+    with pytest.raises(ValueError, match=r"claim refused: you still hold GHI-1"):
+        q.claim_next("worker-1", project="GHI")
