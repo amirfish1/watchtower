@@ -1608,6 +1608,62 @@ def test_refresh_persisted_list_cache_writes_file_from_live_fetch(
     assert backend._list_issues() == [open_issue]
 
 
+def test_poller_refetches_after_another_process_invalidates_snapshot(
+    tmp_path, monkeypatch
+):
+    """A completed write must not let the poller republish its old snapshot.
+
+    ``wt close`` runs in a short-lived worker process, so it invalidates the
+    persisted cache while the daemon poller keeps its pre-close result in
+    memory.  A changed ETag normally observes the fetch cap, but an absent
+    persisted entry is an explicit invalidation and must win over that cap.
+    """
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 60.0)
+    github_backend._LIST_CACHE.clear()
+
+    repo = "acme/invalidate-poller-test"
+    stale = {
+        "number": 1, "title": "still open", "body": "", "state": "OPEN",
+        "url": f"https://github.com/{repo}/issues/1",
+        "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
+        "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
+    }
+    live = {**stale, "title": "closed elsewhere", "state": "CLOSED",
+            "closedAt": "2026-07-01T00:01:00Z"}
+    now = time.time()
+    for state in ("open", "closed"):
+        github_backend._LIST_CACHE[f"{repo}:{state}"] = {
+            "at": now, "data": [stale], "error": None, "etag": '"old"',
+            "fetched_at": now,
+        }
+
+    calls = []
+
+    def fake_run(self, args, *, check=True):
+        state = args[args.index("--state") + 1]
+        calls.append(state)
+        return json.dumps([] if state == "open" else [live])
+
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_run", fake_run)
+    monkeypatch.setattr(
+        github_backend.GitHubIssuesBackend, "_run_raw", lambda self, args: _ok(etag="new")
+    )
+
+    # Simulate the worker process removing the shared snapshot after its close.
+    github_backend._rewrite_persisted_list_cache(lambda data: False)
+    github_backend.refresh_persisted_list_cache(repo)
+
+    persisted = github_backend._read_persisted_list_cache()
+    assert calls == ["open", "closed"]
+    assert persisted[f"{repo}:open"]["data"] == []
+    assert persisted[f"{repo}:closed"]["data"] == [live]
+
+
 def test_local_write_invalidates_list_cache_for_read_your_own_writes(
     tmp_path, monkeypatch
 ):

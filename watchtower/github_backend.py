@@ -222,6 +222,14 @@ def refresh_persisted_list_cache(repo: str) -> None:
     inst = GitHubIssuesBackend(repo, repo=repo)
     for state in ("open", "closed"):
         key = f"{repo}:{state}"
+        # A worker's successful mutation invalidates this shared entry from a
+        # different process.  The daemon poller can still retain its old
+        # snapshot in memory, where a changed ETag would otherwise be held by
+        # the normal heavy-fetch cap and then re-persisted as current.  A
+        # missing shared entry is an explicit invalidation, so discard the
+        # poller's private copy and fetch the authoritative replacement.
+        if key not in _read_persisted_list_cache():
+            _LIST_CACHE.pop(key, None)
         try:
             inst._list_issues(state, fresh=True)
         except GitHubBackendError:
