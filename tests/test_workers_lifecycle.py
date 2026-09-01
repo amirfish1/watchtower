@@ -1690,6 +1690,11 @@ def test_notify_fifoless_worker_falls_back_to_adapter_chain(wt, monkeypatch):
     # stale one is noise -- the next reconcile tick makes a fresh one.
     assert kw["verb"] == "steer"
     assert kw["expire"] == 30
+    # notify_workers is called synchronously from dispatch_after_enqueue, so
+    # this wait is on the `wt add` path: it must not inherit the generous
+    # global delegate timeout, once per fifo-less worker on the queue.
+    assert kw["delegate_timeout_s"] == wt.workers._NUDGE_DELEGATE_TIMEOUT_S
+    assert wt.workers._NUDGE_DELEGATE_TIMEOUT_S < wt.messages._delegate_timeout_s()
 
 
 def test_notify_fifoless_worker_failure_is_not_counted(wt, monkeypatch):

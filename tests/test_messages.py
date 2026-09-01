@@ -479,6 +479,66 @@ def test_delegate_timeout_falls_back_on_unusable_env(wt, monkeypatch, raw):
     assert wt.messages._delegate_timeout_s() == 30.0
 
 
+def test_per_call_delegate_timeout_beats_the_env_override(wt, monkeypatch):
+    """An explicit ceiling wins: the caller has a budget the global cannot see."""
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_TIMEOUT_S", "45")
+    assert wt.messages._delegate_timeout_s(5.0) == 5.0
+    assert wt.messages._delegate_timeout_s() == 45.0
+
+
+@pytest.mark.parametrize("override", [0, -1, "not-a-number", None])
+def test_per_call_delegate_timeout_ignores_unusable_values(wt, monkeypatch, override):
+    """A junk override must fall back, never mean "give up instantly"."""
+    monkeypatch.delenv("WATCHTOWER_DELEGATE_TIMEOUT_S", raising=False)
+    assert wt.messages._delegate_timeout_s(override) == 30.0
+
+
+def test_deliver_message_threads_its_timeout_down_to_the_delegate_post(
+    wt, delegate, monkeypatch
+):
+    """WATCHTOWER-14 follow-up: the ceiling has to survive the whole chain.
+
+    deliver_message -> send -> deliver -> _deliver_unreceipted ->
+    _deliver_delegate is four hops, and a drop at any one of them silently
+    restores the 30s global on a call site that cannot afford it.
+    """
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    _disable_resume(wt, monkeypatch)
+    seen = {}
+    real_post = wt.messages._post_json
+
+    def _spy(url_, payload, timeout_s):
+        seen["timeout_s"] = timeout_s
+        return real_post(url_, payload, timeout_s)
+
+    monkeypatch.setattr(wt.messages, "_post_json", _spy)
+    res = wt.messages.deliver_message(
+        SID_B, "bounded nudge", verb="steer", delegate_timeout_s=5.0,
+    )
+    assert res["ok"] is True
+    assert seen["timeout_s"] == 5.0
+
+
+def test_deliver_message_without_a_timeout_keeps_the_generous_default(
+    wt, delegate, monkeypatch
+):
+    """Ordinary callers must not inherit the nudge's tight budget."""
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    _disable_resume(wt, monkeypatch)
+    seen = {}
+    real_post = wt.messages._post_json
+
+    def _spy(url_, payload, timeout_s):
+        seen["timeout_s"] = timeout_s
+        return real_post(url_, payload, timeout_s)
+
+    monkeypatch.setattr(wt.messages, "_post_json", _spy)
+    assert wt.messages.deliver_message(SID_B, "normal", verb="steer")["ok"] is True
+    assert seen["timeout_s"] == 30.0
+
+
 def test_no_delegate_is_a_working_configuration(wt, monkeypatch):
     """WT standalone: DELEGATE_URL=off means no delegate, and send still works
     end to end via the native fifo path."""

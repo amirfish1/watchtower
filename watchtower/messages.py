@@ -1031,7 +1031,7 @@ def reap_resume_children(now: Optional[float] = None) -> Dict[str, Any]:
     return {"reaped": reaped, "cleared": cleared, "kept_count": len(remaining)}
 
 
-def _delegate_timeout_s() -> float:
+def _delegate_timeout_s(override: Optional[float] = None) -> float:
     """How long to wait for the delegate's inject reply.
 
     Generous on purpose. CCC answers /api/inject-input when the delivery
@@ -1047,7 +1047,20 @@ def _delegate_timeout_s() -> float:
     `queue.close` fires per target); a wrong "failed" costs duplicate
     deliveries, which is the more expensive of the two. $WATCHTOWER_DELEGATE_
     TIMEOUT_S overrides for anyone who wants the old behaviour back.
+
+    ``override`` is an explicit per-call ceiling and beats both the env var
+    and the default. A caller passes one when it has a hard latency budget --
+    the ``notify_workers`` nudge runs synchronously inside ``wt add``, so
+    honouring a larger global there would block ticket creation on a delivery
+    whose documented miss is "the next reconcile tick picks it up."
     """
+    if override is not None:
+        try:
+            parsed = float(override)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        if parsed > 0:
+            return parsed
     raw = (os.environ.get("WATCHTOWER_DELEGATE_TIMEOUT_S") or "").strip()
     if raw:
         try:
@@ -1395,7 +1408,8 @@ def _delegate_payload(
 
 
 def _deliver_delegate(
-    resolved: Dict[str, Any], text: str, mode: str, *, force_queue: bool = False
+    resolved: Dict[str, Any], text: str, mode: str, *,
+    force_queue: bool = False, delegate_timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Adapter 3 (optional, last): hand delivery to a configured delegate."""
     base = _delegate_base()
@@ -1408,7 +1422,7 @@ def _deliver_delegate(
         data = _post_json(
             base + "/api/inject-input",
             _delegate_payload(sid, text, mode, force_queue),
-            timeout_s=_delegate_timeout_s(),
+            timeout_s=_delegate_timeout_s(delegate_timeout_s),
         )
     except Exception as e:  # noqa: BLE001 - any transport failure means fall through
         return {"ok": False, "error": f"delegate: {e}"}
@@ -1420,6 +1434,7 @@ def _deliver_delegate(
 def deliver(
     resolved: Dict[str, Any], text: str, mode: str = "send",
     *, force_queue: bool = False, prefer_uds: bool = False,
+    delegate_timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Try each adapter in order.
 
@@ -1436,6 +1451,7 @@ def deliver(
     carries ``receipt_id``."""
     result = _deliver_unreceipted(
         resolved, text, mode, force_queue=force_queue, prefer_uds=prefer_uds,
+        delegate_timeout_s=delegate_timeout_s,
     )
     sid = str(resolved.get("session_id") or "")
     if result.get("ok") and sid:
@@ -1491,6 +1507,7 @@ def _deliver_uds(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
 def _deliver_unreceipted(
     resolved: Dict[str, Any], text: str, mode: str = "send",
     *, force_queue: bool = False, prefer_uds: bool = False,
+    delegate_timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     errors: List[str] = []
     busy = False
@@ -1521,7 +1538,10 @@ def _deliver_unreceipted(
         and _delegate_base()
     ):
         delegate_tried = True
-        r = _deliver_delegate(resolved, text, mode, force_queue=force_queue)
+        r = _deliver_delegate(
+            resolved, text, mode, force_queue=force_queue,
+            delegate_timeout_s=delegate_timeout_s,
+        )
         if r.get("ok"):
             return r
         errors.append(f"delegate: {r.get('error', 'failed')}")
@@ -1542,7 +1562,10 @@ def _deliver_unreceipted(
             return r
         errors.append(f"antigravity: {r.get('error', 'failed')}")
     if not delegate_tried:
-        r = _deliver_delegate(resolved, text, mode, force_queue=force_queue)
+        r = _deliver_delegate(
+            resolved, text, mode, force_queue=force_queue,
+            delegate_timeout_s=delegate_timeout_s,
+        )
         if r.get("ok"):
             return r
         errors.append(f"delegate: {r.get('error', 'failed')}")
@@ -1768,6 +1791,7 @@ def send(
     engine: str = "",
     force_queue: bool = False,
     prefer_uds: bool = False,
+    delegate_timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
@@ -1788,6 +1812,8 @@ def send(
     extra = {"force_queue": True} if force_queue else {}
     if prefer_uds:
         extra["prefer_uds"] = True
+    if delegate_timeout_s is not None:
+        extra["delegate_timeout_s"] = delegate_timeout_s
     result = deliver(resolved, text, mode, **extra)
     if result.get("ok"):
         out = {"ok": True, "transport": result.get("transport", "?")}
@@ -1918,6 +1944,7 @@ def deliver_message(
     abort_first: bool = False,
     timeout_ms: int = 30000,
     engine: str = "",
+    delegate_timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """One delivery entry point for every WT caller (CCC-1000 Phase 3).
 
@@ -1935,6 +1962,11 @@ def deliver_message(
     Verbs: ``engine_default`` (whatever the engine natively does -- the safe
     default), ``queue`` (after the turn ends), ``steer`` (at the next safe
     seam), ``abort`` (control: interrupt, deliver nothing).
+
+    ``delegate_timeout_s`` caps how long the delegate adapter may block for
+    this one call, overriding the (deliberately generous) global. Pass it when
+    the call sits on a synchronous path and a slow delegate would be worse
+    than no delivery at all.
 
     ``on_busy`` picks what happens when nothing can take the message now:
     ``hold`` parks it in the outbox for the daemon to retry (optionally with
@@ -1954,6 +1986,9 @@ def deliver_message(
     if await_reply:
         # ask() owns the reply-correlation protocol; nothing else here does.
         return ask(target, text, timeout_ms=timeout_ms)
+    send_kwargs: Dict[str, Any] = {}
+    if delegate_timeout_s is not None:
+        send_kwargs["delegate_timeout_s"] = delegate_timeout_s
     result = send(
         target,
         text,
@@ -1963,6 +1998,7 @@ def deliver_message(
         engine=engine,
         force_queue=(verb == "queue" or position == "front"),
         prefer_uds=(verb == "steer"),
+        **send_kwargs,
     )
     if not result.get("ok") and on_busy == "drop":
         return {"ok": False, "dropped": True,

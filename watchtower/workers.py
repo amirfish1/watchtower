@@ -893,6 +893,7 @@ def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) ->
             from . import messages
             if messages.deliver_message(
                 target, text, verb="steer", expire=30,
+                delegate_timeout_s=_NUDGE_DELEGATE_TIMEOUT_S,
             ).get("ok"):
                 n += 1
         except Exception:  # noqa: BLE001 - a nudge must never break reconcile
@@ -908,6 +909,17 @@ def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) ->
         except Exception:
             pass
     return n
+
+
+# Hard ceiling on how long the fifo-less fallback in notify_workers may wait
+# for the delegate. The global delegate timeout is 30s on purpose (a false
+# "failed" costs duplicate deliveries, which is worse than waiting), but this
+# call site is different: notify_workers runs synchronously inside
+# dispatch_after_enqueue, so every `wt add` and every dashboard ticket-create
+# blocks on it, once per fifo-less worker on the queue. The nudge is a pure
+# latency optimization whose miss is well-defined -- the reconcile tick picks
+# the ticket up anyway -- so waiting 30s to maybe save 30s is a losing trade.
+_NUDGE_DELEGATE_TIMEOUT_S = 5.0
 
 
 # Cooldown between stuck-queue nudges to the same queue. A queue's `stuck`
