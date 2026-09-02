@@ -1,6 +1,9 @@
 """Product gate (2026-09-01 design): block kinds, the needs-rationale icebox,
 pre-ack, gate ack/nack, and the close guard."""
 import json
+import threading
+import urllib.error
+import urllib.request
 
 import pytest
 
@@ -231,6 +234,66 @@ def test_run_once_goal_carries_gate_contract_only_when_gated(wt_env):
     assert "--kind rationale" in gated_goal
     wt_env.config.set_product_gate(QUEUE, False)
     assert "PRODUCT GATE" not in workers.run_once_goal(QUEUE, "w1", f"{QUEUE}-1", repo_path="/tmp/x")
+
+
+# --------------------------------------------------------------- dashboard
+
+class _DashboardClient:
+    def __init__(self, base_url):
+        self.base_url = base_url
+
+    def get(self, path):
+        req = urllib.request.Request(f"{self.base_url}{path}")
+        with urllib.request.urlopen(req) as resp:
+            return resp.read().decode()
+
+    def post_json(self, path, body):
+        req = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return json.load(resp)
+        except urllib.error.HTTPError as exc:
+            return json.load(exc)
+
+
+@pytest.fixture
+def dashboard_client(wt_env):
+    from watchtower import dashboard
+    srv = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_address[1]}"
+    try:
+        yield _DashboardClient(base)
+    finally:
+        srv.shutdown()
+
+
+def test_dashboard_gate_ack_endpoint(wt_env, dashboard_client):
+    it = _gated_pitch(wt_env)
+    resp = dashboard_client.post_json(
+        f"/api/ticket/{it['ref']}/gate-ack", {"comment": "go"})
+    assert resp["ok"] is True
+    assert wt_env.queue.get(it["ref"])["product_ack"]["comment"] == "go"
+
+
+def test_dashboard_gate_nack_endpoint(wt_env, dashboard_client):
+    it = _gated_pitch(wt_env)
+    resp = dashboard_client.post_json(
+        f"/api/ticket/{it['ref']}/gate-nack", {"reason": "not now"})
+    assert resp["ok"] is True
+    assert wt_env.queue.get(it["ref"])["readiness"] == "needs-rationale"
+
+
+def test_queue_page_renders_gate_actions(wt_env, dashboard_client):
+    it = _gated_pitch(wt_env)
+    html_out = dashboard_client.get(f"/q/{QUEUE}")
+    assert "wtGateAck" in html_out and "wtGateNack" in html_out
+
 
 
 

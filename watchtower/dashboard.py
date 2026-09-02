@@ -334,6 +334,7 @@ _STYLE = """
     .tstatus { font-size: 12px; }
     .tstatus.open { color: var(--muted); }
     .tstatus.in_progress { color: var(--calm); }
+    .tstatus.gated { color: var(--warn); }
     .tworker { font-size: 12px; color: var(--muted); overflow: hidden;
                text-overflow: ellipsis; }
     .ttitle { font-size: 13.5px; color: var(--ink); }
@@ -350,6 +351,12 @@ _STYLE = """
       cursor: pointer;
     }
     .run-btn:hover { border-color: var(--beam); }
+    .run-btn.warn {
+      border-color: rgba(255,176,32,.35);
+      background: rgba(255,176,32,.12);
+      color: var(--warn);
+    }
+    .run-btn.warn:hover { border-color: var(--warn); }
     .run-spacer { min-width: 1px; min-height: 1px; }
 
     /* ---- closed tickets + resolution ---- */
@@ -1071,6 +1078,28 @@ _QUEUE_SCRIPT = (
     "      }\n"
     "      location.reload();\n"
     "    }\n"
+    "    function wtGateAck(ref) { wtGatePost(ref, 'gate-ack', {comment: ''}); }\n"
+    "    function wtGateAckC(ref) {\n"
+    "      const c = prompt('Ack with comment — steering note for the worker:');\n"
+    "      if (c === null) return;\n"
+    "      wtGatePost(ref, 'gate-ack', {comment: c});\n"
+    "    }\n"
+    "    function wtGateNack(ref) {\n"
+    "      const r = prompt('Nack — WHY is this not being built? (required)');\n"
+    "      if (!r) return;\n"
+    "      const close = confirm('OK = icebox (not now).\\nCancel then re-Nack with --close in the CLI for \"not ever\".\\n\\nIcebox this ticket?');\n"
+    "      if (!close) return;\n"
+    "      wtGatePost(ref, 'gate-nack', {reason: r, close: false});\n"
+    "    }\n"
+    "    function wtGatePost(ref, verb, body) {\n"
+    "      fetch('/api/ticket/' + encodeURIComponent(ref) + '/' + verb, {\n"
+    "        method: 'POST', headers: {'Content-Type': 'application/json'},\n"
+    "        body: JSON.stringify(body),\n"
+    "      }).then(r => r.json()).then(d => {\n"
+    "        if (!d.ok) alert(d.error || 'failed');\n"
+    "        location.reload();\n"
+    "      });\n"
+    "    }\n"
     "    </script>\n"
 )
 
@@ -1126,24 +1155,29 @@ def render_queue(
     for it in tickets:
         ref = html.escape(str(it.get("ref", "")))
         status = str(it.get("status", ""))
+        gated = bool(it.get("needs_input")) and it.get("block_kind") == "rationale"
         worker = html.escape(
             str(it.get("claimed_by") or it.get("claimed_session_id") or "—")[:28]
         )
         title = html.escape(str(it.get("title") or it.get("note") or "")[:120])
         action = '<span class="run-spacer"></span>'
-        # Shown on any open ticket that hasn't been asked to run yet. The old
-        # condition ("missing the queue label") is gone with the whitelist:
-        # every open ticket is now a candidate, so the button's job is to
-        # request a run, not to admit the ticket.
-        if status == "open" and not it.get("run_requested", False):
+        if gated:
+            action = (
+                f'<button class="run-btn" onclick="wtGateAck(\'{ref}\')">Ack</button>'
+                f'<button class="run-btn" onclick="wtGateAckC(\'{ref}\')">Ack+</button>'
+                f'<button class="run-btn warn" onclick="wtGateNack(\'{ref}\')">Nack</button>'
+            )
+        elif status == "open" and not it.get("run_requested", False):
             action = (
                 f'<button class="run-btn" title="Run this ticket" '
                 f'onclick="wtRun(\'{ref}\')">Run</button>'
             )
+        status_class = "gated" if gated else status
+        status_text = "awaiting decision" if gated else status
         trows.append(
             f'      <div class="trow">\n'
             f'        <span class="tref mono">{ref}</span>\n'
-            f'        <span class="tstatus {status} mono">{html.escape(status)}</span>\n'
+            f'        <span class="tstatus {status_class} mono">{html.escape(status_text)}</span>\n'
             f'        <span class="tworker mono">{worker}</span>\n'
             f'        <span class="ttitle">{title}</span>\n'
             f'        {action}\n'
@@ -1409,6 +1443,47 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(500, {"error": str(exc)})
                 return
             self._json(200, {"ok": True, "ticket": item, "dispatch": reason})
+            return
+        # POST /api/ticket/<ref>/gate-ack  {"comment": str}
+        # POST /api/ticket/<ref>/gate-nack {"reason": str, "close": bool}
+        # Note: the dashboard gate-ack does NOT deliver the go-signal to the
+        # worker session (that path needs the messages layer; CCC and the CLI own
+        # delivery) — after a dashboard Ack the ticket simply shows unblocked and
+        # the worker resumes on outbox/next claim.
+        if path.startswith("/api/ticket/") and (path.endswith("/gate-ack") or path.endswith("/gate-nack")):
+            if not _check_same_origin(self):
+                self._json(403, {"error": "cross-origin request rejected"})
+                return
+            if not _check_bearer_token(self):
+                self._json(401, {"error": "missing or invalid bearer token"})
+                return
+            is_ack = path.endswith("/gate-ack")
+            suffix = "/gate-ack" if is_ack else "/gate-nack"
+            ref = urllib.parse.unquote(path[len("/api/ticket/"):-len(suffix)])
+            data = self._read_json_body()
+            if not isinstance(data, dict):
+                self._json(400, {"ok": False, "error": "invalid JSON body"})
+                return
+            try:
+                if is_ack:
+                    item = q.gate_ack(ref, comment=str(data.get("comment") or ""), by="dashboard")
+                else:
+                    item = q.gate_nack(
+                        ref,
+                        reason=str(data.get("reason") or ""),
+                        by="dashboard",
+                        close=bool(data.get("close")),
+                    )
+            except ValueError as exc:
+                self._json(400, {"ok": False, "error": str(exc)})
+                return
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"ok": False, "error": str(exc)})
+                return
+            if item is None:
+                self._json(404, {"ok": False, "error": f"{ref} not found"})
+                return
+            self._json(200, {"ok": True, "item": item})
             return
         # POST /api/ticket/<ref>/ack: {"field", "index", "undo"} | {"all": true}
         # -> queue.ack_resolution. Dims a closed ticket's caveat/unresolved chip
