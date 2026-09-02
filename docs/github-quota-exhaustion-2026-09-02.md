@@ -328,3 +328,77 @@ gh api graphql -f query='{rateLimit{used remaining resetAt}}'   # free; sample e
 
 Target: idle burn comfortably under ~2,000 pts/hr, so that interactive
 `wt claim`/`wt close` always have headroom. Items 1–3 alone should get there.
+
+## Post-deploy measurement — fix 1 shipped (2026-09-02, 18:25–18:45Z)
+
+Fix 1 landed as `05fa957` and went live with
+`launchctl kickstart -k gui/501/ai.watchtower.watcher` (wt is an editable
+install, so the change is inert until the daemon is restarted — OPS-589).
+
+**Fix 1 did exactly what it claimed, and total burn did not move.** Both halves
+of that sentence are measured, and the second one is the useful finding.
+
+The call it targeted is gone. `gh issue view` over a 180-second process sample:
+
+| Window | `gh issue view` |
+|---|---|
+| Before (294 s, 17:08–17:13Z) | 53 |
+| After (180 s, 18:39–18:42Z) | 2 |
+
+Total burn over the same period, sampled every 60 s:
+
+| Window | Burn |
+|---|---|
+| Before (idle) | 5,383 pts/hr |
+| Before (active) | 6,550 pts/hr |
+| After (active, 10 samples) | **5,760 pts/hr** |
+
+Against an active-window baseline that is a real but small improvement, and the
+account still hit `used=5000 remaining=0` before the 18:53Z reset. Removing
+~1,800 pts/hr from a ~6,550 pts/hr active burn cannot by itself get under 5,000,
+and the composition of the remaining traffic had already shifted.
+
+### What is burning it now
+
+Distinct `gh` invocations, 180 s, with parent attribution:
+
+| Invocation | Count | GraphQL? |
+|---|---|---|
+| `gh api -i -H 'If-None-Match: ...'` | 118 | no — conditional REST, free |
+| `gh issue list` | 27 | **yes** |
+| `gh api rate_limit` | 18 | no — and it is the phantom counter (Part 1) |
+| `gh issue edit` | 9 | **yes**, and each one invalidates the cache |
+| `gh pr list` | 3 | yes |
+| `gh issue view` | 2 | yes |
+
+The ETag layer is working where it has an ETag: 118 conditional probes in three
+minutes cost nothing, and the repos holding a real ETag
+(`claude-command-center`, `stramp-platform`) were last fetched 2.6–44 hours ago.
+That is the read-cap design behaving exactly as `docs/github-read-caps.md`
+describes.
+
+### The residual is one repo, and it is fix 2
+
+`~/.watchtower/gh-list-cache.json`, read live during the sample:
+
+| Key | ETag | Age |
+|---|---|---|
+| `amirfish1/BYM-Finie:open` | **`""` (empty)** | 53 s |
+| `amirfish1/claude-command-center:open` | present | 2.6 h |
+| `amirfish1/claude-command-center:closed` | present | 3.6 h |
+| `amirfish1/stramp-platform:open` | present | 44 h |
+| `amirfish1/stramp-platform:closed` | present | 3.5 h |
+
+`BYM-Finie` — the one repo with live workers, and the source of the 9
+`gh issue edit` calls in the sample — is stuck in the ratchet described under
+"`97e2bd8` is the amplifier". Every mutation makes `_invalidate_list_cache`
+delete the persisted key; the next fetch takes the no-cache path, which stores
+`etag=""`; an empty ETag makes the following probe unconditional; that fetch
+mutates nothing but re-stores `etag=""`. The entry can never heal on its own,
+so this repo pays full price on every refresh, forever, at ~9 `gh issue list`
+per minute.
+
+Fix 1 was still worth shipping — it removed a genuinely uncapped path and it
+holds. But the number that has to move next is fix 2, and the empty-string ETag
+above is the single most direct evidence of it: the repo the fleet actually
+works in is the one repo the warm cache cannot keep.
