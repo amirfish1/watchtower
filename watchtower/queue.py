@@ -122,7 +122,7 @@ def effective_type(it_or_value: Any) -> str:
         raw = it_or_value
     s = str(raw or "").strip().lower()
     return s if s in ("bug", "feature") else DEFAULT_ITEM_TYPE
-VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "")
+VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "needs-rationale", "")
 # Readiness values claim_next() excludes by default (a worker gets these only
 # by passing shaping=True or an explicit readiness_filters whitelist). Single
 # source of truth shared by claim_next/peek_next/count_claimable below, the
@@ -131,7 +131,8 @@ VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "")
 # actually claim and what the reconciler thinks is spawn-worthy (see WT's
 # SPAWN/REAP churn bug: needs-spec tickets counted as claimable depth even
 # though claim_next would never hand them to a default worker).
-UNCLAIMABLE_READINESS = ("needs-shaping", "needs-spec")
+# needs-rationale is the product-gate icebox (a human Nacked; revival needs a new rationale — see the 2026-09-01 design).
+UNCLAIMABLE_READINESS = ("needs-shaping", "needs-spec", "needs-rationale")
 VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
 VALID_VALUES = ("H", "M", "L", "")
 VALID_CONFIDENCES = ("H", "M", "L", "")
@@ -795,7 +796,7 @@ def _timeline_event(raw: Dict[str, Any], default_at: str = "") -> Optional[Dict[
 
 _EVENT_PRECEDENCE = {
     "filed": 0, "claim": 1, "block": 2, "progress": 2,
-    "answer": 3, "comment": 4, "close": 5, "reopen": 6,
+    "answer": 3, "gate_ack": 3, "gate_nack": 3, "comment": 4, "close": 5, "reopen": 6,
 }
 
 
@@ -926,6 +927,7 @@ _NOTIFY_VERBS = {
     "claimed": "claimed",
     "closed": "closed",
     "needs_input": "needs input",
+    "awaits_decision": "awaits product decision",
 }
 
 
@@ -1047,6 +1049,7 @@ def enqueue(
     confidence: str = "",
     model_floor: str = "",
     submitter: str = "",
+    pre_ack: bool = False,
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
 
@@ -1124,6 +1127,7 @@ def enqueue(
             # booleans, so both backends hand downstream code the same shape.
             "no_auto_drain": False,
             "run_requested": False,
+            "pre_ack": bool(pre_ack),
             "submitter": str(submitter or ""),
             "claimed_by": None,
             "claimed_at": None,
@@ -2019,6 +2023,7 @@ def update_status(
                     # reopening drops any block — it's back in the pool
                     it["needs_input"] = False
                     it["block_question"] = ""
+                    it["block_kind"] = ""
                     it["blocked_at"] = None
                     _append_history(it, "reopen", by=_by("worker", str(session_id or ""), str(real_sid or "")), at=now, reason=_clip(reason, 4000))
                 _save_unlocked(data)
@@ -2248,6 +2253,7 @@ def block(
     session_id: str = "",
     question: str = "",
     progress: str = "",
+    kind: str = "input",
 ) -> Optional[Dict[str, Any]]:
     """Park a ticket that needs a human decision.
 
@@ -2261,6 +2267,7 @@ def block(
     backstop so a fresh worker could resume from notes if the session is ever
     truly gone. Resume-first, notes-as-fallback.
     """
+    kind = kind if kind in ("input", "rationale") else "input"
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         item = backend.block(
@@ -2278,6 +2285,7 @@ def block(
                 now = _now_iso()
                 it["needs_input"] = True
                 it["block_question"] = _clip(question, 4000)
+                it["block_kind"] = kind
                 it["blocked_at"] = now
                 it["updated_at"] = now
                 if it.get("status") == "open":
@@ -2290,7 +2298,7 @@ def block(
                 actor = _by("worker", str(session_id), str(_coerce_session_uuid(session_id) or ""))
                 if progress:
                     _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
-                _append_history(it, "block", by=actor, at=now, question=_clip(question, 4000))
+                _append_history(it, "block", by=actor, at=now, question=_clip(question, 4000), kind=kind)
                 _save_unlocked(data)
                 if progress:
                     _log(
@@ -2304,7 +2312,9 @@ def block(
                     queue=it.get("project", ""),
                 )
                 _notify_ticket_event(
-                    it, "needs_input", detail=question, actor=session_id,
+                    it,
+                    "awaits_decision" if kind == "rationale" else "needs_input",
+                    detail=question, actor=session_id,
                 )
                 return it
     return None
@@ -2346,6 +2356,7 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     it["claimed_by"] = None
                     it["claimed_at"] = None
                     it["block_question"] = ""
+                    it["block_kind"] = ""
                     it["blocked_at"] = None
                     _append_history(
                         it,

@@ -573,6 +573,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         confidence=getattr(args, "confidence", "") or "",
         model_floor=getattr(args, "model_floor", "") or "",
         submitter=submitter,
+        pre_ack=bool(getattr(args, "pre_ack", False)),
     )
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
     # Enqueue-and-claim: file the ticket, then immediately mark it in_progress so
@@ -1198,6 +1199,7 @@ def cmd_block(args: argparse.Namespace) -> int:
     item = q.block(
         args.ref, session_id=args.worker,
         question=args.question, progress=args.progress,
+        kind=getattr(args, "kind", "input"),
     )
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
@@ -3985,8 +3987,11 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--type", default="", choices=["bug", "feature", ""],
                                help="item type: bug or feature")
         subparser.add_argument("--readiness", default="",
-                               choices=["ready", "needs-shaping", "needs-spec", ""],
+                               choices=["ready", "needs-shaping", "needs-spec", "needs-rationale", ""],
                                help="readiness level")
+        subparser.add_argument("--pre-ack", action="store_true", dest="pre_ack",
+                               help="skip the product gate for this ticket "
+                                    "(the decision to build it is already made)")
         subparser.add_argument("--priority", default="",
                                choices=["p0", "p1", "p2", "p3", "p4", ""],
                                help="priority: p0 (highest) through p4 (lowest)")
@@ -4055,7 +4060,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--type", default=None, choices=["bug", "feature"],
                    help="item type: bug or feature")
     s.add_argument("--readiness", default=None,
-                   choices=["ready", "needs-shaping", "needs-spec"],
+                   choices=["ready", "needs-shaping", "needs-spec", "needs-rationale"],
                    help="readiness level")
     s.add_argument("--priority", default=None,
                    choices=["p0", "p1", "p2", "p3", "p4"],
@@ -4177,6 +4182,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--question", default="", help="the specific decision you need")
     s.add_argument("--progress", default="",
                    help="analysis-so-far note (backstop if the session is lost)")
+    s.add_argument("--kind", default="input", choices=["input", "rationale"],
+                   help="input = implementation question; rationale = product-"
+                        "gate pitch awaiting a human Ack/Nack (wt ack / wt nack)")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_block)
