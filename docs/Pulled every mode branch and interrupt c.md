@@ -708,3 +708,34 @@ DID: Mapped every cross-session-messaging use case (12 total) against whether it
 INSIGHT: "steer" is overloaded — it means "abort running tool" in 4 places (already correctly wired) and "jump the queue, target's idle anyway" in 1 place (#4), and the flagship `wt steer` case only gets real interrupt by accident of routing, never guaranteed.
 NEXT_STEP_USER: Decide whether to spec the two-axis (priority/interrupt) flag as the rework doc now, or send it to Opus-5/Codex review first.
 </session-state>
+---
+
+## RESOLVED — superseded by the shipped CCC-1000 spec (2026-09-01)
+
+This doc ends on an open question and proposes a two-axis shape
+(`priority: queue|jump` / `interrupt: none|abort`). **Neither that shape nor the
+five-value enum in CCC-1000's block-question is what shipped.** A reader who
+stops here will re-derive a design that no longer matches the code — this
+happened once already, on CCC-1000, 2026-09-02.
+
+What shipped is a four-value verb on one axis, plus the orthogonal fields this
+doc correctly identified as wrongly fused into `mode`:
+
+```
+verb:     engine_default | queue | steer | abort
+on_busy:  hold | drop | reject      (+ expire)
+position: back | front              (replaces force_queue/send_queue)
+abort_first: bool                   (the destructive half of legacy "steer")
+```
+
+`interject` collapsed into `steer` rather than getting its own spelling: UDS
+`priority=next` was measured to land inside a running turn *without* aborting
+it, so on Claude `steer` is non-destructive by construction and the separate
+verb had nothing left to mean. The receiver-side buffering guarantee this doc
+worried about is provided by the peer socket, not by the harness.
+
+The answer to this doc's closing question, for the record: spec'd directly, no
+outside review first.
+
+**Spec of record:** `docs/ccc-1000-implementation-plan.md` (STATUS: shipped) —
+priority→verb mapping table, the D1–D3 decisions, and the recorded deviations.
