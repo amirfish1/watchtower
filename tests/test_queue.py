@@ -141,14 +141,18 @@ def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsy
 
     assert wt.cli.main(["comment", claimed["ref"], "Use the safer parser."]) == 0
 
-    assert calls == [
-        (
-            sid,
-            f"[WATCHTOWER] A new comment was added to your claimed ticket "
-            f"{claimed['ref']}:\n\nUse the safer parser.",
-            {"mode": "steer"},
-        )
-    ]
+    assert len(calls) == 1
+    target, text, kwargs = calls[0]
+    assert target == sid
+    assert text == (
+        f"[WATCHTOWER] A new comment was added to your claimed ticket "
+        f"{claimed['ref']}:\n\nUse the safer parser."
+    )
+    # A comment must not cost the worker its in-flight turn: the steer verb
+    # prefers the peer socket, which cannot truncate one (CCC-1000).
+    assert kwargs["prefer_uds"] is True
+    assert kwargs["mode"] == "steer"
+    assert kwargs["force_queue"] is False
     assert "injected into claimed worker via fifo" in capsys.readouterr().out
 
 
