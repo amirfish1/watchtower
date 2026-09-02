@@ -70,3 +70,97 @@ def test_wt_add_pre_ack_and_block_kind(wt_env, run_cli):
                   "--kind", "rationale", "--question", "PITCH: worth it?")
     assert res.code == 0, res.output
     assert wt_env.queue.get(ref)["block_kind"] == "rationale"
+
+
+# ----------------------------------------------------------------- gate core
+
+def _gated_pitch(wt_env, **enqueue_kw):
+    wt_env.config.set_product_gate(QUEUE, True)
+    it = _file_ticket(wt_env, **enqueue_kw)
+    wt_env.queue.claim_by_ref(it["ref"], "w1")
+    wt_env.queue.block(it["ref"], session_id="w1",
+                       question="PITCH: costs 2k tokens/day", kind="rationale")
+    return wt_env.queue.get(it["ref"])
+
+
+def test_gate_ack_records_decision_and_clears_block(wt_env):
+    it = _gated_pitch(wt_env)
+    out = wt_env.queue.gate_ack(it["ref"], comment="go, but keep it small",
+                                by="amir")
+    assert out["needs_input"] is False
+    assert out["product_ack"]["by"] == "amir"
+    assert out["product_ack"]["comment"] == "go, but keep it small"
+    assert out["status"] == "in_progress"  # still bound to its session
+    assert any(e.get("event") == "gate_ack"
+               for e in wt_env.queue.timeline(out))
+
+
+def test_gate_ack_requires_a_rationale_block(wt_env):
+    it = _file_ticket(wt_env)
+    with pytest.raises(ValueError):
+        wt_env.queue.gate_ack(it["ref"])
+    wt_env.queue.block(it["ref"], session_id="w1", question="q")  # kind=input
+    with pytest.raises(ValueError):
+        wt_env.queue.gate_ack(it["ref"])
+
+
+def test_gate_nack_iceboxes(wt_env):
+    it = _gated_pitch(wt_env)
+    out = wt_env.queue.gate_nack(it["ref"], reason="not this quarter", by="amir")
+    assert out["status"] == "open"
+    assert out["claimed_by"] is None
+    assert out["needs_input"] is False
+    assert out["readiness"] == "needs-rationale"
+    assert out["product_nack"]["comment"] == "not this quarter"
+    assert wt_env.queue.claim_next("w2", project=QUEUE) is None  # unclaimable
+
+
+def test_gate_nack_requires_a_reason(wt_env):
+    it = _gated_pitch(wt_env)
+    with pytest.raises(ValueError):
+        wt_env.queue.gate_nack(it["ref"], reason="")
+
+
+def test_gate_nack_close_declines(wt_env):
+    it = _gated_pitch(wt_env)
+    out = wt_env.queue.gate_nack(it["ref"], reason="wrong product direction",
+                                 by="amir", close=True)
+    assert out["status"] == "closed"
+    assert "Declined at product gate" in (out.get("resolution") or {}).get("summary", "")
+
+
+def test_close_guard_refuses_ungated_implemented_close(wt_env):
+    it = _gated_pitch(wt_env)
+    with pytest.raises(ValueError):
+        wt_env.queue.close(it["ref"], "w1",
+                           resolution={"summary": "implemented it anyway"})
+
+
+def test_close_guard_allows_acked_pre_acked_and_ungated_queues(wt_env):
+    it = _gated_pitch(wt_env)
+    wt_env.queue.gate_ack(it["ref"], by="amir")
+    assert wt_env.queue.close(it["ref"], "w1",
+                              resolution={"summary": "done"})["status"] == "closed"
+
+    it2 = _gated_pitch(wt_env, pre_ack=True)
+    assert wt_env.queue.close(it2["ref"], "w1",
+                              resolution={"summary": "done"})["status"] == "closed"
+
+    wt_env.config.set_product_gate(QUEUE, False)
+    it3 = _file_ticket(wt_env)
+    wt_env.queue.claim_by_ref(it3["ref"], "w1")
+    assert wt_env.queue.close(it3["ref"], "w1",
+                              resolution={"summary": "done"})["status"] == "closed"
+
+
+def test_ack_persists_across_reopen(wt_env):
+    it = _gated_pitch(wt_env)
+    wt_env.queue.gate_ack(it["ref"], by="amir")
+    wt_env.queue.close(it["ref"], "w1", resolution={"summary": "done"})
+    wt_env.queue.update_status(it["ref"], "open")
+    fresh = wt_env.queue.get(it["ref"])
+    assert fresh["product_ack"]["by"] == "amir"
+    wt_env.queue.claim_by_ref(fresh["ref"], "w2")
+    assert wt_env.queue.close(fresh["ref"], "w2",
+                              resolution={"summary": "redone"})["status"] == "closed"
+

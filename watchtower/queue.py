@@ -2048,9 +2048,12 @@ def update_status(
 
 
 def close(
-    ident: Any, session_id: str = "", resolution: Any = None, force: bool = False
+    ident: Any, session_id: str = "", resolution: Any = None, force: bool = False,
+    declined: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Close a ticket, optionally recording HOW it was fixed.
+
+    ``declined``: this close IS the product-gate Nack — exempt from the gate guard.
 
     ``resolution`` may be a bare summary string or a dict with any of
     ``summary`` / ``caveats`` / ``follow_ups`` / ``unresolved``. Absent ->
@@ -2063,6 +2066,27 @@ def close(
     ``expect_owner``). Callers that close by ref without asserting ownership
     (e.g. dedup-close) pass no ``session_id`` and are unaffected. ``force=True``
     bypasses the guard for a human deliberately force-closing someone's ticket."""
+    if not force and not declined:
+        current = get(ident)
+        if current is not None:
+            try:
+                from . import config as _config
+                gated = _config.product_gate(str(current.get("project") or ""))
+            except Exception:
+                gated = False
+            if (
+                gated
+                and not current.get("product_ack")
+                and not current.get("pre_ack")
+            ):
+                raise ValueError(
+                    f"{current.get('ref', ident)}: this queue has the product "
+                    f"gate on and the ticket was never Acked. Post your pitch "
+                    f"and wait for the decision: `wt block "
+                    f"{current.get('ref', ident)} --worker <your-id> --kind "
+                    f"rationale --question \"<pitch>\"`. (--force overrides "
+                    f"deliberately.)"
+                )
     item = update_status(
         ident, "closed", session_id, resolution=resolution,
         expect_owner="" if force else str(session_id or ""),
@@ -2372,6 +2396,129 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     queue=it.get("project", ""),
                 )
                 return it
+    return None
+
+
+def _require_rationale_block(it: Dict[str, Any], ident: Any) -> None:
+    if not it.get("needs_input") or it.get("block_kind") != "rationale":
+        status = it.get("status")
+        hint = (
+            "it is closed — resolution-caveat acks moved to `wt unresolved-ack`"
+            if status == "closed" else
+            f"it is {status} with block_kind="
+            f"{it.get('block_kind') or '(none)'} — the gate applies only to a "
+            f"ticket a worker parked with `wt block --kind rationale`"
+        )
+        raise ValueError(
+            f"{it.get('ref', ident)} is not awaiting a product decision: {hint}"
+        )
+
+
+def gate_ack(
+    ident: Any, comment: str = "", by: str = "human", session_id: str = "",
+) -> Optional[Dict[str, Any]]:
+    """Approve a product-gate pitch: clear the block and record the decision.
+
+    The decision survives reopen (``product_ack`` is never cleared by the
+    reopen path), so a ticket approved once is never re-gated. Delivery of
+    the go-signal to the parked worker is the CLI/CCC layer's job (same
+    steer/resume path as ``wt answer``); this function only owns state."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            _require_rationale_block(it, ident)
+            now = _now_iso()
+            it["needs_input"] = False
+            it["answered_at"] = now
+            it["updated_at"] = now
+            it["product_ack"] = {
+                "by": _clip(str(by or "human"), 128),
+                "at": now,
+                "comment": _clip(comment, 4000),
+            }
+            _append_history(
+                it, "gate_ack",
+                by=_by("human", str(by or ""), str(session_id or "")),
+                at=now, text=_clip(comment, 24000),
+            )
+            _save_unlocked(data)
+            _log("GATE-ACK", f"{it.get('ref', '?')} — {_clip(comment, 240)}",
+                 queue=it.get("project", ""))
+            return it
+    return None
+
+
+def gate_nack(
+    ident: Any, reason: str, by: str = "human", session_id: str = "",
+    close: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Decline a product-gate pitch.
+
+    Default is the icebox: the claim is released and the ticket parked
+    unclaimable under ``readiness: needs-rationale`` — "not now"; the value
+    name records what revives it (someone brings a new rationale, via
+    ``wt edit --readiness ready``). ``close=True`` is "not ever": closed via
+    the normal close path with a Declined resolution (reopen stays available).
+    ``reason`` is mandatory either way — the why must survive."""
+    if not str(reason or "").strip():
+        raise ValueError("gate_nack requires a reason (-m): record WHY this "
+                         "is not being built")
+    if close:
+        with _FileLock(_lock_path()):
+            data = _load_unlocked()
+            for it in data["items"]:
+                if _matches(it, ident):
+                    _require_rationale_block(it, ident)
+                    now = _now_iso()
+                    it["product_nack"] = {
+                        "by": _clip(str(by or "human"), 128), "at": now,
+                        "comment": _clip(reason, 4000),
+                    }
+                    _append_history(
+                        it, "gate_nack",
+                        by=_by("human", str(by or ""), str(session_id or "")),
+                        at=now, text=_clip(reason, 24000), closed=True,
+                    )
+                    _save_unlocked(data)
+                    break
+            else:
+                return None
+        return globals()["close"](
+            ident, session_id=str(by or ""),
+            resolution={"summary": f"Declined at product gate: {reason}"},
+            force=True, declined=True,
+        )
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            _require_rationale_block(it, ident)
+            now = _now_iso()
+            it["needs_input"] = False
+            it["block_question"] = ""
+            it["block_kind"] = ""
+            it["blocked_at"] = None
+            it["status"] = "open"
+            it["claimed_by"] = None
+            it["claimed_at"] = None
+            it["readiness"] = "needs-rationale"
+            it["updated_at"] = now
+            it["product_nack"] = {
+                "by": _clip(str(by or "human"), 128), "at": now,
+                "comment": _clip(reason, 4000),
+            }
+            _append_history(
+                it, "gate_nack",
+                by=_by("human", str(by or ""), str(session_id or "")),
+                at=now, text=_clip(reason, 24000),
+            )
+            _save_unlocked(data)
+            _log("GATE-NACK", f"{it.get('ref', '?')} — {_clip(reason, 240)}",
+                 queue=it.get("project", ""))
+            return it
     return None
 
 
