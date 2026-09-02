@@ -1327,7 +1327,8 @@ def cmd_answer(args: argparse.Namespace) -> int:
     """Inject a human answer onto a blocked ticket and hand it to the session.
 
     Clears needs_input, then delivers the answer through the one liveness-aware
-    delivery primitive (``messages.send`` with ``mode="steer"``): steer the
+    delivery primitive (``messages.deliver_message`` with ``verb="steer"``,
+    which prefers the peer socket and so cannot truncate a live turn): steer the
     worker if its turn is live, resume it if idle, hold-and-retry via the
     durable outbox if it is busy or momentarily unreachable. This replaces a
     blind ``--resume`` fork, which for a Codex worker becomes a second
@@ -1402,12 +1403,12 @@ def cmd_answer(args: argparse.Namespace) -> int:
         delivery_engine == "kimi" and not messages._delegate_base()
     )
     try:
-        sent = messages.send(
+        sent = messages.deliver_message(
             str(target),
             prompt,
-            mode="steer",
+            verb="steer",
             engine=delivery_engine,
-            queue_on_fail=queue_on_fail,
+            on_busy="hold" if queue_on_fail else "reject",
         )
     except Exception as e:  # never lose the answer to a delivery-layer crash
         sent = {"ok": False, "error": str(e)}
@@ -1492,7 +1493,7 @@ def cmd_comment(args: argparse.Namespace) -> int:
             f"{item['ref']}:\n\n{args.text}"
         )
         try:
-            sent = messages.send(str(target), prompt, mode="steer")
+            sent = messages.deliver_message(str(target), prompt, verb="steer")
         except Exception as e:  # durable ticket comment already succeeded
             delivery = f" — live injection failed ({e})"
         else:
