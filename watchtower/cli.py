@@ -388,7 +388,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
                 if n:
                     # An acknowledged item still counts -- the record is never
                     # rewritten -- but says so, so a line of stale warnings
-                    # reads as handled rather than outstanding (`wt ack`).
+                    # reads as handled rather than outstanding (`wt unresolved-ack`).
                     acked = sum(1 for i in range(n) if q.is_acked(res, key, i))
                     suffix = f", {acked} acked" if acked else ""
                     extras.append(f"{n} {label}{'s' if n != 1 else ''}{suffix}")
@@ -1011,7 +1011,7 @@ _ACK_FIELDS = (
 
 def _print_resolution_items(item: dict) -> None:
     """Numbered listing of a closed ticket's caveat/follow-up/unresolved
-    entries, with their ack state -- what `wt ack <ref>` prints when no
+    entries, with their ack state -- what `wt unresolved-ack <ref>` prints when no
     selector was given, so the caller can see which index to ack."""
     res = item.get("resolution") or {}
     print(f"{item.get('ref', '')}  {res.get('summary') or item.get('title') or ''}")
@@ -1020,7 +1020,7 @@ def _print_resolution_items(item: dict) -> None:
         for i, val in enumerate(vals):
             mark = "[acked]" if q.is_acked(res, field, i) else "[     ]"
             print(f"  {mark} {flag} {i + 1}  {_oneline(str(val))[:100]}")
-    print("\n  ack one with: wt ack <ref> --unresolved N   (or --all)")
+    print("\n  ack one with: wt unresolved-ack <ref> --unresolved N   (or --all)")
 
 
 def _resolution_haystack(item: dict) -> str:
@@ -1046,8 +1046,8 @@ def _has_resolution_items(item: dict) -> bool:
     return any(res.get(f) for f in q.RESOLUTION_LIST_FIELDS)
 
 
-def _cmd_ack_bulk(args: argparse.Namespace) -> int:
-    """`wt ack -q QUEUE --all [--matching TEXT]` — ack a whole queue at once.
+def _cmd_unresolved_ack_bulk(args: argparse.Namespace) -> int:
+    """`wt unresolved-ack -q QUEUE --all [--matching TEXT]` — ack a whole queue at once.
 
     Per-ref ack is already scriptable, but the case that motivated this
     (WATCHTOWER-18) is a backlog of closed tickets whose unresolved entries
@@ -1108,24 +1108,24 @@ def _cmd_ack_bulk(args: argparse.Namespace) -> int:
           f"{'ticket' if len(updated) == 1 else 'tickets'} in {queue}")
     for it in updated:
         print(f"  {str(it.get('ref','')):<14}"
-              f"{_oneline(it.get('title') or it.get('note') or '')[:56]}")
+          f"{_oneline(it.get('title') or it.get('note') or '')[:56]}")
     for ref, err in failed:
         print(f"  {str(ref):<14}SKIPPED — {err}", file=sys.stderr)
     return 1 if failed and not updated else 0
 
 
-def cmd_ack(args: argparse.Namespace) -> int:
+def cmd_unresolved_ack(args: argparse.Namespace) -> int:
     """Acknowledge resolution warnings without rewriting the close record.
 
     The dashboard renders a closed ticket's caveats / follow-ups / unresolved
     entries as chips; before this the only way to clear a stale one was
     `wt close --force` with a rebuilt resolution, which rewrites history and
-    re-fires close notifications. `wt ack` marks the entry seen instead: the
+    re-fires close notifications. `wt unresolved-ack` marks the entry seen instead: the
     text is preserved verbatim and the chip renders dimmed.
 
     With no ref this dispatches to the bulk form over a whole queue."""
     if not args.ref:
-        return _cmd_ack_bulk(args)
+        return _cmd_unresolved_ack_bulk(args)
     if args.matching:
         print("error: --matching is bulk mode; drop the ref (and pass -q QUEUE)",
               file=sys.stderr)
@@ -3712,7 +3712,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Worker protocol", "claim"),
     ("Worker protocol", "release"),
     ("Worker protocol", "close"),
-    ("Worker protocol", "ack"),
+    ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
 ]
 # `install` is intentionally absent: it's a hidden alias folded into `wt start`
@@ -3728,7 +3728,7 @@ COMMAND_HELP: Dict[str, str] = {
     "claim": "claim next open ticket (smart sort: priority + type + age)",
     "release": "give up a claim without closing it; returns the ticket to open",
     "close": "close a ticket (record how you fixed it)",
-    "ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
+    "unresolved-ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
     "block": "park a ticket that needs a human decision",
     "blocked": "list tickets parked for a human",
     "answer": "answer a blocked ticket; auto-resumes its session",
@@ -4125,7 +4125,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_close)
 
-    s = sub.add_parser("ack", help=COMMAND_HELP.get("ack", ""))
+    s = sub.add_parser("unresolved-ack", help=COMMAND_HELP.get("unresolved-ack", ""))
     s.add_argument("ref", nargs="?", default="",
                    help="ticket ref; omit it (with -q and --all) to bulk-ack a queue")
     s.add_argument("--all", action="store_true",
@@ -4151,7 +4151,7 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar="QUEUE",
                    help="with a ref: accepted but ignored (refs are globally "
                         "unique). With no ref: the queue to bulk-ack.")
-    s.set_defaults(func=cmd_ack)
+    s.set_defaults(func=cmd_unresolved_ack)
 
     s = sub.add_parser("release")
     s.add_argument("ref")
