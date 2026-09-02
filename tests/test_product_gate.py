@@ -211,3 +211,26 @@ def test_wt_gated_lists_only_rationale_blocks(wt_env, run_cli):
     assert gated["ref"] in refs and plain["ref"] not in refs
 
 
+# ------------------------------------------------------------- goal templates
+
+def test_drain_goal_carries_gate_contract_only_when_gated(wt_env):
+    from watchtower import workers
+    wt_env.config.set_product_gate(QUEUE, True)
+    gated_goal = workers.drain_goal(QUEUE, "w1", repo_path="/tmp/x")
+    assert "PRODUCT GATE" in gated_goal
+    assert "--kind rationale" in gated_goal
+    wt_env.config.set_product_gate(QUEUE, False)
+    assert "PRODUCT GATE" not in workers.drain_goal(QUEUE, "w1", repo_path="/tmp/x")
+
+
+def test_run_once_goal_carries_gate_contract_only_when_gated(wt_env):
+    from watchtower import workers
+    wt_env.config.set_product_gate(QUEUE, True)
+    gated_goal = workers.run_once_goal(QUEUE, "w1", f"{QUEUE}-1", repo_path="/tmp/x")
+    assert "PRODUCT GATE" in gated_goal
+    assert "--kind rationale" in gated_goal
+    wt_env.config.set_product_gate(QUEUE, False)
+    assert "PRODUCT GATE" not in workers.run_once_goal(QUEUE, "w1", f"{QUEUE}-1", repo_path="/tmp/x")
+
+
+

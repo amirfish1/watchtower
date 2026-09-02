@@ -266,6 +266,29 @@ SUMMARY_STYLE = (
     "line breaks. Never submit one dense paragraph. "
 )
 
+# Appended to a worker's goal when its queue has product_gate on (2026-09-01
+# design). The gate is also enforced server-side: `wt close` refuses an
+# implemented close on a gated queue when the ticket has no product_ack.
+PRODUCT_GATE_CONTRACT = (
+    " PRODUCT GATE — THIS QUEUE REQUIRES A HUMAN GO-DECISION BEFORE YOU "
+    "IMPLEMENT ANYTHING. After claiming a ticket, first check its JSON: if it "
+    "already has product_ack or pre_ack set, the decision is made — implement "
+    "directly. Otherwise your first phase is DIAGNOSIS ONLY: understand the "
+    "problem, NOT the solution. Do not design, do not write code, do not spend "
+    "more than a few minutes. Then post a decision-grade pitch and stop: "
+    "`wt block <ref> --worker {worker_id} --kind rationale --question "
+    "\"<pitch>\"`. The pitch MUST contain: (1) the problem in 2-3 sentences, "
+    "in product terms; (2) evidence links — the originating conversation, "
+    "source ticket, or failing surface; (3) for inefficiency/tech-debt "
+    "claims, magnitude numbers (tokens, seconds, $/day), each labeled "
+    "measured vs estimated; (4) a rough size gut call (S/M/L) — explicitly "
+    "not a design. After posting the pitch, treat the ticket like any "
+    "blocked ticket and move on (or stop, on a one-off run). If the human "
+    "Acks, you will be resumed with their go-signal — implement then. Never "
+    "try to close an ungated ticket as implemented: `wt close` will refuse "
+    "it on this queue. "
+)
+
 DRAIN_GOAL_TEMPLATE = (
     "Drain the {queue} WatchTower queue and keep it empty. "
     "Work in the git repo at {repo}. "
@@ -3456,6 +3479,8 @@ def drain_goal(
             else CLAUDE_RESUME_CONTRACT
         ).format(runbook=_worker_runbook_ref()),
     )
+    if config.product_gate(queue):
+        goal += PRODUCT_GATE_CONTRACT.format(worker_id=worker_id)
     extra = (extra_instructions or "").strip()
     if extra:
         goal += (
@@ -5251,9 +5276,13 @@ def spawn_workers(
 def run_once_goal(queue: str, worker_id: str, ref: str, repo_path: str = "") -> str:
     """The bounded, single-ticket goal for a "drain once" spawn (CCC-437):
     claim exactly ``ref``, resolve it, then stop -- no re-poll drain loop."""
-    return RUN_ONCE_GOAL_TEMPLATE.format(
+    from . import config
+    goal = RUN_ONCE_GOAL_TEMPLATE.format(
         queue=queue, worker_id=worker_id, ref=ref, repo=repo_path or os.getcwd(),
     )
+    if config.product_gate(queue):
+        goal += PRODUCT_GATE_CONTRACT.format(worker_id=worker_id)
+    return goal
 
 
 def spawn_run_once_worker(
