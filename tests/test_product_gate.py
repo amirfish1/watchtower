@@ -164,3 +164,50 @@ def test_ack_persists_across_reopen(wt_env):
     assert wt_env.queue.close(fresh["ref"], "w2",
                               resolution={"summary": "redone"})["status"] == "closed"
 
+
+# ------------------------------------------------------------------ CLI verbs
+
+def test_wt_ack_acks_the_gate(wt_env, run_cli):
+    it = _gated_pitch(wt_env)
+    res = run_cli("ack", it["ref"], "-m", "yes but small")
+    assert res.code == 0, res.output
+    fresh = wt_env.queue.get(it["ref"])
+    assert fresh["product_ack"]["comment"] == "yes but small"
+    assert fresh["needs_input"] is False
+
+
+def test_wt_ack_on_closed_ticket_points_at_unresolved_ack(wt_env, run_cli):
+    it = _file_ticket(wt_env)
+    wt_env.queue.claim_by_ref(it["ref"], "w1")
+    wt_env.queue.close(it["ref"], "w1", resolution={"summary": "done"})
+    res = run_cli("ack", it["ref"])
+    assert res.code != 0
+    assert "unresolved-ack" in res.output
+
+
+def test_wt_nack_iceboxes_and_requires_reason(wt_env, run_cli):
+    it = _gated_pitch(wt_env)
+    assert run_cli("nack", it["ref"]).code != 0  # no -m
+    res = run_cli("nack", it["ref"], "-m", "not now")
+    assert res.code == 0, res.output
+    fresh = wt_env.queue.get(it["ref"])
+    assert fresh["readiness"] == "needs-rationale"
+
+
+def test_wt_nack_close(wt_env, run_cli):
+    it = _gated_pitch(wt_env)
+    res = run_cli("nack", it["ref"], "-m", "wrong direction", "--close")
+    assert res.code == 0, res.output
+    assert wt_env.queue.get(it["ref"])["status"] == "closed"
+
+
+def test_wt_gated_lists_only_rationale_blocks(wt_env, run_cli):
+    gated = _gated_pitch(wt_env)
+    plain = _file_ticket(wt_env)
+    wt_env.queue.block(plain["ref"], session_id="w2", question="impl q?")
+    res = run_cli("gated", "-q", QUEUE, "--json")
+    assert res.code == 0, res.output
+    refs = [r["ref"] for r in json.loads(res.output)]
+    assert gated["ref"] in refs and plain["ref"] not in refs
+
+

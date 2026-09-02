@@ -1217,18 +1217,26 @@ def cmd_block(args: argparse.Namespace) -> int:
 
 
 def cmd_blocked(args: argparse.Namespace) -> int:
-    """List tickets parked for a human (WT-28)."""
+    """List tickets parked for a human (WT-28). With kind_filter (wt gated),
+    only product-gate pitches awaiting Ack/Nack."""
     rows = q.list_blocked(project=args.queue)
+    kind_filter = getattr(args, "kind_filter", "")
+    if kind_filter:
+        rows = [it for it in rows if it.get("block_kind") == kind_filter]
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
     if not rows:
-        print("(nothing blocked)")
+        print("(nothing gated)" if kind_filter else "(nothing blocked)")
         return 0
     for it in rows:
-        print(f"{it['ref']:<12} {it.get('block_question') or '(no question)'}")
+        kind = "GATE" if it.get("block_kind") == "rationale" else "input"
+        print(f"{it['ref']:<12} [{kind}] {it.get('block_question') or '(no question)'}")
         print(f"             session={it.get('claimed_session_id') or '-'}  "
               f"repo={it.get('repo_path') or '-'}")
+        if it.get("block_kind") == "rationale":
+            print(f"             decide with: wt ack {it['ref']} [-m ...]  |  "
+                  f"wt nack {it['ref']} -m \"why not\" [--close]")
     return 0
 
 
@@ -1325,28 +1333,14 @@ def _answer_engine(item: Dict[str, object], requested: Optional[str]) -> str:
     return "claude"
 
 
-def cmd_answer(args: argparse.Namespace) -> int:
-    """Inject a human answer onto a blocked ticket and hand it to the session.
-
-    Clears needs_input, then delivers the answer through the one liveness-aware
-    delivery primitive (``messages.deliver_message`` with ``verb="steer"``,
-    which prefers the peer socket and so cannot truncate a live turn): steer the
-    worker if its turn is live, resume it if idle, hold-and-retry via the
-    durable outbox if it is busy or momentarily unreachable. This replaces a
-    blind ``--resume`` fork, which for a Codex worker becomes a second
-    app-server owner on a session CCC may already be driving (WT-28, WT-90).
-    Only CCC knows a Codex session's liveness, so ``messages.send`` delegates
-    there; a genuinely unresolvable target still falls back to the headless
-    resume fork so the answer is never silently dropped."""
-    item = q.answer(args.ref, args.text, session_id=args.worker)
-    if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
-        return 1
+def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
+                                engine_arg: str, worker: str) -> int:
+    """Deliver a human decision to the session parked on ``item``. Shared by
+    `wt answer` (implementation answers) and `wt ack` (product-gate go
+    signal): context-budget escalation, then steer/resume/outbox with the
+    headless-fork fallback. Returns the process exit code."""
     sid = item.get("claimed_session_id")
     if not sid:
-        print(f"ANSWERED: {item['ref']} — needs_input cleared. "
-              f"(no resumable session recorded; a worker will pick it up on "
-              f"next claim)")
         return 0
     # Context-budget escalation for the answer-resume path. Resuming the
     # original session is normally right (its investigation context makes the
@@ -1372,13 +1366,13 @@ def cmd_answer(args: argparse.Namespace) -> int:
                 f"{item.get('text') or item.get('note') or ''}\n\n"
                 f"[ANSWERED while blocked, {stamp}] Q: "
                 f"{item.get('block_question') or '(see history)'}\n"
-                f"A: {args.text}\n"
+                f"A: {answer_text}\n"
                 f"(Original session {str(sid)[:8]} was over the context "
                 f"budget — apply this answer fresh.)"
             )
             q.update(item["ref"], text=qa_note)
             q.release(item["ref"], session_id=str(
-                item.get("claimed_by") or args.worker or ""))
+                item.get("claimed_by") or worker or ""))
             print(
                 f"ANSWERED: {item['ref']} — answer embedded on the ticket and "
                 f"claim released: original session {str(sid)[:8]} is over the "
@@ -1387,17 +1381,9 @@ def cmd_answer(args: argparse.Namespace) -> int:
             )
             return 0
     repo = item.get("repo_path") or os.getcwd()
-    prompt = (
-        f"A human answered your blocked question on ticket {item['ref']}. "
-        f"Their answer: {args.text}. Apply it, finish the ticket, and close it "
-        f"with `wt close {item['ref']} --worker <your-id> --summary \"...\" "
-        "--commit <SHA>` (or `--no-code` if no code changed). "
-        f"If it still cannot be resolved, run `wt block` again with the new "
-        f"open question."
-    )
     from . import messages
     target = item.get("claimed_session_id") or item.get("claimed_by")
-    delivery_engine = _answer_engine(item, args.engine)
+    delivery_engine = _answer_engine(item, engine_arg)
     # Kimi has no local messages adapter. Without a delegate, parking this in
     # the outbox would retry the same unsupported adapter chain until dead.
     # Let the existing headless Kimi resume fallback run immediately instead.
@@ -1445,6 +1431,103 @@ def cmd_answer(args: argparse.Namespace) -> int:
               f"failed ({sent.get('error', 'unknown')}); {delivery_engine} "
               "resume also failed to stay running. Resume manually: "
               f"wt discuss {item['ref']} --engine {delivery_engine}")
+    return 0
+
+
+def cmd_answer(args: argparse.Namespace) -> int:
+    """Inject a human answer onto a blocked ticket and hand it to the session.
+
+    Clears needs_input, then delivers the answer through the one liveness-aware
+    delivery primitive (``messages.deliver_message`` with ``verb="steer"``,
+    which prefers the peer socket and so cannot truncate a live turn): steer the
+    worker if its turn is live, resume it if idle, hold-and-retry via the
+    durable outbox if it is busy or momentarily unreachable. This replaces a
+    blind ``--resume`` fork, which for a Codex worker becomes a second
+    app-server owner on a session CCC may already be driving (WT-28, WT-90).
+    Only CCC knows a Codex session's liveness, so ``messages.send`` delegates
+    there; a genuinely unresolvable target still falls back to the headless
+    resume fork so the answer is never silently dropped."""
+    item = q.answer(args.ref, args.text, session_id=args.worker)
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    sid = item.get("claimed_session_id")
+    if not sid:
+        print(f"ANSWERED: {item['ref']} — needs_input cleared. "
+              f"(no resumable session recorded; a worker will pick it up on "
+              f"next claim)")
+        return 0
+    prompt = (
+        f"A human answered your blocked question on ticket {item['ref']}. "
+        f"Their answer: {args.text}. Apply it, finish the ticket, and close it "
+        f"with `wt close {item['ref']} --worker <your-id> --summary \"...\" "
+        "--commit <SHA>` (or `--no-code` if no code changed). "
+        f"If it still cannot be resolved, run `wt block` again with the new "
+        f"open question."
+    )
+    return _deliver_to_blocked_session(
+        item, args.text,
+        prompt, args.engine, args.worker,
+    )
+
+
+def cmd_gate_ack(args: argparse.Namespace) -> int:
+    """Approve a product-gate pitch (2026-09-01 design): record the decision,
+    clear the block, and deliver the go-signal to the parked worker through
+    the same steer/resume path as `wt answer`."""
+    try:
+        item = q.gate_ack(args.ref, comment=args.comment or "",
+                          by=args.by or "human")
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
+    print(f"ACKED: {item['ref']} — product gate approved."
+          + (f" Comment: {args.comment}" if args.comment else ""))
+    sid = item.get("claimed_session_id")
+    if not sid:
+        print("  (no resumable session; the next worker to claim it will see "
+              "product_ack and implement directly)")
+        return 0
+    comment_line = (
+        f" The approver added: {args.comment}." if args.comment else ""
+    )
+    prompt = (
+        f"Your product-gate pitch on ticket {item['ref']} was APPROVED — "
+        f"proceed to implementation now.{comment_line} Implement, verify, "
+        f"and close with `wt close {item['ref']} --worker <your-id> "
+        f"--summary \"...\" --commit <SHA>` (or `--no-code`)."
+    )
+    return _deliver_to_blocked_session(
+        item, args.comment or "approved", prompt, args.engine, args.by or "")
+
+
+def cmd_gate_nack(args: argparse.Namespace) -> int:
+    """Decline a product-gate pitch: icebox it (readiness=needs-rationale),
+    or with --close, close it as Declined."""
+    try:
+        item = q.gate_nack(args.ref, reason=args.comment or "",
+                           by=args.by or "human", close=bool(args.close))
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
+    if args.close:
+        print(f"NACKED+CLOSED: {item['ref']} — declined: {args.comment}")
+    else:
+        print(f"NACKED: {item['ref']} — iceboxed (readiness=needs-rationale): "
+              f"{args.comment}")
+        print(f"  revive later with: wt edit {item['ref']} --readiness ready")
     return 0
 
 
@@ -3707,7 +3790,10 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "find"),
     ("Tickets", "ls"),
     ("Tickets", "blocked"),
+    ("Tickets", "gated"),
     ("Tickets", "answer"),
+    ("Tickets", "ack"),
+    ("Tickets", "nack"),
     ("Tickets", "comment"),
     ("Tickets", "discuss"),
     ("Tickets", "dedup"),
@@ -3741,6 +3827,9 @@ COMMAND_HELP: Dict[str, str] = {
     "unresolved-ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
     "block": "park a ticket that needs a human decision",
     "blocked": "list tickets parked for a human",
+    "gated": "product-gate pitches awaiting your Ack/Nack",
+    "ack": "approve a product-gate pitch (Ack); resolution-caveat acks moved to unresolved-ack",
+    "nack": "decline a product-gate pitch: icebox it, or --close to close as Declined",
     "answer": "answer a blocked ticket; auto-resumes its session",
     "comment": "append a ticket activity comment",
     "discuss": "attach to a blocked ticket's session (claude --resume)",
@@ -4193,6 +4282,36 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-q", "--queue", default=None)
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_blocked)
+
+    s = sub.add_parser("gated",
+                       help="product-gate pitches awaiting your Ack/Nack")
+    s.add_argument("-q", "--queue", default=None)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_blocked, kind_filter="rationale")
+
+    s = sub.add_parser("ack", help="approve a product-gate pitch (Ack); "
+                                   "resolution-caveat acks moved to unresolved-ack")
+    s.add_argument("ref")
+    s.add_argument("-m", "--comment", default="",
+                   help="optional steering comment, delivered to the worker")
+    s.add_argument("--by", default="", help="who decided (default: human)")
+    s.add_argument("--engine", default="",
+                   help="override the delivery engine (as in wt answer)")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_gate_ack)
+
+    s = sub.add_parser("nack", help="decline a product-gate pitch: icebox it, "
+                                    "or --close to close as Declined")
+    s.add_argument("ref")
+    s.add_argument("-m", "--comment", default="",
+                   help="REQUIRED: why this is not being built")
+    s.add_argument("--close", action="store_true",
+                   help="close as Declined instead of iceboxing")
+    s.add_argument("--by", default="", help="who decided (default: human)")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_gate_nack)
 
     s = sub.add_parser("answer")
     s.add_argument("ref")
