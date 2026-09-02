@@ -268,17 +268,85 @@ def poll_list_caches_once() -> None:
             pass  # one bad repo must not stop the sweep or kill the poller
 
 
+# Owner-answer sweep throttle. `ingest_owner_answer` has to spend a live
+# `gh issue view` -- the only path that fetches comments -- *before* it can
+# tell there is nothing to ingest. So "only tickets that are actually blocked"
+# was never "normally zero": one blocked ticket cost one GraphQL read on every
+# sweep, i.e. every ~12s, indefinitely. Measured 2026-09-02: two permanently
+# blocked tickets accounted for 50 of the daemon's 59 heavy GraphQL calls in a
+# five-minute window, ~1,800 points/hour against a 5,000/hour quota
+# (docs/github-quota-exhaustion-2026-09-02.md).
+#
+# The sweep now spends that read only when the warm list snapshot says the
+# issue actually moved. GitHub bumps an issue's `updatedAt` when a comment is
+# posted -- the same property `_list_probe_path` already relies on to make the
+# ETag probe notice comments on old issues -- so a real owner answer still
+# lands on the next sweep, with no added latency.
+#
+# Two costs, both bounded and both deliberate. The snapshot is a cached list,
+# so an answer is seen once that list refreshes rather than on the next sweep
+# -- but the sweep already depended on the same snapshot to learn the ticket is
+# blocked at all, so this adds no new staleness bound. And `updated_at` has
+# second resolution, so an answer posted in the same second as the preceding
+# block reads as "unchanged" until the backstop fires.
+#
+# `_OWNER_ANSWER_MAX_QUIET_S` is that backstop: an unchanged `updated_at` is
+# never trusted for longer than this. Under a same-second collision, a missing
+# timestamp, or a frozen one, the sweep degrades to its old behaviour at a
+# bounded rate rather than silently never ingesting again -- WATCHTOWER-5 is a
+# correctness path, so it may get slower, never wrong.
+_OWNER_ANSWER_MAX_QUIET_S = 300.0
+# repo-scoped ticket key -> (probed_at, updated_at seen at that probe).
+_owner_answer_probes: Dict[str, "tuple[float, str]"] = {}
+
+
+def _owner_answer_probe_due(key: str, updated_at: str, now: float) -> bool:
+    """True when a blocked ticket is worth a live ``gh issue view``.
+
+    Records the decision, so a caller that gets True must go on to probe (the
+    sweep's per-ticket `except` swallows failures, which only costs one skipped
+    re-read before the backstop fires).
+    """
+    seen = _owner_answer_probes.get(key)
+    if seen is not None:
+        probed_at, last_updated = seen
+        if (
+            now - probed_at < _OWNER_ANSWER_MAX_QUIET_S
+            and updated_at
+            and updated_at == last_updated
+        ):
+            return False
+    _owner_answer_probes[key] = (now, updated_at)
+    return True
+
+
+def _prune_owner_answer_probes(now: float) -> None:
+    """Drop entries for tickets that stopped being blocked.
+
+    A still-blocked ticket re-probes at least every ``_OWNER_ANSWER_MAX_QUIET_S``
+    (the backstop above), so anything several multiples older is gone --
+    unblocked, closed, or its queue removed. Keeps the map bounded over a
+    daemon lifetime measured in weeks without any cross-queue bookkeeping.
+    """
+    cutoff = now - (_OWNER_ANSWER_MAX_QUIET_S * 4)
+    for key in [k for k, v in _owner_answer_probes.items() if v[0] < cutoff]:
+        _owner_answer_probes.pop(key, None)
+
+
 def poll_owner_answers_once() -> None:
     """One sweep: ingest owner-authored answer comments on blocked tickets for
     every github-backed queue (WATCHTOWER-5).
 
-    Cheap by construction: the blocked set comes from the already-warm list
-    cache (issue bodies carry ``needs_input``), so a live ``gh issue view`` is
-    spent only on tickets that are actually blocked — normally zero. Each step
-    is best-effort; one bad queue or ticket must never stop the sweep."""
+    The blocked set comes from the already-warm list cache (issue bodies carry
+    ``needs_input``), and a live ``gh issue view`` is spent on a blocked ticket
+    only when that snapshot shows the issue moved since the last read -- see
+    ``_owner_answer_probe_due``. Each step is best-effort; one bad queue or
+    ticket must never stop the sweep."""
     from . import config
     from . import queue as _queue
     seen_targets = set()
+    now = time.time()
+    _prune_owner_answer_probes(now)
     for qname in config.all_queues():
         try:
             if config.backend(qname) != "github":
@@ -297,8 +365,15 @@ def poll_owner_answers_once() -> None:
             for item in backend.list_items(status="in_progress"):
                 if not item.get("needs_input"):
                     continue
+                ident = item.get("ref") or item.get("number")
+                if not _owner_answer_probe_due(
+                    f"{backend.repo}#{ident}",
+                    str(item.get("updated_at") or ""),
+                    now,
+                ):
+                    continue
                 try:
-                    backend.ingest_owner_answer(item.get("ref") or item.get("number"))
+                    backend.ingest_owner_answer(ident)
                 except Exception:
                     pass  # one wedged ticket must not stop the queue's sweep
         except Exception:

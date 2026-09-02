@@ -744,7 +744,37 @@ def _add_issue_comment(state_path, number, login, body):
             issue.setdefault("comments", []).append(
                 {"author": {"login": login}, "body": body}
             )
+            # GitHub bumps an issue's updated_at when a comment is posted --
+            # the property `_list_probe_path` relies on to make the ETag probe
+            # notice comments, and the one the owner-answer sweep now uses to
+            # decide a blocked ticket is worth re-reading. The fake has to
+            # model it or those paths are tested against a repo that never
+            # appears to move.
+            # Strictly greater than whatever is there: GitHub's updated_at has
+            # second resolution, and a test that blocks and comments inside the
+            # same second would otherwise model an issue that never moved.
+            stamp = datetime.now(timezone.utc).replace(microsecond=0)
+            prev = issue.get("updatedAt")
+            if prev:
+                prev_dt = datetime.strptime(prev, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=timezone.utc
+                )
+                stamp = max(stamp, prev_dt + timedelta(seconds=1))
+            issue["updatedAt"] = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
     state_path.write_text(json.dumps(data, indent=2))
+
+
+def _view_count(state_path, number):
+    """How many `gh issue view <number>` calls the fake gh has served.
+
+    `gh issue view` is a GraphQL read, so this is the quota meter for the
+    owner-answer sweep.
+    """
+    commands = json.loads(state_path.read_text())["commands"]
+    return sum(
+        1 for c in commands
+        if c[:2] == ["issue", "view"] and str(c[2]) == str(number)
+    )
 
 
 def _setup_blocked_github_ticket(tmp_path, monkeypatch, *, with_session):
@@ -874,6 +904,89 @@ def test_poll_owner_answers_once_sweeps_blocked_tickets(tmp_path, monkeypatch):
 
     assert q.get("GHI-1")["needs_input"] is False
     assert q.get("GHI-1")["status"] == "open"
+
+
+def test_poll_owner_answers_skips_quiet_blocked_ticket(tmp_path, monkeypatch):
+    """A blocked ticket nobody has touched costs ONE live `gh issue view`, not
+    one per sweep.
+
+    `ingest_owner_answer` must fetch comments before it can tell there is
+    nothing to ingest, so the sweep used to spend a GraphQL read per blocked
+    ticket every few seconds forever -- measured at ~1,800 points/hour against
+    a 5,000/hour quota from two stuck tickets
+    (docs/github-quota-exhaustion-2026-09-02.md).
+    """
+    import watchtower.github_backend as github_backend
+
+    state, _config, _q = _setup_blocked_github_ticket(
+        tmp_path, monkeypatch, with_session=False
+    )
+
+    base = _view_count(state, 1)
+    github_backend.poll_owner_answers_once()
+    first = _view_count(state, 1)
+    for _ in range(5):
+        github_backend.poll_owner_answers_once()
+    later = _view_count(state, 1)
+
+    assert first - base == 1     # the sweep pays for one look
+    assert later == first        # nothing moved, so nothing more is spent
+
+
+def test_poll_owner_answers_reads_again_once_the_issue_moves(tmp_path, monkeypatch):
+    """The throttle is keyed on the snapshot's updated_at, so a real owner
+    answer is still ingested -- the WATCHTOWER-5 guarantee survives."""
+    import watchtower.github_backend as github_backend
+
+    state, _config, q = _setup_blocked_github_ticket(
+        tmp_path, monkeypatch, with_session=False
+    )
+
+    github_backend.poll_owner_answers_once()   # quiet sweep records the probe
+    _add_issue_comment(state, 1, "test-owner", "OWNER ANSWER: ship it")
+    # The sweep reads updated_at from the list snapshot, so it only sees the
+    # comment once that snapshot refreshes -- within `_LIST_FETCH_MIN_INTERVAL_S`
+    # in production, immediately here.
+    github_backend._LIST_CACHE.clear()
+    github_backend.poll_owner_answers_once()
+
+    assert q.get("GHI-1")["needs_input"] is False
+    assert q.get("GHI-1")["status"] == "open"
+
+
+def test_owner_answer_probe_due_tracks_movement_and_backstops(tmp_path, monkeypatch):
+    """The gate itself: quiet is skipped, movement re-reads, and an unchanged
+    timestamp is never trusted past the backstop."""
+    import watchtower.github_backend as gb
+
+    gb._owner_answer_probes.clear()
+
+    assert gb._owner_answer_probe_due("repo#1", "T1", 1000.0) is True   # first look
+    assert gb._owner_answer_probe_due("repo#1", "T1", 1010.0) is False  # quiet
+    assert gb._owner_answer_probe_due("repo#1", "T2", 1020.0) is True   # moved
+    assert gb._owner_answer_probe_due("repo#1", "T2", 1025.0) is False
+    # A frozen or missing timestamp must degrade to the old always-read
+    # behaviour at a bounded rate, never to "silently never ingest again".
+    assert gb._owner_answer_probe_due(
+        "repo#1", "T2", 1025.0 + gb._OWNER_ANSWER_MAX_QUIET_S
+    ) is True
+    assert gb._owner_answer_probe_due("repo#2", "", 2000.0) is True
+    assert gb._owner_answer_probe_due("repo#2", "", 2001.0) is True
+
+
+def test_prune_owner_answer_probes_drops_unblocked_tickets(tmp_path, monkeypatch):
+    """Entries for tickets that stopped being blocked must not accumulate over
+    a daemon lifetime measured in weeks."""
+    import watchtower.github_backend as gb
+
+    gb._owner_answer_probes.clear()
+    gb._owner_answer_probe_due("repo#stale", "T1", 1000.0)
+    gb._owner_answer_probe_due("repo#live", "T1", 5000.0)
+
+    gb._prune_owner_answer_probes(5000.0 + gb._OWNER_ANSWER_MAX_QUIET_S)
+
+    assert "repo#stale" not in gb._owner_answer_probes
+    assert "repo#live" in gb._owner_answer_probes
 
 
 def test_github_backend_comment_posts_issue_comment_and_records_history(
