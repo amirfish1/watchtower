@@ -254,6 +254,21 @@ def auto_drain(queue: str) -> bool:
     return bool(_queue_entry(queue).get("auto_drain", False))
 
 
+def set_product_gate(queue: str, enabled: bool) -> Dict[str, Any]:
+    data = _load()
+    q = data.setdefault(queue, {})
+    q["product_gate"] = bool(enabled)
+    _save(data)
+    return q
+
+
+def product_gate(queue: str) -> bool:
+    """False unless explicitly opted in. When on, workers must post a
+    decision-grade pitch (wt block --kind rationale) and wait for a human
+    Ack before implementing — see the 2026-09-01 product-gate design."""
+    return bool(_queue_entry(queue).get("product_gate", False))
+
+
 def set_grace_s(queue: str, seconds: Any) -> Dict[str, Any]:
     """Set this queue's auto-drain grace period in seconds (see DEFAULT_GRACE_S).
 

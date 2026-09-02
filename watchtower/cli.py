@@ -2795,6 +2795,14 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
         changed.append(f"grace_s={config.grace_s(args.queue)}")
+    if getattr(args, "product_gate", None) is not None:
+        enabled = args.product_gate == "on"
+        if enabled and config.backend(args.queue) == "github":
+            print("warning: product_gate is not enforced on GitHub-backed "
+                  "queues yet (v1 gates file-backed queues only)",
+                  file=sys.stderr)
+        config.set_product_gate(args.queue, enabled)
+        changed.append(f"product_gate={'on' if enabled else 'off'}")
     if getattr(args, "engine", None) is not None:
         config.set_engine(args.queue, args.engine)
         changed.append(f"engine={args.engine}")
@@ -4534,6 +4542,10 @@ def build_parser() -> argparse.ArgumentParser:
                        "immediately. Gives a human time to label a ticket "
                        "watchtower:no-auto-drain; pressing run ignores it."
                    ))
+    s.add_argument("--product-gate", default=None, choices=["on", "off"],
+                   dest="product_gate",
+                   help="on = workers must get a human Ack (wt ack) after a "
+                        "minimal-diagnosis pitch before implementing")
     s.set_defaults(func=cmd_config)
 
     s = sub.add_parser("monitor")

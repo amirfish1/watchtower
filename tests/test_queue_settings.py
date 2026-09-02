@@ -134,6 +134,7 @@ SETTINGS_MATRIX = [
     ("--workers", "3", "desired_workers", 3),
     ("--grace-s", "45", "grace_s", 45),
     ("--auto-drain", "on", "auto_drain", True),
+    ("--product-gate", "on", "product_gate", True),
 ]
 
 
