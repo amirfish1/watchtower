@@ -194,14 +194,36 @@ def _invalidate_list_cache(repo: str) -> None:
     would see the pre-mutation list. Clearing both caches forces exactly one
     fresh live read on the very next call, which is the same live-read
     frequency this had before the persisted cache existed -- just paid only
-    right after a write, not on every read."""
+    right after a write, not on every read.
+
+    It marks the entries stale rather than deleting them. Deleting worked, but
+    it threw away the two fields WATCHTOWER-16 added the persisted cache to
+    share -- `etag` and `fetched_at` -- and both the ETag probe and the
+    heavy-fetch cap in `_list_issues` are gated on `cached is not None`. So on
+    a repo with live workers every claim/close reset the entry to "no
+    validator, no fetch clock", the replacement fetch stored `etag=""` (no
+    probe had run to supply one), and the next mutation landed before the
+    entry could ever earn a real validator back. Measured 2026-09-02:
+    `amirfish1/BYM-Finie` sat permanently at `etag=""` and an age of seconds
+    while every other repo held a real ETag and an age of hours -- ~9
+    `gh issue list` per minute against one repo, the whole residual burn after
+    the owner-answer fix (docs/github-quota-exhaustion-2026-09-02.md).
+
+    Stale means exactly what deletion meant for correctness -- the next read
+    must go live, no probe and no cap may short-circuit it -- while the
+    validator and the fetch clock survive to be re-paired with the list that
+    read brings back."""
     for state in ("open", "closed"):
-        _LIST_CACHE.pop(f"{repo}:{state}", None)
+        entry = _LIST_CACHE.get(f"{repo}:{state}")
+        if entry is not None:
+            entry["stale"] = True
 
     def mutate(data: Dict[str, Any]) -> bool:
         changed = False
         for state in ("open", "closed"):
-            if data.pop(f"{repo}:{state}", None) is not None:
+            entry = data.get(f"{repo}:{state}")
+            if isinstance(entry, dict) and not entry.get("stale"):
+                entry["stale"] = True
                 changed = True
         return changed
 
@@ -226,10 +248,30 @@ def refresh_persisted_list_cache(repo: str) -> None:
         # different process.  The daemon poller can still retain its old
         # snapshot in memory, where a changed ETag would otherwise be held by
         # the normal heavy-fetch cap and then re-persisted as current.  A
-        # missing shared entry is an explicit invalidation, so discard the
+        # stale-marked (or, from an entry written before stale-marking existed,
+        # a missing) shared entry is an explicit invalidation, so discard the
         # poller's private copy and fetch the authoritative replacement.
-        if key not in _read_persisted_list_cache():
+        shared = _read_persisted_list_cache().get(key)
+        private = _LIST_CACHE.get(key)
+        if not isinstance(shared, dict) or shared.get("stale"):
             _LIST_CACHE.pop(key, None)
+        elif (
+            private is not None
+            and shared.get("data") is not None
+            and float(shared.get("at") or 0) > float(private.get("at") or 0)
+        ):
+            # Not stale, and newer than what the poller holds: the mutating
+            # process already published the post-write list. Adopt it instead
+            # of revalidating a copy we know is behind -- otherwise the poller
+            # probes with its own outdated ETag, gets a 200, is held by the cap,
+            # and re-persists its older list over the newer one.
+            _LIST_CACHE[key] = {
+                "at": float(shared["at"]), "data": shared["data"],
+                "error": None,
+                "etag": str(shared.get("etag") or ""),
+                "fetched_at": float(shared.get("fetched_at") or 0),
+                "stale": False,
+            }
         try:
             inst._list_issues(state, fresh=True)
         except GitHubBackendError:
@@ -247,6 +289,7 @@ def refresh_persisted_list_cache(repo: str) -> None:
                     "data": entry["data"],
                     "etag": str(entry.get("etag") or ""),
                     "fetched_at": float(entry.get("fetched_at") or 0),
+                    "stale": False,
                 },
             )
 
@@ -1313,7 +1356,11 @@ class GitHubIssuesBackend:
                 # Backoff expired: retry unconditionally. Deliberately no probe
                 # -- the stored ETag pairs with data we already know is stale,
                 # and a 304 would leave the error latched forever.
-            elif not fresh and age < _LIST_CACHE_TTL:
+            elif (
+                not fresh
+                and age < _LIST_CACHE_TTL
+                and not cached.get("stale")
+            ):
                 return cached["data"]
         if not strict and (not fresh or backoff_active):
             # The common case for every fresh CLI process (wt run, wt claim,
@@ -1327,17 +1374,28 @@ class GitHubIssuesBackend:
             persisted = _read_persisted_list_cache().get(key)
             if persisted is not None and persisted.get("data") is not None:
                 persisted_age = now - float(persisted.get("at") or 0)
+                persisted_stale = bool(persisted.get("stale"))
                 if (
                     persisted_age < _PERSISTED_LIST_STALE_S
                     or backoff_active
                 ):
-                    _LIST_CACHE[key] = {
+                    cached = {
                         "at": persisted["at"], "data": persisted["data"],
                         "error": None,
                         "etag": str(persisted.get("etag") or ""),
                         "fetched_at": float(persisted.get("fetched_at") or 0),
+                        "stale": persisted_stale,
                     }
-                    return persisted["data"]
+                    _LIST_CACHE[key] = cached
+                    # A stale-marked snapshot is one some process's write has
+                    # already superseded, so it is seeded (its validator and
+                    # fetch clock are still worth inheriting) but NOT served --
+                    # we fall through to the live read that read-your-own-writes
+                    # requires, exactly as the old deletion forced. During a
+                    # recorded outage there is no live read to fall through to,
+                    # and stale data still beats failing the command (OPS-589).
+                    if not persisted_stale or backoff_active:
+                        return persisted["data"]
         elif not strict and (cached is None or cached.get("data") is None):
             # `fresh=True`, non-strict (`wt claim`, `wt ls`, `wt status`, the
             # reconciler's dispatch path): the caller asked for current state,
@@ -1363,6 +1421,7 @@ class GitHubIssuesBackend:
                         "error": None,
                         "etag": str(persisted.get("etag") or ""),
                         "fetched_at": float(persisted.get("fetched_at") or 0),
+                        "stale": bool(persisted.get("stale")),
                     }
                     _LIST_CACHE[key] = cached
         # Pre-emptive GraphQL quota guard. If we're close to the hourly limit,
@@ -1374,6 +1433,11 @@ class GitHubIssuesBackend:
             not strict
             and cached is not None
             and cached.get("data") is not None
+            # A stale entry used to be an absent entry, so this guard never saw
+            # one and a post-write read raised rather than quietly returning
+            # pre-write data. Keep that: running low on quota is not a reason
+            # to break read-your-own-writes.
+            and not cached.get("stale")
         ):
             remaining = _graphql_rate_limit_remaining()
             if remaining is not None and remaining < _GH_GRAPHQL_LOW_THRESHOLD:
@@ -1384,6 +1448,9 @@ class GitHubIssuesBackend:
             and cached.get("data") is not None
             and not strict
             and not backoff_active
+            # Same reason as the guard above: a write already superseded this
+            # list, so neither a 304 nor the cap may stand in for the live read.
+            and not cached.get("stale")
         ):
             # Poller not running / persisted cache stale or absent: fall
             # back to the in-process revalidation this always did. Past the
@@ -1419,6 +1486,24 @@ class GitHubIssuesBackend:
                     str(conn_state.get("last_error") or "GitHub unreachable (backoff)"),
                     cached=True,
                 )
+        if not etag:
+            # Every route to this fetch that skipped the probe above -- first
+            # fetch of a repo, a stale entry, a retry after backoff expired --
+            # used to store `etag=""` with the result, which forced the next
+            # probe to go unconditional, which returned a validator the cap
+            # then discarded (it can't be paired with the older list already in
+            # hand). An entry could only earn a real ETag by surviving a full
+            # `_LIST_FETCH_MIN_INTERVAL_S` untouched, and on the repo the fleet
+            # actually works in nothing survives that long.
+            #
+            # So harvest one here instead. This is `gh api` -- conditional REST,
+            # zero GraphQL points -- and passing no ETag guarantees a 200 with a
+            # fresh validator rather than a 304 (which on the post-backoff path
+            # must never be honoured anyway: it would latch the error forever).
+            # It pairs with the list fetched immediately below, which is the
+            # same probe-then-fetch ordering, and the same race, that the
+            # normal changed-list path above already relies on.
+            _, etag = self._probe_list_change(state, "")
         try:
             args = [
                 "issue", "list",
@@ -1461,10 +1546,24 @@ class GitHubIssuesBackend:
                 return prev_data
             raise
         _record_gh_success()
-        _LIST_CACHE[key] = {
+        entry = {
             "at": now, "data": result, "error": None, "etag": etag,
-            "fetched_at": now,
+            "fetched_at": now, "stale": False,
         }
+        _LIST_CACHE[key] = entry
+        if cached is not None and cached.get("stale"):
+            # This read was the one the write forced, and it just produced the
+            # authoritative post-write list. Publish it, so the shared entry
+            # goes from stale to current here rather than staying stale until
+            # the poller notices and spends a second `gh issue list` of its own
+            # -- the double fetch every claim/close used to cost the fleet.
+            _write_persisted_list_entry(
+                key,
+                {
+                    "at": now, "data": result, "etag": etag,
+                    "fetched_at": now, "stale": False,
+                },
+            )
         return result
 
     def enqueue(
