@@ -1346,6 +1346,7 @@ class GitHubIssuesBackend:
         # fetch stores no ETag, so the next poll re-bootstraps one rather than
         # pairing a fresh list with a validator taken at some other moment.
         etag = ""
+        probed = False
         if cached is not None:
             age = now - cached["at"]
             if cached.get("error") is not None:
@@ -1458,6 +1459,7 @@ class GitHubIssuesBackend:
             # settles it without spending rate limit. Strict callers (claim,
             # close) skip the detour: they are about to write and pay for
             # certainty.
+            probed = True
             unchanged, etag = self._probe_list_change(
                 state, str(cached.get("etag") or "")
             )
@@ -1486,7 +1488,7 @@ class GitHubIssuesBackend:
                     str(conn_state.get("last_error") or "GitHub unreachable (backoff)"),
                     cached=True,
                 )
-        if not etag:
+        if not etag and not probed:
             # Every route to this fetch that skipped the probe above -- first
             # fetch of a repo, a stale entry, a retry after backoff expired --
             # used to store `etag=""` with the result, which forced the next
@@ -1503,6 +1505,10 @@ class GitHubIssuesBackend:
             # It pairs with the list fetched immediately below, which is the
             # same probe-then-fetch ordering, and the same race, that the
             # normal changed-list path above already relies on.
+            #
+            # Gated on `not probed` as well: if the probe above already ran and
+            # came back unusable, `gh` itself is broken or hung, and retrying it
+            # here would only double the time we spend discovering that.
             _, etag = self._probe_list_change(state, "")
         try:
             args = [
