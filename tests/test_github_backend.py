@@ -1803,7 +1803,11 @@ def test_local_write_invalidates_list_cache_for_read_your_own_writes(
         "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
     }
     edited_issue = {**open_issue, "labels": [{"name": "watchtower:play"}]}
-    responses = iter(["", json.dumps([edited_issue])])
+    responses = iter([
+        "",                                                # the `gh issue edit`
+        'HTTP/2.0 200 OK\r\nEtag: "post-write"\r\n\r\n[]',  # validator harvest
+        json.dumps([edited_issue]),                        # the forced live list
+    ])
 
     def fake_run_raw(args, **kwargs):
         raw = next(responses)
@@ -1822,14 +1826,25 @@ def test_local_write_invalidates_list_cache_for_read_your_own_writes(
     )
 
     # 2) A local write (any `gh issue edit/create/close/reopen/comment`)
-    # must drop both caches for this repo...
+    # must mark both caches stale for this repo. The entries survive -- their
+    # validator and fetch clock are still worth inheriting -- but a stale entry
+    # is not allowed to answer a read.
     backend._run(["issue", "edit", "1", *backend._repo_args(), "--add-label", "x"])
-    assert f"{repo}:open" not in github_backend._LIST_CACHE
-    assert f"{repo}:open" not in github_backend._read_persisted_list_cache()
+    assert github_backend._LIST_CACHE[f"{repo}:open"]["stale"] is True
+    persisted = github_backend._read_persisted_list_cache()[f"{repo}:open"]
+    assert persisted["stale"] is True
 
     # 3) ...so the very next soft read is forced to see the post-write state,
     # not the pre-write snapshot it would otherwise have kept serving.
     assert backend._list_issues() == [edited_issue]
+
+    # 4) And that forced read publishes what it learned: the shared entry goes
+    # straight from stale to current, carrying a validator, so the poller does
+    # not spend a second `gh issue list` rediscovering this process's write.
+    entry = github_backend._read_persisted_list_cache()[f"{repo}:open"]
+    assert entry["stale"] is False
+    assert entry["data"] == [edited_issue]
+    assert entry["etag"] == '"post-write"'
 
 
 def test_poll_list_caches_once_refreshes_every_configured_github_queue(
@@ -1953,18 +1968,17 @@ def test_etag_304_reads_as_unchanged_and_never_as_an_error(monkeypatch):
 
     monkeypatch.setattr(backend, "_run_raw", fake_run_raw)
 
-    # Cold: nothing cached to validate, so no probe -- just today's fetch.
+    # Cold: nothing cached to validate, so the probe runs unconditionally --
+    # its whole job here is to bring back a validator to pair with the fetch.
     assert backend._list_issues() == [_PROBE_ISSUE]
-    assert (counts["fetch"], len(probes)) == (1, 0)
+    assert (counts["fetch"], len(probes)) == (1, 1)
+    assert not any(a == "-H" for a in probes[0])
 
-    # First revalidation has no ETag yet: unconditional probe, 200, fetch.
-    assert backend._list_issues() == [_PROBE_ISSUE]
-    assert (counts["fetch"], len(probes)) == (2, 1)
-
-    # Now every poll is a 304. No exception, no re-listing, same data.
+    # Which is what makes the very next poll a 304 rather than a second
+    # unconditional 200 followed by a redundant re-list.
     for _ in range(3):
         assert backend._list_issues() == [_PROBE_ISSUE]
-    assert counts["fetch"] == 2, "a 304 must not trigger the expensive fetch"
+    assert counts["fetch"] == 1, "a 304 must not trigger the expensive fetch"
     assert len(probes) == 4
     assert 'If-None-Match: "v1"' in probes[-1]
 
@@ -1981,7 +1995,7 @@ def test_etag_200_refetches_and_stores_the_new_validator(monkeypatch):
     import watchtower.github_backend as github_backend
 
     backend, counts, probes = _etag_backend(monkeypatch)
-    versions = iter(["v1", "v2"])
+    versions = iter(["v1", "v2", "v3"])
 
     def fake_run_raw(args):
         probes.append(list(args))
@@ -1989,13 +2003,14 @@ def test_etag_200_refetches_and_stores_the_new_validator(monkeypatch):
 
     monkeypatch.setattr(backend, "_run_raw", fake_run_raw)
 
-    backend._list_issues()                       # cold fetch, no validator yet
-    backend._list_issues()                       # 200 -> fetch, stores "v1"
+    backend._list_issues()                       # cold fetch, harvests "v1"
     assert github_backend._LIST_CACHE["acme/etag-test:open"]["etag"] == '"v1"'
-    backend._list_issues()                       # 200 again -> fetch, "v2"
+    backend._list_issues()                       # 200 -> fetch, stores "v2"
     assert github_backend._LIST_CACHE["acme/etag-test:open"]["etag"] == '"v2"'
+    backend._list_issues()                       # 200 again -> fetch, "v3"
+    assert github_backend._LIST_CACHE["acme/etag-test:open"]["etag"] == '"v3"'
     assert counts["fetch"] == 3
-    assert 'If-None-Match: "v1"' in probes[-1]
+    assert 'If-None-Match: "v2"' in probes[-1]
 
 
 def test_changed_probe_fetch_is_rate_capped_on_a_busy_repo(monkeypatch):
@@ -2030,6 +2045,110 @@ def test_changed_probe_fetch_is_rate_capped_on_a_busy_repo(monkeypatch):
     assert counts["fetch"] == 2
 
 
+def test_invalidation_keeps_the_validator_and_still_forces_a_live_read(
+    tmp_path, monkeypatch
+):
+    """A local write must not cost the entry its ETag and fetch clock.
+
+    Deletion used to take both, so the replacement fetch stored ``etag=""``,
+    the next probe went unconditional, and its validator was discarded by the
+    cap (it cannot be paired with the older list already in hand). An entry
+    could only earn a real ETag by surviving a whole cap interval untouched --
+    which on a repo whose workers write every few seconds never happens.
+    """
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.0)
+    monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 60.0)
+    github_backend._LIST_CACHE.clear()
+    repo = "acme/stale-marking-test"
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    counts = {"fetch": 0}
+
+    def fake_run(args, *, check=True):
+        counts["fetch"] += 1
+        return json.dumps([_PROBE_ISSUE])
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    monkeypatch.setattr(backend, "_run_raw", lambda args: _ok(etag="v1"))
+
+    backend._list_issues()          # cold: harvests a validator, then fetches
+    entry = github_backend._LIST_CACHE[f"{repo}:open"]
+    assert (counts["fetch"], entry["etag"]) == (1, '"v1"')
+    fetched_at = entry["fetched_at"]
+
+    backend._list_issues()          # probe says changed, but the cap holds
+    assert counts["fetch"] == 1
+
+    github_backend._invalidate_list_cache(repo)
+    entry = github_backend._LIST_CACHE[f"{repo}:open"]
+    assert entry["stale"] is True
+    assert entry["etag"] == '"v1"'        # the validator survives the write
+    assert entry["fetched_at"] == fetched_at   # and so does the fetch clock
+
+    # Stale still means what deletion meant: the cap may not stand in for the
+    # live read that read-your-own-writes requires.
+    backend._list_issues()
+    assert counts["fetch"] == 2
+    assert github_backend._LIST_CACHE[f"{repo}:open"]["stale"] is False
+
+
+def test_poller_adopts_a_published_entry_instead_of_refetching_it(
+    tmp_path, monkeypatch
+):
+    """The mutating process publishes the post-write list, so the poller must
+    not spend a second `gh issue list` rediscovering it.
+
+    That double fetch -- one by the worker that wrote, one by the poller that
+    saw the entry vanish -- was what every claim and close cost the fleet.
+    """
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setenv(
+        "WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh-list-cache.json")
+    )
+    github_backend._LIST_CACHE.clear()
+    repo = "acme/publish-test"
+    published = {**_PROBE_ISSUE, "title": "written by the worker"}
+    now = time.time()
+
+    # The poller holds a snapshot from before the write...
+    github_backend._LIST_CACHE[f"{repo}:open"] = {
+        "at": now - 10, "data": [_PROBE_ISSUE], "error": None,
+        "etag": '"old"', "fetched_at": now - 10, "stale": False,
+    }
+    # ...while the process that wrote has already published the result.
+    github_backend._write_persisted_list_entry(
+        f"{repo}:open",
+        {"at": now, "data": [published], "etag": '"v9"',
+         "fetched_at": now, "stale": False},
+    )
+
+    counts = {"fetch": 0}
+
+    def fake_run(self, args, *, check=True):
+        counts["fetch"] += 1
+        return json.dumps([_PROBE_ISSUE])
+
+    def fake_run_raw(self, args, **kwargs):
+        return _not_modified() if "-H" in args else _ok(etag="v9")
+
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_run", fake_run)
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_run_raw", fake_run_raw)
+
+    github_backend.refresh_persisted_list_cache(repo)
+
+    # Only the closed state -- which nobody published -- cost a fetch. The open
+    # state adopted the published entry and revalidated it with a free 304.
+    assert counts["fetch"] == 1
+    entry = github_backend._read_persisted_list_cache()[f"{repo}:open"]
+    assert entry["data"] == [published], "the poller must not overwrite it"
+    assert entry["etag"] == '"v9"'
+
+
 def test_unusable_etag_probe_falls_through_to_the_unconditional_fetch(monkeypatch):
     """Worst case must equal the behaviour we had before ETags: an unhelpful
     probe (5xx, network blip, an old gh that can't do -i) costs one wasted
@@ -2045,7 +2164,9 @@ def test_unusable_etag_probe_falls_through_to_the_unconditional_fetch(monkeypatc
     for _ in range(3):
         assert backend._list_issues() == [_PROBE_ISSUE]
     assert counts["fetch"] == 3  # every poll still gets real data
-    assert len(probes) == 2      # cold call has nothing to validate
+    # One probe per read and no more: the cold read's harvest and the warm
+    # reads' revalidation are the same single wasted call, never doubled up.
+    assert len(probes) == 3
 
 
 def test_genuine_list_failure_still_backs_off_with_the_probe_in_play(monkeypatch):
@@ -2069,13 +2190,13 @@ def test_genuine_list_failure_still_backs_off_with_the_probe_in_play(monkeypatch
 
     monkeypatch.setattr(backend, "_run", failing_run)
     assert backend._list_issues() == [_PROBE_ISSUE]  # stale-but-good, served silently
-    assert (counts["fetch"], len(probes)) == (2, 1)
+    assert (counts["fetch"], len(probes)) == (2, 2)
 
     # Inside the backoff window nothing hits GitHub at all -- not even the
     # cheap probe, because there is nothing worth revalidating until the
     # repo is healthy again.
     assert backend._list_issues() == [_PROBE_ISSUE]
-    assert (counts["fetch"], len(probes)) == (2, 1)
+    assert (counts["fetch"], len(probes)) == (2, 2)
     assert github_backend._LIST_CACHE["acme/etag-test:open"]["error"] is not None
 
 
@@ -2096,13 +2217,13 @@ def test_low_graphql_quota_skips_expensive_fetch_and_serves_cache(monkeypatch):
 
     assert backend._list_issues() == [_PROBE_ISSUE]  # cold fetch seeds cache
     assert counts["fetch"] == 1
-    assert len(probes) == 0  # cold fetch has no validator to probe
+    assert len(probes) == 1  # cold fetch probes once, to harvest a validator
 
     # Quota is now low. The probe would say 200 (changed), but the expensive
     # fetch must be skipped and the cached issue returned.
     assert backend._list_issues() == [_PROBE_ISSUE]
     assert counts["fetch"] == 1, "low quota must skip the expensive gh issue list fetch"
-    assert len(probes) == 0, "low quota should also skip the ETag probe"
+    assert len(probes) == 1, "low quota should also skip the ETag probe"
 
 
 def test_a_new_issue_is_visible_to_the_next_revalidating_read(tmp_path, monkeypatch):
