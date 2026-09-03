@@ -402,3 +402,78 @@ Fix 1 was still worth shipping — it removed a genuinely uncapped path and it
 holds. But the number that has to move next is fix 2, and the empty-string ETag
 above is the single most direct evidence of it: the repo the fleet actually
 works in is the one repo the warm cache cannot keep.
+
+## Post-deploy measurement — fix 2 shipped (2026-09-02, 00:54–01:30Z)
+
+Fix 2 landed as `70af119`/`126f648`/`e1691b8` and went live the same way.
+
+**It worked, and the account still exhausts.** Those are two separate facts and
+the second one is no longer WatchTower's.
+
+### The ratchet is gone
+
+`~/.watchtower/gh-list-cache.json`, read 33 minutes after the restart:
+
+| Key | ETag | Stale | Last real fetch |
+|---|---|---|---|
+| `amirfish1/BYM-Finie:open` | present | false | **2,009 s ago** |
+| `amirfish1/BYM-Finie:closed` | present | false | 2,007 s ago |
+| `amirfish1/claude-command-center:open` | present | false | 34,015 s ago |
+| `amirfish1/stramp-platform:open` | present | false | 13,422 s ago |
+
+Compare the same table before the fix: `BYM-Finie:open` at `etag=""` with an
+age of 53 seconds. Every entry now holds a validator, nothing is stuck stale,
+and the repo the fleet works in went half an hour without a heavy fetch —
+revalidated the whole time by conditional REST probes that cost nothing.
+
+### Burn did not move, because it was never only ours
+
+| Window | Burn |
+|---|---|
+| Before any fix (idle / active) | 5,383 / 6,550 pts/hr |
+| After fix 1 | 5,760 pts/hr |
+| After fix 2 (10 clean samples) | **5,802 pts/hr** |
+
+Flat across all three. A 180-second correlated sample at 01:27Z, with the
+quota delta measured across exactly that window, says why:
+
+| Invocation | Count | Owner | GraphQL |
+|---|---|---|---|
+| `gh api -i -H 'If-None-Match: …'` | 120 | **WatchTower** | free |
+| `gh api rate_limit` | 11 | both | free (and phantom — Part 1) |
+| `gh api repos/…/pulls/N` | 6 | CCC | free (REST) |
+| `gh pr list --json …statusCheckRollup,mergeable,reviewDecision` | 35 | **CCC** | **yes** |
+| `gh issue list --json …stateReason` (no `--repo`, cwd-scoped) | 22 | **CCC** | **yes** |
+| `gh pr view --json state` | 14 | **CCC** | **yes** |
+| `gh issue list --repo … --limit 1000` (WatchTower's) | **0** | WatchTower | — |
+
+Quota delta over that window: **367 points**. WatchTower's contribution to it
+is zero. Its 120 calls are all conditional REST revalidations, which is exactly
+what `docs/github-read-caps.md` set out to achieve; its own GraphQL list did not
+run once.
+
+Note the field set on those 22 `gh issue list` calls — `stateReason`, no
+`--repo`, `--limit 100`. That is not this module. It is
+`ccc_server/cross_repo_issues.py`, which shells out with `cwd=repo` and never
+passes through `_list_issues`, so none of the caps in this file apply to it.
+
+### What is left, and where it lives
+
+All of it is in `/Users/amirfish/Apps/claude-command-center`:
+
+- `ccc_server/morning_launch.py:_open_prs_cached` — `_OPEN_PRS_TTL = 30.0`,
+  keyed per repo directory, requesting `statusCheckRollup,mergeable,reviewDecision`
+  (the fields that force GitHub to compute merge state, and the reason this call
+  is expensive rather than merely frequent). 35 calls in 180 s implies roughly
+  six live repo directories each refreshing twice a minute. It is reached from
+  the worktrees modal, so it is demand-driven — but a dashboard left open is a
+  standing consumer.
+- `ccc_server/cross_repo_issues.py` — `_CROSS_REPO_ISSUES_TTL = 300`, but one
+  `gh issue list` per repo per state behind that TTL, and no ETag revalidation
+  at all.
+- `server.py:8131` — `gh pr view <url> --json state`, once per open PR. The
+  sample caught it polling `octo-org/demo-repo/pull/00`, a placeholder.
+
+Fixes 1 and 2 were the right calls and they hold: WatchTower's structural
+contribution is gone and its read path is now free. Fix 6 is no longer a
+supporting item — it is the entire remaining problem, and it is in another repo.
