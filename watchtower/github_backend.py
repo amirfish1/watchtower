@@ -1999,6 +1999,10 @@ class GitHubIssuesBackend:
         norm = _normalize_resolution(resolution)
         now = _now_iso()
         meta["closed_at"] = now
+        # A closed ticket isn't waiting on anyone: mirror the local backend
+        # (queue.py update_status) so a ticket closed while blocked doesn't
+        # keep showing NEEDS INPUT on the dashboard forever.
+        meta["needs_input"] = False
         if session_id:
             meta["closed_by"] = str(session_id)
             # Backfill claimed_by on a never-claimed issue so attribution
