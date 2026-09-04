@@ -3134,14 +3134,13 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
 
     host = getattr(args, "host", "127.0.0.1")
     port = getattr(args, "port", 8787)
-    # Only bind HTTP if the dashboard isn't already running on this port.
-    dashboard_already_up = _pid_from_file(DASHBOARD_PID_FILE) is not None
-    if not dashboard_already_up:
-        httpd = dashboard.ThreadingHTTPServer((host, port), dashboard._Handler)
-        threading.Thread(target=httpd.serve_forever, daemon=True).start()
-        print(f"[watchtower] HTTP server on http://{host}:{port}", flush=True)
-    else:
-        print(f"[watchtower] dashboard already running; skipping HTTP bind", flush=True)
+    # A detached `wt dashboard` process keeps Python modules loaded. Replace it
+    # on every watcher start so a kickstart cannot leave old dashboard code
+    # serving this watcher's port.
+    _stop_detached_dashboard()
+    httpd = dashboard.ThreadingHTTPServer((host, port), dashboard._Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    print(f"[watchtower] HTTP server on http://{host}:{port}", flush=True)
     # Log daemon start to activity log.
     try:
         auto_spawn_status = "auto-spawn on" if getattr(args, "auto_spawn", False) else "auto-spawn off"
@@ -3696,6 +3695,34 @@ def _pid_from_file(path: Path) -> Optional[int]:
     except (ProcessLookupError, OSError):
         path.unlink(missing_ok=True)
         return None
+
+
+def _stop_detached_dashboard() -> None:
+    """Stop the pidfile-managed dashboard before the watcher binds HTTP.
+
+    The dashboard is normally detached, so it survives a launchd kickstart of
+    the watcher and otherwise continues serving whichever code it imported at
+    its own launch.  Wait briefly for its socket to be released before binding.
+    """
+    pid = _pid_from_file(DASHBOARD_PID_FILE)
+    if pid is None:
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    finally:
+        DASHBOARD_PID_FILE.unlink(missing_ok=True)
+
+    deadline = time.monotonic() + 2.0
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"detached dashboard pid {pid} did not stop")
+        time.sleep(0.05)
 
 
 def _ensure_dashboard(host: str, port: int) -> int:

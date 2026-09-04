@@ -295,10 +295,8 @@ def test_daemon_loop_calls_nudge_tick_and_survives_its_exception(wt, monkeypatch
         lambda: {"delivered": [], "retried": [], "dead": []},
     )
 
-    # Pretend the dashboard is already up so _daemon_loop skips the HTTP bind
-    # (we don't need a real server for this test, just the tick logic).
-    wt.cli.DASHBOARD_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    wt.cli.DASHBOARD_PID_FILE.write_text(str(os.getpid()))
+    # Use an ephemeral port: this test exercises tick wiring, not dashboard
+    # ownership. The watcher now always owns its in-process HTTP listener.
 
     class _StopLoop(Exception):
         pass
@@ -312,7 +310,7 @@ def test_daemon_loop_calls_nudge_tick_and_survives_its_exception(wt, monkeypatch
         interval = 5
         dry_run = False
         host = "127.0.0.1"
-        port = 8787
+        port = 0
         auto_spawn = False
         stuck_minutes = 20
         engine = "claude"
@@ -323,6 +321,49 @@ def test_daemon_loop_calls_nudge_tick_and_survives_its_exception(wt, monkeypatch
     # nudge_tick ran (and raised) but the loop reached time.sleep anyway,
     # proving the exception was swallowed rather than propagating.
     assert calls["nudge_tick"] == 1
+
+
+def test_daemon_restart_replaces_detached_dashboard_before_binding(wt, monkeypatch):
+    """A watcher restart must not leave an old detached dashboard serving code."""
+    calls = []
+
+    monkeypatch.setattr(
+        wt.cli,
+        "_stop_detached_dashboard",
+        lambda: calls.append("stop detached dashboard"),
+    )
+
+    class _Server:
+        def __init__(self, host_port, handler):
+            calls.append(("bind", host_port))
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr(wt.dashboard, "ThreadingHTTPServer", _Server)
+    monkeypatch.setattr(
+        wt.workers, "reconcile_once", lambda dry_run=False: {"spawned": [], "stopped": []}
+    )
+    monkeypatch.setattr(wt.messages, "drain_outbox", lambda: {})
+
+    class _StopLoop(Exception):
+        pass
+
+    monkeypatch.setattr(wt.cli.time, "sleep", lambda _seconds: (_ for _ in ()).throw(_StopLoop()))
+
+    class Args:
+        interval = 5
+        dry_run = False
+        host = "127.0.0.1"
+        port = 8787
+        auto_spawn = False
+        stuck_minutes = 20
+        engine = "claude"
+
+    with pytest.raises(_StopLoop):
+        wt.cli._daemon_loop_ticks(Args())
+
+    assert calls[:2] == ["stop detached dashboard", ("bind", ("127.0.0.1", 8787))]
 
 
 # --------------------------------------------------------- dashboard: HTTP
