@@ -1264,7 +1264,7 @@ def test_dashboard_launch_nonblocking_and_stop(store, tmp_path, monkeypatch, cap
         out = capsys.readouterr().out
         assert "dashboard" in out.lower()
         assert pidfile.exists()
-        pid = int(pidfile.read_text().strip())
+        pid = json.loads(pidfile.read_text())["pid"]
         # The background server process is alive.
         import os as _os
 
@@ -1272,7 +1272,7 @@ def test_dashboard_launch_nonblocking_and_stop(store, tmp_path, monkeypatch, cap
 
         # Idempotent: a second launch does not start a second server.
         assert cli.main(["dashboard", "--no-open", "--port", str(port)]) == 0
-        assert int(pidfile.read_text().strip()) == pid
+        assert json.loads(pidfile.read_text())["pid"] == pid
     finally:
         # --stop kills the background server and removes the pidfile.
         assert cli.main(["dashboard", "--stop"]) == 0

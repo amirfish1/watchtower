@@ -3137,7 +3137,7 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     # A detached `wt dashboard` process keeps Python modules loaded. Replace it
     # on every watcher start so a kickstart cannot leave old dashboard code
     # serving this watcher's port.
-    _stop_detached_dashboard()
+    _stop_detached_dashboard(host, port)
     httpd = dashboard.ThreadingHTTPServer((host, port), dashboard._Handler)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     print(f"[watchtower] HTTP server on http://{host}:{port}", flush=True)
@@ -3685,8 +3685,10 @@ def _pid_from_file(path: Path) -> Optional[int]:
     if not path.exists():
         return None
     try:
-        pid = int(path.read_text().strip())
-    except (ValueError, OSError):
+        raw = path.read_text().strip()
+        decoded = json.loads(raw)
+        pid = int(decoded["pid"]) if isinstance(decoded, dict) else int(decoded)
+    except (ValueError, KeyError, OSError, TypeError, json.JSONDecodeError):
         path.unlink(missing_ok=True)
         return None
     try:
@@ -3697,15 +3699,37 @@ def _pid_from_file(path: Path) -> Optional[int]:
         return None
 
 
-def _stop_detached_dashboard() -> None:
+def _dashboard_endpoint() -> Optional[Tuple[int, str, int]]:
+    """Return the live detached dashboard's declared identity, if available."""
+    try:
+        data = json.loads(DASHBOARD_PID_FILE.read_text())
+        pid = int(data["pid"])
+        host = str(data["host"])
+        port = int(data["port"])
+    except (ValueError, KeyError, OSError, TypeError, json.JSONDecodeError):
+        return None
+    if _pid_from_file(DASHBOARD_PID_FILE) != pid:
+        return None
+    return pid, host, port
+
+
+def _write_dashboard_pid(pid: int, host: str, port: int) -> None:
+    DASHBOARD_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DASHBOARD_PID_FILE.write_text(json.dumps({"pid": pid, "host": host, "port": port}))
+
+
+def _stop_detached_dashboard(host: str, port: int) -> None:
     """Stop the pidfile-managed dashboard before the watcher binds HTTP.
 
     The dashboard is normally detached, so it survives a launchd kickstart of
     the watcher and otherwise continues serving whichever code it imported at
     its own launch.  Wait briefly for its socket to be released before binding.
     """
-    pid = _pid_from_file(DASHBOARD_PID_FILE)
-    if pid is None:
+    dashboard = _dashboard_endpoint()
+    if dashboard is None:
+        return
+    pid, dashboard_host, dashboard_port = dashboard
+    if (dashboard_host, dashboard_port) != (host, port):
         return
     try:
         os.kill(pid, signal.SIGTERM)
@@ -3753,8 +3777,7 @@ def _ensure_dashboard(host: str, port: int) -> int:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
-    DASHBOARD_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-    DASHBOARD_PID_FILE.write_text(str(proc.pid))
+    _write_dashboard_pid(proc.pid, host, port)
     return proc.pid
 
 
@@ -3781,7 +3804,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
     if getattr(args, "foreground", False) or args.once:
         DASHBOARD_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
         if not args.once:
-            DASHBOARD_PID_FILE.write_text(str(os.getpid()))
+            _write_dashboard_pid(os.getpid(), args.host, args.port)
         try:
             return dashboard.serve(host=args.host, port=args.port, once=args.once)
         finally:

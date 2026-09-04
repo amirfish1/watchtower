@@ -330,7 +330,7 @@ def test_daemon_restart_replaces_detached_dashboard_before_binding(wt, monkeypat
     monkeypatch.setattr(
         wt.cli,
         "_stop_detached_dashboard",
-        lambda: calls.append("stop detached dashboard"),
+        lambda host, port: calls.append("stop detached dashboard"),
     )
 
     class _Server:
@@ -364,6 +364,44 @@ def test_daemon_restart_replaces_detached_dashboard_before_binding(wt, monkeypat
         wt.cli._daemon_loop_ticks(Args())
 
     assert calls[:2] == ["stop detached dashboard", ("bind", ("127.0.0.1", 8787))]
+
+
+def test_detached_dashboard_on_another_endpoint_survives_watcher_start(wt, monkeypatch):
+    """A 8791 dashboard must not be stopped merely because 8787 restarts."""
+    wt.cli.DASHBOARD_PID_FILE.write_text(
+        json.dumps({"pid": os.getpid(), "host": "127.0.0.1", "port": 8791})
+    )
+    signals = []
+
+    def _kill(pid, sig):
+        signals.append((pid, sig))
+
+    monkeypatch.setattr(wt.cli.os, "kill", _kill)
+
+    wt.cli._stop_detached_dashboard("127.0.0.1", 8787)
+
+    assert (os.getpid(), wt.cli.signal.SIGTERM) not in signals
+    assert wt.cli.DASHBOARD_PID_FILE.exists()
+
+
+def test_detached_dashboard_on_requested_endpoint_is_replaced(wt, monkeypatch):
+    """A 8787 dashboard is stopped before the watcher binds a fresh server."""
+    wt.cli.DASHBOARD_PID_FILE.write_text(
+        json.dumps({"pid": os.getpid(), "host": "127.0.0.1", "port": 8787})
+    )
+    signals = []
+
+    def _kill(pid, sig):
+        signals.append((pid, sig))
+        if sig == 0 and any(seen_sig == wt.cli.signal.SIGTERM for _, seen_sig in signals):
+            raise ProcessLookupError
+
+    monkeypatch.setattr(wt.cli.os, "kill", _kill)
+
+    wt.cli._stop_detached_dashboard("127.0.0.1", 8787)
+
+    assert (os.getpid(), wt.cli.signal.SIGTERM) in signals
+    assert not wt.cli.DASHBOARD_PID_FILE.exists()
 
 
 # --------------------------------------------------------- dashboard: HTTP
