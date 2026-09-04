@@ -573,6 +573,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         confidence=getattr(args, "confidence", "") or "",
         model_floor=getattr(args, "model_floor", "") or "",
         submitter=submitter,
+        submitter_explicit=bool((getattr(args, "submitter", "") or "").strip()),
         pre_ack=bool(getattr(args, "pre_ack", False)),
     )
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
@@ -2888,6 +2889,25 @@ def cmd_config(args: argparse.Namespace) -> int:
                   file=sys.stderr)
         config.set_product_gate(args.queue, enabled)
         changed.append(f"product_gate={'on' if enabled else 'off'}")
+    if getattr(args, "notify_events", None) is not None:
+        raw = str(args.notify_events).strip().lower()
+        if raw == "default":
+            events = None
+        elif raw in ("none", ""):
+            events = []
+        else:
+            events = [e.strip() for e in raw.split(",") if e.strip()]
+            unknown = [e for e in events if e not in config.VALID_NOTIFY_EVENTS]
+            if unknown:
+                print(
+                    f"error: unknown notify event(s): {', '.join(unknown)} "
+                    f"(valid: {', '.join(config.VALID_NOTIFY_EVENTS)})",
+                    file=sys.stderr,
+                )
+                return 1
+        config.set_notify_events(args.queue, events)
+        got = config.notify_events(args.queue)
+        changed.append(f"notify_events={','.join(got) if got else 'none'}")
     if getattr(args, "engine", None) is not None:
         config.set_engine(args.queue, args.engine)
         changed.append(f"engine={args.engine}")
@@ -4673,6 +4693,14 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="product_gate",
                    help="on = workers must get a human Ack (wt ack) after a "
                         "minimal-diagnosis pitch before implementing")
+    s.add_argument("--notify-events", default=None, dest="notify_events",
+                   help="comma-separated events a ticket's submitter is "
+                        "notified about: claimed,closed,needs_input,"
+                        "awaits_decision (default: all but claimed -- a claim "
+                        "costs the filer a turn and tells it nothing). "
+                        "'none' notifies the submitter about nothing; "
+                        "'default' restores the default. Subscribers "
+                        "(wt subscribe) always get everything.")
     s.set_defaults(func=cmd_config)
 
     s = sub.add_parser("monitor")

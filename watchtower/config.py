@@ -21,6 +21,9 @@ their own tickets. Managed via ``wt subscribe``/``wt unsubscribe``; delivered
 by ``queue._notify_ticket_event``, the same helper that pushes a ticket's own
 ``submitter`` its status changes.
 
+``notify_events`` is the filter on that second (submitter) half: which events
+a filer hears about by default. See :data:`DEFAULT_NOTIFY_EVENTS`.
+
 Stored as ``~/.watchtower/queue-config.json`` = ``{queue: {auto_drain: bool}}``.
 """
 
@@ -46,6 +49,18 @@ STANDARD_EFFORTS = VALID_EFFORTS[:-1]
 # immediately). It gates auto-eligibility only; a human pressing play ignores
 # it.
 DEFAULT_GRACE_S = 180
+
+# Which ticket events are worth pushing to the session that FILED the ticket
+# (see ``notify_events``). Every event a worker can raise:
+VALID_NOTIFY_EVENTS = ("claimed", "closed", "needs_input", "awaits_decision")
+# ...but "claimed" is off by default (WATCHTOWER-23). A claim carries nothing
+# the filer can act on -- nothing to read, nothing to answer -- while landing
+# it costs the receiving session a turn it did not ask for. The other three
+# all hand the filer something: a summary, a question, a decision to make.
+# ``awaits_decision`` is in the default because it is ``needs_input``'s
+# product-gate sibling (same "a worker is stuck on you" class, different
+# wording), and dropping it would silently stall the gate.
+DEFAULT_NOTIFY_EVENTS = ("closed", "needs_input", "awaits_decision")
 
 # WatchTower's explicitly supported worker model identifiers. This is a
 # deployment policy rather than a claim about every model an account may be
@@ -340,6 +355,41 @@ def claim_types(queue: str) -> list:
     """Return the configured claim-type restriction for a queue, or [] (all)."""
     v = _queue_entry(queue).get("claim_types", [])
     return list(v) if isinstance(v, list) else []
+
+
+def set_notify_events(queue: str, events: Any) -> Dict[str, Any]:
+    """Choose which ticket events reach a ticket's ``submitter`` on this queue.
+
+    ``None`` restores the default (``DEFAULT_NOTIFY_EVENTS``); an explicit
+    empty list means "notify the submitter about nothing". Anything not in
+    ``VALID_NOTIFY_EVENTS`` is dropped rather than raising -- the setting is a
+    preference, and a typo must not wedge a queue's config.
+
+    Applies to the ticket's own submitter only. A target that ran
+    ``wt subscribe`` asked for the queue's whole event stream and keeps it;
+    ``wt unsubscribe`` is how that one is turned down.
+    """
+    if events is None:
+        norm = None
+    else:
+        norm = [e for e in events if e in VALID_NOTIFY_EVENTS]
+    data = _load()
+    q = data.setdefault(queue, {})
+    if norm is None:
+        q.pop("notify_events", None)
+    else:
+        q["notify_events"] = norm
+    _save(data)
+    return q
+
+
+def notify_events(queue: str) -> list:
+    """Events whose notices reach a ticket's submitter (see ``set_notify_events``)."""
+    entry = _queue_entry(queue)
+    if "notify_events" not in entry:
+        return list(DEFAULT_NOTIFY_EVENTS)
+    v = entry.get("notify_events")
+    return [e for e in v if e in VALID_NOTIFY_EVENTS] if isinstance(v, list) else []
 
 
 def _norm_subscriber_targets(values: Any) -> list:

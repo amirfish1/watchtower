@@ -953,6 +953,34 @@ def _actor_identities(*values: Any) -> set:
     return out
 
 
+def _submitter_wants(item: Dict[str, Any], event: str, _config: Any) -> bool:
+    """Should this ticket's ``submitter`` hear about ``event``? (WATCHTOWER-23)
+
+    Filing a ticket makes the filing session its submitter automatically --
+    nobody opted into anything -- so by default it hears only the events that
+    hand it something to act on (``config.DEFAULT_NOTIFY_EVENTS``: closed,
+    needs_input, awaits_decision). A claim tells the filer nothing it can use
+    while costing it a turn, which is the whole point of the setting.
+
+    Two ways to get the full stream back:
+
+    - per queue, ``wt config <q> --notify-events claimed,closed,...``;
+    - per ticket, filing it with an explicit ``--submitter`` or ``--pre-ack``.
+      Both mean a human/session deliberately attached itself to THIS ticket
+      (rather than being recorded as filer by ``_default_report_to``), so it
+      is treated as watching and gets everything.
+
+    Subscribers are not filtered here at all -- ``wt subscribe`` is itself the
+    explicit opt-in, and ``wt unsubscribe`` is its off switch.
+    """
+    if item.get("submitter_explicit") or item.get("pre_ack"):
+        return True
+    try:
+        return event in _config.notify_events(str(item.get("project") or ""))
+    except Exception:
+        return True  # a config hiccup must never silently mute notifications
+
+
 def _notify_ticket_event(
     item: Optional[Dict[str, Any]], event: str, detail: str = "",
     actor: Any = None,
@@ -961,7 +989,8 @@ def _notify_ticket_event(
     change.
 
     Targets = {ticket's own ``submitter`` (captured at file time, see
-    ``enqueue``'s ``submitter`` param)} UNION {this queue's ``subscribers``
+    ``enqueue``'s ``submitter`` param) -- but only for the events that
+    submitter wants, see ``_submitter_wants``} UNION {this queue's ``subscribers``
     (``config.subscribers`` -- see ``wt subscribe``/``wt unsubscribe``)},
     MINUS ``actor`` -- the identity that performed this transition.
     Deduplicated so a target that is both gets exactly one send. Delivery
@@ -1014,9 +1043,11 @@ def _notify_ticket_event(
             seen.add(t)
             targets.append(t)
 
-    _add(item.get("submitter"))
+    project = str(item.get("project") or "")
+    if _submitter_wants(item, event, _config):
+        _add(item.get("submitter"))
     try:
-        for target in _config.subscribers(str(item.get("project") or "")):
+        for target in _config.subscribers(project):
             _add(target)
     except Exception:
         pass
@@ -1054,6 +1085,7 @@ def enqueue(
     confidence: str = "",
     model_floor: str = "",
     submitter: str = "",
+    submitter_explicit: bool = False,
     pre_ack: bool = False,
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
@@ -1065,7 +1097,12 @@ def enqueue(
     them. Optional and best-effort: a caller with no addressable identity at
     filing time (a legacy caller, an anonymous annotate-widget POST) leaves it
     "" and the ticket simply gets no submitter notifications -- this never
-    blocks filing."""
+    blocks filing.
+
+    ``submitter_explicit``: the caller NAMED this submitter (``wt add
+    --submitter``) rather than being auto-detected as the filing session, so
+    it is watching this ticket deliberately and hears every event
+    (``_submitter_wants``), not just the default set."""
     note = _clip(note, 4000)
     if not note and not text:
         raise ValueError("note or text is required")
@@ -1097,6 +1134,7 @@ def enqueue(
             value=value,
             confidence=confidence,
             submitter=submitter,
+            submitter_explicit=submitter_explicit,
         )
         _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
         return saved
@@ -1134,6 +1172,7 @@ def enqueue(
             "run_requested": False,
             "pre_ack": bool(pre_ack),
             "submitter": str(submitter or ""),
+            "submitter_explicit": bool(submitter_explicit),
             "claimed_by": None,
             "claimed_at": None,
             "closed_at": None,

@@ -58,6 +58,7 @@ def test_enqueue_without_submitter_defaults_to_empty_string(wt):
 
 # ------------------------------------------------------------- notify: claim
 def test_claim_by_ref_notifies_the_submitter(wt, monkeypatch):
+    wt.config.set_notify_events("SUB", ["claimed", "closed", "needs_input"])
     calls = _record_sends(monkeypatch, wt.messages)
     item = wt.q.enqueue(project="SUB", note="claim me", submitter="worker-sub")
 
@@ -72,6 +73,7 @@ def test_claim_by_ref_notifies_the_submitter(wt, monkeypatch):
 
 
 def test_claim_next_notifies_the_submitter(wt, monkeypatch):
+    wt.config.set_notify_events("SUB", ["claimed", "closed", "needs_input"])
     calls = _record_sends(monkeypatch, wt.messages)
     item = wt.q.enqueue(project="SUB", note="claim next", submitter="worker-sub")
 
@@ -277,6 +279,7 @@ def test_submitter_and_subscriber_overlap_gets_exactly_one_send(wt, monkeypatch)
 
 
 def test_submitter_and_subscriber_both_get_notified_when_distinct(wt, monkeypatch):
+    wt.config.set_notify_events("SUB", ["claimed", "closed", "needs_input"])
     wt.config.add_subscriber("SUB", "watcher-1")
     calls = _record_sends(monkeypatch, wt.messages)
     item = wt.q.enqueue(project="SUB", note="two targets", submitter="worker-sub")
@@ -421,7 +424,9 @@ def test_github_backend_submitter_round_trips_and_notifies_on_claim_close_block(
 
     claimed = q.claim_by_ref(item["ref"], "worker-a")
     assert claimed["submitter"] == "worker-sub"
-    assert {t for t, _ in calls} == {"worker-sub", "watcher-1"}
+    # ...but only the subscriber hears the claim: "claimed" is off by default
+    # for a ticket's own submitter (WATCHTOWER-23), through this backend too.
+    assert {t for t, _ in calls} == {"watcher-1"}
 
     calls.clear()
     blocked = q.block(item["ref"], session_id="worker-a", question="which repo?")
@@ -450,9 +455,154 @@ def test_notifications_are_sent_as_event_notices_not_ordinary_messages(
         return {"ok": True, "transport": "fake"}
 
     monkeypatch.setattr(wt.messages, "send", _fake_send)
+    wt.config.set_notify_events("SUB", ["claimed", "closed"])
     item = wt.q.enqueue(project="SUB", note="notice class", submitter="worker-sub")
 
     wt.q.claim_by_ref(item["ref"], "worker-a")
     wt.q.close(item["ref"], "worker-a", resolution={"summary": "done"})
 
     assert seen == [True, True]
+
+
+# ------------------------------------------------ notify_events filter (WT-23)
+def test_a_claim_does_not_reach_the_submitter_by_default(wt, monkeypatch):
+    """WATCHTOWER-23: filing a ticket opts you into nothing. A claim tells the
+    filer nothing it can act on, and landing it costs that session a turn."""
+    calls = _record_sends(monkeypatch, wt.messages)
+    item = wt.q.enqueue(project="SUB", note="quiet claim", submitter="worker-sub")
+
+    claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    assert claimed["status"] == "in_progress"
+    assert calls == []
+
+
+@pytest.mark.parametrize("event", ["closed", "needs_input"])
+def test_the_actionable_events_still_reach_the_submitter_by_default(
+    wt, monkeypatch, event
+):
+    """The default silences the claim and nothing else: closed carries the
+    summary, needs_input carries a question only the filer can answer."""
+    item = wt.q.enqueue(project="SUB", note="still notified", submitter="worker-sub")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    if event == "closed":
+        wt.q.close(item["ref"], "worker-a", resolution={"summary": "shipped"})
+    else:
+        wt.q.block(item["ref"], session_id="worker-a", question="which repo?")
+
+    assert [t for t, _ in calls] == ["worker-sub"]
+
+
+def test_awaits_decision_still_reaches_the_submitter_by_default(wt, monkeypatch):
+    """The product gate's ask is needs_input's sibling: muting it would leave
+    a worker waiting on a decision nobody was told to make."""
+    wt.config.set_product_gate("SUB", True)
+    item = wt.q.enqueue(project="SUB", note="gate me", submitter="worker-sub")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.block(item["ref"], session_id="worker-a", question="build it?",
+               kind="rationale")
+
+    assert [t for t, _ in calls] == ["worker-sub"]
+    assert "awaits product decision" in calls[0][1]
+
+
+def test_a_subscriber_still_hears_every_claim(wt, monkeypatch):
+    """`wt subscribe` IS the explicit opt-in; the submitter filter never
+    applies to it (and `wt unsubscribe` is its off switch)."""
+    wt.config.add_subscriber("SUB", "watcher-1")
+    calls = _record_sends(monkeypatch, wt.messages)
+    item = wt.q.enqueue(project="SUB", note="watched", submitter="worker-sub")
+
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    assert [t for t, _ in calls] == ["watcher-1"]
+
+
+def test_an_explicitly_named_submitter_hears_every_claim(wt, monkeypatch):
+    """`wt add --submitter X` attaches X to THIS ticket deliberately, unlike
+    the filing session recorded automatically -- so X gets the full stream."""
+    calls = _record_sends(monkeypatch, wt.messages)
+    item = wt.q.enqueue(project="SUB", note="watch this one",
+                        submitter="worker-sub", submitter_explicit=True)
+
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    assert [t for t, _ in calls] == ["worker-sub"]
+
+
+def test_a_pre_acked_ticket_notifies_its_submitter_on_claim(wt, monkeypatch):
+    """--pre-ack means the filer already made a call about this ticket, so it
+    is watching it -- same carve-out as an explicit submitter."""
+    calls = _record_sends(monkeypatch, wt.messages)
+    item = wt.q.enqueue(project="SUB", note="already acked",
+                        submitter="worker-sub", pre_ack=True)
+
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    assert [t for t, _ in calls] == ["worker-sub"]
+
+
+def test_notify_events_can_be_opened_up_or_shut_off_per_queue(wt, monkeypatch):
+    wt.config.set_notify_events("SUB", [])
+    item = wt.q.enqueue(project="SUB", note="silent queue", submitter="worker-sub")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.close(item["ref"], "worker-a", resolution={"summary": "done quietly"})
+
+    assert calls == []
+
+
+def test_notify_events_is_scoped_per_queue(wt, monkeypatch):
+    """One queue's preference must not mute another's."""
+    wt.config.set_notify_events("SUB", [])
+    calls = _record_sends(monkeypatch, wt.messages)
+    item = wt.q.enqueue(project="OTHER", note="other queue", submitter="worker-sub")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    wt.q.close(item["ref"], "worker-a", resolution={"summary": "done"})
+
+    assert [t for t, _ in calls] == ["worker-sub"]
+
+
+# ------------------------------------------------------ config.py: CRUD (WT-23)
+def test_notify_events_defaults_to_everything_but_claimed(wt):
+    assert wt.config.notify_events("NEVERCONFIGURED") == [
+        "closed", "needs_input", "awaits_decision",
+    ]
+
+
+def test_set_notify_events_roundtrips_and_drops_unknown_events(wt):
+    wt.config.set_notify_events("SUB", ["claimed", "nonsense", "closed"])
+    assert wt.config.notify_events("SUB") == ["claimed", "closed"]
+
+
+def test_set_notify_events_none_restores_the_default(wt):
+    wt.config.set_notify_events("SUB", [])
+    assert wt.config.notify_events("SUB") == []
+    wt.config.set_notify_events("SUB", None)
+    assert wt.config.notify_events("SUB") == list(wt.config.DEFAULT_NOTIFY_EVENTS)
+
+
+def test_wt_config_notify_events_flag(wt_cli, capsys):
+    assert wt_cli.cli.main(["config", "-q", "SUB", "--notify-events",
+                            "claimed,closed"]) == 0
+    assert wt_cli.config.notify_events("SUB") == ["claimed", "closed"]
+
+    assert wt_cli.cli.main(["config", "-q", "SUB", "--notify-events", "none"]) == 0
+    assert wt_cli.config.notify_events("SUB") == []
+
+    assert wt_cli.cli.main(["config", "-q", "SUB", "--notify-events",
+                            "default"]) == 0
+    assert wt_cli.config.notify_events("SUB") == list(
+        wt_cli.config.DEFAULT_NOTIFY_EVENTS
+    )
+
+    assert wt_cli.cli.main(["config", "-q", "SUB", "--notify-events",
+                            "claimed,bogus"]) == 1
+    err = capsys.readouterr().err
+    assert "unknown notify event(s): bogus" in err

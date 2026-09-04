@@ -1509,6 +1509,7 @@ class GitHubIssuesBackend:
             "needs_input": bool(meta.get("needs_input", False)),
             "block_question": str(meta.get("block_question") or ""),
             "submitter": str(meta.get("submitter") or ""),
+            "submitter_explicit": bool(meta.get("submitter_explicit", False)),
             "claimed_by": (
                 meta.get("claimed_by")
                 or (",".join(assignees) if queue_member and status == "in_progress" and assignees else None)
@@ -1952,6 +1953,7 @@ class GitHubIssuesBackend:
         value: str = "",
         confidence: str = "",
         submitter: str = "",
+        submitter_explicit: bool = False,
     ) -> Dict[str, Any]:
         note = _clip(note, 4000)
         text = _clip(text or note, 24000)
@@ -1979,6 +1981,10 @@ class GitHubIssuesBackend:
             # home (labels only carry booleans/enums cheaply; a free-form
             # target string belongs in the body, same as `note`/`resolution`).
             "submitter": str(submitter or ""),
+            # Was that submitter NAMED by the filer (`wt add --submitter`)
+            # rather than auto-detected? It decides whether they hear every
+            # event or only the default set -- see queue._submitter_wants.
+            "submitter_explicit": bool(submitter_explicit),
         }
         issue_title = _clip(title or note or "WatchTower ticket", 200)
         body = _body_with_metadata(text, meta)
