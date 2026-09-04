@@ -1434,9 +1434,13 @@ def _deliver_delegate(
 def deliver(
     resolved: Dict[str, Any], text: str, mode: str = "send",
     *, force_queue: bool = False, prefer_uds: bool = False,
+    notify: bool = False,
     delegate_timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Try each adapter in order.
+
+    ``notify=True`` swaps in the much shorter event-notice chain
+    (``_deliver_notify``): live transports only, never a resume.
 
     For Codex targets, a configured delegate is treated as the CCC/managed
     app-server broker and is tried before WT's private app-server fallback.
@@ -1451,7 +1455,7 @@ def deliver(
     carries ``receipt_id``."""
     result = _deliver_unreceipted(
         resolved, text, mode, force_queue=force_queue, prefer_uds=prefer_uds,
-        delegate_timeout_s=delegate_timeout_s,
+        notify=notify, delegate_timeout_s=delegate_timeout_s,
     )
     sid = str(resolved.get("session_id") or "")
     if result.get("ok") and sid:
@@ -1504,13 +1508,67 @@ def _deliver_uds(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     return {"ok": True, "transport": "uds"}
 
 
+def _deliver_notify(
+    resolved: Dict[str, Any], text: str, mode: str, *,
+    force_queue: bool = False, delegate_timeout_s: Optional[float] = None,
+) -> Dict[str, Any]:
+    """The adapter chain for *event notices* (WATCHTOWER-22).
+
+    A notification is steer-class by nature: it is informational, and it must
+    never be worth a whole model turn. The general chain is wrong for it --
+    ``_deliver_resume`` spawns ``claude -p --resume <sid>``, which re-reads the
+    target's full context in a process nobody is watching (three claim notices
+    to one session measured ~$0.24 of pure notification overhead on
+    2026-09-03), and ``_deliver_gemini_resume`` / ``_deliver_codex_app_server``
+    open a fresh turn on their engines for the same non-news.
+
+    So this chain is only the transports that hand the message to an *already
+    live* target:
+
+    1. ``uds`` -- the target's native Claude peer socket, injected at the next
+       safe seam.
+    2. ``fifo`` -- a live WT worker's own stdin; the worker is already running,
+       so this costs no extra turn.
+    3. ``delegate`` -- CCC's ``/api/inject-input``, which is itself UDS for a
+       live claude session.
+
+    If none of them can take it the target is idle or unreachable, and the
+    caller decides between parking it in the outbox and dropping it -- see
+    ``send``'s ``queue_on_fail``. Never a resume.
+    """
+    errors: List[str] = []
+    r = _deliver_uds(resolved, text)
+    if r.get("ok"):
+        return r
+    errors.append(f"uds: {r.get('error', 'failed')}")
+    r = _deliver_fifo(resolved, text)
+    if r.get("ok"):
+        return r
+    errors.append(f"fifo: {r.get('error', 'failed')}")
+    r = _deliver_delegate(
+        resolved, text, mode, force_queue=force_queue,
+        delegate_timeout_s=delegate_timeout_s,
+    )
+    if r.get("ok"):
+        return r
+    errors.append(f"delegate: {r.get('error', 'failed')}")
+    return {"ok": False, "busy": False, "notify": True,
+            "error": "; ".join(errors)}
+
+
 def _deliver_unreceipted(
     resolved: Dict[str, Any], text: str, mode: str = "send",
     *, force_queue: bool = False, prefer_uds: bool = False,
+    notify: bool = False,
     delegate_timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     errors: List[str] = []
     busy = False
+    if notify:
+        return _deliver_notify(
+            resolved, text, mode, force_queue=force_queue,
+            delegate_timeout_s=delegate_timeout_s,
+        )
     if prefer_uds:
         r = _deliver_uds(resolved, text)
         if r.get("ok"):
@@ -1611,8 +1669,12 @@ def outbox_add(
     ttl_s: Optional[float] = None,
     now: Optional[float] = None,
     engine: str = "",
+    notify: bool = False,
 ) -> Dict[str, Any]:
-    """Append a pending message to the durable outbox. Locked + atomic."""
+    """Append a pending message to the durable outbox. Locked + atomic.
+
+    ``notify`` persists the event-notice delivery class so ``drain_outbox``
+    retries it over the live-only chain instead of resuming the target."""
     now = time.time() if now is None else float(now)
     msg = {
         "id": f"msg-{_uuid.uuid4().hex[:12]}",
@@ -1629,6 +1691,8 @@ def outbox_add(
         msg["expires_at"] = _iso(now + float(ttl_s))
     if engine:
         msg["engine"] = str(engine)
+    if notify:
+        msg["notify"] = True
     with queue_mod._FileLock(_outbox_lock()):
         data = _load_outbox()
         data["messages"].append(msg)
@@ -1731,8 +1795,13 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             resolved = resolve_target(str(m.get("to") or ""), include_recent=False)
             if m.get("engine"):
                 resolved["engine"] = str(m["engine"])
+            # `notify` only when it is actually set: `deliver` is
+            # monkeypatched by tests with the historical three-argument
+            # signature, exactly as in `send`.
+            extra = {"notify": True} if m.get("notify") else {}
             outcomes[str(m.get("id"))] = deliver(
-                resolved, str(m.get("text") or ""), str(m.get("mode") or "send")
+                resolved, str(m.get("text") or ""), str(m.get("mode") or "send"),
+                **extra,
             )
         except ValueError as e:
             outcomes[str(m.get("id"))] = {"ok": False, "error": str(e)}
@@ -1791,10 +1860,16 @@ def send(
     engine: str = "",
     force_queue: bool = False,
     prefer_uds: bool = False,
+    notify: bool = False,
     delegate_timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
+
+    ``notify=True`` marks this as an event notice (``_deliver_notify``): live
+    transports only, never a headless resume. The flag rides along into the
+    outbox row so a parked notice keeps that guarantee when the daemon
+    retries it later.
 
     Returns ``{"ok": True, "transport": ...}`` on delivery,
     ``{"ok": False, "queued": True, "id": ...}`` when parked, and
@@ -1812,6 +1887,8 @@ def send(
     extra = {"force_queue": True} if force_queue else {}
     if prefer_uds:
         extra["prefer_uds"] = True
+    if notify:
+        extra["notify"] = True
     if delegate_timeout_s is not None:
         extra["delegate_timeout_s"] = delegate_timeout_s
     result = deliver(resolved, text, mode, **extra)
@@ -1838,7 +1915,7 @@ def send(
     msg = outbox_add(
         to, text, mode=mode,
         error=str(result.get("error") or ""), delay_s=delay, ttl_s=ttl_s,
-        engine=engine,
+        engine=engine, notify=notify,
     )
     return {
         "ok": False,

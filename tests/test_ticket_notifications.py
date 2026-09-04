@@ -433,3 +433,26 @@ def test_github_backend_submitter_round_trips_and_notifies_on_claim_close_block(
     closed = q.close(item["ref"], "worker-a", resolution={"summary": "fixed on GH"})
     assert closed["status"] == "closed"
     assert {t for t, _ in calls} == {"worker-sub", "watcher-1"}
+
+
+# ------------------------------------------------------- delivery class (WT-22)
+def test_notifications_are_sent_as_event_notices_not_ordinary_messages(
+    wt, monkeypatch
+):
+    """WATCHTOWER-22: every transition notice must carry ``notify=True`` so
+    messages.py routes it over live transports only. Without it a notice to an
+    idle claude session fell through to ``_deliver_resume``, spawning a whole
+    headless model turn (full context re-read) per notice."""
+    seen = []
+
+    def _fake_send(target, text, *a, **kwargs):
+        seen.append(kwargs.get("notify"))
+        return {"ok": True, "transport": "fake"}
+
+    monkeypatch.setattr(wt.messages, "send", _fake_send)
+    item = wt.q.enqueue(project="SUB", note="notice class", submitter="worker-sub")
+
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    wt.q.close(item["ref"], "worker-a", resolution={"summary": "done"})
+
+    assert seen == [True, True]

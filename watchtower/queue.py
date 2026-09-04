@@ -968,7 +968,12 @@ def _notify_ticket_event(
     reuses the exact path ``--report-to`` already uses: ``messages.send``
     (resolve + deliver, parking in the outbox on transient failure) -- this
     is intentionally the *only* place that talks to ``messages``/``config``
-    for this purpose.
+    for this purpose -- but with ``notify=True`` (WATCHTOWER-22): a status
+    notice is informational and must never be worth a whole model turn, so
+    it goes over live transports only (uds -> fifo -> delegate) and never
+    over ``_deliver_resume``, which used to spawn a headless
+    ``claude -p --resume`` per notice. Unreachable simply means the notice
+    waits in the outbox for the target to come back.
 
     ``actor`` is one or more identity strings (worker id and/or session
     UUID; see ``_actor_identities``). A session that files a ticket is its
@@ -1024,7 +1029,7 @@ def _notify_ticket_event(
         text += f" — {_clip(detail, 200)}"
     for target in targets:
         try:
-            messages.send(target, text)
+            messages.send(target, text, notify=True)
         except Exception:
             pass  # best-effort -- a delivery hiccup never fails the transition
 

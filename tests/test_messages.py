@@ -1764,3 +1764,100 @@ def test_engine_default_verb_does_not_use_uds(monkeypatch):
     out = messages.deliver_message("22222222-2222-2222-2222-222222222222",
                                    "hi", verb="engine_default")
     assert out["ok"] is True
+
+
+# ======================================================== notify delivery class
+def _spy_resume(wt, monkeypatch):
+    """Replace resume with a spy that *would* succeed, so any test asserting
+    "resume was not used" is proving the chain skipped a working adapter, not
+    that resume happened to be unavailable."""
+    calls = []
+
+    def _fake(resolved, text):
+        calls.append(text)
+        return {"ok": True, "transport": "resume", "log": ""}
+
+    monkeypatch.setattr(wt.messages, "_deliver_resume", _fake)
+    return calls
+
+
+def test_notify_chain_is_uds_then_fifo_then_delegate(wt, monkeypatch):
+    """WATCHTOWER-22: an event notice is steer-class -- live transports only,
+    in that order, and nothing that opens a fresh turn."""
+    order = []
+
+    def _spy(name):
+        def _fake(*a, **k):
+            order.append(name)
+            return {"ok": False, "error": f"{name} unavailable in test"}
+        return _fake
+
+    for name in ("_deliver_uds", "_deliver_fifo", "_deliver_delegate"):
+        monkeypatch.setattr(wt.messages, name, _spy(name.replace("_deliver_", "")))
+    for name in ("_deliver_resume", "_deliver_codex_app_server",
+                 "_deliver_gemini_resume"):
+        monkeypatch.setattr(wt.messages, name, _spy(name.replace("_deliver_", "")))
+    monkeypatch.setattr(wt.messages.tty_mod, "deliver_tty", _spy("tty"))
+
+    res = wt.messages._deliver_unreceipted(
+        {"session_id": SID_B, "engine": "claude"}, "[watchtower] Q-1 claimed",
+        notify=True,
+    )
+
+    assert order == ["uds", "fifo", "delegate"]
+    assert res["ok"] is False and res["notify"] is True
+
+
+def test_notify_never_falls_through_to_a_headless_resume(wt, monkeypatch):
+    """The cost bug itself: three claim notices to one live session each
+    spawned `claude -p --resume` (~$0.08 of context re-read apiece)."""
+    resumed = _spy_resume(wt, monkeypatch)
+    _write_transcript(wt, SID_B)
+
+    res = wt.messages.send(SID_B, "[watchtower] Q-1 claimed", notify=True)
+
+    assert resumed == []
+    assert res["ok"] is False and res["queued"] is True
+
+
+def test_ordinary_send_still_resumes(wt, monkeypatch):
+    """The narrowing is scoped to notices: every other caller keeps the full
+    adapter chain it has always had."""
+    resumed = _spy_resume(wt, monkeypatch)
+    _write_transcript(wt, SID_B)
+
+    res = wt.messages.send(SID_B, "please look at this")
+
+    assert res["ok"] is True and res["transport"] == "resume"
+    assert resumed == ["please look at this"]
+
+
+def test_notify_reaches_a_live_worker_over_its_own_fifo(wt, monkeypatch):
+    """A running worker's stdin costs no extra turn, so it stays in the chain."""
+    _spy_resume(wt, monkeypatch)
+    rec = _live_worker(wt, "Q")
+
+    res = wt.messages.send(rec["worker_id"], "[watchtower] Q-1 closed", notify=True)
+
+    assert res["ok"] is True and res["transport"] == "fifo"
+    sent = _read_fifo_msg(wt)["message"]["content"]
+    assert sent == [{"type": "text", "text": "[watchtower] Q-1 closed"}]
+
+
+def test_parked_notice_still_refuses_resume_when_the_daemon_retries(
+    wt, monkeypatch
+):
+    """The guarantee has to survive the outbox: a notice parked while the
+    target was unreachable must not be resumed on a later drain tick."""
+    resumed = _spy_resume(wt, monkeypatch)
+    _write_transcript(wt, SID_B)
+    res = wt.messages.send(SID_B, "[watchtower] Q-1 closed", notify=True)
+    assert res["queued"] is True
+
+    parked = wt.messages.outbox_list("pending")
+    assert [m.get("notify") for m in parked] == [True]
+
+    out = wt.messages.drain_outbox(now=time.time() + 3600)
+
+    assert resumed == []
+    assert out["delivered"] == [] and out["retried"] == [res["id"]]
