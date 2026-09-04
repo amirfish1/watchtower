@@ -3212,3 +3212,76 @@ def test_claim_guard_still_refuses_a_genuinely_held_ticket(tmp_path, monkeypatch
 
     with pytest.raises(ValueError, match=r"claim refused: you still hold GHI-1"):
         q.claim_next("worker-1", project="GHI")
+
+
+def test_reconcile_skip_reason_names_grace_not_a_filter(tmp_path, monkeypatch):
+    """A queue skipped during the grace window must SAY grace.
+
+    The old reason string was inferred, not observed -- any depth==0 with
+    open tickets was reported as "filtered by claim_types/readiness". Grace
+    is the common real cause and was never one of the two named, so the log
+    asserted a filter that wasn't acting. Two workers in a row believed it
+    and went hunting for a stale-read bug that didn't exist (WATCHTOWER-24,
+    WATCHTOWER-26); this is the guard against reintroducing that guess.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.workers as workers
+
+    importlib.reload(workers)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    config.set_auto_drain("GHI", True)
+    config.set_grace_s("GHI", 180)
+
+    just_filed = _fake_issue(1, "Filed seconds ago")
+    just_filed["createdAt"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=20)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _write_fake_issues(state, [just_filed])
+
+    result = workers.reconcile_once(dry_run=True)
+    assert result["spawned"] == []
+    reason = next(s["reason"] for s in result["skipped"] if s["queue"] == "GHI")
+
+    assert "grace_s=180" in reason, reason
+    # The specific false claim this ticket was filed about.
+    assert "claim_types" not in reason and "readiness" not in reason, reason
+
+
+def test_reconcile_skip_reason_names_readiness_when_readiness_is_the_gate(
+    tmp_path, monkeypatch
+):
+    """The other half: when readiness really is what holds the queue back,
+    the reason names it (and which value), rather than the old catch-all."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    import watchtower.workers as workers
+
+    importlib.reload(workers)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)  # auto-drain on, grace 0 -- grace cannot be the cause
+    import watchtower.github_backend as github_backend
+
+    _write_fake_issues(
+        state,
+        [
+            _fake_issue(
+                1,
+                "Half-formed",
+                body=github_backend._body_with_metadata(
+                    "Half-formed", {"readiness": "needs-spec"}
+                ),
+            )
+        ],
+    )
+
+    result = workers.reconcile_once(dry_run=True)
+    assert result["spawned"] == []
+    reason = next(s["reason"] for s in result["skipped"] if s["queue"] == "GHI")
+
+    assert "needs-spec" in reason, reason
+    assert "grace" not in reason, reason

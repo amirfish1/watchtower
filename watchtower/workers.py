@@ -4589,14 +4589,21 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     # (unfiltered -- just how big the backlog is, regardless of claimability).
     from . import queue as _q
     _total_open_by_q: Dict[str, int] = {}
+    # The same items, kept rather than only counted, so a depth==0 skip can
+    # report what was actually observed about them instead of guessing
+    # (see _zero_claimable_reason). Costs no extra read: this is the one
+    # list pass the reconciler already makes.
+    _open_items_by_q: Dict[str, List[Dict[str, Any]]] = {}
     try:
         for it in (_q.list_items() or []):
             if it.get("status") != "open":
                 continue
             qn = str(it.get("project") or "")
             _total_open_by_q[qn] = _total_open_by_q.get(qn, 0) + 1
+            _open_items_by_q.setdefault(qn, []).append(it)
     except Exception:
         _total_open_by_q = {}
+        _open_items_by_q = {}
 
     def _claimable_depth(qn: str) -> tuple:
         """(claimable_open, total_open) for a queue. claimable_open comes from
@@ -4615,6 +4622,85 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         """How many claimable tickets on this queue a human pressed ▶ on."""
         types = config.claim_types(qn) or None
         return _q.count_manual_eligible(project=qn, item_types=types)
+
+    def _zero_claimable_reason(qn: str, total_open: int, auto_on: bool) -> str:
+        """Why this queue reads as 0-claimable, from the open items in hand.
+
+        This used to be inferred rather than observed -- `filtered =
+        total_open - depth; if filtered > 0: "filtered by
+        claim_types/readiness"` -- which asserts a cause nothing checked.
+        Grace is the common real cause and was never one of the two named:
+        a ticket younger than `grace_s` is open (so it counts in total_open)
+        but not `auto_eligible` (so it counts 0 toward depth), which is the
+        design, not a fault. Two workers in a row read that string as proof
+        of a filter that wasn't acting and went looking for a bug that
+        wasn't there (WATCHTOWER-24, WATCHTOWER-26), so the cost of guessing
+        here is debugging time, not just log accuracy.
+
+        Classification runs over `_open_items_by_q` -- the items the
+        reconciler already listed this pass -- so it adds no GitHub read.
+        Each item is attributed to the FIRST gate that would reject it, in
+        the order the candidate filters apply. Anything no gate explains is
+        reported as unexplained rather than folded into a named cause: that
+        residual is the only signal that depth and total_open really did
+        disagree, and it must not be disguised as a filter."""
+        # The same age helper the grace gate itself uses, so "within grace"
+        # here means exactly what auto_eligible means by it (an undateable
+        # ticket reads as infinitely old, i.e. never inside grace).
+        from .github_backend import _age_seconds
+
+        items = _open_items_by_q.get(qn) or []
+        if not items:
+            # Nothing in hand to reason from (the list pass failed, or this
+            # queue's depth came from a source the pass didn't cover).
+            return f"depth=0 ({total_open} open, no items in hand to explain it)"
+        types = set(config.claim_types(qn) or [])
+        grace = config.grace_s(qn)
+        counts: Dict[str, int] = {}
+        readiness_seen: Set[str] = set()
+
+        def _bump(kind: str) -> None:
+            counts[kind] = counts.get(kind, 0) + 1
+
+        for it in items:
+            readiness = str(it.get("readiness") or "")
+            if types and _q.effective_type(it) not in types:
+                _bump("wrong type")
+            elif readiness in _q.UNCLAIMABLE_READINESS:
+                readiness_seen.add(readiness)
+                _bump("readiness")
+            elif not auto_on and not it.get("run_requested", False):
+                # Drain is off, so depth is the ▶ count: what holds this
+                # ticket back is that nobody pressed ▶, not any auto gate.
+                _bump("no run request (auto_drain off)")
+            elif "auto_eligible" not in it or it.get("auto_eligible"):
+                # A file-backed item carries no auto_eligible because the file
+                # backend's candidate filter has no gate past type/readiness;
+                # a GitHub item that HAS it and is True passed every gate. In
+                # both cases nothing observed here rejects this ticket, yet it
+                # counted 0 toward depth.
+                _bump("unexplained")
+            elif it.get("no_auto_drain", False):
+                _bump("opted out of auto-drain")
+            elif _age_seconds(it.get("created_at")) < grace:
+                _bump(f"within grace_s={grace}")
+            else:
+                # auto_eligible is False and neither the opt-out nor grace
+                # explains it. Name only what we know -- the predicate said
+                # no -- rather than picking one of its remaining inputs.
+                _bump("not auto-eligible")
+
+        if "readiness" in counts and readiness_seen:
+            counts[f"readiness {'/'.join(sorted(readiness_seen))}"] = counts.pop(
+                "readiness"
+            )
+        parts = [f"{n} {kind}" for kind, n in sorted(counts.items())]
+        detail = ", ".join(parts)
+        if counts.get("unexplained"):
+            # depth and total_open came from reads that disagree -- say so
+            # plainly instead of naming a filter we did not see act.
+            detail += " (open here but counted 0 claimable; reads may disagree)"
+        return f"0 claimable ({total_open} open: {detail})"
 
     planned_queues: set = set()
 
@@ -4847,11 +4933,11 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             # three ▶ presses run serially, in order, instead of at once.
             desired = max(config.desired_workers(q_name), 1)
         if depth == 0:
-            # Distinguish "truly empty" from "only non-claimable items remain"
-            # (wrong claim_type, or needs-shaping/needs-spec readiness).
-            filtered = total_open - depth
-            reason = (f"0 claimable ({total_open} open, filtered by claim_types/readiness)"
-                      if filtered > 0 else "depth=0")
+            # Distinguish "truly empty" from "only non-claimable items
+            # remain", and say WHICH gate was observed to hold each one back
+            # rather than asserting a cause (see _zero_claimable_reason).
+            reason = (_zero_claimable_reason(q_name, total_open, bool(auto))
+                      if total_open > 0 else "depth=0")
             result["skipped"].append({"queue": q_name, "reason": reason})
             if released_by_q.get(q_name):
                 _record_spawn_plan(
