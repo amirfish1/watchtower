@@ -382,16 +382,36 @@ def refresh_persisted_list_cache(repo: str) -> None:
     list.
     """
     inst = GitHubIssuesBackend(repo, repo=repo)
-    before = _graphql_quota_snapshot(force=True)
+    # Metering must not become part of the burn it measures. A `force=True`
+    # snapshot on each side of every repo's poll is 2 `gh` subprocesses per
+    # repo per sweep -- at three repos on a 5s loop that was ~4,300 extra
+    # `gh api graphql` invocations an hour, and it made `gh api graphql
+    # -f query={rateLimit...}` the single most frequent gh command on the
+    # machine. (The points cost of a rateLimit-only query is ~0 -- measured:
+    # 20 back-to-back queries moved `used` by less than the idle drift over
+    # the same interval -- but the process churn and the added latency on
+    # every poll are real.)
+    #
+    # So: reuse the previous sweep's closing snapshot as this one's opening
+    # reading, and only take a fresh closing reading when this poll actually
+    # fetched something. A sweep that was answered entirely by 304s has no
+    # cost to report, which is most sweeps on a quiet repo.
+    before = _GH_POLL_LAST_SNAPSHOT.get(repo) or _graphql_quota_snapshot()
+    fetches_before = _LIST_FETCH_COUNT["n"]
     _mark_poll_started(repo)
     try:
         _refresh_persisted_list_cache_states(inst, repo)
     finally:
         _mark_poll_finished(repo)
+    if _LIST_FETCH_COUNT["n"] == fetches_before:
+        return  # nothing was fetched, so there is nothing to account for
     after = _graphql_quota_snapshot(force=True)
+    if after is not None:
+        _GH_POLL_LAST_SNAPSHOT[repo] = after
     _log_quota(
         "poll",
         repo=repo,
+        fetches=_LIST_FETCH_COUNT["n"] - fetches_before,
         cost=(
             None
             if before is None or after is None
@@ -660,6 +680,14 @@ _GH_GRAPHQL_LOW_THRESHOLD = 300
 _GH_RATE_LIMIT_CHECK_INTERVAL_S = 30.0
 _GH_GRAPHQL_QUOTA_CACHE: Dict[str, Any] = {"ts": 0.0, "snapshot": None}
 _GH_QUOTA_LOG_FILE = Path.home() / ".watchtower" / "gh-quota.log"
+# Closing quota reading of each repo's last metered poll, reused as the
+# opening reading of its next one so a sweep costs one meter read, not two.
+# `cost` is therefore a *window* delta: on a busy machine it includes whatever
+# else spent GraphQL points during the same interval, which is the honest
+# thing for an operator to see -- the quota is per-account, not per-process.
+_GH_POLL_LAST_SNAPSHOT: Dict[str, Dict[str, int]] = {}
+# Count of heavy `gh issue list` fetches this process has actually paid for.
+_LIST_FETCH_COUNT: Dict[str, int] = {"n": 0}
 _GRAPHQL_QUOTA_QUERY = "{rateLimit{limit cost remaining used resetAt}}"
 
 
@@ -1874,6 +1902,7 @@ class GitHubIssuesBackend:
             raise
         if own_marker:
             _mark_poll_finished(self.repo)
+        _LIST_FETCH_COUNT["n"] += 1
         _record_gh_success()
         _log_quota(
             "list",

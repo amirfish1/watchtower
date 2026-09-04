@@ -388,8 +388,13 @@ def test_each_poll_logs_the_points_it_spent(tmp_path, monkeypatch):
     monkeypatch.setattr(
         github_backend, "_graphql_quota_snapshot", lambda **kw: next(snapshots)
     )
+    github_backend._GH_POLL_LAST_SNAPSHOT.pop(repo, None)
+
+    def fetched(inst, r):
+        github_backend._LIST_FETCH_COUNT["n"] += 2  # open + closed
+
     monkeypatch.setattr(
-        github_backend, "_refresh_persisted_list_cache_states", lambda inst, r: None
+        github_backend, "_refresh_persisted_list_cache_states", fetched
     )
 
     github_backend.refresh_persisted_list_cache(repo)
@@ -399,7 +404,63 @@ def test_each_poll_logs_the_points_it_spent(tmp_path, monkeypatch):
     assert record["event"] == "poll"
     assert record["repo"] == repo
     assert record["cost"] == 7
+    assert record["fetches"] == 2
     assert record["remaining"] == 3993
+
+
+def test_a_poll_that_fetched_nothing_costs_no_meter_read(tmp_path, monkeypatch):
+    """Metering must not become part of the burn it measures. Most sweeps on a
+    quiet repo are answered entirely by 304s and have no cost to report; taking
+    a `force=True` reading on each side of every one of them was ~4,300 extra
+    `gh api graphql` invocations an hour at three repos on a 5s loop."""
+    import watchtower.github_backend as github_backend
+
+    repo = "acme/quiet-poll"
+    reads = {"n": 0}
+
+    def counted(*, force=False):
+        reads["n"] += 1
+        return {"limit": 5000, "remaining": 4000, "used": 1000}
+
+    monkeypatch.setattr(github_backend, "_graphql_quota_snapshot", counted)
+    monkeypatch.setattr(
+        github_backend, "_refresh_persisted_list_cache_states", lambda inst, r: None
+    )
+
+    github_backend.refresh_persisted_list_cache(repo)
+
+    assert not (tmp_path / "gh-quota.log").exists()
+    assert reads["n"] <= 1, "a fetchless sweep must not pay for a closing reading"
+
+
+def test_the_opening_reading_is_reused_across_polls(monkeypatch):
+    """One meter read per metered sweep, not two: the closing reading of a
+    repo's last poll is the opening reading of its next."""
+    import watchtower.github_backend as github_backend
+
+    repo = "acme/reused-reading"
+    github_backend._GH_POLL_LAST_SNAPSHOT[repo] = {
+        "limit": 5000, "remaining": 4000, "used": 1000,
+    }
+    forced = {"n": 0}
+
+    def counted(*, force=False):
+        forced["n"] += 1 if force else 0
+        return {"limit": 5000, "remaining": 3990, "used": 1010}
+
+    monkeypatch.setattr(github_backend, "_graphql_quota_snapshot", counted)
+    monkeypatch.setattr(
+        github_backend,
+        "_refresh_persisted_list_cache_states",
+        lambda inst, r: github_backend._LIST_FETCH_COUNT.__setitem__(
+            "n", github_backend._LIST_FETCH_COUNT["n"] + 1
+        ),
+    )
+
+    github_backend.refresh_persisted_list_cache(repo)
+
+    assert forced["n"] == 1
+    assert github_backend._GH_POLL_LAST_SNAPSHOT[repo]["used"] == 1010
 
 
 def test_quota_logging_cannot_break_a_poll(tmp_path, monkeypatch):
