@@ -362,6 +362,25 @@ def test_quota_snapshot_reads_the_in_band_ratelimit_not_the_rest_endpoint(monkey
     assert not any("rate_limit" in arg for arg in calls[0])
 
 
+def test_the_quota_probe_cannot_reach_the_machines_own_github(monkeypatch):
+    """WATCHTOWER-27: the guard reads the quota in-band, so with the
+    developer's real `gh` on PATH the cache/ETag suites quietly became a
+    function of how much quota the live fleet had left this hour -- 11 of them
+    failed together, as "a fresh read served the persisted snapshot", whenever
+    it was under `_GH_GRAPHQL_LOW_THRESHOLD`. The probe must resolve the inert
+    stub and report a fixed healthy reading instead."""
+    import shutil
+    from pathlib import Path
+
+    import watchtower.github_backend as github_backend
+
+    assert Path(shutil.which("gh") or "").parent.name == "watchtower-test-bin"
+    assert github_backend._graphql_quota_snapshot(force=True) == {
+        "limit": 5000, "remaining": 5000, "used": 0,
+    }
+    assert github_backend._graphql_rate_limit_remaining() > github_backend._GH_GRAPHQL_LOW_THRESHOLD
+
+
 def test_an_unreadable_quota_meter_does_not_break_reads(monkeypatch):
     """An unreadable meter must return None so callers proceed normally --
     quota bookkeeping is not allowed to be what freezes the queue."""

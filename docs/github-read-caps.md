@@ -36,6 +36,20 @@ the staleness bound: seeded entries are then rejected as stale, soft readers
 fall back to live fetches, and the change makes quota use *worse* than
 before. Move both or neither.
 
+## The quota guard reads the meter in-band
+
+`_list_issues` has a third guard: under `_GH_GRAPHQL_LOW_THRESHOLD` remaining
+GraphQL points it serves cached data rather than fetching. It learns
+"remaining" by shelling out to `gh api graphql` right there in the read path,
+so anything running that code inherits the machine's live quota.
+
+In tests that made the cache/ETag suites a function of the fleet's hourly
+burn: on a rested account they passed, and once the window was spent 11 of
+them failed together, all reporting that a fresh read had served the persisted
+snapshot (WATCHTOWER-27). `tests/conftest.py` therefore puts an inert `gh` on
+PATH that answers the quota probe with a fixed healthy reading; a test that
+needs a working `gh` installs its own in front of it.
+
 ## Adding a read path
 
 If you add a code path that lists issues, route it through `_list_issues`

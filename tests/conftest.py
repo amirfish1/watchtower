@@ -71,15 +71,51 @@ def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
 
 
+# The GraphQL quota probe `gh` answers here. `_list_issues` reads the real
+# hourly quota in-band (`_graphql_quota_snapshot`) and, under
+# `_GH_GRAPHQL_LOW_THRESHOLD`, serves cached data instead of fetching. With
+# the developer's own `gh` on PATH that made ~11 cache/ETag tests depend on
+# how much quota the live fleet had left this hour: they passed on a rested
+# account and failed together, as "a fresh read returned the persisted
+# snapshot", once the fleet had burned the window down (WATCHTOWER-27).
+# A fixed healthy reading makes the guard's not-firing deterministic.
+_INERT_GH = """#!/bin/sh
+case "$*" in
+  *rateLimit*) echo '{"data":{"rateLimit":{"limit":5000,"remaining":5000,"used":0}}}' ;;
+  *) echo "inert test gh refused: $*" >&2; exit 2 ;;
+esac
+"""
+
+
 @pytest.fixture(autouse=True)
-def inert_codex_binary(tmp_path, monkeypatch):
-    """Keep a test from resolving the developer's real Codex executable."""
+def inert_engine_binaries(tmp_path, monkeypatch):
+    """Keep a test from resolving the developer's real `codex`/`gh`.
+
+    A test that wants a working `gh` installs its own fake later in setup, so
+    its bin dir lands in front of this one on PATH.
+    """
     bin_dir = tmp_path / "watchtower-test-bin"
     bin_dir.mkdir()
     codex = bin_dir / "codex"
     codex.write_text("#!/bin/sh\nexit 0\n")
     codex.chmod(0o755)
+    gh = bin_dir / "gh"
+    gh.write_text(_INERT_GH)
+    gh.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+
+
+@pytest.fixture(autouse=True)
+def reset_gh_quota_cache():
+    """The quota snapshot is a module global cached for 30s -- i.e. across
+    test boundaries. Whatever a test taught it must not decide whether the
+    next test's read is allowed to fetch."""
+    import watchtower.github_backend as github_backend
+
+    empty = {"ts": 0.0, "snapshot": None}
+    github_backend._GH_GRAPHQL_QUOTA_CACHE.update(empty)
+    yield
+    github_backend._GH_GRAPHQL_QUOTA_CACHE.update(empty)
 
 
 # Every path-ish knob WatchTower reads from the environment. Redirecting all of
