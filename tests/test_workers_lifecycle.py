@@ -4047,3 +4047,71 @@ def test_deliver_release_instruction_falls_back_when_no_registry_row(
     result = wt.workers._deliver_release_instruction(w, "you are released")
 
     assert result["transport"] != "uds"
+
+
+# ============================================== no self-echo on dispatch (WT-25)
+def _fifo_pending(fd) -> bool:
+    """Is anything waiting on this worker's FIFO? The reader fd is a blocking
+    O_RDWR handle, so a bare os.read() on an empty FIFO hangs the test."""
+    return bool(select.select([fd], [], [], 0.05)[0])
+
+
+def test_dispatch_does_not_nudge_anyone_about_an_already_claimed_ticket(wt):
+    """WATCHTOWER-25: ▶ pressed seconds after a claim landed broadcast
+    "New ticket X filed. Claim it" to every live worker on the queue --
+    including the worker holding X, which read its own claim back as an
+    instruction to claim again, mid-turn."""
+    wt.config.set_auto_drain("Q", True)
+    holder = _live_worker(wt, "Q")
+    _live_worker(wt, "Q")  # a second live worker: it can't claim it either
+    item = wt.q.enqueue(project="Q", note="already mine")
+    wt.q.claim_by_ref(item["ref"], holder["worker_id"])
+
+    reason = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+
+    assert reason == f"already claimed by {holder['worker_id']} — no nudge"
+    assert [_fifo_pending(fd) for fd in wt._readers] == [False, False]
+
+
+def test_dispatch_still_nudges_for_an_unclaimed_ticket(wt):
+    """The guard is about claimed tickets only -- a fresh one still dispatches."""
+    wt.config.set_auto_drain("Q", True)
+    _live_worker(wt, "Q")
+    item = wt.q.enqueue(project="Q", note="up for grabs")
+
+    reason = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+
+    assert reason == "nudged 1 live worker(s) — immediate pickup"
+    msg = json.loads(os.read(wt._readers[-1], 65536).decode().strip())
+    assert item["ref"] in msg["message"]["content"][0]["text"]
+
+
+def test_dispatch_does_not_nudge_the_session_that_filed_the_ticket(wt, monkeypatch):
+    """Telling a session about its own `wt add` is never news -- and it lands
+    as a steer mid-turn (same class as WATCHTOWER-21's comment echo)."""
+    wt.config.set_auto_drain("Q", True)
+    filer = _live_worker(wt, "Q")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", str(filer["session_id"]))
+    item = wt.q.enqueue(project="Q", note="filed by the only live worker")
+
+    reason = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+
+    assert "nudged" not in reason
+    assert _fifo_pending(wt._readers[-1]) is False
+
+
+def test_notify_workers_exclude_skips_by_worker_id_and_session_id(wt):
+    by_worker = _live_worker(wt, "Q")
+    by_session = _live_worker(wt, "Q")
+    other = _live_worker(wt, "Q")
+
+    delivered = wt.workers.notify_workers(
+        "Q", "nudge",
+        exclude={by_worker["worker_id"], str(by_session["session_id"])},
+    )
+
+    assert delivered == 1
+    msg = json.loads(os.read(wt._readers[-1], 65536).decode().strip())
+    assert msg["message"]["content"][0]["text"] == "nudge"
+    assert other["worker_id"] not in {by_worker["worker_id"],
+                                      by_session["worker_id"]}

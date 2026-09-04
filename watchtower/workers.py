@@ -858,13 +858,39 @@ def _worker_released(w: Dict[str, Any]) -> bool:
     return bool(worker_id and (STOP_SIGNALS_DIR / worker_id).exists())
 
 
-def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) -> int:
+def _self_identities() -> Set[str]:
+    """Every string that names the session running this process right now.
+
+    Same signals ``cli._caller_identity`` reads, and the same ones the claim
+    path records into ``claimed_by``/``claimed_session_id``, so a match here
+    means "this worker IS me". Used to keep a push from echoing back at its
+    own author (WATCHTOWER-25).
+    """
+    out: Set[str] = set()
+    for var in ("WT_WORKER", "CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
+        value = str(os.environ.get(var, "") or "").strip()
+        if value:
+            out.add(value)
+    return out
+
+
+def notify_workers(
+    queue: str, text: str, max_idle_s: Optional[float] = None,
+    exclude: Optional[Set[str]] = None,
+) -> int:
     """Push `text` to live workers on `queue` via their FIFO.
 
     ``max_idle_s`` defaults to the lifecycle release floor. A cache-cold worker
     is still the queue's valid worker and must be woken for new work; only a
     separately verified/released worker is skipped. Callers may pass a smaller
     bound when they specifically want warm-cache-only routing.
+
+    ``exclude`` is a set of worker ids / session ids that must NOT be pushed
+    to. Nothing here is news to the session that caused it: telling the
+    session that just filed a ticket "a new ticket was filed, claim it"
+    steers it mid-turn with an echo of its own command (WATCHTOWER-25, same
+    class as WATCHTOWER-21's comment echo and the transition-notify actor
+    drop).
 
     A worker whose turn is still open is SKIPPED, not written to: the idle
     filter above preferentially selects warm workers, i.e. exactly the ones
@@ -885,6 +911,11 @@ def notify_workers(queue: str, text: str, max_idle_s: Optional[float] = None) ->
             continue  # already released from queue staffing
         if _worker_idle_s(w) >= max_idle_s:
             continue
+        if exclude and (
+            str(w.get("worker_id") or "") in exclude
+            or str(w.get("session_id") or "") in exclude
+        ):
+            continue  # never push a nudge back at whoever caused it
         # UDS first. It is steer by construction -- the frame goes at peer
         # priority `next`, which Claude injects into a running turn without
         # aborting it -- so unlike a FIFO write it is safe even mid-turn, and
@@ -3794,6 +3825,7 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
 
     Disposition, logged as `DISPATCH <ref> — <reason>`:
       - auto_drain off, no ▶      → queued as backlog (no worker)
+      - somebody already holds it → no nudge (nothing left to dispatch)
       - a warm worker is live     → nudged via its FIFO (immediate pickup)
       - no eligible worker        → release verified-idle + reconcile
       - reconcile spawned nothing → no action (with the reconcile skip reason)
@@ -3804,17 +3836,41 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
     try:
         ref = ref or ""
         run_requested = False
+        # One read of this ticket, from the cached list rather than a
+        # per-issue `gh issue view`: on a GitHub-backed queue that view is an
+        # uncapped live fetch per dispatch (docs/github-read-caps.md), and the
+        # enqueue/mark_runnable that precedes every call here already
+        # invalidated the list cache in this same process, so the list is
+        # read-your-own-writes fresh without costing an extra round trip.
+        item = None
+        if ref:
+            item = next(
+                (it for it in (_q.list_items(project=queue) or [])
+                 if str(it.get("ref") or "") == ref),
+                None,
+            )
         if not config.auto_drain(queue):
             # Drain off parks the backlog, but not a run somebody just asked
             # for -- bailing here is what made ▶ report "Running" and do
             # nothing. reconcile_once() staffs requested runs on drain-off
             # queues, so the reconcile path below has real work to do.
-            item = _q.get(ref) if ref else None
             run_requested = bool((item or {}).get("run_requested", False))
             if not run_requested:
                 reason = "queued — auto_drain off (backlog, no worker)"
                 _log("DISPATCH", f"{ref} — {reason}", queue=queue)
                 return reason
+        # Nobody should be told to claim a ticket somebody already holds.
+        # `wt run` on an in-progress ticket (a ▶ pressed seconds after the
+        # claim landed) used to broadcast "New ticket X filed. Claim it" to
+        # every live worker on the queue -- including the very worker holding
+        # X, which read it mid-`wt claim` as an instruction to claim what it
+        # had just claimed (WATCHTOWER-25). The others could not have claimed
+        # it either; the claim guard would have refused them.
+        holder = str((item or {}).get("claimed_by") or "")
+        if holder and (item or {}).get("status") == "in_progress":
+            reason = f"already claimed by {holder} — no nudge"
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
         claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
         nudge = (
             f"A run was requested for {ref} on {queue} (its queue is not "
@@ -3825,7 +3881,8 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             f"New ticket {ref} filed on {queue}. Claim it with "
             f"`wt claim -q {queue} --worker <your-id>{claim_filter} --json` and drain the queue."
         )
-        delivered = notify_workers(queue, nudge)
+        # ...and the session that filed it (or pressed ▶) already knows.
+        delivered = notify_workers(queue, nudge, exclude=_self_identities())
         if delivered:
             reason = f"nudged {delivered} live worker(s) — immediate pickup"
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
