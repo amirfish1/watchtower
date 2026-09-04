@@ -2843,12 +2843,16 @@ def test_github_backend_ack_rejects_bad_field_index_and_ticket(tmp_path, monkeyp
 def test_fresh_read_seeds_from_persisted_cache_and_revalidates_with_etag(
     tmp_path, monkeypatch
 ):
-    """WATCHTOWER-16: a cold `fresh=True` process (wt claim / wt ls / the
-    reconciler's dispatch path) must inherit the poller's ETag validator from
-    the persisted cache instead of paying an uncapped GraphQL `gh issue list`.
+    """WATCHTOWER-16, tightened by W4-4: a cold `fresh=True` process (wt claim
+    / wt ls / wt status / the reconciler's dispatch path) must not pay an
+    uncapped GraphQL `gh issue list`.
 
-    A 304 proves the snapshot is current, so `fresh` still means fresh -- it
-    just costs a conditional REST probe rather than GraphQL quota.
+    WATCHTOWER-16 achieved that by seeding the process from the poller's
+    snapshot so it could revalidate with a conditional REST probe instead.
+    W4-4 goes one step further: inside `_persisted_list_ttl_s()` the snapshot
+    is *served*, so a cold fresh read costs no `gh` invocation at all -- not
+    the GraphQL list, and not the probe. Past the TTL the probe path below
+    still applies, and the seeded validator is still what makes it cheap.
     """
     import watchtower.github_backend as github_backend
 
@@ -2889,6 +2893,14 @@ def test_fresh_read_seeds_from_persisted_cache_and_revalidates_with_etag(
     )
 
     assert backend._list_issues("open", fresh=True) == [issue]
+    assert probes == [], "a snapshot inside the TTL is served, not revalidated"
+
+    # Past the TTL the reader does revalidate -- and inherits the poller's
+    # validator to do it, which is the guarantee WATCHTOWER-16 added.
+    github_backend._LIST_CACHE.clear()
+    monkeypatch.setenv("WATCHTOWER_GH_LIST_TTL_S", "0.001")
+    time.sleep(0.01)
+    assert backend._list_issues("open", fresh=True) == [issue]
     assert 'If-None-Match: "v1"' in probes[-1]
 
 
@@ -2897,7 +2909,12 @@ def test_fresh_read_seeded_from_persisted_cache_honors_the_fetch_rate_cap(
 ):
     """Same seed, but the repo genuinely changed (probe 200). The heavy-fetch
     rate cap -- previously invisible to a cold CLI process -- now applies:
-    within the cap the seeded snapshot is served, past it the fetch runs."""
+    within the cap the seeded snapshot is served, past it the fetch runs.
+
+    The snapshot is aged past `_persisted_list_ttl_s()` throughout, because
+    since W4-4 the TTL gate sits *in front* of this cap: inside the TTL the
+    reader returns the snapshot and never reaches the probe. This test is
+    about what happens once it does."""
     import watchtower.github_backend as github_backend
 
     monkeypatch.setenv(
@@ -2916,8 +2933,9 @@ def test_fresh_read_seeded_from_persisted_cache_honors_the_fetch_rate_cap(
         "assignees": [], "labels": [], "createdAt": "2026-07-01T00:00:00Z",
         "updatedAt": "2026-07-01T00:00:00Z", "closedAt": None,
     }
+    stale_at = time.time() - (github_backend._PERSISTED_LIST_STALE_S + 1)
     entry = {
-        "at": time.time(), "data": [issue], "etag": '"v1"',
+        "at": stale_at, "data": [issue], "etag": '"v1"',
         "fetched_at": time.time(),
     }
     github_backend._write_persisted_list_entry(f"{repo}:open", dict(entry))

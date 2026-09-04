@@ -47,6 +47,41 @@ VALID_CONFIDENCES = ("H", "M", "L", "")
 DEFAULT_ITEM_TYPE = "bug"
 COMPLETED_ISSUE_RETENTION_DAYS = 14
 
+# Per-call list cost. GitHub GraphQL charges 1 point per 100 nodes returned,
+# so `--limit` -- not the field list -- is the lever on what one
+# `gh issue list` costs. Measured 2026-09-03 on amirfish1/BYM-Finie: the
+# 14-day closed window is 459 issues, i.e. ~5 points per fetch at
+# `--limit 1000` and ~2 at `--limit 200`.
+#
+# Measured too, and worth writing down because it is counter-intuitive: adding
+# `body` to the field list costs *nothing*. `issues(first:100)` reports
+# `cost: 1` with body and `cost: 1` without it. So `body` stays -- the
+# `<!-- watchtower -->` metadata block that carries claimed_by, lane,
+# priority, readiness, needs_input, history and resolution lives in the issue
+# body, and dropping it from the list would break status and eligibility for
+# every ticket in exchange for zero quota.
+_LIST_LIMIT_DEFAULT = 200
+_LIST_JSON_FIELDS = (
+    "number,title,body,state,url,assignees,labels,createdAt,updatedAt,closedAt"
+)
+
+
+def _list_limit() -> int:
+    """Max issues one ``gh issue list`` may return, per state.
+
+    ``WATCHTOWER_GH_LIST_LIMIT`` overrides the default; a non-positive or
+    unparseable value falls back to it.
+    """
+    raw = os.environ.get("WATCHTOWER_GH_LIST_LIMIT")
+    if raw:
+        try:
+            limit = int(raw)
+        except ValueError:
+            return _LIST_LIMIT_DEFAULT
+        if limit > 0:
+            return limit
+    return _LIST_LIMIT_DEFAULT
+
 _ISSUE_URL_RE = re.compile(r"/issues/(\d+)(?:\D*)?$")
 _META_START = "<!-- watchtower"
 _META_END = "-->"
@@ -112,12 +147,74 @@ _LIST_FETCH_MIN_INTERVAL_S = 60.0
 _GH_LIST_CACHE_FILE = Path.home() / ".watchtower" / "gh-list-cache.json"
 _PERSISTED_LIST_STALE_S = 300.0
 
+# A poll is "in flight" while the poller holds this marker. Readers use it to
+# answer the one question that decides whether they may spend a live `gh`
+# call: is the staleness I'm seeing a *dead* poller (fetch it myself, or the
+# queue freezes) or a poller that is fetching the replacement right now (wait
+# -- my duplicate fetch would buy nothing and cost quota)? Before W4-4 there
+# was no way to tell them apart, so every one of ~8 concurrent lanes answered
+# "dead" simultaneously and each paid for the same list.
+#
+# The marker is a file whose mtime is the poll's start. `_GH_POLL_INFLIGHT_MAX_S`
+# bounds how long a marker is believed: a poller killed mid-fetch leaves its
+# marker behind forever, and an unbounded marker would be indistinguishable
+# from a healthy poll and would stall live reads permanently.
+_GH_POLL_INFLIGHT_MAX_S = 120.0
+
 
 def _list_cache_path() -> Path:
     env = os.environ.get("WATCHTOWER_GH_LIST_CACHE_FILE")
     if env:
         return Path(env).expanduser()
     return _GH_LIST_CACHE_FILE
+
+
+def _persisted_list_ttl_s() -> float:
+    """How long a poller-written snapshot is served without a live read.
+
+    ``WATCHTOWER_GH_LIST_TTL_S`` overrides the 5-minute default; a
+    non-positive or unparseable value falls back to it, so a typo in the
+    environment cannot silently turn every read back into a live `gh` call.
+    """
+    raw = os.environ.get("WATCHTOWER_GH_LIST_TTL_S")
+    if raw:
+        try:
+            ttl = float(raw)
+        except ValueError:
+            return _PERSISTED_LIST_STALE_S
+        if ttl > 0:
+            return ttl
+    return _PERSISTED_LIST_STALE_S
+
+
+def _poll_marker_path(repo: str) -> Path:
+    safe_repo = re.sub(r"[^A-Za-z0-9_.-]", "_", repo or "") or "unknown"
+    return _claim_locks_dir() / f"{safe_repo}.polling"
+
+
+def _mark_poll_started(repo: str) -> None:
+    path = _poll_marker_path(repo)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(os.getpid()))
+    except OSError:
+        pass
+
+
+def _mark_poll_finished(repo: str) -> None:
+    try:
+        _poll_marker_path(repo).unlink()
+    except OSError:
+        pass
+
+
+def _poll_in_flight(repo: str) -> bool:
+    """Whether a poller is mid-fetch for ``repo`` right now."""
+    try:
+        age = time.time() - _poll_marker_path(repo).stat().st_mtime
+    except OSError:
+        return False
+    return age < _GH_POLL_INFLIGHT_MAX_S
 
 
 def _claim_locks_dir() -> Path:
@@ -242,6 +339,29 @@ def refresh_persisted_list_cache(repo: str) -> None:
     list.
     """
     inst = GitHubIssuesBackend(repo, repo=repo)
+    before = _graphql_quota_snapshot(force=True)
+    _mark_poll_started(repo)
+    try:
+        _refresh_persisted_list_cache_states(inst, repo)
+    finally:
+        _mark_poll_finished(repo)
+    after = _graphql_quota_snapshot(force=True)
+    _log_quota(
+        "poll",
+        repo=repo,
+        cost=(
+            None
+            if before is None or after is None
+            else max(0, after["used"] - before["used"])
+        ),
+        remaining=None if after is None else after["remaining"],
+        limit=None if after is None else after["limit"],
+    )
+
+
+def _refresh_persisted_list_cache_states(
+    inst: "GitHubIssuesBackend", repo: str
+) -> None:
     for state in ("open", "closed"):
         key = f"{repo}:{state}"
         # A worker's successful mutation invalidates this shared entry from a
@@ -273,7 +393,7 @@ def refresh_persisted_list_cache(repo: str) -> None:
                 "stale": False,
             }
         try:
-            inst._list_issues(state, fresh=True)
+            inst._list_issues(state, fresh=True, poller=True)
         except GitHubBackendError:
             continue
         entry = _LIST_CACHE.get(key)
@@ -467,39 +587,115 @@ _GH_SUCCESS_WRITE_THROTTLE_S = 30.0
 
 # Pre-emptive GraphQL quota guard. `gh issue list` is a GraphQL operation that
 # can burn the hourly quota fast on a busy repo. Before paying for a rich
-# fetch, check `gh api rate_limit` (a cheap REST call) and skip the fetch when
-# we're close to the limit, serving cached data instead. The check is cached so
-# the extra REST call is amortized across all polls.
+# fetch, read the quota and skip the fetch when we're close to the limit,
+# serving cached data instead. The reading is cached so the extra call is
+# amortized across all polls.
+#
+# THE WRONG METER (measured 2026-09-03, W4-4). This guard used to read the REST
+# endpoint `gh api rate_limit` and look at `.resources.graphql.remaining`. That
+# number is not this token's GraphQL quota. At one instant, on one machine:
+#
+#     gh api rate_limit  -> graphql: used=0     remaining=5000
+#     gh api graphql -f query='{rateLimit{used remaining}}'
+#                        -> rateLimit: used=1025 remaining=3975
+#
+# ...while `~/.watchtower/watcher.log` was full of "API rate limit already
+# exceeded for user ID 255024423". So the guard compared against a number
+# pinned at the limit and could never trip -- it passed at exactly the moments
+# it existed to catch. (WATCHTOWER-19 read the same discrepancy as an
+# invisible *user-level aggregate* limit that `rate_limit` could not see. It is
+# simpler than that: `rate_limit` can see it, we were reading the wrong field
+# of the wrong endpoint. The observed-evidence hold below stays regardless --
+# believing real failures is still correct -- but it is no longer the only
+# defence.)
+#
+# The authoritative meter is the `rateLimit` block returned in-band by a real
+# GraphQL request. Reading it is self-funding: a query whose only selection is
+# `rateLimit` reports `cost: 1` but does not move `used` (measured: two
+# back-to-back reads report an identical `used`).
 _GH_GRAPHQL_LOW_THRESHOLD = 300
 _GH_RATE_LIMIT_CHECK_INTERVAL_S = 30.0
-_GH_GRAPHQL_QUOTA_CACHE: Dict[str, Any] = {"ts": 0.0, "remaining": None}
+_GH_GRAPHQL_QUOTA_CACHE: Dict[str, Any] = {"ts": 0.0, "snapshot": None}
+_GH_QUOTA_LOG_FILE = Path.home() / ".watchtower" / "gh-quota.log"
+_GRAPHQL_QUOTA_QUERY = "{rateLimit{limit cost remaining used resetAt}}"
+
+
+def _quota_log_path() -> Path:
+    env = os.environ.get("WATCHTOWER_GH_QUOTA_LOG")
+    if env:
+        return Path(env).expanduser()
+    return _GH_QUOTA_LOG_FILE
+
+
+def _log_quota(event: str, **fields: Any) -> None:
+    """Append one JSON line of GraphQL quota accounting to the quota log.
+
+    Best-effort and deliberately unable to raise: quota *bookkeeping* must
+    never be what breaks a poll or a queue read.
+    """
+    record: Dict[str, Any] = {"ts": _now_iso(), "event": event}
+    record.update({k: v for k, v in fields.items() if v is not None})
+    try:
+        path = _quota_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+    except (OSError, TypeError, ValueError):
+        pass
+
+
+def _graphql_quota_snapshot(*, force: bool = False) -> Optional[Dict[str, int]]:
+    """Read the authoritative GraphQL quota, in-band. ``None`` if unreadable.
+
+    Cached for ``_GH_RATE_LIMIT_CHECK_INTERVAL_S`` seconds; ``force`` bypasses
+    the cache, which is what the poller's before/after accounting needs.
+    Any failure is swallowed and returns None, in which case callers proceed
+    normally -- an unreadable meter must not be able to freeze the queue.
+    """
+    now = time.time()
+    if not force and now - _GH_GRAPHQL_QUOTA_CACHE["ts"] < _GH_RATE_LIMIT_CHECK_INTERVAL_S:
+        return _GH_GRAPHQL_QUOTA_CACHE["snapshot"]
+    try:
+        result = subprocess.run(
+            ["gh", "api", "graphql", "-f", f"query={_GRAPHQL_QUOTA_QUERY}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return None
+        payload = json.loads(result.stdout)
+        block = (payload.get("data") or {}).get("rateLimit") or {}
+        snapshot = {
+            "limit": int(block.get("limit") or 0),
+            "remaining": int(block.get("remaining") or 0),
+            "used": int(block.get("used") or 0),
+        }
+    except (OSError, ValueError, TypeError, json.JSONDecodeError, subprocess.SubprocessError):
+        return None
+    _GH_GRAPHQL_QUOTA_CACHE["ts"] = now
+    _GH_GRAPHQL_QUOTA_CACHE["snapshot"] = snapshot
+    return snapshot
 
 
 def _graphql_rate_limit_remaining() -> Optional[int]:
-    """Return the current GitHub GraphQL rate-limit remaining, or None.
+    """Remaining points on the authoritative GraphQL quota, or None."""
+    snapshot = _graphql_quota_snapshot()
+    return None if snapshot is None else snapshot["remaining"]
 
-    Caches the result for ``_GH_RATE_LIMIT_CHECK_INTERVAL_S`` seconds. Any
-    failure to read the limit is swallowed and returns None, in which case
-    callers should proceed normally.
+
+def _graphql_quota_remaining_cached() -> Optional[int]:
+    """Remaining points *if already known*, without spending a call to find out.
+
+    For accounting only. `_log_quota` runs on the tail of every heavy list, and
+    reading the meter there through `_graphql_rate_limit_remaining` would spawn
+    a `gh` subprocess on any fetch whose 30s meter cache had expired -- i.e.
+    metering the burn would itself become part of the burn, and would drag a
+    live network call into every unit test that fakes `_run`. A stale-by-30s
+    number in the log is worth more than a call.
     """
-    now = time.time()
-    if now - _GH_GRAPHQL_QUOTA_CACHE["ts"] < _GH_RATE_LIMIT_CHECK_INTERVAL_S:
-        return _GH_GRAPHQL_QUOTA_CACHE["remaining"]
-    try:
-        result = subprocess.run(
-            ["gh", "api", "rate_limit", "--jq", ".resources.graphql.remaining"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            remaining = int(result.stdout.strip())
-            _GH_GRAPHQL_QUOTA_CACHE["ts"] = now
-            _GH_GRAPHQL_QUOTA_CACHE["remaining"] = remaining
-            return remaining
-    except Exception:
-        pass
-    return None
+    snapshot = _GH_GRAPHQL_QUOTA_CACHE.get("snapshot")
+    return None if not isinstance(snapshot, dict) else snapshot.get("remaining")
 
 
 # Observed-evidence rate-limit hold. The pre-emptive guard above reads
@@ -1333,8 +1529,21 @@ class GitHubIssuesBackend:
         return None, etag
 
     def _list_issues(
-        self, state: str = "open", *, fresh: bool = False, strict: bool = False
+        self,
+        state: str = "open",
+        *,
+        fresh: bool = False,
+        strict: bool = False,
+        poller: bool = False,
     ) -> List[Dict[str, Any]]:
+        """Read the issue list for ``state``.
+
+        ``poller=True`` marks the one caller that *owns* live GitHub reads for
+        this repo (``refresh_persisted_list_cache``). Everything else is a
+        reader, and a reader is gated: it serves the poller's snapshot and only
+        goes live when that snapshot is older than ``_persisted_list_ttl_s()``
+        AND no poll is in flight. ``strict=True`` (claim/close, about to write)
+        is exempt -- correctness of a write outranks quota."""
         key = f"{self.repo}:{state}"
         now = time.time()
         cached = _LIST_CACHE.get(key)
@@ -1363,7 +1572,7 @@ class GitHubIssuesBackend:
                 and not cached.get("stale")
             ):
                 return cached["data"]
-        if not strict and (not fresh or backoff_active):
+        if not strict and not poller and (not fresh or backoff_active):
             # The common case for every fresh CLI process (wt run, wt claim,
             # the reconciler's dispatch path): no in-process cache yet, but
             # the background poller (poll_list_caches_forever) almost
@@ -1377,8 +1586,12 @@ class GitHubIssuesBackend:
                 persisted_age = now - float(persisted.get("at") or 0)
                 persisted_stale = bool(persisted.get("stale"))
                 if (
-                    persisted_age < _PERSISTED_LIST_STALE_S
+                    persisted_age < _persisted_list_ttl_s()
                     or backoff_active
+                    # Past the TTL, but the poller is fetching the replacement
+                    # right now: one more second of staleness is strictly
+                    # better than N lanes each paying for the same list.
+                    or _poll_in_flight(self.repo)
                 ):
                     cached = {
                         "at": persisted["at"], "data": persisted["data"],
@@ -1397,34 +1610,51 @@ class GitHubIssuesBackend:
                     # and stale data still beats failing the command (OPS-589).
                     if not persisted_stale or backoff_active:
                         return persisted["data"]
-        elif not strict and (cached is None or cached.get("data") is None):
+        elif not strict and not poller:
             # `fresh=True`, non-strict (`wt claim`, `wt ls`, `wt status`, the
-            # reconciler's dispatch path): the caller asked for current state,
-            # so the snapshot above is NOT served as-is -- but it is still
-            # loaded as this process's cache seed. Without it, every one of
-            # these short-lived processes started with an empty `_LIST_CACHE`,
-            # skipped the ETag probe AND the heavy-fetch rate cap below (both
-            # require a cached entry), and went straight to a full GraphQL
-            # `gh issue list` per state. Fleet-wide that was the single
-            # largest GraphQL consumer -- uncapped by construction, since the
-            # caps only ever lived in a process that had already fetched once
-            # (WATCHTOWER-16 / OPS-838/839). Seeded, the same call revalidates
-            # with a conditional REST probe that costs no GraphQL quota, and a
-            # 304 proves the snapshot is current -- so `fresh` still means
-            # fresh. Only a genuinely-changed repo re-fetches, subject to the
-            # shared cap.
+            # reconciler's dispatch path). THIS is the burst the quota
+            # exhaustion was made of: ~8 concurrent Becky lanes, each a fresh
+            # short-lived process, each treating "the caller asked for current
+            # state" as a licence to go to GitHub itself.
+            #
+            # It previously only *seeded* this process's `_LIST_CACHE` from the
+            # snapshot and then always fell through to the ETag probe and,
+            # on a repo where the probe returns 200 on every sweep (any repo
+            # with live workers), to a real fetch bounded only by the shared
+            # 60s cap. Seeding fixed the uncapped case (WATCHTOWER-16 /
+            # OPS-838/839) but left the fleet paying a probe per lane per
+            # invocation and a heavy fetch per minute per state on top of the
+            # poller's own.
+            #
+            # Now the snapshot is *served*, not just seeded, while it is
+            # within `_persisted_list_ttl_s()`. The poller refreshes every few
+            # seconds, so "fresh" in practice still means seconds old, and the
+            # TTL is the explicit bound on how wrong that can get. Two
+            # exemptions survive, and only two:
+            #   - `stale`: a write already superseded this snapshot, and
+            #     read-your-own-writes outranks quota (see _invalidate_list_cache).
+            #   - past the TTL with no poll in flight: the poller is dead or
+            #     wedged, and a reader fetching for itself is what keeps the
+            #     queue moving instead of freezing on old data.
             persisted = _read_persisted_list_cache().get(key)
             if persisted is not None and persisted.get("data") is not None:
-                if now - float(persisted.get("at") or 0) < _PERSISTED_LIST_STALE_S:
+                persisted_age = now - float(persisted.get("at") or 0)
+                persisted_stale = bool(persisted.get("stale"))
+                if cached is None or cached.get("data") is None:
                     cached = {
                         "at": float(persisted.get("at") or 0),
                         "data": persisted["data"],
                         "error": None,
                         "etag": str(persisted.get("etag") or ""),
                         "fetched_at": float(persisted.get("fetched_at") or 0),
-                        "stale": bool(persisted.get("stale")),
+                        "stale": persisted_stale,
                     }
                     _LIST_CACHE[key] = cached
+                if not persisted_stale and (
+                    persisted_age < _persisted_list_ttl_s()
+                    or _poll_in_flight(self.repo)
+                ):
+                    return persisted["data"]
         # Pre-emptive GraphQL quota guard. If we're close to the hourly limit,
         # skip the expensive rich fetch (and the ETag probe that would only tell
         # us to do it) and serve whatever cached data we have. This keeps a
@@ -1519,15 +1749,22 @@ class GitHubIssuesBackend:
                 # for nested comment bodies across the whole queue can return
                 # a 503, making even an otherwise healthy queue unavailable.
                 # `get()` still requests comments for one ticket at a time.
-                "--json", "number,title,body,state,url,assignees,labels,createdAt,updatedAt,closedAt",
-                "--limit", "1000",
+                "--json", _LIST_JSON_FIELDS,
+                "--limit", str(_list_limit()),
             ]
             if state == "closed":
                 cutoff = (
                     datetime.now(timezone.utc)
                     - timedelta(days=COMPLETED_ISSUE_RETENTION_DAYS)
                 ).date().isoformat()
-                args.extend(["--search", f"closed:>={cutoff}"])
+                # `sort:updated-desc` is what makes `_list_limit()` safe to
+                # lower. Without an explicit sort the truncation point is
+                # GitHub's relevance ranking, i.e. arbitrary; with it, the rows
+                # we keep are the newest, which are exactly the ones
+                # health.queue_status reads (most recent `closed_at`, and the
+                # drain rate over a short window). Only the cosmetic total
+                # `closed` count is affected by truncation.
+                args.extend(["--search", f"closed:>={cutoff} sort:updated-desc"])
             raw = self._run(args)
             try:
                 data = json.loads(raw or "[]")
@@ -1552,6 +1789,15 @@ class GitHubIssuesBackend:
                 return prev_data
             raise
         _record_gh_success()
+        _log_quota(
+            "list",
+            repo=self.repo,
+            state=state,
+            rows=len(result),
+            strict=strict,
+            poller=poller,
+            remaining=_graphql_quota_remaining_cached(),
+        )
         entry = {
             "at": now, "data": result, "error": None, "etag": etag,
             "fetched_at": now, "stale": False,

@@ -61,6 +61,12 @@ def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
     monkeypatch.setenv("WATCHTOWER_OUTBOX_FILE", str(tmp_path / "outbox.json"))
+    # Same class of leak, GraphQL-quota accounting (W4-4): `_log_quota` appends
+    # on the tail of every heavy list, so without this every `gh`-faking test
+    # in the suite wrote fabricated poll costs into the live fleet's
+    # ~/.watchtower/gh-quota.log -- the one file an operator reads to decide
+    # whether the real burn is under control.
+    monkeypatch.setenv("WATCHTOWER_GH_QUOTA_LOG", str(tmp_path / "gh-quota.log"))
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
 
@@ -90,6 +96,7 @@ _ENV_FILES = {
     "WATCHTOWER_CODEX_THREAD_REGISTRY": "codex-threads.json",
     "WATCHTOWER_GH_CONNECTIVITY_FILE": "gh-connectivity.json",
     "WATCHTOWER_GH_LIST_CACHE_FILE": "gh-list-cache.json",
+    "WATCHTOWER_GH_QUOTA_LOG": "gh-quota.log",
     "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE": "no-ccc-spawn-defaults.json",
     "WATCHTOWER_DAEMON_PID": "daemon.pid",
     "WATCHTOWER_DASHBOARD_PID": "dashboard.pid",
