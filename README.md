@@ -102,6 +102,22 @@ wt skills remove    # undo: removes only the symlinks wt manages
 See [`docs/agent-discovery.md`](docs/agent-discovery.md) for the design
 rationale (why a skill, not just a repo convention or an MCP server).
 
+## Testing
+
+Use the focused, host-independent spawn suite when changing worker launch or
+CCC integration behavior. It stubs engine binaries and does not start an agent:
+
+```bash
+python3 -m pytest -q tests/test_critique.py tests/test_workers_lifecycle.py tests/test_smoke.py -k spawn
+```
+
+The full suite can exceed short command-runner limits. Run it in `tmux` when a
+complete baseline is needed, then reconnect to the session for its final result:
+
+```bash
+tmux new -s watchtower-pytest 'python3 -m pytest -q'
+```
+
 ### Browser annotation widget (optional)
 
 Drop `contrib/annotate-widget.js` into your project to let users file tickets directly from the browser with a single click. See [`contrib/annotate-widget.md`](contrib/annotate-widget.md).
