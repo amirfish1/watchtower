@@ -217,6 +217,41 @@ def _poll_in_flight(repo: str) -> bool:
     return age < _GH_POLL_INFLIGHT_MAX_S
 
 
+def _try_claim_poll(repo: str) -> bool:
+    """Atomically become the owner of a fetch for ``repo``; False if taken.
+
+    Readers race each other, so the check and the claim have to be one
+    operation -- `if not _poll_in_flight(): _mark_poll_started()` lets every
+    lane that runs the check in the same instant win it, which is the exact
+    stampede the marker exists to prevent. `O_CREAT | O_EXCL` makes the kernel
+    pick one winner.
+
+    An expired marker (owner killed mid-fetch) is removed first, so a dead
+    poller cannot make the claim permanently unwinnable.
+    """
+    path = _poll_marker_path(repo)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    if path.exists() and not _poll_in_flight(repo):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    try:
+        os.write(fd, str(os.getpid()).encode())
+    finally:
+        os.close(fd)
+    return True
+
+
 def _claim_locks_dir() -> Path:
     env = os.environ.get("WATCHTOWER_GH_CLAIM_LOCKS_DIR")
     if env:
@@ -314,6 +349,14 @@ def _invalidate_list_cache(repo: str) -> None:
         entry = _LIST_CACHE.get(f"{repo}:{state}")
         if entry is not None:
             entry["stale"] = True
+            # `stale_local` is the part of read-your-own-writes that is
+            # genuinely non-negotiable: *this* process just wrote, so its next
+            # read must be live, full stop. The persisted `stale` flag below is
+            # a weaker claim -- it tells other processes "a write landed" -- and
+            # W4-4 lets those coalesce behind one refresh instead of each
+            # paying for its own. Conflating the two is what made the busy repo
+            # re-list once per reader per write. See `_list_issues`.
+            entry["stale_local"] = True
 
     def mutate(data: Dict[str, Any]) -> bool:
         changed = False
@@ -1593,12 +1636,20 @@ class GitHubIssuesBackend:
                     # better than N lanes each paying for the same list.
                     or _poll_in_flight(self.repo)
                 ):
+                    # Seeding must not lose this process's own
+                    # `stale_local` flag: that flag is the record that *we*
+                    # wrote, and it is the one claim on freshness the snapshot
+                    # can never satisfy.
+                    stale_local = bool(
+                        (cached or {}).get("stale_local")
+                    )
                     cached = {
                         "at": persisted["at"], "data": persisted["data"],
                         "error": None,
                         "etag": str(persisted.get("etag") or ""),
                         "fetched_at": float(persisted.get("fetched_at") or 0),
-                        "stale": persisted_stale,
+                        "stale": persisted_stale or stale_local,
+                        "stale_local": stale_local,
                     }
                     _LIST_CACHE[key] = cached
                     # A stale-marked snapshot is one some process's write has
@@ -1608,7 +1659,16 @@ class GitHubIssuesBackend:
                     # requires, exactly as the old deletion forced. During a
                     # recorded outage there is no live read to fall through to,
                     # and stale data still beats failing the command (OPS-589).
-                    if not persisted_stale or backoff_active:
+                    #
+                    # W4-4 adds the third case: someone *else*'s write marked it
+                    # stale and a refresh is already in flight. Only the writer
+                    # needs the live read; the rest can wait for the one that is
+                    # already running rather than each starting their own.
+                    if not stale_local and (
+                        not persisted_stale
+                        or backoff_active
+                        or _poll_in_flight(self.repo)
+                    ):
                         return persisted["data"]
         elif not strict and not poller:
             # `fresh=True`, non-strict (`wt claim`, `wt ls`, `wt status`, the
@@ -1650,10 +1710,23 @@ class GitHubIssuesBackend:
                         "stale": persisted_stale,
                     }
                     _LIST_CACHE[key] = cached
-                if not persisted_stale and (
-                    persisted_age < _persisted_list_ttl_s()
-                    or _poll_in_flight(self.repo)
-                ):
+                if cached.get("stale_local"):
+                    pass  # this process wrote: nothing may stand in for a live read
+                elif not persisted_stale:
+                    if (
+                        persisted_age < _persisted_list_ttl_s()
+                        or _poll_in_flight(self.repo)
+                    ):
+                        return persisted["data"]
+                elif _poll_in_flight(self.repo):
+                    # Someone else's write marked this stale and a refresh is
+                    # already running. On the repo the fleet actually works in,
+                    # writes land continuously and every reader saw every one of
+                    # them as "go live" -- measured after the TTL gate shipped,
+                    # 6 reader fetches to 0 poller fetches in one 90s window on
+                    # amirfish1/BYM-Finie. Waiting out the in-flight refresh
+                    # costs one fetch of extra staleness and turns N duplicate
+                    # lists back into one.
                     return persisted["data"]
         # Pre-emptive GraphQL quota guard. If we're close to the hourly limit,
         # skip the expensive rich fetch (and the ETag probe that would only tell
@@ -1740,6 +1813,14 @@ class GitHubIssuesBackend:
             # came back unusable, `gh` itself is broken or hung, and retrying it
             # here would only double the time we spend discovering that.
             _, etag = self._probe_list_change(state, "")
+        # Claim ownership of this fetch for its duration. Readers race each
+        # other, not just the poller: ~8 lanes reaching this line within the
+        # same second each used to pay for the same list. Whoever gets here
+        # first publishes the marker; the rest take the branches above and
+        # serve the snapshot. Strict callers are exempt from *waiting* on the
+        # marker but still publish one, since their fetch is just as good a
+        # reason for everyone else to hold off.
+        own_marker = _try_claim_poll(self.repo)
         try:
             args = [
                 "issue", "list",
@@ -1774,6 +1855,9 @@ class GitHubIssuesBackend:
                 raise GitHubBackendError("gh issue list returned a non-list JSON value")
             result = [issue for issue in data if isinstance(issue, dict)]
         except GitHubBackendError as exc:
+            if own_marker:
+                _mark_poll_finished(self.repo)
+                own_marker = False
             _record_gh_failure(str(exc))
             prev_data = cached.get("data") if cached else None
             _LIST_CACHE[key] = {
@@ -1788,6 +1872,8 @@ class GitHubIssuesBackend:
             if prev_data is not None and not strict:
                 return prev_data
             raise
+        if own_marker:
+            _mark_poll_finished(self.repo)
         _record_gh_success()
         _log_quota(
             "list",
@@ -1800,7 +1886,7 @@ class GitHubIssuesBackend:
         )
         entry = {
             "at": now, "data": result, "error": None, "etag": etag,
-            "fetched_at": now, "stale": False,
+            "fetched_at": now, "stale": False, "stale_local": False,
         }
         _LIST_CACHE[key] = entry
         if cached is not None and cached.get("stale"):

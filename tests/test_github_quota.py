@@ -414,3 +414,135 @@ def test_quota_logging_cannot_break_a_poll(tmp_path, monkeypatch):
         github_backend.Path, "mkdir", lambda *a, **k: (_ for _ in ()).throw(OSError())
     )
     github_backend._log_quota("poll", repo="acme/x", cost=1)  # must not raise
+
+
+# --- write-invalidation coalescing -----------------------------------------
+#
+# The TTL gate alone was not enough on the repo the fleet actually works in.
+# Measured after it shipped: 6 reader fetches to 0 poller fetches in one 90s
+# window on amirfish1/BYM-Finie, because live workers write continuously and
+# every write marks the shared snapshot stale, which every reader read as
+# "go live". Only the process that wrote actually needs that.
+
+def test_a_reader_waits_out_another_processes_invalidation(monkeypatch):
+    """Someone else's write marked the snapshot stale and a refresh is already
+    running: this reader must wait for it, not start a duplicate."""
+    import watchtower.github_backend as github_backend
+
+    repo = "acme/foreign-write-coalesced"
+    issues = [_issue(repo=repo)]
+    _seed_snapshot(repo, issues, age_s=1.0, stale=True)
+    github_backend._mark_poll_started(repo)
+
+    backend = _backend_that_must_not_call_gh(monkeypatch, repo)
+
+    assert backend._list_issues("open", fresh=True) == issues
+    assert backend._list_issues("open", fresh=False) == issues
+
+
+def test_this_processes_own_write_still_forces_a_live_read(monkeypatch):
+    """Read-your-own-writes is the one claim coalescing may never satisfy:
+    `dispatch_after_enqueue` calls count_manual_eligible() straight after
+    mark_runnable() and would otherwise dispatch off pre-write data."""
+    import watchtower.github_backend as github_backend
+
+    repo = "acme/own-write-not-coalesced"
+    _seed_snapshot(repo, [_issue(repo=repo)], age_s=1.0)
+
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    live = [_issue(2, "post-write", repo=repo)]
+    calls = {"n": 0}
+
+    monkeypatch.setattr(
+        backend, "_run", lambda args, check=True: (
+            calls.update(n=calls["n"] + 1), json.dumps(live))[1]
+    )
+    monkeypatch.setattr(backend, "_probe_list_change", lambda state, etag: (None, etag))
+
+    # Warm this process's cache, then let it write.
+    assert backend._list_issues("open", fresh=True) == [_issue(repo=repo)]
+    github_backend._invalidate_list_cache(repo)
+    # A concurrent refresh is running -- irrelevant, we wrote.
+    github_backend._mark_poll_started(repo)
+
+    assert backend._list_issues("open", fresh=True) == live
+    assert calls["n"] == 1
+
+    # Same for the soft path, which seeds from the snapshot and must not let
+    # that seeding wipe the local-write flag.
+    github_backend._invalidate_list_cache(repo)
+    assert backend._list_issues("open", fresh=False) == live
+    assert calls["n"] == 2
+
+
+def test_the_reader_that_does_go_live_claims_the_fetch(monkeypatch):
+    """Readers race each other, not just the poller. Whoever reaches the fetch
+    first publishes the marker so its peers coalesce onto it."""
+    import watchtower.github_backend as github_backend
+
+    repo = "acme/reader-claims-marker"
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+    seen = {}
+
+    def fake_run(args, *, check=True):
+        # Observed from inside the fetch: a peer arriving now must see it.
+        seen["in_flight_during_fetch"] = github_backend._poll_in_flight(repo)
+        return "[]"
+
+    monkeypatch.setattr(backend, "_run", fake_run)
+    monkeypatch.setattr(backend, "_probe_list_change", lambda state, etag: (None, etag))
+
+    backend._list_issues("open", fresh=True)
+
+    assert seen["in_flight_during_fetch"] is True
+    assert github_backend._poll_in_flight(repo) is False, "marker released after"
+
+
+def test_a_failed_reader_fetch_releases_its_marker(monkeypatch):
+    """A marker leaked by a failing fetch would gate every peer for its full
+    expiry window -- on a repo that is already erroring, that is the worst
+    possible time to also stop serving reads."""
+    import watchtower.github_backend as github_backend
+
+    repo = "acme/reader-marker-on-error"
+    backend = github_backend.GitHubIssuesBackend("T", repo=repo)
+
+    def boom(args, *, check=True):
+        raise github_backend.GitHubBackendError("gh exploded")
+
+    monkeypatch.setattr(backend, "_run", boom)
+    monkeypatch.setattr(backend, "_probe_list_change", lambda state, etag: (None, etag))
+
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend._list_issues("open", fresh=True)
+
+    assert github_backend._poll_in_flight(repo) is False
+
+
+def test_only_one_racing_reader_wins_the_fetch(monkeypatch):
+    """The claim and the check have to be one operation. `if not in_flight:
+    mark()` lets every lane that runs the check in the same instant win it --
+    which is the stampede the marker exists to prevent."""
+    import watchtower.github_backend as github_backend
+
+    repo = "acme/racing-readers"
+    winners = [github_backend._try_claim_poll(repo) for _ in range(8)]
+
+    assert winners.count(True) == 1
+    assert github_backend._poll_in_flight(repo) is True
+
+
+def test_an_expired_marker_does_not_make_the_claim_unwinnable(monkeypatch):
+    """A poller killed mid-fetch leaves its marker behind. If that blocked the
+    claim forever, no reader could ever fetch again."""
+    import watchtower.github_backend as github_backend
+
+    repo = "acme/expired-marker-claim"
+    assert github_backend._try_claim_poll(repo) is True
+    assert github_backend._try_claim_poll(repo) is False
+
+    marker = github_backend._poll_marker_path(repo)
+    old = time.time() - (github_backend._GH_POLL_INFLIGHT_MAX_S + 5)
+    os.utime(marker, (old, old))
+
+    assert github_backend._try_claim_poll(repo) is True
