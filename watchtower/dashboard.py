@@ -17,6 +17,7 @@ Routes:
     GET  /api/queues                raw per-queue counts (mirrors `wt queues`)
     GET  /api/queue/<name>          active + closed tickets (closed carry resolution)
     POST /api/ticket/<ref>/run      request a run; the reconciler spawns the worker
+    POST /api/queue/<name>/reconcile run one reconciler pass for a queue alert
     POST /api/queue/<name>/add      ingest a ticket — {"note": "...", "url": "...",
                                       "selector": "...", "repo_path": "...",
                                       "title": "...", "source": "...", "text": "..."}
@@ -53,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import health, queue as q, workers
+from . import config, health, queue as q, workers
 
 REFRESH_SECONDS = 5
 
@@ -118,12 +119,45 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     items = q.list_items()
     rows = health.all_status(stuck_minutes=stuck_minutes, items=items)
     counts = workers.worker_counts()
+    wrows = workers.list_workers(prune=False)
+    workers.annotate_activity(wrows, items)
+    workers_by_queue: Dict[str, List[Dict[str, Any]]] = {}
+    for worker in wrows:
+        workers_by_queue.setdefault(str(worker.get("queue") or ""), []).append(worker)
     for r in rows:
         wc = counts.get(r["queue"], {"total": 0, "live": 0})
         r["workers_total"] = wc["total"]
         r["workers_live"] = wc["live"]
-    wrows = workers.list_workers(prune=False)
-    workers.annotate_activity(wrows, items)
+        queue_workers = workers_by_queue.get(r["queue"], [])
+        live_workers = [
+            worker for worker in queue_workers
+            if worker.get("alive") and not workers._worker_released(worker)
+        ]
+        r["workers_effective"] = sum(
+            1 for worker in live_workers if str(worker.get("session_id") or "").strip()
+        )
+        r["staffing_diagnostics"] = [
+            f"worker {str(worker.get('worker_id') or 'unknown')} missing session identity"
+            for worker in live_workers
+            if not str(worker.get("session_id") or "").strip()
+        ]
+        queue_items = [item for item in items if item.get("project") == r["queue"]]
+        r["claimable_depth"] = len(q._claim_candidates(
+            queue_items,
+            project=r["queue"],
+            item_types=config.claim_types(r["queue"]) or None,
+        ))
+        r["awaiting_human"] = sum(
+            1 for item in queue_items
+            if item.get("status") in ("open", "in_progress") and item.get("needs_input")
+        )
+        engine = config.engine(r["queue"])
+        model = config.model(r["queue"])
+        effort = config.effort(r["queue"])
+        if not config.is_approved_effort(engine, model, effort):
+            r["configuration_error"] = (
+                f"{model or f'{engine} default model'} does not support effort {effort!r}"
+            )
     return {"queues": rows, "workers": wrows, "github": health.github_connectivity()}
 
 
@@ -358,6 +392,20 @@ _STYLE = """
     }
     .run-btn.warn:hover { border-color: var(--warn); }
     .run-spacer { min-width: 1px; min-height: 1px; }
+
+    .queue-alert {
+      position: sticky; top: 12px; z-index: 2;
+      margin: 0 0 18px; padding: 15px 16px;
+      background: #301b24; border: 1px solid rgba(255,92,92,.7);
+      border-left: 4px solid var(--alarm); border-radius: 10px;
+      box-shadow: 0 8px 26px rgba(0,0,0,.28);
+    }
+    .queue-alert-title { color: var(--alarm); font-size: 14px; font-weight: 700; }
+    .queue-alert-detail { color: var(--ink); font-size: 12.5px; line-height: 1.55; margin-top: 5px; }
+    .queue-alert-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 12px; }
+    .queue-alert-link { align-self: center; color: var(--beam); font-size: 12px; }
+    .worker-inspection { margin: 18px 0; }
+    .worker-inspection .wk-row { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; margin-top: 6px; padding: 8px; }
 
     /* ---- closed tickets + resolution ---- */
     .closed-head {
@@ -1056,6 +1104,16 @@ def _closed_block(closed: List[Dict[str, Any]], total_closed: int) -> str:
 
 _QUEUE_SCRIPT = (
     "    <script>\n"
+    "    async function wtReconcile(queue) {\n"
+    "      const res = await fetch('/api/queue/' + encodeURIComponent(queue) + '/reconcile', {method: 'POST'});\n"
+    "      if (!res.ok) {\n"
+    "        let msg = 'Reconcile failed';\n"
+    "        try { const data = await res.json(); msg = data.error || msg; } catch (_) {}\n"
+    "        alert(msg);\n"
+    "        return;\n"
+    "      }\n"
+    "      location.reload();\n"
+    "    }\n"
     "    async function wtRun(ref) {\n"
     "      const res = await fetch('/api/ticket/' + encodeURIComponent(ref) + '/run', {method: 'POST'});\n"
     "      if (!res.ok) {\n"
@@ -1104,6 +1162,65 @@ _QUEUE_SCRIPT = (
 )
 
 
+def _queue_staffing_alert(
+    name: str, row: Optional[Dict[str, Any]], workers_for_queue: List[Dict[str, Any]],
+) -> tuple[str, str]:
+    """Render actionable diagnostics when an auto-drain queue cannot progress."""
+    if not row:
+        return "", ""
+    claimable = int(row.get("claimable_depth") or 0)
+    effective = int(row.get("workers_effective") or 0)
+    config_error = str(row.get("configuration_error") or "")
+    show_alert = bool(row.get("auto_drain")) and (
+        bool(row.get("stuck")) or (claimable > 0 and effective == 0) or bool(config_error)
+    )
+    if not show_alert:
+        return "", ""
+
+    details = [
+        f"{effective} effective worker{'s' if effective != 1 else ''} for "
+        f"{claimable} claimable ticket{'s' if claimable != 1 else ''}.",
+        f"Last progress: {html.escape(str(row.get('since_progress') or 'unknown'))} ago.",
+    ]
+    details.extend(html.escape(str(value)) for value in row.get("staffing_diagnostics") or [])
+    if config_error:
+        details.append("Invalid worker configuration: " + html.escape(config_error) + ".")
+    awaiting_human = int(row.get("awaiting_human") or 0)
+    if awaiting_human:
+        details.append(f"{awaiting_human} awaiting human input; those tickets are not draining work.")
+
+    inspection_links = []
+    inspection_rows = []
+    for worker in workers_for_queue:
+        worker_id = str(worker.get("worker_id") or "unknown")
+        anchor = "worker-" + urllib.parse.quote(worker_id, safe="")
+        label = html.escape(worker_id)
+        inspection_links.append(f'<a class="queue-alert-link" href="#{anchor}">Inspect {label}</a>')
+        session = html.escape(str(worker.get("session_id") or "missing session identity"))
+        inspection_rows.append(
+            f'      <div class="wk-row" id="{anchor}"><span class="mono">{label}</span> '
+            f'<span class="mono">session: {session}</span></div>\n'
+        )
+    inspection = (
+        '    <section class="worker-inspection">\n'
+        '      <h2>Worker inspection</h2>\n'
+        + "".join(inspection_rows)
+        + "    </section>\n"
+        if inspection_rows else ""
+    )
+    alert = (
+        '    <section class="queue-alert" role="alert">\n'
+        '      <div class="queue-alert-title">Auto-drain needs attention</div>\n'
+        + "".join(f'      <div class="queue-alert-detail">{detail}</div>\n' for detail in details)
+        + '      <div class="queue-alert-actions">\n'
+        + f'        <button class="run-btn warn" onclick="wtReconcile(\'{html.escape(name)}\')">Retry / reconcile</button>\n'
+        + "        " + " ".join(inspection_links) + "\n"
+        + "      </div>\n"
+        + "    </section>\n"
+    )
+    return alert, inspection
+
+
 def render_queue(
     name: str,
     payload: Dict[str, Any],
@@ -1132,13 +1249,18 @@ def render_queue(
         header += f'      <div class="fleet">{_readout(row)}</div>\n'
     header += "    </header>\n    <hr class=\"divider\">\n"
 
+    queue_workers = [
+        worker for worker in payload.get("workers", []) if worker.get("queue") == name
+    ]
+    staffing_alert, worker_inspection = _queue_staffing_alert(name, row, queue_workers)
+
     closed_block = _closed_block(closed, total_closed)
 
     if not tickets:
         # The ack toggles live on closed rows, so the script has to ship on
         # the no-active-tickets page too -- a drained queue is exactly where
         # you sit clearing old warning chips.
-        body = header + (
+        body = header + staffing_alert + worker_inspection + (
             '    <div class="empty">\n'
             '      <div class="beacon dim" aria-hidden="true"></div>\n'
             '      <div class="line disp">No active tickets</div>\n'
@@ -1184,7 +1306,10 @@ def render_queue(
             f"      </div>"
         )
     tickets_block = '    <div class="tickets">\n' + "\n".join(trows) + "\n    </div>\n"
-    return _page(f"{name} · WatchTower", header + tickets_block + closed_block + _QUEUE_SCRIPT)
+    return _page(
+        f"{name} · WatchTower",
+        header + staffing_alert + worker_inspection + tickets_block + closed_block + _QUEUE_SCRIPT,
+    )
 
 
 def _chat_not_found_page(ref: str) -> str:
@@ -1416,6 +1541,26 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0].rstrip("/")
+        if path.startswith("/api/queue/") and path.endswith("/reconcile"):
+            if not _check_same_origin(self):
+                self._json(403, {"error": "cross-origin request rejected"})
+                return
+            if not _check_bearer_token(self):
+                self._json(401, {"error": "missing or invalid bearer token"})
+                return
+            name = q._norm_project(urllib.parse.unquote(
+                path[len("/api/queue/"):-len("/reconcile")]
+            ))
+            if not name:
+                self._json(400, {"error": "queue is required"})
+                return
+            try:
+                result = workers.reconcile_once()
+            except Exception as exc:  # noqa: BLE001
+                self._json(500, {"error": str(exc)})
+                return
+            self._json(200, {"ok": True, "queue": name, "reconcile": result})
+            return
         if path.startswith("/api/ticket/") and path.endswith("/run"):
             ref = urllib.parse.unquote(path[len("/api/ticket/"):-len("/run")])
             try:

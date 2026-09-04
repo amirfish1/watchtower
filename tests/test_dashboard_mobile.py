@@ -24,6 +24,7 @@ ticket note -- that's an open owner decision for a later version).
 
 from __future__ import annotations
 
+import os
 import threading
 import urllib.error
 import urllib.request
@@ -101,6 +102,101 @@ def test_queue_page_has_viewport_and_apple_meta(wt):
     assert status == 200
     assert '<meta name="viewport" content="width=device-width, initial-scale=1">' in page
     assert 'name="apple-mobile-web-app-capable" content="yes"' in page
+
+
+def test_stuck_auto_drain_queue_has_persistent_diagnostic_banner():
+    """A queue that cannot make progress must explain why on its own page."""
+    import watchtower.dashboard as dashboard
+
+    payload = {
+        "queues": [{
+            "queue": "OPS", "depth": 3, "state": "stuck", "stuck": True,
+            "auto_drain": True, "workers_live": 1, "workers_effective": 0,
+            "claimable_depth": 3, "awaiting_human": 2,
+            "staffing_diagnostics": ["worker ops-orphan missing session identity"],
+            "configuration_error": "kimi-code/k3 does not support effort 'high'",
+        }],
+        "workers": [{"worker_id": "ops-orphan", "alive": True, "queue": "OPS"}],
+    }
+
+    page = dashboard.render_queue("OPS", payload, [])
+
+    assert 'class="queue-alert"' in page
+    assert 'role="alert"' in page
+    assert "0 effective workers" in page
+    assert "3 claimable tickets" in page
+    assert "missing session identity" in page
+    assert "kimi-code/k3 does not support effort" in page
+    assert "2 awaiting human input" in page
+    assert "wtReconcile('OPS')" in page
+    assert 'href="#worker-ops-orphan"' in page
+
+
+def test_status_payload_reports_unreachable_workers_and_invalid_effort(wt):
+    wt.q.enqueue(project="OPS", note="first")
+    wt.q.enqueue(project="OPS", note="second")
+    wt.config.set_auto_drain("OPS", True)
+    wt.config.set_engine("OPS", "kimi")
+    wt.config.set_model("OPS", "kimi-code/k3")
+    wt.config.set_effort("OPS", "high")
+    wt.workers.record_worker(os.getpid(), "OPS", "kimi", "ops-orphan")
+
+    payload = wt.dashboard.status_payload()
+    row = payload["queues"][0]
+
+    assert row["workers_live"] == 1
+    assert row["workers_effective"] == 0
+    assert row["claimable_depth"] == 2
+    assert row["awaiting_human"] == 0
+    assert "missing session identity" in row["staffing_diagnostics"][0]
+    assert row["configuration_error"] == "kimi-code/k3 does not support effort 'high'"
+
+
+def test_queue_banner_reconcile_action_runs_one_reconcile(wt, monkeypatch):
+    dashboard = wt.dashboard
+    seen = []
+    monkeypatch.setattr(
+        dashboard.workers, "reconcile_once", lambda: seen.append(True) or {"ok": "reconciled"}
+    )
+    httpd, port, thread = _serve_once(dashboard)
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/queue/OPS/reconcile",
+            data=b"{}", method="POST",
+            headers={"Content-Type": "application/json", "Origin": f"http://127.0.0.1:{port}"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            body = response.read().decode()
+    finally:
+        thread.join(timeout=5)
+        httpd.server_close()
+
+    assert seen == [True]
+    assert '"ok": true' in body
+    assert '"queue": "OPS"' in body
+
+
+def test_queue_banner_reconcile_rejects_cross_origin_request(wt, monkeypatch):
+    dashboard = wt.dashboard
+    monkeypatch.setattr(
+        dashboard.workers, "reconcile_once", lambda: (_ for _ in ()).throw(AssertionError("must not run"))
+    )
+    httpd, port, thread = _serve_once(dashboard)
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/queue/OPS/reconcile",
+            data=b"{}", method="POST",
+            headers={"Content-Type": "application/json", "Origin": "https://untrusted.example"},
+        )
+        try:
+            urllib.request.urlopen(req, timeout=5)
+        except urllib.error.HTTPError as error:
+            assert error.code == 403
+        else:
+            raise AssertionError("cross-origin reconcile request was accepted")
+    finally:
+        thread.join(timeout=5)
+        httpd.server_close()
 
 
 def test_chat_page_has_viewport_and_apple_meta(wt):
