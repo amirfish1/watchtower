@@ -385,6 +385,31 @@ def test_github_backend_rejects_placeholder_repos():
             config.set_github_repo("GHI", placeholder)
 
 
+def test_github_backend_decodes_legacy_escaped_json_metadata():
+    """Old issue bodies stored terminal escapes invalid in JSON (OPS-989)."""
+    from watchtower.github_backend import GitHubIssuesBackend
+
+    body = r'''Legacy metadata
+
+<!-- watchtower
+history: [{"event": "close", "resolution": {"caveats": ["build log \^[[0m"]}}]
+resolution_summary: "fixed it"
+resolution_caveats: ["build log \^[[0m"]
+-->'''
+    issue = _fake_issue(1, "Legacy metadata", body=body)
+    issue["state"] = "CLOSED"
+
+    item = GitHubIssuesBackend("GHI", repo="test-owner/test-repo")._issue_to_item(issue)
+
+    assert item["history"] == [{
+        "event": "close", "resolution": {"caveats": ["build log \\^[[0m"]},
+    }]
+    assert item["resolution"] == {
+        "summary": "fixed it",
+        "caveats": ["build log \\^[[0m"],
+    }
+
+
 def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
