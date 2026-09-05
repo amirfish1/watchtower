@@ -361,13 +361,13 @@ def cmd_ls(args: argparse.Namespace) -> int:
         items = _unresolved_items(items)
     elif want != "all":
         items = [i for i in items if i.get("status") == want]
+    limit = args.limit or len(items)
     if args.json:
-        print(json.dumps(items, indent=2))
+        print(json.dumps(items[:limit], indent=2))
         return 0
     if not items:
         print(f"(no {('' if want=='all' else want+' ')}items in {args.queue})")
         return 0
-    limit = args.limit or len(items)
     if unresolved_total and want != "unresolved":
         print(f"{args.queue}: {unresolved_total} closed "
               f"{'ticket' if unresolved_total == 1 else 'tickets'} with unresolved "

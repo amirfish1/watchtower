@@ -1351,6 +1351,20 @@ def test_cli_close_builds_resolution(store, capsys):
     assert "1 caveat" in ls_out
 
 
+def test_cli_ls_json_honors_limit(store, capsys):
+    """Machine-readable queue listings must not bypass the output cap."""
+    import watchtower.queue as q
+    from watchtower.cli import main
+
+    for note in ("first", "second", "third"):
+        q.enqueue(project="JSONLIMIT", note=note)
+
+    assert main(["ls", "-q", "JSONLIMIT", "--limit", "2", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert [item["note"] for item in payload] == ["first", "second"]
+
+
 def test_cli_close_enqueue_follow_ups(store, capsys):
     """--enqueue-follow-ups files each follow-up/unresolved as a new ticket."""
     import watchtower.queue as q
