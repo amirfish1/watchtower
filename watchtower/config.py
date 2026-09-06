@@ -134,6 +134,57 @@ CCC_SPAWN_DEFAULTS_FILE = Path(
     or (Path.home() / ".claude" / "command-center" / "spawn-defaults.json")
 )
 
+# Machine-wide model deny-list, shared with CCC (which owns the file):
+#   {"blocked_models": ["gpt-6-astra"]}
+# WATCHTOWER_BLOCKED_MODELS="a,b" is unioned in. A blocked model can neither
+# be pinned on a queue (set_model raises) nor inherited from CCC's defaults
+# or an old pin (model() substitutes an allowed fallback), and
+# build_drain_command re-checks right before the argv is built. Motivation
+# (2026-09-05): a 2.5x-priced model was the default in three places at once
+# and drained a weekly allowance in half an hour.
+CCC_MODEL_POLICY_FILE = Path(
+    os.environ.get("WATCHTOWER_MODEL_POLICY_FILE")
+    or (Path.home() / ".claude" / "command-center" / "model-policy.json")
+)
+
+
+def blocked_models() -> frozenset:
+    """Lowercased model ids blocked by policy (env + CCC policy file)."""
+    blocked = set()
+    for token in str(os.environ.get("WATCHTOWER_BLOCKED_MODELS") or "").split(","):
+        key = token.strip().lower()
+        if key:
+            blocked.add(key)
+    try:
+        with open(CCC_MODEL_POLICY_FILE) as f:
+            data = json.load(f)
+        raw = data.get("blocked_models") if isinstance(data, dict) else None
+        for item in raw or []:
+            key = str(item or "").strip().lower()
+            if key:
+                blocked.add(key)
+    except (OSError, ValueError, AttributeError):
+        pass
+    return frozenset(blocked)
+
+
+def is_blocked_model(value: str) -> bool:
+    return str(value or "").strip().lower() in blocked_models()
+
+
+def policy_fallback_model(eng: str) -> str:
+    """First allowed model for ``eng``: CCC's worker default, then CCC's
+    shared default, then the approved catalog in order; "" if none."""
+    eng = str(eng or "").strip().lower()
+    for candidate in (_ccc_worker_model_default(eng), default_model(eng)):
+        candidate = canonical_model(eng, candidate)
+        if candidate and not is_blocked_model(candidate):
+            return candidate
+    for candidate, _ in MODEL_EFFORTS.get(eng, ()):
+        if not is_blocked_model(candidate):
+            return candidate
+    return ""
+
 
 def _load() -> Dict[str, Any]:
     try:
@@ -550,7 +601,13 @@ def set_model(queue: str, m: str) -> Dict[str, Any]:
     q = data.setdefault(queue, {})
     model_value = str(m or "").strip()
     if model_value:
-        q["model"] = canonical_model(engine(queue), model_value)
+        resolved = canonical_model(engine(queue), model_value)
+        if is_blocked_model(resolved):
+            raise ValueError(
+                f"model {model_value!r} is blocked by model policy "
+                f"({CCC_MODEL_POLICY_FILE}); remove it from blocked_models to allow it"
+            )
+        q["model"] = resolved
     else:
         q.pop("model", None)
     _save(data)
@@ -639,8 +696,15 @@ def model(queue: str) -> str:
     eng = engine(queue)
     explicit = _queue_entry(queue).get("model", "")
     if explicit:
-        return canonical_model(eng, explicit)
-    return canonical_model(eng, _ccc_worker_model_default(eng) or default_model(eng))
+        resolved = canonical_model(eng, explicit)
+    else:
+        resolved = canonical_model(eng, _ccc_worker_model_default(eng) or default_model(eng))
+    if resolved and is_blocked_model(resolved):
+        # A pin that predates the policy, or an inherited CCC default that
+        # policy now blocks: never spawn it. Substitute rather than fail so
+        # the queue keeps draining on an allowed model.
+        return policy_fallback_model(eng)
+    return resolved
 
 
 def set_effort(queue: str, value: str) -> Dict[str, Any]:
@@ -812,7 +876,11 @@ def is_approved_model(eng: str, value: str) -> bool:
     commands use this predicate before persisting a new model selection.
     """
     model_value = str(value or "").strip()
-    return not model_value or model_value in approved_models(eng)
+    if not model_value:
+        return True
+    if is_blocked_model(canonical_model(eng, model_value)):
+        return False
+    return model_value in approved_models(eng)
 
 
 def approved_efforts(eng: str, model: str = "") -> tuple[str, ...]:

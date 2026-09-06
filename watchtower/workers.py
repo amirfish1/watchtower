@@ -3552,6 +3552,16 @@ def build_drain_command(
     """
     from . import config
     model = config.canonical_model(engine, model)
+    if model and config.is_blocked_model(model):
+        # Last line of defense: callers pass config.model(queue), which
+        # already substitutes, but a raw model reaching here must not spawn.
+        fallback = config.policy_fallback_model(engine)
+        print(
+            f"[watchtower] model {model!r} is blocked by model policy; "
+            f"spawning {queue} worker with {fallback or 'engine default'!r}",
+            file=sys.stderr,
+        )
+        model = fallback
     bin_name = _ENGINE_BIN.get(engine, engine)
     if engine == "codex":
         # Best-effort, idempotent: keep `wt` runnable in turns that do NOT
