@@ -2208,6 +2208,17 @@ def test_run_once_goal_uses_ticket_push_policy(wt):
     assert "leave commits local" in goal
 
 
+def test_goals_tell_worker_to_announce_the_ticket(wt):
+    # WATCHTOWER-28: a transcript that jumps from claim JSON to tool calls is
+    # unreadable; both goals must ask for a plain-language restatement first.
+    for goal in (
+        wt.workers.drain_goal("Q", "q-7", "/repo"),
+        wt.workers.run_once_goal("Q", "q-8", "Q-12", "/repo"),
+    ):
+        assert "ANNOUNCE THE TICKET" in goal
+        assert "in your own words" in goal
+
+
 def test_worker_runbook_exists_and_covers_both_protocols(wt):
     text = wt.workers._WORKER_RUNBOOK_PATH.read_text()
     assert "## Resume Check" in text and "## Idle Protocol" in text

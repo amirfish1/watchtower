@@ -255,6 +255,20 @@ KIMI_RESUME_CONTRACT = (
     "ticket gets fixed and committed twice. "
 )
 
+# Injected into both goal templates (WATCHTOWER-28). A session transcript
+# shows the raw `wt claim` JSON and then jumps straight into tool calls, so a
+# human skimming it cannot tell what the worker is actually working on. Have
+# the worker say it in its own words, in prose, right after the claim.
+# No braces: safe for the templates' .format() calls.
+ANNOUNCE_TICKET = (
+    "ANNOUNCE THE TICKET: immediately after a successful claim, before you "
+    "read code or run any other command, write one short plain-language "
+    "paragraph (2-3 sentences) saying which ref you claimed and what it is "
+    "asking for, in your own words. A human skimming your session transcript "
+    "should learn what you are working on from that line alone -- do not make "
+    "them read the claim JSON. "
+)
+
 # Style contract for the mandatory close --summary, injected into both goal
 # templates. No braces: safe for the templates' .format() calls.
 SUMMARY_STYLE = (
@@ -315,6 +329,7 @@ DRAIN_GOAL_TEMPLATE = (
     "Idle Protocol in {runbook} to update the queue's learnings file, the same "
     "as on a drained queue -- a recycle that skips it throws away everything "
     "this session learned. THEN exit; do not claim another ticket. "
+    + ANNOUNCE_TICKET +
     "Read the ticket's note/text and, if present, open its screenshot_path and "
     "resolve its selector. Make the change in the relevant repo and verify it. "
     "Commit only the paths you changed (never `git add -A`/`.`/`-a`). "
@@ -361,6 +376,7 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "\"duplicate\". Only if a DIFFERENT worker id claimed or closed it were "
     "you reaped and it was taken over -- then discard uncommitted changes "
     "and exit, do not commit or close. "
+    + ANNOUNCE_TICKET +
     "Read the ticket's note/text and, if present, open its screenshot_path and "
     "resolve its selector. Make the change in the relevant repo and verify it. "
     "Commit only the paths you changed (never `git add -A`/`.`/`-a`). "
