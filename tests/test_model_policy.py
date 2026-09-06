@@ -52,6 +52,17 @@ def test_set_model_refuses_a_blocked_pin(policy_env):
     assert "model" not in config._queue_entry("Q")
 
 
+def test_set_model_confirm_blocked_allows_a_deliberate_pin(policy_env):
+    # 2026-09-06: a human confirming the pick in CCC's queue-config dialog
+    # (or `wt config -q ... --confirm-blocked`) can still pin it -- the
+    # automatic worker-dispatch path (build_drain_command / model()) never
+    # passes this, so an unattended queue still can't silently spawn it.
+    policy_env("gpt-6-astra")
+    config.set_engine("Q", "codex")
+    config.set_model("Q", "gpt-6-astra", confirm_blocked=True)
+    assert config._queue_entry("Q")["model"] == "gpt-6-astra"
+
+
 def test_env_var_unions_with_policy_file(policy_env, monkeypatch):
     policy_env("gpt-6-astra")
     monkeypatch.setenv("WATCHTOWER_BLOCKED_MODELS", "gpt-5.5, Claude-Opus-5")

@@ -590,22 +590,26 @@ def engine(queue: str) -> str:
     return "claude"
 
 
-def set_model(queue: str, m: str) -> Dict[str, Any]:
+def set_model(queue: str, m: str, *, confirm_blocked: bool = False) -> Dict[str, Any]:
     """Set (or clear, with "") the model workers on this queue are spawned with.
 
     Supported engine-specific aliases (e.g. ``opus-5`` for Claude) are stored
     as the canonical model id so downstream spawn logic receives a value the
-    engine CLI understands.
+    engine CLI understands. A policy-blocked model still raises unless the
+    caller passes confirm_blocked=True (a deliberate, human-confirmed pick
+    from CCC's queue-config dialog or `wt config -q ... --confirm-blocked`,
+    2026-09-06) -- the automatic worker-dispatch path never sets this.
     """
     data = _load()
     q = data.setdefault(queue, {})
     model_value = str(m or "").strip()
     if model_value:
         resolved = canonical_model(engine(queue), model_value)
-        if is_blocked_model(resolved):
+        if is_blocked_model(resolved) and not confirm_blocked:
             raise ValueError(
                 f"model {model_value!r} is blocked by model policy "
-                f"({CCC_MODEL_POLICY_FILE}); remove it from blocked_models to allow it"
+                f"({CCC_MODEL_POLICY_FILE}); remove it from blocked_models to allow it, "
+                "or pass confirm_blocked=True for a deliberate one-off override"
             )
         q["model"] = resolved
     else:
