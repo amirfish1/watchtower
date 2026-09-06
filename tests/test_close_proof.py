@@ -57,6 +57,36 @@ def test_resolves_in_a_secondary_repo_when_absent_from_primary(repo_with_commit)
     assert found_in == other
 
 
+def test_cli_verification_searches_the_callers_current_repo(
+    repo_with_commit, monkeypatch
+):
+    """Workers often fix an OPS ticket in a repo that is not queue-configured.
+
+    Running ``wt close`` from that relevant repo must verify its commit before
+    unrelated stale configured paths can turn the close into a hard error.
+    """
+    from watchtower import cli
+
+    primary, _ = repo_with_commit("primary")
+    current, current_sha = repo_with_commit("current")
+    monkeypatch.chdir(current)
+    monkeypatch.setattr(
+        cli.q,
+        "get",
+        lambda _ref: {"repo_path": primary, "project": "OPS"},
+    )
+    monkeypatch.setattr(
+        close_proof,
+        "configured_repos",
+        lambda: ["/unrelated/stale/repository"],
+    )
+
+    verified, error = cli._verify_close_commit("OPS-1", current_sha)
+
+    assert verified == current_sha
+    assert error == ""
+
+
 def test_primary_is_searched_first(repo_with_commit):
     primary, primary_sha = repo_with_commit("primary")
     other, _ = repo_with_commit("other")

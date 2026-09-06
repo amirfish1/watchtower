@@ -935,7 +935,14 @@ def _verify_close_commit(ref: str, sha: str) -> Tuple[str, str]:
     # repo first, then every other configured one (including `host:/path`
     # remotes, verified over ssh). The commit must still genuinely resolve --
     # see close_proof for why widening the search beats loosening the check.
-    verified, _found_in, errors = close_proof.verify_with_errors(candidate, repo)
+    # The worker normally runs from the repository it actually changed. OPS and
+    # other cross-cutting queues can legitimately point at a different primary
+    # repo, so search cwd before unrelated configured repositories. This keeps
+    # proof strict while avoiding a central registry entry for every one-off
+    # ticket repository.
+    verified, _found_in, errors = close_proof.verify_with_errors(
+        candidate, repo, extra=[os.getcwd()]
+    )
     if not verified:
         if errors:
             detail = "; ".join(errors[:3])
