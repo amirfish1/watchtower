@@ -307,6 +307,39 @@ and related maintenance results. In `dry_run` mode, no subprocesses or releases
 occur; staffing plans and synthetic spawn records are still returned and
 logged for tests.
 
+### Launch-failure escalation (spawn-then-die)
+
+A worker that dies before it claims anything is invisible to every other
+mechanism here: idle release, zombie release and reaping all reason about
+workers that are *alive*. The only thing standing between a broken engine and
+an endless respawn loop is the launch-failure ladder in `workers.py`, and it
+escalates in four steps as the same failure repeats:
+
+1. **Record + cooldown.** `_wait_for_immediate_launch_failure` (spawn-time,
+   `_LAUNCH_FAILURE_GRACE_S`) and `_postmortem_launch_failure` (prune-time, for
+   engines that burn minutes before printing the real error) both funnel into
+   `_record_launch_failure`, which sets a cooldown the next tick honours.
+   Consecutive failures double it up to `_LAUNCH_FAILURE_MAX_COOLDOWN_S`.
+2. **Name it if we can.** `_classify_launch_failure_log` maps the log to a
+   reason an operator can act on — usage limit, auth, API down, broken binary.
+   It can only ever name failures we have already seen, so an unrecognised
+   non-zero exit inside the grace window is still recorded, under a generic
+   `engine exited immediately (exit N)`. That fallback is the load-bearing
+   part: WATCHTOWER-29 was an *unclassified* failure (a half-installed codex
+   npm package), and "no phrase matched" used to mean "no cooldown at all".
+3. **Say so.** At `_LAUNCH_FAILURE_ALERT_STREAK` consecutive failures,
+   `_alert_repeated_launch_failure` files a ticket about the outage. A cooldown
+   is correct but silent, and silence is what let hermes INTAKE grind for five
+   days. The ref is written back onto the failure record, so one outage files
+   one ticket however long it lasts; the streak (and the alert) clear when a
+   worker finally establishes a session.
+4. **Swap or park.** `_warrants_engine_swap` moves the queue to
+   `config.fallback_engine()` — immediately for a usage limit (the provider has
+   already told us it will not serve us), only on a repeat for anything else,
+   so one flaky start never rewrites a queue's configured engine. With no
+   fallback installed, a repeated failure parks the queue instead: `auto_drain`
+   goes off and `wt drain on <queue>` is the deliberate act that resumes it.
+
 ### `request_stop(worker_id)`
 
 Creates the stop-signal sentinel, then persists `released_at` under the
