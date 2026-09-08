@@ -366,6 +366,105 @@ def test_daemon_restart_replaces_detached_dashboard_before_binding(wt, monkeypat
     assert calls[:2] == ["stop detached dashboard", ("bind", ("127.0.0.1", 8787))]
 
 
+def _daemon_loop_ticks_args():
+    class Args:
+        interval = 5
+        dry_run = False
+        host = "127.0.0.1"
+        port = 0
+        auto_spawn = False
+        stuck_minutes = 20
+        engine = "claude"
+
+    return Args()
+
+
+def test_periodic_self_update_skipped_within_interval(wt, monkeypatch):
+    """A single tick must not recheck for new commits: only the unconditional
+    start-of-loop call to _maybe_self_update should have run, since real
+    elapsed time between it and the loop's own check is near zero."""
+    monkeypatch.setattr(wt.cli, "_stop_detached_dashboard", lambda host, port: None)
+
+    class _Server:
+        def __init__(self, host_port, handler):
+            pass
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr(wt.dashboard, "ThreadingHTTPServer", _Server)
+    monkeypatch.setattr(
+        wt.workers, "reconcile_once", lambda dry_run=False: {"spawned": [], "stopped": []}
+    )
+    monkeypatch.setattr(wt.messages, "drain_outbox", lambda: {})
+
+    calls = []
+    monkeypatch.setattr(wt.cli, "_maybe_self_update", lambda: calls.append("checked"))
+
+    class _StopLoop(Exception):
+        pass
+
+    monkeypatch.setattr(wt.cli.time, "sleep", lambda _seconds: (_ for _ in ()).throw(_StopLoop()))
+
+    with pytest.raises(_StopLoop):
+        wt.cli._daemon_loop_ticks(_daemon_loop_ticks_args())
+
+    assert calls == ["checked"]  # only the start-of-loop call, not a second one mid-tick
+
+
+def test_periodic_self_update_fires_after_interval_elapses(wt, monkeypatch):
+    """Once _SELF_UPDATE_CHECK_INTERVAL_S has passed, the tick loop rechecks
+    for new commits on its own -- this is what lets a long-running daemon pick
+    up a release without an external restart."""
+    monkeypatch.setattr(wt.cli, "_stop_detached_dashboard", lambda host, port: None)
+
+    class _Server:
+        def __init__(self, host_port, handler):
+            pass
+
+        def serve_forever(self):
+            return None
+
+    monkeypatch.setattr(wt.dashboard, "ThreadingHTTPServer", _Server)
+    monkeypatch.setattr(
+        wt.workers, "reconcile_once", lambda dry_run=False: {"spawned": [], "stopped": []}
+    )
+    monkeypatch.setattr(wt.messages, "drain_outbox", lambda: {})
+
+    calls = []
+    monkeypatch.setattr(wt.cli, "_maybe_self_update", lambda: calls.append("checked"))
+
+    # First time.time() call sets last_self_update_check; jump the clock past
+    # the interval before the loop body's own check runs.
+    fake_now = [1_000_000.0]
+
+    def _fake_time():
+        return fake_now[0]
+
+    monkeypatch.setattr(wt.cli.time, "time", _fake_time)
+
+    class _StopLoop(Exception):
+        pass
+
+    def _fake_sleep(_seconds):
+        raise _StopLoop()
+
+    monkeypatch.setattr(wt.cli.time, "sleep", _fake_sleep)
+
+    real_reconcile = wt.workers.reconcile_once
+
+    def _advance_then_reconcile(dry_run=False):
+        fake_now[0] += wt.cli._SELF_UPDATE_CHECK_INTERVAL_S + 1
+        return real_reconcile(dry_run=dry_run)
+
+    monkeypatch.setattr(wt.workers, "reconcile_once", _advance_then_reconcile)
+
+    with pytest.raises(_StopLoop):
+        wt.cli._daemon_loop_ticks(_daemon_loop_ticks_args())
+
+    assert calls == ["checked", "checked"]  # start-of-loop call, then the periodic recheck
+
+
 def test_detached_dashboard_on_another_endpoint_survives_watcher_start(wt, monkeypatch):
     """A 8791 dashboard must not be stopped merely because 8787 restarts."""
     wt.cli.DASHBOARD_PID_FILE.write_text(

@@ -3043,6 +3043,9 @@ def cmd_wait(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+_SELF_UPDATE_CHECK_INTERVAL_S = 3600  # how often the running daemon rechecks for new commits
+
+
 def _maybe_self_update() -> None:
     """Best-effort ``git pull --ff-only`` on the source checkout, then re-exec.
 
@@ -3132,6 +3135,7 @@ def _daemon_loop(args: argparse.Namespace) -> None:
 
 def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     _maybe_self_update()  # pick up reconciler fixes on every (re)start; re-execs if HEAD moved
+    last_self_update_check = time.time()
     interval = max(5, args.interval)
     dry_run = getattr(args, "dry_run", False)
     # Always host the HTTP server alongside the watcher.
@@ -3267,6 +3271,14 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
                     # cause classification, and capacity cap as every other
                     # worker launch.
                     workers.reconcile_once(dry_run=dry_run)
+        # Periodic self-update (WT release pickup without an external restart):
+        # same never-kill-the-loop contract as the maintenance calls above.
+        # _maybe_self_update() re-execs via execvp when HEAD moves, which
+        # preserves this process's pid, so a supervisor (systemd, launchd)
+        # never sees the daemon as having stopped.
+        if time.time() - last_self_update_check >= _SELF_UPDATE_CHECK_INTERVAL_S:
+            last_self_update_check = time.time()
+            _maybe_self_update()
         time.sleep(interval)
 
 
