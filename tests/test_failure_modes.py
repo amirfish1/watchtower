@@ -68,6 +68,11 @@ def test_missing_engine_binary_sets_a_cooldown_so_the_reconciler_stops_retrying(
         ("authentication failed: token expired", "engine authentication failed"),
         ("You've hit your usage limit. Try again later.", "engine usage limit"),
         ("HTTP 503 upstream connect error", "engine api unavailable"),
+        (
+            "node:internal/modules: Cannot find module '@openai/codex-linux-x64'",
+            "engine binary broken",
+        ),
+        ("/usr/local/bin/codex: line 3: node: command not found", "engine binary broken"),
     ],
 )
 def test_launch_failure_log_is_classified_into_an_actionable_reason(
@@ -185,6 +190,133 @@ def test_provider_failure_falls_back_to_a_different_installed_engine(wt_env, fak
 
 def test_fallback_engine_is_empty_when_nothing_else_is_installed(wt_env, no_engines):
     assert wt_env.config.fallback_engine("codex") == ""
+
+
+# --------------------------------------------------------------------------- #
+# 1b. The spawn-then-die loop (WATCHTOWER-29). A broken engine binary is
+# installed, executable, and dies on every start. The classifier had no phrase
+# for it, so no cooldown was recorded, so the reconciler respawned every tick
+# for five days on hermes INTAKE without anyone being told.
+# --------------------------------------------------------------------------- #
+def test_an_unrecognised_immediate_death_still_records_a_cooldown(wt_env, fake_bin):
+    """The classifier can only name failures we have already seen. Anything
+    that dies non-zero within the grace window must still stop the loop."""
+    fake_bin("codex", 'echo "kaboom" >&2\nexit 7')
+    failures = []
+    spawned = wt_env.workers.spawn_workers(
+        QUEUE, 1, engine="codex", repo_path=str(wt_env.tmp), launch_failures=failures
+    )
+    assert spawned == []
+    assert failures and "exit 7" in failures[0]["reason"]
+    assert wt_env.workers.active_launch_failure_cooldown(QUEUE, "codex") is not None
+
+
+def test_a_worker_that_starts_cleanly_is_not_treated_as_a_launch_failure(
+    wt_env, fake_bin
+):
+    """The catch-all above keys off a non-zero exit precisely so a worker that
+    starts, finds nothing to do and exits 0 is not punished with a cooldown."""
+    fake_bin("codex", "exit 0")
+    wt_env.workers.spawn_workers(QUEUE, 1, engine="codex", repo_path=str(wt_env.tmp))
+    assert wt_env.workers.active_launch_failure_cooldown(QUEUE, "codex") is None
+
+
+def _record_failures(wt_env, tmp_path, n, reason="engine binary broken"):
+    log = tmp_path / "w.log"
+    log.write_text("Cannot find module '@openai/codex-linux-x64'")
+    last = None
+    for i in range(n):
+        last = wt_env.workers._record_launch_failure(
+            queue=QUEUE, engine="codex", worker_id=f"w{i}", pid=0,
+            log_path=log, reason=reason,
+        )
+    return last
+
+
+def test_a_repeated_spawn_then_die_loop_files_a_ticket_about_itself(wt_env, tmp_path):
+    """A cooldown is silent. Five days of silence is the actual bug — the queue
+    has to say out loud that it is not staffing."""
+    rec = _record_failures(wt_env, tmp_path, 3)
+    ref = rec.get("alerted_ref")
+    assert ref, "third consecutive launch failure filed no self-report"
+    filed = wt_env.queue.get(ref)
+    assert filed is not None
+    assert filed["status"] == "open"
+    assert QUEUE in filed["note"] and "engine binary broken" in filed["note"]
+
+
+def test_a_running_outage_files_one_ticket_not_one_per_tick(wt_env, tmp_path):
+    """The alert has to be de-duped by the failure record itself, or a two-day
+    outage buries the queue under 500 identical tickets."""
+    first = _record_failures(wt_env, tmp_path, 3)
+    later = _record_failures(wt_env, tmp_path, 4)
+    assert later["consecutive"] == 7
+    assert later["alerted_ref"] == first["alerted_ref"]
+    open_refs = [
+        it for it in wt_env.queue.list_items()
+        if it.get("title", "").endswith("(codex)")
+    ]
+    assert len(open_refs) == 1
+
+
+def test_a_recovered_engine_lets_the_next_outage_alert_again(wt_env, tmp_path):
+    """The de-dupe is per-streak, not forever: once a worker proves the engine
+    works, the next outage is news again."""
+    first = _record_failures(wt_env, tmp_path, 3)
+    wt_env.workers._clear_launch_failure(QUEUE, "codex")
+    second = _record_failures(wt_env, tmp_path, 3)
+    assert second["alerted_ref"] and second["alerted_ref"] != first["alerted_ref"]
+
+
+def test_a_repeatedly_failing_engine_is_swapped_for_one_that_works(wt_env, fake_bin):
+    """Falling back was reserved for usage limits. Every other way an engine
+    can be down — broken binary, expired login — left the queue on it."""
+    fake_bin("claude")
+    fake_bin("codex", 'echo "Cannot find module" >&2\nexit 1')
+    wt_env.config.set_engine(QUEUE, "codex")
+    wt_env.config.set_auto_drain(QUEUE, True)
+    wt_env.config.set_grace_s(QUEUE, 0)
+    wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
+    for _ in range(3):
+        _expire_cooldown(wt_env)
+        wt_env.workers.reconcile_once()
+    assert wt_env.config.engine(QUEUE) == "claude"
+
+
+def _expire_cooldown(wt_env, queue=QUEUE, engine="codex"):
+    """Age out the cooldown without aging out the streak, so a test can watch
+    consecutive failures accumulate the way five days of ticks would."""
+    data = wt_env.workers._load_launch_failures()
+    rec = data.get(f"{queue}:{engine}")
+    if rec:
+        rec["cooldown_until"] = time.time() - 1
+        rec["failed_at"] = time.time() - 60
+        wt_env.workers._save_launch_failures(data)
+
+
+def test_a_queue_with_no_fallback_engine_is_parked_not_looped(wt_env, no_engines):
+    """When there is nothing to fall back to, the reconciler must stop rather
+    than spawn into the same wall for the rest of the week."""
+    wt_env.config.set_engine(QUEUE, "codex")
+    wt_env.config.set_auto_drain(QUEUE, True)
+    wt_env.config.set_grace_s(QUEUE, 0)
+    wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
+    for _ in range(3):
+        _expire_cooldown(wt_env)
+        result = wt_env.workers.reconcile_once()
+    assert result["parked"] and result["parked"][0]["queue"] == QUEUE
+    assert wt_env.config.auto_drain(QUEUE) is False
+
+
+def test_a_single_transient_failure_does_not_park_a_healthy_queue(wt_env, no_engines):
+    """Parking costs a human a `wt drain on`. One failed start must not."""
+    wt_env.config.set_engine(QUEUE, "codex")
+    wt_env.config.set_auto_drain(QUEUE, True)
+    wt_env.config.set_grace_s(QUEUE, 0)
+    wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
+    result = wt_env.workers.reconcile_once()
+    assert not result["parked"]
+    assert wt_env.config.auto_drain(QUEUE) is True
 
 
 # =========================================================================== #

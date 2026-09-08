@@ -111,6 +111,22 @@ _LAUNCH_POSTMORTEM_MAX_AGE_S = float(
 _LAUNCH_POSTMORTEM_MAX_LOG_BYTES = int(
     os.environ.get("WATCHTOWER_LAUNCH_POSTMORTEM_MAX_LOG_BYTES", "65536")
 )
+# Consecutive immediate deaths before the spawn-then-die loop stops being a
+# private matter between the reconciler and its log: at this streak WatchTower
+# files a ticket about itself and, if the engine can be swapped, swaps it.
+# Three is one escalated cooldown past the default -- long enough that a single
+# transient 503 never trips it, short enough that the loop is caught in minutes
+# rather than the five days it took on hermes INTAKE (WATCHTOWER-29).
+_LAUNCH_FAILURE_ALERT_STREAK = int(
+    os.environ.get("WATCHTOWER_LAUNCH_FAILURE_ALERT_STREAK", "3")
+)
+# Where the self-report lands. Unset means "an OPS queue if this fleet has one,
+# otherwise the affected queue itself" -- filing into the broken queue is still
+# worth doing, because the ticket is what makes the outage visible on the
+# dashboard and in `wt status` instead of only in a log nobody tails.
+_LAUNCH_FAILURE_ALERT_QUEUE = os.environ.get(
+    "WATCHTOWER_LAUNCH_FAILURE_ALERT_QUEUE", ""
+)
 
 # Shared, queue-agnostic runbook (WT-101): DRAIN_GOAL_TEMPLATE keeps only a
 # one-line trigger for the Resume Check / Idle Protocol steps; the how-to
@@ -2616,6 +2632,20 @@ def _classify_launch_failure_log(
         reason = "engine authentication required"
     elif "authentication" in lower and ("failed" in lower or "error" in lower):
         reason = "engine authentication failed"
+    elif (
+        "cannot find module" in lower
+        or "modulenotfounderror" in lower
+        or "command not found" in lower
+        or "exec format error" in lower
+        or "no such file or directory" in lower
+    ):
+        # The binary exists and is executable, so engine_available() says yes,
+        # but it falls over before it can do anything -- a half-installed npm
+        # package (hermes INTAKE's missing @openai/codex-linux-x64), a wrapper
+        # pointing at a moved interpreter, a wrong-arch build. Checked last:
+        # these phrases are generic enough that a real auth/quota message
+        # mentioning them should still classify as auth/quota.
+        reason = "engine binary broken"
     if not reason:
         return None
     return {"reason": reason, "retry_at": retry_at}
@@ -2733,6 +2763,11 @@ def _record_launch_failure(
         rec["exit_code"] = exit_code
     if session_id:
         rec["session_id"] = session_id
+    prior = data.get(key)
+    if isinstance(prior, dict) and prior.get("alerted_ref"):
+        # Carry the alert across the streak so one outage files one ticket.
+        rec["alerted_ref"] = prior["alerted_ref"]
+        rec["alerted_consecutive"] = prior.get("alerted_consecutive")
 
     data[key] = rec
     _save_launch_failures(data)
@@ -2747,7 +2782,99 @@ def _record_launch_failure(
         )
     except Exception:
         pass
+    if consecutive >= _LAUNCH_FAILURE_ALERT_STREAK and not rec.get("alerted_ref"):
+        _alert_repeated_launch_failure(rec)
     return rec
+
+
+def _alert_launch_failure_queue(queue: str) -> str:
+    """Which queue a spawn-then-die self-report is filed into.
+
+    An explicit ``$WATCHTOWER_LAUNCH_FAILURE_ALERT_QUEUE`` wins; otherwise an
+    OPS queue if this fleet has one configured, else the affected queue. The
+    affected queue is a deliberate last resort rather than a no-op: its workers
+    cannot claim the ticket (that is the failure being reported), but the whole
+    point is that the outage becomes *visible* — an open ticket shows up in
+    ``wt status`` and on the dashboard, which is exactly the surface nobody had
+    when hermes INTAKE ground for five days."""
+    explicit = str(_LAUNCH_FAILURE_ALERT_QUEUE or "").strip()
+    if explicit:
+        return explicit
+    try:
+        from . import config
+        for name in config.all_queues():
+            if str(name).strip().upper() == "OPS":
+                return str(name)
+    except Exception:
+        pass
+    return queue
+
+
+def _alert_repeated_launch_failure(rec: Dict[str, Any]) -> str:
+    """File one ticket when a queue's workers keep dying on launch.
+
+    Without this the reconciler's only reaction to an engine that is down is a
+    cooldown: correct, but entirely silent. The failure record itself is the
+    de-dupe key -- the ref is written back onto it so a streak that runs for
+    days files one ticket, not one per tick."""
+    queue = str(rec.get("queue") or "")
+    if not queue:
+        return ""
+    engine = str(rec.get("engine") or "")
+    consecutive = int(rec.get("consecutive") or 0)
+    reason = str(rec.get("reason") or "worker launch failed")
+    try:
+        from . import queue as _q
+        item = _q.enqueue(
+            note=(
+                f"{queue}: {consecutive} consecutive worker launch failures "
+                f"[{engine or 'claude'}] — {reason}"
+            ),
+            title=f"{queue} workers keep dying on launch ({engine or 'claude'})",
+            text=(
+                f"The reconciler has spawned {consecutive} workers in a row for "
+                f"queue {queue} on engine {engine or 'claude'} and every one of "
+                f"them died before it could claim anything. Classified reason: "
+                f"{reason}.\n\n"
+                f"Nothing on {queue} is moving while this lasts, and the "
+                f"reconciler will keep backing off rather than fixing it. Check "
+                f"the engine itself first (binary installed and runnable, login "
+                f"valid, quota available):\n"
+                f"  last worker log: {rec.get('log') or '(none)'}\n"
+                f"  cooldown until:  {rec.get('cooldown_until_human') or '(none)'}\n\n"
+                f"Once the engine works again the streak clears on the first "
+                f"worker that establishes a session; no manual reset needed."
+            ),
+            project=_alert_launch_failure_queue(queue),
+            source="wt",
+            item_type="bug",
+            priority="p1",
+        )
+    except Exception:
+        return ""
+    ref = str(item.get("ref") or "")
+    if not ref:
+        return ""
+    data = _load_launch_failures()
+    key = _launch_failure_key(queue, engine)
+    stored = data.get(key)
+    if isinstance(stored, dict):
+        stored["alerted_ref"] = ref
+        stored["alerted_consecutive"] = consecutive
+        _save_launch_failures(data)
+    rec["alerted_ref"] = ref
+    rec["alerted_consecutive"] = consecutive
+    try:
+        from watchtower.queue import _log
+        _log(
+            "LAUNCH_FAIL_ALERT",
+            f"{consecutive} consecutive launch failures [{engine or 'claude'}] "
+            f"— filed {ref}",
+            queue=queue,
+        )
+    except Exception:
+        pass
+    return ref
 
 
 def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2809,6 +2936,25 @@ def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any
     )
 
 
+def _warrants_engine_swap(rec: Optional[Dict[str, Any]]) -> bool:
+    """Whether this launch failure is worth moving the queue off its engine.
+
+    A usage limit is swapped away from on sight: the provider has already said
+    it will not serve us and named no alternative, so waiting costs the queue
+    the whole cooldown. Every other failure has to prove it is not transient by
+    repeating -- a single 503 or a flaky first start must not permanently
+    rewrite a queue's configured engine."""
+    if not isinstance(rec, dict):
+        return False
+    if rec.get("reason") == "engine usage limit":
+        return True
+    try:
+        consecutive = int(rec.get("consecutive") or 0)
+    except (TypeError, ValueError):
+        return False
+    return consecutive >= _LAUNCH_FAILURE_ALERT_STREAK
+
+
 def active_launch_failure_cooldown(
     queue: str, engine: str
 ) -> Optional[Dict[str, Any]]:
@@ -2853,7 +2999,15 @@ def _wait_for_immediate_launch_failure(
         return None
     classified = _classify_launch_failure_log(log_path)
     if not classified:
-        return None
+        if not exit_code:
+            return None
+        # Unrecognised, but not ambiguous: the engine was handed a drain goal
+        # and was dead within seconds, non-zero. Recording it under a generic
+        # reason is what turns an unknown breakage into a cooldown instead of a
+        # silent respawn every tick -- the classifier can only ever name the
+        # failures we have already seen, and this is the one that hurt
+        # (WATCHTOWER-29: 242 dead workers over 5 days, none of them recorded).
+        classified = {"reason": f"engine exited immediately (exit {exit_code})"}
     return _record_launch_failure(
         queue=queue,
         engine=engine,
@@ -4419,6 +4573,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                               "session_title_backfilled": [],
                               "ledger_backfilled": [],
                               "launch_failed": [], "fallbacks": [],
+                              "parked": [],
                               "spawn_plans": [],
                               "reconcile_id": reconcile_id}
 
@@ -5095,24 +5250,28 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             )
             _annotate_spawn_records(spawned, plan, spawn_reason)
             _annotate_spawn_records(launch_failed, plan, spawn_reason)
-            usage_failures = [
-                rec for rec in launch_failed
-                if rec.get("reason") == "engine usage limit"
+            swap_failures = [
+                rec for rec in launch_failed if _warrants_engine_swap(rec)
             ]
+            swap_cause = (
+                str(swap_failures[0].get("reason") or "repeated launch failure")
+                if swap_failures
+                else ""
+            )
             fallback = (
                 ""
-                if dry_run or not usage_failures
+                if dry_run or not swap_failures
                 else config.fallback_engine(engine)
             )
             if fallback:
                 fallback_model = config.default_model(fallback)
                 config.set_engine(q_name, fallback)
                 config.set_model(q_name, fallback_model)
-                fallback_reason = f"fallback from {engine} usage limit"
+                fallback_reason = f"fallback from {engine} {swap_cause}"
                 fallback_failures: List[Dict[str, Any]] = []
                 failed_indices = [
                     int(rec.get("_spawn_index", index))
-                    for index, rec in enumerate(usage_failures)
+                    for index, rec in enumerate(swap_failures)
                 ]
                 fallback_spawned = spawn_workers(
                     q_name, n=len(failed_indices), engine=fallback,
@@ -5137,10 +5296,41 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                     "queue": q_name,
                     "from_engine": engine,
                     "to_engine": fallback,
-                    "reason": "engine usage limit",
+                    "reason": swap_cause,
                 })
                 spawned.extend(fallback_spawned)
                 launch_failed.extend(fallback_failures)
+            elif swap_failures and not dry_run:
+                # No engine left to fall back to. A cooldown alone would keep
+                # this queue in a spawn-then-die loop for as long as the
+                # breakage lasts (5 days on hermes INTAKE), so park it: the
+                # ticket filed by the streak alert says why, and `wt drain on`
+                # is the deliberate act that resumes it once the engine is
+                # fixed. Only repeated failures park -- a one-off usage limit
+                # with no fallback is what the cooldown is for.
+                repeated = [
+                    rec for rec in swap_failures
+                    if int(rec.get("consecutive") or 0)
+                    >= _LAUNCH_FAILURE_ALERT_STREAK
+                ]
+                if repeated and config.auto_drain(q_name):
+                    config.set_auto_drain(q_name, False)
+                    park_reason = (
+                        f"parked: {engine} keeps failing at launch "
+                        f"({swap_cause}) and no fallback engine is available "
+                        f"— run `wt drain on {q_name}` once it is fixed"
+                    )
+                    result["parked"].append(
+                        {"queue": q_name, "engine": engine, "reason": swap_cause}
+                    )
+                    result["skipped"].append(
+                        {"queue": q_name, "reason": park_reason}
+                    )
+                    try:
+                        from watchtower.queue import _log
+                        _log("QUEUE_PARKED", park_reason, queue=q_name)
+                    except Exception:
+                        pass
             result["spawned"].extend(spawned)
             result["launch_failed"].extend(launch_failed)
         elif staffed > desired:
