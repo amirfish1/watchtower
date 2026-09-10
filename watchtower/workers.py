@@ -3770,6 +3770,21 @@ def build_drain_command(
         if model:
             argv += ["--model", model]
         return argv
+    if engine == "grok":
+        # Grok Build does not accept Claude's --input-format flag.  Like Kimi,
+        # run the drain goal as one prompt and emit its supported ACP NDJSON.
+        argv = [
+            bin_name,
+            "-p",
+            goal or drain_goal(queue, worker_id, repo_path, engine=engine),
+            "--output-format",
+            "streaming-json",
+        ]
+        if model:
+            argv += ["--model", model]
+        if effort:
+            argv += ["--effort", effort]
+        return argv
     argv = [
         bin_name, "-p",
         "--input-format", "stream-json",

@@ -2172,6 +2172,15 @@ def test_build_codex_has_goal_in_argv(wt):
     assert "after the idle audit" in goal.lower()
 
 
+def test_build_grok_uses_supported_one_shot_json_mode(wt):
+    argv = wt.workers.build_drain_command("Q", "grok", "q-1", "/repo")
+
+    assert argv[:2] == ["grok", "-p"]
+    assert "--input-format" not in argv
+    assert argv[argv.index("--output-format") + 1] == "streaming-json"
+    assert "Drain the Q" in argv[2]
+
+
 def test_drain_goal_content(wt):
     goal = wt.workers.drain_goal("Q", "q-7", "/repo")
     assert "Q" in goal and "q-7" in goal and "/repo" in goal
