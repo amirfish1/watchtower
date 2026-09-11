@@ -91,9 +91,14 @@ def resolve_in_repo(repo: str, candidate: str) -> Tuple[str, str]:
     verified = result.stdout.strip()
     if result.returncode == 0 and COMMIT_SHA_RE.fullmatch(verified):
         return verified, ""
+    stderr = getattr(result, "stderr", None) or ""
+    # Queue configuration can retain a directory after it stops being a Git
+    # checkout. That path is a normal search miss, not an access failure that
+    # should hide the useful "commit not found" result from later candidates.
+    if "not a git repository" in stderr.lower():
+        return "", ""
     # Git refused to answer. Surface its stderr (dubious ownership, etc.) so the
     # user does not chase a commit that was fine all along.
-    stderr = getattr(result, "stderr", None) or ""
     stdout = getattr(result, "stdout", None) or ""
     git_err = (stderr or stdout).strip()
     return "", git_err

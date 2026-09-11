@@ -119,6 +119,24 @@ def test_missing_directory_is_a_miss_not_a_crash(repo_with_commit):
     assert found_in == other
 
 
+def test_existing_non_git_directory_is_a_miss_not_a_git_refusal(
+    repo_with_commit, tmp_path, monkeypatch
+):
+    """A stale configured path must not make an unrelated SHA look inaccessible."""
+    other, _ = repo_with_commit("other")
+    stale = tmp_path / "stale-configured-path"
+    stale.mkdir()
+    monkeypatch.setattr(close_proof, "configured_repos", lambda: [])
+
+    verified, found_in, errors = close_proof.verify_with_errors(
+        "deadbeef", str(stale), extra=[other]
+    )
+
+    assert verified == ""
+    assert found_in == ""
+    assert errors == []
+
+
 def test_search_order_dedupes_and_drops_blanks(repo_with_commit):
     repo, _ = repo_with_commit("primary")
     order = close_proof.search_order(repo, [repo, "", "   "])
