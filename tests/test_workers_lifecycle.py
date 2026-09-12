@@ -3481,6 +3481,21 @@ def test_resolve_session_id_from_kimi_log(wt):
             == "session_86aa9848-9a2d-4bf7-8aa6-ce55b6e1ff61")
 
 
+def test_resolve_session_id_from_antigravity_log(wt):
+    """antigravity/agy opens with an init event carrying conversation_id at
+    top level, not session_id -- a distinct key for the same UUID CCC needs
+    to link the worker to its transcript row."""
+    log = wt.tmp / "agy.log"
+    log.write_text(
+        '{"event":"init","conversation_id":'
+        '"c4060331-4a45-4395-a116-b87067afa337","init":{"model":"gemini-3.8-flash-high"}}\n'
+        '{"event":"step_update","step_update":{'
+        '"conversation_id":"c4060331-4a45-4395-a116-b87067afa337","step_index":0}}\n'
+    )
+    assert (wt.workers.resolve_session_id_from_log(str(log))
+            == "c4060331-4a45-4395-a116-b87067afa337")
+
+
 def test_resolve_session_id_absent_returns_empty(wt):
     log = wt.tmp / "noinit.log"
     log.write_text('{"type":"assistant","message":{}}\n')

@@ -3036,6 +3036,8 @@ def resolve_session_id_from_log(log_path: str) -> str:
     startup line. ``kimi -p --output-format stream-json`` closes with a
     ``{"role":"meta","type":"session.resume_hint","session_id":"session_<uuid>"}``
     line; the prefixed id is returned as-is (CCC indexes kimi sessions that way).
+    ``antigravity``/``agy`` opens with ``{"event":"init","conversation_id":"<uuid>"}``
+    -- its own key name, at top level, for the same UUID CCC needs.
     We scan the first lines of the captured output log for any of these shapes.
     Returns "" until the event has been written (the worker must have started
     its first turn)."""
@@ -3061,7 +3063,7 @@ def resolve_session_id_from_log(log_path: str) -> str:
                     if m:
                         return m.group(1)
                     continue
-                sid = ev.get("session_id") or ev.get("sessionId")
+                sid = ev.get("session_id") or ev.get("sessionId") or ev.get("conversation_id")
                 if sid:
                     sid = str(sid)
                     if _SESSION_ID_RE.fullmatch(sid):
