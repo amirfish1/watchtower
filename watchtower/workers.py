@@ -3795,6 +3795,10 @@ def build_drain_command(
         # AGY supports stream-json input, but its print flag requires an
         # attached (empty) prompt before any other flags. Its NDJSON envelope
         # also differs from Claude's; see _stream_json_user_line.
+        # Like kimi, AGY has no --effort flag -- effort is baked into the
+        # model id suffix (-high/-medium/-low; see MODEL_EFFORTS). Passing
+        # --effort here (even the fleet-wide default) makes AGY exit 1 with
+        # "--effort is not supported for model ...".
         argv = [
             bin_name,
             "-p=",
@@ -3804,8 +3808,6 @@ def build_drain_command(
         ]
         if model:
             argv += ["--model", model]
-        if effort:
-            argv += ["--effort", effort]
         return argv
     argv = [
         bin_name, "-p",
