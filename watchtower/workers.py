@@ -572,11 +572,17 @@ def _unlink_path_quiet(path: Optional[str]) -> None:
         pass
 
 
-def _stream_json_user_line(text: str) -> bytes:
-    msg = {
-        "type": "user",
-        "message": {"role": "user", "content": [{"type": "text", "text": text}]},
-    }
+def _stream_json_user_line(text: str, engine: str = "claude") -> bytes:
+    if engine == "antigravity":
+        msg = {
+            "event": "user",
+            "message": {"content": text},
+        }
+    else:
+        msg = {
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": text}]},
+        }
     return (json.dumps(msg) + "\n").encode("utf-8")
 
 
@@ -651,14 +657,14 @@ def worker_turn_open(w: Dict[str, Any]) -> bool:
     return turn_open
 
 
-def write_to_worker_fifo(fifo_path: str, text: str) -> bool:
+def write_to_worker_fifo(fifo_path: str, text: str, engine: str = "claude") -> bool:
     """Push a stream-json user message to a live worker's FIFO. Returns True on
     delivery, False if the worker isn't listening (no reader / closed)."""
     fd = _open_fifo_writer(fifo_path)
     if fd is None:
         return False
     try:
-        os.write(fd, _stream_json_user_line(text))
+        os.write(fd, _stream_json_user_line(text, engine=engine))
         return True
     except OSError:
         return False
@@ -963,7 +969,7 @@ def notify_workers(
             deferred += 1
             continue  # mid-turn: defer to the next tick rather than interrupt
         fifo = w.get("fifo")
-        if fifo and write_to_worker_fifo(fifo, text):
+        if fifo and write_to_worker_fifo(fifo, text, engine=str(w.get("engine") or "claude")):
             n += 1
             continue
         # WATCHTOWER-14: a worker with no fifo (or a failed write) used to get
@@ -1266,7 +1272,7 @@ def _deliver_release_instruction(
     # target and retries, instead of interrupting.
     if fifo and not worker_turn_open(w):
         try:
-            if write_to_worker_fifo(fifo, text):
+            if write_to_worker_fifo(fifo, text, engine=str(w.get("engine") or "claude")):
                 return {"transport": "fifo", "delivered": True, "error": ""}
         except Exception as exc:
             return {
@@ -3785,6 +3791,22 @@ def build_drain_command(
         if effort:
             argv += ["--effort", effort]
         return argv
+    if engine == "antigravity":
+        # AGY supports stream-json input, but its print flag requires an
+        # attached (empty) prompt before any other flags. Its NDJSON envelope
+        # also differs from Claude's; see _stream_json_user_line.
+        argv = [
+            bin_name,
+            "-p=",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json",
+            "--dangerously-skip-permissions",
+        ]
+        if model:
+            argv += ["--model", model]
+        if effort:
+            argv += ["--effort", effort]
+        return argv
     argv = [
         bin_name, "-p",
         "--input-format", "stream-json",
@@ -5615,7 +5637,7 @@ def spawn_workers(
         # child's inherited RDWR fd is already a reader, so this open + write
         # succeeds immediately and never blocks.
         if fifo_path is not None:
-            if not write_to_worker_fifo(fifo_path, goal):
+            if not write_to_worker_fifo(fifo_path, goal, engine=engine):
                 # FIFO write failed -> the worker never got its task. Kill it so
                 # we don't leave a stuck, goal-less process behind.
                 try:
@@ -5715,7 +5737,7 @@ def spawn_run_once_worker(
         logf.close()
         _close_fd_quiet(child_stdin_fd)
     if fifo_path is not None:
-        if not write_to_worker_fifo(fifo_path, goal):
+        if not write_to_worker_fifo(fifo_path, goal, engine=engine):
             try:
                 os.kill(proc.pid, 15)
             except OSError:

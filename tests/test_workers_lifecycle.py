@@ -1618,7 +1618,7 @@ def test_notify_prefers_uds_over_raw_fifo(wt, monkeypatch):
     written = []
     monkeypatch.setattr(
         wt.workers, "write_to_worker_fifo",
-        lambda fifo, text: written.append(text) or True,
+        lambda fifo, text, engine="claude": written.append(text) or True,
     )
 
     assert wt.workers.notify_workers("Q", "nudge") == 1
@@ -1645,7 +1645,7 @@ def test_notify_uses_uds_even_when_the_turn_is_open(wt, monkeypatch):
     )
     monkeypatch.setattr(
         wt.workers, "write_to_worker_fifo",
-        lambda fifo, text: pytest.fail("mid-turn FIFO write would truncate"),
+        lambda fifo, text, engine="claude": pytest.fail("mid-turn FIFO write would truncate"),
     )
 
     assert wt.workers.notify_workers("Q", "nudge") == 1
@@ -1659,7 +1659,7 @@ def test_notify_falls_back_to_fifo_when_uds_declines(wt, monkeypatch):
     written = []
     monkeypatch.setattr(
         wt.workers, "write_to_worker_fifo",
-        lambda fifo, text: written.append(text) or True,
+        lambda fifo, text, engine="claude": written.append(text) or True,
     )
     assert wt.workers.notify_workers("Q", "nudge") == 1
     assert written == ["nudge"]
@@ -2179,6 +2179,26 @@ def test_build_grok_uses_supported_one_shot_json_mode(wt):
     assert "--input-format" not in argv
     assert argv[argv.index("--output-format") + 1] == "streaming-json"
     assert "Drain the Q" in argv[2]
+
+
+def test_build_antigravity_uses_its_stream_json_contract(wt):
+    argv = wt.workers.build_drain_command("Q", "antigravity", "q-1", "/repo")
+
+    assert argv[:2] == ["antigravity", "-p="]
+    assert argv[argv.index("--input-format") + 1] == "stream-json"
+    assert argv[argv.index("--output-format") + 1] == "stream-json"
+    assert "--permission-mode" not in argv
+
+
+def test_antigravity_fifo_payload_uses_its_event_schema(wt):
+    payload = json.loads(
+        wt.workers._stream_json_user_line("drain this queue", engine="antigravity")
+    )
+
+    assert payload == {
+        "event": "user",
+        "message": {"content": "drain this queue"},
+    }
 
 
 def test_drain_goal_content(wt):
