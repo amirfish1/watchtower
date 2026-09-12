@@ -98,9 +98,15 @@ MODEL_EFFORTS = {
     "antigravity": (
         ("gemini-3.1-pro-high", ()),
         ("gemini-3.1-pro-low", ()),
+        ("gemini-3.6-flash-high", ()),
+        ("gemini-3.6-flash-medium", ()),
+        ("gemini-3.6-flash-low", ()),
         ("gemini-3.7-flash-high", ()),
         ("gemini-3.7-flash-medium", ()),
         ("gemini-3.7-flash-low", ()),
+        ("gemini-3.8-flash-high", ()),
+        ("gemini-3.8-flash-medium", ()),
+        ("gemini-3.8-flash-low", ()),
     ),
 }
 
@@ -110,6 +116,26 @@ MODEL_EFFORTS = {
 MODEL_ALIASES: Dict[str, Dict[str, str]] = {
     "claude": {
         "opus-5": "claude-opus-5",
+    },
+    # CCC's antigravity model picker stores its display label as the "id"
+    # (unlike every other engine, where the id is already the canonical CLI
+    # value) because that label is also what AGY's own settings.json expects.
+    # A `wt config --model` set from that picker therefore arrives here as
+    # "Gemini 3.8 Flash (High)", not "gemini-3.8-flash-high" -- alias it so
+    # the picker's choices resolve to a MODEL_EFFORTS-approved id instead of
+    # tripping the "not approved" queue-config validation.
+    "antigravity": {
+        "Gemini 3.1 Pro (High)": "gemini-3.1-pro-high",
+        "Gemini 3.1 Pro (Low)": "gemini-3.1-pro-low",
+        "Gemini 3.6 Flash (High)": "gemini-3.6-flash-high",
+        "Gemini 3.6 Flash (Medium)": "gemini-3.6-flash-medium",
+        "Gemini 3.6 Flash (Low)": "gemini-3.6-flash-low",
+        "Gemini 3.7 Flash (High)": "gemini-3.7-flash-high",
+        "Gemini 3.7 Flash (Medium)": "gemini-3.7-flash-medium",
+        "Gemini 3.7 Flash (Low)": "gemini-3.7-flash-low",
+        "Gemini 3.8 Flash (High)": "gemini-3.8-flash-high",
+        "Gemini 3.8 Flash (Medium)": "gemini-3.8-flash-medium",
+        "Gemini 3.8 Flash (Low)": "gemini-3.8-flash-low",
     },
 }
 
