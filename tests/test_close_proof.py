@@ -119,6 +119,15 @@ def test_missing_directory_is_a_miss_not_a_crash(repo_with_commit):
     assert found_in == other
 
 
+def test_missing_directory_is_not_reported_as_a_git_error():
+    """An absent configured checkout is a normal search miss."""
+    verified, found_in, errors = close_proof.verify_with_errors(
+        "deadbeef", "/nonexistent/repo/path"
+    )
+
+    assert (verified, found_in, errors) == ("", "", [])
+
+
 def test_existing_non_git_directory_is_a_miss_not_a_git_refusal(
     repo_with_commit, tmp_path, monkeypatch
 ):

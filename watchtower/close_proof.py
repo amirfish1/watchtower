@@ -73,6 +73,11 @@ def resolve_in_repo(repo: str, candidate: str) -> Tuple[str, str]:
     """
     argv, setup_err = _rev_parse_argv(repo, candidate)
     if setup_err:
+        # A configured checkout can disappear between queue runs. It is no
+        # different from a present checkout that no longer contains the SHA:
+        # continue searching rather than turning it into a proof failure.
+        if not _REMOTE_RE.match(repo) and not os.path.isdir(repo):
+            return "", ""
         return "", setup_err
     if not argv:
         return "", ""
