@@ -292,6 +292,55 @@ def test_cli_ready_reopens_a_closed_file_backed_ticket(wt, capsys):
     assert "RUNNABLE: LOCAL-1" in capsys.readouterr().out
 
 
+def test_reopen_returns_closed_ticket_to_open_pool(wt):
+    item = wt.q.enqueue(project="REOP", note="not actually done", source="test")
+    wt.q.close(item["ref"], "worker-a", resolution={"summary": "premature"})
+
+    reopened = wt.q.reopen(item["ref"], reason="regressed in staging")
+
+    assert reopened["status"] == "open"
+    assert reopened["claimed_by"] is None
+    assert reopened["closed_at"] is None
+    assert "resolution" not in reopened
+    assert "closed_by" not in reopened
+    assert reopened["history"][-1]["event"] == "reopen"
+    assert reopened["history"][-1]["reason"] == "regressed in staging"
+    assert reopened["history"][-1]["by"]["kind"] == "human"
+    # The old claim handle survives so `wt discuss` can still resume context.
+    assert reopened["claimed_session_id"] == item["claimed_session_id"]
+
+
+def test_reopen_refuses_already_open_and_missing(wt):
+    item = wt.q.enqueue(project="REOP", note="fine as-is", source="test")
+    with pytest.raises(ValueError, match="already open"):
+        wt.q.reopen(item["ref"])
+    assert wt.q.reopen("REOP-999") is None
+
+
+def test_reopen_refuses_blocked_ticket_unless_force(wt):
+    item = wt.q.enqueue(project="REOP", note="blocked one", source="test")
+    claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
+    wt.q.block(claimed["ref"], session_id="worker-a", question="which way?")
+
+    with pytest.raises(ValueError, match="wt answer"):
+        wt.q.reopen(item["ref"])
+
+    forced = wt.q.reopen(item["ref"], reason="block went stale", force=True)
+    assert forced["status"] == "open"
+    assert forced["needs_input"] is False
+
+
+def test_cli_reopen_closed_ticket(wt, capsys):
+    item = wt.q.enqueue(project="REOP", note="retry me", source="test")
+    wt.q.close(item["ref"], "worker-a", resolution={"summary": "wrong fix"})
+
+    assert wt.cli.main(["reopen", item["ref"], "--reason", "still broken"]) == 0
+    out = capsys.readouterr().out
+    assert "REOPENED: REOP-1" in out
+    assert "still broken" in out
+    assert wt.q.get(item["ref"])["status"] == "open"
+
+
 def test_file_backed_run_request_is_set_cleared_and_counted(wt):
     """Backend parity: ▶ on a file-backed ticket leaves the same
     ``run_requested`` state a GitHub-backed one does, and can be withdrawn."""

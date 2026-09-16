@@ -357,6 +357,7 @@ wt uninstall</div>
 <span class="cmd">wt close  DEMO-1 --summary "fixed the overlap" --commit &lt;SHA&gt; \</span>
 <span class="cmd">          --caveat "only tested on iOS" --follow-up "add a regression test"</span>
 <span class="cmd">wt release DEMO-1</span>              <span class="cm"># give up a claim without closing; returns it to open</span>
+<span class="cmd">wt reopen DEMO-1 --reason "regressed"</span>  <span class="cm"># reopen a closed ticket back to open (no dispatch)</span>
 <span class="cmd">wt block   DEMO-1 --question "ship behind a flag?" \</span>
 <span class="cmd">          --progress "root cause found; fix drafted"</span>  <span class="cm"># park for a human decision</span></pre></div>
     </div>

@@ -18,6 +18,7 @@
     wt claim -q Q --type bug  claim only bugs (or --type feature for ideas)
     wt claim -q Q --readiness needs-shaping  claim unspecced ideas
     wt close <ref>            close a ticket (summary + commit proof required)
+    wt reopen <ref>           reopen a closed ticket back to the open pool
     wt drain on|off Q         opt a queue in/out of auto-spawn
     wt workers                list workers the watcher started
     wt block / blocked        park a ticket needing a human / list parked
@@ -1198,6 +1199,29 @@ def cmd_release(args: argparse.Namespace) -> int:
             )
         return 1
     print(f"RELEASED: {item['ref']} -> open")
+    return 0
+
+
+def cmd_reopen(args: argparse.Namespace) -> int:
+    """Reopen a closed (or in-progress) ticket, returning it to the open pool.
+
+    The human triage verb — the CCC reopen button's CLI equivalent. Unlike
+    `wt release` it also applies to closed tickets; unlike `wt ready` it does
+    not mark the ticket run_requested or dispatch its queue.
+    """
+    try:
+        item = q.reopen(args.ref, reason=args.reason, session_id=args.worker,
+                        force=args.force)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
+    print(f"REOPENED: {item['ref']}" + (f" — {args.reason}" if args.reason else ""))
     return 0
 
 
@@ -3896,6 +3920,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Agent messaging", "snapshot"),
     ("Worker protocol", "claim"),
     ("Worker protocol", "release"),
+    ("Worker protocol", "reopen"),
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
@@ -3912,6 +3937,7 @@ COMMAND_HELP: Dict[str, str] = {
     "edit": "patch fields (title/priority/type/readiness/...) on an existing ticket",
     "claim": "claim next open ticket (smart sort: priority + type + age)",
     "release": "give up a claim without closing it; returns the ticket to open",
+    "reopen": "reopen a closed ticket, returning it to the open pool (no dispatch)",
     "close": "close a ticket (record how you fixed it)",
     "unresolved-ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
     "block": "park a ticket that needs a human decision",
@@ -4353,6 +4379,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "prefer `wt answer` to resolve a block")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_release)
+
+    s = sub.add_parser("reopen", help=COMMAND_HELP.get("reopen", ""))
+    s.add_argument("ref")
+    s.add_argument("--reason", default="",
+                   help="why the ticket is being reopened (recorded on its timeline)")
+    s.add_argument("--worker", default="", help="your session/worker id")
+    s.add_argument("--force", action="store_true",
+                   help="reopen even if the ticket is blocked (needs_input) -- "
+                        "normally refused because it erases the open question; "
+                        "prefer `wt answer` to resolve a block")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_reopen)
 
     s = sub.add_parser("block")
     s.add_argument("ref")

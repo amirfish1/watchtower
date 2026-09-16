@@ -1925,6 +1925,7 @@ def update_status(
     require_status: Optional[str] = None,
     reason: str = "",
     expect_owner: str = "",
+    by_kind: str = "worker",
 ) -> Optional[Dict[str, Any]]:
     """``require_status``, when set, makes this a compare-and-swap: the
     transition is only applied if the item's *current* status (read fresh,
@@ -1950,7 +1951,12 @@ def update_status(
     forwarded to GitHub-backed queues.
 
     ``reason`` (optional) is recorded on the appended ``history`` entry, e.g.
-    the orphan-ticket sweep passes "worker gone" for a reopen."""
+    the orphan-ticket sweep passes "worker gone" for a reopen.
+
+    ``by_kind`` selects the actor recorded on the appended history entry;
+    worker-driven transitions keep the default "worker", while human triage
+    verbs (``reopen``) pass "human" so the timeline attributes the event
+    correctly. Ignored by the GitHub backend's history mirroring."""
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {VALID_STATUSES}")
     backend = _github_backend_for_project(_project_from_ident(ident))
@@ -2059,6 +2065,12 @@ def update_status(
                     it["claimed_by"] = None
                     it["claimed_at"] = None
                     it["closed_at"] = None
+                    # Back to the pool: the stale close attribution and
+                    # resolution must not survive on a claimable ticket
+                    # (parity with the GitHub backend's reopen, which pops
+                    # closed_by/closed_at/resolution_* from the body meta).
+                    it.pop("closed_by", None)
+                    it.pop("resolution", None)
                     # Keep claimed_session_id: reopening drops the claim *lock*
                     # (so a new worker can claim) but preserves the handle to the
                     # session that last worked this ticket, so `wt discuss` can
@@ -2069,7 +2081,7 @@ def update_status(
                     it["block_question"] = ""
                     it["block_kind"] = ""
                     it["blocked_at"] = None
-                    _append_history(it, "reopen", by=_by("worker", str(session_id or ""), str(real_sid or "")), at=now, reason=_clip(reason, 4000))
+                    _append_history(it, "reopen", by=_by(by_kind, str(session_id or ""), str(real_sid or "")), at=now, reason=_clip(reason, 4000))
                 _save_unlocked(data)
                 verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
                 verb = verbs.get(status, status.upper())
@@ -2179,6 +2191,44 @@ def release(ident: Any, session_id: str = "", force: bool = False) -> Optional[D
             )
     return update_status(ident, "open", session_id, require_status="in_progress",
                           reason="released")
+
+
+def reopen(ident: Any, reason: str = "", session_id: str = "",
+           force: bool = False) -> Optional[Dict[str, Any]]:
+    """Reopen a closed or in-progress ticket, returning it to the open pool.
+
+    This is the human triage verb (``wt reopen``) — the CCC reopen button's
+    CLI equivalent. Unlike ``release`` it also applies to *closed* tickets,
+    and unlike ``ready`` it does not mark the ticket run_requested or
+    dispatch its queue: the ticket just goes back to open for the normal
+    claim pool. On GitHub-backed projects the transition is mirrored to
+    ``gh issue reopen``.
+
+    Refuses a ticket that is currently ``needs_input`` unless ``force=True``:
+    the reopen path clears ``needs_input``/``block_question`` (see
+    ``update_status``), so reopening a blocked ticket silently erases the
+    open question — same guard and rationale as ``release``; ``wt answer``
+    is the intentional unblock.
+    """
+    current = get(ident)
+    if current is None:
+        return None
+    if current.get("status") == "open":
+        raise ValueError(
+            f"{current.get('ref', ident)} is already open — nothing to reopen"
+        )
+    if not force and current.get("needs_input"):
+        raise ValueError(
+            f"{current.get('ref', ident)} is blocked awaiting human input: "
+            f"{current.get('block_question') or '(no question recorded)'} "
+            f"-- reopening would erase that question and hand it to a fresh "
+            f"worker with no memory of it. Use `wt answer "
+            f"{current.get('ref', ident)} \"...\"` to resolve it, or pass "
+            f"--force if the block is stale."
+        )
+    by_kind = "worker" if session_id else "human"
+    return update_status(ident, "open", session_id, reason=reason or "reopened",
+                         by_kind=by_kind)
 
 
 RESOLUTION_LIST_FIELDS = ("caveats", "follow_ups", "unresolved")

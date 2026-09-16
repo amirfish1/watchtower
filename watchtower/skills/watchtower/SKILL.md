@@ -50,6 +50,7 @@ wt add -q WT --title "..." --type bug       # file a ticket
 wt claim -q WT --worker <id> --type bug --json   # claim the next open one
 wt close <ref> --worker <id> --commit <sha> --summary "..."  # code change
 wt close <ref> --worker <id> --no-code --summary "..."       # no code changed
+wt reopen <ref> --reason "..."               # reopen a closed ticket back to open
 ```
 
 ## Import a document as tickets
