@@ -202,11 +202,13 @@ def wt_env(tmp_path, monkeypatch):
     config.GH_DRAIN_MIGRATION_MARKER.parent.mkdir(parents=True, exist_ok=True)
     config.GH_DRAIN_MIGRATION_MARKER.write_text("{}\n")
 
-    # `wt drain on` / `wt config --auto-drain on` load a LaunchAgent and
-    # background a real `wt start` when the daemon looks dead. Point the plist
-    # at nothing and claim the daemon is alive (our own pid) so the settings
-    # path is testable without spawning anything.
+    # `wt drain on` / `wt config --auto-drain on` activate a service unit and
+    # background a real `wt start` when the daemon looks dead. Point both the
+    # launchd plist and the systemd unit at nothing and claim the daemon is
+    # alive (our own pid) so the settings path is testable without spawning
+    # anything or touching the developer's real ~/.config/systemd.
     monkeypatch.setattr(cli, "_LAUNCHAGENT_PLIST", tmp_path / "no-such.plist")
+    monkeypatch.setattr(cli, "_SYSTEMD_UNIT", tmp_path / "no-such.service")
     monkeypatch.setattr(cli, "DAEMON_PID_FILE", tmp_path / "daemon.pid")
     cli.DAEMON_PID_FILE.write_text(str(os.getpid()))
 

@@ -48,6 +48,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -2891,11 +2892,11 @@ def cmd_drain(args: argparse.Namespace) -> int:
     )
     print(f"{args.queue}: drain {state} — reconciler will {'spawn workers automatically' if enabled else 'leave this queue alone'} — {restriction}")
     if enabled:
-        # Load the LaunchAgent if installed but not yet active.
-        if _LAUNCHAGENT_PLIST.exists():
-            rc = os.system(f"launchctl load '{_LAUNCHAGENT_PLIST}' 2>/dev/null")
+        # Activate the service if installed but not yet enabled/loaded.
+        if _service_installed():
+            rc = _service_activate()
             if rc == 0:
-                print(f"LaunchAgent activated (survives reboots)")
+                print(f"{_service_kind()} activated (survives reboots)")
         # Also start the service right now if daemon isn't running.
         daemon_live = False
         if DAEMON_PID_FILE.exists():
@@ -2991,10 +2992,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         state = "on" if enabled else "off"
         changed.append(f"auto_drain={state}")
         if enabled:
-            if _LAUNCHAGENT_PLIST.exists():
-                rc = os.system(f"launchctl load '{_LAUNCHAGENT_PLIST}' 2>/dev/null")
+            if _service_installed():
+                rc = _service_activate()
                 if rc == 0:
-                    print("LaunchAgent activated (survives reboots)")
+                    print(f"{_service_kind()} activated (survives reboots)")
             daemon_live = False
             if DAEMON_PID_FILE.exists():
                 try:
@@ -3481,39 +3482,36 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
 def cmd_start(args: argparse.Namespace) -> int:
     dry_run = getattr(args, "dry_run", False)
     # First-time auto-install: `wt start` is the normal user entry point, so a
-    # user should never have to run a separate `wt install` first. If the
-    # LaunchAgent has never been written, write it now (same plist + skill
-    # sync as `wt install`) and fall through to the launchd-start branch
-    # below, which always loads it -- this is an explicit `wt start`, so the
-    # cmd_install "only load if some queue has auto_drain" gate does not
-    # apply here. Guard: --foreground is what the plist itself execs (no user
-    # session, must never recurse into installing itself); --dry-run must not
-    # write anything either.
-    if not args.foreground and not dry_run and not _LAUNCHAGENT_PLIST.exists():
-        _write_launchagent_plist()
-        print(f"first start: installed LaunchAgent {_LAUNCHAGENT_LABEL} (auto-starts on login)")
-    # Prefer launchd supervision: if a plist exists, start THROUGH launchd so
-    # there is exactly ONE supervised daemon (KeepAlive relaunches it on crash).
-    # A manual background `wt start` would create a second, unsupervised daemon,
-    # which is exactly the bug that made the live service unreliable. Guard: the
-    # --foreground path is what the plist itself invokes, so it must run the loop
-    # directly and NOT re-enter launchctl (that would recurse forever); likewise
-    # --dry-run stays a pure in-process run.
-    if not args.foreground and not dry_run and _LAUNCHAGENT_PLIST.exists():
-        target = _launchd_domain_target()
-        if _launchagent_loaded():
-            # Already bootstrapped: (re)start the existing service in place.
-            rc = os.system(f"launchctl kickstart -k '{target}' 2>/dev/null") >> 8
-            action = "restarted"
-        else:
-            rc = os.system(
-                f"launchctl bootstrap gui/{os.getuid()} '{_LAUNCHAGENT_PLIST}' 2>/dev/null"
-            ) >> 8
-            action = "started"
+    # user should never have to run a separate `wt install` first. If no service
+    # file exists yet, write it now (same file + skill sync as `wt install`) and
+    # fall through to the supervised-start branch below, which always activates
+    # it -- this is an explicit `wt start`, so the cmd_install "only load if some
+    # queue has auto_drain" gate does not apply here. Guard: --foreground is what
+    # the unit itself execs (no user session, must never recurse into installing
+    # itself); --dry-run must not write anything either. On hosts with no
+    # supported supervisor (_service_file() is None) we skip straight to the
+    # manual background path and never write a foreign-OS unit.
+    if (not args.foreground and not dry_run
+            and _service_file() is not None and not _service_installed()):
+        _write_service_file()
+        print(
+            f"first start: installed {_service_kind()} {_service_label()} "
+            "(auto-starts on login)"
+        )
+    # Prefer supervisor management: if a service file exists, start THROUGH the
+    # supervisor so there is exactly ONE supervised daemon (systemd Restart /
+    # launchd KeepAlive relaunches it on crash). A manual background `wt start`
+    # would create a second, unsupervised daemon, which is exactly the bug that
+    # made the live service unreliable. Guard: the --foreground path is what the
+    # unit itself invokes, so it must run the loop directly and NOT re-enter the
+    # supervisor (that would recurse forever); likewise --dry-run stays a pure
+    # in-process run.
+    if not args.foreground and not dry_run and _service_installed():
+        rc, action = _service_start()
         if rc == 0:
-            print(f"{action} LaunchAgent {_LAUNCHAGENT_LABEL} (launchd-supervised)")
+            print(f"{action} {_service_kind()} {_service_label()} (supervised)")
             return 0
-        print(f"warning: launchctl exited {rc}; falling back to manual start")
+        print(f"warning: service manager exited {rc}; falling back to manual start")
     if not dry_run and DAEMON_PID_FILE.exists():
         try:
             pid = int(DAEMON_PID_FILE.read_text().strip())
@@ -3541,9 +3539,9 @@ def cmd_start(args: argparse.Namespace) -> int:
                 DAEMON_PID_FILE.unlink(missing_ok=True)
         return 0
     # Re-exec ourselves in the background in foreground-mode. This is the only
-    # supervision path on hosts without launchd, so use the same hardened PATH
-    # as the LaunchAgent plist; otherwise the daemon may later fail to find
-    # git/gh/claude/codex while spawning workers.
+    # supervision path on hosts without a supported service manager, so use the
+    # same hardened PATH as the service unit; otherwise the daemon may later fail
+    # to find git/gh/claude/codex while spawning workers.
     import subprocess
 
     cmd = [
@@ -3579,26 +3577,27 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def cmd_stop(args: argparse.Namespace) -> int:
-    # With KeepAlive=true, a raw SIGTERM to the pid is immediately undone by
-    # launchd (it relaunches the daemon). So an INTENTIONAL stop of a launchd-
-    # supervised daemon must tell launchd to stop-and-stay-stopped via `bootout`.
-    # Only fall back to the pidfile+SIGTERM path for a manually-started daemon
-    # (dev machines that never ran `wt install`).
-    if _LAUNCHAGENT_PLIST.exists() and _launchagent_loaded():
-        rc = _launchctl_bootout()
+    # With Restart=always (systemd) / KeepAlive=true (launchd), a raw SIGTERM to
+    # the pid is immediately undone by the supervisor. So an INTENTIONAL stop of
+    # a supervised daemon must tell the supervisor to stop-and-stay-stopped:
+    # `systemctl --user disable --now` or `launchctl bootout`. Only fall back to
+    # the pidfile+SIGTERM path for a manually-started daemon (dev machines that
+    # never ran `wt install`).
+    if _service_installed() and _service_loaded():
+        rc = _service_stop()
         if rc == 0:
-            print(f"stopped LaunchAgent {_LAUNCHAGENT_LABEL} (launchd will not relaunch)")
+            print(f"stopped {_service_kind()} {_service_label()} (will not relaunch)")
             # Log stop to activity log before clearing pidfile.
             try:
                 from . import queue as _q
-                _q._log("DAEMON_STOP", "via launchctl bootout")
+                _q._log("DAEMON_STOP", "via service manager stop")
             except Exception:
                 pass
-            # The launchd-owned daemon owns the pidfile; clear it so a later
+            # The supervisor-owned daemon owns the pidfile; clear it so a later
             # `wt start`/status doesn't see a stale pid.
             DAEMON_PID_FILE.unlink(missing_ok=True)
             return 0
-        print(f"warning: launchctl bootout exited {rc}; falling back to signal")
+        print(f"warning: service manager stop exited {rc}; falling back to signal")
     if not DAEMON_PID_FILE.exists():
         print("watcher not running")
         return 0
@@ -3628,15 +3627,68 @@ def cmd_stop(args: argparse.Namespace) -> int:
 _LAUNCHAGENT_LABEL = "ai.watchtower.watcher"
 _LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
 
+_SYSTEMD_UNIT_NAME = "ai.watchtower.watcher.service"
+_SYSTEMD_UNIT = Path.home() / ".config" / "systemd" / "user" / _SYSTEMD_UNIT_NAME
+
+
+def _is_macos() -> bool:
+    return sys.platform == "darwin"
+
+
+def _systemd_available() -> bool:
+    """True when a systemd *user* service can actually be installed here.
+
+    Three gates, all required: Linux, a systemd PID 1 (the ``/run/systemd/
+    system`` marker dir distinguishes a real systemd boot from distros that
+    merely ship the binary), and a ``systemctl`` client on PATH. The user
+    manager is implied by the marker dir -- without it ``systemctl --user``
+    would fail anyway."""
+    if not sys.platform.startswith("linux"):
+        return False
+    if not os.path.isdir("/run/systemd/system"):
+        return False
+    return shutil.which("systemctl") is not None
+
+
+def _use_systemd() -> bool:
+    """Whether WT's service is managed by systemd (Linux) vs launchd (macOS)."""
+    return _systemd_available()
+
+
+def _service_file() -> Optional[Path]:
+    """Path of the platform's service definition, or None if unsupervised.
+
+    None means no supported supervisor: callers fall back to the manual
+    background ``wt start`` path and must not write a foreign-OS unit."""
+    if _use_systemd():
+        return _SYSTEMD_UNIT
+    if _is_macos():
+        return _LAUNCHAGENT_PLIST
+    return None
+
+
+def _service_label() -> str:
+    return _SYSTEMD_UNIT_NAME if _use_systemd() else _LAUNCHAGENT_LABEL
+
+
+def _service_kind() -> str:
+    return "systemd user service" if _use_systemd() else "LaunchAgent"
+
+
+def _service_installed() -> bool:
+    f = _service_file()
+    return f is not None and f.exists()
+
 
 def _launchd_path() -> str:
-    """Build a PATH the launchd-spawned daemon can actually use.
+    """Build a PATH a supervisor-spawned daemon can actually use.
 
     launchd starts LaunchAgents with a minimal PATH (roughly /usr/bin:/bin:
-    /usr/sbin:/sbin). The daemon shells out to gh/git/claude/codex (e.g. the
-    GitHub backend runs `gh issue list`), so with the minimal PATH those tools
-    are not found and the worker crashes. We capture the INSTALLING shell's real
-    PATH (which already contains the user's tool locations) and additionally
+    /usr/sbin:/sbin), and systemd user units inherit an equally sparse
+    environment. The daemon shells out to gh/git/claude/codex (e.g. the GitHub
+    backend runs `gh issue list`), so with a minimal PATH those tools are not
+    found and the worker crashes. We capture the INSTALLING shell's real PATH
+    (which already contains the user's tool locations) and additionally
     guarantee the usual Homebrew and user-local bins are present, then ensure the
     system dirs are on the tail. De-duped, order preserved."""
     prepend = [
@@ -3681,10 +3733,7 @@ def _launchctl_bootout() -> int:
 
 
 def _write_launchagent_plist() -> None:
-    """Write the LaunchAgent plist (creating/refreshing it) and sync the
-    bundled skill into every installed agent harness. Shared by `wt install`
-    and the first-run auto-install inside `wt start` (see cmd_start); callers
-    decide whether/how to load the result into launchctl.
+    """Write/refresh the macOS LaunchAgent plist.
 
     The generated plist is HARDENED against three production failures we hit:
       1. ProgramArguments used a bare `wt` shim, but launchd's minimal PATH could
@@ -3731,49 +3780,164 @@ def _write_launchagent_plist() -> None:
     _LAUNCHAGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
     _LAUNCHAGENT_PLIST.write_text(plist)
     print(f"wrote {_LAUNCHAGENT_PLIST}")
+
+
+def _write_systemd_unit() -> None:
+    """Write/refresh the systemd *user* unit (``~/.config/systemd/user``).
+
+    Mirrors the hardened LaunchAgent guarantees:
+      1. ExecStart is an absolute interpreter + ``-m watchtower.cli`` so no
+         ``wt`` shim need be on the user manager's minimal PATH.
+      2. ``Restart=always`` supervises the daemon, the analogue of KeepAlive.
+      3. ``Environment=PATH=...`` hands the daemon the same real PATH as the
+         plist so it can find gh/git/claude/codex when spawning workers.
+    ``WantedBy=default.target`` starts it on login, matching the LaunchAgent."""
+    program_args = [sys.executable, "-m", "watchtower.cli",
+                    "start", "--foreground", "--auto-spawn"]
+    log_path = Path.home() / ".watchtower" / "watcher.log"
+    unit = f"""[Unit]
+Description=WatchTower watcher (queue auto-drain supervisor)
+
+[Service]
+Type=simple
+ExecStart={' '.join(program_args)}
+Restart=always
+RestartSec=5
+Environment=PATH={_launchd_path()}
+StandardOutput=append:{log_path}
+StandardError=append:{log_path}
+
+[Install]
+WantedBy=default.target
+"""
+    _SYSTEMD_UNIT.parent.mkdir(parents=True, exist_ok=True)
+    _SYSTEMD_UNIT.write_text(unit)
+    print(f"wrote {_SYSTEMD_UNIT}")
+
+
+def _write_service_file() -> Optional[Path]:
+    """Write the platform's service definition and sync the bundled skill.
+
+    Shared by ``wt install`` and the first-run auto-install inside ``wt start``
+    (see cmd_start); callers decide whether/how to activate the result. Returns
+    the path written, or None when no supervisor is available."""
+    if _use_systemd():
+        _write_systemd_unit()
+    elif _is_macos():
+        _write_launchagent_plist()
+    else:
+        return None
     # Keep the bundled watchtower skill in sync with every installed agent
-    # harness on every install/auto-install, independent of LaunchAgent
-    # activation -- so re-running always refreshes it.
+    # harness on every install/auto-install, independent of service activation
+    # -- so re-running always refreshes it.
     from . import skills_sync
     for r in skills_sync.sync():
         print(skills_sync.format_result(r))
+    return _service_file()
+
+
+def _systemctl(systemctl_args: str) -> int:
+    """Run ``systemctl --user <args>`` quietly and return the exit status.
+
+    Routed through ``os.system`` (not subprocess) so tests can stub a single
+    shell-out seam, matching the launchctl helpers."""
+    return os.system(f"systemctl --user {systemctl_args} >/dev/null 2>&1") >> 8
+
+
+def _service_activate() -> int:
+    """Load/enable an already-written service so it starts now and on login."""
+    if _use_systemd():
+        _systemctl("daemon-reload")
+        return _systemctl(f"enable --now '{_SYSTEMD_UNIT_NAME}'")
+    return os.system(f"launchctl load '{_LAUNCHAGENT_PLIST}' 2>/dev/null")
+
+
+def _service_start() -> Tuple[int, str]:
+    """Start an installed service through its supervisor -> (rc, action).
+
+    On systemd, ``enable --now`` brings the unit up and marks it for login
+    autostart; if it is already active we ``restart`` instead so a refreshed
+    unit takes effect. On launchd an already-bootstrapped agent is kickstarted
+    (same reason) and a new one is bootstrapped."""
+    if _use_systemd():
+        _systemctl("daemon-reload")
+        if _service_loaded():
+            rc = _systemctl(f"restart '{_SYSTEMD_UNIT_NAME}'")
+            return rc, "restarted"
+        rc = _systemctl(f"enable --now '{_SYSTEMD_UNIT_NAME}'")
+        return rc, "started"
+    target = _launchd_domain_target()
+    if _launchagent_loaded():
+        rc = os.system(f"launchctl kickstart -k '{target}' 2>/dev/null") >> 8
+        return rc, "restarted"
+    rc = os.system(
+        f"launchctl bootstrap gui/{os.getuid()} '{_LAUNCHAGENT_PLIST}' 2>/dev/null"
+    ) >> 8
+    return rc, "started"
+
+
+def _service_loaded() -> bool:
+    """Best-effort: is the installed service currently active?"""
+    if _use_systemd():
+        return _systemctl(f"is-active --quiet '{_SYSTEMD_UNIT_NAME}'") == 0
+    return _launchagent_loaded()
+
+
+def _service_stop() -> int:
+    """Stop-and-disable the service so it stays stopped across login/reboot."""
+    if _use_systemd():
+        return _systemctl(f"disable --now '{_SYSTEMD_UNIT_NAME}'")
+    return _launchctl_bootout()
+
+
+def _service_reload() -> None:
+    """Tell the supervisor to re-read on-disk unit changes, if applicable."""
+    if _use_systemd():
+        _systemctl("daemon-reload")
 
 
 def cmd_install(args: argparse.Namespace) -> int:
-    """Write a LaunchAgent plist so the WT service starts automatically on login.
+    """Write the platform service so WT starts automatically on login.
 
-    Writes the plist unconditionally (so it's ready), but only loads it into
-    launchctl if at least one queue has auto-drain enabled — otherwise the
+    On Linux with systemd this is a *user* unit at
+    ``~/.config/systemd/user/ai.watchtower.watcher.service``; on macOS it is the
+    LaunchAgent plist. The file is written unconditionally (so it's ready), but
+    only activated if at least one queue has auto-drain enabled — otherwise the
     service would start for no reason.
 
     Hidden alias: the normal user path is `wt start`, which auto-installs on
-    first run (see cmd_start) and always loads, since starting the service is
-    an explicit user action there. `wt install` stays registered for anyone
+    first run (see cmd_start) and always activates, since starting the service
+    is an explicit user action there. `wt install` stays registered for anyone
     who wants to install without starting, but it's no longer in the help
     listing (see COMMAND_SECTIONS)."""
     from . import config as _cfg
-    _write_launchagent_plist()
+    if _service_file() is None:
+        print("no supported service manager found (systemd user manager required on Linux)")
+        return 1
+    _write_service_file()
     # Only activate if some queue has auto-drain on — no point starting the
     # service when there's nothing to drain.
     drain_queues = [q for q in (_cfg._load().keys()) if _cfg.auto_drain(q)]
     if not drain_queues:
-        print("no queues have drain=on yet — plist written, will activate on first 'wt drain on <queue>'")
+        print("no queues have drain=on yet — service written, will activate on first 'wt drain on <queue>'")
         return 0
-    rc = os.system(f"launchctl load '{_LAUNCHAGENT_PLIST}'")
+    rc = _service_activate()
     if rc == 0:
-        print(f"loaded: {_LAUNCHAGENT_LABEL} — service starts on every login")
+        print(f"loaded: {_service_label()} — service starts on every login")
         print(f"  drain-on queues: {', '.join(drain_queues)}")
     else:
-        print(f"warning: launchctl load exited {rc} — plist written but not loaded")
+        print(f"warning: activation exited {rc} — service written but not enabled")
     return 0
 
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
-    """Remove the LaunchAgent so WT no longer starts on login."""
-    if _LAUNCHAGENT_PLIST.exists():
-        os.system(f"launchctl unload '{_LAUNCHAGENT_PLIST}'")
-        _LAUNCHAGENT_PLIST.unlink(missing_ok=True)
-        print(f"removed {_LAUNCHAGENT_PLIST} and unloaded from launchctl")
+    """Remove the platform service so WT no longer starts on login."""
+    if _service_installed():
+        _service_stop()
+        svc = _service_file()
+        svc.unlink(missing_ok=True)
+        _service_reload()
+        print(f"removed {svc} and stopped the service")
     else:
         print("not installed")
     from . import skills_sync
@@ -4146,9 +4310,9 @@ COMMAND_HELP: Dict[str, str] = {
     "spawn": "spawn one ad-hoc one-shot agent on a goal (WT Spawn)",
     "outbox": "inspect and manage undelivered messages",
     "chat": "group chats: multi-agent conversations",
-    "start": "start the service (installs the LaunchAgent on first run)",
+    "start": "start the service (installs the service on first run)",
     "stop": "stop service (watcher, reconciler, dashboard, HTTP API)",
-    "uninstall": "remove LaunchAgent (stop auto-start on login)",
+    "uninstall": "remove the service (stop auto-start on login)",
     "dashboard": "open the night-watch dashboard (background server + browser)",
     "skills": "sync the bundled skills into installed agent harnesses",
     "snapshot": "manage session auto-snapshots before prompt cache expiration",
