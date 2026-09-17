@@ -3205,6 +3205,11 @@ def cmd_wait(args: argparse.Namespace) -> int:
 
 
 _SELF_UPDATE_CHECK_INTERVAL_S = 3600  # how often the running daemon rechecks for new commits
+# How often the running daemon re-heals invalid queue worker settings
+# (config.sanitize_worker_settings). Cheap -- a single-file read that only
+# writes when something changed -- so no stamp file; daemon restarts are rare
+# and a restart simply runs it again.
+_CONFIG_SANITIZE_INTERVAL_S = 3600
 
 
 def _maybe_self_update() -> None:
@@ -3319,6 +3324,7 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
         _q._log("DAEMON_START", f"(pid {os.getpid()}) {auto_spawn_status}")
     except Exception:
         pass
+    last_config_sanitize = 0.0  # 0 -> the first tick below heals at daemon start
     while True:
         result = workers.reconcile_once(dry_run=dry_run)
         # Drain queued cross-agent messages each tick. Best-effort: a messaging
@@ -3362,6 +3368,35 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
                 )
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] logs prune failed: {e}", flush=True)
+        # Queue-config self-heal (2026-09-17): an explicit per-queue effort
+        # the model catalog rejects (e.g. an effort pinned on an effort-less
+        # model) makes validators like CCC's is_approved_effort check flag
+        # the queue config invalid permanently. Drop just the invalid key at
+        # daemon start and hourly; same never-kill-the-loop contract as the
+        # maintenance calls above.
+        try:
+            now = time.time()
+            if now - last_config_sanitize >= _CONFIG_SANITIZE_INTERVAL_S:
+                last_config_sanitize = now
+                from . import config as _config
+                for change in _config.sanitize_worker_settings():
+                    print(
+                        f"[watchtower] queue {change['queue']}: dropped "
+                        f"invalid effort {change['dropped_effort']!r} "
+                        f"(engine {change['engine']}, "
+                        f"model {change['model'] or 'default'})",
+                        flush=True,
+                    )
+                    _q._log(
+                        "WARN",
+                        f"self-heal: dropped invalid effort "
+                        f"{change['dropped_effort']!r} (engine "
+                        f"{change['engine']}, model "
+                        f"{change['model'] or 'default'})",
+                        queue=change["queue"],
+                    )
+        except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+            print(f"[watchtower] config sanitize failed: {e}", flush=True)
         # Group-chat nudge scheduler: same never-kill-the-loop contract as the
         # outbox drain above. deliver() wraps messages.send so chats.py never
         # touches transports directly; a chats.py bug must not take down

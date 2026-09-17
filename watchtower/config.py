@@ -35,7 +35,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 VALID_BACKENDS = ("file", "github")
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -934,6 +934,68 @@ def is_approved_effort(eng: str, model: str, value: str) -> bool:
     """Whether ``value`` is empty or supported by the selected model."""
     effort_value = str(value or "").strip().lower()
     return not effort_value or effort_value in approved_efforts(eng, model)
+
+
+def sanitize_worker_settings(*, log=None) -> List[Dict[str, Any]]:
+    """Drop explicit per-queue efforts the model catalog rejects. Self-heal.
+
+    Motivation (2026-09-17): a queue pinned to an effort-less model (kimi's
+    pinned models accept no explicit effort) with ``"effort": "high"`` set
+    made every consumer that validates via :func:`is_approved_effort` flag
+    the queue's worker config as permanently invalid, until a human cleared
+    the key by hand. Any such config now heals itself: the daemon runs this
+    at start and hourly.
+
+    Conservative scope on purpose: ONLY an invalid explicit effort is
+    dropped. The model and engine are left alone -- a model missing from the
+    catalog may be catalog lag, but an invalid effort is silently ignored at
+    spawn anyway, so dropping it loses nothing. Malformed entries (non-dict
+    queue values, unparseable fields) are skipped, never fatal, and the file
+    is written at most once per call, only when something changed.
+
+    ``log`` is an optional callable invoked once per healed queue with a
+    human-readable message. Returns the list of changes:
+    ``{"queue", "dropped_effort", "engine", "model"}``.
+    """
+    data = _load()
+    changes: List[Dict[str, Any]] = []
+    dirty = False
+    for queue_name, entry in data.items():
+        if not isinstance(entry, dict):
+            continue
+        effort_value = str(entry.get("effort") or "").strip().lower()
+        if not effort_value:
+            continue
+        try:
+            eng = engine(queue_name)
+            model_value = str(entry.get("model") or "").strip()
+            approved = is_approved_effort(eng, model_value, effort_value)
+        except Exception:
+            continue  # a queue we cannot evaluate is left exactly as-is
+        if approved:
+            continue
+        entry.pop("effort", None)
+        dirty = True
+        changes.append(
+            {
+                "queue": queue_name,
+                "dropped_effort": effort_value,
+                "engine": eng,
+                "model": model_value,
+            }
+        )
+        if log is not None:
+            try:
+                log(
+                    f"queue {queue_name}: dropped invalid effort "
+                    f"{effort_value!r} (engine {eng}, "
+                    f"model {model_value or 'default'})"
+                )
+            except Exception:
+                pass
+    if dirty:
+        _save(data)
+    return changes
 
 
 def set_desired_workers(queue: str, n: int) -> Dict[str, Any]:
