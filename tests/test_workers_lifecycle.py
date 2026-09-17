@@ -429,10 +429,15 @@ def test_reconcile_live_equals_desired_skips(wt):
 
 def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
     """A worker parked on a human question (``needs_input``) is alive but does
-    no dispatch work until answered, which can take hours. Before this fix it
+    no dispatch work until answered, which can take hours. Before WT-129 it
     still counted toward desired_workers, so one blocked ticket could occupy
     the queue's entire budget and starve every other claimable ticket
-    alongside it (WT-129 blocking WT-131's dispatch)."""
+    alongside it (WT-129 blocking WT-131's dispatch).
+
+    Since SONIA-CHAT-21, a reachable blocked-only worker still covers the
+    budget slot (no second worker spawns for it) but now via a wake nudge on
+    its FIFO rather than sitting there doing nothing -- it retries
+    `wt claim` itself and picks up the other ticket."""
     wt.config.set_auto_drain("Q", True)  # desired_workers defaults to 1
     blocked = wt.q.enqueue(project="Q", note="needs a human call")
     wt.q.enqueue(project="Q", note="unrelated claimable work")
@@ -443,6 +448,51 @@ def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
     )
     assert claimed["ref"] == blocked["ref"]
     wt.q.block(blocked["ref"], question="fix or dismiss?", session_id=worker["worker_id"])
+
+    r = wt.workers.reconcile_once(dry_run=False)
+    assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 0
+
+    fd = wt._readers[-1]
+    msg = json.loads(os.read(fd, 65536).decode().strip())
+    assert "Q" in msg["message"]["content"][0]["text"]
+
+
+def test_reconcile_wakes_fifo_less_blocked_worker_falls_back_to_spawn(wt):
+    """SONIA-CHAT-21's other half: a blocked-only worker with no live FIFO
+    (e.g. a Codex worker that already exited between turns) can't be woken,
+    so it must NOT be counted as covering the spawn budget -- a second
+    worker still needs to spawn to pick up the other claimable ticket."""
+    wt.config.set_auto_drain("Q", True)  # desired_workers defaults to 1
+    blocked = wt.q.enqueue(project="Q", note="needs a human call")
+    wt.q.enqueue(project="Q", note="unrelated claimable work")
+
+    worker = _live_worker(wt, "Q", with_fifo=False)
+    claimed = wt.q.claim_next(
+        worker["worker_id"], project="Q", session_uuid=worker["session_id"],
+    )
+    assert claimed["ref"] == blocked["ref"]
+    wt.q.block(blocked["ref"], question="fix or dismiss?", session_id=worker["worker_id"])
+
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1
+
+
+def test_reconcile_does_not_wake_blocked_worker_past_release_ceiling(wt):
+    """A blocked-only worker idle past RELEASED_TTL_S is about to be reclaimed
+    by the ordinary idle-release path anyway (see _idle_snapshot's
+    blocked_only_past_ceiling) -- waking it here would race that reclaim, so
+    it must fall back to spawning a fresh worker instead."""
+    wt.config.set_auto_drain("Q", True)  # desired_workers defaults to 1
+    blocked = wt.q.enqueue(project="Q", note="needs a human call")
+    wt.q.enqueue(project="Q", note="unrelated claimable work")
+
+    worker = _live_worker(wt, "Q")
+    claimed = wt.q.claim_next(
+        worker["worker_id"], project="Q", session_uuid=worker["session_id"],
+    )
+    assert claimed["ref"] == blocked["ref"]
+    wt.q.block(blocked["ref"], question="fix or dismiss?", session_id=worker["worker_id"])
+    _age_worker_log(wt, worker, wt.workers.RELEASED_TTL_S + 30)
 
     r = wt.workers.reconcile_once(dry_run=True)
     assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1

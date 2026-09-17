@@ -896,6 +896,25 @@ def _worker_released(w: Dict[str, Any]) -> bool:
     return bool(worker_id and (STOP_SIGNALS_DIR / worker_id).exists())
 
 
+def _worker_wakeable(w: Dict[str, Any]) -> bool:
+    """True if a live, blocked-only worker can be pushed a message to retry
+    `wt claim` instead of needing a fresh spawn for the same budget slot
+    (SONIA-CHAT-21).
+
+    Two gates, mirroring why the worker would otherwise sit uncovered
+    forever: a FIFO stdin that can actually reach it (a Codex worker that
+    already exited between turns has none -- notify_workers may still try
+    UDS/adapter fallbacks when actually delivering, but a channel that
+    isn't guaranteed live isn't something the spawn decision should bank
+    on), and the same RELEASED_TTL_S ceiling ``_idle_snapshot`` uses to
+    decide a blocked-only worker is stale enough to reclaim rather than
+    keep waiting on -- past that point it's about to be released anyway, so
+    let a spawn cover the budget instead."""
+    if _worker_idle_s(w) >= RELEASED_TTL_S:
+        return False
+    return bool(w.get("fifo"))
+
+
 def _self_identities() -> Set[str]:
     """Every string that names the session running this process right now.
 
@@ -915,13 +934,16 @@ def _self_identities() -> Set[str]:
 def notify_workers(
     queue: str, text: str, max_idle_s: Optional[float] = None,
     exclude: Optional[Set[str]] = None,
+    only: Optional[Set[str]] = None,
 ) -> int:
     """Push `text` to live workers on `queue` via their FIFO.
 
     ``max_idle_s`` defaults to the lifecycle release floor. A cache-cold worker
     is still the queue's valid worker and must be woken for new work; only a
     separately verified/released worker is skipped. Callers may pass a smaller
-    bound when they specifically want warm-cache-only routing.
+    bound when they specifically want warm-cache-only routing, or a larger one
+    (e.g. RELEASED_TTL_S) when targeting workers that are idle by design, like
+    one parked on a blocked ticket.
 
     ``exclude`` is a set of worker ids / session ids that must NOT be pushed
     to. Nothing here is news to the session that caused it: telling the
@@ -929,6 +951,10 @@ def notify_workers(
     steers it mid-turn with an echo of its own command (WATCHTOWER-25, same
     class as WATCHTOWER-21's comment echo and the transition-notify actor
     drop).
+
+    ``only``, if given, restricts delivery to workers whose worker_id is in
+    the set -- e.g. waking specific blocked-only workers without nudging
+    every other live worker on the queue too.
 
     A worker whose turn is still open is SKIPPED, not written to: the idle
     filter above preferentially selects warm workers, i.e. exactly the ones
@@ -947,6 +973,8 @@ def notify_workers(
             continue
         if _worker_released(w):
             continue  # already released from queue staffing
+        if only is not None and str(w.get("worker_id") or "") not in only:
+            continue
         if _worker_idle_s(w) >= max_idle_s:
             continue
         if exclude and (
@@ -1035,6 +1063,48 @@ def _all_workers_within_startup_grace(workers: List[Dict[str, Any]]) -> bool:
     """True if every live worker is too freshly started to plausibly have
     claimed a ticket yet -- a spawn/dispatch race, not real staleness."""
     return all(_worker_idle_s(w) < _NUDGE_STARTUP_GRACE_S for w in workers)
+
+
+# Cooldown between blocked-worker wake nudges on the same queue, same rationale
+# as _STUCK_NUDGE_COOLDOWN_S: claimable depth can persist across several
+# reconcile ticks while the woken worker is still making its way through
+# `wt claim`, and re-pushing every tick would just spam its FIFO.
+_BLOCKED_WAKE_COOLDOWN_S = WARM_TTL_S
+_last_blocked_wake: Dict[str, float] = {}
+
+
+def _maybe_wake_blocked_workers(queue: str, wakeable: List[Dict[str, Any]]) -> int:
+    """Wake blocked-only worker(s) that are being counted as staffed capacity
+    for `queue` (SONIA-CHAT-21), so they retry `wt claim` themselves instead
+    of the reconciler spawning a second worker into the budget slot they're
+    already covering.
+
+    Uses RELEASED_TTL_S, not the default RELEASE_IDLE_S, as the idle bound --
+    these workers are idle *by design* while parked on a blocked ticket, so
+    the ordinary 30-minute release-candidate window would filter out exactly
+    the workers this exists to reach. Rate-limited like the stuck-queue nudge.
+    """
+    from .queue import _log
+    if not wakeable:
+        return 0
+    now = time.time()
+    if now - _last_blocked_wake.get(queue, 0.0) < _BLOCKED_WAKE_COOLDOWN_S:
+        return 0
+    _last_blocked_wake[queue] = now
+    nudge = (
+        f"New work is claimable on {queue}. You're currently parked on a "
+        "blocked ticket and covering this queue's worker budget, so no "
+        "second worker will be spawned for it -- run `wt claim` again now; "
+        "if it returns nothing, go back to waiting on the blocked ticket."
+    )
+    ids = {str(w.get("worker_id") or "") for w in wakeable if w.get("worker_id")}
+    delivered = notify_workers(queue, nudge, max_idle_s=float(RELEASED_TTL_S), only=ids)
+    _log(
+        "NUDGE",
+        f"blocked-only worker(s) covering spawn budget — woke {delivered}/{len(wakeable)}",
+        queue=queue,
+    )
+    return delivered
 
 
 def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
@@ -5183,11 +5253,21 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         actual = len(live)
         blocked_ids_here = blocked_worker_ids.get(q_name, set())
         busy_ids_here = busy_worker_ids.get(q_name, set())
-        blocked_count = sum(
-            1 for w in live
+        blocked_only = [
+            w for w in live
             if str(w.get("worker_id") or "") in blocked_ids_here
             and str(w.get("worker_id") or "") not in busy_ids_here
-        )
+        ]
+        # A blocked-only worker that's still reachable (SONIA-CHAT-21) can be
+        # woken to retry `wt claim` instead of a second worker spawning into
+        # the same budget slot -- so it still counts toward `staffed` below,
+        # same as before this split existed. One that can't be reached (no
+        # FIFO channel, or past the release ceiling and about to be reclaimed
+        # anyway) can't cover the budget, so it's excluded exactly like the
+        # old unconditional blocked_count did.
+        wakeable_blocked = [w for w in blocked_only if _worker_wakeable(w)]
+        unwakeable_blocked = [w for w in blocked_only if not _worker_wakeable(w)]
+        blocked_count = len(unwakeable_blocked)
         # Blocked workers don't do dispatch work, so they shouldn't consume the
         # queue's spawn budget -- `staffed` is what actually gates spawn/surplus
         # decisions below, while `actual` (raw live count) stays around for
@@ -5196,6 +5276,9 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         # an in_progress one isn't idle, so it stays out of blocked_count.
         staffed = actual - blocked_count
         blocked_note = f", {blocked_count} blocked" if blocked_count else ""
+
+        if not dry_run and depth > 0 and wakeable_blocked:
+            _maybe_wake_blocked_workers(q_name, wakeable_blocked)
 
         # A queue can be fully staffed (actual > 0) yet show zero progress --
         # e.g. every live worker's last turn errored out on a transient API or
