@@ -822,6 +822,136 @@ def _rate_limit_hold_seconds() -> float:
     return _GH_RATE_LIMIT_MIN_HOLD_S
 
 
+# Observed-evidence auth-failure self-heal + hold (2026-09-17 incident). Five
+# GitHub-backed queues ERRORed "To get started with GitHub CLI, please run:
+# gh auth login" in bursts while an interactive `gh auth status` in a normal
+# shell was fine -- hosts.yml on disk was valid before and after, so the
+# daemon's reads were transient (e.g. hosts.yml mid-rewrite by another gh
+# process) or masked by a stale GH_TOKEN/GITHUB_TOKEN in the daemon's
+# supervisor environment. Each failure cost one ERROR line per queue per poll
+# in the activity log, which surfaces as alert banners in dashboards.
+#
+# Two defences, in order:
+# 1. Self-heal: on an auth-signature failure, re-run `gh auth status`. If
+#    stored auth reads fine now, the failure was transient -- retry the
+#    original command once. If it fails only under the current env while a
+#    valid oauth_token sits in hosts.yml, scrub GH_TOKEN/GITHUB_TOKEN from
+#    the child env (an env token outranks stored auth in gh, so a bad one
+#    masks a good one) and latch that scrub for every later gh call in this
+#    process.
+# 2. Hold: when the heal also fails, set `auth_broken_until` -- like the
+#    rate-limit hold, this stops every queue from ERRORing every poll, and it
+#    deliberately does not escalate the unreachability ladder: GitHub is
+#    reachable, auth is just broken. `_record_gh_success` clears the hold, so
+#    once auth is repaired out of band the next live success un-breaks
+#    polling on its own.
+_GH_AUTH_HOLD_S = 900.0
+_AUTH_ERROR_RE = re.compile(
+    r"To get started with GitHub CLI|gh auth login"
+    r"|authentication required|Bad credentials",
+    re.IGNORECASE,
+)
+# Latched once a token-scrubbed environment is proven to fix gh; consulted by
+# `_gh_child_env` for every later call in this process. Re-probing per call
+# would re-fail first, so the proof is remembered, not re-derived.
+_GH_SCRUB_ENV = False
+
+
+def _is_auth_error(error: Any) -> bool:
+    """Whether a gh error message is gh reporting it has no usable auth."""
+    return bool(_AUTH_ERROR_RE.search(str(error or "")))
+
+
+def _gh_hosts_file() -> Path:
+    env = os.environ.get("GH_CONFIG_DIR")
+    if env:
+        return Path(env).expanduser() / "hosts.yml"
+    return Path.home() / ".config" / "gh" / "hosts.yml"
+
+
+def _gh_child_env() -> Dict[str, str]:
+    """Environment for gh subprocesses: the process env, minus the token
+    variables once a scrub has been proven to unmask good stored auth."""
+    env = dict(os.environ)
+    if _GH_SCRUB_ENV:
+        env.pop("GH_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
+    return env
+
+
+def _attempt_auth_self_heal() -> bool:
+    """Best-effort recovery from an auth-signature gh failure. Never raises.
+
+    Only ever called from `_run` on an actual auth-signature failure -- it
+    spawns subprocesses and must never sit on a hot path. Returns True when
+    gh's auth turns out to be usable after all, in which case the caller
+    retries the original command once:
+
+    a. `gh auth status` succeeds under the current env -- the failure was a
+       transient read (hosts.yml mid-rewrite by another gh process).
+    b. It fails, but GH_TOKEN/GITHUB_TOKEN is set while hosts.yml holds an
+       oauth_token -- the env token may be masking good stored auth, so
+       re-check with those scrubbed. If that passes, latch the scrub for
+       every later gh call in this process (the retry included).
+    """
+    global _GH_SCRUB_ENV
+    try:
+        probe = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=_gh_child_env(),
+        )
+        if probe.returncode == 0:
+            return True
+        if not (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")):
+            return False
+        try:
+            hosts = _gh_hosts_file().read_text()
+        except OSError:
+            return False
+        if "oauth_token" not in hosts:
+            return False
+        env = dict(os.environ)
+        env.pop("GH_TOKEN", None)
+        env.pop("GITHUB_TOKEN", None)
+        probe = subprocess.run(
+            ["gh", "auth", "status"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=env,
+        )
+        if probe.returncode == 0:
+            _GH_SCRUB_ENV = True
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _record_gh_auth_broken(error: str) -> None:
+    """Record a confirmed auth outage and hold live gh calls off.
+
+    Modelled on ``_record_gh_rate_limited``: sets the hold without escalating
+    the unreachability ladder -- GitHub is reachable, auth is just broken --
+    so one bad token stops every queue from ERRORing every poll while the
+    account waits on a human (`gh auth login`). `_record_gh_success` clears
+    the hold, which is what makes the outage auto-fixed once auth recovers.
+    """
+    state = _load_connectivity()
+    hold_until = datetime.now(timezone.utc) + timedelta(seconds=_GH_AUTH_HOLD_S)
+    state["auth_broken_until"] = hold_until.strftime("%Y-%m-%dT%H:%M:%SZ")
+    state["last_error"] = str(error)
+    if state.get("broken_since") is None:
+        state["broken_since"] = _now_iso()
+    existing = _parse_iso(state.get("next_retry_at"))
+    if existing is None or existing < hold_until:
+        state["next_retry_at"] = state["auth_broken_until"]
+    _save_connectivity(state)
+
+
 def _connectivity_path() -> Path:
     env = os.environ.get("WATCHTOWER_GH_CONNECTIVITY_FILE")
     if env:
@@ -837,6 +967,7 @@ def _empty_connectivity() -> Dict[str, Any]:
         "next_retry_at": None,
         "last_error": "",
         "rate_limited_until": None,
+        "auth_broken_until": None,
     }
 
 
@@ -878,6 +1009,9 @@ def _record_gh_success() -> None:
     # A live fetch that succeeded is direct proof the account is out of the
     # penalty box, whatever the hold said.
     state["rate_limited_until"] = None
+    # Same proof for auth: a live success means whatever gh complained about
+    # (transient read, masked stored auth, since-repaired token) is over.
+    state["auth_broken_until"] = None
     _save_connectivity(state)
 
 
@@ -935,8 +1069,11 @@ def _gh_backoff_active() -> "tuple[bool, Dict[str, Any]]":
     now = datetime.now(timezone.utc)
     next_retry = _parse_iso(state.get("next_retry_at"))
     rate_limited_until = _parse_iso(state.get("rate_limited_until"))
-    active = (next_retry is not None and now < next_retry) or (
-        rate_limited_until is not None and now < rate_limited_until
+    auth_broken_until = _parse_iso(state.get("auth_broken_until"))
+    active = (
+        (next_retry is not None and now < next_retry)
+        or (rate_limited_until is not None and now < rate_limited_until)
+        or (auth_broken_until is not None and now < auth_broken_until)
     )
     return active, state
 
@@ -1382,6 +1519,7 @@ class GitHubIssuesBackend:
                 capture_output=True,
                 text=True,
                 timeout=60,
+                env=_gh_child_env(),
             )
         except FileNotFoundError as exc:
             raise GitHubBackendError(
@@ -1392,12 +1530,28 @@ class GitHubIssuesBackend:
 
     def _run(self, args: List[str], *, check: bool = True) -> str:
         proc = self._run_raw(args)
+        if (
+            check
+            and proc.returncode != 0
+            and _is_auth_error((proc.stderr or proc.stdout or "").strip())
+            and _attempt_auth_self_heal()
+        ):
+            # The heal proved gh's auth is usable (transient read, or a
+            # masking env token now latched out of the child env): the
+            # original command earns exactly one retry before we believe it.
+            proc = self._run_raw(args)
         if check and proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             if _is_rate_limit_error(detail):
                 # Observed evidence beats `gh api rate_limit`, which cannot
                 # see the user-level aggregate limit (WATCHTOWER-19).
                 _record_gh_rate_limited(detail)
+            elif _is_auth_error(detail):
+                # The heal already ran (or found nothing to heal), so this is
+                # a confirmed auth outage: hold live calls off instead of
+                # letting every queue ERROR every poll until a human repairs
+                # the token.
+                _record_gh_auth_broken(detail)
             raise GitHubBackendError(
                 f"gh {' '.join(args)} failed"
                 + (f": {detail}" if detail else "")
