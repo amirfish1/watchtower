@@ -1492,7 +1492,15 @@ def cmd_answer(args: argparse.Namespace) -> int:
     app-server owner on a session CCC may already be driving (WT-28, WT-90).
     Only CCC knows a Codex session's liveness, so ``messages.send`` delegates
     there; a genuinely unresolvable target still falls back to the headless
-    resume fork so the answer is never silently dropped."""
+    resume fork so the answer is never silently dropped.
+
+    The delivered prompt branches on ``block_kind`` (SONIA-CHAT-17, same-topic
+    routing plan section 4): a ticket parked ``awaiting-client`` is a live
+    multi-turn conversation topic, not a one-shot blocked question, so
+    "answered -> close" is wrong for it. ``--tid`` marks this specific answer
+    as the client saying the topic itself is over (Topic-Is-Done, plan section
+    3b) rather than just the next turn in an ongoing exchange.
+    """
     item = q.answer(args.ref, args.text, session_id=args.worker)
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
@@ -1503,14 +1511,33 @@ def cmd_answer(args: argparse.Namespace) -> int:
               f"(no resumable session recorded; a worker will pick it up on "
               f"next claim)")
         return 0
-    prompt = (
-        f"A human answered your blocked question on ticket {item['ref']}. "
-        f"Their answer: {args.text}. Apply it, finish the ticket, and close it "
-        f"with `wt close {item['ref']} --worker <your-id> --summary \"...\" "
-        "--commit <SHA>` (or `--no-code` if no code changed). "
-        f"If it still cannot be resolved, run `wt block` again with the new "
-        f"open question."
-    )
+    block_kind = str(item.get("block_kind") or "")
+    if block_kind == "awaiting-client" and getattr(args, "tid", False):
+        prompt = (
+            f"The client answered on ticket {item['ref']} and this is the "
+            f"end of the topic (Topic-Is-Done): {args.text}. The client is "
+            f"done with this topic. Push anything still local, then close "
+            f"with `wt close {item['ref']} --worker <your-id> --summary "
+            f'"..." --commit <SHA>` (or `--no-code` if nothing changed). '
+            f"Append your learnings line. Message the client only if you "
+            f"actually pushed something."
+        )
+    elif block_kind == "awaiting-client":
+        prompt = (
+            f"The client replied on ticket {item['ref']}: {args.text}. Do "
+            f"this turn, then park again with `wt block {item['ref']} "
+            f"--worker <your-id> --kind awaiting-client` unless the topic is "
+            f"finished, in which case close it instead."
+        )
+    else:
+        prompt = (
+            f"A human answered your blocked question on ticket {item['ref']}. "
+            f"Their answer: {args.text}. Apply it, finish the ticket, and close it "
+            f"with `wt close {item['ref']} --worker <your-id> --summary \"...\" "
+            "--commit <SHA>` (or `--no-code` if no code changed). "
+            f"If it still cannot be resolved, run `wt block` again with the new "
+            f"open question."
+        )
     return _deliver_to_blocked_session(
         item, args.text,
         prompt, args.engine, args.worker,
@@ -4467,6 +4494,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--worker", default="")
     s.add_argument("--engine", choices=["claude", "codex", "kimi"],
                    help="override the blocked session engine")
+    s.add_argument("--tid", action="store_true",
+                   help="mark this answer as Topic-Is-Done: on an "
+                        "awaiting-client blocked ticket, tells the worker "
+                        "to push and close instead of parking again")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_answer)
 
