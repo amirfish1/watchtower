@@ -657,19 +657,95 @@ def worker_turn_open(w: Dict[str, Any]) -> bool:
     return turn_open
 
 
-def write_to_worker_fifo(fifo_path: str, text: str, engine: str = "claude") -> bool:
-    """Push a stream-json user message to a live worker's FIFO. Returns True on
+def _write_fifo_frame(fifo_path: str, line: bytes) -> bool:
+    """Write one raw stream-json frame to a live worker's FIFO. Returns True on
     delivery, False if the worker isn't listening (no reader / closed)."""
     fd = _open_fifo_writer(fifo_path)
     if fd is None:
         return False
     try:
-        os.write(fd, _stream_json_user_line(text, engine=engine))
+        os.write(fd, line)
         return True
     except OSError:
         return False
     finally:
         _close_fd_quiet(fd)
+
+
+def write_to_worker_fifo(fifo_path: str, text: str, engine: str = "claude") -> bool:
+    """Push a stream-json user message to a live worker's FIFO. Returns True on
+    delivery, False if the worker isn't listening (no reader / closed)."""
+    return _write_fifo_frame(fifo_path, _stream_json_user_line(text, engine=engine))
+
+
+def _stream_json_interrupt_line() -> bytes:
+    """Serialize a stream-json ``interrupt`` control request (one line).
+
+    Byte-compatible with CCC's ``_write_stream_json_interrupt`` (verified
+    against claude 2.1.x): the control plane accepts this frame MID-TURN --
+    it aborts the in-flight tool call and ends the turn
+    (``terminal_reason: aborted_tools``) while leaving the process alive.
+    """
+    msg = {
+        "type": "control_request",
+        "request_id": str(uuid.uuid4()),
+        "request": {"subtype": "interrupt"},
+        "uuid": str(uuid.uuid4()),
+    }
+    return (json.dumps(msg) + "\n").encode("utf-8")
+
+
+def interrupt_worker_turn(worker_id: str) -> Dict[str, Any]:
+    """Interrupt the current turn of a live claude worker, leaving it running.
+
+    Writes a stream-json ``interrupt`` control request to the worker's stdin
+    FIFO (SONIA-CHAT-5: a client saying "stop" must halt the in-flight turn
+    WITHOUT killing the process -- the session and its warm prompt cache
+    survive for the next instruction).
+
+    This deliberately bypasses the ``worker_turn_open()`` mid-turn guard that
+    protects steering TEXT writes: the guard exists because a user-message
+    frame landing mid-turn can truncate the in-flight response, but the
+    interrupt control request is the one frame type DESIGNED to be written
+    mid-turn -- aborting the current tool/turn is its entire purpose.
+
+    A False result is not necessarily an error for callers: ``not_live``
+    simply means there is nothing to interrupt (unknown worker, dead process,
+    or no FIFO recorded)."""
+    wid = str(worker_id or "").strip()
+    rec: Optional[Dict[str, Any]] = None
+    if wid:
+        for w in _load().get("workers", []):
+            if str(w.get("worker_id") or "") == wid:
+                rec = w
+                break
+    fifo = str((rec or {}).get("fifo") or "")
+    try:
+        pid = int((rec or {}).get("pid") or 0)
+    except (TypeError, ValueError):
+        pid = 0
+    if not rec or not fifo or not _pid_alive(pid):
+        return {"ok": False, "code": "not_live", "worker_id": wid}
+    engine = str(rec.get("engine") or "")
+    if engine != "claude":
+        # Codex already has its own interrupt path via CCC's app-server
+        # control channel; this primitive is claude-only.
+        return {
+            "ok": False, "code": "unsupported_engine",
+            "worker_id": wid, "engine": engine,
+        }
+    if _write_fifo_frame(fifo, _stream_json_interrupt_line()):
+        try:
+            from .queue import _log
+            _log(
+                "INTERRUPT",
+                f"{wid} — turn interrupt written to FIFO",
+                queue=str(rec.get("queue") or ""),
+            )
+        except Exception:
+            pass  # audit logging must never fail the interrupt itself
+        return {"ok": True, "worker_id": wid, "via": "fifo-interrupt"}
+    return {"ok": False, "code": "fifo_unreachable", "worker_id": wid}
 
 
 # Cache warmth is a routing/cost hint, not permission to terminate or release a

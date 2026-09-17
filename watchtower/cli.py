@@ -25,6 +25,7 @@
     wt answer / discuss       answer a blocked ticket / attach to its session
     wt send <target> "text"   push a message to a worker/agent/session
     wt ask <target> "q"       ask a target and wait for its reply
+    wt interrupt <target>     interrupt a worker's in-flight turn (process stays up)
     wt outbox ls|retry|rm     inspect and manage undelivered messages
     wt critique "goal"        spawn 2 cross-family critique agents on a goal
     wt spawn "goal"           spawn one ad-hoc one-shot agent (WT Spawn)
@@ -1797,6 +1798,48 @@ def cmd_session_names(args: argparse.Namespace) -> int:
     print(json.dumps(rows, indent=2))
     return 0
 
+
+def cmd_interrupt(args: argparse.Namespace) -> int:
+    """Interrupt a worker's in-flight turn WITHOUT killing its process.
+
+    <target> may be a ticket ref (BE-31) — resolved through the queue store to
+    the worker currently claiming it — or a worker id directly. Writes claude's
+    stream-json ``interrupt`` control request to the worker's stdin FIFO: the
+    in-flight tool aborts and the turn ends, but the session (and its warm
+    prompt cache) survives for the next instruction (SONIA-CHAT-5).
+    """
+    target = str(args.target or "").strip()
+    worker_id = target
+    item = q.get(target)
+    if item is not None:
+        claimed_by = str(item.get("claimed_by") or "")
+        if str(item.get("status") or "") != "in_progress" or not claimed_by:
+            print(f"{item.get('ref', target)}: not claimed / nothing to interrupt")
+            return 0
+        worker_id = claimed_by
+    res = workers.interrupt_worker_turn(worker_id)
+    if args.json:
+        print(json.dumps(res, indent=2))
+    elif res.get("ok"):
+        print(f"INTERRUPTED: {worker_id} (via {res.get('via', '?')})")
+    elif res.get("code") == "not_live":
+        print(f"{worker_id}: not live / nothing to interrupt")
+    elif res.get("code") == "unsupported_engine":
+        print(
+            f"error: {worker_id} runs engine "
+            f"'{res.get('engine', '?')}'; only claude workers support "
+            f"fifo-interrupt",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"error: {worker_id}: interrupt failed "
+            f"({res.get('code', 'unknown')})",
+            file=sys.stderr,
+        )
+    if res.get("ok") or res.get("code") == "not_live":
+        return 0
+    return 1
 
 
 def cmd_send(args: argparse.Namespace) -> int:
@@ -4006,6 +4049,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "dedup"),
     ("Agent messaging", "send"),
     ("Agent messaging", "ask"),
+    ("Agent messaging", "interrupt"),
     ("Agent messaging", "critique"),
     ("Agent messaging", "spawn"),
     ("Agent messaging", "outbox"),
@@ -4062,6 +4106,7 @@ COMMAND_HELP: Dict[str, str] = {
     "agents": "address book: list reachable agents; register/set-name/rm to name them",
     "send": "push a message to a worker/agent/session",
     "ask": "ask a target and wait for its reply",
+    "interrupt": "interrupt a worker's in-flight turn (the process stays alive)",
     "critique": "spawn 2 cross-family critique agents on a goal",
     "spawn": "spawn one ad-hoc one-shot agent on a goal (WT Spawn)",
     "outbox": "inspect and manage undelivered messages",
@@ -4629,6 +4674,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--_notify-child", action="store_true",
                    dest="_notify_child", help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_ask)
+
+    s = sub.add_parser("interrupt")
+    s.add_argument("target",
+                   help="ticket ref (resolves to its claiming worker) or "
+                        "worker id")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_interrupt)
 
     s = sub.add_parser("critique")
     s.add_argument("goal", help="what to critique / the context to critique it against")
