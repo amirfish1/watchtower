@@ -1208,7 +1208,60 @@ def cmd_reopen(args: argparse.Namespace) -> int:
     The human triage verb — the CCC reopen button's CLI equivalent. Unlike
     `wt release` it also applies to closed tickets; unlike `wt ready` it does
     not mark the ticket run_requested or dispatch its queue.
+
+    ``--resume TEXT`` is the re-entry re-bind (SONIA-CHAT-19, same-topic
+    routing plan section 3a): instead of the plain reopen-to-open-pool path,
+    atomically re-bind the ticket to its OWN preserved ``claimed_session_id``
+    (queue.reopen_and_claim) and deliver TEXT to that session through the
+    same liveness-aware path `wt answer` uses -- steer if live, headless
+    resume if the process died. This is what makes a client re-engaging a
+    closed topic land back on the session that actually remembers it,
+    instead of a cold session with only a text summary. Falls back to a
+    plain reopen (today's behavior, caller handles re-engagement separately)
+    when the ticket has no resumable session at all.
     """
+    if getattr(args, "resume", None) is not None:
+        try:
+            item = q.get(args.ref)
+        except Exception:
+            item = None
+        if not item:
+            print(f"(no item {args.ref})", file=sys.stderr)
+            return 1
+        sid = item.get("claimed_session_id")
+        if not sid:
+            # No session to resume -- reopen only, caller (intake) falls
+            # back to a cold continuation_prefix-style new ticket.
+            try:
+                reopened = q.reopen(args.ref, reason=args.reason, force=args.force)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            if args.json:
+                print(json.dumps(reopened, indent=2))
+                return 0
+            print(f"REOPENED: {args.ref} — no resumable session recorded; "
+                  f"reopened to the open pool only.")
+            return 0
+        try:
+            claimed = q.reopen_and_claim(
+                args.ref, str(sid), session_uuid=str(sid),
+                reason=args.reason, force=args.force,
+            )
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if not claimed:
+            print(f"(no item {args.ref})", file=sys.stderr)
+            return 1
+        prompt = (
+            f"The client re-engaged ticket {args.ref} after it was closed: "
+            f"{args.resume}. This continues the same topic you already "
+            f"worked -- pick it back up with that context."
+        )
+        return _deliver_to_blocked_session(
+            claimed, args.resume, prompt, args.engine, args.worker,
+        )
     try:
         item = q.reopen(args.ref, reason=args.reason, session_id=args.worker,
                         force=args.force)
@@ -4430,6 +4483,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="reopen even if the ticket is blocked (needs_input) -- "
                         "normally refused because it erases the open question; "
                         "prefer `wt answer` to resolve a block")
+    s.add_argument("--resume", default=None, metavar="TEXT",
+                   help="re-entry re-bind (SONIA-CHAT-19): atomically reopen "
+                        "AND claim under the ticket's own preserved session, "
+                        "then deliver TEXT to it via the same liveness-aware "
+                        "path `wt answer` uses -- steer if live, headless "
+                        "resume if dead. Falls back to a plain reopen if the "
+                        "ticket has no resumable session.")
+    s.add_argument("--engine", choices=["claude", "codex", "kimi"],
+                   help="override the resumed session's engine (--resume only)")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_reopen)

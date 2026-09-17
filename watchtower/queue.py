@@ -2232,6 +2232,108 @@ def reopen(ident: Any, reason: str = "", session_id: str = "",
                          by_kind=by_kind)
 
 
+def reopen_and_claim(
+    ident: Any,
+    session_id: str,
+    session_uuid: str = "",
+    reason: str = "",
+    force: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Reopen a closed/blocked ticket and claim it under ``session_id`` in one
+    lock acquisition -- the re-entry re-bind primitive for same-topic routing
+    (SONIA-CHAT-19). ``session_id``/``session_uuid`` should be the ticket's
+    OWN preserved ``claimed_session_id`` (reopen preserves it; see ``reopen``'s
+    docstring) so the transition re-binds the ticket to the exact session
+    that last worked it, not a fresh claim.
+
+    Why one lock instead of ``reopen()`` then ``claim_by_ref()``: those two
+    calls each take and release ``_FileLock`` independently, leaving the
+    ticket sitting ``open`` -- and therefore visible to any live drain
+    worker's normal claim loop -- in the gap between them. A second worker
+    can steal it in that window. This function never leaves the ticket in
+    an externally-claimable state: closed/blocked goes straight to
+    in_progress under the given session, atomically.
+
+    Raises ``ValueError`` for the same reasons ``reopen()`` does (already
+    open, or blocked without ``force``). Returns ``None`` if the ticket
+    doesn't exist. GitHub-backed projects have no equivalent atomic
+    transition available server-side, so they fall back to the sequential
+    reopen + claim (same residual race ``reopen`` already had there; this
+    function only closes the window for the local file-backed store)."""
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        current = get(ident)
+        if current is None:
+            return None
+        reopened = reopen(ident, reason=reason, session_id=session_id, force=force)
+        if reopened is None:
+            return None
+        return claim_by_ref(reopened.get("ref", ident), session_id, session_uuid=session_uuid)
+
+    real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            if it.get("status") == "open":
+                raise ValueError(
+                    f"{it.get('ref', ident)} is already open — nothing to reopen"
+                )
+            if not force and it.get("needs_input"):
+                raise ValueError(
+                    f"{it.get('ref', ident)} is blocked awaiting human input: "
+                    f"{it.get('block_question') or '(no question recorded)'} "
+                    f"-- reopening would erase that question and hand it to a "
+                    f"fresh worker with no memory of it. Use `wt answer "
+                    f"{it.get('ref', ident)} \"...\"` to resolve it, or pass "
+                    f"--force if the block is stale."
+                )
+            now = _now_iso()
+            # Reopen half: same field resets as update_status's "open" branch
+            # (parity with reopen()/GitHub's reopen), except status lands on
+            # in_progress instead of open -- this ticket is never externally
+            # claimable in between.
+            it.pop("closed_by", None)
+            it.pop("resolution", None)
+            it["needs_input"] = False
+            it["block_question"] = ""
+            it["block_kind"] = ""
+            it["block_commit"] = ""
+            it["blocked_at"] = None
+            it["closed_at"] = None
+            _append_history(
+                it, "reopen",
+                by=_by("worker" if session_id else "human", str(session_id or ""), str(real_sid or "")),
+                at=now, reason=_clip(reason, 4000),
+            )
+            # Claim half: same fields claim_by_ref sets.
+            it["status"] = "in_progress"
+            it["claimed_by"] = str(session_id)
+            if real_sid:
+                it["claimed_session_id"] = real_sid
+            it["claimed_at"] = now
+            it["updated_at"] = now
+            _append_history(
+                it, "claim",
+                by=_by("worker", str(session_id), str(real_sid or "")),
+                at=now,
+            )
+            _save_unlocked(data)
+            _log(
+                "CLAIM",
+                f"{it.get('ref', '?')} by {str(session_id)[:16]} (reopen+claim) — "
+                f"{it.get('title') or it.get('note', '')[:60]}",
+                queue=it.get("project", ""),
+            )
+            _notify_ticket_event(
+                it, "claimed",
+                actor=(it.get("claimed_by"), it.get("claimed_session_id")),
+            )
+            return it
+    return None
+
+
 RESOLUTION_LIST_FIELDS = ("caveats", "follow_ups", "unresolved")
 
 
