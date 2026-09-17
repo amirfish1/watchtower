@@ -1227,11 +1227,25 @@ def cmd_reopen(args: argparse.Namespace) -> int:
 
 def cmd_block(args: argparse.Namespace) -> int:
     """A worker parks a ticket that needs a human decision (WT-28). Stays
-    in_progress, bound to its session; flagged needs_input with a question."""
+    in_progress, bound to its session; flagged needs_input with a question.
+
+    ``--commit`` optionally records a verified commit SHA for the work done
+    in this turn -- same local `git rev-parse` proof `wt close --commit`
+    uses (`_verify_close_commit`), so a parked (e.g. `--kind
+    awaiting-client`) ticket can still show what was done without closing.
+    """
+    commit = ""
+    if getattr(args, "commit", ""):
+        verified, error = _verify_close_commit(args.ref, args.commit)
+        if error:
+            print(error, file=sys.stderr)
+            return 1
+        commit = verified
     item = q.block(
         args.ref, session_id=args.worker,
         question=args.question, progress=args.progress,
         kind=getattr(args, "kind", "input"),
+        commit=commit,
     )
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
@@ -4399,9 +4413,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--question", default="", help="the specific decision you need")
     s.add_argument("--progress", default="",
                    help="analysis-so-far note (backstop if the session is lost)")
-    s.add_argument("--kind", default="input", choices=["input", "rationale"],
+    s.add_argument("--kind", default="input",
+                   choices=["input", "rationale", "awaiting-client"],
                    help="input = implementation question; rationale = product-"
-                        "gate pitch awaiting a human Ack/Nack (wt ack / wt nack)")
+                        "gate pitch awaiting a human Ack/Nack (wt ack / wt nack); "
+                        "awaiting-client = parked between conversation turns, "
+                        "resumable by `wt answer` when the client replies")
+    s.add_argument("--commit", default="", metavar="SHA",
+                   help="verified commit SHA recording what this turn did, "
+                        "same local `git rev-parse` proof as `wt close --commit`")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_block)

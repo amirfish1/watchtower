@@ -2080,6 +2080,7 @@ def update_status(
                     it["needs_input"] = False
                     it["block_question"] = ""
                     it["block_kind"] = ""
+                    it["block_commit"] = ""
                     it["blocked_at"] = None
                     _append_history(it, "reopen", by=_by(by_kind, str(session_id or ""), str(real_sid or "")), at=now, reason=_clip(reason, 4000))
                 _save_unlocked(data)
@@ -2372,6 +2373,7 @@ def block(
     question: str = "",
     progress: str = "",
     kind: str = "input",
+    commit: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Park a ticket that needs a human decision.
 
@@ -2384,8 +2386,13 @@ def block(
     ``progress`` is an optional analysis-so-far note, stored append-only as a
     backstop so a fresh worker could resume from notes if the session is ever
     truly gone. Resume-first, notes-as-fallback.
+
+    ``commit`` is an optional pre-verified commit SHA (verified by the caller,
+    e.g. `wt block --commit` via the same `close_proof`/`git rev-parse` check
+    `wt close --commit` uses) recording what this turn's work did, without
+    requiring the ticket to close -- the point of `--kind awaiting-client`.
     """
-    kind = kind if kind in ("input", "rationale") else "input"
+    kind = kind if kind in ("input", "rationale", "awaiting-client") else "input"
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         item = backend.block(
@@ -2406,6 +2413,8 @@ def block(
                 it["block_kind"] = kind
                 it["blocked_at"] = now
                 it["updated_at"] = now
+                if commit:
+                    it["block_commit"] = commit
                 if it.get("status") == "open":
                     it["status"] = "in_progress"
                 if session_id:
@@ -2416,7 +2425,11 @@ def block(
                 actor = _by("worker", str(session_id), str(_coerce_session_uuid(session_id) or ""))
                 if progress:
                     _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
-                _append_history(it, "block", by=actor, at=now, question=_clip(question, 4000), kind=kind)
+                _append_history(
+                    it, "block", by=actor, at=now,
+                    question=_clip(question, 4000), kind=kind,
+                    commit=commit,
+                )
                 _save_unlocked(data)
                 if progress:
                     _log(
@@ -2475,6 +2488,7 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     it["claimed_at"] = None
                     it["block_question"] = ""
                     it["block_kind"] = ""
+                    it["block_commit"] = ""
                     it["blocked_at"] = None
                     _append_history(
                         it,

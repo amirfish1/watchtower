@@ -39,6 +39,32 @@ def test_unknown_block_kind_degrades_to_input(wt_env):
     assert blocked["block_kind"] == "input"
 
 
+def test_block_kind_awaiting_client_is_stored_and_survives_reload(wt_env):
+    """SONIA-CHAT-14: `wt block --kind awaiting-client` parks a ticket between
+    WhatsApp client-intake turns so `wt answer` can later resume the exact
+    same worker session -- it must validate exactly like `input`/`rationale`,
+    not degrade to the `input` fallback for unknown kinds."""
+    it = _file_ticket(wt_env)
+    wt_env.queue.block(it["ref"], session_id="w1",
+                       question="waiting on client reply", kind="awaiting-client")
+    fresh = wt_env.queue.get(it["ref"])
+    assert fresh["block_kind"] == "awaiting-client"
+    assert fresh["needs_input"] is True
+
+
+def test_existing_block_kinds_still_validate_alongside_awaiting_client(wt_env):
+    """Adding the new kind must not disturb the two existing ones."""
+    it_input = _file_ticket(wt_env)
+    blocked_input = wt_env.queue.block(it_input["ref"], session_id="w1", question="q")
+    assert blocked_input["block_kind"] == "input"
+
+    it_rationale = _file_ticket(wt_env)
+    blocked_rationale = wt_env.queue.block(
+        it_rationale["ref"], session_id="w1", question="PITCH: ok?", kind="rationale"
+    )
+    assert blocked_rationale["block_kind"] == "rationale"
+
+
 def test_reopen_clears_block_kind(wt_env):
     it = _file_ticket(wt_env)
     wt_env.queue.block(it["ref"], session_id="w1", question="q", kind="rationale")
