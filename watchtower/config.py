@@ -89,6 +89,15 @@ MODEL_EFFORTS = {
         ("kimi-code/kimi-for-coding", ()),
         ("kimi-code/kimi-for-coding-highspeed", ()),
     ),
+    # devin (Devin CLI) has no effort flag; effort is baked into the model id
+    # suffix (-medium/-high/-max), same shape as kimi. `devin models list` is
+    # the full vocabulary; only the swe-2 family is approved for WT workers.
+    "devin": (
+        ("swe-2", ()),
+        ("swe-2-medium", ()),
+        ("swe-2-high", ()),
+        ("swe-2-max", ()),
+    ),
     # antigravity (AGY, spawn-only via `wt spawn --engine antigravity`) has no
     # effort flag; effort is baked into the model id suffix (-high/-medium/
     # -low), so pinned models accept no explicit effort — same shape as kimi.
