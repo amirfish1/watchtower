@@ -85,6 +85,10 @@ separate re-sync step. Four skills ship today:
   queue health, file/claim/close tickets.
 - **`wt-triage-queue`**: unstick a queue that's flagged stuck or has aging,
   abandoned, or unclosed claims.
+- **`wt-queue-sweep`**: review a healthy queue's tickets that need a
+  decision: blocked-on-human questions and closes with unresolved items.
+  Auto-resolves mechanical blockers after verifying, and presents product
+  decisions as short proposal/opposing-view/score cards.
 - **`critique`** (`/critique` in any synced harness): spawn two
   cross-family agents that independently critique a plan/design/diff and
   report back via `wt send`. Wraps `wt critique`; the reports arrive

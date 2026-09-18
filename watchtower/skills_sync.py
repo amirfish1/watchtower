@@ -21,7 +21,7 @@ from typing import Dict, List, NamedTuple, Optional, Tuple
 SKILL_NAME = "watchtower"
 SKILL_NAMES: Tuple[str, ...] = (
     "watchtower", "group-chat-checkin", "critique", "wt-triage-queue",
-    "compact-to-queue", "add-annotate-widget",
+    "wt-queue-sweep", "compact-to-queue", "add-annotate-widget",
     "auto-snapshot-on", "auto-snapshot-off", "snapshot-now",
     "resume-from-snapshot", "resume-from-session",
 )
