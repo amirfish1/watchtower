@@ -321,6 +321,10 @@ def github_assignee(queue: str) -> str:
 
 
 DEFAULT_QUEUE_LABEL_PREFIX = "watchtower:"
+# A queue whose ``queue_label`` is this value is the repo's catch-all: on a repo
+# shared by 2+ queues it owns every issue that no *other* queue's label claims,
+# so it needs no label of its own. At most one catch-all per repo.
+CATCH_ALL_LABEL = "*"
 # Labels that already mean something else to the GitHub backend.
 _RESERVED_QUEUE_LABELS = {
     "watchtower:in-progress",
@@ -353,11 +357,41 @@ def set_queue_label(queue: str, label: str) -> Dict[str, Any]:
     label = str(label or "").strip()
     if label:
         _validate_queue_label(label)
+        if label == CATCH_ALL_LABEL:
+            repo = str(q.get("github_repo") or "").strip().lower()
+            for other, entry in data.items():
+                if other == queue or not isinstance(entry, dict):
+                    continue
+                if (
+                    str(entry.get("queue_label") or "").strip() == CATCH_ALL_LABEL
+                    and str(entry.get("github_repo") or "").strip().lower() == repo
+                ):
+                    raise ValueError(
+                        f"{other} is already the catch-all queue for {repo or 'this repo'}; "
+                        "a repo can have only one"
+                    )
         q["queue_label"] = label
     else:
         q.pop("queue_label", None)
     _save(data)
     return q
+
+
+def is_catch_all(queue: str) -> bool:
+    return queue_label(queue) == CATCH_ALL_LABEL
+
+
+def sibling_queue_labels(queue: str, repo: str) -> list:
+    """The membership labels of every OTHER queue sharing ``repo`` -- what a
+    catch-all queue must leave alone. Catch-alls contribute no label."""
+    out = []
+    for name in github_queues_for_repo(repo):
+        if name == queue:
+            continue
+        label = queue_label(name)
+        if label != CATCH_ALL_LABEL:
+            out.append(label)
+    return out
 
 
 def queue_label(queue: str) -> str:

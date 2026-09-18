@@ -102,7 +102,7 @@
         <tr><td>--model / --effort</td><td>Model identifier and reasoning effort for spawned workers. See <code class="inline-code">wt models</code> for approved ids.</td></tr>
         <tr><td>--type</td><td>Restrict auto-drain workers to a ticket type.</td></tr>
         <tr><td>--grace-s</td><td>Seconds a new ticket is left alone before auto-drain may claim it (default 180); <code>0</code> drains immediately.</td></tr>
-        <tr><td>--queue-label</td><td>GitHub label marking an issue as this queue's when 2+ queues share a repo (default <code>watchtower:&lt;QUEUE&gt;</code>); <code>''</code> resets.</td></tr>
+        <tr><td>--queue-label</td><td>GitHub label marking an issue as this queue's when 2+ queues share a repo (default <code>watchtower:&lt;QUEUE&gt;</code>); <code>*</code> makes it the repo's catch-all (every issue no other queue claims; one per repo); <code>''</code> resets.</td></tr>
       </table>
     </div>
     <div class="cli-cmd">

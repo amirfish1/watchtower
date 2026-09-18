@@ -4995,7 +4995,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--queue-label", default=None, dest="queue_label",
                    help="GitHub label that marks an issue as this queue's on a repo "
                         "shared by 2+ queues (default: watchtower:<QUEUE>; "
-                        "pass '' to reset)")
+                        "'*' = catch-all for every issue no sibling queue "
+                        "claims; pass '' to reset)")
     s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi"],
                    help="agent engine for workers on this queue")
     s.add_argument("--model", default=None,

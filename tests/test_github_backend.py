@@ -1231,6 +1231,80 @@ def test_queue_label_config_overrides_the_partition_label(tmp_path, monkeypatch)
     assert "queue_label" not in config.get_queue_config("GHA")
 
 
+def _shared_repo_queues(config, catch_all="GHC", labelled=(("GHA", "team-a"), ("GHB", None))):
+    for name in [n for n, _ in labelled] + [catch_all]:
+        config.set_backend(name, "github")
+        config.set_github_repo(name, "owner/shared")
+        config.set_auto_drain(name, True)
+        config.set_grace_s(name, 0)
+    for name, label in labelled:
+        if label:
+            config.set_queue_label(name, label)
+    config.set_queue_label(catch_all, "*")
+
+
+def test_catch_all_queue_owns_every_issue_no_sibling_claims(tmp_path, monkeypatch):
+    """`queue_label: "*"` = everything on the shared repo that no OTHER queue's
+    label (custom or default `watchtower:<Q>`) already claims."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    _shared_repo_queues(config)
+    assert config.is_catch_all("GHC") and not config.is_catch_all("GHA")
+    _write_fake_issues(state, [
+        _fake_issue(1, "Unlabelled", labels=[]),
+        _fake_issue(2, "Only a plain label", labels=["bug"]),
+        _fake_issue(3, "A's custom label", labels=["team-a"]),
+        _fake_issue(4, "B's default label", labels=["watchtower:GHB"]),
+        _fake_issue(5, "Claimed by both siblings", labels=["team-a", "watchtower:GHB"]),
+    ])
+
+    assert [it["ref"] for it in q.list_items(project="GHC")] == ["GHC-1", "GHC-2"]
+    # The labelled queues are unchanged: still exactly their own slice.
+    assert [it["ref"] for it in q.list_items(project="GHA")] == ["GHA-3", "GHA-5"]
+    assert [it["ref"] for it in q.list_items(project="GHB")] == ["GHB-4", "GHB-5"]
+    assert q.claim_next("worker-c", project="GHC")["ref"] == "GHC-1"
+
+
+def test_catch_all_files_and_runs_without_creating_a_star_label(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    _shared_repo_queues(config)
+    _write_fake_issues(state, [_fake_issue(1, "Plain")])
+
+    q.enqueue(project="GHC", note="filed via catch-all", source="test")
+    issues = json.loads(state.read_text())["issues"]
+    assert issues[-1]["labels"] == []
+    q.mark_runnable("GHC-1")
+    labels = json.loads(state.read_text())["issues"][0]["labels"]
+    assert "*" not in labels and "watchtower:play" in labels
+    # ...and the file is still the catch-all's, since it has no sibling label.
+    assert {it["ref"] for it in q.list_items(project="GHC")} == {"GHC-1", "GHC-2"}
+
+
+def test_a_repo_can_have_only_one_catch_all(tmp_path, monkeypatch):
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    _shared_repo_queues(config)
+    config.set_backend("GHD", "github")
+    config.set_github_repo("GHD", "owner/shared")
+    with pytest.raises(ValueError, match="already the catch-all"):
+        config.set_queue_label("GHD", "*")
+    assert "queue_label" not in config.get_queue_config("GHD")
+    # A different repo is independent.
+    config.set_github_repo("GHD", "owner/elsewhere")
+    config.set_queue_label("GHD", "*")
+    assert config.is_catch_all("GHD")
+
+
+def test_catch_all_alone_on_a_repo_sees_everything(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHC", "github")
+    config.set_github_repo("GHC", "owner/solo")
+    config.set_queue_label("GHC", "*")
+    _write_fake_issues(state, [_fake_issue(1, "Any"), _fake_issue(2, "Other", labels=["x"])])
+    assert [it["ref"] for it in q.list_items(project="GHC")] == ["GHC-1", "GHC-2"]
+
+
 def test_queue_label_rejects_values_gh_would_mangle(tmp_path, monkeypatch, capsys):
     config, _q = _reload_isolated(tmp_path, monkeypatch)
     from watchtower.cli import main

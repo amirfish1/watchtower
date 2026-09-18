@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from .config import CATCH_ALL_LABEL
 from .queue import UNCLAIMABLE_READINESS, _FileLock
 
 VALID_LANES = ("normal", "express")
@@ -1463,6 +1464,13 @@ class GitHubIssuesBackend:
             if queue_label is not None and str(queue_label).strip()
             else self._config_queue_label()
         )
+        # The catch-all queue (`queue_label: "*"`) owns every issue on a shared
+        # repo that no sibling queue's label claims. It has no label of its own,
+        # so nothing below ever creates, adds, or matches on one.
+        self.catch_all = self.queue_label == CATCH_ALL_LABEL
+        self.sibling_labels = (
+            frozenset(self._config_sibling_labels()) if self.catch_all else frozenset()
+        )
         self.in_progress_label = "watchtower:in-progress"
         self.no_auto_drain_label = NO_AUTO_DRAIN_LABEL
         self.run_requested_label = RUN_REQUESTED_LABEL
@@ -1482,6 +1490,13 @@ class GitHubIssuesBackend:
             if partition_by_label is not None
             else self._config_partitions_by_label()
         )
+
+    def _config_sibling_labels(self) -> List[str]:
+        try:
+            from . import config
+            return config.sibling_queue_labels(self.queue, self.repo)
+        except Exception:
+            return []
 
     def _config_queue_label(self) -> str:
         try:
@@ -1592,11 +1607,12 @@ class GitHubIssuesBackend:
         )
 
     def _ensure_labels(self) -> None:
-        self._ensure_label(
-            self.queue_label,
-            "5319e7",
-            f"WatchTower queue {self.queue}",
-        )
+        if not self.catch_all:
+            self._ensure_label(
+                self.queue_label,
+                "5319e7",
+                f"WatchTower queue {self.queue}",
+            )
         self._ensure_label(
             self.in_progress_label,
             "fbca04",
@@ -1636,7 +1652,12 @@ class GitHubIssuesBackend:
         # Membership, not admission: under the blacklist model every issue in
         # the repo belongs to this queue unless the repo is shared, in which
         # case the legacy label is the only thing that can divide them.
-        queue_member = (not self.partition_by_label) or self.queue_label in labels
+        if not self.partition_by_label:
+            queue_member = True
+        elif self.catch_all:
+            queue_member = not self.sibling_labels.intersection(labels)
+        else:
+            queue_member = self.queue_label in labels
         number = int(issue.get("number") or 0)
         state = str(issue.get("state") or "").upper()
         if state == "CLOSED":
@@ -2180,7 +2201,8 @@ class GitHubIssuesBackend:
             *self._repo_args(),
             "--title", issue_title,
             "--body", body,
-            "--label", self.queue_label,
+            # The catch-all owns unlabelled issues, so it files without one.
+            *([] if self.catch_all else ["--label", self.queue_label]),
         ])
         match = _ISSUE_URL_RE.search(out.strip())
         if not match:
@@ -2251,7 +2273,7 @@ class GitHubIssuesBackend:
             raise ValueError(f"{item.get('ref', ident)} is closed")
         self._ensure_labels()
         add_labels = ["--add-label", self.run_requested_label]
-        if self.partition_by_label:
+        if self.partition_by_label and not self.catch_all:
             add_labels += ["--add-label", self.queue_label]
         self._run([
             "issue", "edit", str(item["number"]),

@@ -315,7 +315,9 @@ three. The old `watchtower:<QUEUE>` label no longer admits anything; it is
 only still read when two or more queues point at the *same* repo, where it is
 the only way to say which issue belongs to which queue. That label defaults to
 `watchtower:<QUEUE>`; override it per queue with
-`wt config -q MYAPP --queue-label team-a` (pass `''` to reset). Turning drain on for a
+`wt config -q MYAPP --queue-label team-a` (pass `''` to reset). One queue per repo can instead be the **catch-all**
+(`wt config -q MYAPP --queue-label '*'`): it owns every issue that no other
+queue on that repo claims by label, so it needs no label of its own. Turning drain on for a
 **public** repo prints a warning first — agents will work strangers' issues.
 Claims assign the issue to `@me` by default; override with
 `wt set -q MYAPP --github-assignee USERNAME`.
