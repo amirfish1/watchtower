@@ -309,7 +309,9 @@ So a queue with drain on works every open issue except the ones labelled
 seconds so a human can label them first. `wt run MYAPP-123` overrides all
 three. The old `watchtower:<QUEUE>` label no longer admits anything; it is
 only still read when two or more queues point at the *same* repo, where it is
-the only way to say which issue belongs to which queue. Turning drain on for a
+the only way to say which issue belongs to which queue. That label defaults to
+`watchtower:<QUEUE>`; override it per queue with
+`wt config -q MYAPP --queue-label team-a` (pass `''` to reset). Turning drain on for a
 **public** repo prints a warning first — agents will work strangers' issues.
 Claims assign the issue to `@me` by default; override with
 `wt set -q MYAPP --github-assignee USERNAME`.
