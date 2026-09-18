@@ -104,6 +104,25 @@ def test_worker_that_dies_unauthenticated_is_recorded_not_registered(wt_env, fak
     assert wt_env.workers.list_workers() == []
 
 
+def test_unrecognised_launch_failure_reason_carries_the_engines_own_error(wt_env, fake_bin):
+    """`exit 2` alone told the operator nothing; the reason must quote what the
+    engine printed so the activity log names the actual breakage."""
+    fake_bin(
+        "codex",
+        "echo \"error: unexpected argument '--input-format' found\" >&2\n"
+        "echo 'Usage: codex [OPTIONS]' >&2\n"
+        "echo \"For more information, try '--help'.\" >&2\nexit 2",
+    )
+    failures = []
+    wt_env.workers.spawn_workers(
+        QUEUE, 1, engine="codex", repo_path=str(wt_env.tmp), launch_failures=failures
+    )
+    assert failures
+    reason = failures[0]["reason"]
+    assert reason.startswith("engine exited immediately (exit 2)")
+    assert "unexpected argument '--input-format'" in reason
+
+
 def test_usage_limit_cooldown_honours_the_provider_supplied_retry_time(wt_env, tmp_path):
     """When the provider says when it will serve again, trust that over our own
     exponential guess — retrying earlier just burns another rejection."""

@@ -264,6 +264,12 @@ KIMI_IDLE_CONTRACT = (
     "message. "
 )
 
+DEVIN_IDLE_CONTRACT = (
+    "Do NOT poll or sleep-loop. After the idle audit, end your turn and exit "
+    "immediately. This is a one-shot run (devin -p); do not wait for a wake "
+    "message. "
+)
+
 KIMI_RESUME_CONTRACT = (
     "RESUME CHECK: if this run starts with context indicating you were "
     "mid-work on a ticket, follow the Resume Check protocol in {runbook} before "
@@ -431,11 +437,11 @@ _MANUAL_RUN_INSTRUCTIONS = (
     "do NOT wait for new work."
 )
 
-_ENGINE_BIN = {"claude": "claude", "codex": "codex", "kimi": "kimi"}
+_ENGINE_BIN = {"claude": "claude", "codex": "codex", "kimi": "kimi", "devin": "devin"}
 
 # Engines whose workers are one-shot processes (goal in argv, DEVNULL stdin,
 # exit when done) rather than FIFO-fed live processes like claude.
-_ONE_SHOT_ENGINES = ("codex", "kimi")
+_ONE_SHOT_ENGINES = ("codex", "kimi", "devin")
 
 
 def _resolve_engine_bin(engine: str) -> str:
@@ -3204,7 +3210,15 @@ def _last_log_line(log_path: Path, limit: int = 160) -> str:
         return ""
     if not lines:
         return ""
-    line = lines[-1]
+    # Prefer the newest error-looking line over the literal last one: clap-style
+    # CLIs (devin) close with "For more information, try '--help'." after the
+    # actual complaint.
+    tail = lines[-12:]
+    line = next(
+        (ln for ln in reversed(tail)
+         if re.search(r"error|unexpected|invalid|unknown|failed", ln, re.I)),
+        tail[-1],
+    )
     return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
@@ -3861,11 +3875,12 @@ def drain_goal(
         idle_contract=(
             CODEX_IDLE_CONTRACT if engine == "codex"
             else KIMI_IDLE_CONTRACT if engine == "kimi"
+            else DEVIN_IDLE_CONTRACT if engine == "devin"
             else CLAUDE_IDLE_CONTRACT
         ),
         resume_contract=(
             CODEX_RESUME_CONTRACT if engine == "codex"
-            else KIMI_RESUME_CONTRACT if engine == "kimi"
+            else KIMI_RESUME_CONTRACT if engine in ("kimi", "devin")
             else CLAUDE_RESUME_CONTRACT
         ).format(runbook=_worker_runbook_ref()),
     )
@@ -3955,6 +3970,24 @@ def build_drain_command(
             goal or drain_goal(queue, worker_id, repo_path, engine=engine),
             "--output-format",
             "stream-json",
+        ]
+        if model:
+            argv += ["--model", model]
+        return argv
+    if engine == "devin":
+        # One-shot print mode like kimi: goal rides in argv, stdin is DEVNULL,
+        # the process exits when the drain loop ends. Devin rejects Claude's
+        # --input-format (exit 2), so it must not reach the default branch.
+        # "dangerous" auto-approves every tool, matching the bypass flag the
+        # other engines get; print mode cannot show the workspace-trust prompt
+        # and fails in an untrusted repo unless the check is skipped. Devin has
+        # no --effort flag; queue effort config is ignored for this engine.
+        argv = [
+            bin_name,
+            "-p",
+            goal or drain_goal(queue, worker_id, repo_path, engine=engine),
+            "--permission-mode", "dangerous",
+            "--respect-workspace-trust", "false",
         ]
         if model:
             argv += ["--model", model]

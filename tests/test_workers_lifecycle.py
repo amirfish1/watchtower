@@ -2258,6 +2258,24 @@ def test_build_grok_uses_supported_one_shot_json_mode(wt):
     assert "Drain the Q" in argv[2]
 
 
+def test_build_devin_is_one_shot_print_without_claude_flags(wt):
+    """devin exits 2 on Claude's --input-format; it needs its own one-shot
+    print command (the 2026-09-18 CCC devin fallback loop)."""
+    argv = wt.workers.build_drain_command("Q", "devin", "q-1", "/repo", model="swe-2")
+
+    assert argv[:2] == ["devin", "-p"]
+    assert "Drain the Q" in argv[2]
+    assert "--input-format" not in argv
+    assert "--output-format" not in argv
+    assert "--verbose" not in argv
+    assert argv[argv.index("--permission-mode") + 1] == "dangerous"
+    assert argv[argv.index("--respect-workspace-trust") + 1] == "false"
+    assert argv[argv.index("--model") + 1] == "swe-2"
+    assert "--effort" not in argv
+    assert "devin" in wt.workers._ONE_SHOT_ENGINES
+    assert "(devin -p)" in argv[2]
+
+
 def test_build_antigravity_uses_its_stream_json_contract(wt):
     argv = wt.workers.build_drain_command("Q", "antigravity", "q-1", "/repo")
 
