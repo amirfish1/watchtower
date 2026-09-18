@@ -1197,6 +1197,55 @@ def test_github_backend_still_partitions_a_repo_shared_by_two_queues(tmp_path, m
     assert q.claim_next("worker-a2", project="GHA") is None
 
 
+def test_queue_label_config_overrides_the_partition_label(tmp_path, monkeypatch):
+    """A per-queue `queue_label` replaces `watchtower:<QUEUE>` for membership,
+    creation, and run-requests; a queue without one keeps the default."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    for name in ("GHA", "GHB"):
+        config.set_backend(name, "github")
+        config.set_github_repo(name, "owner/shared")
+        config.set_auto_drain(name, True)
+        config.set_grace_s(name, 0)
+    config.set_queue_label("GHA", "team-a")
+    assert config.queue_label("GHA") == "team-a"
+    assert config.queue_label("GHB") == "watchtower:GHB"
+    _write_fake_issues(state, [
+        _fake_issue(1, "Old default label for A", labels=["watchtower:GHA"]),
+        _fake_issue(2, "Custom label for A", labels=["team-a"]),
+        _fake_issue(3, "Default label for B", labels=["watchtower:GHB"]),
+    ])
+
+    a_items = q.list_items(project="GHA")
+    assert [it["ref"] for it in a_items] == ["GHA-2"]
+    assert a_items[0]["watchtower_label"] == "team-a"
+    assert [it["ref"] for it in q.list_items(project="GHB")] == ["GHB-3"]
+
+    created = q.enqueue(project="GHA", note="New A ticket", source="test")
+    assert "team-a" in json.loads(state.read_text())["issues"][-1]["labels"]
+    assert "watchtower:GHA" not in json.loads(state.read_text())["issues"][-1]["labels"]
+    assert created["watchtower_label"] == "team-a"
+
+    config.set_queue_label("GHA", "")
+    assert config.queue_label("GHA") == "watchtower:GHA"
+    assert "queue_label" not in config.get_queue_config("GHA")
+
+
+def test_queue_label_rejects_values_gh_would_mangle(tmp_path, monkeypatch, capsys):
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    from watchtower.cli import main
+
+    for bad in ("a,b", "x" * 51, "watchtower:play"):
+        with pytest.raises(ValueError):
+            config.set_queue_label("GHI", bad)
+    assert "queue_label" not in config.get_queue_config("GHI")
+
+    assert main(["config", "-q", "GHI", "--queue-label", "BYM"]) == 0
+    assert "queue_label=BYM" in capsys.readouterr().out
+    assert config.queue_label("GHI") == "BYM"
+    assert main(["config", "-q", "GHI", "--queue-label", "a,b"]) == 1
+
+
 def test_github_backend_lists_issues_closed_within_last_14_days(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)

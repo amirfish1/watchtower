@@ -3032,6 +3032,13 @@ def cmd_config(args: argparse.Namespace) -> int:
     if getattr(args, "github_assignee", None) is not None:
         config.set_github_assignee(args.queue, args.github_assignee)
         changed.append(f"github_assignee={config.github_assignee(args.queue)}")
+    if getattr(args, "queue_label", None) is not None:
+        try:
+            config.set_queue_label(args.queue, args.queue_label)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        changed.append(f"queue_label={config.queue_label(args.queue)}")
     if getattr(args, "workers_local_path", None) is not None:
         expanded_path = os.path.expanduser(args.workers_local_path)
         if not os.path.isdir(expanded_path):
@@ -4979,6 +4986,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="GitHub repo for --backend github, as OWNER/REPO")
     s.add_argument("--github-assignee", default=None, dest="github_assignee",
                    help="assignee used by GitHub-backed claims (default: @me)")
+    s.add_argument("--queue-label", default=None, dest="queue_label",
+                   help="GitHub label that marks an issue as this queue's on a repo "
+                        "shared by 2+ queues (default: watchtower:<QUEUE>; "
+                        "pass '' to reset)")
     s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi"],
                    help="agent engine for workers on this queue")
     s.add_argument("--model", default=None,

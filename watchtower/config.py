@@ -320,6 +320,53 @@ def github_assignee(queue: str) -> str:
     return str(_queue_entry(queue).get("github_assignee") or "@me")
 
 
+DEFAULT_QUEUE_LABEL_PREFIX = "watchtower:"
+# Labels that already mean something else to the GitHub backend.
+_RESERVED_QUEUE_LABELS = {
+    "watchtower:in-progress",
+    "watchtower:no-auto-drain",
+    "watchtower:play",
+}
+
+
+def _validate_queue_label(label: str) -> None:
+    """Reject values ``gh`` would split, mangle, or that collide with a
+    WatchTower control label, so a bad label fails at config time."""
+    if "," in label or "\n" in label or "\r" in label:
+        raise ValueError(
+            f"queue_label {label!r} cannot contain commas or newlines"
+        )
+    if len(label) > 50:
+        raise ValueError("queue_label must be 50 characters or fewer (GitHub's limit)")
+    if label.lower() in _RESERVED_QUEUE_LABELS:
+        raise ValueError(
+            f"queue_label {label!r} is reserved for a WatchTower control label"
+        )
+
+
+def set_queue_label(queue: str, label: str) -> Dict[str, Any]:
+    """Override the GitHub label that marks an issue as belonging to ``queue``
+    on a repo shared by two or more queues. An empty value clears the override
+    and restores the default ``watchtower:<queue>``."""
+    data = _load()
+    q = data.setdefault(queue, {})
+    label = str(label or "").strip()
+    if label:
+        _validate_queue_label(label)
+        q["queue_label"] = label
+    else:
+        q.pop("queue_label", None)
+    _save(data)
+    return q
+
+
+def queue_label(queue: str) -> str:
+    """The effective membership label: the configured ``queue_label``, else
+    ``watchtower:<queue>``."""
+    configured = str(_queue_entry(queue).get("queue_label") or "").strip()
+    return configured or f"{DEFAULT_QUEUE_LABEL_PREFIX}{queue}"
+
+
 def set_auto_drain(queue: str, enabled: bool) -> Dict[str, Any]:
     data = _load()
     q = data.setdefault(queue, {})

@@ -1450,12 +1450,19 @@ class GitHubIssuesBackend:
         auto_drain: Optional[bool] = None,
         grace_s: Optional[int] = None,
         partition_by_label: Optional[bool] = None,
+        queue_label: Optional[str] = None,
     ):
         self.queue = queue
         self.repo = str(repo or "").strip()
         self.repo_path = str(repo_path or "").strip()
         self.assignee = str(assignee or "@me").strip() or "@me"
-        self.queue_label = f"watchtower:{queue}"
+        # `queue_label` in queue-config.json overrides the default
+        # `watchtower:<QUEUE>`; unset keeps the default exactly.
+        self.queue_label = (
+            str(queue_label).strip()
+            if queue_label is not None and str(queue_label).strip()
+            else self._config_queue_label()
+        )
         self.in_progress_label = "watchtower:in-progress"
         self.no_auto_drain_label = NO_AUTO_DRAIN_LABEL
         self.run_requested_label = RUN_REQUESTED_LABEL
@@ -1475,6 +1482,13 @@ class GitHubIssuesBackend:
             if partition_by_label is not None
             else self._config_partitions_by_label()
         )
+
+    def _config_queue_label(self) -> str:
+        try:
+            from . import config
+            return config.queue_label(self.queue)
+        except Exception:
+            return f"watchtower:{self.queue}"
 
     def _config_auto_drain(self) -> bool:
         try:
