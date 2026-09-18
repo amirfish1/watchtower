@@ -88,6 +88,10 @@ Never flood. Each card, short enough that the user never opens the ticket:
 - **Score 0–1** — 1 = no-brainer, go; 0 = controversial, think more. Say what
   drives the score; split into parts if the parts differ (e.g. 0.95 for the
   source fix, 0.75 for the risky piece).
+- **Blast radius: L/M/H** — how much of the product or how many users the
+  bug/feature touches (one button vs a whole surface vs everything).
+- **Risk: L/M/H** — chance that making the change breaks something or is hard
+  to undo. Say what drives it in a few words.
 - **Your call** — what to reply. Then `wt answer` exactly the user's decision,
   including any refinements they add.
 
