@@ -177,6 +177,13 @@ def _spawn_env() -> Dict[str, str]:
         for key in list(env):
             if key.startswith("WATCHTOWER_"):
                 env.pop(key, None)
+    # These name the session that runs `wt`, i.e. the *spawner* -- never the
+    # worker. Claude and Codex overwrite them with their own ids at startup,
+    # but engines that set neither (devin) inherited the spawner's, so their
+    # `wt claim` recorded the spawner's session as claimed_session_id and a
+    # later `wt answer` was delivered to the wrong session (CCC-1153).
+    for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+        env.pop(key, None)
     env["WT_WORKER_COMMIT"] = "1"
     return env
 

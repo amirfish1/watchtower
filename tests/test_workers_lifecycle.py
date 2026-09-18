@@ -1011,6 +1011,25 @@ def test_spawn_workers_inherits_env_outside_pytest(wt, monkeypatch):
     assert worker_env["WATCHTOWER_STORE"] == "/custom/queue.json"
 
 
+def test_spawn_env_never_carries_the_spawners_session_identity(wt, monkeypatch):
+    """`wt` run inside a Claude/Codex session can spawn workers. The child must
+    not inherit that session's id: devin sets neither variable, so it claimed
+    tickets under the spawner's session and `wt answer` went to the wrong
+    session (CCC-1153)."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "spawner-claude-session")
+    monkeypatch.setenv("CODEX_THREAD_ID", "spawner-codex-thread")
+    monkeypatch.setenv("WATCHTOWER_STORE", "/custom/queue.json")
+
+    env = wt.workers._spawn_env()
+
+    assert "CLAUDE_CODE_SESSION_ID" not in env
+    assert "CODEX_THREAD_ID" not in env
+    # Everything else still inherits.
+    assert env["WATCHTOWER_STORE"] == "/custom/queue.json"
+    assert env["WT_WORKER_COMMIT"] == "1"
+
+
 def test_engine_available_uses_codex_env_override(wt, monkeypatch):
     script = wt.tmp / "fake-codex"
     script.write_text("#!/bin/sh\nexit 0\n")
