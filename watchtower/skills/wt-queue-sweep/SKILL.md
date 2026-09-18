@@ -120,6 +120,13 @@ without the user's say-so, except the auto-ack in category 1.
    user to clarify; the goal is to get to the bottom of it and solve it.
 5. **Recurring alerts / shared root cause** (e.g. repeated perf tickets): treat
    as one big item under 6.
+7. **Feature deliberately killed later** (checked at the top of this section):
+   ack its leftover caveats automatically (`wt unresolved-ack <ref> --all`),
+   no question to the user. Only when a commit provably disabled, removed,
+   reverted or superseded it on purpose (cite the SHA). If it merely broke as a
+   side effect, or no clear killing commit exists, it is NOT moot: make it a
+   normal decision card. List every auto-ack in a one-line "closed as moot"
+   digest at the end of the sweep (ticket, killing SHA, `--undo` hint).
 6. **Caveats, tech debt, fragile assumptions**: propose a remedy. Small: suggest
    a new ticket. Big: suggest opening a `CCC-DESIGN-*` ticket for a proper
    design assessment and a go/no-go decision.
