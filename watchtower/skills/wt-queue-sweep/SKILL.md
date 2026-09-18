@@ -88,6 +88,12 @@ Never flood. Each card, short enough that the user never opens the ticket:
 - **Score 0–1** — 1 = no-brainer, go; 0 = controversial, think more. Say what
   drives the score; split into parts if the parts differ (e.g. 0.95 for the
   source fix, 0.75 for the risky piece).
+- **Other repos are fair game.** If the root-cause fix lives in a different repo
+  (e.g. an external tool's repo), that is fine: file the ticket in the current
+  queue, name the target repo path at the top of the ticket, and have the worker
+  do the work there. Check the queue's auto-drain type filter first (`wt add`
+  prints "wrong type" if it won't drain); file as `bug` when the queue only
+  drains bugs, or the ticket will sit unclaimed.
 - **Scoring principles.** (1) A fix at the root cause scores high; a workaround
   that leaves the cause in place scores low. (2) Someone opened the ticket, so
   it matters: never lower a score because "the user may not care anymore" or
