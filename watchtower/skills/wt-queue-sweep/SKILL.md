@@ -14,6 +14,11 @@ Two levels, don't mix them: **stuck** is a queue property (open work, no
 closes in the window). **Blocked** is a ticket property (a worker parked it
 with a question; status stays `in_progress`, `needs_input: true`).
 
+**A sweep covers exactly one queue: the one the user names.** Tickets waiting
+in other queues are out of scope; don't go looking, and don't widen the sweep on
+your own. (If you happen to notice something urgent elsewhere, mention it in one
+line, don't act on it.)
+
 ## 1. Collect
 
 ```bash
