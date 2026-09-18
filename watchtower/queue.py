@@ -192,7 +192,10 @@ def _log_many(events: List[tuple]) -> bool:
             if sid and str(verb).upper() not in ("ENQUEUE", "CLAIM"):
                 detail = f"{detail} [sid:{sid[:8]}]"
             q_col = (queue or "reconciler")
-            lines.append(f"{now}  {q_col:<14}  {verb:<9}{detail}\n")
+            # Verbs of 9+ chars (SPAWN_PLAN, IDLE_DECISION) fill the column, so
+            # force one space or they glue onto the first detail field.
+            sep = " " if len(verb) >= 9 else ""
+            lines.append(f"{now}  {q_col:<14}  {verb:<9}{sep}{detail}\n")
         with open(log_path, "a") as f:
             f.write("".join(lines))
         return True

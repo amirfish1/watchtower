@@ -1485,6 +1485,37 @@ def _audit_detail(**fields: Any) -> str:
     return " ".join(f"{key}={_audit_value(value)}" for key, value in fields.items())
 
 
+_SPAWN_CAUSE_TEXT = {
+    "initial_staffing": "initial staffing",
+    "scale_up": "scale up",
+    "dead_worker_recovery": "replacing a dead worker",
+    "release_replacement": "replacing a released worker",
+    "manual_or_run_once": "manual run",
+}
+
+_ZERO_SPAWN_TEXT = {
+    "live_workers_cover_claimable_work": "live workers already cover the claimable work",
+    "no_claimable_work": "nothing claimable",
+    "auto_drain_off": "auto-drain is off",
+    "depth_lookup_failed": "could not read the queue",
+    "surplus_staffing_after_release": "already over-staffed",
+    "staffing_sufficient_after_release": "already fully staffed",
+}
+
+
+def _spawn_plan_summary(plan: Dict[str, Any]) -> str:
+    """One plain-English sentence for a SPAWN_PLAN line; the key=value audit
+    fields still follow it for machines."""
+    running = f"{plan['eligible_after']}/{plan['desired']} workers running"
+    work = f"{plan['claimable_depth']} of {plan['total_open']} open tickets claimable"
+    cause = _SPAWN_CAUSE_TEXT.get(plan["cause"], plan["cause"])
+    if plan["requested"] > 0:
+        noun = "worker" if plan["requested"] == 1 else "workers"
+        return f"wants to spawn {plan['requested']} {noun} ({cause}); {running}, {work} |"
+    why = _ZERO_SPAWN_TEXT.get(plan["zero_spawn_reason"], plan["zero_spawn_reason"])
+    return f"no spawn wanted: {why}; {running}, {work} |"
+
+
 def _whole_age(value: Any) -> Any:
     age = float(value)
     return int(age) if age != float("inf") else age
@@ -5215,7 +5246,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         }
         result["spawn_plans"].append(plan)
         planned_queues.add(qn)
-        plan_detail = _audit_detail(
+        plan_detail = _spawn_plan_summary(plan) + " " + _audit_detail(
                 reconcile_id=plan["reconcile_id"],
                 queue=plan["queue"],
                 total_open=plan["total_open"],
@@ -5499,9 +5530,26 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 reason = cooldown.get("reason", "recent worker launch failure")
                 substitute = _launch_substitute(q_name, engine)
                 if not substitute:
+                    skip_reason = f"launch cooldown until {until} — {reason}"
                     result["skipped"].append(
-                        {"queue": q_name,
-                         "reason": f"launch cooldown until {until} — {reason}"}
+                        {"queue": q_name, "reason": skip_reason}
+                    )
+                    hint = (
+                        "no fallback engine is available"
+                        if config.fallback_to_default_worker(q_name)
+                        else "fallback to the default worker is off for this queue"
+                    )
+                    _q._log(
+                        "SPAWN_SKIP",
+                        f"spawn of {to_spawn} blocked: {engine} is cooling down "
+                        f"until {until} ({reason}); {hint} | "
+                        + _audit_detail(
+                            reconcile_id=reconcile_id, queue=q_name,
+                            engine=engine, requested=to_spawn,
+                            cooldown_until=until,
+                            fallback_to_default_worker=config.fallback_to_default_worker(q_name),
+                        ),
+                        queue=q_name,
                     )
                     continue
                 launch_engine = substitute

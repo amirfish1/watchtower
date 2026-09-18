@@ -673,6 +673,32 @@ def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
     )
 
 
+def test_spawn_plan_line_is_readable_and_cooldown_skip_is_logged(wt):
+    """The plan line leads with a plain-English sentence, the verb never glues
+    onto the first field, and a cooldown that blocks the spawn says so in the
+    activity log rather than only in reconcile's return value."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_engine("Q", "codex")
+    wt.q.enqueue(project="Q", note="work")
+    log = wt.tmp / "fail.log"
+    log.write_text("error: unexpected argument\n")
+    wt.workers._record_launch_failure(
+        queue="Q", engine="codex", worker_id="q-old", pid=1, log_path=log,
+        reason="engine exited immediately (exit 2)",
+    )
+
+    result = wt.workers.reconcile_once(dry_run=False)
+
+    assert result["spawned"] == []
+    plan = _activity_lines(wt, "SPAWN_PLAN")[0]
+    assert "SPAWN_PLAN wants to spawn 1 worker (initial staffing); 0/1 workers running, 1 of 1 open tickets claimable | reconcile_id=" in plan
+    skip = _activity_lines(wt, "SPAWN_SKIP")[0]
+    assert "codex is cooling down until" in skip
+    assert "engine exited immediately (exit 2)" in skip
+    assert "fallback to the default worker is off for this queue" in skip
+    assert "requested=1" in skip
+
+
 def test_reconcile_usage_limit_falls_back_to_default_engine(wt, monkeypatch):
     """A quota-exhausted engine is substituted for this launch only: the
     queue's stored engine/model are the user's and are never rewritten
