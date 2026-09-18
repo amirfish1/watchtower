@@ -622,6 +622,7 @@ def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
     create a fresh cloud session every tick while the reset/cooldown is active."""
     wt.config.set_auto_drain("Q", True)
     wt.config.set_engine("Q", "codex")
+    wt.config.set_fallback_to_default_worker("Q", True)
     wt.q.enqueue(project="Q", note="work")
     sid = "11111111-1111-1111-1111-111111111111"
     script = (
@@ -648,7 +649,7 @@ def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
         "queue": "Q", "from_engine": "codex", "to_engine": "claude",
         "reason": "engine usage limit",
     }]
-    assert wt.config.engine("Q") == "claude"
+    assert wt.config.engine("Q") == "codex"
     activity = (wt.tmp / "activity.log").read_text()
     correlated_failures = [
         line for line in activity.splitlines() if "  SPAWN_FAIL" in line
@@ -673,18 +674,21 @@ def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
 
 
 def test_reconcile_usage_limit_falls_back_to_default_engine(wt, monkeypatch):
-    """A quota-exhausted explicit engine is replaced once, not retried forever."""
+    """A quota-exhausted engine is substituted for this launch only: the
+    queue's stored engine/model are the user's and are never rewritten
+    (WATCHTOWER-30)."""
     wt.config.set_auto_drain("Q", True)
     wt.config.set_engine("Q", "kimi")
     wt.config.set_model("Q", "kimi-code/k3")
+    wt.config.set_fallback_to_default_worker("Q", True)
     wt.q.enqueue(project="Q", note="work")
     calls = []
 
     def fake_spawn(
         queue, n=1, engine="claude", *, repo_path="", dry_run=False,
-        launch_failures=None, **_kwargs,
+        launch_failures=None, model="", inherit_queue_model=True, **_kwargs,
     ):
-        calls.append(engine)
+        calls.append((engine, model, inherit_queue_model))
         if engine == "kimi":
             launch_failures.append({"reason": "engine usage limit"})
             return []
@@ -692,17 +696,40 @@ def test_reconcile_usage_limit_falls_back_to_default_engine(wt, monkeypatch):
 
     monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
     monkeypatch.setattr(wt.config, "fallback_engine", lambda failed: "codex")
-    monkeypatch.setattr(wt.config, "default_model", lambda engine: "gpt-5.6-terra")
+    monkeypatch.setattr(wt.config, "fallback_model", lambda engine: "gpt-5.6-terra")
 
     result = wt.workers.reconcile_once(dry_run=False)
 
-    assert calls == ["kimi", "codex"]
-    assert wt.config.engine("Q") == "codex"
-    assert wt.config.model("Q") == "gpt-5.6-terra"
+    assert calls == [("kimi", "", True), ("codex", "gpt-5.6-terra", False)]
+    assert wt.config.engine("Q") == "kimi"
+    assert wt.config.model("Q") == "kimi-code/k3"
     assert result["fallbacks"] == [{
         "queue": "Q", "from_engine": "kimi", "to_engine": "codex",
         "reason": "engine usage limit",
     }]
+
+
+def test_reconcile_usage_limit_without_opt_in_does_not_substitute(
+    wt, monkeypatch
+):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_engine("Q", "kimi")
+    wt.q.enqueue(project="Q", note="work")
+    calls = []
+
+    def fake_spawn(queue, n=1, engine="claude", launch_failures=None, **_kw):
+        calls.append(engine)
+        launch_failures.append({"reason": "engine usage limit"})
+        return []
+
+    monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
+    monkeypatch.setattr(wt.config, "fallback_engine", lambda failed: "codex")
+
+    result = wt.workers.reconcile_once(dry_run=False)
+
+    assert calls == ["kimi"]
+    assert result["fallbacks"] == []
+    assert wt.config.engine("Q") == "kimi"
 
 
 _KIMI_QUOTA_LOG = (
@@ -3414,6 +3441,7 @@ def test_partial_usage_fallback_preserves_failed_slot_causality(
     wt.config.set_auto_drain("Q", True)
     wt.config.set_desired_workers("Q", 2)
     wt.config.set_engine("Q", "codex")
+    wt.config.set_fallback_to_default_worker("Q", True)
     wt.q.enqueue(project="Q", note="work one")
     wt.q.enqueue(project="Q", note="work two")
     cold = _live_worker(wt, "Q")

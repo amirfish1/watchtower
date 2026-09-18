@@ -3064,6 +3064,12 @@ def cmd_config(args: argparse.Namespace) -> int:
                   file=sys.stderr)
         config.set_product_gate(args.queue, enabled)
         changed.append(f"product_gate={'on' if enabled else 'off'}")
+    if getattr(args, "fallback_to_default_worker", None) is not None:
+        enabled = args.fallback_to_default_worker == "on"
+        config.set_fallback_to_default_worker(args.queue, enabled)
+        changed.append(
+            f"fallback_to_default_worker={'on' if enabled else 'off'}"
+        )
     if getattr(args, "notify_events", None) is not None:
         raw = str(args.notify_events).strip().lower()
         if raw == "default":
@@ -5013,6 +5019,13 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="product_gate",
                    help="on = workers must get a human Ack (wt ack) after a "
                         "minimal-diagnosis pitch before implementing")
+    s.add_argument("--fallback-to-default-worker", default=None,
+                   choices=["on", "off"], dest="fallback_to_default_worker",
+                   help="revert to CCC default worker if current model is "
+                        "exhausted: on = while this queue's engine keeps "
+                        "failing at launch, spawn workers on the fallback "
+                        "engine (the queue's engine/model setting is never "
+                        "changed); off (default) = park the queue instead")
     s.add_argument("--notify-events", default=None, dest="notify_events",
                    help="comma-separated events a ticket's submitter is "
                         "notified about: claimed,closed,needs_input,"

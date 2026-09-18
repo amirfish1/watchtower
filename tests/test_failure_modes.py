@@ -270,17 +270,100 @@ def test_a_recovered_engine_lets_the_next_outage_alert_again(wt_env, tmp_path):
 
 def test_a_repeatedly_failing_engine_is_swapped_for_one_that_works(wt_env, fake_bin):
     """Falling back was reserved for usage limits. Every other way an engine
-    can be down — broken binary, expired login — left the queue on it."""
+    can be down — broken binary, expired login — left the queue on it. The
+    swap is per launch only (WATCHTOWER-30): the user's stored engine and
+    model survive it, so the preferred engine is retried once it cools down."""
+    fake_bin("claude")
+    fake_bin("codex", 'echo "Cannot find module" >&2\nexit 1')
+    wt_env.config.set_engine(QUEUE, "codex")
+    wt_env.config.set_model(QUEUE, "gpt-5.5")
+    wt_env.config.set_fallback_to_default_worker(QUEUE, True)
+    wt_env.config.set_auto_drain(QUEUE, True)
+    wt_env.config.set_grace_s(QUEUE, 0)
+    wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
+    spawned = []
+    for _ in range(3):
+        _expire_cooldown(wt_env)
+        spawned += wt_env.workers.reconcile_once()["spawned"]
+    assert [w["engine"] for w in spawned] == ["claude"]
+    assert spawned[0].get("model", "") != "gpt-5.5"
+    stored = wt_env.config.get_queue_config(QUEUE)
+    assert stored["engine"] == "codex" and stored["model"] == "gpt-5.5"
+    assert wt_env.config.engine(QUEUE) == "codex"
+
+
+def test_fallback_off_parks_the_queue_instead_of_switching(wt_env, fake_bin):
+    """Without the per-queue opt-in the reconciler must never put a queue's
+    work on an engine the user did not choose -- it parks and says why."""
     fake_bin("claude")
     fake_bin("codex", 'echo "Cannot find module" >&2\nexit 1')
     wt_env.config.set_engine(QUEUE, "codex")
     wt_env.config.set_auto_drain(QUEUE, True)
     wt_env.config.set_grace_s(QUEUE, 0)
     wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
+    spawned, fallbacks = [], []
+    for _ in range(3):
+        _expire_cooldown(wt_env)
+        result = wt_env.workers.reconcile_once()
+        spawned += result["spawned"]
+        fallbacks += result["fallbacks"]
+    assert spawned == [] and fallbacks == []
+    assert result["parked"] and result["parked"][0]["queue"] == QUEUE
+    assert wt_env.config.auto_drain(QUEUE) is False
+    assert wt_env.config.get_queue_config(QUEUE)["engine"] == "codex"
+    park = next(s for s in result["skipped"] if s["reason"].startswith("parked"))
+    assert "fallback to the CCC default worker is off" in park["reason"]
+
+
+def test_fallback_log_names_the_real_launch_failure(wt_env, fake_bin):
+    """FALLBACK said "usage limit" for every cause, including a CLI that
+    rejected its own arguments. It must say what actually failed."""
+    fake_bin("claude")
+    fake_bin(
+        "codex",
+        "echo \"error: unexpected argument '--input-format' found\" >&2\nexit 2",
+    )
+    wt_env.config.set_engine(QUEUE, "codex")
+    wt_env.config.set_fallback_to_default_worker(QUEUE, True)
+    wt_env.config.set_auto_drain(QUEUE, True)
+    wt_env.config.set_grace_s(QUEUE, 0)
+    wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
     for _ in range(3):
         _expire_cooldown(wt_env)
         wt_env.workers.reconcile_once()
-    assert wt_env.config.engine(QUEUE) == "claude"
+    lines = [
+        line for line in (wt_env.tmp / "activity.log").read_text().splitlines()
+        if "FALLBACK" in line
+    ]
+    assert lines
+    assert "usage limit" not in lines[0]
+    assert "unexpected argument '--input-format'" in lines[0]
+    assert "queue engine unchanged" in lines[0]
+
+
+def test_opted_in_queue_keeps_draining_on_fallback_while_engine_cools_down(
+    wt_env, fake_bin, tmp_path
+):
+    """With the preferred engine in cooldown, an opted-in queue launches on the
+    fallback engine for that tick; an opted-out one waits the cooldown out."""
+    fake_bin("claude")
+    wt_env.config.set_engine(QUEUE, "codex")
+    wt_env.config.set_auto_drain(QUEUE, True)
+    wt_env.config.set_grace_s(QUEUE, 0)
+    wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
+    _record_failures(wt_env, tmp_path, 1)
+    assert wt_env.workers.reconcile_once()["spawned"] == []
+    wt_env.config.set_fallback_to_default_worker(QUEUE, True)
+    result = wt_env.workers.reconcile_once()
+    assert [w["engine"] for w in result["spawned"]] == ["claude"]
+    assert wt_env.config.engine(QUEUE) == "codex"
+
+
+def test_fallback_opt_in_is_settable_from_the_cli(wt_env, run_cli):
+    assert wt_env.config.fallback_to_default_worker(QUEUE) is False
+    res = run_cli("config", "-q", QUEUE, "--fallback-to-default-worker", "on")
+    assert res.code == 0, res.output
+    assert wt_env.config.fallback_to_default_worker(QUEUE) is True
 
 
 def _expire_cooldown(wt_env, queue=QUEUE, engine="codex"):

@@ -325,7 +325,7 @@ escalates in four steps as the same failure repeats:
    reason an operator can act on — usage limit, auth, API down, broken binary.
    It can only ever name failures we have already seen, so an unrecognised
    non-zero exit inside the grace window is still recorded, under a generic
-   `engine exited immediately (exit N)`. That fallback is the load-bearing
+   `engine exited immediately (exit N): <last log line>`. That fallback is the load-bearing
    part: WATCHTOWER-29 was an *unclassified* failure (a half-installed codex
    npm package), and "no phrase matched" used to mean "no cooldown at all".
 3. **Say so.** At `_LAUNCH_FAILURE_ALERT_STREAK` consecutive failures,
@@ -334,12 +334,20 @@ escalates in four steps as the same failure repeats:
    days. The ref is written back onto the failure record, so one outage files
    one ticket however long it lasts; the streak (and the alert) clear when a
    worker finally establishes a session.
-4. **Swap or park.** `_warrants_engine_swap` moves the queue to
-   `config.fallback_engine()` — immediately for a usage limit (the provider has
-   already told us it will not serve us), only on a repeat for anything else,
-   so one flaky start never rewrites a queue's configured engine. With no
-   fallback installed, a repeated failure parks the queue instead: `auto_drain`
-   goes off and `wt drain on <queue>` is the deliberate act that resumes it.
+4. **Substitute or park.** Only a queue that opted in with
+   `wt config -q <queue> --fallback-to-default-worker on` ("Revert to CCC
+   default worker if current model is exhausted"; default **off**) gets a
+   substitute. `_warrants_engine_swap` decides when: immediately for a usage
+   limit, only on a repeat for anything else. `_launch_substitute` then
+   launches that tick's workers on `config.fallback_engine()` with
+   `config.fallback_model()`, and keeps doing so while the preferred engine's
+   cooldown runs. It is a **launch-time substitution only**: the queue's stored
+   engine/model are never rewritten (WATCHTOWER-30 — the reconciler used to
+   `set_engine`/`set_model`, silently overwriting a user's choice), so the next
+   tick after the cooldown tries the preferred engine again. The `FALLBACK`
+   log line names the real failure reason. A queue that did not opt in, or has
+   no fallback installed, is parked on a repeated failure instead: `auto_drain`
+   goes off with the reason logged, and `wt drain on <queue>` resumes it.
 
 ### `request_stop(worker_id)`
 

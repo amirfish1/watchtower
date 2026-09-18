@@ -3094,8 +3094,8 @@ def _warrants_engine_swap(rec: Optional[Dict[str, Any]]) -> bool:
     A usage limit is swapped away from on sight: the provider has already said
     it will not serve us and named no alternative, so waiting costs the queue
     the whole cooldown. Every other failure has to prove it is not transient by
-    repeating -- a single 503 or a flaky first start must not permanently
-    rewrite a queue's configured engine."""
+    repeating -- a single 503 or a flaky first start must not move a queue's
+    workers off its configured engine."""
     if not isinstance(rec, dict):
         return False
     if rec.get("reason") == "engine usage limit":
@@ -3105,6 +3105,20 @@ def _warrants_engine_swap(rec: Optional[Dict[str, Any]]) -> bool:
     except (TypeError, ValueError):
         return False
     return consecutive >= _LAUNCH_FAILURE_ALERT_STREAK
+
+
+def _launch_substitute(queue: str, engine: str) -> str:
+    """Engine to launch this queue's workers on instead of its failing
+    ``engine``, or "" to not substitute. Only a queue that opted in to
+    "Revert to CCC default worker" gets one (WATCHTOWER-30), and never an
+    engine that is itself cooling down on this queue."""
+    from . import config
+    if not config.fallback_to_default_worker(queue):
+        return ""
+    substitute = config.fallback_engine(engine)
+    if substitute and active_launch_failure_cooldown(queue, substitute):
+        return ""
+    return substitute
 
 
 def active_launch_failure_cooldown(
@@ -3159,7 +3173,11 @@ def _wait_for_immediate_launch_failure(
         # silent respawn every tick -- the classifier can only ever name the
         # failures we have already seen, and this is the one that hurt
         # (WATCHTOWER-29: 242 dead workers over 5 days, none of them recorded).
-        classified = {"reason": f"engine exited immediately (exit {exit_code})"}
+        reason = f"engine exited immediately (exit {exit_code})"
+        tail = _last_log_line(log_path)
+        if tail:
+            reason += f": {tail}"
+        classified = {"reason": reason}
     return _record_launch_failure(
         queue=queue,
         engine=engine,
@@ -3171,6 +3189,23 @@ def _wait_for_immediate_launch_failure(
         model=model,
         exit_code=exit_code,
     )
+
+
+def _last_log_line(log_path: Path, limit: int = 160) -> str:
+    """Last non-blank line of a startup log, trimmed -- the engine's own words
+    for why it died (e.g. ``unexpected argument '--input-format'``)."""
+    try:
+        lines = [
+            line.strip()
+            for line in log_path.read_text(errors="replace").splitlines()
+            if line.strip()
+        ]
+    except OSError:
+        return ""
+    if not lines:
+        return ""
+    line = lines[-1]
+    return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
 def resolve_session_id_from_log(log_path: str) -> str:
@@ -5416,20 +5451,41 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 or (peeked or {}).get("repo_path", "")
             )
             engine = config.engine(q_name)
+            # A fallback engine is a launch-time substitution only
+            # (WATCHTOWER-30): the queue's stored engine/model are the user's
+            # and stay put, so once the preferred engine's cooldown ends the
+            # next tick tries it again.
+            launch_engine = engine
+            launch_model = ""
+            substitute_note = ""
             cooldown = (
                 None if dry_run else active_launch_failure_cooldown(q_name, engine)
             )
             if cooldown:
                 until = cooldown.get("cooldown_until_human", "later")
                 reason = cooldown.get("reason", "recent worker launch failure")
-                result["skipped"].append(
-                    {"queue": q_name,
-                     "reason": f"launch cooldown until {until} — {reason}"}
+                substitute = _launch_substitute(q_name, engine)
+                if not substitute:
+                    result["skipped"].append(
+                        {"queue": q_name,
+                         "reason": f"launch cooldown until {until} — {reason}"}
+                    )
+                    continue
+                launch_engine = substitute
+                launch_model = config.fallback_model(substitute)
+                substitute_note = (
+                    f"; fallback from {engine} ({reason}) until {until}"
                 )
-                continue
+                result["fallbacks"].append({
+                    "queue": q_name,
+                    "from_engine": engine,
+                    "to_engine": substitute,
+                    "reason": reason,
+                })
             launch_failed: List[Dict[str, Any]] = []
             spawned = spawn_workers(
-                q_name, n=to_spawn, engine=engine,
+                q_name, n=to_spawn, engine=launch_engine, model=launch_model,
+                inherit_queue_model=launch_engine == engine,
                 repo_path=repo_path, dry_run=dry_run,
                 launch_failures=launch_failed,
                 # On a drain-off queue the worker exists only for the tickets
@@ -5447,6 +5503,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             spawn_reason = (
                 f"{depth} {counted}, {staffed} staffed < {desired} desired "
                 f"({actual} live{blocked_note}), {unclaimed} unclaimed, spawn {to_spawn}"
+                f"{substitute_note}"
             )
             _annotate_spawn_records(spawned, plan, spawn_reason)
             _annotate_spawn_records(launch_failed, plan, spawn_reason)
@@ -5459,15 +5516,13 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 else ""
             )
             fallback = (
-                ""
-                if dry_run or not swap_failures
-                else config.fallback_engine(engine)
+                _launch_substitute(q_name, engine)
+                if swap_failures and not dry_run and launch_engine == engine
+                else ""
             )
             if fallback:
-                fallback_model = config.default_model(fallback)
-                config.set_engine(q_name, fallback)
-                config.set_model(q_name, fallback_model)
-                fallback_reason = f"fallback from {engine} {swap_cause}"
+                fallback_model = config.fallback_model(fallback)
+                fallback_reason = f"fallback from {engine} ({swap_cause})"
                 fallback_failures: List[Dict[str, Any]] = []
                 failed_indices = [
                     int(rec.get("_spawn_index", index))
@@ -5475,8 +5530,13 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 ]
                 fallback_spawned = spawn_workers(
                     q_name, n=len(failed_indices), engine=fallback,
+                    model=fallback_model, inherit_queue_model=False,
                     repo_path=repo_path, dry_run=False,
                     launch_failures=fallback_failures,
+                    extra_instructions=(
+                        _MANUAL_RUN_INSTRUCTIONS.format(queue=q_name)
+                        if manual_run else ""
+                    ),
                 )
                 for rec in fallback_spawned + fallback_failures:
                     local_index = int(rec.get("_spawn_index", 0))
@@ -5515,13 +5575,20 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 ]
                 if repeated and config.auto_drain(q_name):
                     config.set_auto_drain(q_name, False)
+                    why_not = (
+                        "no fallback engine is available"
+                        if config.fallback_to_default_worker(q_name)
+                        else "fallback to the CCC default worker is off for "
+                        "this queue"
+                    )
                     park_reason = (
-                        f"parked: {engine} keeps failing at launch "
-                        f"({swap_cause}) and no fallback engine is available "
+                        f"parked: {launch_engine} keeps failing at launch "
+                        f"({swap_cause}) and {why_not} "
                         f"— run `wt drain on {q_name}` once it is fixed"
                     )
                     result["parked"].append(
-                        {"queue": q_name, "engine": engine, "reason": swap_cause}
+                        {"queue": q_name, "engine": launch_engine,
+                         "reason": swap_cause}
                     )
                     result["skipped"].append(
                         {"queue": q_name, "reason": park_reason}
@@ -5639,8 +5706,9 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         for fallback in result.get("fallbacks", []):
             _log(
                 "FALLBACK",
-                f"{fallback.get('from_engine')} usage limit — switched to "
-                f"{fallback.get('to_engine')} default",
+                f"{fallback.get('from_engine')} launch failed "
+                f"({fallback.get('reason') or 'unknown reason'}) — this launch "
+                f"used {fallback.get('to_engine')}; queue engine unchanged",
                 queue=fallback.get("queue", ""),
             )
     except Exception:
@@ -5660,6 +5728,7 @@ def spawn_workers(
     kind: str = "",
     dry_run: bool = False,
     launch_failures: Optional[List[Dict[str, Any]]] = None,
+    inherit_queue_model: bool = True,
 ) -> List[Dict[str, Any]]:
     """Launch ``n`` worker subprocesses draining ``queue``.
 
@@ -5674,9 +5743,13 @@ def spawn_workers(
     need dispatcher guidance beyond the standard drain contract). ``kind``
     tags the worker record (e.g. ``"bespoke"`` for one-off custom spawns) so
     dashboards can tell them from reconciler-spawned drain workers.
+
+    ``inherit_queue_model=False`` keeps an empty ``model`` empty (the engine's
+    own default) instead of reading the queue's configured model -- for a
+    worker substituted onto a different engine than the queue's own.
     """
     repo_path = repo_path or os.getcwd()
-    if not model:
+    if not model and inherit_queue_model:
         from . import config
         model = config.model(queue)
     from . import config

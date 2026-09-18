@@ -761,6 +761,34 @@ def fallback_engine(failed_engine: str) -> str:
     return ""
 
 
+def set_fallback_to_default_worker(queue: str, enabled: bool) -> Dict[str, Any]:
+    data = _load()
+    q = data.setdefault(queue, {})
+    q["fallback_to_default_worker"] = bool(enabled)
+    _save(data)
+    return q
+
+
+def fallback_to_default_worker(queue: str) -> bool:
+    """"Revert to CCC default worker if current model is exhausted."
+
+    False unless explicitly opted in (WATCHTOWER-30). When on, a queue whose
+    engine keeps failing at launch gets workers on ``fallback_engine`` for
+    that launch only -- the queue's stored engine/model are never rewritten.
+    When off, such a queue is parked instead of switched."""
+    return bool(_queue_entry(queue).get("fallback_to_default_worker", False))
+
+
+def fallback_model(eng: str) -> str:
+    """The model a substituted worker on ``eng`` runs with: the same shared
+    defaults ``model()`` resolves for an unpinned queue on that engine. The
+    failed queue's own pin belongs to its engine, so it is never carried over."""
+    resolved = canonical_model(eng, _ccc_worker_model_default(eng) or default_model(eng))
+    if resolved and is_blocked_model(resolved):
+        return policy_fallback_model(eng)
+    return resolved
+
+
 def model(queue: str) -> str:
     """Return the worker model for a queue: an explicit `wt set --model`
     override if one is configured, else CCC's worker-only default for this
