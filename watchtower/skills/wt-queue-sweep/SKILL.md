@@ -88,11 +88,36 @@ Never flood. Each card, short enough that the user never opens the ticket:
 
 ## 5. Unresolved closes
 
-Closed tickets whose resolution lists `unresolved` items. Group by root cause
-(several perf tickets often share one architectural fix). Present as decision
-cards (Rule B). Propose per item: file a follow-up ticket, `wt reopen`, or
-dismiss. Do not reopen or file without the user's say-so. *(Rule for
-auto-handling these is not yet defined; ask the user.)*
+Closed tickets whose resolution lists `unresolved` / `follow_ups` / `caveats`.
+Read the full resolution. Group tickets that share a root cause. Classify each
+item by nature, then apply that category's rule. Never file, reopen or ack
+without the user's say-so, except the auto-ack in category 1.
+
+**Acknowledge** with `wt unresolved-ack <ref> --all` (or `--unresolved N`,
+`--caveat N`, `--follow-up N`; `--undo` reverses; no history rewrite). NOT
+`wt ack` -- that approves product-gate pitches.
+
+1. **Couldn't verify** (worker lacked the means to test it). Assess (a) feature
+   size S/M/L and (b) probability 0-1 that the fix is right unverified, with the
+   evidence. Small AND high probability: let it go and `wt unresolved-ack` it.
+   Important OR low probability: bring it to the user with a proposal to reopen
+   or file a dedicated verification ticket.
+2. **Real bug noticed, never filed**: a decision card (Rule B) whose proposal is
+   "file this bug", with confidence it is worth fixing and the case for NOT
+   opening it.
+3. **Design question the worker didn't guess at**: did it implement nothing, or
+   something? If something: score 0-1 how reasonable that implementation is. If
+   nothing: should it have implemented? If yes, it becomes a product decision
+   card (Rule B).
+4. **Can't reproduce**: an opened issue has a reason, so never dismiss. Give 1-3
+   hypotheses of what the reporter meant and why it doesn't reproduce, and a
+   0-1 score for "no longer happens" vs "worker misread it". Bring it to the
+   user to clarify; the goal is to get to the bottom of it and solve it.
+5. **Recurring alerts / shared root cause** (e.g. repeated perf tickets): treat
+   as one big item under 6.
+6. **Caveats, tech debt, fragile assumptions**: propose a remedy. Small: suggest
+   a new ticket. Big: suggest opening a `CCC-DESIGN-*` ticket for a proper
+   design assessment and a go/no-go decision.
 
 ## Don't fabricate
 
