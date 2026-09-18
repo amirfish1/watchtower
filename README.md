@@ -53,21 +53,24 @@ wt --version
 ### Service (background watcher + reconciler)
 
 ```bash
-wt start        # starts the service; installs the LaunchAgent on first run
-wt uninstall    # remove the LaunchAgent
+wt start        # starts the service; installs the service unit on first run
+wt uninstall    # remove the service unit
 ```
 
 There's no separate install step: the first `wt start` (or `wt drain on`,
-which starts the service too) writes and loads a macOS LaunchAgent so the
-watcher starts on every login and restarts on crash. Re-running `wt start`
-later just (re)starts the already-installed service.
+which starts the service too) writes and loads a service so the watcher starts
+on every login and restarts on crash — a macOS LaunchAgent, or a systemd
+**user** unit (`~/.config/systemd/user/ai.watchtower.watcher.service`) on Linux
+when systemd is present. On Linux without systemd it falls back to a plain
+background process. Re-running `wt start` later just (re)starts the
+already-installed service.
 
 ```bash
 wt stop     # stop it
 wt status   # check service + queue health
 ```
 
-If you'd rather write the LaunchAgent without starting it, `wt install` still
+If you'd rather write the service file without starting it, `wt install` still
 works, but it's a hidden command now: `wt start` is the path everyone should
 use.
 
@@ -154,9 +157,9 @@ wt workers                             # list workers the watcher started
 wt workers release --engine claude      # finish active tickets, then retire Claude workers
 wt wait   -q DEMO --timeout 600 --cmd "say done" # block until drained, then run cmd
 
-wt start                               # start the watcher; installs the LaunchAgent on first run
+wt start                               # start the watcher; installs the service unit on first run
 wt stop                                # stop the watcher
-wt uninstall                           # remove the LaunchAgent
+wt uninstall                           # remove the service unit
 wt dashboard                           # open the night-watch dashboard (non-blocking)
 wt dashboard --no-open                 # ensure the server is up, don't open a browser
 wt skills sync                         # (re-)sync the bundled skills into installed harnesses
