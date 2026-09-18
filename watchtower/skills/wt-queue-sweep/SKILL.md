@@ -76,6 +76,13 @@ wt answer <ref> "Rule-1 auto-answer. Verified: <facts>. Do: <exact scoped action
 user what you verified and what you told each worker; do not claim tickets are
 done until they close.
 
+Check the `delivered to session <id>` line `wt answer` prints. If `<id>` equals
+your own `$CLAUDE_CODE_SESSION_ID`, the answer came back to you, not to the
+worker (a devin worker once inherited its spawner's id and CCC-1153's answer
+was misrouted). Do not act on the echoed message as if you were the worker:
+`wt release <ref> --worker <claimed_by>` if that worker's process is gone, and
+put the steps in the ticket note so the next claimant sees them.
+
 ## 4. Rule B: the decision card
 
 Show a small number: ONE if the topic is meaty, two or three if each is small.
