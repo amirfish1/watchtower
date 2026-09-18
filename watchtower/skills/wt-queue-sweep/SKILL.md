@@ -88,6 +88,10 @@ Never flood. Each card, short enough that the user never opens the ticket:
 - **Score 0–1** — 1 = no-brainer, go; 0 = controversial, think more. Say what
   drives the score; split into parts if the parts differ (e.g. 0.95 for the
   source fix, 0.75 for the risky piece).
+- **Scoring principles.** (1) A fix at the root cause scores high; a workaround
+  that leaves the cause in place scores low. (2) Someone opened the ticket, so
+  it matters: never lower a score because "the user may not care anymore" or
+  "it's rare". Score only on whether the proposal is right, cheap and safe.
 - **Blast radius: L/M/H** — how much of the product or how many users the
   bug/feature touches (one button vs a whole surface vs everything).
 - **Risk: L/M/H** — chance that making the change breaks something or is hard
