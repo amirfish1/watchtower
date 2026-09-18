@@ -1577,7 +1577,9 @@ def cmd_answer(args: argparse.Namespace) -> int:
             f"done with this topic. Push anything still local, then close "
             f"with `wt close {item['ref']} --worker <your-id> --summary "
             f'"..." --commit <SHA>` (or `--no-code` if nothing changed). '
-            f"Append your learnings line. Message the client only if you "
+            f"Append your learnings line to ~/.watchtower/learnings/"
+            f"<your-queue>.pending.md if this turn earned one. Message the "
+            f"client only if you "
             f"actually pushed something."
         )
     elif block_kind == "awaiting-client":
