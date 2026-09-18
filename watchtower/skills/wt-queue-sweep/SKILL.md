@@ -92,6 +92,12 @@ Never flood. Each card, short enough that the user never opens the ticket:
   bug/feature touches (one button vs a whole surface vs everything).
 - **Risk: L/M/H** — chance that making the change breaks something or is hard
   to undo. Say what drives it in a few words.
+- **Auto-GO rule:** score above 0.8 AND blast radius L AND risk L means GO with
+  no question: do the proposal (e.g. file the ticket with `wt add ... --pre-ack`;
+  omit `--submitter`, a made-up name makes the close notification undeliverable)
+  and list it in the end-of-sweep digest. Applies to proposals the sweep itself
+  makes. It does NOT override "approving a worker's proposed design is never
+  automatic". Anything else: ask.
 - **Your call** — what to reply. Then `wt answer` exactly the user's decision,
   including any refinements they add.
 
