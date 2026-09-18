@@ -89,7 +89,12 @@ Never flood. Each card, short enough that the user never opens the ticket:
 ## 5. Unresolved closes
 
 Closed tickets whose resolution lists `unresolved` / `follow_ups` / `caveats`.
-Read the full resolution. Group tickets that share a root cause. Classify each
+Read the full resolution. **First check the feature still exists as shipped**:
+`git log` for later commits that disabled, gated, or removed it (grep the
+feature's keywords). If it was killed or removed, its caveats are moot: propose
+acking, nothing else. Never infer that a feature is live from a data file
+(e.g. a `fired: true` flag); read the code path that sets it. Group tickets
+that share a root cause. Classify each
 item by nature, then apply that category's rule. Never file, reopen or ack
 without the user's say-so, except the auto-ack in category 1.
 
