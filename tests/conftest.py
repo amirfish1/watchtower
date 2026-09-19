@@ -67,6 +67,11 @@ def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
     # ~/.watchtower/gh-quota.log -- the one file an operator reads to decide
     # whether the real burn is under control.
     monkeypatch.setenv("WATCHTOWER_GH_QUOTA_LOG", str(tmp_path / "gh-quota.log"))
+    # Devin session lookup (WATCHTOWER-32) reads devin's own sessions.db; a
+    # devin worker in a test must never resolve against the real one.
+    monkeypatch.setenv(
+        "WATCHTOWER_DEVIN_SESSIONS_DB", str(tmp_path / "devin-sessions.db")
+    )
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
 

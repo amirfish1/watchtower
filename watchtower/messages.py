@@ -449,6 +449,18 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
                 "engine": str(w.get("engine") or "claude"),
                 "cwd": str(w.get("cwd") or ""),
             }
+    # A live worker's own session id, whatever its shape. Devin ids are word
+    # slugs ("patch-macadamia"), not UUIDs, so the hex-prefix branch below
+    # can never match the claimed_session_id a devin ticket carries.
+    for w in live:
+        if str(w.get("session_id") or "") == t:
+            return {
+                "kind": "worker",
+                "session_id": t,
+                "worker": w,
+                "engine": str(w.get("engine") or "claude"),
+                "cwd": str(w.get("cwd") or ""),
+            }
     agents = _load_agents()
     name = t.lstrip("@")
     rec = agents.get(name)

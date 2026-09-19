@@ -1695,6 +1695,30 @@ def _comment_author_is_claimant(item: Dict[str, Any], args: argparse.Namespace) 
     )
 
 
+def _unsessioned_target_warning(target: str) -> str:
+    """Suffix for a queued ``wt comment`` whose target has no session id.
+
+    Every transport except the worker FIFO routes by session id, so a queued
+    message to a sessionless worker cannot land until its id is resolved --
+    and a one-shot engine (``devin -p``) has no FIFO at all. Reporting that as
+    a plain "queued" read as success while the message sat in the outbox
+    forever (WATCHTOWER-32)."""
+    from . import messages
+    try:
+        resolved = messages.resolve_target(target, include_recent=False)
+    except Exception:  # noqa: BLE001 - best-effort hint only
+        return ""
+    if resolved.get("session_id"):
+        return ""
+    engine = str(resolved.get("engine") or "claude")
+    kind = "one-shot " if engine in workers._ONE_SHOT_ENGINES else ""
+    return (
+        f"\n  WARNING: target is a {kind}{engine} worker with no session id; "
+        "nothing can deliver this until its session is resolved "
+        "(check: wt outbox ls)"
+    )
+
+
 def cmd_comment(args: argparse.Namespace) -> int:
     item = q.comment(args.ref, args.text, by=args.by, session_id=args.worker)
     if not item:
@@ -1725,7 +1749,10 @@ def cmd_comment(args: argparse.Namespace) -> int:
                     f"{sent.get('transport', '?')}"
                 )
             elif sent.get("queued"):
-                delivery = f" — live injection queued as {sent.get('id', '?')}"
+                delivery = (
+                    f" — live injection queued as {sent.get('id', '?')}"
+                    + _unsessioned_target_warning(str(target))
+                )
             else:
                 delivery = (
                     " — live injection unavailable"

@@ -3672,6 +3672,8 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
             # and link to its conversation. Parsed at most once per worker.
             if not w.get("session_id") and w.get("log"):
                 sid = resolve_session_id_from_log(w["log"])
+                if not sid and str(w.get("engine") or "").lower() == "devin":
+                    sid = resolve_devin_session_id(str(w.get("worker_id") or ""))
                 if sid:
                     w["session_id"] = sid
                     backfilled = True
@@ -4039,7 +4041,10 @@ def build_drain_command(
         # "dangerous" auto-approves every tool, matching the bypass flag the
         # other engines get; print mode cannot show the workspace-trust prompt
         # and fails in an untrusted repo unless the check is skipped. Devin has
-        # no --effort flag; queue effort config is ignored for this engine.
+        # no --effort flag (effort is baked into the model id suffix,
+        # -low/-medium/-high/-max); queue effort config is ignored here.
+        # devin -p prints no session id, so the worker's session is recovered
+        # from devin's own store instead (resolve_devin_session_id).
         argv = [
             bin_name,
             "-p",
@@ -4064,28 +4069,6 @@ def build_drain_command(
             argv += ["--model", model]
         if effort:
             argv += ["--effort", effort]
-        return argv
-    if engine == "devin":
-        # devin -p is one-shot print mode like kimi: the goal rides in argv,
-        # stdin is DEVNULL, and the process exits when the drain loop ends.
-        # devin has no --input-format/--output-format/--verbose flags and its
-        # permission modes differ from claude's ("dangerous" is the
-        # bypassPermissions equivalent). Print mode cannot show the workspace
-        # trust prompt, so it fails in an untrusted directory without
-        # --respect-workspace-trust false. Devin has no --effort flag; effort
-        # is baked into the model id suffix (-low/-medium/-high/-max), so
-        # queue effort config is ignored for this engine.
-        argv = [
-            bin_name,
-            "-p",
-            goal or drain_goal(queue, worker_id, repo_path, engine=engine),
-            "--permission-mode",
-            "dangerous",
-            "--respect-workspace-trust",
-            "false",
-        ]
-        if model:
-            argv += ["--model", model]
         return argv
     if engine == "antigravity":
         # AGY supports stream-json input, but its print flag requires an
@@ -4660,6 +4643,54 @@ def _kimi_worker_session_ids(cutoff: float) -> List[str]:
         if _is_worker_session_id(sid):
             out.append(sid)
     return out
+
+
+def _devin_sessions_db() -> Path:
+    override = os.environ.get("WATCHTOWER_DEVIN_SESSIONS_DB")
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "share" / "devin" / "cli" / "sessions.db"
+
+
+def resolve_devin_session_id(worker_id: str) -> str:
+    """Session id of the devin session spawned as WT worker ``worker_id``.
+
+    ``devin -p`` prints plain text and never its session id, so the log-based
+    ``resolve_session_id_from_log`` can never backfill a devin worker -- which
+    left every devin worker unsteerable (WATCHTOWER-32: comments parked in the
+    outbox forever, ``wt answer`` could not ``devin --resume``). Devin records
+    every prompt, print mode included, in its own sessions.db
+    ``prompt_history`` table keyed by session id, and the drain goal's first
+    prompt carries "Your worker id is <id>". Match that line exactly (the
+    regex group must equal the whole id, so ``wt-1`` never claims
+    ``wt-12``'s session) and take the newest hit. Read-only; any failure
+    (no devin install, locked or unknown schema) returns ""."""
+    wid = str(worker_id or "").strip()
+    if not wid:
+        return ""
+    db = _devin_sessions_db()
+    if not db.is_file():
+        return ""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return ""
+    try:
+        rows = conn.execute(
+            "SELECT session_id, content FROM prompt_history "
+            "WHERE instr(content, ?) > 0 ORDER BY timestamp DESC LIMIT 20",
+            (f"Your worker id is {wid}",),
+        ).fetchall()
+    except sqlite3.Error:
+        return ""
+    finally:
+        conn.close()
+    for sid, content in rows:
+        m = _KIMI_WORKER_GOAL_RE.search(str(content or ""))
+        if m and m.group(1) == wid and sid:
+            return str(sid)
+    return ""
 
 
 def backfill_recent_session_titles(

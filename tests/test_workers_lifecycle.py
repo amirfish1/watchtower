@@ -2323,6 +2323,93 @@ def test_build_devin_is_one_shot_print_without_claude_flags(wt):
     assert "(devin -p)" in argv[2]
 
 
+def _devin_store(wt, rows):
+    """A minimal devin sessions.db with the prompt_history rows given as
+    (session_id, content, timestamp)."""
+    import sqlite3
+    db = Path(os.environ["WATCHTOWER_DEVIN_SESSIONS_DB"])
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE prompt_history (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "content TEXT NOT NULL, timestamp INTEGER NOT NULL, "
+        "session_id TEXT NOT NULL, is_shell INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.executemany(
+        "INSERT INTO prompt_history (session_id, content, timestamp) "
+        "VALUES (?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_resolve_devin_session_id_matches_the_exact_worker(wt):
+    """devin -p prints no session id (WATCHTOWER-32); the drain goal in
+    devin's prompt_history links worker -> session. A worker id that is a
+    prefix of another must not steal its session."""
+    goal = wt.workers.drain_goal("Q", "q-devin-1", "/repo", engine="devin")
+    other = wt.workers.drain_goal("Q", "q-devin-12", "/repo", engine="devin")
+    _devin_store(wt, [
+        ("patch-macadamia", goal, 100),
+        ("elated-chalk", other, 200),
+        ("user-chat", "what does Your worker id is mean?", 300),
+    ])
+
+    assert wt.workers.resolve_devin_session_id("q-devin-1") == "patch-macadamia"
+    assert wt.workers.resolve_devin_session_id("q-devin-12") == "elated-chalk"
+    assert wt.workers.resolve_devin_session_id("q-devin-9") == ""
+
+
+def test_resolve_devin_session_id_without_a_store_is_empty(wt):
+    assert wt.workers.resolve_devin_session_id("q-devin-1") == ""
+
+
+def test_list_workers_backfills_a_devin_session_from_its_store(wt):
+    log = wt.tmp / "q-devin-1.log"
+    log.write_text("plain text, no session id line\n")
+    wt.workers.record_worker(
+        os.getpid(), "Q", "devin", "q-devin-1", str(wt.tmp), str(log),
+    )
+    goal = wt.workers.drain_goal("Q", "q-devin-1", "/repo", engine="devin")
+    _devin_store(wt, [("patch-macadamia", goal, 100)])
+
+    rows = wt.workers.list_workers(prune=False)
+
+    assert [w["session_id"] for w in rows] == ["patch-macadamia"]
+
+
+def test_resolve_target_finds_a_live_worker_by_devin_session_slug(wt):
+    """A devin ticket's claimed_session_id is a slug, not a UUID; wt comment
+    targets it first, so it must resolve to the live worker."""
+    import watchtower.messages as messages
+    log = wt.tmp / "q-devin-1.log"
+    log.write_text("")
+    wt.workers.record_worker(
+        os.getpid(), "Q", "devin", "q-devin-1", str(wt.tmp), str(log),
+        session_id="patch-macadamia",
+    )
+
+    resolved = messages.resolve_target("patch-macadamia", include_recent=False)
+
+    assert resolved["kind"] == "worker"
+    assert resolved["engine"] == "devin"
+    assert resolved["worker"]["worker_id"] == "q-devin-1"
+
+
+def test_comment_warns_when_queued_for_an_unsessioned_one_shot_worker(wt):
+    import watchtower.cli as cli
+    log = wt.tmp / "q-devin-1.log"
+    log.write_text("")
+    wt.workers.record_worker(
+        os.getpid(), "Q", "devin", "q-devin-1", str(wt.tmp), str(log),
+    )
+
+    warning = cli._unsessioned_target_warning("q-devin-1")
+
+    assert "one-shot devin worker with no session id" in warning
+    assert "wt outbox ls" in warning
+
+
 def test_build_antigravity_uses_its_stream_json_contract(wt):
     argv = wt.workers.build_drain_command("Q", "antigravity", "q-1", "/repo")
 
