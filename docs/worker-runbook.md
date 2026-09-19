@@ -64,25 +64,39 @@ prefix is ever missing.
 
 ## Idle Protocol
 
-Do this when `wt claim` reports the queue is drained (returns nothing) FIRST,
-before ending your turn — AND equally when `wt claim` returns a stop signal
-(`{"stop": true}`, including the `{"reason": "context_budget"}` recycle that
-replaces you with a fresh worker). The stop path is where this matters most: a
-recycled worker is torn down and its successor starts cold, so skipping the
-learnings hand-off on a stop throws away the whole session's wisdom. A Claude
-conversation may later be released from queue staffing, while a Codex worker
-exits immediately after this audit. Either way, the audit is not optional and
-not deferrable to "next time" — run it before you exit on a stop, too.
+Learnings writes are tiered (same-topic-routing plan §8) so a chatty queue
+doesn't pay a full file rewrite every turn:
+
+- **Tier 1 — per turn, append-only.** After each `block`/`close`, append at
+  most one dated line to `~/.watchtower/learnings/{queue}.pending.md`, and
+  only when the turn produced a genuinely new hard-won fact. Append-only —
+  never read-modify-write this file, so concurrent workers can't clobber it.
+- **Tier 2 — consolidate on a forced boundary.** Fold `pending.md` into
+  `{queue}.md` (the audit below) only when `wt claim` returns
+  `{"stop": true}` (recycle or release), or when you have been idle on a
+  drained queue past the floor (~20 min) and `pending.md` is non-empty.
+  After folding, clear `pending.md` of the lines you merged.
+- **Skip rule:** on a merely-drained queue, if `pending.md` is empty and
+  `{queue}.md` was modified within the floor, do nothing — end your turn.
+
+The stop path is where the audit matters most: a recycled worker is torn
+down and its successor starts cold, so skipping the learnings hand-off on a
+stop throws away the whole session's wisdom. Either way, the audit is not
+optional and not deferrable to "next time" — run it before you exit on a
+stop, too.
+
+The audit (Tier 2):
 
 1. Read the queue's learnings file at `~/.watchtower/learnings/{queue}.md`
-   (create it if it doesn't exist).
-2. Update it with anything the next worker should know from this session:
-   infra changes, recurring ticket patterns, gotchas, env quirks. Record
-   VERIFIED facts only. Never record rules that tell future workers to
-   distrust their own worker id or to treat their own commits, closes, or
-   working-tree hunks as another process's — that class of entry is
-   self-amplifying paranoia and has caused workers to destroy their own
-   correct work (CCC-675/676; see Resume Check above).
+   (create it if it doesn't exist) and `{queue}.pending.md`.
+2. Fold the pending lines plus anything else the next worker should know
+   from this session into `{queue}.md`: infra changes, recurring ticket
+   patterns, gotchas, env quirks. Record VERIFIED facts only. Never record
+   rules that tell future workers to distrust their own worker id or to
+   treat their own commits, closes, or working-tree hunks as another
+   process's — that class of entry is self-amplifying paranoia and has
+   caused workers to destroy their own correct work (CCC-675/676; see
+   Resume Check above).
 3. Keep the WHOLE FILE under ~60 lines. This cap is on the whole file, not
    per-edit — read the current file before editing and prune, don't just
    append unboundedly.

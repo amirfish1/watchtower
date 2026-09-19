@@ -1007,7 +1007,9 @@ def test_spawn_workers_inherits_env_outside_pytest(wt, monkeypatch):
     worker_env = captured_envs[0][1]
     assert worker_env is not None
     assert worker_env["WT_WORKER_COMMIT"] == "1"
-    # Rest of the parent's environment (e.g. WATCHTOWER_* vars) is preserved.
+    assert worker_env["GIT_AUTHOR_NAME"] == "Amir Fish (watchtower)"
+    assert worker_env["GIT_COMMITTER_NAME"] == "Amir Fish (watchtower)"
+    assert worker_env["AGENT_MACHINE"] == "watchtower"
     assert worker_env["WATCHTOWER_STORE"] == "/custom/queue.json"
 
 

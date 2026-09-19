@@ -185,6 +185,11 @@ def _spawn_env() -> Dict[str, str]:
     for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
         env.pop(key, None)
     env["WT_WORKER_COMMIT"] = "1"
+    # Commit attribution: distinct from interactive Hermes on this VM
+    # (`Amir Fish (hermes)` / Agent-Machine: hermes).
+    env["GIT_AUTHOR_NAME"] = "Amir Fish (watchtower)"
+    env["GIT_COMMITTER_NAME"] = "Amir Fish (watchtower)"
+    env["AGENT_MACHINE"] = "watchtower"
     return env
 
 
@@ -278,6 +283,19 @@ DEVIN_IDLE_CONTRACT = (
 )
 
 KIMI_RESUME_CONTRACT = (
+    "RESUME CHECK: if this run starts with context indicating you were "
+    "mid-work on a ticket, follow the Resume Check protocol in {runbook} before "
+    "you edit, commit, or close anything -- skipping this is how the same "
+    "ticket gets fixed and committed twice. "
+)
+
+DEVIN_IDLE_CONTRACT = (
+    "Do NOT poll or sleep-loop. After the idle audit, end your turn and exit "
+    "immediately. This is a one-shot run (devin -p); do not wait for a wake "
+    "message. "
+)
+
+DEVIN_RESUME_CONTRACT = (
     "RESUME CHECK: if this run starts with context indicating you were "
     "mid-work on a ticket, follow the Resume Check protocol in {runbook} before "
     "you edit, commit, or close anything -- skipping this is how the same "
@@ -380,6 +398,10 @@ DRAIN_GOAL_TEMPLATE = (
     "close it and do NOT guess: run `wt block <ref> --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
     "figured out so far\"`, then move on to the next ticket. "
+    "LEARNINGS: after each `wt close` or `wt block`, append at most one "
+    "dated line to ~/.watchtower/learnings/{queue}.pending.md -- only if "
+    "the turn produced a genuinely new hard-won fact (append-only, never "
+    "rewrite it; the Idle Protocol folds it into {queue}.md on a boundary). "
     "IDLE: when `wt claim` reports the queue is drained, follow the Idle "
     "Protocol in {runbook} BEFORE ending your turn (it has you update the "
     "queue's learnings file). {idle_contract}{resume_contract}"
@@ -444,7 +466,12 @@ _MANUAL_RUN_INSTRUCTIONS = (
     "do NOT wait for new work."
 )
 
-_ENGINE_BIN = {"claude": "claude", "codex": "codex", "kimi": "kimi", "devin": "devin"}
+_ENGINE_BIN = {
+    "claude": "claude",
+    "codex": "codex",
+    "kimi": "kimi",
+    "devin": "devin",
+}
 
 # Engines whose workers are one-shot processes (goal in argv, DEVNULL stdin,
 # exit when done) rather than FIFO-fed live processes like claude.
@@ -466,6 +493,7 @@ def _resolve_engine_bin(engine: str) -> str:
         "claude": "WATCHTOWER_CLAUDE_BIN",
         "codex": "WATCHTOWER_CODEX_BIN",
         "kimi": "WATCHTOWER_KIMI_BIN",
+        "devin": "WATCHTOWER_DEVIN_BIN",
     }.get(engine)
     if env_name:
         env_bin = os.environ.get(env_name)
@@ -3909,7 +3937,8 @@ def drain_goal(
         ),
         resume_contract=(
             CODEX_RESUME_CONTRACT if engine == "codex"
-            else KIMI_RESUME_CONTRACT if engine in ("kimi", "devin")
+            else KIMI_RESUME_CONTRACT if engine == "kimi"
+            else DEVIN_RESUME_CONTRACT if engine == "devin"
             else CLAUDE_RESUME_CONTRACT
         ).format(runbook=_worker_runbook_ref()),
     )
@@ -4035,6 +4064,28 @@ def build_drain_command(
             argv += ["--model", model]
         if effort:
             argv += ["--effort", effort]
+        return argv
+    if engine == "devin":
+        # devin -p is one-shot print mode like kimi: the goal rides in argv,
+        # stdin is DEVNULL, and the process exits when the drain loop ends.
+        # devin has no --input-format/--output-format/--verbose flags and its
+        # permission modes differ from claude's ("dangerous" is the
+        # bypassPermissions equivalent). Print mode cannot show the workspace
+        # trust prompt, so it fails in an untrusted directory without
+        # --respect-workspace-trust false. Devin has no --effort flag; effort
+        # is baked into the model id suffix (-low/-medium/-high/-max), so
+        # queue effort config is ignored for this engine.
+        argv = [
+            bin_name,
+            "-p",
+            goal or drain_goal(queue, worker_id, repo_path, engine=engine),
+            "--permission-mode",
+            "dangerous",
+            "--respect-workspace-trust",
+            "false",
+        ]
+        if model:
+            argv += ["--model", model]
         return argv
     if engine == "antigravity":
         # AGY supports stream-json input, but its print flag requires an
