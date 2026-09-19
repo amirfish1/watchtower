@@ -63,7 +63,7 @@ COMPLETED_ISSUE_RETENTION_DAYS = 14
 # every ticket in exchange for zero quota.
 _LIST_LIMIT_DEFAULT = 200
 _LIST_JSON_FIELDS = (
-    "number,title,body,state,url,assignees,labels,createdAt,updatedAt,closedAt"
+    "number,title,body,state,url,assignees,labels,author,createdAt,updatedAt,closedAt"
 )
 
 
@@ -1730,6 +1730,11 @@ class GitHubIssuesBackend:
             "github_repo": self.repo,
             "github_labels": labels,
             "github_assignees": assignees,
+            # The issue's GitHub author -- "who opened it" for synced tickets
+            # (CCC-1166). Kept separate from ``submitter`` (a wt-addressable
+            # notify target): a GitHub login is not resolvable by
+            # messages.resolve_target.
+            "github_author": str((issue.get("author") or {}).get("login") or ""),
             "watchtower_label": self.queue_label,
             "watchtower_runnable": bool(queue_member),
             "no_auto_drain": no_auto_drain,
@@ -2305,7 +2310,7 @@ class GitHubIssuesBackend:
         raw = self._run([
             "issue", "view", str(number),
             *self._repo_args(),
-            "--json", "number,title,body,state,url,assignees,labels,comments,createdAt,updatedAt,closedAt",
+            "--json", "number,title,body,state,url,assignees,labels,author,comments,createdAt,updatedAt,closedAt",
         ])
         try:
             issue = json.loads(raw or "{}")

@@ -83,6 +83,7 @@ def project_fields(issue):
         "url": issue["url"],
         "assignees": [{"login": a} for a in issue["assignees"]],
         "labels": [{"name": name} for name in issue["labels"]],
+        "author": issue.get("author"),
         "comments": issue.get("comments", []),
         "createdAt": issue["createdAt"],
         "updatedAt": issue["updatedAt"],

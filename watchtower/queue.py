@@ -916,6 +916,16 @@ def timeline(item: Dict[str, Any]) -> List[Dict[str, Any]]:
         return (ts, 1, 0, e.get("_idx", 0))
 
     result = sorted(events, key=_sort_key)
+    # The filer is a ticket-level field (``submitter``, or ``github_author``
+    # for GitHub-synced issues). Fold it onto the filed event so consumers
+    # rendering the stream (``wt find``, CCC's ticket detail) can show who
+    # opened the ticket without a second lookup -- older tickets and the
+    # GitHub backend recorded the filed event before this existed.
+    filer = str(item.get("submitter") or item.get("github_author") or "")
+    if filer:
+        for e in result:
+            if e.get("event") == "filed" and not e.get("submitter"):
+                e["submitter"] = filer
     for e in result:
         e.pop("_synthesized", None)
         e.pop("_idx", None)
@@ -1183,7 +1193,8 @@ def enqueue(
             "created_at": now,
             "updated_at": now,
         }
-        _append_history(item, "filed", by=_by("system"), at=now, source=item["source"], project=proj)
+        _append_history(item, "filed", by=_by("system"), at=now, source=item["source"], project=proj,
+                        submitter=str(submitter or ""))
         data["items"].append(item)
         _normalize_items(data["items"])  # assign this item's seq/ref
         _save_unlocked(data)

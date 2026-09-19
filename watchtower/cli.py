@@ -176,7 +176,8 @@ def _with_timeline(item: dict) -> dict:
 def _event_summary(event: dict) -> str:
     name = str(event.get("event") or "")
     if name == "filed":
-        return f"filed from {event.get('source') or 'unknown'}"
+        filer = str(event.get("submitter") or "").strip()
+        return f"filed from {event.get('source') or 'unknown'}" + (f" by {filer}" if filer else "")
     if name == "claim":
         by = event.get("by") or {}
         return f"claimed by {by.get('worker') or by.get('session_id') or by.get('kind') or 'unknown'}"
@@ -466,6 +467,9 @@ def cmd_find(args: argparse.Namespace) -> int:
     worker = str(item.get("claimed_by") or item.get("claimed_session_id") or "")
     title = _oneline(item.get("title") or item.get("note") or "")
     print(f"{item.get('ref',''):<14}[{item.get('status',''):<11}] {title}")
+    filer = str(item.get("submitter") or item.get("github_author") or "")
+    if filer:
+        print(f"  filed_by: {filer}")
     if worker:
         you = " (you)" if item_with_timeline.get("claimed_by_you") else ""
         print(f"  claimed_by: {worker}{you}")
