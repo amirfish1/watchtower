@@ -3434,3 +3434,38 @@ def test_reconcile_skip_reason_names_readiness_when_readiness_is_the_gate(
 
     assert "needs-spec" in reason, reason
     assert "grace" not in reason, reason
+
+
+def test_github_backend_records_fix_commit_on_the_issue(tmp_path, monkeypatch):
+    """BYM BECKY-1651: the verified --commit SHA must survive onto the issue.
+
+    A What's New card fires on issue CLOSE; the consumer can only gate it on
+    the fix being deployed if the issue says which commit fixed it. The SHA is
+    written to the metadata block (read from the issue body, no extra fetch)
+    AND as a ``Fix-Commit:`` line in the close comment, round-trips on re-read,
+    and is dropped again if the ticket is re-closed without one.
+    """
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    sha = "ed66bfd65" + "a" * 31
+
+    q.enqueue(project="GHI", title="ship it", note="n", text="b")
+    q.claim_next("worker-1", project="GHI")
+    closed = q.close("GHI-1", "worker-1", resolution={"summary": "done", "commit": sha})
+
+    assert closed["resolution"]["commit"] == sha
+    assert q.get("GHI-1")["resolution"]["commit"] == sha
+    issue = json.loads(state.read_text())["issues"][0]
+    assert f'resolution_commit: "{sha}"' in issue["body"]
+    assert any(c.rstrip().endswith(f"Fix-Commit: {sha}") for c in issue["comments"])
+
+    # A no-code re-close must not leave the earlier close's SHA vouching for it.
+    q.update_status("GHI-1", "open", reason="redo")
+    q.claim_next("worker-1", project="GHI")
+    q.close("GHI-1", "worker-1", resolution={"summary": "no code", "no_code": True})
+    issue = json.loads(state.read_text())["issues"][0]
+    assert "resolution_commit" not in issue["body"]
+    assert "commit" not in q.get("GHI-1")["resolution"]

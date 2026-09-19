@@ -1225,6 +1225,12 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
     summary = _clip(resolution.get("summary", ""), 4000)
     if summary:
         out["summary"] = summary
+    # The verified fixing commit. Kept so the issue itself records WHICH commit
+    # closed it: downstream consumers (BYM's What's New carousel) gate on it
+    # being deployed, and a close comment without it left them nothing to check.
+    commit = _clip(resolution.get("commit", ""), 128)
+    if commit:
+        out["commit"] = commit
     for field in ("caveats", "follow_ups", "unresolved"):
         raw = resolution.get(field)
         if raw is None:
@@ -1263,6 +1269,10 @@ def _resolution_comment(resolution: Optional[Dict[str, Any]]) -> str:
         if values:
             lines.append(f"{label}:")
             lines.extend(f"- {value}" for value in values)
+    if resolution.get("commit"):
+        # Machine-readable, one per close comment; the same value is stored as
+        # ``resolution_commit`` in the issue's metadata block.
+        lines.append(f"Fix-Commit: {resolution['commit']}")
     return "\n".join(lines)
 
 
@@ -1685,6 +1695,7 @@ class GitHubIssuesBackend:
 
         resolution = _normalize_resolution({
             "summary": meta.get("resolution_summary", ""),
+            "commit": meta.get("resolution_commit", ""),
             "caveats": meta.get("resolution_caveats", []),
             "follow_ups": meta.get("resolution_follow_ups", []),
             "unresolved": meta.get("resolution_unresolved", []),
@@ -2560,7 +2571,7 @@ class GitHubIssuesBackend:
         if status == "open":
             for key in (
                 "claimed_by", "claimed_at", "closed_by", "closed_at",
-                "resolution_summary", "resolution_caveats",
+                "resolution_summary", "resolution_commit", "resolution_caveats",
                 "resolution_follow_ups", "resolution_unresolved",
                 "resolution_caveats_ack", "resolution_follow_ups_ack",
                 "resolution_unresolved_ack",
@@ -2593,6 +2604,9 @@ class GitHubIssuesBackend:
                 meta["claimed_by"] = str(session_id)
         if norm:
             meta["resolution_summary"] = norm.get("summary", "")
+            # Always overwrite (possibly with ""), so a re-close without a
+            # commit can't leave the previous close's SHA vouching for it.
+            meta["resolution_commit"] = norm.get("commit", "")
             meta["resolution_caveats"] = norm.get("caveats", [])
             meta["resolution_follow_ups"] = norm.get("follow_ups", [])
             meta["resolution_unresolved"] = norm.get("unresolved", [])
