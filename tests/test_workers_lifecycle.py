@@ -2575,7 +2575,9 @@ def test_release_floor_is_30_minutes_for_claude(wt):
     assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
 
 
-def test_release_idle_claude_worker_without_killing_session(wt):
+def test_release_idle_claude_worker_without_killing_session(
+    wt, no_real_message_delivery
+):
     rec = _live_worker(wt, "Q")
     _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
 
@@ -2586,10 +2588,11 @@ def test_release_idle_claude_worker_without_killing_session(wt):
     assert wt.workers._pid_alive(os.getpid())
     assert wt.workers.live_worker_count("Q") == 0
     assert wt.workers.worker_counts()["Q"] == {"total": 1, "live": 0}
-    payload = json.loads(os.read(wt._readers[-1], 65536).decode())
-    text = payload["message"]["content"][0]["text"]
-    assert "no longer a WatchTower worker for Q" in text
-    assert "continue any unrelated work" in text
+    # WATCHTOWER-31: release sends the worker nothing. Messaging a verified
+    # idle (cache-cold) session would buy a full-price turn just to say stop.
+    assert not _fifo_pending(wt._readers[-1])
+    assert released[0]["_release_transport"] == "none"
+    assert no_real_message_delivery == []
     assert wt.q.claim_next(rec["worker_id"], project="Q") == {"stop": True}
     assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
     # The one-shot signal is gone, but durable detachment keeps this live
@@ -2705,7 +2708,9 @@ def test_reap_spares_codex_worker_with_fresh_rollout_activity(wt, monkeypatch):
         child.wait(timeout=5)
 
 
-def test_release_injects_queue_scoped_instruction_into_codex_session(wt, monkeypatch):
+def test_release_sends_nothing_into_idle_codex_session(wt, monkeypatch):
+    """WATCHTOWER-31: the stop sentinel is the whole release; a message into
+    a cache-cold session costs a full uncached turn for nothing."""
     import watchtower.messages as messages
 
     sent = []
@@ -2733,8 +2738,8 @@ def test_release_injects_queue_scoped_instruction_into_codex_session(wt, monkeyp
     released = wt.workers.release_idle_workers(queue="Q")
 
     assert [row["worker_id"] for row in released] == [rec["worker_id"]]
-    assert sent and sent[0][0] == sid
-    assert "continue any unrelated work" in sent[0][1]
+    assert sent == []
+    assert (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
     assert wt.workers._pid_alive(os.getpid())
 
 

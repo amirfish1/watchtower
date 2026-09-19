@@ -1256,18 +1256,6 @@ def _find_claude_session_row(session_id: str) -> Optional[Dict[str, Any]]:
     return matches[0]
 
 
-def _release_instruction(w: Dict[str, Any]) -> str:
-    queue = str(w.get("queue") or "this queue")
-    return (
-        "This is from the WatchTower Reconciler. You are no longer a "
-        f"WatchTower worker for {queue}. Do not claim any more tickets from "
-        "this queue. If the active goal is this queue's WatchTower drain goal, "
-        "clear/complete that goal now; do not clear or interrupt an unrelated "
-        "goal. This release is queue-scoped: continue any unrelated work "
-        "already underway in this conversation."
-    )
-
-
 def _uds_delivery_receipt(
     session_id: str, msg_id: str, body: str, start_offset: int, timeout_s: float = 2.0
 ) -> str:
@@ -2155,9 +2143,12 @@ def release_idle_workers(max_idle_s: float = RELEASE_IDLE_S,
             # sentinel creation have both succeeded. A failed request_stop
             # therefore remains retryable on the next tick.
             _persist_worker_audit_state(worker_id, state)
-            delivery = _deliver_release_instruction(
-                w, _release_instruction(w)
-            )
+            # No message to the worker (WATCHTOWER-31). It is verified idle,
+            # so its prompt cache is cold, and any message would start a
+            # full-price uncached turn just to say "stop". The sentinel is
+            # enough: notify_workers skips released workers, so the worker
+            # never wakes from us again, and its next wt claim returns stop.
+            delivery = {"transport": "none", "delivered": False, "error": ""}
             released_at = _released_at(worker_id)
             idle_min = int(snapshot["idle_s"] / 60)
             floor_min = int(max_idle_s / 60)

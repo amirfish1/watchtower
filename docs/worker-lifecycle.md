@@ -171,7 +171,8 @@ worker crosses the 30-minute inactivity floor
   └─ strict queue read confirms no ticket is owned by worker ID or session ID
   └─ complete IDLE_CANDIDATE / IDLE_SIGNAL / IDLE_DECISION bundle is logged
   └─ released_at is persisted and a one-shot stop sentinel is written
-  └─ queue-scoped release instruction is attempted over FIFO/session delivery
+  └─ no message is sent: the worker is idle and cache-cold, so a message
+     would buy a full-price uncached turn just to say "stop" (WATCHTOWER-31)
   └─ worker's next wt claim returns {"stop": true}
   └─ process and unrelated conversation work continue untouched
 ```
