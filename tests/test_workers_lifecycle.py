@@ -2528,7 +2528,8 @@ def test_drain_goal_content(wt):
     # CHUCK's "commit and push main" workflow.
     assert "Do not push unless explicitly asked" not in goal
     assert "claimed ticket's worker instructions" in goal
-    assert "leave commits local" in goal
+    assert "git push origin HEAD" in goal
+    assert "leave commits local" not in goal
 
 
 def test_run_once_goal_uses_ticket_push_policy(wt):
@@ -2536,7 +2537,8 @@ def test_run_once_goal_uses_ticket_push_policy(wt):
     assert "Q-12" in goal and "q-8" in goal and "/repo" in goal
     assert "Do not push unless explicitly asked" not in goal
     assert "claimed ticket's worker instructions" in goal
-    assert "leave commits local" in goal
+    assert "git push origin HEAD" in goal
+    assert "leave commits local" not in goal
 
 
 def test_goals_tell_worker_to_announce_the_ticket(wt):

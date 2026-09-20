@@ -327,6 +327,18 @@ SUMMARY_STYLE = (
     "line breaks. Never submit one dense paragraph. "
 )
 
+# Push contract injected into both goal templates. Deployment pulls from
+# origin, so a commit that stays local is undeployed work; the default is
+# push-after-commit, and a ticket's worker instructions may opt out.
+# No braces: safe for the templates' .format() calls.
+PUSH_CONTRACT = (
+    "After each commit, push it: `git push origin HEAD` (the branch you are "
+    "on -- never switch branches, never force, never `--no-verify`). If the "
+    "push is rejected as non-fast-forward, `git fetch && git merge "
+    "origin/<branch>` and push again. Skip pushing only when the claimed "
+    "ticket's worker instructions explicitly say not to push."
+)
+
 # Appended to a worker's goal when its queue has product_gate on (2026-09-01
 # design). The gate is also enforced server-side: `wt close` refuses an
 # implemented close on a gated queue when the ticket has no product_ack.
@@ -404,10 +416,8 @@ DRAIN_GOAL_TEMPLATE = (
     "rewrite it; the Idle Protocol folds it into {queue}.md on a boundary). "
     "IDLE: when `wt claim` reports the queue is drained, follow the Idle "
     "Protocol in {runbook} BEFORE ending your turn (it has you update the "
-    "queue's learnings file). {idle_contract}{resume_contract}"
-    "Push or publish exactly when the claimed ticket's worker instructions tell "
-    "you to. If the claimed ticket has no explicit push/publish instruction, "
-    "leave commits local unless the user explicitly asks you to push."
+    "queue's learnings file). {idle_contract}{resume_contract} "
+    + PUSH_CONTRACT
 )
 
 # Bounded, single-ticket variant of DRAIN_GOAL_TEMPLATE (CCC-437's per-row
@@ -449,10 +459,8 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "figured out so far\"`. "
     "Either way -- closed or blocked -- STOP once this one ticket is "
     "resolved. Do NOT claim another ticket, do NOT poll, do NOT wait for new "
-    "work. End your turn. Push or publish exactly when the claimed ticket's "
-    "worker instructions tell you to. If the claimed ticket has no explicit "
-    "push/publish instruction, leave commits local unless the user explicitly "
-    "asks you to push."
+    "work. End your turn. "
+    + PUSH_CONTRACT
 )
 
 # Appended to the drain goal when the reconciler staffs a queue whose owner
