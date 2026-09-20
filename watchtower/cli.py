@@ -2007,11 +2007,25 @@ def _default_report_to() -> Tuple[str, str]:
     resolve_target treats an unknown bare UUID as engine=claude, so delivery
     would try the wrong transport and never land. Registering it in the
     agents registry (engine=codex, deterministic per-thread name, idempotent)
-    makes ``wt send @name`` route via the codex app-server transport."""
+    makes ``wt send @name`` route via the codex app-server transport.
+
+    Devin sets NEITHER env var, so a ``wt add`` from inside a devin session
+    used to file with ``submitter=""`` and silently give up on ever notifying
+    its filer (WATCHTOWER-33). Its session is recovered from our own process
+    ancestry instead; the ``devincli-`` form is what resolve_target and CCC's
+    delegate both address."""
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
     if sid:
         return sid, ""
     tid = os.environ.get("CODEX_THREAD_ID", "").strip()
+    if not tid:
+        from . import workers as _w
+        try:
+            devin = _w.current_devin_session_id()
+        except Exception:
+            devin = ""
+        if devin:
+            return devin, ""
     if tid:
         from . import messages
         name = f"codex-thread-{tid.replace('-', '')[:12]}"

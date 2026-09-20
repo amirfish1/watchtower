@@ -113,6 +113,9 @@ _UUID_RE = re.compile(
 _WORKER_ID_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_-]*-[0-9a-f]{8}$")
 # A candidate session-id prefix: hex plus dashes, at least 8 chars.
 _HEX_PREFIX_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,}$")
+# CCC's id for a devin-cli session: the "devincli-" prefix plus devin's own
+# word slug ("glorious-sturgeon"). Never hex, so it matches no branch above.
+_DEVIN_CLI_SESSION_RE = re.compile(r"^devincli-[A-Za-z0-9][A-Za-z0-9._-]*$")
 _AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -426,8 +429,11 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
     "worker": dict|None, "engine": str}``. Resolution order:
 
       1. exact live worker_id match,
-      2. agents registry name (a leading ``@`` is allowed),
-      3. raw session UUID, or a unique hex prefix (>= 8 chars) of a known
+      2. a devin-cli session id (``devincli-<slug>``): the prefix names the
+         engine, so it is addressable without a lookup (delivery goes out
+         through the delegate),
+      3. agents registry name (a leading ``@`` is allowed),
+      4. raw session UUID, or a unique hex prefix (>= 8 chars) of a known
          session; an unknown value is accepted only as a full 36-char UUID.
 
     Known sessions for prefix matching are live workers + the registry, plus
@@ -451,7 +457,9 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
             }
     # A live worker's own session id, whatever its shape. Devin ids are word
     # slugs ("patch-macadamia"), not UUIDs, so the hex-prefix branch below
-    # can never match the claimed_session_id a devin ticket carries.
+    # can never match the claimed_session_id a devin ticket carries; a BARE
+    # slug is only addressable here, while its devincli- prefixed form (what
+    # CCC records for an embedded devin session) has its own branch below.
     for w in live:
         if str(w.get("session_id") or "") == t:
             return {
@@ -461,6 +469,24 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
                 "engine": str(w.get("engine") or "claude"),
                 "cwd": str(w.get("cwd") or ""),
             }
+    # A devin-cli session id (CCC's "devincli-<word-slug>"). It is neither hex
+    # nor a UUID, so every branch below rejects it and devin sessions were
+    # unaddressable -- unsubscribable as a ticket's submitter, unreachable by
+    # `wt send` (WATCHTOWER-33). The prefix names the engine outright, so no
+    # lookup is needed to know the transport: no FIFO and no claude resume, so
+    # the chain falls through to the delegate, and CCC's /api/inject-input
+    # speaks devincli- ids natively (it strips the prefix and steers over ACP).
+    # Placed after the two live-worker branches on purpose: a devin session
+    # that IS a live WT worker has a record saying so, and that record (with
+    # its fifo and cwd) beats anything this shape can tell us.
+    if _DEVIN_CLI_SESSION_RE.match(t):
+        return {
+            "kind": "session",
+            "session_id": t,
+            "worker": None,
+            "engine": "devin",
+            "known": True,
+        }
     agents = _load_agents()
     name = t.lstrip("@")
     rec = agents.get(name)

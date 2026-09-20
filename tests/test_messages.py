@@ -281,6 +281,66 @@ def test_resolve_full_uuid_unknown_accepted(wt):
     assert r["worker"] is None and r["engine"] == "claude"
 
 
+def test_resolve_devin_cli_session_id(wt):
+    """WATCHTOWER-33: a devin-cli session id is a word slug behind CCC's
+    ``devincli-`` prefix, so it is neither hex nor a UUID and every other
+    branch rejects it -- which left devin sessions unaddressable as a
+    ticket's submitter or a `wt send` target. The prefix names the engine,
+    so no lookup is needed; delivery falls through to the delegate."""
+    r = wt.messages.resolve_target("devincli-glorious-sturgeon")
+
+    assert r["kind"] == "session"
+    assert r["session_id"] == "devincli-glorious-sturgeon"
+    assert r["engine"] == "devin"
+    assert r["worker"] is None
+
+
+def test_resolve_devin_cli_session_does_not_shadow_a_live_worker(wt):
+    """A devin session that IS a live WT worker resolves through its worker
+    record (fifo, cwd, recorded engine) -- the shape branch is the fallback."""
+    _live_worker(wt, "Q", session_id="devincli-patch-macadamia")
+    r = wt.messages.resolve_target("devincli-patch-macadamia")
+    assert r["kind"] == "worker"
+    assert r["worker"] is not None
+
+
+def test_default_report_to_uses_our_devin_session(wt, monkeypatch):
+    """`wt add` from inside a devin session used to file with submitter=""
+    (devin sets neither harness env var), so its filer could never be
+    notified. The session recovered from our ancestry fills it in, and it
+    resolves -- which is what makes the notification deliverable."""
+    import watchtower.cli as cli
+
+    monkeypatch.setattr(
+        wt.workers, "current_devin_session_id",
+        lambda: "devincli-glorious-sturgeon",
+    )
+    target, note = cli._default_report_to()
+
+    assert target == "devincli-glorious-sturgeon" and note == ""
+    assert wt.messages.resolve_target(target)["engine"] == "devin"
+
+
+def test_default_report_to_prefers_the_claude_env_over_devin(wt, monkeypatch):
+    import watchtower.cli as cli
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SID_A)
+    monkeypatch.setattr(
+        wt.workers, "current_devin_session_id",
+        lambda: pytest.fail("must not probe devin when the env names us"),
+    )
+    assert cli._default_report_to() == (SID_A, "")
+
+
+def test_resolve_bare_devin_slug_still_raises(wt):
+    """Only the prefixed form is an address: a bare slug is indistinguishable
+    from a typo'd agent name, and CCC's delegate does not answer to it."""
+    with pytest.raises(ValueError):
+        wt.messages.resolve_target("glorious-sturgeon")
+    with pytest.raises(ValueError):
+        wt.messages.resolve_target("devincli-")
+
+
 def test_resolve_pruned_kimi_worker_from_session_ledger(wt):
     sid = "session_11111111-2222-3333-4444-555555555555"
     wt.workers.record_worker(
@@ -419,6 +479,22 @@ def test_delegate_delivery_payload(wt, delegate, monkeypatch):
     assert path == "/api/inject-input"
     assert body == {"session_id": SID_B, "text": "over http", "mode": "steer",
                     "origin": "wt"}
+
+
+def test_delegate_carries_a_devin_session_id_verbatim(wt, delegate, monkeypatch):
+    """WATCHTOWER-33 end to end: WT has no native devin transport, so a devin
+    target must reach the delegate -- and with the ``devincli-`` prefix
+    intact, because that is the id CCC's /api/inject-input answers to (it
+    strips the prefix itself and steers the session over ACP)."""
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+
+    res = wt.messages.send("devincli-glorious-sturgeon", "over http")
+
+    assert res["ok"] is True and res["transport"] == "delegate"
+    path, body = srv.requests[0]
+    assert path == "/api/inject-input"
+    assert body["session_id"] == "devincli-glorious-sturgeon"
 
 
 def test_delegate_500_falls_to_outbox(wt, delegate, monkeypatch):

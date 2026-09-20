@@ -2364,6 +2364,52 @@ def test_resolve_devin_session_id_without_a_store_is_empty(wt):
     assert wt.workers.resolve_devin_session_id("q-devin-1") == ""
 
 
+def _devin_lock(wt, slug, pid):
+    """Write devin's per-session lock file (it holds the owning pid)."""
+    d = wt.workers._devin_cli_locks_dirs()[0]
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{slug}.lock").write_text(f"{pid}\n")
+
+
+def test_current_devin_session_id_from_our_own_pid(wt):
+    """WATCHTOWER-33: devin exports no session env var, so a `wt add` from
+    inside one had no submitter to notify. The lock file devin writes for the
+    session holds its pid, so our own ancestry names the session we're in."""
+    _devin_lock(wt, "glorious-sturgeon", os.getpid())
+    assert (
+        wt.workers.current_devin_session_id() == "devincli-glorious-sturgeon"
+    )
+
+
+def test_current_devin_session_id_walks_up_the_parent_chain(wt, monkeypatch):
+    """`wt` runs as a grandchild of devin (devin -> shell -> wt), so a direct
+    pid match is the exception, not the rule."""
+    _devin_lock(wt, "patch-macadamia", 4001)
+    monkeypatch.setattr(
+        wt.workers, "_ppid_map", lambda: {5003: 5002, 5002: 4001, 4001: 1}
+    )
+    assert (
+        wt.workers.current_devin_session_id(pid=5003)
+        == "devincli-patch-macadamia"
+    )
+
+
+def test_current_devin_session_id_outside_devin_is_empty(wt, monkeypatch):
+    """The common case: not a devin session at all. A lock exists but owns no
+    ancestor of ours, so nothing is claimed."""
+    assert wt.workers.current_devin_session_id() == ""  # no locks at all
+    _devin_lock(wt, "someone-else", 4001)
+    monkeypatch.setattr(wt.workers, "_ppid_map", lambda: {5003: 5002, 5002: 1})
+    assert wt.workers.current_devin_session_id(pid=5003) == ""
+
+
+def test_current_devin_session_id_survives_a_junk_lock(wt):
+    _devin_lock(wt, "empty", "")
+    _devin_lock(wt, "not-a-pid", "banana")
+    _devin_lock(wt, "real-one", os.getpid())
+    assert wt.workers.current_devin_session_id() == "devincli-real-one"
+
+
 def test_list_workers_backfills_a_devin_session_from_its_store(wt):
     log = wt.tmp / "q-devin-1.log"
     log.write_text("plain text, no session id line\n")

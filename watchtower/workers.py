@@ -4693,6 +4693,100 @@ def resolve_devin_session_id(worker_id: str) -> str:
     return ""
 
 
+# CCC's session id for a devin-cli session: its word-slug with a prefix that
+# keeps it from colliding with a cloud Devin session (ccc_server/devin.py's
+# DEVIN_CLI_SESSION_PREFIX). This is the address `wt send`/notifications must
+# use, because it is the address CCC's /api/inject-input answers to.
+DEVIN_CLI_SESSION_PREFIX = "devincli-"
+
+
+def _devin_cli_locks_dirs() -> List[Path]:
+    """Directories holding devin-cli's per-session lock files.
+
+    Devin writes ``<locks>/<slug>.lock`` containing the owning pid for every
+    live session. Derived from ``_devin_sessions_db()`` so the one
+    ``$WATCHTOWER_DEVIN_SESSIONS_DB`` override isolates both stores in tests;
+    with no override we scan devin's ``cli`` and ``cli-next`` trees, the same
+    pair CCC scans."""
+    if os.environ.get("WATCHTOWER_DEVIN_SESSIONS_DB"):
+        return [_devin_sessions_db().parent / "session_locks"]
+    base = Path.home() / ".local" / "share" / "devin"
+    return [base / "cli" / "session_locks", base / "cli-next" / "session_locks"]
+
+
+def _devin_cli_lock_pids() -> Dict[int, str]:
+    """``{pid: slug}`` for every devin-cli session lock we can read."""
+    out: Dict[int, str] = {}
+    for locks_dir in _devin_cli_locks_dirs():
+        try:
+            entries = list(locks_dir.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            if p.suffix != ".lock" or len(p.name) <= 5:
+                continue
+            try:
+                pid = int((p.read_text(encoding="utf-8") or "").strip())
+            except (OSError, ValueError):
+                continue
+            if pid > 0:
+                out[pid] = p.name[:-5]
+    return out
+
+
+def _ppid_map() -> Dict[int, int]:
+    """``{pid: ppid}`` for every process on the machine."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,ppid="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out: Dict[int, int] = {}
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            out[int(parts[0])] = int(parts[1])
+        except ValueError:
+            continue
+    return out
+
+
+def current_devin_session_id(pid: Optional[int] = None) -> str:
+    """CCC session id of the devin session running THIS process, or "".
+
+    A devin-cli session sets no session env var -- neither
+    ``CLAUDE_CODE_SESSION_ID`` nor ``CODEX_THREAD_ID`` -- so a ``wt add`` run
+    from inside one filed with ``submitter=""`` and its filer could never be
+    notified (WATCHTOWER-33). Devin does record the owning pid in a per-session
+    lock file, so walk our own parent chain until a pid matches one: that lock's
+    slug is the session we are running inside. Returns the ``devincli-``
+    prefixed form CCC addresses, or "" when we are not inside a devin session
+    (the overwhelmingly common case, and the only cost is one ``ps``).
+
+    We walk UP from ourselves, unlike CCC's ``_devin_cli_raw_id_for_pid``,
+    which walks DOWN from a spawn pid it already knows."""
+    locks = _devin_cli_lock_pids()
+    if not locks:
+        return ""
+    cur = int(pid if pid is not None else os.getpid())
+    if cur in locks:
+        return DEVIN_CLI_SESSION_PREFIX + locks[cur]
+    parents = _ppid_map()
+    seen = {cur}
+    while cur > 1:
+        cur = parents.get(cur, 0)
+        if cur <= 1 or cur in seen:
+            break
+        seen.add(cur)
+        if cur in locks:
+            return DEVIN_CLI_SESSION_PREFIX + locks[cur]
+    return ""
+
+
 def backfill_recent_session_titles(
     hours: float = 24.0,
     dry_run: bool = False,
