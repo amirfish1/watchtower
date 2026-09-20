@@ -180,7 +180,11 @@ def _event_summary(event: dict) -> str:
         return f"filed from {event.get('source') or 'unknown'}" + (f" by {filer}" if filer else "")
     if name == "claim":
         by = event.get("by") or {}
-        return f"claimed by {by.get('worker') or by.get('session_id') or by.get('kind') or 'unknown'}"
+        actor = q.with_machine(
+            by.get("worker") or by.get("session_id") or by.get("kind") or "unknown",
+            by.get("machine"),
+        )
+        return f"claimed by {actor}"
     if name == "block":
         return f"blocked: {event.get('question') or ''}".rstrip()
     if name in ("answer", "comment", "progress"):
@@ -378,7 +382,10 @@ def cmd_ls(args: argparse.Namespace) -> int:
     print(f"{'REF':<14}{'STATUS':<12}{'WORKER':<22}TITLE")
     print("-" * 72)
     for it in items[:limit]:
-        worker = str(it.get("claimed_by") or it.get("claimed_session_id") or "")[:20]
+        machine = it.get("claimed_machine") or it.get("closed_machine") or ""
+        worker = q.with_machine(
+            it.get("claimed_by") or it.get("claimed_session_id"), machine
+        )[:20]
         title = _oneline(it.get("title") or it.get("note") or "")[:56]
         line = f"{str(it.get('ref','')):<14}{str(it.get('status','')):<12}{worker:<22}{title}"
         res = it.get("resolution") if it.get("status") == "closed" else None
@@ -464,7 +471,10 @@ def cmd_find(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(item_with_timeline, indent=2))
         return 0
-    worker = str(item.get("claimed_by") or item.get("claimed_session_id") or "")
+    worker = q.with_machine(
+        item.get("claimed_by") or item.get("claimed_session_id"),
+        item.get("claimed_machine"),
+    )
     title = _oneline(item.get("title") or item.get("note") or "")
     print(f"{item.get('ref',''):<14}[{item.get('status',''):<11}] {title}")
     filer = str(item.get("submitter") or item.get("github_author") or "")
@@ -473,7 +483,7 @@ def cmd_find(args: argparse.Namespace) -> int:
     if worker:
         you = " (you)" if item_with_timeline.get("claimed_by_you") else ""
         print(f"  claimed_by: {worker}{you}")
-    closed_by = str(item.get("closed_by") or "")
+    closed_by = q.with_machine(item.get("closed_by"), item.get("closed_machine"))
     if closed_by:
         you = " (you)" if item_with_timeline.get("closed_by_you") else ""
         print(f"  closed_by: {closed_by}{you}")

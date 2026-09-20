@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import CATCH_ALL_LABEL
-from .queue import UNCLAIMABLE_READINESS, _FileLock
+from .queue import UNCLAIMABLE_READINESS, _FileLock, machine_tag
 
 VALID_LANES = ("normal", "express")
 # `gh issue` subcommands that actually change an issue's list-visible state
@@ -1163,6 +1163,13 @@ def _append_history(meta: Dict[str, Any], event: str, **fields: Any) -> None:
     for key, value in fields.items():
         if value:
             entry[key] = value
+    # Worker lifecycle events carry the recording machine's tag (queue.py's
+    # _append_history stamps by.machine on the file backend); human-kind
+    # events (answers, human reopens) don't claim a machine.
+    if entry.get("worker") and entry.get("kind") != "human" and "machine" not in entry:
+        tag = machine_tag()
+        if tag:
+            entry["machine"] = tag
     hist.append(entry)
     meta["history"] = hist
 
@@ -1736,6 +1743,7 @@ class GitHubIssuesBackend:
             "claimed_at": meta.get("claimed_at"),
             "closed_at": issue.get("closedAt") or meta.get("closed_at"),
             "claimed_session_id": meta.get("claimed_session_id"),
+            "claimed_machine": meta.get("claimed_machine"),
             "created_at": issue.get("createdAt") or _now_iso(),
             "updated_at": issue.get("updatedAt") or issue.get("createdAt") or _now_iso(),
             "github_repo": self.repo,
@@ -1769,6 +1777,7 @@ class GitHubIssuesBackend:
         }
         if status == "closed":
             item["closed_by"] = meta.get("closed_by") or item.get("claimed_by")
+            item["closed_machine"] = meta.get("closed_machine") or item.get("claimed_machine")
         if resolution:
             item["resolution"] = resolution
         history = meta.get("history")
@@ -2503,6 +2512,7 @@ class GitHubIssuesBackend:
             body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
             meta.update({
                 "claimed_by": str(session_id),
+                "claimed_machine": machine_tag(),
                 "claimed_at": _now_iso(),
             })
             if session_uuid:
@@ -2519,6 +2529,7 @@ class GitHubIssuesBackend:
             claimed = self.get(ref)
             if claimed:
                 claimed["claimed_by"] = str(session_id)
+                claimed["claimed_machine"] = meta.get("claimed_machine")
                 claimed["status"] = "in_progress"
             return claimed
 
@@ -2570,7 +2581,8 @@ class GitHubIssuesBackend:
 
         if status == "open":
             for key in (
-                "claimed_by", "claimed_at", "closed_by", "closed_at",
+                "claimed_by", "claimed_machine", "claimed_at",
+                "closed_by", "closed_machine", "closed_at",
                 "resolution_summary", "resolution_commit", "resolution_caveats",
                 "resolution_follow_ups", "resolution_unresolved",
                 "resolution_caveats_ack", "resolution_follow_ups_ack",
@@ -2597,11 +2609,13 @@ class GitHubIssuesBackend:
         meta["needs_input"] = False
         if session_id:
             meta["closed_by"] = str(session_id)
+            meta["closed_machine"] = machine_tag()
             # Backfill claimed_by on a never-claimed issue so attribution
             # isn't dropped when a worker closes by ref without claiming
             # first (WT-81). Never overwrites a real claimant.
             if not meta.get("claimed_by"):
                 meta["claimed_by"] = str(session_id)
+                meta["claimed_machine"] = meta["closed_machine"]
         if norm:
             meta["resolution_summary"] = norm.get("summary", "")
             # Always overwrite (possibly with ""), so a re-close without a
@@ -2636,6 +2650,9 @@ class GitHubIssuesBackend:
         closed = self.get(ident)
         if closed:
             closed["closed_by"] = str(session_id or closed.get("claimed_by") or "")
+            closed["closed_machine"] = str(
+                meta.get("closed_machine") or closed.get("claimed_machine") or ""
+            )
             if norm:
                 closed["resolution"] = norm
         return closed
@@ -2751,7 +2768,9 @@ class GitHubIssuesBackend:
         meta["block_question"] = _clip(question, 4000)
         meta["blocked_at"] = now
         if session_id:
-            meta.setdefault("claimed_by", str(session_id))
+            if not meta.get("claimed_by"):
+                meta["claimed_by"] = str(session_id)
+                meta["claimed_machine"] = machine_tag()
         if progress:
             _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
         _append_history(meta, "block", worker=str(session_id), question=_clip(question, 4000))
@@ -2815,7 +2834,8 @@ class GitHubIssuesBackend:
         )
         if releasing:
             for key in (
-                "claimed_by", "claimed_at", "claimed_session_id",
+                "claimed_by", "claimed_machine", "claimed_at",
+                "claimed_session_id",
                 "block_question", "blocked_at",
             ):
                 meta.pop(key, None)

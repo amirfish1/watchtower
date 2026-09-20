@@ -1077,7 +1077,10 @@ def _closed_block(closed: List[Dict[str, Any]], total_closed: int) -> str:
     for it in closed:
         ref = html.escape(str(it.get("ref", "")))
         worker = html.escape(
-            str(it.get("closed_by") or it.get("claimed_by") or "—")[:28]
+            q.with_machine(
+                it.get("closed_by") or it.get("claimed_by"),
+                it.get("closed_machine") or it.get("claimed_machine"),
+            )[:28] or "—"
         )
         res = it.get("resolution") or {}
         summary = res.get("summary", "")
@@ -1279,7 +1282,10 @@ def render_queue(
         status = str(it.get("status", ""))
         gated = bool(it.get("needs_input")) and it.get("block_kind") == "rationale"
         worker = html.escape(
-            str(it.get("claimed_by") or it.get("claimed_session_id") or "—")[:28]
+            q.with_machine(
+                it.get("claimed_by") or it.get("claimed_session_id"),
+                it.get("claimed_machine"),
+            )[:28] or "—"
         )
         title = html.escape(str(it.get("title") or it.get("note") or "")[:120])
         action = '<span class="run-spacer"></span>'

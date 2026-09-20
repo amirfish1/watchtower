@@ -10,6 +10,7 @@ import pytest
 def wt(tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "queue.json"))
     monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
+    monkeypatch.delenv("WATCHTOWER_MACHINE", raising=False)
 
     import watchtower.queue as q
     import watchtower.cli as cli
@@ -44,6 +45,7 @@ def test_mutations_append_canonical_history_and_stop_legacy_lists(wt):
         "kind": "worker",
         "worker": "worker-a",
         "session_id": "11111111-2222-3333-4444-555555555555",
+        "machine": wt.q.machine_tag(),
     }
 
     blocked = wt.q.block(claimed["ref"], session_id="worker-a", question="ship it?", progress="ready except decision")
@@ -495,3 +497,71 @@ def test_timeline_same_timestamp_precedence(wt):
     }
     tl = wt.q.timeline(item)
     assert _events(tl) == ["filed", "claim"]
+
+
+def test_machine_tag_env_override_and_derivation(wt, monkeypatch):
+    """WATCHTOWER_MACHINE wins; otherwise the tag is derived from the
+    hostname's first label, lowercase alnum, first 3 chars."""
+    monkeypatch.setenv("WATCHTOWER_MACHINE", "Hermes-VM")
+    wt.q._MACHINE_TAG_CACHE = None
+    assert wt.q.machine_tag() == "her"
+
+    monkeypatch.delenv("WATCHTOWER_MACHINE")
+    wt.q._MACHINE_TAG_CACHE = None
+    monkeypatch.setattr("socket.gethostname", lambda: "Bobs-Mac-mini.local")
+    assert wt.q.machine_tag() == "bob"
+
+
+def test_worker_events_carry_machine_tag(wt, monkeypatch):
+    """claim/progress/block/close events record by.machine so a shared queue's
+    timeline can show which host the worker ran on (the human/system events
+    around them don't claim a machine)."""
+    monkeypatch.setenv("WATCHTOWER_MACHINE", "tst")
+    wt.q._MACHINE_TAG_CACHE = None
+
+    item = wt.q.enqueue(project="MAC", note="machine tag")
+    assert item["history"][0]["by"] == {"kind": "system"}
+
+    claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
+    assert claimed["claimed_machine"] == "tst"
+    claim_by = claimed["history"][-1]["by"]
+    assert claim_by["worker"] == "worker-a" and claim_by["machine"] == "tst"
+
+    blocked = wt.q.block(item["ref"], session_id="worker-a",
+                         question="ok?", progress="halfway")
+    assert blocked["history"][-2]["by"]["machine"] == "tst"
+    assert blocked["history"][-1]["by"]["machine"] == "tst"
+
+    closed = wt.q.close(item["ref"], "worker-a",
+                        resolution={"summary": "done"}, force=True)
+    assert closed["closed_machine"] == "tst"
+    assert closed["history"][-1]["by"]["machine"] == "tst"
+
+    # Human events (answer/comment) carry no machine tag.
+    assert all(
+        "machine" not in (e.get("by") or {})
+        for e in closed["history"]
+        if (e.get("by") or {}).get("kind") in ("human", "system")
+    )
+
+
+def test_machine_tag_survives_timeline_and_reopen_clears(wt, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_MACHINE", "tst")
+    wt.q._MACHINE_TAG_CACHE = None
+
+    item = wt.q.enqueue(project="MAC2", note="reopen clears machine")
+    claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
+    timeline = wt.q.timeline(wt.q.get(item["ref"]))
+    assert timeline[-1]["by"]["machine"] == "tst"
+
+    reopened = wt.q.reopen(item["ref"], reason="retry", force=True)
+    assert reopened.get("claimed_machine") is None
+    assert reopened.get("closed_machine") is None
+
+
+def test_with_machine_prefix_display(wt):
+    assert wt.q.with_machine("bym-zxcv", "her") == "her-bym-zxcv"
+    assert wt.q.with_machine("her-bym-zxcv", "her") == "her-bym-zxcv"
+    assert wt.q.with_machine("bym-zxcv", "") == "bym-zxcv"
+    assert wt.q.with_machine("", "her") == ""
+    assert wt.q.with_machine(None, None) == ""

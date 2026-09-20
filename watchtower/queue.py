@@ -51,6 +51,8 @@ Item shape::
                                           # notified on claim/close/needs-input
       "claimed_by": null, "claimed_at": null, "closed_at": null,
       "claimed_session_id": null,        # real worker/session id, when known
+      "claimed_machine": null,           # ~3-letter machine tag (machine_tag()),
+                                         # same for "closed_machine"
       "resolution": {                    # HOW it was fixed (set on close, optional)
         "summary": "...",                # the main one-liner
         "commit": "...",                 # verified code-change commit, if any
@@ -716,32 +718,75 @@ def _clip(value: Any, max_len: int) -> str:
     return s if len(s) <= max_len else s[:max_len].rstrip() + "…"
 
 
-def _by(kind: str = "system", worker: str = "", session_id: str = "") -> Dict[str, str]:
+_MACHINE_TAG_CACHE: Optional[str] = None
+
+
+def machine_tag() -> str:
+    """~3-letter tag identifying the machine a worker event was recorded on.
+
+    The queue store is shared, and its tickets are rendered on machines other
+    than the one that wrote the event, so the tag is stamped at write time —
+    deriving it at render time would show the *viewer's* host instead.
+    ``WATCHTOWER_MACHINE`` overrides the hostname-derived default for machines
+    with opaque hostnames (cloud VMs, containers); otherwise it's the first
+    three alnum chars of the hostname's first label (``hermes`` -> ``her``).
+    """
+    global _MACHINE_TAG_CACHE
+    if _MACHINE_TAG_CACHE is not None:
+        return _MACHINE_TAG_CACHE
+    raw = str(os.environ.get("WATCHTOWER_MACHINE") or "").strip()
+    if not raw:
+        import socket
+        raw = socket.gethostname().split(".", 1)[0]
+    tag = _re.sub(r"[^a-z0-9]", "", raw.lower())[:3]
+    _MACHINE_TAG_CACHE = tag
+    return tag
+
+
+def with_machine(worker: Any, machine: Any) -> str:
+    """``<machine>-<worker>`` for display — e.g. ``her-bym-a1b2``.
+
+    The tag is a separate recorded field (``by.machine`` / ``claimed_machine``)
+    so claim/ownership comparisons keep matching the bare worker id; a worker
+    id that already carries the tag isn't double-prefixed."""
+    w = str(worker or "")
+    m = str(machine or "")
+    if m and w and not w.startswith(m + "-"):
+        return f"{m}-{w}"
+    return w
+
+
+def _by(kind: str = "system", worker: str = "", session_id: str = "", machine: str = "") -> Dict[str, str]:
     kind = kind if kind in ("worker", "human", "system") else "system"
     out = {"kind": kind}
     if worker:
         out["worker"] = str(worker)
     if session_id:
         out["session_id"] = str(session_id)
+    if machine:
+        out["machine"] = str(machine)
     return out
 
 
-def _normalize_by(value: Any = None, *, worker: Any = "", session_id: Any = "", event: str = "") -> Dict[str, str]:
+def _normalize_by(value: Any = None, *, worker: Any = "", session_id: Any = "", machine: Any = "", event: str = "") -> Dict[str, str]:
     if isinstance(value, dict):
         kind = str(value.get("kind") or "").strip()
         out = _by(kind if kind else "system")
         w = value.get("worker") or worker
         sid = value.get("session_id") or session_id
+        m = value.get("machine") or machine
         if w:
             out["worker"] = str(w)
         if sid:
             out["session_id"] = str(sid)
+        if m:
+            out["machine"] = str(m)
         return out
     if isinstance(value, str) and value in ("worker", "human", "system"):
-        return _by(value, str(worker or ""), str(session_id or ""))
+        return _by(value, str(worker or ""), str(session_id or ""), str(machine or ""))
     if worker or session_id:
         kind = "human" if event in ("answer", "comment") else "worker"
-        return _by(kind, str(worker or ""), str(session_id or ""))
+        return _by(kind, str(worker or ""), str(session_id or ""), str(machine or ""))
     if event in ("answer", "comment"):
         return _by("human")
     return _by("system")
@@ -765,6 +810,15 @@ def _append_history(
         "at": str(at or _now_iso()),
         "by": _normalize_by(by, event=event),
     }
+    entry_by = entry["by"]
+    if (
+        entry_by.get("kind") == "worker"
+        and entry_by.get("worker")
+        and "machine" not in entry_by
+    ):
+        tag = machine_tag()
+        if tag:
+            entry_by["machine"] = tag
     if text:
         entry["text"] = text
     for key, value in fields.items():
@@ -786,11 +840,12 @@ def _timeline_event(raw: Dict[str, Any], default_at: str = "") -> Optional[Dict[
             raw.get("by"),
             worker=raw.get("worker") or "",
             session_id=raw.get("session_id") or "",
+            machine=raw.get("machine") or "",
             event=event,
         ),
     }
     for key, value in raw.items():
-        if key in ("event", "at", "by", "worker", "session_id"):
+        if key in ("event", "at", "by", "worker", "session_id", "machine"):
             continue
         if value is not None and value != "":
             out[key] = value
@@ -1770,6 +1825,7 @@ def claim_next(
         item = candidates[0]
         item["status"] = "in_progress"
         item["claimed_by"] = str(session_id)
+        item["claimed_machine"] = machine_tag()
         if real_sid:
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
@@ -1818,6 +1874,7 @@ def claim_by_ref(
             raise ValueError(f"{ref} is not open (status={status})")
         item["status"] = "in_progress"
         item["claimed_by"] = str(session_id)
+        item["claimed_machine"] = machine_tag()
         if real_sid:
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
@@ -2042,6 +2099,7 @@ def update_status(
                 it["updated_at"] = now
                 if status == "in_progress" and session_id:
                     it["claimed_by"] = str(session_id)
+                    it["claimed_machine"] = machine_tag()
                     it["claimed_at"] = now
                     if real_sid:
                         it["claimed_session_id"] = real_sid
@@ -2053,16 +2111,20 @@ def update_status(
                     # (without a prior claim) still gets credited.
                     if session_id:
                         it["closed_by"] = str(session_id)
+                        it["closed_machine"] = machine_tag()
                         # Backfill claimed_by on a never-claimed ticket so
                         # consumers that attribute by claimant (wt find, the
                         # dashboard's in-progress column) don't show a blank.
                         # Never overwrites a real claimant (WT-81).
                         if not it.get("claimed_by"):
                             it["claimed_by"] = str(session_id)
+                            it["claimed_machine"] = it["closed_machine"]
                             if real_sid and not it.get("claimed_session_id"):
                                 it["claimed_session_id"] = real_sid
                     elif it.get("claimed_by"):
                         it["closed_by"] = it["claimed_by"]
+                        if it.get("claimed_machine"):
+                            it["closed_machine"] = it["claimed_machine"]
                     # Record HOW it was fixed — the trust-layer signal. Optional:
                     # absent resolution leaves the item without the key.
                     norm = _normalize_resolution(resolution)
@@ -2077,6 +2139,7 @@ def update_status(
                     )
                 if status == "open":
                     it["claimed_by"] = None
+                    it["claimed_machine"] = None
                     it["claimed_at"] = None
                     it["closed_at"] = None
                     # Back to the pool: the stale close attribution and
@@ -2084,6 +2147,7 @@ def update_status(
                     # (parity with the GitHub backend's reopen, which pops
                     # closed_by/closed_at/resolution_* from the body meta).
                     it.pop("closed_by", None)
+                    it.pop("closed_machine", None)
                     it.pop("resolution", None)
                     # Keep claimed_session_id: reopening drops the claim *lock*
                     # (so a new worker can claim) but preserves the handle to the
@@ -2309,6 +2373,7 @@ def reopen_and_claim(
             # in_progress instead of open -- this ticket is never externally
             # claimable in between.
             it.pop("closed_by", None)
+            it.pop("closed_machine", None)
             it.pop("resolution", None)
             it["needs_input"] = False
             it["block_question"] = ""
@@ -2324,6 +2389,7 @@ def reopen_and_claim(
             # Claim half: same fields claim_by_ref sets.
             it["status"] = "in_progress"
             it["claimed_by"] = str(session_id)
+            it["claimed_machine"] = machine_tag()
             if real_sid:
                 it["claimed_session_id"] = real_sid
             it["claimed_at"] = now
@@ -2534,7 +2600,9 @@ def block(
                 if it.get("status") == "open":
                     it["status"] = "in_progress"
                 if session_id:
-                    it["claimed_by"] = it.get("claimed_by") or str(session_id)
+                    if not it.get("claimed_by"):
+                        it["claimed_by"] = str(session_id)
+                        it["claimed_machine"] = machine_tag()
                     real = _coerce_session_uuid(session_id)
                     if real and not it.get("claimed_session_id"):
                         it["claimed_session_id"] = real
@@ -2601,6 +2669,7 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                 if it.get("status") == "in_progress" and not it.get("claimed_session_id"):
                     it["status"] = "open"
                     it["claimed_by"] = None
+                    it["claimed_machine"] = None
                     it["claimed_at"] = None
                     it["block_question"] = ""
                     it["block_kind"] = ""
@@ -2727,6 +2796,7 @@ def gate_nack(
             it["blocked_at"] = None
             it["status"] = "open"
             it["claimed_by"] = None
+            it["claimed_machine"] = None
             it["claimed_at"] = None
             it["readiness"] = "needs-rationale"
             it["updated_at"] = now

@@ -120,4 +120,6 @@ def test_find_human_output_appends_you_markers(wt, capsys, monkeypatch):
     )
     assert rc == 0
     text = capsys.readouterr().out
-    assert "closed_by: ccc-worker-a (you)" in text
+    tag = wt.q.machine_tag()
+    expected = f"{tag}-ccc-worker-a" if tag else "ccc-worker-a"
+    assert f"closed_by: {expected} (you)" in text
