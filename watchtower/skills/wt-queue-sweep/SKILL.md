@@ -134,6 +134,26 @@ without the user's say-so, except the auto-ack in category 1.
 `--caveat N`, `--follow-up N`; `--undo` reverses; no history rewrite). NOT
 `wt ack` -- that approves product-gate pitches.
 
+**Presenting owner-action items.** Any item routed to a human (studio owner
+must text a client, fix a contact record, apply a credit) must show (a) how
+old the ticket is — days since `created_at` — (b) when it references a
+specific appointment, the APPOINTMENT's date, not just the ticket's, and
+(c) the ticket's ORIGIN: system (auditor autofile, digest, delivery-log
+alert, cron) vs owner (in-app "Report an issue", a direct ask). Owners skim:
+"The owner should text Dana (system, 10d old; class was Sep 15)" is
+actionable, a bare ticket ref is not. Auditor-filed issues carry a
+`Auto-filed by the Becky Auditor sweeper` note in the body; otherwise infer
+from phrasing and mark the inference — tickets have no explicit origin field.
+
+Two consequences follow automatically:
+- If the referenced appointment/event has ALREADY PASSED, the communication
+  item is moot — they have almost certainly handled it out of band. Ack it;
+  there is nothing left to send. If a still-live instance of the same issue
+  exists (a fresher ticket in the cluster), say so instead of acking blindly.
+- System-originated items can be acked/closed on this judgment alone.
+  Owner-originated items cannot — a human asked for it, so it goes in front
+  of the user even when it looks stale.
+
 1. **Couldn't verify** (worker lacked the means to test it). Assess (a) feature
    size S/M/L and (b) probability 0-1 that the fix is right unverified, with the
    evidence. Small AND high probability: let it go and `wt unresolved-ack` it.
