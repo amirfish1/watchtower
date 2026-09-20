@@ -2371,43 +2371,70 @@ def _devin_lock(wt, slug, pid):
     (d / f"{slug}.lock").write_text(f"{pid}\n")
 
 
-def test_current_devin_session_id_from_our_own_pid(wt):
-    """WATCHTOWER-33: devin exports no session env var, so a `wt add` from
-    inside one had no submitter to notify. The lock file devin writes for the
-    session holds its pid, so our own ancestry names the session we're in."""
-    _devin_lock(wt, "glorious-sturgeon", os.getpid())
-    assert (
-        wt.workers.current_devin_session_id() == "devincli-glorious-sturgeon"
-    )
+def _fake_ps(wt, monkeypatch, procs):
+    """Stand in for `ps`: ``{pid: (ppid, command)}``."""
+    monkeypatch.setattr(wt.workers, "_ps_snapshot", lambda: dict(procs))
 
 
 def test_current_devin_session_id_walks_up_the_parent_chain(wt, monkeypatch):
-    """`wt` runs as a grandchild of devin (devin -> shell -> wt), so a direct
-    pid match is the exception, not the rule."""
+    """WATCHTOWER-33: devin exports no session env var, so a `wt add` from
+    inside one had no submitter to notify. The lock file devin writes holds
+    the session's pid, so our own ancestry names the session we're in --
+    `wt` runs as devin's grandchild (devin -> shell -> wt), so a direct pid
+    match is the exception, not the rule."""
     _devin_lock(wt, "patch-macadamia", 4001)
-    monkeypatch.setattr(
-        wt.workers, "_ppid_map", lambda: {5003: 5002, 5002: 4001, 4001: 1}
-    )
+    _fake_ps(wt, monkeypatch, {
+        5003: (5002, "python3"),
+        5002: (4001, "zsh"),
+        4001: (1, "/Users/x/.local/bin/devin"),
+    })
     assert (
         wt.workers.current_devin_session_id(pid=5003)
         == "devincli-patch-macadamia"
     )
 
 
-def test_current_devin_session_id_outside_devin_is_empty(wt, monkeypatch):
-    """The common case: not a devin session at all. A lock exists but owns no
-    ancestor of ours, so nothing is claimed."""
-    assert wt.workers.current_devin_session_id() == ""  # no locks at all
-    _devin_lock(wt, "someone-else", 4001)
-    monkeypatch.setattr(wt.workers, "_ppid_map", lambda: {5003: 5002, 5002: 1})
+def test_current_devin_session_id_ignores_a_stale_lock(wt, monkeypatch):
+    """Devin never prunes its lock files (199 of 201 on the dev machine held
+    dead pids) and macOS recycles pids, so a bare pid match would eventually
+    name a stranger's session as a ticket's filer. Only a pid that is still
+    a live `devin` counts."""
+    _devin_lock(wt, "long-gone", 4001)
+    _fake_ps(wt, monkeypatch, {
+        5003: (4001, "python3"),
+        4001: (1, "Google Chrome Helper"),  # pid recycled away from devin
+    })
     assert wt.workers.current_devin_session_id(pid=5003) == ""
 
 
-def test_current_devin_session_id_survives_a_junk_lock(wt):
+def test_current_devin_session_id_outside_devin_is_empty(wt, monkeypatch):
+    """The common case: not a devin session at all. A live devin exists, but
+    it is not an ancestor of ours, so nothing is claimed."""
+    assert wt.workers.current_devin_session_id() == ""  # no locks at all
+    _devin_lock(wt, "someone-else", 4001)
+    _fake_ps(wt, monkeypatch, {
+        5003: (5002, "python3"), 5002: (1, "zsh"), 4001: (1, "devin"),
+    })
+    assert wt.workers.current_devin_session_id(pid=5003) == ""
+
+
+def test_current_devin_session_id_survives_a_junk_lock(wt, monkeypatch):
     _devin_lock(wt, "empty", "")
     _devin_lock(wt, "not-a-pid", "banana")
-    _devin_lock(wt, "real-one", os.getpid())
-    assert wt.workers.current_devin_session_id() == "devincli-real-one"
+    _devin_lock(wt, "real-one", 4001)
+    _fake_ps(wt, monkeypatch, {5003: (4001, "python3"), 4001: (1, "devin")})
+    assert (
+        wt.workers.current_devin_session_id(pid=5003) == "devincli-real-one"
+    )
+
+
+def test_current_devin_session_id_stops_on_a_pid_cycle(wt, monkeypatch):
+    """A malformed ps snapshot must not hang the walk."""
+    _devin_lock(wt, "unreachable", 4001)
+    _fake_ps(wt, monkeypatch, {
+        5003: (5002, "python3"), 5002: (5003, "zsh"), 4001: (1, "devin"),
+    })
+    assert wt.workers.current_devin_session_id(pid=5003) == ""
 
 
 def test_list_workers_backfills_a_devin_session_from_its_store(wt):

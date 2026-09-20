@@ -4734,22 +4734,22 @@ def _devin_cli_lock_pids() -> Dict[int, str]:
     return out
 
 
-def _ppid_map() -> Dict[int, int]:
-    """``{pid: ppid}`` for every process on the machine."""
+def _ps_snapshot() -> Dict[int, tuple]:
+    """``{pid: (ppid, command)}`` for every process on the machine."""
     try:
         proc = subprocess.run(
-            ["ps", "-ax", "-o", "pid=,ppid="],
+            ["ps", "-ax", "-o", "pid=,ppid=,comm="],
             capture_output=True, text=True, timeout=2,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
-    out: Dict[int, int] = {}
+    out: Dict[int, tuple] = {}
     for line in (proc.stdout or "").splitlines():
-        parts = line.split()
+        parts = line.split(None, 2)
         if len(parts) < 2:
             continue
         try:
-            out[int(parts[0])] = int(parts[1])
+            out[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
         except ValueError:
             continue
     return out
@@ -4767,23 +4767,30 @@ def current_devin_session_id(pid: Optional[int] = None) -> str:
     prefixed form CCC addresses, or "" when we are not inside a devin session
     (the overwhelmingly common case, and the only cost is one ``ps``).
 
+    Locks are matched only against pids that are STILL a live ``devin``: devin
+    never prunes them (199 of 201 on this machine were dead), and macOS recycles
+    pids, so a bare pid match would eventually name a stranger's session as the
+    filer of a ticket -- a wrong answer is worse here than none.
+
     We walk UP from ourselves, unlike CCC's ``_devin_cli_raw_id_for_pid``,
     which walks DOWN from a spawn pid it already knows."""
     locks = _devin_cli_lock_pids()
     if not locks:
         return ""
+    procs = _ps_snapshot()
+    locks = {
+        p: slug for p, slug in locks.items()
+        if "devin" in os.path.basename(procs.get(p, (0, ""))[1])
+    }
+    if not locks:
+        return ""
     cur = int(pid if pid is not None else os.getpid())
-    if cur in locks:
-        return DEVIN_CLI_SESSION_PREFIX + locks[cur]
-    parents = _ppid_map()
-    seen = {cur}
-    while cur > 1:
-        cur = parents.get(cur, 0)
-        if cur <= 1 or cur in seen:
-            break
-        seen.add(cur)
+    seen: Set[int] = set()
+    while cur > 1 and cur not in seen:
         if cur in locks:
             return DEVIN_CLI_SESSION_PREFIX + locks[cur]
+        seen.add(cur)
+        cur = procs.get(cur, (0, ""))[0]
     return ""
 
 
