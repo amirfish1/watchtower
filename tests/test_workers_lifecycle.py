@@ -3280,6 +3280,58 @@ def test_unknown_engine_preserves_stale_worker(wt):
     assert "authoritative_activity_unknown" in decision
 
 
+def _antigravity_worker(wt, monkeypatch, wid):
+    """An antigravity worker whose conversation store is the AGY CLI's
+    per-session SQLite db (``conversations/<sid>.db`` + WAL sidecars)."""
+    home = wt.tmp / "agy-home"
+    monkeypatch.setenv("WATCHTOWER_ANTIGRAVITY_HOME", str(home))
+    sid = "f67fcf91-e571-49cb-aa4d-38fb4d841d3f"
+    conv = home / "conversations"
+    conv.mkdir(parents=True, exist_ok=True)
+    db = conv / f"{sid}.db"
+    db.write_text("")
+    (conv / f"{sid}.db-wal").write_text("")
+    log = wt.tmp / f"{wid}.log"
+    log.write_text("")
+    rec = wt.workers.record_worker(
+        os.getpid(), "Q", "antigravity", wid, str(wt.tmp), str(log),
+        session_id=sid,
+    )
+    rec["_test_activity_path"] = str(db)
+    old = time.time() - (wt.workers.RELEASE_IDLE_S + 60)
+    os.utime(conv / f"{sid}.db-wal", (old, old))
+    return rec, conv / f"{sid}.db-shm"
+
+
+def test_stale_antigravity_worker_is_released(wt, monkeypatch):
+    """WATCHTOWER-36: AGY workers were PRESERVEd forever with
+    authoritative_activity_unknown, so the dashboard showed them working
+    days after their last turn."""
+    rec, shm = _antigravity_worker(wt, monkeypatch, "q-agy-stale")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    # A reader (CCC, sqlite3) touches the shared-memory index without any
+    # conversation activity; it must not count as the worker being busy.
+    shm.write_text("")
+
+    released = wt.workers.release_idle_workers(queue="Q")
+
+    assert [w["worker_id"] for w in released] == [rec["worker_id"]]
+    signal = [
+        line for line in _activity_lines(wt, "IDLE_SIGNAL")
+        if "signal=antigravity_conversation" in line
+    ]
+    assert signal and "exists=true" in signal[0]
+
+
+def test_active_antigravity_conversation_keeps_worker(wt, monkeypatch):
+    rec, _ = _antigravity_worker(wt, monkeypatch, "q-agy-busy")
+    os.utime(rec["log"], (time.time() - 7200,) * 2)
+    Path(rec["_test_activity_path"]).touch()
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+
+
 def test_unknown_pid_identity_preserves_worker(wt):
     rec = _live_worker(wt, "Q")
     _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)

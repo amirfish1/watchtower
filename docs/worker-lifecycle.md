@@ -203,7 +203,7 @@ an operator to reconstruct the transaction without reading a worker transcript.
 | Verb | Meaning |
 |------|---------|
 | `IDLE_CANDIDATE` | Identity, release floor, and newest effective activity clock for a worker that crossed the floor. |
-| `IDLE_SIGNAL` | One line per safety signal: PID, WT stdout, Claude transcript/Codex rollout/Kimi wire log, queue-read result, owned and blocked refs, and `pid_signal_planned=false`. |
+| `IDLE_SIGNAL` | One line per safety signal: PID, WT stdout, Claude transcript/Codex rollout/Kimi wire log/Antigravity conversation db, queue-read result, owned and blocked refs, and `pid_signal_planned=false`. |
 | `IDLE_DECISION` | Exactly one `PRESERVE` (with every reason) or `RELEASE` result for an evaluation. |
 | `ACTIVE_AGAIN` | A prior idle candidate received newer authoritative activity and fell below the floor. |
 | `RELEASE` | Durable detachment, delivery outcome, sentinel state, and `pid_signalled=false`. |

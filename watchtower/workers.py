@@ -1645,6 +1645,23 @@ def _engine_activity(w: Dict[str, Any]) -> Dict[str, Any]:
             "kimi_wire",
             str(home / "sessions" / pattern),
         )
+    if engine == "antigravity":
+        # The AGY CLI keeps each conversation in its own SQLite db. The db and
+        # its WAL are written per step; the -shm index is excluded because any
+        # reader (CCC, sqlite3) touches it without the worker doing anything.
+        home = Path(
+            os.environ.get("WATCHTOWER_ANTIGRAVITY_HOME")
+            or (Path.home() / ".gemini" / "antigravity-cli")
+        )
+        conv = home / "conversations"
+        return _matched_activity(
+            (
+                p for p in (conv / f"{session_id}.db", conv / f"{session_id}.db-wal")
+                if p.exists()
+            ),
+            "antigravity_conversation",
+            str(conv / f"{session_id}.db"),
+        )
     return _file_activity(None, f"{engine or 'engine'}_activity")
 
 
@@ -1850,7 +1867,7 @@ def _idle_snapshot(
         reasons.append("worker_identity_missing")
     if not str(w.get("queue") or ""):
         reasons.append("queue_identity_missing")
-    if engine not in {"claude", "codex", "kimi"}:
+    if engine not in {"claude", "codex", "kimi", "antigravity"}:
         reasons.append("authoritative_activity_unknown")
     elif session_id:
         if not evidence["engine_activity"]["exists"]:
