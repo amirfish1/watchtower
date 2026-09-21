@@ -776,12 +776,21 @@ def cmd_claim(args: argparse.Namespace) -> int:
             # (its next `wt add` nudge wakes it), with queue-scoped release as the
             # persistently-idle safety net.
             from . import config
-            desired = config.desired_workers(args.queue) if config.auto_drain(args.queue) else 0
+            drain_on = config.auto_drain(args.queue)
+            desired = config.desired_workers(args.queue) if drain_on else 0
             live = workers.live_worker_count(args.queue)
             if live > desired:
                 from watchtower.queue import _log
-                _log("STOP", f"{worker} — surplus at claim ({live}>{desired} desired)",
-                     queue=args.queue)
+                # With auto-drain off, desired_workers only staffs manual runs;
+                # once no run-requested ticket is left the run is done. Say so,
+                # or "(1>0 desired)" reads as contradicting the SPAWN row's
+                # "1 desired" (WATCHTOWER-35).
+                why = (
+                    f"surplus at claim ({live}>{desired} desired)" if drain_on
+                    else "manual run done — auto-drain off and no "
+                         "run-requested ticket left to claim"
+                )
+                _log("STOP", f"{worker} — {why}", queue=args.queue)
                 if args.json:
                     print(json.dumps({"stop": True}))
                 else:

@@ -1713,6 +1713,20 @@ def test_claim_empty_queue_drain_off_stays_warm(wt, capsys):
     assert json.loads(capsys.readouterr().out.strip()) == {"stop": True}
 
 
+def test_claim_drain_off_stop_log_names_manual_run(wt, capsys):
+    """WATCHTOWER-35: on a drain-off queue the STOP row must say the manual
+    run is done, not "surplus (1>0 desired)" -- the SPAWN row for that same
+    worker said "1 desired", so the bare count read as a contradiction."""
+    cli = _reloaded_cli(wt)
+    wt.config.set_auto_drain("Q", False)
+    _live_worker(wt, "Q")
+    cli.cmd_claim(_claim_ns("Q", "q-live-0", json_out=True))
+    log = wt.q._resolve_activity_log_path().read_text()
+    stop = [ln for ln in log.splitlines() if "STOP" in ln]
+    assert stop and "manual run done" in stop[-1]
+    assert "surplus" not in stop[-1]
+
+
 # ====================================================================== FIFO push
 def test_notify_live_worker_delivers(wt):
     rec = _live_worker(wt, "Q")
