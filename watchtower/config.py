@@ -79,6 +79,7 @@ MODEL_EFFORTS = {
         ("gpt-5.4", STANDARD_EFFORTS),
     ),
     "claude": (
+        ("claude-opus-5-5", VALID_EFFORTS),
         ("claude-opus-5", VALID_EFFORTS),
         ("claude-opus-4-8", VALID_EFFORTS),
         ("claude-sonnet-5", VALID_EFFORTS),
@@ -126,6 +127,7 @@ MODEL_EFFORTS = {
 # WatchTower identifier before being stored or passed to a worker.
 MODEL_ALIASES: Dict[str, Dict[str, str]] = {
     "claude": {
+        "opus-5-5": "claude-opus-5-5",
         "opus-5": "claude-opus-5",
     },
     # CCC's antigravity model picker stores its display label as the "id"
@@ -949,6 +951,7 @@ MODEL_FLOOR_TIERS = (
     "kimi-code/kimi-for-coding-highspeed",
     "claude-opus-4-8",
     "claude-opus-5",
+    "claude-opus-5-5",
 )
 
 
