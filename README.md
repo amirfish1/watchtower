@@ -202,7 +202,8 @@ wt set -q MYAPP --engine codex     # OpenAI Codex (one-shot exec)
 wt set -q MYAPP --engine kimi      # Kimi Code (one-shot prompt)
 ```
 
-The engine is stored in `~/.watchtower/queue-config.json` and picked up by the
+The engine is stored in the persistent `queue-config.json` (see
+[Where the queue lives](#where-the-queue-lives)) and picked up by the
 reconciler on the next spawn. Changing a queue's engine or model gracefully
 retires live workers that no longer match: they finish their current ticket,
 then stop before their next claim, allowing the reconciler to replace them with
@@ -549,21 +550,37 @@ Idle agent sessions lose their prompt cache at the 60-minute cliff, forcing an e
 
 ## Where the queue lives
 
-WatchTower resolves its store *base path* in this order:
+Queues and their settings live outside both applications' installation and
+settings directories, in **`~/.local/share/watchtower/`** by default:
 
-1. `$WATCHTOWER_STORE`: explicit override (used by tests/CI).
-2. The existing CCC store at `~/.claude/command-center/ux-fixes-queue.json`
-   **if it (or its migrated `.db`) already exists** on this machine, so
-   WatchTower drains real work today without migration.
-3. `~/.watchtower/queues.json`: WatchTower's own default, used whenever no CCC
-   store is present. A fresh install with no CCC on the machine always lands
-   here.
+- `queues.db`: tickets, bodies, status, resolution, history, and counters.
+- `queue-config.json`: queue definitions (including empty queues), repository
+  mappings, GitHub backends, worker settings, and drain preferences.
 
-The authoritative store is that path with a `.db` suffix (SQLite, stdlib
-`sqlite3`) once it exists. Legacy JSON stores are imported by the first
-mutation or `wt migrate-store`; JSON remains the interchange format via
-`wt export-json`. See
-`docs/superpowers/specs/2026-08-20-sqlite-store-design.md`.
+Removing CCC, WatchTower, `~/.claude/command-center`, or `~/.watchtower` leaves
+this data intact. Reinstalling automatically reuses it. `wt uninstall` also
+migrates any legacy data first and prints the retained paths.
+
+Set `WATCHTOWER_DATA_DIR` to choose another persistent directory. Otherwise,
+`XDG_DATA_HOME/watchtower` is used when `XDG_DATA_HOME` is an absolute path,
+falling back to `~/.local/share/watchtower`. Keep the same setting on reinstall.
+Explicit `WATCHTOWER_STORE` and `WATCHTOWER_CONFIG_FILE` paths still override
+these defaults; those custom paths must be retained separately.
+
+On first access, existing data is imported automatically: the former CCC
+store (`~/.claude/command-center/ux-fixes-queue.db` or `.json`) takes precedence
+over `~/.watchtower/queues.db` or `.json`, matching previous behavior. Original
+files remain untouched. SQLite migration includes committed WAL data; corrupt
+sources fail migration instead of becoming empty queues. Once the persistent
+store exists, stale legacy files never replace it. Queue settings migrate from
+`~/.watchtower/queue-config.json` independently.
+
+Restart CCC and any running WatchTower daemon together when upgrading to this
+storage layout: older processes still use the legacy paths. To migrate now and
+see the active paths, run `wt migrate-store`. JSON remains the interchange
+format via `wt export-json -o tickets.json`. Back up the persistent directory
+to protect against disk loss or deliberate deletion of that directory; this
+is local persistence, not cloud synchronization.
 
 Tracked workers live in `~/.watchtower/workers.json`; the watcher daemon's
 pidfile is `~/.watchtower/daemon.pid`, and the background dashboard server's is

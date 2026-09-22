@@ -24,7 +24,8 @@ by ``queue._notify_ticket_event``, the same helper that pushes a ticket's own
 ``notify_events`` is the filter on that second (submitter) half: which events
 a filer hears about by default. See :data:`DEFAULT_NOTIFY_EVENTS`.
 
-Stored as ``~/.watchtower/queue-config.json`` = ``{queue: {auto_drain: bool}}``.
+Stored as ``queue-config.json`` in the persistent data directory, with
+``~/.watchtower/queue-config.json`` imported automatically on first access.
 """
 
 from __future__ import annotations
@@ -154,9 +155,10 @@ MODEL_ALIASES: Dict[str, Dict[str, str]] = {
 # names (``sonnet``) are already accepted by the CLI and must NOT be rewritten.
 _CLAUDE_VERSIONED_ALIAS = re.compile(r"^(sonnet|opus|haiku|fable)-\d", re.IGNORECASE)
 
+_LEGACY_CONFIG_FILE = Path.home() / ".watchtower" / "queue-config.json"
 CONFIG_FILE = Path(
     os.environ.get("WATCHTOWER_CONFIG_FILE")
-    or (Path.home() / ".watchtower" / "queue-config.json")
+    or _LEGACY_CONFIG_FILE
 )
 
 # CCC (Claude Command Center) keeps its own per-engine default model at this
@@ -222,9 +224,18 @@ def policy_fallback_model(eng: str) -> str:
     return ""
 
 
+def config_path() -> Path:
+    """Authoritative settings path, also used by CCC's direct file reader."""
+    if CONFIG_FILE != _LEGACY_CONFIG_FILE or os.environ.get("WATCHTOWER_CONFIG_FILE"):
+        return CONFIG_FILE.expanduser()
+    from . import storage
+    return storage.migrate_config(_LEGACY_CONFIG_FILE)
+
+
 def _load() -> Dict[str, Any]:
+    path = config_path()  # Migration errors must not become empty settings.
     try:
-        with open(CONFIG_FILE, "r") as f:
+        with open(path, "r") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
@@ -232,11 +243,12 @@ def _load() -> Dict[str, Any]:
 
 
 def _save(data: Dict[str, Any]) -> None:
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = str(CONFIG_FILE) + ".tmp"
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(path) + ".tmp"
     with open(tmp, "w") as f:
         json.dump(data, f, indent=2)
-    os.replace(tmp, CONFIG_FILE)
+    os.replace(tmp, path)
 
 
 def _queue_entry(queue: str) -> Dict[str, Any]:
@@ -1196,7 +1208,10 @@ def migrate_github_auto_drain() -> list:
     guarded by :data:`GH_DRAIN_MIGRATION_MARKER` so it cannot fire twice and
     undo a user who has since turned drain back on.
     """
-    if GH_DRAIN_MIGRATION_MARKER.exists():
+    marker = GH_DRAIN_MIGRATION_MARKER
+    if marker == _LEGACY_CONFIG_FILE.parent / "gh-drain-migration.done":
+        marker = config_path().parent / marker.name
+    if marker.exists():
         return []
     data = _load()
     switched = []
@@ -1211,8 +1226,8 @@ def migrate_github_auto_drain() -> list:
     if switched:
         _save(data)
     try:
-        GH_DRAIN_MIGRATION_MARKER.parent.mkdir(parents=True, exist_ok=True)
-        GH_DRAIN_MIGRATION_MARKER.write_text(
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
             json.dumps({
                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 "queues": switched,

@@ -2799,6 +2799,8 @@ def cmd_migrate_store(args: argparse.Namespace) -> int:
 
     try:
         result = q.migrate_store()
+        from . import config
+        settings = config.config_path()
     except Exception as e:  # corrupt JSON source — refuse to shadow it
         print(f"migrate-store: refusing to migrate: {e}", file=sys.stderr)
         return 1
@@ -2807,6 +2809,7 @@ def cmd_migrate_store(args: argparse.Namespace) -> int:
         print(f"migrated {n} item(s) into {result['db']}")
     else:
         print(f"store is already SQLite ({n} item(s)) at {result['db']}")
+    print(f"queue settings: {settings}")
     return 0
 
 
@@ -3855,6 +3858,9 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
     """Remove the LaunchAgent so WT no longer starts on login."""
+    # Preserve legacy installations before removing their service/hooks.
+    if cmd_migrate_store(args):
+        return 1
     if _LAUNCHAGENT_PLIST.exists():
         os.system(f"launchctl unload '{_LAUNCHAGENT_PLIST}'")
         _LAUNCHAGENT_PLIST.unlink(missing_ok=True)
@@ -3864,6 +3870,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     from . import skills_sync
     for r in skills_sync.remove():
         print(skills_sync.format_result(r))
+    print("Queue data and settings retained; reinstalling reuses them automatically.")
     return 0
 
 
@@ -4387,7 +4394,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--version", action=_VersionAction)
-    sub = p.add_subparsers(dest="command", metavar="<command>", help=argparse.SUPPRESS)
+    sub = p.add_subparsers(prog=p.prog, dest="command", metavar="<command>", help=argparse.SUPPRESS)
 
     s = sub.add_parser("status")
     s.add_argument("-q", "--queue", default=None)

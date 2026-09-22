@@ -17,9 +17,13 @@ Storage: a single SQLite file (stdlib ``sqlite3`` — still no pip deps).
 Resolution order for the store's *base* path (kept from the JSON era):
 
   1. ``$WATCHTOWER_STORE`` (explicit override — used by tests and CI).
-  2. The existing CCC store at ``~/.claude/command-center/ux-fixes-queue.json``
-     if it (or its migrated ``.db``) already exists on this machine.
-  3. ``~/.watchtower/queues.json`` (WatchTower's own default).
+  2. ``$WATCHTOWER_DATA_DIR/queues.json``, or
+     ``$XDG_DATA_HOME/watchtower/queues.json`` (default:
+     ``~/.local/share/watchtower/queues.json``).
+
+Existing CCC and ~/.watchtower stores are imported automatically on first
+access, keeping the original files. Queue data survives removal of either
+application and its settings directory.
 
 The authoritative file is that path with a ``.db`` suffix once it exists;
 until then the legacy JSON is read directly, and the first locked save (or
@@ -218,11 +222,45 @@ def _resolve_store_path() -> Path:
     env = os.environ.get("WATCHTOWER_STORE")
     if env:
         return Path(env).expanduser()
-    # The .db check keeps resolution stable if someone deletes the frozen
-    # legacy JSON after its store has migrated to SQLite.
-    if _CCC_LEGACY_STORE.exists() or _CCC_LEGACY_STORE.with_suffix(".db").exists():
-        return _CCC_LEGACY_STORE
-    return _WT_DEFAULT_STORE
+    from . import storage
+    base = storage.data_dir() / "queues.json"
+    db = base.with_suffix(".db")
+    if db.exists() or base.exists():
+        return base
+    with storage.migration_lock(base.parent):
+        if not db.exists():
+            # Match the previous resolver's precedence. The unused legacy
+            # store is left intact, as are the files we import.
+            source = next((p for p in (_CCC_LEGACY_STORE, _WT_DEFAULT_STORE)
+                           if p.exists() or p.with_suffix(".db").exists()), None)
+            if source == base:
+                return base
+            if source is not None:
+                with storage.file_lock(source.with_suffix(".lock")):
+                    source_db = source.with_suffix(".db")
+                    if source_db.exists():
+                        # SQLite backup includes committed WAL pages. A raw
+                        # copy of the main file can silently lose tickets.
+                        with storage.atomic_destination(db) as temporary:
+                            original = sqlite3.connect(source_db.as_uri() + "?mode=ro", uri=True)
+                            copied = sqlite3.connect(temporary)
+                            try:
+                                original.backup(copied)
+                                if copied.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                                    raise ValueError(f"invalid queue database: {source_db}")
+                            finally:
+                                copied.close()
+                                original.close()
+                            snapshot = _read_db(temporary, strict=True)
+                            _normalize_items(snapshot["items"])
+                    else:
+                        data = json.loads(source.read_text())
+                        if not isinstance(data, dict) or not isinstance(data.get("items", []), list):
+                            raise ValueError(f"invalid queue store: {source}")
+                        _normalize_items(data.get("items", []))
+                        with storage.atomic_destination(db) as temporary:
+                            _create_db(temporary, data)
+    return base
 
 
 def _db_path() -> Path:

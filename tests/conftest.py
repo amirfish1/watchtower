@@ -143,6 +143,7 @@ _ENV_FILES = {
     "WATCHTOWER_DASHBOARD_PID": "dashboard.pid",
 }
 _ENV_DIRS = {
+    "WATCHTOWER_DATA_DIR": "persistent-data",
     "WATCHTOWER_STOP_SIGNALS_DIR": "stop-signals",
     "CLAUDE_CONFIG_DIR": "claude-home",
     "WATCHTOWER_GH_CLAIM_LOCKS_DIR": "gh-claim-locks",
