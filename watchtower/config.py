@@ -69,6 +69,7 @@ DEFAULT_NOTIFY_EVENTS = ("closed", "needs_input", "awaits_decision")
 # fleet adopts a new model.
 MODEL_EFFORTS = {
     "codex": (
+        ("gpt-6-astra", VALID_EFFORTS),
         ("gpt-5.6", VALID_EFFORTS),
         ("gpt-5.6-sol", VALID_EFFORTS),
         ("gpt-5.6-terra", VALID_EFFORTS),
