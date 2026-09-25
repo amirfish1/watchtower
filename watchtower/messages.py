@@ -1708,11 +1708,17 @@ def outbox_add(
     now: Optional[float] = None,
     engine: str = "",
     notify: bool = False,
+    ticket_ref: str = "",
+    ticket_session: str = "",
 ) -> Dict[str, Any]:
     """Append a pending message to the durable outbox. Locked + atomic.
 
     ``notify`` persists the event-notice delivery class so ``drain_outbox``
-    retries it over the live-only chain instead of resuming the target."""
+    retries it over the live-only chain instead of resuming the target.
+
+    ``ticket_ref`` binds the message to a ticket (and ``ticket_session`` to
+    the claim session it was addressed to): ``drain_outbox`` cancels it once
+    that ticket closes or changes session instead of retrying it (WT-1)."""
     now = time.time() if now is None else float(now)
     msg = {
         "id": f"msg-{_uuid.uuid4().hex[:12]}",
@@ -1731,6 +1737,9 @@ def outbox_add(
         msg["engine"] = str(engine)
     if notify:
         msg["notify"] = True
+    if ticket_ref:
+        msg["ticket"] = str(ticket_ref)
+        msg["ticket_session"] = str(ticket_session or "")
     with queue_mod._FileLock(_outbox_lock()):
         data = _load_outbox()
         data["messages"].append(msg)
@@ -1796,14 +1805,50 @@ def outbox_remove(message_id: str) -> bool:
     return True
 
 
+def _ticket_stale_reason(m: Dict[str, Any]) -> str:
+    """Why a ticket-bound outbox message must not be delivered, or "".
+
+    Callers bind only messages sent while the ticket is ``in_progress``,
+    addressed to the session that held it then. Once the ticket closes, or
+    its claim is released or moves to another session, delivering it is at
+    best noise and at worst tells a session to work a ticket it no longer
+    owns -- and every retry re-injects it (WT-1; the 09-15 CCC inject
+    circuit-breaker trips).
+    A store read failure answers "": delivering as before beats dropping a
+    human's answer on a transient error."""
+    ref = str(m.get("ticket") or "")
+    if not ref:
+        return ""
+    try:
+        item = queue_mod.get(ref)
+    except Exception:  # noqa: BLE001 - best-effort guard, never block delivery
+        return ""
+    if item is None:
+        return ""
+    status = str(item.get("status") or "")
+    if status == "closed":
+        return f"ticket {ref} closed"
+    if status != "in_progress":
+        # Released or reopened: the claim is gone even though reopen keeps
+        # claimed_session_id as a `wt discuss` handle, so compare status too.
+        return f"ticket {ref} released (now {status or 'unknown'})"
+    bound = str(m.get("ticket_session") or "")
+    current = str(item.get("claimed_session_id") or "")
+    if bound and current != bound:
+        return (f"ticket {ref} changed session "
+                f"({bound[:8]} -> {current[:8] or 'unclaimed'})")
+    return ""
+
+
 def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
     """One daemon tick over the outbox: retry due pending messages.
 
     Delivery attempts run OUTSIDE the file lock (a delegate POST can take
     seconds), then results are folded back in under the lock. Backoff is
     30 * 2^attempts capped at 600s; after ``MAX_ATTEMPTS`` or TTL expiry a
-    message goes ``dead`` and is logged as DEADMSG. Returns id lists per
-    outcome."""
+    message goes ``dead`` and is logged as DEADMSG. A ticket-bound message
+    whose ticket has closed or changed session goes ``cancelled`` without a
+    delivery attempt (CANCELMSG). Returns id lists per outcome."""
     now = time.time() if now is None else float(now)
     with queue_mod._FileLock(_outbox_lock()):
         data = _load_outbox()
@@ -1821,11 +1866,18 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             and str(m.get("id")) not in expired_ids
             and _parse_iso(m.get("next_attempt_at")) <= now
         ]
-    result: Dict[str, List[str]] = {"delivered": [], "retried": [], "dead": []}
+    result: Dict[str, List[str]] = {
+        "delivered": [], "retried": [], "dead": [], "cancelled": [],
+    }
     if not due and not expired_ids:
         return result
     outcomes: Dict[str, Dict[str, Any]] = {}
+    stale: Dict[str, str] = {}
     for m in due:
+        reason = _ticket_stale_reason(m)
+        if reason:
+            stale[str(m.get("id"))] = reason
+            continue
         try:
             # include_recent=False: the daemon tick must never enumerate the
             # transcript archive; outbox targets are already resolved sids
@@ -1854,6 +1906,15 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
                 queue_mod._log(
                     "DEADMSG",
                     f"{m.get('id','?')} to {m.get('to','?')}: expired",
+                )
+                continue
+            if msg_id in stale and m.get("status") == "pending":
+                m["status"] = "cancelled"
+                m["last_error"] = stale[msg_id]
+                result["cancelled"].append(msg_id)
+                queue_mod._log(
+                    "CANCELMSG",
+                    f"{m.get('id','?')} to {m.get('to','?')}: {stale[msg_id]}",
                 )
                 continue
             res = outcomes.get(str(m.get("id")))
@@ -1900,9 +1961,13 @@ def send(
     prefer_uds: bool = False,
     notify: bool = False,
     delegate_timeout_s: Optional[float] = None,
+    ticket_ref: str = "",
+    ticket_session: str = "",
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
+    ``ticket_ref``/``ticket_session`` ride along onto the parked row so the
+    daemon cancels it once the ticket closes or changes session.
 
     ``notify=True`` marks this as an event notice (``_deliver_notify``): live
     transports only, never a headless resume. The flag rides along into the
@@ -1954,6 +2019,7 @@ def send(
         to, text, mode=mode,
         error=str(result.get("error") or ""), delay_s=delay, ttl_s=ttl_s,
         engine=engine, notify=notify,
+        ticket_ref=ticket_ref, ticket_session=ticket_session,
     )
     return {
         "ok": False,
@@ -2060,6 +2126,8 @@ def deliver_message(
     timeout_ms: int = 30000,
     engine: str = "",
     delegate_timeout_s: Optional[float] = None,
+    ticket_ref: str = "",
+    ticket_session: str = "",
 ) -> Dict[str, Any]:
     """One delivery entry point for every WT caller (CCC-1000 Phase 3).
 
@@ -2087,6 +2155,10 @@ def deliver_message(
     ``hold`` parks it in the outbox for the daemon to retry (optionally with
     ``expire`` seconds of TTL), ``drop`` discards it, ``reject`` fails fast so
     the caller can react rather than waiting on a timeout it cannot see.
+
+    ``ticket_ref`` (with the ``ticket_session`` it is addressed to) marks a
+    held message as about that ticket, so the outbox cancels it rather than
+    retrying once the ticket closes or changes session (WT-1).
     """
     verb = str(verb or "engine_default").strip().lower()
     if verb not in DELIVERY_VERBS:
@@ -2104,6 +2176,9 @@ def deliver_message(
     send_kwargs: Dict[str, Any] = {}
     if delegate_timeout_s is not None:
         send_kwargs["delegate_timeout_s"] = delegate_timeout_s
+    if ticket_ref:
+        send_kwargs["ticket_ref"] = ticket_ref
+        send_kwargs["ticket_session"] = ticket_session
     result = send(
         target,
         text,

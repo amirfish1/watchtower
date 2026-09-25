@@ -1517,6 +1517,9 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
     queue_on_fail = not (
         delivery_engine == "kimi" and not messages._delegate_base()
     )
+    # Bind a held answer to this claim: the outbox cancels it once the ticket
+    # closes or changes session instead of retrying it (WT-1).
+    bound = item.get("status") == "in_progress"
     try:
         sent = messages.deliver_message(
             str(target),
@@ -1524,6 +1527,8 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
             verb="steer",
             engine=delivery_engine,
             on_busy="hold" if queue_on_fail else "reject",
+            ticket_ref=str(item.get("ref") or "") if bound else "",
+            ticket_session=str(sid) if bound else "",
         )
     except Exception as e:  # never lose the answer to a delivery-layer crash
         sent = {"ok": False, "error": str(e)}
@@ -1758,7 +1763,11 @@ def cmd_comment(args: argparse.Namespace) -> int:
             f"{item['ref']}:\n\n{args.text}"
         )
         try:
-            sent = messages.deliver_message(str(target), prompt, verb="steer")
+            sent = messages.deliver_message(
+                str(target), prompt, verb="steer",
+                ticket_ref=str(item.get("ref") or ""),
+                ticket_session=str(item.get("claimed_session_id") or ""),
+            )
         except Exception as e:  # durable ticket comment already succeeded
             delivery = f" — live injection failed ({e})"
         else:
