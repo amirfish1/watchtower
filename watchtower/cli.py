@@ -1233,7 +1233,7 @@ def cmd_reopen(args: argparse.Namespace) -> int:
     `wt release` it also applies to closed tickets; unlike `wt ready` it does
     not mark the ticket run_requested or dispatch its queue.
 
-    ``--resume TEXT`` is the re-entry re-bind (SONIA-CHAT-19, same-topic
+    ``--resume TEXT`` is the re-entry re-bind (CLIENT-CHAT-19, same-topic
     routing plan section 3a): instead of the plain reopen-to-open-pool path,
     atomically re-bind the ticket to its OWN preserved ``claimed_session_id``
     (queue.reopen_and_claim) and deliver TEXT to that session through the
@@ -1575,7 +1575,7 @@ def cmd_answer(args: argparse.Namespace) -> int:
     there; a genuinely unresolvable target still falls back to the headless
     resume fork so the answer is never silently dropped.
 
-    The delivered prompt branches on ``block_kind`` (SONIA-CHAT-17, same-topic
+    The delivered prompt branches on ``block_kind`` (CLIENT-CHAT-17, same-topic
     routing plan section 4): a ticket parked ``awaiting-client`` is a live
     multi-turn conversation topic, not a one-shot blocked question, so
     "answered -> close" is wrong for it. ``--tid`` marks this specific answer
@@ -1864,7 +1864,7 @@ def cmd_interrupt(args: argparse.Namespace) -> int:
     the worker currently claiming it — or a worker id directly. Writes claude's
     stream-json ``interrupt`` control request to the worker's stdin FIFO: the
     in-flight tool aborts and the turn ends, but the session (and its warm
-    prompt cache) survives for the next instruction (SONIA-CHAT-5).
+    prompt cache) survives for the next instruction (CLIENT-CHAT-5).
     """
     target = str(args.target or "").strip()
     worker_id = target
@@ -4656,7 +4656,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "normally refused because it erases the open question; "
                         "prefer `wt answer` to resolve a block")
     s.add_argument("--resume", default=None, metavar="TEXT",
-                   help="re-entry re-bind (SONIA-CHAT-19): atomically reopen "
+                   help="re-entry re-bind (CLIENT-CHAT-19): atomically reopen "
                         "AND claim under the ticket's own preserved session, "
                         "then deliver TEXT to it via the same liveness-aware "
                         "path `wt answer` uses -- steer if live, headless "

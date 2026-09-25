@@ -2358,7 +2358,7 @@ def reopen_and_claim(
 ) -> Optional[Dict[str, Any]]:
     """Reopen a closed/blocked ticket and claim it under ``session_id`` in one
     lock acquisition -- the re-entry re-bind primitive for same-topic routing
-    (SONIA-CHAT-19). ``session_id``/``session_uuid`` should be the ticket's
+    (CLIENT-CHAT-19). ``session_id``/``session_uuid`` should be the ticket's
     OWN preserved ``claimed_session_id`` (reopen preserves it; see ``reopen``'s
     docstring) so the transition re-binds the ticket to the exact session
     that last worked it, not a fresh claim.

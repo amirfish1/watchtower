@@ -1,4 +1,4 @@
-"""SONIA-CHAT-14: `wt block --kind awaiting-client` and `wt block --commit`.
+"""CLIENT-CHAT-14: `wt block --kind awaiting-client` and `wt block --commit`.
 
 Context: a WhatsApp client-intake worker needs to "park" a ticket between
 conversation turns instead of closing it, so `wt answer` can later resume the

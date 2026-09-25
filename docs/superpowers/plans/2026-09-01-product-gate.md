@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Repos: Tasks 1–7 in `/Users/amirfish/Apps/watchtower`; Task 8 in `/Users/amirfish/Apps/claude-command-center`. Both shared clones on `main` — never branch.
+- Repos: Tasks 1–7 in `~/Apps/watchtower`; Task 8 in `~/Apps/claude-command-center`. Both shared clones on `main` — never branch.
 - Git: commit early and often; stage by explicit path only (never `git add -A`/`.`/`-a`); commit with `git commit --only <paths> -m "..."`.
 - v1 excludes GitHub-backed queues: never forward new fields to `github_backend`; `wt config --product-gate on` on a `backend=github` queue prints a warning.
 - The pending state is `block_kind`, NOT a new status — `VALID_STATUSES` is untouched.
@@ -1072,7 +1072,7 @@ git commit --only watchtower/dashboard.py tests/test_product_gate.py -m "feat: p
 
 ---
 
-### Task 8: CCC surfaces (repo: `/Users/amirfish/Apps/claude-command-center`)
+### Task 8: CCC surfaces (repo: `~/Apps/claude-command-center`)
 
 This task runs in the claude-command-center repo. The watchtower package is imported by CCC's `server.py` as `_wt_config` / `_wt_workers` (and queue functions via its own wrappers) — Tasks 1–7 must be committed first.
 

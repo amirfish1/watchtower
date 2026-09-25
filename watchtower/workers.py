@@ -748,7 +748,7 @@ def interrupt_worker_turn(worker_id: str) -> Dict[str, Any]:
     """Interrupt the current turn of a live claude worker, leaving it running.
 
     Writes a stream-json ``interrupt`` control request to the worker's stdin
-    FIFO (SONIA-CHAT-5: a client saying "stop" must halt the in-flight turn
+    FIFO (CLIENT-CHAT-5: a client saying "stop" must halt the in-flight turn
     WITHOUT killing the process -- the session and its warm prompt cache
     survive for the next instruction).
 
@@ -1024,7 +1024,7 @@ def _worker_released(w: Dict[str, Any]) -> bool:
 def _worker_wakeable(w: Dict[str, Any]) -> bool:
     """True if a live, blocked-only worker can be pushed a message to retry
     `wt claim` instead of needing a fresh spawn for the same budget slot
-    (SONIA-CHAT-21).
+    (CLIENT-CHAT-21).
 
     Two gates, mirroring why the worker would otherwise sit uncovered
     forever: a FIFO stdin that can actually reach it (a Codex worker that
@@ -1200,7 +1200,7 @@ _last_blocked_wake: Dict[str, float] = {}
 
 def _maybe_wake_blocked_workers(queue: str, wakeable: List[Dict[str, Any]]) -> int:
     """Wake blocked-only worker(s) that are being counted as staffed capacity
-    for `queue` (SONIA-CHAT-21), so they retry `wt claim` themselves instead
+    for `queue` (CLIENT-CHAT-21), so they retry `wt claim` themselves instead
     of the reconciler spawning a second worker into the budget slot they're
     already covering.
 
@@ -5639,7 +5639,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             if str(w.get("worker_id") or "") in blocked_ids_here
             and str(w.get("worker_id") or "") not in busy_ids_here
         ]
-        # A blocked-only worker that's still reachable (SONIA-CHAT-21) can be
+        # A blocked-only worker that's still reachable (CLIENT-CHAT-21) can be
         # woken to retry `wt claim` instead of a second worker spawning into
         # the same budget slot -- so it still counts toward `staffed` below,
         # same as before this split existed. One that can't be reached (no

@@ -140,7 +140,7 @@ def test_find_engine_ancestor_ignores_codex_app_server(wt, monkeypatch):
         "run",
         lambda *args, **kwargs: SimpleNamespace(
             stdout=(
-                "9000 /Users/amirfish/.local/bin/codex -c "
+                "9000 /Users/x/.local/bin/codex -c "
                 "model_context_window=1000000 app-server --listen stdio://\n"
             )
         ),
@@ -434,7 +434,7 @@ def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
     the queue's entire budget and starve every other claimable ticket
     alongside it (WT-129 blocking WT-131's dispatch).
 
-    Since SONIA-CHAT-21, a reachable blocked-only worker still covers the
+    Since CLIENT-CHAT-21, a reachable blocked-only worker still covers the
     budget slot (no second worker spawns for it) but now via a wake nudge on
     its FIFO rather than sitting there doing nothing -- it retries
     `wt claim` itself and picks up the other ticket."""
@@ -458,7 +458,7 @@ def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
 
 
 def test_reconcile_wakes_fifo_less_blocked_worker_falls_back_to_spawn(wt):
-    """SONIA-CHAT-21's other half: a blocked-only worker with no live FIFO
+    """CLIENT-CHAT-21's other half: a blocked-only worker with no live FIFO
     (e.g. a Codex worker that already exited between turns) can't be woken,
     so it must NOT be counted as covering the spawn budget -- a second
     worker still needs to spawn to pick up the other claimable ticket."""
@@ -2539,7 +2539,7 @@ def test_drain_goal_content(wt):
     # hand-off (WATCHTOWER-11: a recycle must update learnings before exit).
     assert goal.count(runbook) == 3
     # Push policy must not override queue-specific ticket instructions such as
-    # CHUCK's "commit and push main" workflow.
+    # a client queue's "commit and push main" workflow.
     assert "Do not push unless explicitly asked" not in goal
     assert "claimed ticket's worker instructions" in goal
     assert "git push origin HEAD" in goal
