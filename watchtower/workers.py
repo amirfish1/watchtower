@@ -2530,6 +2530,69 @@ def sweep_orphan_stop_signals() -> List[str]:
     return removed
 
 
+def _pid_argv(pid: int) -> str:
+    """argv of a live pid via ps, '' on any failure."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _worker_pid_identity(w: Dict[str, Any], pid: int) -> str:
+    """Is ``pid`` still the process this worker record was written for?
+
+    Returns ``"match"``, ``"mismatch"`` (the pid now belongs to some other
+    process), or ``"unknown"`` (ps could not answer -- try again later).
+    Records outlive their process (rebound rows are never pruned) and Linux
+    hosts wrap pid_max within days, so a bare pid is not an identity. The
+    recorded start token is authoritative; rows without one fall back to
+    checking that argv still names the worker's engine."""
+    recorded = str(w.get("pid_started") or "")
+    if recorded:
+        current = _pid_start_token(pid)
+        if not current:
+            return "unknown"
+        return "match" if current == recorded else "mismatch"
+    argv = _pid_argv(pid)
+    if not argv:
+        return "unknown"
+    engine_bin = _ENGINE_BIN.get(str(w.get("engine") or "").lower(), "")
+    head = [Path(tok).name.lower() for tok in argv.split()[:2]]
+    return "match" if engine_bin and engine_bin in head else "mismatch"
+
+
+def _signal_worker(pid: int, sig: int) -> str:
+    """Signal a worker and everything it started; returns the scope used.
+
+    Spawned workers are session leaders (``start_new_session=True``), so their
+    engine's MCP servers and tool subprocesses share the worker's process
+    group. Signalling only the leader orphans those children -- exactly the
+    pile-up GH issue #1 is about. A worker that is not its own group leader
+    (a rebound continuation living in someone's terminal) gets a pid-only
+    signal: that group belongs to someone else."""
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = 0
+    if pgid == pid and pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, sig)
+            return "group"
+        except OSError:
+            pass
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+    return "pid"
+
+
 def reap_released_workers(
     ttl_s: float = RELEASED_TTL_S,
     kill_grace_s: float = _RELEASED_KILL_GRACE_S,
@@ -2551,18 +2614,24 @@ def reap_released_workers(
     stop-signal sentinel is dropped once the process is confirmed dead, so
     ``stop-signals/`` does not accumulate orphans for it.
 
+    Never signals a pid that no longer belongs to the worker (see
+    ``_worker_pid_identity``): such a row is marked ``gc_skipped`` and logged
+    once as GC_SKIPPED. Signals go to the worker's whole process group when it
+    leads one (see ``_signal_worker``).
+
     Returns one dict per action taken:
     ``{"worker_id", "queue", "pid", "action": "sigterm"|"sigkill",
-    "released_age_s"}``.
+    "scope": "group"|"pid", "released_age_s"}``.
     """
     now = time.time() if now is None else float(now)
     actions: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
     with _WorkersFileLock():
         data = _load()
         changed = False
         for row in data["workers"]:
             released_at = str(row.get("released_at") or "")
-            if not released_at:
+            if not released_at or row.get("gc_skipped"):
                 continue
             age_s = _iso_age_s(released_at, now)
             if age_s < ttl_s:
@@ -2572,51 +2641,61 @@ def reap_released_workers(
             if not _pid_alive(pid):
                 continue  # sweep_orphan_stop_signals() cleans up its sentinel
             kill_sent_at = str(row.get("gc_kill_sent_at") or "")
-            if not kill_sent_at:
-                try:
-                    os.kill(pid, 15)
-                except OSError:
-                    pass
+            if kill_sent_at and _iso_age_s(kill_sent_at, now) < kill_grace_s:
+                continue  # SIGTERM was just sent -- give it the grace window
+            identity = _worker_pid_identity(row, pid)
+            if identity == "unknown":
+                continue  # ps could not answer; never signal blind -- next tick
+            if identity == "mismatch":
+                row["gc_skipped"] = "pid_reused"
+                changed = True
+                skipped.append({
+                    "worker_id": worker_id,
+                    "queue": str(row.get("queue") or ""),
+                    "pid": pid,
+                })
+                continue
+            action = "sigkill" if kill_sent_at else "sigterm"
+            scope = _signal_worker(pid, 9 if kill_sent_at else 15)
+            if kill_sent_at:
+                _cleanup_stop_signal(worker_id)
+            else:
                 row["gc_kill_sent_at"] = datetime.now(timezone.utc).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"
                 )
                 changed = True
-                actions.append({
-                    "worker_id": worker_id,
-                    "queue": str(row.get("queue") or ""),
-                    "pid": pid,
-                    "action": "sigterm",
-                    "released_age_s": int(age_s),
-                })
-                continue
-            if _iso_age_s(kill_sent_at, now) < kill_grace_s:
-                continue  # SIGTERM was just sent -- give it the grace window
-            try:
-                os.kill(pid, 9)
-            except OSError:
-                pass
-            _cleanup_stop_signal(worker_id)
             actions.append({
                 "worker_id": worker_id,
                 "queue": str(row.get("queue") or ""),
                 "pid": pid,
-                "action": "sigkill",
+                "action": action,
+                "scope": scope,
                 "released_age_s": int(age_s),
             })
         if changed:
             _save(data)
-    if actions:
+    events = [
+        (
+            "GC_RELEASED",
+            f"worker {a['worker_id']} pid {a['pid']} {a['action']} "
+            f"{a['scope']} (released {a['released_age_s']}s ago, "
+            f"TTL {int(ttl_s)}s)",
+            a["queue"],
+        )
+        for a in actions
+    ] + [
+        (
+            "GC_SKIPPED",
+            f"worker {s['worker_id']} pid {s['pid']} not signalled: the pid "
+            "now belongs to another process (worker already gone)",
+            s["queue"],
+        )
+        for s in skipped
+    ]
+    if events:
         try:
             from .queue import _log_many
-            _log_many([
-                (
-                    "GC_RELEASED",
-                    f"worker {a['worker_id']} pid {a['pid']} {a['action']} "
-                    f"(released {a['released_age_s']}s ago, TTL {int(ttl_s)}s)",
-                    a["queue"],
-                )
-                for a in actions
-            ])
+            _log_many(events)
         except Exception:
             pass
     return actions
@@ -3728,6 +3807,14 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                     recovered.append((str(w.get("queue") or ""),
                                       str(w.get("engine") or "")))
             alive = _pid_alive(int(w.get("pid", 0)))
+            # Rebound rows are kept after their process dies (see below), so
+            # their pid can be reused by an unrelated process; don't let that
+            # stranger read as this worker. Other dead rows are pruned on this
+            # very pass, so only rebound rows pay for the extra ps call.
+            if alive and w.get("rebound_at") and w.get("pid_started"):
+                current = _pid_start_token(int(w.get("pid", 0)))
+                if current and current != w.get("pid_started"):
+                    alive = False
             row = dict(w)
             row["alive"] = alive
             out.append(row)
