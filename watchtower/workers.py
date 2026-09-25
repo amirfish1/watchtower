@@ -2868,6 +2868,15 @@ def _classify_launch_failure_log(
         retry_at = _parse_usage_retry_at(text, now=now)
     elif "http 503" in lower or "upstream connect error" in lower:
         reason = "engine api unavailable"
+    elif "model is not supported" in lower or "model_not_found" in lower:
+        # Codex on a ChatGPT login rejects API-only models ("The 'gpt-5.6'
+        # model is not supported when using Codex with a ChatGPT account").
+        # The fix is the queue's model, not the engine, so say so.
+        reason = "engine rejected the queue's model"
+    elif "subscription does not have access" in lower or "upgrade your plan" in lower:
+        # Kimi's lapsed plan: "provider.auth_error: 403 Your current
+        # subscription does not have access". Logged in fine; needs billing.
+        reason = "engine subscription has no access"
     elif "not logged in" in lower or "please run /login" in lower:
         reason = "engine authentication required"
     elif "authentication" in lower and ("failed" in lower or "error" in lower):
@@ -3079,7 +3088,8 @@ def _alert_repeated_launch_failure(rec: Dict[str, Any]) -> str:
                 f"Nothing on {queue} is moving while this lasts, and the "
                 f"reconciler will keep backing off rather than fixing it. Check "
                 f"the engine itself first (binary installed and runnable, login "
-                f"valid, quota available):\n"
+                f"valid, plan active, quota available, queue model accepted "
+                f"by this login):\n"
                 f"  last worker log: {rec.get('log') or '(none)'}\n"
                 f"  cooldown until:  {rec.get('cooldown_until_human') or '(none)'}\n\n"
                 f"Once the engine works again the streak clears on the first "
@@ -3176,17 +3186,25 @@ def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any
     )
 
 
+_SWAP_ON_SIGHT_REASONS = frozenset({
+    "engine usage limit",
+    "engine subscription has no access",
+    "engine rejected the queue's model",
+})
+
+
 def _warrants_engine_swap(rec: Optional[Dict[str, Any]]) -> bool:
     """Whether this launch failure is worth moving the queue off its engine.
 
-    A usage limit is swapped away from on sight: the provider has already said
-    it will not serve us and named no alternative, so waiting costs the queue
-    the whole cooldown. Every other failure has to prove it is not transient by
-    repeating -- a single 503 or a flaky first start must not move a queue's
-    workers off its configured engine."""
+    A usage limit (or a lapsed plan, or a model this login cannot use) is
+    swapped away from on sight: the provider has already said it will not serve
+    us and named no alternative, so waiting costs the queue the whole cooldown.
+    Every other failure has to prove it is not transient by repeating -- a
+    single 503 or a flaky first start must not move a queue's workers off its
+    configured engine."""
     if not isinstance(rec, dict):
         return False
-    if rec.get("reason") == "engine usage limit":
+    if rec.get("reason") in _SWAP_ON_SIGHT_REASONS:
         return True
     try:
         consecutive = int(rec.get("consecutive") or 0)
