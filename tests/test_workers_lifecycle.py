@@ -2259,6 +2259,156 @@ def test_reconcile_once_reaps_and_sweeps(wt):
             pass
 
 
+def _set_row(wt, worker_id, **fields):
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        for row in data["workers"]:
+            if row["worker_id"] == worker_id:
+                row.update(fields)
+        wt.workers._save(data)
+
+
+def _row(wt, worker_id):
+    return next(
+        r for r in wt.workers._load()["workers"] if r["worker_id"] == worker_id
+    )
+
+
+@pytest.mark.parametrize("kill_sent_age_s", [None, 120])
+def test_reap_released_workers_never_signals_a_reused_pid(wt, kill_sent_age_s):
+    """A record can outlive its process (rebound rows are kept forever), and
+    Linux hosts wrap pid_max within days. Once the pid belongs to someone else
+    the reaper must neither SIGTERM nor SIGKILL it -- the same pid-identity
+    rule the release path already enforces."""
+    rec, proc = _released_worker(
+        wt, "Q", released_age_s=7200, kill_sent_age_s=kill_sent_age_s,
+    )
+    _set_row(wt, rec["worker_id"], pid_started="Mon Jan  1 00:00:00 2024")
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600, kill_grace_s=30)
+        assert actions == []
+        time.sleep(0.2)
+        assert proc.poll() is None, "reaper signalled a process it did not own"
+        assert _row(wt, rec["worker_id"]).get("gc_skipped") == "pid_reused"
+        log = (wt.tmp / "activity.log").read_text()
+        assert log.count("GC_SKIPPED") == 1
+        # Marked once, never re-evaluated or re-logged on later ticks.
+        wt.workers.reap_released_workers(ttl_s=3600, kill_grace_s=30)
+        assert (wt.tmp / "activity.log").read_text().count("GC_SKIPPED") == 1
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_reap_released_workers_legacy_row_without_start_token(wt):
+    """Rows recorded before pid_started existed fall back to an argv check:
+    a pid whose command is not the worker's engine is never signalled."""
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    _set_row(wt, rec["worker_id"], pid_started="")  # argv is `sleep`, not claude
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        time.sleep(0.2)
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def _group_members(pgid):
+    out = subprocess.run(
+        ["ps", "-Ao", "pid=,pgid=,stat="], capture_output=True, text=True,
+    ).stdout
+    members = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and int(parts[1]) == pgid and not parts[2].startswith("Z"):
+            members.append(int(parts[0]))
+    return members
+
+
+def test_reap_released_workers_takes_the_whole_process_group(wt):
+    """Workers are spawned as session leaders; an engine's MCP servers and tool
+    subprocesses share its process group. Signalling only the leader orphans
+    them -- the pile-up GH issue #1 is about -- so the reaper signals the group."""
+    leader = subprocess.Popen(
+        ["sh", "-c", "sleep 60 & sleep 60 & wait"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.time() + 5
+        while len(_group_members(leader.pid)) < 3 and time.time() < deadline:
+            time.sleep(0.05)
+        assert len(_group_members(leader.pid)) >= 3
+        rec = wt.workers.record_worker(
+            leader.pid, "Q", "claude", f"q-group-{leader.pid}",
+            str(wt.tmp), str(wt.tmp / "group.log"),
+        )
+        _set_row(
+            wt, rec["worker_id"],
+            released_at=time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200)
+            ),
+        )
+        actions = wt.workers.reap_released_workers(ttl_s=3600)
+        assert [a["action"] for a in actions] == ["sigterm"]
+        assert actions[0]["scope"] == "group"
+        leader.wait(timeout=5)
+        deadline = time.time() + 5
+        while _group_members(leader.pid) and time.time() < deadline:
+            time.sleep(0.05)
+        assert _group_members(leader.pid) == []
+    finally:
+        try:
+            os.killpg(leader.pid, 9)
+        except OSError:
+            pass
+        leader.wait()
+
+
+def test_reap_released_workers_spares_a_shared_process_group(wt):
+    """A worker that is NOT its own group leader (e.g. a rebound continuation
+    living in someone's terminal) gets a pid-only signal, never killpg --
+    the group belongs to someone else. Here that group is pytest's own."""
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600)
+        assert actions[0]["scope"] == "pid"
+        assert _wait_gone(proc.pid)
+    finally:
+        try:
+            proc.terminate()
+            proc.wait()
+        except Exception:
+            pass
+
+
+def test_list_workers_dead_rebound_row_with_reused_pid_reads_dead(wt):
+    """Rebound rows survive pruning. If the pid is later reused, the row must
+    not read alive -- otherwise it counts toward staffing (and the reaper
+    would treat an unrelated process as the worker)."""
+    proc = _spawn_sleeper()
+    try:
+        rec = wt.workers.record_worker(
+            proc.pid, "Q", "claude", "q-rebound", str(wt.tmp),
+            str(wt.tmp / "rb.log"),
+        )
+        _set_row(
+            wt, rec["worker_id"],
+            rebound_at="2026-09-01T00:00:00Z",
+            pid_started="Mon Jan  1 00:00:00 2024",
+        )
+        row = next(
+            w for w in wt.workers.list_workers() if w["worker_id"] == "q-rebound"
+        )
+        assert row["alive"] is False
+        assert wt.workers.live_worker_count("Q") == 0
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
 # =========================================================== tracking & cleanup
 def test_prune_drops_dead_and_unlinks_fifo(wt):
     dead = _dead_worker(wt, "Q")
