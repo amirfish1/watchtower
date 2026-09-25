@@ -360,22 +360,130 @@ def _norm_project(value: Any) -> str:
     return s.strip("-_")
 
 
+def _git_config_path(repo_path: str) -> str:
+    """Path of the shared git config for the checkout at ``repo_path``, or ''.
+
+    Handles plain clones (``.git/`` dir) and linked worktrees (``.git`` file
+    pointing at ``<common>/worktrees/<name>``, whose ``commondir`` leads back
+    to the config that holds the remotes)."""
+    dot_git = os.path.join(repo_path, ".git")
+    try:
+        if os.path.isdir(dot_git):
+            git_dir = dot_git
+        elif os.path.isfile(dot_git):
+            with open(dot_git, encoding="utf-8") as fh:
+                line = fh.read().strip()
+            if not line.startswith("gitdir:"):
+                return ""
+            git_dir = line[len("gitdir:"):].strip()
+            if not os.path.isabs(git_dir):
+                git_dir = os.path.join(repo_path, git_dir)
+            commondir = os.path.join(git_dir, "commondir")
+            if os.path.isfile(commondir):
+                with open(commondir, encoding="utf-8") as fh:
+                    common = fh.read().strip()
+                git_dir = common if os.path.isabs(common) else os.path.join(git_dir, common)
+        else:
+            return ""
+    except OSError:
+        return ""
+    cfg = os.path.join(git_dir, "config")
+    return cfg if os.path.isfile(cfg) else ""
+
+
+def _normalize_remote_url(url: str) -> str:
+    """``git@github.com:o/r.git`` and ``https://u@github.com/o/r`` -> ``github.com/o/r``."""
+    u = str(url or "").strip()
+    if not u:
+        return ""
+    m = _re.match(r"^[a-z][a-z0-9+.-]*://(?:[^@/]*@)?([^/:]+)(?::\d+)?/(.*)$", u, _re.I)
+    if m:
+        host, path = m.group(1), m.group(2)
+    else:
+        m = _re.match(r"^(?:[^@/]+@)?([^/:]+):(.*)$", u)  # scp-like ssh
+        if not m:
+            return ""  # local path or unrecognised: no stable identity
+        host, path = m.group(1), m.group(2)
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return f"{host}/{path}".lower() if path else ""
+
+
+# config path -> (mtime_ns, identity). Keyed on mtime so a remote added or
+# changed after first lookup is picked up without restarting a long-lived daemon.
+_REPO_IDENTITY_CACHE: Dict[str, Any] = {}
+
+
+def _repo_identity(repo_path: str) -> str:
+    """Normalised ``origin`` URL of the git checkout at ``repo_path``, else ''."""
+    cfg = _git_config_path(repo_path)
+    if not cfg:
+        return ""
+    try:
+        mtime = os.stat(cfg).st_mtime_ns
+    except OSError:
+        return ""
+    hit = _REPO_IDENTITY_CACHE.get(cfg)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    ident = ""
+    try:
+        section = ""
+        with open(cfg, encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if line.startswith("["):
+                    section = line
+                    continue
+                if section.replace(" ", "") == '[remote"origin"]' and line.startswith("url"):
+                    key, _, val = line.partition("=")
+                    if key.strip() == "url":
+                        ident = _normalize_remote_url(val)
+                        break
+    except OSError:
+        return ""
+    _REPO_IDENTITY_CACHE[cfg] = (mtime, ident)
+    return ident
+
+
 def _queue_for_repo_path(repo_path: str) -> str:
     """Return the configured queue whose repo_path matches, else ''.
 
     Configured queues use short codes (CCC, BYM) that rarely equal the repo
     basename (claude-command-center, BYM+Finie). A client that files by
     repo_path alone must still land in the right queue, so we check the config
-    for an exact repo_path match before falling back to the basename."""
+    for an exact repo_path match before falling back to the basename.
+
+    A second checkout of the same repository (an app's installed copy such as
+    ``~/.ccc/claude-command-center``, a worktree, a symlinked path) is the same
+    project, so it matches too: first by resolved path, then by git ``origin``.
+    Without this, those filings fell back to the folder name and landed in an
+    auto-created queue that has no workers."""
     if not repo_path:
         return ""
     target = str(repo_path).rstrip("/")
     try:
         from . import config
+        configured = []
         for name, conf in (config.all_queues() or {}).items():
             cfg_rp = str((conf or {}).get("repo_path") or "").rstrip("/")
-            if cfg_rp and cfg_rp == target:
+            if not cfg_rp:
+                continue
+            if cfg_rp == target:
                 return _norm_project(name)
+            configured.append((name, cfg_rp))
+        if not configured:
+            return ""
+        real_target = os.path.realpath(target)
+        for name, cfg_rp in configured:
+            if os.path.realpath(cfg_rp) == real_target:
+                return _norm_project(name)
+        ident = _repo_identity(target)
+        if ident:
+            for name, cfg_rp in configured:
+                if _repo_identity(cfg_rp) == ident:
+                    return _norm_project(name)
     except Exception:
         pass
     return ""
