@@ -4410,10 +4410,10 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             reason = f"nudged {delivered} live worker(s) — immediate pickup"
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
-        # No warm worker: only release workers past the separate lifecycle
-        # floor, then reconcile. Cache coldness alone is not a release signal.
-        release_idle_workers(queue=queue)
-        result = reconcile_once()
+        # No warm worker: reconcile just this queue (WT-2) -- its pass
+        # releases workers past the separate lifecycle floor, then staffs it.
+        # Cache coldness alone is not a release signal.
+        result = reconcile_once(only_queue=queue)
         spawned = [r for r in result.get("spawned", []) if r.get("queue") == queue]
         if spawned:
             wids = ", ".join(r.get("worker_id", "?") for r in spawned)
@@ -4880,7 +4880,8 @@ def backfill_recent_session_titles(
     return out
 
 
-def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
+def reconcile_once(dry_run: bool = False,
+                   only_queue: str = "") -> Dict[str, Any]:
     """One reconciler tick.
 
     Loads the registry + live workers + queue depths and for each registered
@@ -4906,10 +4907,18 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     delta, over-spawning the queue (WT-75: 4 spawned for desired=2).
     ``spawn_workers`` persists every worker via ``record_worker()`` before the
     lock is released, so a blocked pass sees the fresh workers and skips.
+
+    ``only_queue`` is the event-driven fast path (WT-2): ``dispatch_after_
+    enqueue`` already knows which queue just gained work (a filed ticket or a
+    ▶), so it staffs just that queue -- its idle release, its depth read, its
+    spawn decision -- and skips the fleet-wide maintenance passes (zombie
+    release, reaping, requeue, backfills) and the depth reads of every other
+    queue. Those belong to the periodic tick, and running them inline is what
+    made a ▶ take ~13 s to reach SPAWN_PLAN.
     """
     from .queue import _FileLock
     with _FileLock(WORKERS_FILE.parent / "reconcile.lock"):
-        return _reconcile_once_locked(dry_run)
+        return _reconcile_once_locked(dry_run, only_queue=only_queue)
 
 
 def bump_timeboxed_model_floor_blocks(
@@ -5032,7 +5041,8 @@ def bump_timeboxed_model_floor_blocks(
     return out
 
 
-def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
+def _reconcile_once_locked(dry_run: bool = False,
+                           only_queue: str = "") -> Dict[str, Any]:
     from . import config, health
     import sys
     reconcile_id = f"reconcile-{uuid.uuid4().hex[:12]}"
@@ -5083,7 +5093,17 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
 
     # Gracefully release workers only after engine-aware activity clocks are
     # stale past the lifecycle floor. Never derive lifecycle from cache warmth.
-    if not dry_run:
+    if not dry_run and only_queue:
+        # Scoped dispatch pass: release only this queue's idle workers (so
+        # replacement bookkeeping still sees them) and leave the fleet-wide
+        # maintenance below to the periodic tick.
+        try:
+            result["released"] = release_idle_workers(
+                queue=only_queue, reconcile_id=reconcile_id
+            )
+        except Exception:
+            pass
+    elif not dry_run:
         try:
             result["released"] = release_idle_workers(
                 reconcile_id=reconcile_id
@@ -5255,7 +5275,8 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
 
     # Use health for queue depth + stuck ground-truth -- one call covers all queues.
     health_by_queue: Dict[str, Dict[str, Any]] = {
-        row["queue"]: row for row in health.all_status()
+        row["queue"]: row
+        for row in health.all_status(project=only_queue or None)
     }
 
     # Raw open depth per queue, for the "N open" figure in skip/spawn messages
@@ -5268,7 +5289,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     # list pass the reconciler already makes.
     _open_items_by_q: Dict[str, List[Dict[str, Any]]] = {}
     try:
-        for it in (_q.list_items() or []):
+        for it in (_q.list_items(project=only_queue or None) or []):
             if it.get("status") != "open":
                 continue
             qn = str(it.get("project") or "")
@@ -5547,7 +5568,10 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     except Exception:
         pass
 
-    for q_name in sorted(set(all_cfg) | set(released_by_q)):
+    loop_queues = set(all_cfg) | set(released_by_q)
+    if only_queue:
+        loop_queues &= {only_queue}
+    for q_name in sorted(loop_queues):
         auto = config.auto_drain(q_name)
         desired = config.desired_workers(q_name) if auto else 0
         manual_run = False

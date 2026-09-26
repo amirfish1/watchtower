@@ -385,6 +385,35 @@ def test_dispatch_after_enqueue_acts_on_a_requested_run_with_drain_off(wt, monke
     assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-manual"
 
 
+def test_dispatch_reconciles_only_the_dispatched_queue(wt, monkeypatch):
+    """WT-2: a ▶ knows which queue needs staffing, so it must not pay for a
+    fleet-wide pass -- other queues' depth reads and the maintenance sweeps
+    are the periodic tick's job, and running them inline delayed SPAWN_PLAN
+    by ~13 s."""
+    wt.config.set_auto_drain("OTHER", True)
+    wt.q.enqueue(project="OTHER", note="backlog elsewhere")
+    wt.config.set_auto_drain("Q", False)
+    item = wt.q.mark_runnable(wt.q.enqueue(project="Q", note="run me")["ref"])
+
+    swept = []
+    for name in ("release_zombie_workers", "reap_released_workers",
+                 "requeue_orphaned_tickets", "backfill_recent_session_titles"):
+        monkeypatch.setattr(wt.workers, name,
+                            lambda *a, _n=name, **k: swept.append(_n) or [])
+    monkeypatch.setattr(
+        wt.workers, "spawn_workers",
+        lambda queue, n=1, **kwargs: [{"worker_id": f"{queue.lower()}-w", "queue": queue}],
+    )
+
+    assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-w"
+    assert swept == []
+
+    scoped = wt.workers.reconcile_once(dry_run=True, only_queue="Q")
+    assert {s["queue"] for s in scoped["spawned"] + scoped["skipped"]} <= {"Q"}
+    full = wt.workers.reconcile_once(dry_run=True)
+    assert "OTHER" in {s["queue"] for s in full["spawned"]}
+
+
 def test_reconcile_empty_queue_skips(wt):
     wt.config.set_auto_drain("Q", True)  # config entry exists, but no tickets
     r = wt.workers.reconcile_once(dry_run=True)
