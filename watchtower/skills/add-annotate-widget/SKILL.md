@@ -18,7 +18,7 @@ picks an element, types a note, and a ticket lands in their WatchTower queue
 2. **Copy the widget** into the app's dev assets (next to the HTML):
 
    ```bash
-   cp /Users/amirfish/Apps/watchtower/contrib/annotate-widget.js <app-dir>/annotate-widget.js
+   cp ~/Apps/watchtower/contrib/annotate-widget.js <app-dir>/annotate-widget.js
    ```
 
    (If a local `watchtower/contrib/annotate-widget.js` exists in the repo, use that.)

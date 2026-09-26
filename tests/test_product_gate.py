@@ -40,7 +40,7 @@ def test_unknown_block_kind_degrades_to_input(wt_env):
 
 
 def test_block_kind_awaiting_client_is_stored_and_survives_reload(wt_env):
-    """SONIA-CHAT-14: `wt block --kind awaiting-client` parks a ticket between
+    """CLIENT-CHAT-14: `wt block --kind awaiting-client` parks a ticket between
     WhatsApp client-intake turns so `wt answer` can later resume the exact
     same worker session -- it must validate exactly like `input`/`rationale`,
     not degrade to the `input` fallback for unknown kinds."""

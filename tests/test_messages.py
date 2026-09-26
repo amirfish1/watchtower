@@ -1937,3 +1937,112 @@ def test_parked_notice_still_refuses_resume_when_the_daemon_retries(
 
     assert resumed == []
     assert out["delivered"] == [] and out["retried"] == [res["id"]]
+
+
+# ================================== WT-1: ticket-bound outbox rows go stale
+def _claimed_ticket(wt, sid, worker="wt1-deadbeef"):
+    item = wt.q.enqueue(project="WT1", note="blocked work")
+    wt.q.claim_next(worker, project="WT1", session_uuid=sid)
+    return wt.q.get(item["ref"])
+
+
+def _no_delivery(*a, **k):
+    raise AssertionError("a stale ticket message must not be delivered")
+
+
+def test_send_records_ticket_binding_on_parked_outbox_row(wt, monkeypatch):
+    monkeypatch.setattr(
+        wt.messages, "deliver", lambda *a, **k: {"ok": False, "error": "down"}
+    )
+    res = wt.messages.send(SID_B, "your answer", ticket_ref="WT1-1",
+                           ticket_session=SID_B)
+    assert res["queued"] is True
+    m = wt.messages.outbox_list()[0]
+    assert m["ticket"] == "WT1-1" and m["ticket_session"] == SID_B
+
+
+def test_drain_outbox_cancels_message_for_closed_ticket(wt, monkeypatch):
+    """WT-1: an answer parked for a ticket that has since closed used to be
+    retried up to MAX_ATTEMPTS times -- each retry re-injecting it through
+    CCC until the inject circuit breaker tripped (09-15)."""
+    item = _claimed_ticket(wt, SID_B)
+    t0 = time.time()
+    msg = wt.messages.outbox_add(SID_B, "apply the answer", delay_s=0, now=t0,
+                                 ticket_ref=item["ref"], ticket_session=SID_B)
+    wt.q.close(item["ref"], force=True)
+    monkeypatch.setattr(wt.messages, "deliver", _no_delivery)
+
+    out = wt.messages.drain_outbox(now=t0 + 1)
+
+    assert out["cancelled"] == [msg["id"]]
+    assert not out["retried"] and not out["delivered"] and not out["dead"]
+    m = wt.messages.outbox_list()[0]
+    assert m["status"] == "cancelled"
+    assert item["ref"] in m["last_error"] and "closed" in m["last_error"]
+    # Cancelled is terminal: later ticks leave it alone.
+    out = wt.messages.drain_outbox(now=t0 + 10 ** 6)
+    assert out == {"delivered": [], "retried": [], "dead": [], "cancelled": []}
+
+
+def test_drain_outbox_cancels_message_after_ticket_changes_session(wt, monkeypatch):
+    item = _claimed_ticket(wt, SID_B)
+    t0 = time.time()
+    msg = wt.messages.outbox_add(SID_B, "apply the answer", delay_s=0, now=t0,
+                                 ticket_ref=item["ref"], ticket_session=SID_B)
+    wt.q.release(item["ref"], force=True)
+    wt.q.claim_next("wt1-cafef00d", project="WT1", session_uuid=SID_C)
+    monkeypatch.setattr(wt.messages, "deliver", _no_delivery)
+
+    out = wt.messages.drain_outbox(now=t0 + 1)
+
+    assert out["cancelled"] == [msg["id"]]
+    m = wt.messages.outbox_list()[0]
+    assert m["status"] == "cancelled" and "session" in m["last_error"]
+
+
+def test_drain_outbox_cancels_message_after_ticket_released(wt, monkeypatch):
+    item = _claimed_ticket(wt, SID_B)
+    t0 = time.time()
+    msg = wt.messages.outbox_add(SID_B, "apply the answer", delay_s=0, now=t0,
+                                 ticket_ref=item["ref"], ticket_session=SID_B)
+    wt.q.release(item["ref"], force=True)
+    monkeypatch.setattr(wt.messages, "deliver", _no_delivery)
+
+    assert wt.messages.drain_outbox(now=t0 + 1)["cancelled"] == [msg["id"]]
+
+
+def test_drain_outbox_still_delivers_while_ticket_owned_by_same_session(
+    wt, monkeypatch
+):
+    item = _claimed_ticket(wt, SID_B)
+    t0 = time.time()
+    msg = wt.messages.outbox_add(SID_B, "apply the answer", delay_s=0, now=t0,
+                                 ticket_ref=item["ref"], ticket_session=SID_B)
+    monkeypatch.setattr(
+        wt.messages, "deliver",
+        lambda *a, **k: {"ok": True, "transport": "delegate"},
+    )
+
+    out = wt.messages.drain_outbox(now=t0 + 1)
+
+    assert out["delivered"] == [msg["id"]] and out["cancelled"] == []
+
+
+def test_drain_outbox_delivers_ticket_message_when_store_lookup_fails(
+    wt, monkeypatch
+):
+    """A store read error must not silently drop an answer: deliver as before."""
+    t0 = time.time()
+    msg = wt.messages.outbox_add(SID_B, "apply the answer", delay_s=0, now=t0,
+                                 ticket_ref="WT1-1", ticket_session=SID_B)
+
+    def boom(ident):
+        raise OSError("store unreadable")
+
+    monkeypatch.setattr(wt.q, "get", boom)
+    monkeypatch.setattr(
+        wt.messages, "deliver",
+        lambda *a, **k: {"ok": True, "transport": "delegate"},
+    )
+
+    assert wt.messages.drain_outbox(now=t0 + 1)["delivered"] == [msg["id"]]

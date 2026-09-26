@@ -748,7 +748,7 @@ def interrupt_worker_turn(worker_id: str) -> Dict[str, Any]:
     """Interrupt the current turn of a live claude worker, leaving it running.
 
     Writes a stream-json ``interrupt`` control request to the worker's stdin
-    FIFO (SONIA-CHAT-5: a client saying "stop" must halt the in-flight turn
+    FIFO (CLIENT-CHAT-5: a client saying "stop" must halt the in-flight turn
     WITHOUT killing the process -- the session and its warm prompt cache
     survive for the next instruction).
 
@@ -1024,7 +1024,7 @@ def _worker_released(w: Dict[str, Any]) -> bool:
 def _worker_wakeable(w: Dict[str, Any]) -> bool:
     """True if a live, blocked-only worker can be pushed a message to retry
     `wt claim` instead of needing a fresh spawn for the same budget slot
-    (SONIA-CHAT-21).
+    (CLIENT-CHAT-21).
 
     Two gates, mirroring why the worker would otherwise sit uncovered
     forever: a FIFO stdin that can actually reach it (a Codex worker that
@@ -1200,7 +1200,7 @@ _last_blocked_wake: Dict[str, float] = {}
 
 def _maybe_wake_blocked_workers(queue: str, wakeable: List[Dict[str, Any]]) -> int:
     """Wake blocked-only worker(s) that are being counted as staffed capacity
-    for `queue` (SONIA-CHAT-21), so they retry `wt claim` themselves instead
+    for `queue` (CLIENT-CHAT-21), so they retry `wt claim` themselves instead
     of the reconciler spawning a second worker into the budget slot they're
     already covering.
 
@@ -2530,6 +2530,69 @@ def sweep_orphan_stop_signals() -> List[str]:
     return removed
 
 
+def _pid_argv(pid: int) -> str:
+    """argv of a live pid via ps, '' on any failure."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _worker_pid_identity(w: Dict[str, Any], pid: int) -> str:
+    """Is ``pid`` still the process this worker record was written for?
+
+    Returns ``"match"``, ``"mismatch"`` (the pid now belongs to some other
+    process), or ``"unknown"`` (ps could not answer -- try again later).
+    Records outlive their process (rebound rows are never pruned) and Linux
+    hosts wrap pid_max within days, so a bare pid is not an identity. The
+    recorded start token is authoritative; rows without one fall back to
+    checking that argv still names the worker's engine."""
+    recorded = str(w.get("pid_started") or "")
+    if recorded:
+        current = _pid_start_token(pid)
+        if not current:
+            return "unknown"
+        return "match" if current == recorded else "mismatch"
+    argv = _pid_argv(pid)
+    if not argv:
+        return "unknown"
+    engine_bin = _ENGINE_BIN.get(str(w.get("engine") or "").lower(), "")
+    head = [Path(tok).name.lower() for tok in argv.split()[:2]]
+    return "match" if engine_bin and engine_bin in head else "mismatch"
+
+
+def _signal_worker(pid: int, sig: int) -> str:
+    """Signal a worker and everything it started; returns the scope used.
+
+    Spawned workers are session leaders (``start_new_session=True``), so their
+    engine's MCP servers and tool subprocesses share the worker's process
+    group. Signalling only the leader orphans those children -- exactly the
+    pile-up GH issue #1 is about. A worker that is not its own group leader
+    (a rebound continuation living in someone's terminal) gets a pid-only
+    signal: that group belongs to someone else."""
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = 0
+    if pgid == pid and pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, sig)
+            return "group"
+        except OSError:
+            pass
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+    return "pid"
+
+
 def reap_released_workers(
     ttl_s: float = RELEASED_TTL_S,
     kill_grace_s: float = _RELEASED_KILL_GRACE_S,
@@ -2551,18 +2614,24 @@ def reap_released_workers(
     stop-signal sentinel is dropped once the process is confirmed dead, so
     ``stop-signals/`` does not accumulate orphans for it.
 
+    Never signals a pid that no longer belongs to the worker (see
+    ``_worker_pid_identity``): such a row is marked ``gc_skipped`` and logged
+    once as GC_SKIPPED. Signals go to the worker's whole process group when it
+    leads one (see ``_signal_worker``).
+
     Returns one dict per action taken:
     ``{"worker_id", "queue", "pid", "action": "sigterm"|"sigkill",
-    "released_age_s"}``.
+    "scope": "group"|"pid", "released_age_s"}``.
     """
     now = time.time() if now is None else float(now)
     actions: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
     with _WorkersFileLock():
         data = _load()
         changed = False
         for row in data["workers"]:
             released_at = str(row.get("released_at") or "")
-            if not released_at:
+            if not released_at or row.get("gc_skipped"):
                 continue
             age_s = _iso_age_s(released_at, now)
             if age_s < ttl_s:
@@ -2572,51 +2641,61 @@ def reap_released_workers(
             if not _pid_alive(pid):
                 continue  # sweep_orphan_stop_signals() cleans up its sentinel
             kill_sent_at = str(row.get("gc_kill_sent_at") or "")
-            if not kill_sent_at:
-                try:
-                    os.kill(pid, 15)
-                except OSError:
-                    pass
+            if kill_sent_at and _iso_age_s(kill_sent_at, now) < kill_grace_s:
+                continue  # SIGTERM was just sent -- give it the grace window
+            identity = _worker_pid_identity(row, pid)
+            if identity == "unknown":
+                continue  # ps could not answer; never signal blind -- next tick
+            if identity == "mismatch":
+                row["gc_skipped"] = "pid_reused"
+                changed = True
+                skipped.append({
+                    "worker_id": worker_id,
+                    "queue": str(row.get("queue") or ""),
+                    "pid": pid,
+                })
+                continue
+            action = "sigkill" if kill_sent_at else "sigterm"
+            scope = _signal_worker(pid, 9 if kill_sent_at else 15)
+            if kill_sent_at:
+                _cleanup_stop_signal(worker_id)
+            else:
                 row["gc_kill_sent_at"] = datetime.now(timezone.utc).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"
                 )
                 changed = True
-                actions.append({
-                    "worker_id": worker_id,
-                    "queue": str(row.get("queue") or ""),
-                    "pid": pid,
-                    "action": "sigterm",
-                    "released_age_s": int(age_s),
-                })
-                continue
-            if _iso_age_s(kill_sent_at, now) < kill_grace_s:
-                continue  # SIGTERM was just sent -- give it the grace window
-            try:
-                os.kill(pid, 9)
-            except OSError:
-                pass
-            _cleanup_stop_signal(worker_id)
             actions.append({
                 "worker_id": worker_id,
                 "queue": str(row.get("queue") or ""),
                 "pid": pid,
-                "action": "sigkill",
+                "action": action,
+                "scope": scope,
                 "released_age_s": int(age_s),
             })
         if changed:
             _save(data)
-    if actions:
+    events = [
+        (
+            "GC_RELEASED",
+            f"worker {a['worker_id']} pid {a['pid']} {a['action']} "
+            f"{a['scope']} (released {a['released_age_s']}s ago, "
+            f"TTL {int(ttl_s)}s)",
+            a["queue"],
+        )
+        for a in actions
+    ] + [
+        (
+            "GC_SKIPPED",
+            f"worker {s['worker_id']} pid {s['pid']} not signalled: the pid "
+            "now belongs to another process (worker already gone)",
+            s["queue"],
+        )
+        for s in skipped
+    ]
+    if events:
         try:
             from .queue import _log_many
-            _log_many([
-                (
-                    "GC_RELEASED",
-                    f"worker {a['worker_id']} pid {a['pid']} {a['action']} "
-                    f"(released {a['released_age_s']}s ago, TTL {int(ttl_s)}s)",
-                    a["queue"],
-                )
-                for a in actions
-            ])
+            _log_many(events)
         except Exception:
             pass
     return actions
@@ -2868,6 +2947,15 @@ def _classify_launch_failure_log(
         retry_at = _parse_usage_retry_at(text, now=now)
     elif "http 503" in lower or "upstream connect error" in lower:
         reason = "engine api unavailable"
+    elif "model is not supported" in lower or "model_not_found" in lower:
+        # Codex on a ChatGPT login rejects API-only models ("The 'gpt-5.6'
+        # model is not supported when using Codex with a ChatGPT account").
+        # The fix is the queue's model, not the engine, so say so.
+        reason = "engine rejected the queue's model"
+    elif "subscription does not have access" in lower or "upgrade your plan" in lower:
+        # Kimi's lapsed plan: "provider.auth_error: 403 Your current
+        # subscription does not have access". Logged in fine; needs billing.
+        reason = "engine subscription has no access"
     elif "not logged in" in lower or "please run /login" in lower:
         reason = "engine authentication required"
     elif "authentication" in lower and ("failed" in lower or "error" in lower):
@@ -3079,7 +3167,8 @@ def _alert_repeated_launch_failure(rec: Dict[str, Any]) -> str:
                 f"Nothing on {queue} is moving while this lasts, and the "
                 f"reconciler will keep backing off rather than fixing it. Check "
                 f"the engine itself first (binary installed and runnable, login "
-                f"valid, quota available):\n"
+                f"valid, plan active, quota available, queue model accepted "
+                f"by this login):\n"
                 f"  last worker log: {rec.get('log') or '(none)'}\n"
                 f"  cooldown until:  {rec.get('cooldown_until_human') or '(none)'}\n\n"
                 f"Once the engine works again the streak clears on the first "
@@ -3176,17 +3265,25 @@ def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any
     )
 
 
+_SWAP_ON_SIGHT_REASONS = frozenset({
+    "engine usage limit",
+    "engine subscription has no access",
+    "engine rejected the queue's model",
+})
+
+
 def _warrants_engine_swap(rec: Optional[Dict[str, Any]]) -> bool:
     """Whether this launch failure is worth moving the queue off its engine.
 
-    A usage limit is swapped away from on sight: the provider has already said
-    it will not serve us and named no alternative, so waiting costs the queue
-    the whole cooldown. Every other failure has to prove it is not transient by
-    repeating -- a single 503 or a flaky first start must not move a queue's
-    workers off its configured engine."""
+    A usage limit (or a lapsed plan, or a model this login cannot use) is
+    swapped away from on sight: the provider has already said it will not serve
+    us and named no alternative, so waiting costs the queue the whole cooldown.
+    Every other failure has to prove it is not transient by repeating -- a
+    single 503 or a flaky first start must not move a queue's workers off its
+    configured engine."""
     if not isinstance(rec, dict):
         return False
-    if rec.get("reason") == "engine usage limit":
+    if rec.get("reason") in _SWAP_ON_SIGHT_REASONS:
         return True
     try:
         consecutive = int(rec.get("consecutive") or 0)
@@ -3710,6 +3807,14 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                     recovered.append((str(w.get("queue") or ""),
                                       str(w.get("engine") or "")))
             alive = _pid_alive(int(w.get("pid", 0)))
+            # Rebound rows are kept after their process dies (see below), so
+            # their pid can be reused by an unrelated process; don't let that
+            # stranger read as this worker. Other dead rows are pruned on this
+            # very pass, so only rebound rows pay for the extra ps call.
+            if alive and w.get("rebound_at") and w.get("pid_started"):
+                current = _pid_start_token(int(w.get("pid", 0)))
+                if current and current != w.get("pid_started"):
+                    alive = False
             row = dict(w)
             row["alive"] = alive
             out.append(row)
@@ -5663,7 +5768,7 @@ def _reconcile_once_locked(dry_run: bool = False,
             if str(w.get("worker_id") or "") in blocked_ids_here
             and str(w.get("worker_id") or "") not in busy_ids_here
         ]
-        # A blocked-only worker that's still reachable (SONIA-CHAT-21) can be
+        # A blocked-only worker that's still reachable (CLIENT-CHAT-21) can be
         # woken to retry `wt claim` instead of a second worker spawning into
         # the same budget slot -- so it still counts toward `staffed` below,
         # same as before this split existed. One that can't be reached (no

@@ -5,8 +5,8 @@
 """Resolving a close proof (`wt close --commit <SHA>`) across repositories.
 
 A queue has ONE ``repo_path``, but a queue's tickets do not always live in one
-repository. The VM-NEXT queue that tracked the 2026-08-10 Chuck incident is the
-motivating case: its tickets spanned ``chuck-realtor-web``, ``watchtower``, the
+repository. The VM-NEXT queue that tracked the 2026-08-10 client-site incident is the
+motivating case: its tickets spanned a client web app, ``watchtower``, the
 VM's ``Hermes-WT-client-intake``, VM system config with no repository at all,
 and the local ``wt`` store. Work was genuinely committed, but `wt close`
 rejected the SHA because it was not in the queue's configured repo, and the

@@ -69,6 +69,18 @@ def test_missing_engine_binary_sets_a_cooldown_so_the_reconciler_stops_retrying(
         ("You've hit your usage limit. Try again later.", "engine usage limit"),
         ("HTTP 503 upstream connect error", "engine api unavailable"),
         (
+            'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'
+            "\"message\":\"The 'gpt-5.6' model is not supported when using Codex with a "
+            'ChatGPT account."}}',
+            "engine rejected the queue's model",
+        ),
+        (
+            "error: failed to run prompt: provider.auth_error: 403 Your current "
+            "subscription does not have access to Kimi Code right now. Upgrade your "
+            "plan to keep coding with Kimi Code",
+            "engine subscription has no access",
+        ),
+        (
             "node:internal/modules: Cannot find module '@openai/codex-linux-x64'",
             "engine binary broken",
         ),
@@ -868,3 +880,21 @@ def test_an_unregistered_queue_is_invisible_to_the_reconciler(wt_env, fake_bin):
     wt_env.queue.mark_runnable(item["ref"])
     assert "GHOSTQ" in wt_env.config.all_queues()
     assert wt_env.config.auto_drain("GHOSTQ") is False
+
+
+@pytest.mark.parametrize(
+    "reason,swaps",
+    [
+        ("engine usage limit", True),
+        ("engine subscription has no access", True),
+        ("engine rejected the queue's model", True),
+        ("engine api unavailable", False),
+    ],
+)
+def test_provider_refusals_swap_engine_on_first_failure(wt_env, reason, swaps):
+    """A lapsed plan or a model this login cannot use will not fix itself by
+    waiting (OPS-8 codex/gpt-5.6, OPS-9 kimi 403), so like a usage limit it
+    moves an opted-in queue off the engine on the first failure; a transient
+    503 still has to repeat first."""
+    rec = {"reason": reason, "consecutive": 1}
+    assert wt_env.workers._warrants_engine_swap(rec) is swaps
