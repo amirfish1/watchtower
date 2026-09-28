@@ -149,6 +149,33 @@ def _write_codex_rollout(wt, sid):
     return p
 
 
+def test_locate_transcript_tries_hinted_engine_first(wt):
+    """S8a: `wt close` resolves a session's transcript so CCC can attribute a
+    closed ticket to it. The hint avoids a wasted lookup when the caller
+    already knows the engine (from CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID)."""
+    claude_path = _write_transcript(wt, SID_A)
+    assert wt.messages.locate_transcript(SID_A, "claude") == str(claude_path)
+
+    codex_path = _write_codex_rollout(wt, SID_D)
+    assert wt.messages.locate_transcript(SID_D, "codex") == str(codex_path)
+
+
+def test_locate_transcript_falls_back_to_the_other_engine(wt):
+    """No hint (or a wrong one) still finds the transcript by trying both
+    finders -- e.g. a coordinator closing a ticket claimed by a different
+    engine's session."""
+    codex_path = _write_codex_rollout(wt, SID_D)
+    assert wt.messages.locate_transcript(SID_D) == str(codex_path)
+    assert wt.messages.locate_transcript(SID_D, "claude") == str(codex_path)
+
+
+def test_locate_transcript_missing_session_returns_empty(wt):
+    """An ephemeral queue-worker sandbox whose transcript never lands on this
+    machine (see S8b's harvest-before-wipe) must not raise."""
+    assert wt.messages.locate_transcript("no-such-session") == ""
+    assert wt.messages.locate_transcript("") == ""
+
+
 def test_delegate_base_accepts_a_url_in_the_ccc_port_file(wt, monkeypatch):
     """CCC's native launcher records its full local base URL, not just a port."""
     ccc_dir = wt.tmp / ".claude" / "command-center"

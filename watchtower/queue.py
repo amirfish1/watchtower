@@ -2069,9 +2069,14 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
 
     Accepts a bare string (treated as the summary) or a dict with any of
     ``summary`` / ``commit`` / ``no_code`` / ``caveats`` / ``follow_ups`` /
-    ``unresolved``. List fields are
-    coerced to lists of clipped strings; empty fields are dropped. Returns None
-    when nothing meaningful was supplied (so close stays back-compatible)."""
+    ``unresolved`` / ``session_id`` / ``engine`` / ``transcript_path`` /
+    ``machine``. The last four attribute the close to the session and
+    machine that did the work, so CCC's ``ccc shipped``/``ccc brief`` can
+    resolve "session X on node Y" even for an ephemeral queue-worker
+    sandbox whose transcript never lands on the local machine. List fields
+    are coerced to lists of clipped strings; empty fields are dropped.
+    Returns None when nothing meaningful was supplied (so close stays
+    back-compatible)."""
     if resolution is None:
         return None
     if isinstance(resolution, str):
@@ -2087,6 +2092,15 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
         out["commit"] = commit
     if resolution.get("no_code") is True:
         out["no_code"] = True
+    for field, max_len in (
+        ("session_id", 128),
+        ("engine", 32),
+        ("transcript_path", 1024),
+        ("machine", 16),
+    ):
+        val = _clip(resolution.get(field, ""), max_len)
+        if val:
+            out[field] = val
     for field in ("caveats", "follow_ups", "unresolved"):
         raw = resolution.get(field)
         if raw is None:
@@ -2284,12 +2298,22 @@ def update_status(
                     # Record HOW it was fixed — the trust-layer signal. Optional:
                     # absent resolution leaves the item without the key.
                     norm = _normalize_resolution(resolution)
+                    close_machine = it.get("closed_machine") or machine_tag()
+                    close_sid = real_sid or it.get("claimed_session_id") or ""
                     if norm is not None:
+                        norm.setdefault("machine", close_machine)
+                        if close_sid:
+                            norm.setdefault("session_id", close_sid)
                         it["resolution"] = norm
                     _append_history(
                         it,
                         "close",
-                        by=_by("worker", str(session_id or it.get("closed_by") or ""), str(real_sid or "")),
+                        by=_by(
+                            "worker",
+                            str(session_id or it.get("closed_by") or ""),
+                            str(real_sid or ""),
+                            close_machine,
+                        ),
                         at=now,
                         resolution=norm,
                     )
@@ -2340,7 +2364,7 @@ def update_status(
 
 def close(
     ident: Any, session_id: str = "", resolution: Any = None, force: bool = False,
-    declined: bool = False,
+    declined: bool = False, session_uuid: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Close a ticket, optionally recording HOW it was fixed.
 
@@ -2379,7 +2403,7 @@ def close(
                     f"deliberately.)"
                 )
     item = update_status(
-        ident, "closed", session_id, resolution=resolution,
+        ident, "closed", session_id, session_uuid=session_uuid, resolution=resolution,
         expect_owner="" if force else str(session_id or ""),
     )
     if item and item.get("status") == "closed":

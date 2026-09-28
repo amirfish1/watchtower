@@ -605,6 +605,29 @@ def _find_codex_rollout(sid: str) -> Optional[Path]:
     return newest
 
 
+def locate_transcript(sid: str, engine_hint: str = "") -> str:
+    """Resolve a session id to its transcript path on this machine, if any.
+
+    Tries the engine the caller already knows (``engine_hint``) first, then
+    falls back to the other finder -- a worker's own env vars name its
+    engine, but callers resolving *someone else's* session may not know it.
+    Returns "" when the session has no transcript on this machine (e.g. an
+    ephemeral queue-worker sandbox whose transcript never lands here; see
+    S8b's harvest-before-wipe for that case)."""
+    if not sid:
+        return ""
+    finders = {"claude": _find_transcript, "codex": _find_codex_rollout}
+    order = [engine_hint] + [e for e in finders if e != engine_hint]
+    for engine in order:
+        finder = finders.get(engine)
+        if finder is None:
+            continue
+        path = finder(sid)
+        if path is not None:
+            return str(path)
+    return ""
+
+
 def _latest_session_title(path: Path) -> str:
     """Return the last explicit Claude title/agent-name in a transcript."""
     try:
