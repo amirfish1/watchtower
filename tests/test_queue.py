@@ -110,7 +110,13 @@ def test_mutations_append_canonical_history_and_stop_legacy_lists(wt):
 
     closed = wt.q.close(claimed["ref"], "worker-a", resolution={"summary": "done"})
     assert closed["history"][-1]["event"] == "close"
-    assert closed["history"][-1]["resolution"] == {"summary": "done"}
+    # Auto-filled from the earlier claim's session_uuid (S8a: close records
+    # who did the work so ccc shipped/brief can attribute it).
+    assert closed["history"][-1]["resolution"] == {
+        "summary": "done",
+        "machine": wt.q.machine_tag(),
+        "session_id": "11111111-2222-3333-4444-555555555555",
+    }
 
 
 def test_ticket_updates_appear_in_activity_log(wt):
@@ -282,13 +288,13 @@ def test_close_ownership_guard_blocks_reap_duplicate(wt):
     wt.q.update_status(item["ref"], "open", reason="worker gone")
     wt.q.claim_by_ref(item["ref"], "worker-b")
     real = wt.q.close(item["ref"], "worker-b", resolution={"summary": "real fix"})
-    assert real["resolution"] == {"summary": "real fix"}
+    assert real["resolution"] == {"summary": "real fix", "machine": wt.q.machine_tag()}
 
     # worker-a resumes from stale context and tries to close it too -> rejected.
     with pytest.raises(ValueError, match="already closed"):
         wt.q.close(item["ref"], "worker-a", resolution={"summary": "duplicate fix"})
     # The real resolution is untouched.
-    assert wt.q.get(item["ref"])["resolution"] == {"summary": "real fix"}
+    assert wt.q.get(item["ref"])["resolution"] == {"summary": "real fix", "machine": wt.q.machine_tag()}
     # A close event was NOT appended for the rejected attempt.
     assert _events(wt.q.get(item["ref"])["history"]).count("close") == 1
 
@@ -314,6 +320,53 @@ def test_close_guard_rejects_crosscloser_but_allows_force_and_unclaimed(wt):
     # dedup-close by ref (no session_id -> expect_owner empty) is unguarded.
     b = wt.q.enqueue(project="OWN", note="dupe", source="test")
     assert wt.q.close(b["ref"], resolution="duplicate of OWN-1")["status"] == "closed"
+
+
+def test_cli_close_records_session_engine_and_transcript(wt, monkeypatch, tmp_path, capsys):
+    """S8a: `wt close` records machine/session_id/engine/transcript_path in
+    the resolution so `ccc shipped`/`ccc brief` can attribute a closed
+    ticket to a session even when the transcript is on a different node."""
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.setenv(
+        "WATCHTOWER_CLAUDE_PROJECTS_DIR", str(tmp_path / "claude-projects")
+    )
+    sid = "11111111-2222-3333-4444-555555555555"
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+    transcript_dir = tmp_path / "claude-projects" / "some-project"
+    transcript_dir.mkdir(parents=True)
+    transcript_path = transcript_dir / f"{sid}.jsonl"
+    transcript_path.write_text('{"type":"user"}\n')
+
+    item = wt.q.enqueue(project="EVT", note="attribute this close", source="test")
+    assert wt.cli.main(
+        ["close", item["ref"], "--summary", "fixed it", "--no-code", "--worker", "worker-a"]
+    ) == 0
+    capsys.readouterr()
+
+    res = wt.q.get(item["ref"])["resolution"]
+    assert res["session_id"] == sid
+    assert res["engine"] == "claude"
+    assert res["transcript_path"] == str(transcript_path)
+    assert res["machine"] == wt.q.machine_tag()
+
+
+def test_cli_close_without_session_env_omits_engine_and_transcript(wt, monkeypatch, capsys):
+    """No CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID (e.g. a human closing from a
+    plain shell) must not fabricate attribution fields."""
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+
+    item = wt.q.enqueue(project="EVT", note="no session env", source="test")
+    assert wt.cli.main(
+        ["close", item["ref"], "--summary", "fixed it", "--no-code", "--worker", "worker-a"]
+    ) == 0
+    capsys.readouterr()
+
+    res = wt.q.get(item["ref"])["resolution"]
+    assert "engine" not in res
+    assert "transcript_path" not in res
+    assert "session_id" not in res
+    assert res["machine"] == wt.q.machine_tag()
 
 
 def test_cli_ready_reopens_a_closed_file_backed_ticket(wt, capsys):

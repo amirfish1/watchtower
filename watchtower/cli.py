@@ -922,8 +922,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 cmd_ready = cmd_run  # preferred alias: 'wt ready' reads as "mark this ticket ready for workers"
 
 
-def _resolution_from_args(args: argparse.Namespace) -> Optional[dict]:
+def _resolution_from_args(
+    args: argparse.Namespace, engine: str = "", transcript_path: str = "",
+) -> Optional[dict]:
     """Build a resolution dict from the close-resolution flags.
+
+    ``engine``/``transcript_path`` come from the closing process's own
+    session env vars (see ``cmd_close``) -- ``session_id``/``machine`` are
+    filled in by ``queue._normalize_resolution``'s close-time defaults, so
+    they're not threaded through here.
 
     Returns None when no flag was given (so close stays back-compatible)."""
     res = {
@@ -938,6 +945,10 @@ def _resolution_from_args(args: argparse.Namespace) -> Optional[dict]:
         res["no_code"] = True
     if not any(res.values()):
         return None
+    if engine:
+        res["engine"] = engine
+    if transcript_path:
+        res["transcript_path"] = transcript_path
     return res
 
 
@@ -1010,10 +1021,20 @@ def cmd_close(args: argparse.Namespace) -> int:
             print(error, file=sys.stderr)
             return 1
         args.commit = verified
+    from . import messages
     worker = args.worker or _default_worker_id()
-    resolution = _resolution_from_args(args)
+    codex_thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
+    claude_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if codex_thread_id:
+        session_uuid, engine = codex_thread_id, "codex"
+    elif claude_session_id:
+        session_uuid, engine = claude_session_id, "claude"
+    else:
+        session_uuid, engine = "", ""
+    transcript_path = messages.locate_transcript(session_uuid, engine) if session_uuid else ""
+    resolution = _resolution_from_args(args, engine=engine, transcript_path=transcript_path)
     try:
-        item = q.close(args.ref, worker, resolution=resolution,
+        item = q.close(args.ref, worker, resolution=resolution, session_uuid=session_uuid,
                        force=getattr(args, "force", False))
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)

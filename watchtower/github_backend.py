@@ -1238,6 +1238,17 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
     commit = _clip(resolution.get("commit", ""), 128)
     if commit:
         out["commit"] = commit
+    # session_id/engine/transcript_path/machine attribute the close to the
+    # session and node that did the work. Mirrors queue._normalize_resolution.
+    for field, max_len in (
+        ("session_id", 128),
+        ("engine", 32),
+        ("transcript_path", 1024),
+        ("machine", 16),
+    ):
+        val = _clip(resolution.get(field, ""), max_len)
+        if val:
+            out[field] = val
     for field in ("caveats", "follow_ups", "unresolved"):
         raw = resolution.get(field)
         if raw is None:
@@ -1709,6 +1720,10 @@ class GitHubIssuesBackend:
             "caveats_ack": meta.get("resolution_caveats_ack") or {},
             "follow_ups_ack": meta.get("resolution_follow_ups_ack") or {},
             "unresolved_ack": meta.get("resolution_unresolved_ack") or {},
+            "session_id": meta.get("resolution_session_id", ""),
+            "engine": meta.get("resolution_engine", ""),
+            "transcript_path": meta.get("resolution_transcript_path", ""),
+            "machine": meta.get("resolution_machine", ""),
         })
 
         item: Dict[str, Any] = {
@@ -2587,6 +2602,8 @@ class GitHubIssuesBackend:
                 "resolution_follow_ups", "resolution_unresolved",
                 "resolution_caveats_ack", "resolution_follow_ups_ack",
                 "resolution_unresolved_ack",
+                "resolution_session_id", "resolution_engine",
+                "resolution_transcript_path", "resolution_machine",
                 "needs_input", "block_question",
             ):
                 meta.pop(key, None)
@@ -2617,6 +2634,17 @@ class GitHubIssuesBackend:
                 meta["claimed_by"] = str(session_id)
                 meta["claimed_machine"] = meta["closed_machine"]
         if norm:
+            # session_id/machine default to this close's own attribution
+            # (mirrors queue.update_status) so CCC can resolve "session X on
+            # node Y" even when the caller didn't pass them explicitly.
+            # Mutated in place (not just written to ``meta``) so the enriched
+            # values also come back on ``closed["resolution"]`` below, which
+            # overwrites the self.get() round-trip with this same ``norm``.
+            if not norm.get("session_id"):
+                sid = str(session_uuid or "") or meta.get("claimed_session_id", "")
+                if sid:
+                    norm["session_id"] = sid
+            norm.setdefault("machine", meta.get("closed_machine") or machine_tag())
             meta["resolution_summary"] = norm.get("summary", "")
             # Always overwrite (possibly with ""), so a re-close without a
             # commit can't leave the previous close's SHA vouching for it.
@@ -2624,6 +2652,10 @@ class GitHubIssuesBackend:
             meta["resolution_caveats"] = norm.get("caveats", [])
             meta["resolution_follow_ups"] = norm.get("follow_ups", [])
             meta["resolution_unresolved"] = norm.get("unresolved", [])
+            meta["resolution_session_id"] = norm.get("session_id", "")
+            meta["resolution_engine"] = norm.get("engine", "")
+            meta["resolution_transcript_path"] = norm.get("transcript_path", "")
+            meta["resolution_machine"] = norm.get("machine", "")
             # A (re-)close writes a fresh resolution, so acks carry over only
             # when the caller handed them back -- same as the local backend,
             # where close replaces `resolution` wholesale.

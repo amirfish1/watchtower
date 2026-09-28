@@ -460,6 +460,30 @@ def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     assert any("fixed it" in c for c in issue["comments"])
 
 
+def test_github_backend_close_records_session_and_machine(tmp_path, monkeypatch):
+    """S8a parity: a GitHub-backed close must attribute the same way as a
+    file-backed one (machine always, session_id when a claim/close supplied
+    one) -- CCC's ccc shipped/brief must not lose attribution just because a
+    queue happens to be GitHub-backed."""
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    item = q.enqueue(project="GHI", note="attribute this", source="test")
+    sid = "11111111-2222-3333-4444-555555555555"
+    q.claim_by_ref(item["ref"], "worker-1", session_uuid=sid)
+    closed = q.close(item["ref"], "worker-1", resolution={"summary": "fixed it"})
+
+    assert closed["resolution"]["session_id"] == sid
+    assert closed["resolution"]["machine"] == q.machine_tag()
+
+    reloaded = q.get(item["ref"])
+    assert reloaded["resolution"]["session_id"] == sid
+    assert reloaded["resolution"]["machine"] == q.machine_tag()
+
+
 def test_github_backend_claim_by_ref_serializes_concurrent_claimants(tmp_path, monkeypatch):
     """Regression for a double-claim race: two workers claiming the same ref
     at the same instant (e.g. both nudged awake for a stuck queue) must not
