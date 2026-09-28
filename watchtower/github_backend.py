@@ -2517,15 +2517,35 @@ class GitHubIssuesBackend:
             })
             if session_uuid:
                 meta["claimed_session_id"] = str(session_uuid)
+            original_body = item.get("_github_body") or item.get("text", "")
             _append_history(meta, "claim", session_id=str(session_uuid or ""), worker=str(session_id))
             self._ensure_labels()
-            self._run([
-                "issue", "edit", number,
-                *self._repo_args(),
-                "--body", _body_with_metadata(body, meta),
-                "--add-assignee", self.assignee,
-                "--add-label", self.in_progress_label,
-            ])
+            try:
+                self._run([
+                    "issue", "edit", number,
+                    *self._repo_args(),
+                    "--body", _body_with_metadata(body, meta),
+                    "--add-assignee", self.assignee,
+                    "--add-label", self.in_progress_label,
+                ])
+            except GitHubBackendError as exc:
+                # `gh issue edit` is not atomic: an unassignable assignee
+                # (a typo'd github_assignee) fails the edit AFTER the label
+                # landed, leaving an unowned issue that reads in_progress to
+                # every later claim -- a requested run then STOPs its own
+                # freshly spawned worker ("no run-requested ticket left")
+                # until someone strips the label by hand (WT-2). Undo the
+                # half-applied claim so the ticket stays claimable.
+                self._run([
+                    "issue", "edit", number,
+                    *self._repo_args(),
+                    "--body", original_body,
+                    "--remove-label", self.in_progress_label,
+                ], check=False)
+                raise GitHubBackendError(
+                    f"claim of {ref} failed and was rolled back (check the "
+                    f"queue's github_assignee, currently {self.assignee!r}): {exc}"
+                ) from exc
             claimed = self.get(ref)
             if claimed:
                 claimed["claimed_by"] = str(session_id)

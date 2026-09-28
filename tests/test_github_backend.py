@@ -172,6 +172,18 @@ if args[:2] == ["issue", "view"]:
 
 if args[:2] == ["issue", "edit"]:
     issue = issue_by_number(data, args[2])
+    bad = [a for a in opts(args, "--add-assignee")
+           if a in os.environ.get("FAKE_GH_BAD_ASSIGNEES", "").split(",")]
+    if bad:
+        # Real gh applies the labels/body before failing on the assignee.
+        for label in opts(args, "--add-label"):
+            if label not in issue["labels"]:
+                issue["labels"].append(label)
+        if "--body" in args:
+            issue["body"] = opt(args, "--body")
+        save(data)
+        print(f"'{bad[0]}' not found", file=sys.stderr)
+        sys.exit(1)
     for assignee in opts(args, "--add-assignee"):
         if assignee not in issue["assignees"]:
             issue["assignees"].append(assignee)
@@ -510,6 +522,34 @@ def test_github_backend_claim_by_ref_serializes_concurrent_claimants(tmp_path, m
     assert final["claimed_by"] == winners[0]
     assert [e["event"] for e in final["history"]] == ["claim"]
     assert final["history"][0]["worker"] == winners[0]
+
+
+def test_github_backend_rolls_back_claim_when_assignee_is_rejected(tmp_path, monkeypatch):
+    """WT-2: a bad github_assignee failed `gh issue edit` after its label
+    landed, leaving the issue in_progress with no owner. The requested run's
+    freshly spawned worker then saw nothing claimable and was STOPped. The
+    failed claim must roll back so the ticket stays claimable."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="bad assignee", source="test")
+    original_body = json.loads(state.read_text())["issues"][0]["body"]
+
+    monkeypatch.setenv("FAKE_GH_BAD_ASSIGNEES", "@me")
+    with pytest.raises(Exception, match="rolled back"):
+        q.claim_next("worker-1", project="GHI")
+
+    issue = json.loads(state.read_text())["issues"][0]
+    assert not any("in-progress" in label for label in issue["labels"])
+    assert issue["body"] == original_body
+    assert q.get(item["ref"])["status"] == "open"
+
+    monkeypatch.delenv("FAKE_GH_BAD_ASSIGNEES")
+    claimed = q.claim_next("worker-1", project="GHI")
+    assert claimed["ref"] == item["ref"]
+    assert claimed["status"] == "in_progress"
 
 
 def test_claim_next_falls_through_stale_closed_candidate(tmp_path, monkeypatch):

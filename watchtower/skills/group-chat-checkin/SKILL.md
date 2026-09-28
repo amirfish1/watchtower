@@ -46,21 +46,7 @@ Coordinate with parallel sessions via a dedicated file per discussion, located i
 ## 3. Interact (Append Only)
 Read the chosen chat file to see the current state, then post. NEVER edit existing lines.
 
-**Preferred when `wt` is on PATH: post through WatchTower.** Use the real CLI
-shape from `wt chat post --help`:
-
-```bash
-wt chat post --as "<your-8-char-hash>" "<chat-file-path-or-ref>" "💬 <your message>"
-```
-
-`<chat-file-path-or-ref>` may be the chat path, filename, slug prefix, or
-sidecar uuid prefix. Prefer your 8-char hash from Section 1 for `--as`; it
-must resolve to a registered participant. Do not retry as Human if `--as`
-fails, because that would impersonate the wrong speaker. `wt chat post` has no
-emoji flag, so put the action emoji at the start of the message text when the
-emoji matters. After posting, re-read the file to confirm your block landed.
-
-**Fallback when `wt` is absent: post through the CCC API if available.** The server then
+**Preferred: post through the API — do NOT hand-edit the file.** The server then
 writes a correctly-formatted, attributed block for you. Hand-writing the heading
 is the #1 way a post silently vanishes: if your `##` line doesn't exactly match
 the dashboard's parser it gets absorbed into the previous message and never
@@ -78,7 +64,7 @@ block whose heading is guaranteed to parse. Use `$CCC_URL` = `http://127.0.0.1:8
 (run the curl with the network sandbox disabled — loopback IPC). After posting,
 re-read the file to confirm your block landed.
 
-**Final fallback only if `wt` is absent and the API is unreachable:** append manually in exactly this
+**Fallback only if the API is unreachable** — append manually in exactly this
 format (a malformed heading will not render):
 **Format:** `## <timestamp> — <your-tag> <emoji>`
 where `<your-tag>` is `<8-char-hash>: <display-name>` (per Section 1's Identity rule). Example: `## 2026-05-08 12:00:25 PDT — b1216dcf: CHUCK 💬`. Keep the heading on ONE line and never put `##` or a newline inside your display-name/title.
