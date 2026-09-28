@@ -32,6 +32,46 @@ def _events(timeline):
     return [event["event"] for event in timeline]
 
 
+def test_notify_ticket_event_forwards_submitter_through_ccc(wt, monkeypatch):
+    """MEMORY-5: a ticket's submitter that CCC has since forwarded (a manual
+    `ccc rebind-report-to` or a spawned continuation) gets the notice at its
+    successor, not at the stale sid recorded on the ticket."""
+    import watchtower.messages as messages
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
+    monkeypatch.setattr(
+        messages, "ccc_forward_target",
+        lambda sid, timeout_s=1.5: "new-sid" if sid == "old-sid" else None,
+    )
+    sent = []
+    monkeypatch.setattr(
+        messages, "send",
+        lambda target, text, **kw: sent.append(target) or {"ok": True},
+    )
+    item = {
+        "project": "MEMORY", "ref": "MEMORY-1", "number": 1,
+        "submitter": "old-sid", "pre_ack": True,
+    }
+    wt.q._notify_ticket_event(item, "closed", detail="done")
+    assert sent == ["new-sid"]
+
+
+def test_notify_ticket_event_no_forward_uses_target_unchanged(wt, monkeypatch):
+    import watchtower.messages as messages
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
+    monkeypatch.setattr(messages, "ccc_forward_target", lambda sid, timeout_s=1.5: None)
+    sent = []
+    monkeypatch.setattr(
+        messages, "send",
+        lambda target, text, **kw: sent.append(target) or {"ok": True},
+    )
+    item = {
+        "project": "MEMORY", "ref": "MEMORY-1", "number": 1,
+        "submitter": "still-here-sid", "pre_ack": True,
+    }
+    wt.q._notify_ticket_event(item, "closed", detail="done")
+    assert sent == ["still-here-sid"]
+
+
 def test_mutations_append_canonical_history_and_stop_legacy_lists(wt):
     item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
     assert _events(item["history"]) == ["filed"]

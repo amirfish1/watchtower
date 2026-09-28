@@ -86,7 +86,7 @@ import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from . import queue as queue_mod
 from . import resume_verify
@@ -1131,6 +1131,48 @@ def _post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str,
     except json.JSONDecodeError:
         data = {}
     return data if isinstance(data, dict) else {}
+
+
+def _get_json(url: str, timeout_s: float) -> Optional[Dict[str, Any]]:
+    """GET JSON, return the parsed object or None on any transport/parse
+    failure -- read-only counterpart to ``_post_json``, deliberately
+    swallowing errors itself since every caller treats a failed lookup as
+    'nothing to report', not a delivery failure."""
+    headers = {}
+    token = (os.environ.get("WATCHTOWER_DELEGATE_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read().decode("utf-8", "replace")
+        data = json.loads(body)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def ccc_forward_target(sid: str, timeout_s: float = 1.5) -> Optional[str]:
+    """Ask CCC -- the one source of truth for lineage forwards, see
+    ``ccc_server/continuation.py`` -- whether ``sid`` currently forwards
+    elsewhere: a manual ``ccc rebind-report-to`` or a spawned continuation.
+    None when no delegate is configured, ``sid`` is falsy, the lookup fails,
+    or there simply is no forward -- all of which mean "deliver to sid as
+    given", the same as a standalone WT with no CCC at all. Used at the two
+    places WT would otherwise keep addressing a session that has moved on:
+    ``_notify_ticket_event``'s submitter/subscriber targets (queue.py) and
+    ``cmd_find``'s ``filed_by`` display (cli.py)."""
+    if not sid:
+        return None
+    base = _delegate_base()
+    if not base:
+        return None
+    url = f"{base}/api/session/{quote(sid, safe='')}/forward-target"
+    data = _get_json(url, timeout_s)
+    if not data:
+        return None
+    forwarded = data.get("forwarded_to")
+    return forwarded if forwarded and forwarded != sid else None
 
 
 def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:

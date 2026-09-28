@@ -110,6 +110,32 @@ def test_find_marks_self_via_harness_session_env_without_worker_flag(
     assert out["closed_by_you"] is True
 
 
+def test_find_shows_filed_by_forward_when_ccc_reports_one(wt, capsys, monkeypatch):
+    """MEMORY-5: once CCC has recorded a forward for the submitter (a manual
+    `ccc rebind-report-to` or a spawned continuation), `wt find` should show
+    where the notice actually lands, not just the stale sid on the ticket."""
+    import watchtower.messages as messages
+    item = wt.q.enqueue(project="CCC", title="x", note="x", text="", submitter="old-sid")
+    monkeypatch.setattr(
+        messages, "ccc_forward_target",
+        lambda sid, timeout_s=1.5: "new-sid" if sid == "old-sid" else None,
+    )
+    rc = wt.cli.cmd_find(argparse.Namespace(ref=item["ref"], json=False, worker=""))
+    assert rc == 0
+    assert "filed_by: old-sid -> new-sid" in capsys.readouterr().out
+
+
+def test_find_filed_by_unchanged_when_no_forward(wt, capsys, monkeypatch):
+    import watchtower.messages as messages
+    item = wt.q.enqueue(project="CCC", title="x", note="x", text="", submitter="old-sid")
+    monkeypatch.setattr(messages, "ccc_forward_target", lambda sid, timeout_s=1.5: None)
+    rc = wt.cli.cmd_find(argparse.Namespace(ref=item["ref"], json=False, worker=""))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "filed_by: old-sid" in out
+    assert "->" not in out
+
+
 def test_find_human_output_appends_you_markers(wt, capsys, monkeypatch):
     _clear_identity_env(monkeypatch)
     item = wt.q.enqueue(project="CCC", title="x", note="x", text="")

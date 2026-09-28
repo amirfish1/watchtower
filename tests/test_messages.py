@@ -177,6 +177,13 @@ class _DelegateHandler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0) or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
         self.server.requests.append((self.path, body))
+        self._respond()
+
+    def do_GET(self):
+        self.server.requests.append((self.path, None))
+        self._respond()
+
+    def _respond(self):
         status, payload = (
             self.server.responses.pop(0)
             if self.server.responses else (200, {"ok": True})
@@ -560,6 +567,44 @@ def test_per_call_delegate_timeout_beats_the_env_override(wt, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_DELEGATE_TIMEOUT_S", "45")
     assert wt.messages._delegate_timeout_s(5.0) == 5.0
     assert wt.messages._delegate_timeout_s() == 45.0
+
+
+# ============================================================ ccc_forward_target
+# MEMORY-5: CCC (ccc_server/continuation.py) is the one source of truth for
+# "this sid now forwards to that one" -- WT only ever asks, never keeps its
+# own copy.
+
+def test_ccc_forward_target_no_delegate_is_none(wt):
+    assert wt.messages.ccc_forward_target(SID_A) is None
+
+
+def test_ccc_forward_target_empty_sid_is_none(wt, delegate, monkeypatch):
+    _srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    assert wt.messages.ccc_forward_target("") is None
+
+
+def test_ccc_forward_target_follows_ccc_forward(wt, delegate, monkeypatch):
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    srv.responses.append((200, {"ok": True, "session_id": SID_A, "forwarded_to": SID_B}))
+    assert wt.messages.ccc_forward_target(SID_A) == SID_B
+    path, _ = srv.requests[0]
+    assert path == f"/api/session/{SID_A}/forward-target"
+
+
+def test_ccc_forward_target_no_forward_is_none(wt, delegate, monkeypatch):
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    srv.responses.append((200, {"ok": True, "session_id": SID_A, "forwarded_to": None}))
+    assert wt.messages.ccc_forward_target(SID_A) is None
+
+
+def test_ccc_forward_target_transport_error_is_none(wt, delegate, monkeypatch):
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    srv.responses.append((500, {"ok": False}))
+    assert wt.messages.ccc_forward_target(SID_A) is None
 
 
 @pytest.mark.parametrize("override", [0, -1, "not-a-number", None])

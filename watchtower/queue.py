@@ -1274,8 +1274,17 @@ def _notify_ticket_event(
     if detail:
         text += f" — {_clip(detail, 200)}"
     for target in targets:
+        # MEMORY-5: a submitter/subscriber that has since been manually
+        # rebound or continued to a new session (`ccc rebind-report-to`,
+        # `ccc spawn --continue-from`) still has its old sid written down
+        # here -- ask CCC (the one source of truth for the forward map)
+        # whether it should really go to a successor instead.
         try:
-            messages.send(target, text, notify=True)
+            deliver_target = messages.ccc_forward_target(target) or target
+        except Exception:
+            deliver_target = target
+        try:
+            messages.send(deliver_target, text, notify=True)
         except Exception:
             pass  # best-effort -- a delivery hiccup never fails the transition
 

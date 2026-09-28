@@ -479,7 +479,12 @@ def cmd_find(args: argparse.Namespace) -> int:
     print(f"{item.get('ref',''):<14}[{item.get('status',''):<11}] {title}")
     filer = str(item.get("submitter") or item.get("github_author") or "")
     if filer:
-        print(f"  filed_by: {filer}")
+        from . import messages
+        try:
+            forwarded = messages.ccc_forward_target(filer)
+        except Exception:
+            forwarded = None
+        print(f"  filed_by: {filer}" + (f" -> {forwarded}" if forwarded else ""))
     if worker:
         you = " (you)" if item_with_timeline.get("claimed_by_you") else ""
         print(f"  claimed_by: {worker}{you}")
