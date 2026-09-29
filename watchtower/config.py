@@ -82,6 +82,7 @@ MODEL_EFFORTS = {
         ("claude-opus-5-5", VALID_EFFORTS),
         ("claude-opus-5", VALID_EFFORTS),
         ("claude-opus-4-8", VALID_EFFORTS),
+        ("claude-sonnet-5-5", VALID_EFFORTS),
         ("claude-sonnet-5", VALID_EFFORTS),
     ),
     # kimi has no effort flag on its CLI; pinned models accept no explicit
