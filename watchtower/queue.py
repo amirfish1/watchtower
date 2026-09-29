@@ -1331,6 +1331,7 @@ def enqueue(
     pre_ack: bool = False,
     blocked_by: Optional[List[str]] = None,
     gates: Optional[List[str]] = None,
+    accept_line: str = "",
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
 
@@ -1423,6 +1424,7 @@ def enqueue(
             "pre_ack": bool(pre_ack),
             "blocked_by": blockers,
             **({"gates": validate_gates(gates)} if gates else {}),
+            **({"accept": str(accept_line).strip()} if str(accept_line or "").strip() else {}),
             "submitter": str(submitter or ""),
             "submitter_explicit": bool(submitter_explicit),
             "claimed_by": None,
@@ -1622,7 +1624,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
-        "needs_input", "block_question", "model_floor", "blocked_by", "gates",
+        "needs_input", "block_question", "model_floor", "blocked_by", "gates", "accept",
     })
     with _FileLock(_lock_path()):
         data = _load_unlocked()
@@ -2542,8 +2544,10 @@ def update_status(
 # A gate list is ordered; kinds: ``cmd:<command>`` (WT runs it in the ticket's
 # repo at the closing commit -- the worker cannot self-report a pass),
 # ``review`` / ``review:<target>`` (the submitter, or <target>, must
-# ``wt accept`` / ``wt reject``). cmd gates run first; review fires only once
-# every cmd gate has passed.
+# ``wt accept`` / ``wt reject``), ``verify`` (an independent verifier session
+# checks the ticket's ``accept`` line -- or its text -- and files its verdict
+# with ``wt verdict``, never through the worker). cmd gates run first, then
+# verify, then review; each later stage fires only once the earlier ones pass.
 GATE_OUTPUT_TAIL = 2000
 GATE_CMD_TIMEOUT_S = 900
 
@@ -2562,9 +2566,12 @@ def validate_gates(gates: Any) -> List[str]:
             if not g[4:].strip():
                 raise ValueError("gate 'cmd:' needs a command, e.g. cmd:pytest -q")
             g = "cmd:" + g[4:].strip()
-        elif g != "review" and not (g.startswith("review:") and g[7:].strip()):
+        elif g not in ("review", "verify") and not (
+            g.startswith("review:") and g[7:].strip()
+        ):
             raise ValueError(
-                f"unknown gate {g!r}: use cmd:<command>, review or review:<target>"
+                f"unknown gate {g!r}: use cmd:<command>, verify, review or "
+                f"review:<target>"
             )
         out.append(g)
     return out
@@ -2627,13 +2634,13 @@ def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str) -> Dict[s
             "at": _now_iso(), "seconds": round(time.time() - started, 1)}
 
 
-def evaluate_gates(item: Dict[str, Any], commit: str = "") -> Tuple[List[Dict[str, Any]], str]:
+def evaluate_gates(item: Dict[str, Any], commit: str = "") -> Tuple[List[Dict[str, Any]], List[str]]:
     """Run the cmd gates in order, stopping at the first failure. Returns
-    ``(results, reviewer)``: ``reviewer`` is "" or the ``review`` target
-    (``"submitter"`` for a bare ``review``) still owed once all cmd gates
-    passed. A failed result has ``passed`` False."""
+    ``(results, stages)``: ``stages`` is the ordered list still owed once all
+    cmd gates passed (``"verify"`` then ``"review"`` / ``"review:<target>"``),
+    empty when the ticket can close outright. A failed result has ``passed``
+    False (and ``stages`` is then empty)."""
     results: List[Dict[str, Any]] = []
-    reviewer = ""
     gates = effective_gates(item)
     for g in gates:
         if g.startswith("cmd:"):
@@ -2641,16 +2648,52 @@ def evaluate_gates(item: Dict[str, Any], commit: str = "") -> Tuple[List[Dict[st
                               str(item.get("ref") or ""))
             results.append(r)
             if not r["passed"]:
-                return results, ""
+                return results, []
+    stages: List[str] = []
+    if "verify" in gates:
+        stages.append("verify")
     for g in gates:
         if g == "review" or g.startswith("review:"):
-            reviewer = g[7:].strip() if g.startswith("review:") else "submitter"
+            stages.append(g)
             break
-    return results, reviewer
+    return results, stages
 
 
-def _reviewer_target(item: Dict[str, Any], reviewer: str) -> str:
-    return str(item.get("submitter") or "") if reviewer == "submitter" else reviewer
+def gate_stage_label(stage: str) -> str:
+    """Who/what a pending stage waits on, for prose."""
+    if stage == "verify":
+        return "independent verifier"
+    return stage[7:].strip() if stage.startswith("review:") else "submitter"
+
+
+def checks_block(item: Dict[str, Any]) -> str:
+    """Plain-words "Checks after you close" block for a ticket with gates
+    (empty string when it has none). Told to the worker at claim time so it
+    does not run its own independent verifier."""
+    gates = effective_gates(item)
+    if not gates:
+        return ""
+    lines = ["Checks after you close:"]
+    has_verify = False
+    for g in gates:
+        if g.startswith("cmd:"):
+            lines.append(f"- WatchTower runs: {g[4:]}")
+        elif g == "verify":
+            has_verify = True
+            what = str(item.get("accept") or "").strip() or "the ticket text"
+            lines.append(f"- An independent verifier checks: {what}")
+        else:
+            lines.append(f"- Review by {gate_stage_label(g)} (wt accept / wt reject)")
+    lines.append("Still your job: write and run tests for this change.")
+    if has_verify:
+        lines.append("Don't launch your own independent verifier; this ticket "
+                     "already gets one.")
+    return "\n".join(lines)
+
+
+def _reviewer_target(item: Dict[str, Any], stage: str) -> str:
+    target = gate_stage_label(stage)
+    return str(item.get("submitter") or "") if target == "submitter" else target
 
 
 def _dependents_of(ref: str) -> List[str]:
@@ -2662,6 +2705,8 @@ def _dependents_of(ref: str) -> List[str]:
 
 
 def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any) -> None:
+    if reviewer == "verify":
+        return  # the verifier is spawned by the CLI; nobody to notify yet
     target = _reviewer_target(item, reviewer)
     ref = str(item.get("ref") or "?")
     if not target:
@@ -2680,9 +2725,10 @@ def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any) -> None:
         pass
 
 
-def accept(ident: Any, by: str = "human") -> Optional[Dict[str, Any]]:
+def accept(ident: Any, by: str = "human", force: bool = False) -> Optional[Dict[str, Any]]:
     """Accept an ``in_review`` ticket: it becomes ``closed`` (its dependents
-    unblock). Raises ValueError when it is not awaiting review."""
+    unblock). Raises ValueError when it is not awaiting review, or while the
+    independent verifier's verdict is still pending (``force`` overrides)."""
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -2690,11 +2736,16 @@ def accept(ident: Any, by: str = "human") -> Optional[Dict[str, Any]]:
                 if it.get("status") != "in_review":
                     raise ValueError(f"{it.get('ref', ident)} is {it.get('status')}, "
                                      "not in_review -- nothing to accept")
+                if it.get("gate_pending") == "verify" and not force:
+                    raise ValueError(
+                        f"{it.get('ref', ident)} is waiting on its independent "
+                        f"verifier's verdict (wt verdict); --force overrides")
                 now = _now_iso()
                 it["status"] = "closed"
                 it["closed_at"] = now
                 it["updated_at"] = now
                 it.pop("gate_pending", None)
+                it.pop("gate_stages", None)
                 it["gate_accepted_by"] = str(by)
                 _append_history(it, "accept", by=_by("human", str(by)), at=now)
                 _escalate_stuck_blockers(data["items"])
@@ -2710,6 +2761,77 @@ def accept(ident: Any, by: str = "human") -> Optional[Dict[str, Any]]:
     return item
 
 
+def verdict(ident: Any, passed: bool, findings: str = "", by: str = "verifier") -> Optional[Dict[str, Any]]:
+    """File the independent verifier's verdict on an ``in_review`` ticket
+    whose pending stage is ``verify``. Pass: advance to the next stage (a
+    review) or close. Fail: back to open with the findings and the original
+    worker session re-bound (the CLI resumes it)."""
+    current = get(ident)
+    if current is None:
+        return None
+    if current.get("status") != "in_review" or current.get("gate_pending") != "verify":
+        raise ValueError(f"{current.get('ref', ident)} is not waiting on a verifier "
+                         f"(status {current.get('status')})")
+    entry = {"gate": "verify", "passed": bool(passed), "output_tail": _clip(findings, GATE_OUTPUT_TAIL),
+             "by": str(by), "at": _now_iso()}
+    if not passed:
+        why = f"independent verification failed: {_clip(findings, 3000) or '(no findings given)'}"
+        item = reject_with(ident, why, by_label=str(by), results_add=entry)
+        return item
+    nxt = ""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                it["gate_results"] = list(it.get("gate_results") or []) + [entry]
+                stages = [x for x in (it.get("gate_stages") or []) if x != "verify"]
+                it["gate_stages"] = stages
+                it["updated_at"] = _now_iso()
+                _append_history(it, "verify", by=_by("system"), at=it["updated_at"],
+                                passed=True, findings=_clip(findings, 500))
+                if stages:
+                    it["gate_pending"] = nxt = stages[0]
+                _save_unlocked(data)
+                item = it
+                break
+        else:
+            return None
+    if nxt:
+        _notify_review(item, nxt, by)
+        return item
+    return accept(ident, by=f"verifier:{by}", force=True)
+
+
+def reject_with(ident: Any, why: str, by_label: str = "human",
+                results_add: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Shared reject path: back to open (session re-bound when known) with
+    ``why`` on ``gate_feedback``."""
+    current = get(ident)
+    if current is None:
+        return None
+    sid = str(current.get("claimed_session_id") or "")
+    if sid and _github_backend_for_project(_project_from_ident(ident)) is None:
+        item = reopen_and_claim(ident, sid, session_uuid=sid, reason=why)
+        if item is None:
+            return None
+    else:
+        item = update_status(ident, "open", reason=why, by_kind="human")
+        if item is None:
+            return None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                it.pop("gate_pending", None)
+                it.pop("gate_stages", None)
+                it["gate_feedback"] = _clip(why, 4000)
+                if results_add:
+                    it["gate_results"] = list(it.get("gate_results") or []) + [results_add]
+                _save_unlocked(data)
+                return it
+    return item
+
+
 def reject(ident: Any, reason: str, by: str = "human") -> Optional[Dict[str, Any]]:
     """Reject an ``in_review`` ticket: back to ``open`` with ``reason`` kept
     on ``gate_feedback`` (the caller resumes the original session)."""
@@ -2721,24 +2843,7 @@ def reject(ident: Any, reason: str, by: str = "human") -> Optional[Dict[str, Any
     if current.get("status") != "in_review":
         raise ValueError(f"{current.get('ref', ident)} is {current.get('status')}, "
                          "not in_review -- nothing to reject")
-    why = f"rejected by {by}: {reason}"
-    sid = str(current.get("claimed_session_id") or "")
-    if sid and _github_backend_for_project(_project_from_ident(ident)) is None:
-        # Re-bind to the original worker session atomically (never claimable
-        # by another worker in between); the CLI then resumes it.
-        item = reopen_and_claim(ident, sid, session_uuid=sid, reason=why)
-        if item is None:
-            return None
-        with _FileLock(_lock_path()):
-            data = _load_unlocked()
-            for it in data["items"]:
-                if _matches(it, ident):
-                    it.pop("gate_pending", None)
-                    it["gate_feedback"] = _clip(why, 4000)
-                    _save_unlocked(data)
-                    return it
-        return item
-    return _reopen_with_feedback(ident, why, [], by_kind="human")
+    return reject_with(ident, f"rejected by {by}: {reason}", by_label=str(by))
 
 
 def _reopen_with_feedback(ident: Any, reason: str, results: List[Dict[str, Any]],
@@ -2794,15 +2899,15 @@ def close(
         current = get(ident)
         if current is not None and current.get("status") != "closed" and effective_gates(current):
             norm = _normalize_resolution(resolution) or {}
-            results, reviewer = evaluate_gates(current, str(norm.get("commit") or ""))
+            results, stages = evaluate_gates(current, str(norm.get("commit") or ""))
             failed = [r for r in results if not r["passed"]]
             if failed:
                 f = failed[0]
                 why = (f"gate {f['gate']} failed (exit {f['exit_code']}): "
                        f"{f['output_tail'][-600:].strip()}")
                 return _reopen_with_feedback(ident, why, results)
-            extras = {"gate_results": results}
-            hold_review = reviewer
+            extras = {"gate_results": results, "gate_stages": stages}
+            hold_review = stages[0] if stages else ""
     item = update_status(
         ident, "closed", session_id, session_uuid=session_uuid, resolution=resolution,
         expect_owner="" if force else str(session_id or ""),

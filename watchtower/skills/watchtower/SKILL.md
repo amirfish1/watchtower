@@ -77,6 +77,15 @@ the command fails before filing anything.
 rejected with exit code 1. The summary is the trust signal surfaced on the
 dashboard; the proof keeps uncommitted or fabricated fixes from being closed.
 
+Tickets can carry acceptance gates (`wt add/edit --gate cmd:<command> | verify |
+review`, or `wt config <queue> --gate ...`). A ticket with gates lands in
+`in_review` on `wt close`, not `closed`, until every gate passes. `wt claim` and
+`wt find` print a "Checks after you close" block listing them; if it shows a
+verify check, skip your own independent verifier -- WatchTower spawns one after
+you close, and it files its verdict with `wt verdict`. `wt accept` / `wt reject
+--reason` are the reviewer's verbs; a failed gate or rejection sends the ticket
+back with the reason and resumes your session.
+
 ## Don't fabricate
 
 If `wt find <ref>` returns "not found" or `wt` isn't installed, say so

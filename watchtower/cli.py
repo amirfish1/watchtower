@@ -197,6 +197,8 @@ def _event_summary(event: dict) -> str:
         return f"in review (gates passed; reviewer: {event.get('reviewer') or 'submitter'})"
     if name == "accept":
         return "accepted"
+    if name == "verify":
+        return f"verifier passed: {event.get('findings') or ''}".rstrip()
     if name == "close":
         res = event.get("resolution") or {}
         summary = res.get("summary") if isinstance(res, dict) else ""
@@ -413,7 +415,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
         if waiting:
             line += f"  [{waiting}]"
         if it.get("status") == "in_review":
-            line += f"  [gate pending: review by {it.get('gate_pending') or 'submitter'}]"
+            line += f"  [gate pending: {q.gate_stage_label(str(it.get('gate_pending') or 'review'))}]"
         elif it.get("status") == "open" and it.get("gate_feedback"):
             line += f"  [gate: {_oneline(it['gate_feedback'])[:60]}]"
         res = it.get("resolution") if it.get("status") in ("closed", "in_review") else None
@@ -496,7 +498,10 @@ def cmd_find(args: argparse.Namespace) -> int:
     item_with_timeline = _mark_self(
         _with_timeline(item), caller_worker, caller_session
     )
+    checks = q.checks_block(item)
     if args.json:
+        if checks:
+            item_with_timeline = dict(item_with_timeline, checks_after_close=checks)
         print(json.dumps(item_with_timeline, indent=2))
         return 0
     worker = q.with_machine(
@@ -521,6 +526,10 @@ def cmd_find(args: argparse.Namespace) -> int:
             note = ""
         if note:
             print(f"  {note}")
+    if item.get("accept"):
+        print(f"  accept: {item['accept']}")
+    if checks:
+        print("  " + checks.replace("\n", "\n  "))
     if worker:
         you = " (you)" if item_with_timeline.get("claimed_by_you") else ""
         print(f"  claimed_by: {worker}{you}")
@@ -551,7 +560,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     for name in (
         "title", "note", "text", "url", "type", "readiness", "priority",
         "value", "confidence", "model_floor", "selector", "screenshot_path",
-        "repo_path",
+        "repo_path", "accept",
     ):
         value = getattr(args, name, None)
         if value is not None:
@@ -575,7 +584,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
             "error: no fields to edit -- pass at least one of "
             "--title/--note/--text/--url/--type/--readiness/--priority/"
             "--value/--confidence/--model-floor/--selector/"
-            "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates",
+            "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates/--accept",
             file=sys.stderr,
         )
         return 1
@@ -648,6 +657,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             pre_ack=bool(getattr(args, "pre_ack", False)),
             blocked_by=list(getattr(args, "after", None) or []),
             gates=list(getattr(args, "gate", None) or []) or None,
+            accept_line=getattr(args, "accept", "") or "",
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -754,6 +764,7 @@ def cmd_import(args: argparse.Namespace) -> int:
                 url=candidate.source_ref,
                 repo_path=str(Path(candidate.source_path).parent),
                 item_type=args.type or candidate.item_type,
+                accept_line=candidate.accept,
                 blocked_by=[
                     refs_by_title[t] for t in candidate.depends_on
                     if t in refs_by_title
@@ -911,10 +922,17 @@ def cmd_claim(args: argparse.Namespace) -> int:
         # The claim just made is by definition the caller's; marking history
         # events under the same identity keeps a re-claimed ticket's earlier
         # activity from reading as another worker's (CCC-675).
-        _print_item(_mark_self(item, worker, session_uuid))
+        shown = _mark_self(item, worker, session_uuid)
+        checks = q.checks_block(item)
+        if checks:
+            shown = dict(shown, checks_after_close=checks)
+        _print_item(shown)
     else:
         print(f"CLAIMED: {item['ref']} -> {worker}")
         print(item.get("text") or item.get("note") or "")
+        checks = q.checks_block(item)
+        if checks:
+            print("\n" + checks)
     return 0
 
 
@@ -1103,15 +1121,19 @@ def cmd_close(args: argparse.Namespace) -> int:
         return 1
     if item.get("status") == "open":
         print(f"GATE FAILED: {item['ref']} reopened -- {item.get('gate_feedback', '')}\n"
-              f"  fix it, then run `wt close {item['ref']} ...` again.", file=sys.stderr)
+              f"  fix it, then run `wt close {item['ref']} ...` again.\n"
+              f"{q.checks_block(item)}", file=sys.stderr)
         return 1
     res = item.get("resolution") or {}
     summary = res.get("summary", "")
     if item.get("status") == "in_review":
+        pending = str(item.get("gate_pending") or "review")
         print(f"IN REVIEW: {item['ref']} -- gates passed; awaiting "
-              f"`wt accept` from {item.get('gate_pending') or 'submitter'}"
+              f"{q.gate_stage_label(pending)}"
               + (f" — {summary}" if summary else ""))
         _rename_claiming_session(item, summary)
+        if pending == "verify":
+            _spawn_verifier(item)
         return 0
     print(f"CLOSED: {item['ref']}" + (f" — {summary}" if summary else ""))
 
@@ -1321,10 +1343,78 @@ def cmd_release(args: argparse.Namespace) -> int:
     return 0
 
 
+def _verifier_goal(item: dict) -> str:
+    ref = item["ref"]
+    accept = str(item.get("accept") or "").strip()
+    target = accept or (item.get("text") or item.get("note") or item.get("title") or "")
+    res = item.get("resolution") or {}
+    commit = res.get("commit", "") if isinstance(res, dict) else ""
+    return (
+        f"You are an INDEPENDENT verifier for WatchTower ticket {ref}. You did "
+        f"not do the work and must not trust its summary. Check, against the "
+        f"real running app or code"
+        + (f" at commit {commit}" if commit else "")
+        + f", that this acceptance criterion holds:\n\n{target}\n\n"
+        "Drive a real browser/app where the criterion is user-visible; read the "
+        "code and run it otherwise. Do NOT edit files or fix anything. When "
+        f"done, file your verdict on the ticket (not to anyone else): "
+        f"`wt verdict {ref} --pass --findings \"what you checked\"` or "
+        f"`wt verdict {ref} --fail --findings \"what is wrong, with evidence\"`."
+    )
+
+
+def _spawn_verifier(item: dict) -> None:
+    """Spawn the independent verifier session for an in_review ticket whose
+    pending stage is ``verify``. Best-effort: on failure the ticket stays in
+    review and a human can `wt verdict` or `wt accept --force`."""
+    try:
+        rec = workers.spawn_adhoc(
+            _verifier_goal(item), "claude",
+            repo_path=str(item.get("repo_path") or "") or None,
+            name=f"verify-{item['ref']}", report_to=None,
+        )
+        print(f"  verifier spawned: {rec.get('worker_id', '?')}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"warning: could not spawn verifier for {item['ref']}: {exc}; "
+              f"file a verdict with `wt verdict` or `wt accept --force`",
+              file=sys.stderr)
+
+
+def cmd_verdict(args: argparse.Namespace) -> int:
+    """File the independent verifier's verdict straight onto the ticket."""
+    try:
+        item = q.verdict(args.ref, bool(args.passed), args.findings or "",
+                         by=args.by or _default_worker_id())
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+    else:
+        print(f"VERDICT {'PASS' if args.passed else 'FAIL'}: {item['ref']} -> {item.get('status')}")
+    if not args.passed and item.get("status") == "in_progress" and item.get("claimed_session_id"):
+        return _resume_rejected(item, item.get("gate_feedback") or args.findings or "", args.engine)
+    return 0
+
+
+def _resume_rejected(item: dict, reason: str, engine: str = "") -> int:
+    prompt = (
+        f"Your work on ticket {item['ref']} was sent back: {reason}. Address it, "
+        f"then close again with `wt close {item['ref']} --worker <your-id> "
+        f"--summary \"...\" --commit <SHA>` (or `--no-code`).\n\n"
+        + q.checks_block(item)
+    ).strip()
+    return _deliver_to_blocked_session(item, reason, prompt, engine or "",
+                                       item.get("claimed_by") or "")
+
+
 def cmd_accept(args: argparse.Namespace) -> int:
     """Accept an in_review ticket (WT-5): it closes and its dependents unblock."""
     try:
-        item = q.accept(args.ref, by=args.by or "human")
+        item = q.accept(args.ref, by=args.by or "human", force=getattr(args, "force", False))
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -1354,14 +1444,7 @@ def cmd_reject(args: argparse.Namespace) -> int:
     else:
         print(f"REJECTED: {item['ref']} -> {item.get('status')} — {args.reason}")
     if item.get("status") == "in_progress" and item.get("claimed_session_id"):
-        prompt = (
-            f"Your work on ticket {item['ref']} was REJECTED in review: "
-            f"{args.reason}. Address it, then close again with `wt close "
-            f"{item['ref']} --worker <your-id> --summary \"...\" --commit <SHA>` "
-            f"(or `--no-code`)."
-        )
-        return _deliver_to_blocked_session(item, args.reason, prompt,
-                                           args.engine, item.get("claimed_by") or "")
+        return _resume_rejected(item, args.reason, args.engine or "")
     return 0
 
 
@@ -4343,6 +4426,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Worker protocol", "reopen"),
     ("Tickets", "accept"),
     ("Tickets", "reject"),
+    ("Tickets", "verdict"),
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
@@ -4360,6 +4444,7 @@ COMMAND_HELP: Dict[str, str] = {
     "claim": "claim next open ticket (smart sort: priority + type + age)",
     "release": "give up a claim without closing it; returns the ticket to open",
     "accept": "accept an in_review ticket (closes it, unblocks dependents)",
+    "verdict": "file an independent verifier's pass/fail on an in_review ticket",
     "reject": "reject an in_review ticket back to open and resume its worker",
     "reopen": "reopen a closed ticket, returning it to the open pool (no dispatch)",
     "close": "close a ticket (record how you fixed it)",
@@ -4654,7 +4739,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "completed (repeatable)")
     s.add_argument("--gate", action="append", default=None, metavar="GATE",
                    help="acceptance gate (repeatable, ordered; overrides the "
-                        "queue's): cmd:<command>, review or review:<target>")
+                        "queue's): cmd:<command>, verify, review or "
+                        "review:<target>")
+    s.add_argument("--accept", default=None, metavar="LINE",
+                   help="one plain-language acceptance line the verify gate "
+                        "checks (falls back to the ticket text when empty)")
     s.add_argument("--claim", action="store_true",
                    help="immediately claim the new ticket (mark in_progress) so no "
                         "auto-drain worker picks it up; use when you're already working it")
@@ -4718,8 +4807,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="remove all blockers from this ticket")
     s.add_argument("--gate", action="append", default=None, metavar="GATE",
                    help="per-ticket acceptance gate (repeatable, ordered; "
-                        "overrides the queue's): cmd:<command>, review or "
-                        "review:<target>")
+                        "overrides the queue's): cmd:<command>, verify, "
+                        "review or review:<target>")
+    s.add_argument("--accept", default=None, metavar="LINE",
+                   help="one plain-language acceptance line the verify gate "
+                        "checks (falls back to the ticket text when empty)")
     s.add_argument("--clear-gates", action="store_true", dest="clear_gates",
                    help="drop this ticket's gate override (an empty override "
                         "= no gates; use --gate to set one)")
@@ -4826,9 +4918,24 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("accept", help=COMMAND_HELP.get("accept", ""))
     s.add_argument("ref")
     s.add_argument("--by", default="", help="who accepted (default: human)")
+    s.add_argument("--force", action="store_true",
+                   help="accept even while the independent verifier's verdict is pending")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_accept)
+
+    s = sub.add_parser("verdict", help=COMMAND_HELP.get("verdict", ""))
+    s.add_argument("ref")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pass", dest="passed", action="store_true")
+    g.add_argument("--fail", dest="passed", action="store_false")
+    s.add_argument("--findings", default="", help="what was checked / what is wrong")
+    s.add_argument("--by", default="", help="verifier id (default: your worker id)")
+    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
+                   help="override the resumed worker's engine (--fail only)")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_verdict)
 
     s = sub.add_parser("reject", help=COMMAND_HELP.get("reject", ""))
     s.add_argument("ref")
@@ -5291,7 +5398,7 @@ def build_parser() -> argparse.ArgumentParser:
                    ))
     s.add_argument("--gate", action="append", default=None, metavar="GATE",
                    help="queue default acceptance gate (repeatable, ordered): "
-                        "cmd:<command>, review or review:<target>; "
+                        "cmd:<command>, verify, review or review:<target>; "
                         "--gate none clears them")
     s.add_argument("--product-gate", default=None, choices=["on", "off"],
                    dest="product_gate",
