@@ -2666,6 +2666,57 @@ def gate_stage_label(stage: str) -> str:
     return stage[7:].strip() if stage.startswith("review:") else "submitter"
 
 
+def verifier_target(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Engine/model the verify gate's verifier runs on (WT-6). Precedence, per
+    field: the queue's ``--verifier-engine/--verifier-model`` override, else
+    the claiming worker's recorded engine+model, else the queue's configured
+    engine/model. Returns ``{engine, model, source, blocked}``; ``blocked`` is
+    True when the resolved model is on the policy deny-list (the caller must
+    then not spawn -- never substitute)."""
+    from . import config as _config
+    queue = str(item.get("project") or "")
+    engine, model, source = "", "", "queue"
+    wid = str(item.get("claimed_by") or "")
+    if wid:
+        try:
+            from . import workers as _workers
+            rec = next((w for w in _workers._load().get("workers", [])
+                        if isinstance(w, dict) and w.get("worker_id") == wid
+                        and w.get("engine")), None)
+        except Exception:
+            rec = None
+        if rec:
+            engine, source = str(rec["engine"]), "worker"
+            model = str(rec.get("model") or "")
+    q_engine = _config.engine(queue)
+    if not engine:
+        engine = q_engine
+    if not model and engine == q_engine:
+        model = _config.raw_model(queue)
+    o_eng, o_model = _config.verifier_override(queue)
+    if o_eng or o_model:
+        source = "override"
+        if o_eng and o_eng != engine:
+            engine = o_eng
+            model = ""
+        model = o_model or model
+    model = _config.canonical_model(engine, model) if model else ""
+    return {"engine": engine, "model": model, "source": source,
+            "blocked": bool(model and _config.is_blocked_model(model))}
+
+
+def set_verifier_info(ident: Any, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Record which verifier (engine/model/worker) was spawned for a ticket."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                it["verifier"] = dict(info)
+                _save_unlocked(data)
+                return it
+    return None
+
+
 def checks_block(item: Dict[str, Any]) -> str:
     """Plain-words "Checks after you close" block for a ticket with gates
     (empty string when it has none). Told to the worker at claim time so it
@@ -2681,7 +2732,12 @@ def checks_block(item: Dict[str, Any]) -> str:
         elif g == "verify":
             has_verify = True
             what = str(item.get("accept") or "").strip() or "the ticket text"
-            lines.append(f"- An independent verifier checks: {what}")
+            try:
+                vt = verifier_target(item)
+                who = f" ({vt['engine']}{'/' + vt['model'] if vt['model'] else ''})"
+            except Exception:
+                who = ""
+            lines.append(f"- An independent verifier{who} checks: {what}")
         else:
             lines.append(f"- Review by {gate_stage_label(g)} (wt accept / wt reject)")
     lines.append("Still your job: write and run tests for this change.")
@@ -2774,6 +2830,9 @@ def verdict(ident: Any, passed: bool, findings: str = "", by: str = "verifier") 
                          f"(status {current.get('status')})")
     entry = {"gate": "verify", "passed": bool(passed), "output_tail": _clip(findings, GATE_OUTPUT_TAIL),
              "by": str(by), "at": _now_iso()}
+    v = current.get("verifier") or {}
+    if v.get("engine"):
+        entry["engine"], entry["model"] = v.get("engine"), v.get("model", "")
     if not passed:
         why = f"independent verification failed: {_clip(findings, 3000) or '(no findings given)'}"
         item = reject_with(ident, why, by_label=str(by), results_add=entry)

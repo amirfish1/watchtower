@@ -1368,12 +1368,21 @@ def _spawn_verifier(item: dict) -> None:
     pending stage is ``verify``. Best-effort: on failure the ticket stays in
     review and a human can `wt verdict` or `wt accept --force`."""
     try:
+        vt = q.verifier_target(item)
+        if vt["blocked"]:
+            raise ValueError(
+                f"model {vt['model']!r} for the verifier ({vt['engine']}) is blocked "
+                f"by model policy; not substituting another model")
         rec = workers.spawn_adhoc(
-            _verifier_goal(item), "claude",
-            repo_path=str(item.get("repo_path") or "") or None,
-            name=f"verify-{item['ref']}", report_to=None,
+            _verifier_goal(item), vt["engine"], model=vt["model"],
+            repo_path=str(item.get("repo_path") or ""),
+            name=f"verify-{item['ref']}", report_to="",
         )
-        print(f"  verifier spawned: {rec.get('worker_id', '?')}")
+        q.set_verifier_info(item["ref"], {"engine": vt["engine"], "model": vt["model"],
+                                          "source": vt["source"],
+                                          "worker_id": rec.get("worker_id", "")})
+        print(f"  verifier spawned: {rec.get('worker_id', '?')} "
+              f"({vt['engine']}{'/' + vt['model'] if vt['model'] else ''}, {vt['source']})")
     except Exception as exc:  # noqa: BLE001
         print(f"warning: could not spawn verifier for {item['ref']}: {exc}; "
               f"file a verdict with `wt verdict` or `wt accept --force`",
@@ -1394,7 +1403,9 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(item, indent=2))
     else:
-        print(f"VERDICT {'PASS' if args.passed else 'FAIL'}: {item['ref']} -> {item.get('status')}")
+        v = item.get("verifier") or {}
+        via = f" [{v['engine']}{'/' + v['model'] if v.get('model') else ''}]" if v.get("engine") else ""
+        print(f"VERDICT {'PASS' if args.passed else 'FAIL'}{via}: {item['ref']} -> {item.get('status')}")
     if not args.passed and item.get("status") == "in_progress" and item.get("claimed_session_id"):
         return _resume_rejected(item, item.get("gate_feedback") or args.findings or "", args.engine)
     return 0
@@ -3362,6 +3373,11 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
         changed.append(f"grace_s={config.grace_s(args.queue)}")
+    if (getattr(args, "verifier_engine", None) is not None
+            or getattr(args, "verifier_model", None) is not None):
+        config.set_verifier(args.queue, args.verifier_engine, args.verifier_model)
+        changed.append("verifier=%s/%s" % (config.verifier_override(args.queue)[0] or "(worker)",
+                                           config.verifier_override(args.queue)[1] or "(worker)"))
     if getattr(args, "gate", None) is not None:
         try:
             config.set_gates(args.queue, [] if args.gate == ["none"] else args.gate)
@@ -5396,6 +5412,12 @@ def build_parser() -> argparse.ArgumentParser:
                        "immediately. Gives a human time to label a ticket "
                        "watchtower:no-auto-drain; pressing run ignores it."
                    ))
+    s.add_argument("--verifier-engine", default=None, dest="verifier_engine",
+                   help="engine the verify gate's verifier runs on (default: "
+                        "the worker's own engine); empty string clears")
+    s.add_argument("--verifier-model", default=None, dest="verifier_model",
+                   help="model the verify gate's verifier runs on (default: "
+                        "the worker's own model); empty string clears")
     s.add_argument("--gate", action="append", default=None, metavar="GATE",
                    help="queue default acceptance gate (repeatable, ordered): "
                         "cmd:<command>, verify, review or review:<target>; "

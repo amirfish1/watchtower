@@ -36,7 +36,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 VALID_BACKENDS = ("file", "github")
 VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
@@ -864,6 +864,44 @@ def fallback_model(eng: str) -> str:
     if resolved and is_blocked_model(resolved):
         return policy_fallback_model(eng)
     return resolved
+
+
+def raw_model(queue: str) -> str:
+    """The queue's configured/inherited model exactly as :func:`model` would
+    resolve it, but WITHOUT the blocked-model substitution -- for callers that
+    must fail loudly instead of quietly swapping models (the verify gate)."""
+    eng = engine(queue)
+    explicit = _queue_entry(queue).get("model", "")
+    if explicit:
+        return canonical_model(eng, explicit)
+    return canonical_model(eng, _ccc_worker_model_default(eng) or default_model(eng))
+
+
+def set_verifier(queue: str, eng: Any = None, model_value: Any = None) -> Dict[str, Any]:
+    """Per-queue verify-gate engine/model override (WT-6); "" clears a field,
+    None leaves it. A model is stored canonicalised against the effective
+    verifier engine (blocked models are rejected at spawn, not here)."""
+    data = _load()
+    q = data.setdefault(queue, {})
+    if eng is not None:
+        e = str(eng or "").strip().lower()
+        if e:
+            q["verifier_engine"] = e
+        else:
+            q.pop("verifier_engine", None)
+    if model_value is not None:
+        m = str(model_value or "").strip()
+        if m:
+            q["verifier_model"] = canonical_model(q.get("verifier_engine") or engine(queue), m)
+        else:
+            q.pop("verifier_model", None)
+    _save(data)
+    return q
+
+
+def verifier_override(queue: str) -> Tuple[str, str]:
+    e = _queue_entry(queue)
+    return str(e.get("verifier_engine") or ""), str(e.get("verifier_model") or "")
 
 
 def model(queue: str) -> str:

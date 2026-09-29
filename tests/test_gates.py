@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 
 import pytest
 
@@ -124,7 +125,7 @@ def test_accept_field_and_checks_block(wt):
     assert a["accept"].startswith("Rows show")
     block = q.checks_block(a)
     assert "WatchTower runs: pytest -q" in block
-    assert "An independent verifier checks: Rows show the short ticket ID" in block
+    assert "An independent verifier" in block and "checks: Rows show the short ticket ID" in block
     assert "Don't launch your own independent verifier" in block
     assert q.checks_block(_file(q, "plain")) == ""
     b = _file(q, "no accept", gates=["verify"])
@@ -181,3 +182,76 @@ def test_import_accepts_optional_accept_line(tmp_path):
     assert got[0].accept == "Rows show short ID."
     payload["tickets"][0].pop("accept")
     assert di.extract_document(src, reasoner=lambda p, s: payload)[0].accept == ""
+
+
+@pytest.fixture()
+def vcfg(wt, tmp_path, monkeypatch):
+    import watchtower.config as config
+    import watchtower.workers as workers
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    monkeypatch.setattr(config, "CCC_MODEL_POLICY_FILE", tmp_path / "policy.json")
+    monkeypatch.setattr(config, "CCC_SPAWN_DEFAULTS_FILE", tmp_path / "spawn.json")
+    monkeypatch.setattr(workers, "WORKERS_FILE", tmp_path / "workers.json")
+    monkeypatch.setattr(workers, "WORKER_IDS_FILE", tmp_path / "worker-ids.json")
+    monkeypatch.setattr(workers, "WORKER_SESSIONS_FILE", tmp_path / "worker-sessions.json")
+    config.set_engine("GT", "codex")
+    config.set_model("GT", "gpt-5.5")
+    wt.config, wt.workers = config, workers
+    return wt
+
+
+def _worker_rec(v, engine, model):
+    (v.workers.WORKERS_FILE).write_text(json.dumps({"workers": [
+        {"worker_id": "w1", "queue": "GT", "engine": engine, "model": model}]}))
+
+
+def _verify_item(q):
+    a = _claimed(q, gates=["verify"])
+    return q.get(a["ref"])
+
+
+def test_verifier_inherits_queue_engine_model(vcfg):
+    t = vcfg.q.verifier_target(_verify_item(vcfg.q))
+    assert (t["engine"], t["model"], t["source"]) == ("codex", "gpt-5.5", "queue")
+
+
+def test_claimed_worker_model_beats_queue_config(vcfg):
+    q = vcfg.q
+    item = _verify_item(q)
+    _worker_rec(vcfg, "claude", "claude-sonnet-5")
+    t = q.verifier_target(item)
+    assert (t["engine"], t["model"], t["source"]) == ("claude", "claude-sonnet-5", "worker")
+
+
+def test_verifier_override_beats_both(vcfg):
+    q = vcfg.q
+    item = _verify_item(q)
+    _worker_rec(vcfg, "claude", "claude-sonnet-5")
+    vcfg.config.set_verifier("GT", "codex", "gpt-5.5")
+    t = q.verifier_target(item)
+    assert (t["engine"], t["model"], t["source"]) == ("codex", "gpt-5.5", "override")
+    assert "codex/gpt-5.5" in q.checks_block(item)
+
+
+def test_blocked_verifier_model_is_flagged_not_substituted(vcfg, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_BLOCKED_MODELS", "gpt-5.5")
+    t = vcfg.q.verifier_target(_verify_item(vcfg.q))
+    assert t["model"] == "gpt-5.5" and t["blocked"] is True
+
+
+def test_spawn_verifier_passes_engine_model_and_refuses_blocked(vcfg, monkeypatch, capsys):
+    import watchtower.cli as cli
+    importlib.reload(cli)
+    q = vcfg.q
+    calls = []
+    monkeypatch.setattr(cli.workers, "spawn_adhoc",
+                        lambda goal, eng, **kw: calls.append((eng, kw)) or {"worker_id": "v1"})
+    cli.q = q
+    item = _verify_item(q)
+    cli._spawn_verifier(item)
+    assert calls[0][0] == "codex" and calls[0][1]["model"] == "gpt-5.5"
+    assert q.get(item["ref"])["verifier"]["engine"] == "codex"
+    monkeypatch.setenv("WATCHTOWER_BLOCKED_MODELS", "gpt-5.5")
+    calls.clear()
+    cli._spawn_verifier(item)
+    assert calls == [] and "blocked" in capsys.readouterr().err
