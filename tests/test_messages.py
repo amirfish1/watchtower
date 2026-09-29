@@ -2118,3 +2118,14 @@ def test_drain_outbox_delivers_ticket_message_when_store_lookup_fails(
     )
 
     assert wt.messages.drain_outbox(now=t0 + 1)["delivered"] == [msg["id"]]
+
+
+def test_delegate_rejection_preserves_code_and_reason(wt, monkeypatch):
+    monkeypatch.setattr(wt.messages, "_delegate_base", lambda: "http://x")
+    monkeypatch.setattr(
+        wt.messages, "_post_json",
+        lambda *a, **k: {"ok": False, "code": "session_gone", "error": "no such session"},
+    )
+    res = wt.messages._deliver_delegate({"session_id": "s1"}, "hi", "answer")
+    assert res["ok"] is False
+    assert "session_gone" in res["error"] and "no such session" in res["error"]

@@ -1530,7 +1530,14 @@ def _deliver_delegate(
     except Exception as e:  # noqa: BLE001 - any transport failure means fall through
         return {"ok": False, "error": f"delegate: {e}"}
     if data.get("ok") is False:
-        return {"ok": False, "error": "delegate rejected the message"}
+        # Keep the delegate's own reason/code so operators (and the outbox
+        # last_error) can see why it refused, not just that it did.
+        detail = str(data.get("error") or data.get("reason") or "").strip()
+        code = str(data.get("code") or "").strip()
+        msg = "delegate rejected the message"
+        if code or detail:
+            msg += " (" + ": ".join(x for x in (code, detail) if x) + ")"
+        return {"ok": False, "error": msg}
     return {"ok": True, "transport": "delegate"}
 
 
