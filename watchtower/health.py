@@ -91,8 +91,13 @@ def queue_status(
     drain_window_minutes: int = DRAIN_WINDOW_MINUTES,
     auto_drain: bool = True,
     claim_types: Optional[List[str]] = None,
+    waiting_refs: Optional[set] = None,
 ) -> Dict[str, Any]:
     """Compute the status row for a single queue from its items.
+
+    ``waiting_refs``: refs of open tickets held back by an unsatisfied
+    ``blocked_by`` dependency (WT-4). They count toward ``depth`` but not
+    ``claimable_depth``, and are reported separately as ``blocked``.
 
     ``auto_drain`` (the queue's policy) shapes the *display* ``state`` but not
     the raw ``stuck`` ground-truth: a queue that's opted out of auto-drain
@@ -121,6 +126,7 @@ def queue_status(
         it for it in open_items
         if it.get("claimable", True)
         and it.get("readiness", "") not in q.UNCLAIMABLE_READINESS
+        and it.get("ref") not in (waiting_refs or ())
     ]
     if claim_types:
         claimable_depth = sum(
@@ -192,6 +198,7 @@ def queue_status(
         "queue": project,
         "depth": depth,
         "claimable_depth": claimable_depth,
+        "blocked": sum(1 for it in open_items if it.get("ref") in (waiting_refs or ())),
         "in_progress": len(in_progress),
         "closed": len(closed),
         "oldest_open_age_s": oldest_open_age,
@@ -241,10 +248,17 @@ def all_status(
     fetched = items if items is not None else q.list_items(project=project, fresh=fresh)
     for it in fetched:
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
+    by_ref = q._refs_index(fetched)
+    waiting_refs = {
+        str(it.get("ref")) for it in fetched
+        if it.get("status") == "open" and it.get("blocked_by")
+        and q.blocker_verdict(it, by_ref)[0] != "ok"
+    }
     rows = [
         queue_status(
             name,
             items,
+            waiting_refs=waiting_refs,
             now=now,
             stuck_minutes=stuck_minutes,
             drain_window_minutes=drain_window_minutes,

@@ -146,6 +146,7 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
             queue_items,
             project=r["queue"],
             item_types=config.claim_types(r["queue"]) or None,
+            all_items=items,
         ))
         r["awaiting_human"] = sum(
             1 for item in queue_items

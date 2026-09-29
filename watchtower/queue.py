@@ -83,7 +83,7 @@ import re as _re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:  # stdlib, but missing on Pythons built without libsqlite3-dev present
     # at build time (a common pyenv/asdf-on-fresh-Linux gotcha) -- fail with
@@ -1327,8 +1327,12 @@ def enqueue(
     submitter: str = "",
     submitter_explicit: bool = False,
     pre_ack: bool = False,
+    blocked_by: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
+
+    ``blocked_by``: refs of tickets that must close (completed) before this one
+    is claimable (WT-4); validated -- unknown refs raise ValueError.
 
     ``submitter``: an addressable target (worker id / ``@agent`` name /
     session UUID -- the same shape ``messages.resolve_target`` already
@@ -1357,6 +1361,8 @@ def enqueue(
     # trace in queue-config.json.
     backend = _github_backend_for_project(proj)
     if backend is not None:
+        if blocked_by:
+            raise ValueError("ticket dependencies (--after) are not supported on GitHub-backed queues")
         saved = backend.enqueue(
             note=note,
             text=text,
@@ -1380,6 +1386,7 @@ def enqueue(
         return saved
     with _FileLock(_lock_path()):
         data = _load_unlocked()
+        blockers = _validate_blocked_by(data["items"], "", list(blocked_by or []))
         data["counter"] = int(data.get("counter", 0)) + 1
         number = data["counter"]
         now = _now_iso()
@@ -1411,6 +1418,7 @@ def enqueue(
             "no_auto_drain": False,
             "run_requested": False,
             "pre_ack": bool(pre_ack),
+            "blocked_by": blockers,
             "submitter": str(submitter or ""),
             "submitter_explicit": bool(submitter_explicit),
             "claimed_by": None,
@@ -1593,7 +1601,8 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
 
     Allowed fields: item_type, readiness, priority, value, confidence,
     model_floor, note, text, title, url, selector, screenshot_path,
-    repo_path, needs_input, block_question.
+    repo_path, needs_input, block_question, blocked_by (list of refs; validated
+    -- unknown refs and cycles raise ValueError).
 
     Disallowed (managed by state machine): status, claimed_by, claimed_at,
     closed_at, claimed_session_id, number, project, ref, seq, created_at.
@@ -1604,16 +1613,24 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         return backend.update(ident, **fields)
+    if "blocked_by" in fields and backend is not None:
+        raise ValueError("ticket dependencies (--after) are not supported on GitHub-backed queues")
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
-        "needs_input", "block_question", "model_floor",
+        "needs_input", "block_question", "model_floor", "blocked_by",
     })
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
                 now = _now_iso()
+                if "blocked_by" in fields:
+                    fields = dict(fields)
+                    fields["blocked_by"] = _validate_blocked_by(
+                        data["items"], str(it.get("ref") or ""),
+                        list(fields["blocked_by"] or []),
+                    )
                 for k, v in fields.items():
                     if k in ALLOWED:
                         # "item_type" and "type" are aliases — store as "type"
@@ -1681,6 +1698,115 @@ def move(ident: Any, new_project: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _blocker_state(blocker: Dict[str, Any]) -> str:
+    """The ONE predicate for "is this blocker satisfied" (WT-4).
+
+    ``satisfied``: closed as completed -- not declined at the product gate,
+    and its resolution has no ``unresolved`` items. ``waiting``: not closed
+    yet. ``stuck``: closed, but declined or with unresolved items, so the
+    dependent must NOT auto-unblock; a human decides. Extend here (e.g. with
+    a review/accept state), nowhere else."""
+    if blocker.get("status") != "closed":
+        return "waiting"
+    if blocker.get("product_nack"):
+        return "stuck"
+    res = blocker.get("resolution")
+    if isinstance(res, dict) and any(str(x).strip() for x in (res.get("unresolved") or [])):
+        return "stuck"
+    return "satisfied"
+
+
+def blocker_verdict(
+    it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]
+) -> Tuple[str, str]:
+    """``(state, blocker_ref)`` for one ticket: ``ok`` (claimable as far as
+    dependencies go), ``waiting`` (a blocker is still open) or ``stuck`` (a
+    blocker closed declined/unresolved). ``stuck`` wins over ``waiting``. A
+    stuck blocker a human already answered for (``blocker_escalated`` and
+    ``needs_input`` cleared) counts as satisfied; a blocker that no longer
+    exists is ignored."""
+    waiting = ""
+    for ref in it.get("blocked_by") or []:
+        blocker = by_ref.get(str(ref))
+        if blocker is None:
+            continue
+        state = _blocker_state(blocker)
+        if state == "stuck":
+            if str(ref) in (it.get("blocker_escalated") or []) and not it.get("needs_input"):
+                continue
+            return "stuck", str(ref)
+        if state == "waiting" and not waiting:
+            waiting = str(ref)
+    return ("waiting", waiting) if waiting else ("ok", "")
+
+
+def _refs_index(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    return {str(it.get("ref")): it for it in items if it.get("ref")}
+
+
+def _escalate_stuck_blockers(items: List[Dict[str, Any]]) -> bool:
+    """Flag every open ticket whose blocker closed declined/unresolved as
+    ``needs_input`` (once per blocker) so it shows under ``wt blocked``
+    instead of silently never being claimed. Mutates ``items``; returns
+    whether anything changed. Caller holds the lock and saves."""
+    by_ref = _refs_index(items)
+    changed = False
+    for it in items:
+        if it.get("status") != "open" or it.get("needs_input") or not it.get("blocked_by"):
+            continue
+        state, ref = blocker_verdict(it, by_ref)
+        if state != "stuck":
+            continue
+        blocker = by_ref[ref]
+        why = "declined" if blocker.get("product_nack") else "closed with unresolved items"
+        question = (
+            f"Blocker {ref} was {why}. Proceed anyway (wt answer), or change "
+            f"the dependency (wt edit --clear-after)?"
+        )
+        now = _now_iso()
+        it["needs_input"] = True
+        it["block_question"] = question
+        it["block_kind"] = "input"
+        it["blocked_at"] = now
+        it["updated_at"] = now
+        it["blocker_escalated"] = list(it.get("blocker_escalated") or []) + [ref]
+        _append_history(it, "block", by=_by("system"), at=now, question=question, kind="input")
+        changed = True
+    return changed
+
+
+def _validate_blocked_by(
+    items: List[Dict[str, Any]], ref: str, blocked_by: List[str]
+) -> List[str]:
+    """Normalise ``blocked_by`` for ticket ``ref`` (may be "" for a not-yet-
+    filed ticket): every blocker must exist, none may be the ticket itself,
+    and no cycle may result. Raises ValueError."""
+    by_ref = _refs_index(items)
+    out: List[str] = []
+    for raw in blocked_by:
+        found = next((it for it in items if _matches(it, raw)), None)
+        if found is None:
+            raise ValueError(f"blocker {raw} does not exist")
+        b = str(found.get("ref"))
+        if ref and b == ref:
+            raise ValueError(f"{ref} cannot be blocked by itself")
+        if b not in out:
+            out.append(b)
+    if ref:
+        # A cycle exists iff ref is reachable from any of its new blockers.
+        seen = set()
+        stack = list(out)
+        while stack:
+            cur = stack.pop()
+            if cur == ref:
+                raise ValueError(f"dependency cycle: {ref} would (transitively) block itself")
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(str(x) for x in (by_ref.get(cur, {}).get("blocked_by") or []))
+    return out
+
+
 def _claim_candidates(
     items: List[Dict[str, Any]],
     *,
@@ -1690,6 +1816,7 @@ def _claim_candidates(
     oldest: bool = False,
     item_types: Optional[List[str]] = None,
     readiness_filters: Optional[List[str]] = None,
+    all_items: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Return ``items`` filtered + sorted exactly as claim_next() would pick
     from them — the single source of truth for "is this ticket claimable
@@ -1699,6 +1826,14 @@ def _claim_candidates(
     silently drift out of sync (``project`` is expected pre-normalized).
     """
     candidates = [it for it in items if it.get("status") == "open"]
+    if any(it.get("blocked_by") for it in candidates):
+        # Dependencies (WT-4): waiting/stuck tickets are not claimable. Blockers
+        # may live in other queues, so resolve against ``all_items`` if given.
+        by_ref = _refs_index(all_items if all_items is not None else items)
+        candidates = [
+            it for it in candidates
+            if not it.get("blocked_by") or blocker_verdict(it, by_ref)[0] == "ok"
+        ]
     if project:
         candidates = [it for it in candidates if it.get("project") == project]
     if lane:
@@ -1988,6 +2123,8 @@ def claim_next(
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
         data = _load_unlocked()
+        if _escalate_stuck_blockers(data["items"]):
+            _save_unlocked(data)
         candidates = _claim_candidates(
             data["items"], project=proj, lane=lane, shaping=shaping, oldest=oldest,
             item_types=item_types, readiness_filters=readiness_filters,
@@ -2423,6 +2560,13 @@ def close(
         expect_owner="" if force else str(session_id or ""),
     )
     if item and item.get("status") == "closed":
+        try:
+            with _FileLock(_lock_path()):
+                data = _load_unlocked()
+                if _escalate_stuck_blockers(data["items"]):
+                    _save_unlocked(data)
+        except Exception:  # noqa: BLE001 - claim_next re-runs this sweep anyway
+            pass
         res = item.get("resolution") or {}
         summary = res.get("summary", "") if isinstance(res, dict) else (
             res if isinstance(res, str) else ""

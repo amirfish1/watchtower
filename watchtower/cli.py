@@ -128,6 +128,8 @@ def _print_status(rows: List[dict]) -> None:
             drain_cell = "on " if drain_val else "off"
             ctypes = _cfg.claim_types(r["queue"])
             note = _eta_note(r)
+            if r.get("blocked"):
+                note = f"{note} [{r['blocked']} waiting on deps]".strip()
             if ctypes:
                 label = f"{ctypes[0]}s only" if len(ctypes) == 1 else ",".join(ctypes)
                 note = f"{note} [{label}]".strip()
@@ -349,11 +351,25 @@ def _ack_counts(item: dict) -> Tuple[int, int]:
     return len(entries), acked
 
 
+def _waiting_note(item: dict, by_ref: dict) -> str:
+    """"waiting on REF" for an open ticket held back by an unsatisfied
+    blocked_by dependency (WT-4), else ""."""
+    if item.get("status") != "open" or not item.get("blocked_by"):
+        return ""
+    state, ref = q.blocker_verdict(item, by_ref)
+    if state == "waiting":
+        return f"waiting on {ref}"
+    if state == "stuck":
+        return f"blocked: {ref} declined/unresolved"
+    return ""
+
+
 def cmd_ls(args: argparse.Namespace) -> int:
     """List the tickets in a single queue (the actual items, not just counts)."""
     # fresh=True for the same reason as `wt status`: a CLI read always
     # revalidates, so `wt ls` is never behind the repo.
     items = q.list_items(project=args.queue, fresh=True)
+    all_items = items
     # Counted over the WHOLE queue, before the status filter, so the default
     # (active) view still surfaces that closed-but-unresolved work exists.
     unresolved_total = len(_unresolved_items(items))
@@ -381,6 +397,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
               f"items (wt unresolved -q {args.queue})")
     print(f"{'REF':<14}{'STATUS':<12}{'WORKER':<22}TITLE")
     print("-" * 72)
+    by_ref = q._refs_index(all_items)
     for it in items[:limit]:
         machine = it.get("claimed_machine") or it.get("closed_machine") or ""
         worker = q.with_machine(
@@ -388,6 +405,9 @@ def cmd_ls(args: argparse.Namespace) -> int:
         )[:20]
         title = _oneline(it.get("title") or it.get("note") or "")[:56]
         line = f"{str(it.get('ref','')):<14}{str(it.get('status','')):<12}{worker:<22}{title}"
+        waiting = _waiting_note(it, by_ref)
+        if waiting:
+            line += f"  [{waiting}]"
         res = it.get("resolution") if it.get("status") == "closed" else None
         if res and res.get("summary"):
             line += f"  — {res['summary']}"
@@ -485,6 +505,14 @@ def cmd_find(args: argparse.Namespace) -> int:
         except Exception:
             forwarded = None
         print(f"  filed_by: {filer}" + (f" -> {forwarded}" if forwarded else ""))
+    if item.get("blocked_by"):
+        print(f"  blocked_by: {', '.join(item['blocked_by'])}")
+        try:
+            note = _waiting_note(item, q._refs_index(q.list_items()))
+        except Exception:
+            note = ""
+        if note:
+            print(f"  {note}")
     if worker:
         you = " (you)" if item_with_timeline.get("claimed_by_you") else ""
         print(f"  claimed_by: {worker}{you}")
@@ -520,13 +548,22 @@ def cmd_edit(args: argparse.Namespace) -> int:
         value = getattr(args, name, None)
         if value is not None:
             fields[name] = value
+    after = getattr(args, "after", None)
+    if getattr(args, "clear_after", False):
+        fields["blocked_by"] = []
+    elif after:
+        try:
+            existing = list((q.get(args.ref) or {}).get("blocked_by") or [])
+        except Exception:
+            existing = []
+        fields["blocked_by"] = existing + [a for a in after if a not in existing]
     new_queue = getattr(args, "queue", None)
     if not fields and new_queue is None:
         print(
             "error: no fields to edit -- pass at least one of "
             "--title/--note/--text/--url/--type/--readiness/--priority/"
             "--value/--confidence/--model-floor/--selector/"
-            "--screenshot-path/--repo-path/--queue",
+            "--screenshot-path/--repo-path/--queue/--after/--clear-after",
             file=sys.stderr,
         )
         return 1
@@ -579,24 +616,29 @@ def cmd_add(args: argparse.Namespace) -> int:
                 "notifications sent before it's known/registered will fail",
                 file=sys.stderr,
             )
-    item = q.enqueue(
-        project=args.queue,
-        title=args.title or "",
-        note=args.note or (args.title or ""),
-        text=args.text or "",
-        url=args.url or "",
-        lane=args.lane,
-        source="wt",
-        item_type=getattr(args, "type", "") or "",
-        readiness=getattr(args, "readiness", "") or "",
-        priority=getattr(args, "priority", "") or "",
-        value=getattr(args, "value", "") or "",
-        confidence=getattr(args, "confidence", "") or "",
-        model_floor=getattr(args, "model_floor", "") or "",
-        submitter=submitter,
-        submitter_explicit=bool((getattr(args, "submitter", "") or "").strip()),
-        pre_ack=bool(getattr(args, "pre_ack", False)),
-    )
+    try:
+        item = q.enqueue(
+            project=args.queue,
+            title=args.title or "",
+            note=args.note or (args.title or ""),
+            text=args.text or "",
+            url=args.url or "",
+            lane=args.lane,
+            source="wt",
+            item_type=getattr(args, "type", "") or "",
+            readiness=getattr(args, "readiness", "") or "",
+            priority=getattr(args, "priority", "") or "",
+            value=getattr(args, "value", "") or "",
+            confidence=getattr(args, "confidence", "") or "",
+            model_floor=getattr(args, "model_floor", "") or "",
+            submitter=submitter,
+            submitter_explicit=bool((getattr(args, "submitter", "") or "").strip()),
+            pre_ack=bool(getattr(args, "pre_ack", False)),
+            blocked_by=list(getattr(args, "after", None) or []),
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
     # Enqueue-and-claim: file the ticket, then immediately mark it in_progress so
     # the reconciler (which only spawns for OPEN tickets) leaves it alone. For the
@@ -699,6 +741,10 @@ def cmd_import(args: argparse.Namespace) -> int:
                 url=candidate.source_ref,
                 repo_path=str(Path(candidate.source_path).parent),
                 item_type=args.type or candidate.item_type,
+                blocked_by=[
+                    refs_by_title[t] for t in candidate.depends_on
+                    if t in refs_by_title
+                ],
             )
         except Exception as exc:
             print(
@@ -4525,6 +4571,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("add")
     _add_common_ticket_args(s)
+    s.add_argument("--after", action="append", default=None, metavar="REF",
+                   help="this ticket is not claimable until REF closes as "
+                        "completed (repeatable)")
     s.add_argument("--claim", action="store_true",
                    help="immediately claim the new ticket (mark in_progress) so no "
                         "auto-drain worker picks it up; use when you're already working it")
@@ -4581,6 +4630,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--selector", default=None)
     s.add_argument("--screenshot-path", default=None, dest="screenshot_path")
     s.add_argument("--repo-path", default=None, dest="repo_path")
+    s.add_argument("--after", action="append", default=None, metavar="REF",
+                   help="add a blocker: this ticket is not claimable until REF "
+                        "closes as completed (repeatable)")
+    s.add_argument("--clear-after", action="store_true", dest="clear_after",
+                   help="remove all blockers from this ticket")
     s.add_argument("--queue", default=None,
                    help="move the ticket to a different queue in place, "
                         "reassigning its ref (WT-83); file-backed queues only")

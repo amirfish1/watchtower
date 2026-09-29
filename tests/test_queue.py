@@ -671,3 +671,76 @@ def test_normalize_items_keeps_refs_stable_across_moves():
     items[0]["project"] = "B"  # move A-1 into B
     _normalize_items(items)
     assert [i["ref"] for i in items] == ["B-2", "A-2", "B-1"]
+
+
+def _file(q, title, **kw):
+    return q.enqueue(project="DEP", title=title, note=title, **kw)
+
+
+def test_claim_skips_blocked_until_blocker_closes_completed(wt):
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    assert b["blocked_by"] == [a["ref"]]
+    assert q.count_claimable("DEP") == 1
+    assert q.claim_next("w1", project="DEP")["ref"] == a["ref"]
+    assert q.claim_next("w2", project="DEP") is None  # b still waiting
+    q.close(a["ref"], session_id="w1", resolution="done")
+    assert q.count_claimable("DEP") == 1
+    assert q.claim_next("w2", project="DEP")["ref"] == b["ref"]
+
+
+def test_unresolved_blocker_escalates_and_answer_unblocks(wt):
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    q.claim_next("w1", project="DEP")
+    q.close(a["ref"], session_id="w1",
+            resolution={"summary": "partial", "unresolved": ["thing not fixed"]})
+    got = q.get(b["ref"])
+    assert got["needs_input"] is True and a["ref"] in got["block_question"]
+    assert q.claim_next("w2", project="DEP") is None
+    q.answer(b["ref"], "go ahead")
+    assert q.count_claimable("DEP") == 1
+    assert q.claim_next("w2", project="DEP")["ref"] == b["ref"]
+
+
+def test_nacked_blocker_escalates(wt):
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    q.claim_next("w1", project="DEP")
+    q.update_status(a["ref"], "in_progress", "w1")
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked()
+        for it in data["items"]:
+            if it["ref"] == a["ref"]:
+                it["product_nack"] = {"by": "h", "comment": "no"}
+        q._save_unlocked(data)
+    q.close(a["ref"], session_id="w1", resolution="declined")
+    assert q.get(b["ref"])["needs_input"] is True
+
+
+def test_blocked_by_rejects_unknown_self_and_cycles(wt):
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    with pytest.raises(ValueError):
+        _file(q, "bad", blocked_by=["DEP-999"])
+    with pytest.raises(ValueError):
+        q.update(a["ref"], blocked_by=[a["ref"]])
+    with pytest.raises(ValueError):
+        q.update(a["ref"], blocked_by=[b["ref"]])  # a -> b -> a
+    assert q.update(b["ref"], blocked_by=[])["blocked_by"] == []
+
+
+def test_status_counts_blocked_separately_and_ls_shows_waiting(wt, capsys):
+    import watchtower.health as health
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    rows = health.all_status(project="DEP", items=q.list_items(project="DEP"))
+    row = next(r for r in rows if r["queue"] == "DEP")
+    assert row["depth"] == 2 and row["claimable_depth"] == 1 and row["blocked"] == 1
+    note = wt.cli._waiting_note(q.get(b["ref"]), q._refs_index(q.list_items()))
+    assert note == f"waiting on {a['ref']}"
