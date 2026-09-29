@@ -658,3 +658,16 @@ def test_with_machine_prefix_display(wt):
     assert wt.q.with_machine("bym-zxcv", "") == "bym-zxcv"
     assert wt.q.with_machine("", "her") == ""
     assert wt.q.with_machine(None, None) == ""
+
+
+def test_normalize_items_keeps_refs_stable_across_moves():
+    from watchtower.queue import _normalize_items
+
+    items = [
+        {"number": 1, "project": "A", "seq": 1, "ref": "A-1"},
+        {"number": 2, "project": "A", "seq": 2, "ref": "A-2"},
+        {"number": 3, "project": "B", "seq": 1, "ref": "B-1"},
+    ]
+    items[0]["project"] = "B"  # move A-1 into B
+    _normalize_items(items)
+    assert [i["ref"] for i in items] == ["B-2", "A-2", "B-1"]

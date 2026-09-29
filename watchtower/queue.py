@@ -556,19 +556,35 @@ def _github_projects() -> List[str]:
 
 
 def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Ensure every item has project/seq/ref. Deterministic + idempotent: refs
-    are assigned per-queue in global-number order, so they stay stable as long
-    as items aren't reordered or removed (status changes keep them in the list).
+    """Ensure every item has project/seq/ref. seq is assigned once (next free
+    number in the item's queue) and then persisted, so refs stay stable when
+    other tickets move in/out of a queue. An item keeps its stored seq only if
+    its stored ref still belongs to its current project and the seq is unique
+    there; otherwise (new item, moved item, collision) it gets max+1.
     """
-    counts: Dict[str, int] = {}
-    for it in sorted(items, key=lambda x: int(x.get("number", 0))):
+    ordered = sorted(items, key=lambda x: int(x.get("number", 0)))
+    used: Dict[str, set] = {}
+    pending: List[Dict[str, Any]] = []
+    for it in ordered:
         proj = it.get("project") or _project_for(
             it.get("source", ""), it.get("repo_path", ""), ""
         )
         it["project"] = proj
-        counts[proj] = counts.get(proj, 0) + 1
-        it["seq"] = counts[proj]
-        it["ref"] = f"{proj}-{counts[proj]}"
+        try:
+            seq = int(it.get("seq") or 0)
+        except (TypeError, ValueError):
+            seq = 0
+        taken = used.setdefault(proj, set())
+        if seq > 0 and it.get("ref", "") == f"{proj}-{seq}" and seq not in taken:
+            taken.add(seq)
+        else:
+            pending.append(it)
+    for it in pending:
+        taken = used.setdefault(it["project"], set())
+        seq = max(taken, default=0) + 1
+        taken.add(seq)
+        it["seq"] = seq
+        it["ref"] = f"{it['project']}-{seq}"
     return items
 
 
@@ -1618,8 +1634,8 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
 
 def move(ident: Any, new_project: str) -> Optional[Dict[str, Any]]:
     """Move a ticket to a different queue in place (WT-83): reassigns its ref
-    within the target queue (refs are derived from project+number, see
-    _normalize_items) but preserves status/claim state/notes/history. Avoids
+    within the target queue (next free seq there, persisted; other tickets'
+    refs do not shift, see _normalize_items) but preserves status/claim state/notes/history. Avoids
     the refile-new-ticket + close-original workaround, which churns refs and
     inflates the closed count.
 
