@@ -193,6 +193,10 @@ def _event_summary(event: dict) -> str:
         return f"{name}: {event.get('text') or ''}".rstrip()
     if name == "reopen":
         return f"reopened: {event.get('reason') or ''}".rstrip()
+    if name == "in_review":
+        return f"in review (gates passed; reviewer: {event.get('reviewer') or 'submitter'})"
+    if name == "accept":
+        return "accepted"
     if name == "close":
         res = event.get("resolution") or {}
         summary = res.get("summary") if isinstance(res, dict) else ""
@@ -377,7 +381,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
     if getattr(args, "unresolved", False):
         want = "unresolved"
     if want == "active":
-        items = [i for i in items if i.get("status") in ("open", "in_progress")]
+        items = [i for i in items if i.get("status") in ("open", "in_progress", "in_review")]
     elif want == "blocked":
         items = [i for i in items if i.get("needs_input")]
     elif want == "unresolved":
@@ -408,7 +412,11 @@ def cmd_ls(args: argparse.Namespace) -> int:
         waiting = _waiting_note(it, by_ref)
         if waiting:
             line += f"  [{waiting}]"
-        res = it.get("resolution") if it.get("status") == "closed" else None
+        if it.get("status") == "in_review":
+            line += f"  [gate pending: review by {it.get('gate_pending') or 'submitter'}]"
+        elif it.get("status") == "open" and it.get("gate_feedback"):
+            line += f"  [gate: {_oneline(it['gate_feedback'])[:60]}]"
+        res = it.get("resolution") if it.get("status") in ("closed", "in_review") else None
         if res and res.get("summary"):
             line += f"  — {res['summary']}"
             extras = []
@@ -557,13 +565,17 @@ def cmd_edit(args: argparse.Namespace) -> int:
         except Exception:
             existing = []
         fields["blocked_by"] = existing + [a for a in after if a not in existing]
+    if getattr(args, "clear_gates", False):
+        fields["gates"] = []
+    elif getattr(args, "gate", None):
+        fields["gates"] = list(args.gate)
     new_queue = getattr(args, "queue", None)
     if not fields and new_queue is None:
         print(
             "error: no fields to edit -- pass at least one of "
             "--title/--note/--text/--url/--type/--readiness/--priority/"
             "--value/--confidence/--model-floor/--selector/"
-            "--screenshot-path/--repo-path/--queue/--after/--clear-after",
+            "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates",
             file=sys.stderr,
         )
         return 1
@@ -635,6 +647,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             submitter_explicit=bool((getattr(args, "submitter", "") or "").strip()),
             pre_ack=bool(getattr(args, "pre_ack", False)),
             blocked_by=list(getattr(args, "after", None) or []),
+            gates=list(getattr(args, "gate", None) or []) or None,
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -1088,8 +1101,18 @@ def cmd_close(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
+    if item.get("status") == "open":
+        print(f"GATE FAILED: {item['ref']} reopened -- {item.get('gate_feedback', '')}\n"
+              f"  fix it, then run `wt close {item['ref']} ...` again.", file=sys.stderr)
+        return 1
     res = item.get("resolution") or {}
     summary = res.get("summary", "")
+    if item.get("status") == "in_review":
+        print(f"IN REVIEW: {item['ref']} -- gates passed; awaiting "
+              f"`wt accept` from {item.get('gate_pending') or 'submitter'}"
+              + (f" — {summary}" if summary else ""))
+        _rename_claiming_session(item, summary)
+        return 0
     print(f"CLOSED: {item['ref']}" + (f" — {summary}" if summary else ""))
 
     _rename_claiming_session(item, summary)
@@ -1295,6 +1318,50 @@ def cmd_release(args: argparse.Namespace) -> int:
             )
         return 1
     print(f"RELEASED: {item['ref']} -> open")
+    return 0
+
+
+def cmd_accept(args: argparse.Namespace) -> int:
+    """Accept an in_review ticket (WT-5): it closes and its dependents unblock."""
+    try:
+        item = q.accept(args.ref, by=args.by or "human")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
+    print(f"ACCEPTED: {item['ref']} -> closed")
+    return 0
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    """Reject an in_review ticket: back to open with the reason attached, and
+    the original worker session resumed through the `wt answer` delivery path."""
+    try:
+        item = q.reject(args.ref, args.reason, by=args.by or "human")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+    else:
+        print(f"REJECTED: {item['ref']} -> {item.get('status')} — {args.reason}")
+    if item.get("status") == "in_progress" and item.get("claimed_session_id"):
+        prompt = (
+            f"Your work on ticket {item['ref']} was REJECTED in review: "
+            f"{args.reason}. Address it, then close again with `wt close "
+            f"{item['ref']} --worker <your-id> --summary \"...\" --commit <SHA>` "
+            f"(or `--no-code`)."
+        )
+        return _deliver_to_blocked_session(item, args.reason, prompt,
+                                           args.engine, item.get("claimed_by") or "")
     return 0
 
 
@@ -3212,6 +3279,13 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
         changed.append(f"grace_s={config.grace_s(args.queue)}")
+    if getattr(args, "gate", None) is not None:
+        try:
+            config.set_gates(args.queue, [] if args.gate == ["none"] else args.gate)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        changed.append(f"gates={config.gates(args.queue) or 'none'}")
     if getattr(args, "product_gate", None) is not None:
         enabled = args.product_gate == "on"
         if enabled and config.backend(args.queue) == "github":
@@ -4267,6 +4341,8 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Worker protocol", "claim"),
     ("Worker protocol", "release"),
     ("Worker protocol", "reopen"),
+    ("Tickets", "accept"),
+    ("Tickets", "reject"),
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
@@ -4283,6 +4359,8 @@ COMMAND_HELP: Dict[str, str] = {
     "edit": "patch fields (title/priority/type/readiness/...) on an existing ticket",
     "claim": "claim next open ticket (smart sort: priority + type + age)",
     "release": "give up a claim without closing it; returns the ticket to open",
+    "accept": "accept an in_review ticket (closes it, unblocks dependents)",
+    "reject": "reject an in_review ticket back to open and resume its worker",
     "reopen": "reopen a closed ticket, returning it to the open pool (no dispatch)",
     "close": "close a ticket (record how you fixed it)",
     "unresolved-ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
@@ -4495,9 +4573,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--status",
         default="active",
-        choices=["active", "open", "in_progress", "blocked", "closed",
+        choices=["active", "open", "in_progress", "in_review", "blocked", "closed",
                  "unresolved", "all"],
-        help="which tickets to show (default: active = open + in_progress; "
+        help="which tickets to show (default: active = open + in_progress + in_review; "
              "blocked = parked for human input; unresolved = closed with "
              "unresolved items flagged in the resolution)",
     )
@@ -4574,6 +4652,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--after", action="append", default=None, metavar="REF",
                    help="this ticket is not claimable until REF closes as "
                         "completed (repeatable)")
+    s.add_argument("--gate", action="append", default=None, metavar="GATE",
+                   help="acceptance gate (repeatable, ordered; overrides the "
+                        "queue's): cmd:<command>, review or review:<target>")
     s.add_argument("--claim", action="store_true",
                    help="immediately claim the new ticket (mark in_progress) so no "
                         "auto-drain worker picks it up; use when you're already working it")
@@ -4635,6 +4716,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "closes as completed (repeatable)")
     s.add_argument("--clear-after", action="store_true", dest="clear_after",
                    help="remove all blockers from this ticket")
+    s.add_argument("--gate", action="append", default=None, metavar="GATE",
+                   help="per-ticket acceptance gate (repeatable, ordered; "
+                        "overrides the queue's): cmd:<command>, review or "
+                        "review:<target>")
+    s.add_argument("--clear-gates", action="store_true", dest="clear_gates",
+                   help="drop this ticket's gate override (an empty override "
+                        "= no gates; use --gate to set one)")
     s.add_argument("--queue", default=None,
                    help="move the ticket to a different queue in place, "
                         "reassigning its ref (WT-83); file-backed queues only")
@@ -4734,6 +4822,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "prefer `wt answer` to resolve a block")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_release)
+
+    s = sub.add_parser("accept", help=COMMAND_HELP.get("accept", ""))
+    s.add_argument("ref")
+    s.add_argument("--by", default="", help="who accepted (default: human)")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_accept)
+
+    s = sub.add_parser("reject", help=COMMAND_HELP.get("reject", ""))
+    s.add_argument("ref")
+    s.add_argument("--reason", required=True, help="what must change")
+    s.add_argument("--by", default="", help="who rejected (default: human)")
+    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
+                   help="override the resumed session's engine")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_reject)
 
     s = sub.add_parser("reopen", help=COMMAND_HELP.get("reopen", ""))
     s.add_argument("ref")
@@ -5184,6 +5289,10 @@ def build_parser() -> argparse.ArgumentParser:
                        "immediately. Gives a human time to label a ticket "
                        "watchtower:no-auto-drain; pressing run ignores it."
                    ))
+    s.add_argument("--gate", action="append", default=None, metavar="GATE",
+                   help="queue default acceptance gate (repeatable, ordered): "
+                        "cmd:<command>, review or review:<target>; "
+                        "--gate none clears them")
     s.add_argument("--product-gate", default=None, choices=["on", "off"],
                    dest="product_gate",
                    help="on = workers must get a human Ack (wt ack) after a "

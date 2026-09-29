@@ -459,6 +459,24 @@ def set_product_gate(queue: str, enabled: bool) -> Dict[str, Any]:
     return q
 
 
+def set_gates(queue: str, gates: List[str]) -> Dict[str, Any]:
+    """Set this queue's default acceptance gates (WT-5); [] clears them."""
+    from . import queue as _q
+    data = _load()
+    entry = data.setdefault(queue, {})
+    clean = _q.validate_gates(gates)
+    if clean:
+        entry["gates"] = clean
+    else:
+        entry.pop("gates", None)
+    _save(data)
+    return entry
+
+
+def gates(queue: str) -> List[str]:
+    return list(_queue_entry(queue).get("gates") or [])
+
+
 def product_gate(queue: str) -> bool:
     """False unless explicitly opted in. When on, workers must post a
     decision-grade pitch (wt block --kind rationale) and wait for a human

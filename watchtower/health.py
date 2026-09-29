@@ -200,6 +200,7 @@ def queue_status(
         "claimable_depth": claimable_depth,
         "blocked": sum(1 for it in open_items if it.get("ref") in (waiting_refs or ())),
         "in_progress": len(in_progress),
+        "in_review": sum(1 for it in items if it.get("status") == "in_review"),
         "closed": len(closed),
         "oldest_open_age_s": oldest_open_age,
         "oldest_open_age": _fmt_age(oldest_open_age),

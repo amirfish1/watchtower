@@ -81,6 +81,7 @@ import json
 import os
 import re as _re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -105,7 +106,7 @@ try:  # POSIX cross-process locking; degrade gracefully if unavailable.
 except Exception:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore
 
-VALID_STATUSES = ("open", "in_progress", "closed")
+VALID_STATUSES = ("open", "in_progress", "in_review", "closed")
 VALID_LANES = ("normal", "express")
 
 VALID_ITEM_TYPES = ("bug", "feature", "")
@@ -1159,6 +1160,7 @@ _NOTIFY_VERBS = {
     "closed": "closed",
     "needs_input": "needs input",
     "awaits_decision": "awaits product decision",
+    "in_review": "awaits review",
 }
 
 
@@ -1328,6 +1330,7 @@ def enqueue(
     submitter_explicit: bool = False,
     pre_ack: bool = False,
     blocked_by: Optional[List[str]] = None,
+    gates: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
 
@@ -1419,6 +1422,7 @@ def enqueue(
             "run_requested": False,
             "pre_ack": bool(pre_ack),
             "blocked_by": blockers,
+            **({"gates": validate_gates(gates)} if gates else {}),
             "submitter": str(submitter or ""),
             "submitter_explicit": bool(submitter_explicit),
             "claimed_by": None,
@@ -1618,13 +1622,16 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
-        "needs_input", "block_question", "model_floor", "blocked_by",
+        "needs_input", "block_question", "model_floor", "blocked_by", "gates",
     })
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
                 now = _now_iso()
+                if "gates" in fields:
+                    fields = dict(fields)
+                    fields["gates"] = validate_gates(fields["gates"])
                 if "blocked_by" in fields:
                     fields = dict(fields)
                     fields["blocked_by"] = _validate_blocked_by(
@@ -2320,8 +2327,15 @@ def update_status(
     reason: str = "",
     expect_owner: str = "",
     by_kind: str = "worker",
+    hold_review: str = "",
+    extras: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """``require_status``, when set, makes this a compare-and-swap: the
+    """``hold_review`` (close only, WT-5): land the ticket in ``in_review``
+    instead of ``closed`` -- the same close bookkeeping runs, but it does not
+    count as done until ``accept``. ``extras`` are extra ticket fields
+    (gate results) written in the same locked step.
+
+    ``require_status``, when set, makes this a compare-and-swap: the
     transition is only applied if the item's *current* status (read fresh,
     inside the lock) still matches. Without it, a caller that decided to
     transition an item based on a stale snapshot (e.g. the orphan-ticket
@@ -2470,6 +2484,14 @@ def update_status(
                         at=now,
                         resolution=norm,
                     )
+                    if hold_review:
+                        it["status"] = "in_review"
+                        it["closed_at"] = None
+                        it["gate_pending"] = hold_review
+                        _append_history(it, "in_review", by=_by("system"), at=now,
+                                        reviewer=hold_review)
+                if extras:
+                    it.update(extras)
                 if status == "open":
                     it["claimed_by"] = None
                     it["claimed_machine"] = None
@@ -2482,6 +2504,7 @@ def update_status(
                     it.pop("closed_by", None)
                     it.pop("closed_machine", None)
                     it.pop("resolution", None)
+                    it.pop("gate_pending", None)
                     # Keep claimed_session_id: reopening drops the claim *lock*
                     # (so a new worker can claim) but preserves the handle to the
                     # session that last worked this ticket, so `wt discuss` can
@@ -2496,7 +2519,7 @@ def update_status(
                     _append_history(it, "reopen", by=_by(by_kind, str(session_id or ""), str(real_sid or "")), at=now, reason=_clip(reason, 4000))
                 _save_unlocked(data)
                 verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
-                verb = verbs.get(status, status.upper())
+                verb = "REVIEW" if it.get("status") == "in_review" else verbs.get(status, status.upper())
                 summary = ""
                 if status == "closed":
                     res = it.get("resolution") or {}
@@ -2513,6 +2536,217 @@ def update_status(
                     _log(verb, detail, queue=it.get('project', ''))
                 return it
     return None
+
+
+# --- Acceptance gates (WT-5) -------------------------------------------------
+# A gate list is ordered; kinds: ``cmd:<command>`` (WT runs it in the ticket's
+# repo at the closing commit -- the worker cannot self-report a pass),
+# ``review`` / ``review:<target>`` (the submitter, or <target>, must
+# ``wt accept`` / ``wt reject``). cmd gates run first; review fires only once
+# every cmd gate has passed.
+GATE_OUTPUT_TAIL = 2000
+GATE_CMD_TIMEOUT_S = 900
+
+
+def validate_gates(gates: Any) -> List[str]:
+    """Normalise a gate list (or a comma-free list of strings); raises
+    ValueError on an unknown kind or an empty ``cmd:``."""
+    if isinstance(gates, str):
+        gates = [gates]
+    out: List[str] = []
+    for raw in gates or []:
+        g = str(raw or "").strip()
+        if not g:
+            continue
+        if g.startswith("cmd:"):
+            if not g[4:].strip():
+                raise ValueError("gate 'cmd:' needs a command, e.g. cmd:pytest -q")
+            g = "cmd:" + g[4:].strip()
+        elif g != "review" and not (g.startswith("review:") and g[7:].strip()):
+            raise ValueError(
+                f"unknown gate {g!r}: use cmd:<command>, review or review:<target>"
+            )
+        out.append(g)
+    return out
+
+
+def effective_gates(item: Dict[str, Any]) -> List[str]:
+    """Per-ticket ``gates`` override the queue's ``wt config --gate`` list."""
+    if item.get("gates") is not None:
+        return list(item.get("gates") or [])
+    try:
+        from . import config as _config
+        return list(_config.gates(str(item.get("project") or "")))
+    except Exception:
+        return []
+
+
+def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str) -> Dict[str, Any]:
+    """Run one cmd gate; at the closing commit when it differs from the repo's
+    checked-out HEAD (via a throwaway detached worktree)."""
+    import shutil
+    import subprocess
+    import tempfile
+    cwd = os.path.expanduser(repo_path) if repo_path else os.getcwd()
+    tmp = ""
+    started = time.time()
+    try:
+        if commit and repo_path and os.path.isdir(cwd):
+            head = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
+                                  capture_output=True, text=True).stdout.strip()
+            full = subprocess.run(["git", "-C", cwd, "rev-parse", commit],
+                                  capture_output=True, text=True).stdout.strip()
+            if full and head and full != head:
+                tmp = tempfile.mkdtemp(prefix="wt-gate-")
+                add = subprocess.run(
+                    ["git", "-C", cwd, "worktree", "add", "--detach", tmp, full],
+                    capture_output=True, text=True)
+                if add.returncode == 0:
+                    cwd = tmp
+                else:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                    tmp = ""
+        env = dict(os.environ, WT_GATE_COMMIT=commit or "", WT_TICKET_REF=ref)
+        try:
+            proc = subprocess.run(command, shell=True, cwd=cwd, env=env,
+                                  capture_output=True, text=True,
+                                  timeout=GATE_CMD_TIMEOUT_S)
+            ok, out = proc.returncode == 0, (proc.stdout or "") + (proc.stderr or "")
+            code = proc.returncode
+        except subprocess.TimeoutExpired:
+            ok, out, code = False, f"timed out after {GATE_CMD_TIMEOUT_S}s", -1
+        except OSError as exc:
+            ok, out, code = False, str(exc), -1
+    finally:
+        if tmp:
+            subprocess.run(["git", "-C", os.path.expanduser(repo_path), "worktree",
+                            "remove", "--force", tmp], capture_output=True)
+            shutil.rmtree(tmp, ignore_errors=True)
+    return {"gate": "cmd:" + command, "passed": ok, "exit_code": code,
+            "output_tail": out[-GATE_OUTPUT_TAIL:], "commit": commit or "",
+            "at": _now_iso(), "seconds": round(time.time() - started, 1)}
+
+
+def evaluate_gates(item: Dict[str, Any], commit: str = "") -> Tuple[List[Dict[str, Any]], str]:
+    """Run the cmd gates in order, stopping at the first failure. Returns
+    ``(results, reviewer)``: ``reviewer`` is "" or the ``review`` target
+    (``"submitter"`` for a bare ``review``) still owed once all cmd gates
+    passed. A failed result has ``passed`` False."""
+    results: List[Dict[str, Any]] = []
+    reviewer = ""
+    gates = effective_gates(item)
+    for g in gates:
+        if g.startswith("cmd:"):
+            r = _run_cmd_gate(g[4:], str(item.get("repo_path") or ""), commit,
+                              str(item.get("ref") or ""))
+            results.append(r)
+            if not r["passed"]:
+                return results, ""
+    for g in gates:
+        if g == "review" or g.startswith("review:"):
+            reviewer = g[7:].strip() if g.startswith("review:") else "submitter"
+            break
+    return results, reviewer
+
+
+def _reviewer_target(item: Dict[str, Any], reviewer: str) -> str:
+    return str(item.get("submitter") or "") if reviewer == "submitter" else reviewer
+
+
+def _dependents_of(ref: str) -> List[str]:
+    try:
+        return [str(i.get("ref")) for i in list_items(fresh=True)
+                if ref in (i.get("blocked_by") or []) and i.get("status") != "closed"]
+    except Exception:
+        return []
+
+
+def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any) -> None:
+    target = _reviewer_target(item, reviewer)
+    ref = str(item.get("ref") or "?")
+    if not target:
+        return
+    res = item.get("resolution") or {}
+    deps = _dependents_of(ref)
+    text = (f"[watchtower] {ref} awaits your review -- "
+            f"{_clip(str(res.get('summary') or item.get('title') or ''), 200)}. "
+            f"Run `wt accept {ref}` or `wt reject {ref} --reason \"...\"`."
+            + (f" Accepting unblocks: {', '.join(deps)}." if deps else ""))
+    try:
+        from . import messages
+        if target not in _actor_identities(actor):
+            messages.send(messages.ccc_forward_target(target) or target, text, notify=True)
+    except Exception:
+        pass
+
+
+def accept(ident: Any, by: str = "human") -> Optional[Dict[str, Any]]:
+    """Accept an ``in_review`` ticket: it becomes ``closed`` (its dependents
+    unblock). Raises ValueError when it is not awaiting review."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                if it.get("status") != "in_review":
+                    raise ValueError(f"{it.get('ref', ident)} is {it.get('status')}, "
+                                     "not in_review -- nothing to accept")
+                now = _now_iso()
+                it["status"] = "closed"
+                it["closed_at"] = now
+                it["updated_at"] = now
+                it.pop("gate_pending", None)
+                it["gate_accepted_by"] = str(by)
+                _append_history(it, "accept", by=_by("human", str(by)), at=now)
+                _escalate_stuck_blockers(data["items"])
+                _save_unlocked(data)
+                item = it
+                break
+        else:
+            return None
+    _log("ACCEPT", f"{item.get('ref', '?')}", queue=item.get("project", ""))
+    res = item.get("resolution") or {}
+    _notify_ticket_event(item, "closed", detail=res.get("summary", "") if isinstance(res, dict) else "",
+                         actor=by)
+    return item
+
+
+def reject(ident: Any, reason: str, by: str = "human") -> Optional[Dict[str, Any]]:
+    """Reject an ``in_review`` ticket: back to ``open`` with ``reason`` kept
+    on ``gate_feedback`` (the caller resumes the original session)."""
+    if not str(reason or "").strip():
+        raise ValueError("reject needs a --reason")
+    current = get(ident)
+    if current is None:
+        return None
+    if current.get("status") != "in_review":
+        raise ValueError(f"{current.get('ref', ident)} is {current.get('status')}, "
+                         "not in_review -- nothing to reject")
+    why = f"rejected by {by}: {reason}"
+    sid = str(current.get("claimed_session_id") or "")
+    if sid and _github_backend_for_project(_project_from_ident(ident)) is None:
+        # Re-bind to the original worker session atomically (never claimable
+        # by another worker in between); the CLI then resumes it.
+        item = reopen_and_claim(ident, sid, session_uuid=sid, reason=why)
+        if item is None:
+            return None
+        with _FileLock(_lock_path()):
+            data = _load_unlocked()
+            for it in data["items"]:
+                if _matches(it, ident):
+                    it.pop("gate_pending", None)
+                    it["gate_feedback"] = _clip(why, 4000)
+                    _save_unlocked(data)
+                    return it
+        return item
+    return _reopen_with_feedback(ident, why, [], by_kind="human")
+
+
+def _reopen_with_feedback(ident: Any, reason: str, results: List[Dict[str, Any]],
+                          by_kind: str = "worker") -> Optional[Dict[str, Any]]:
+    item = update_status(ident, "open", reason=reason, by_kind=by_kind,
+                         extras={"gate_feedback": _clip(reason, 4000),
+                                 "gate_results": results})
+    return item
 
 
 def close(
@@ -2555,10 +2789,28 @@ def close(
                     f"rationale --question \"<pitch>\"`. (--force overrides "
                     f"deliberately.)"
                 )
+    hold_review, extras = "", None
+    if not force and _github_backend_for_project(_project_from_ident(ident)) is None:
+        current = get(ident)
+        if current is not None and current.get("status") != "closed" and effective_gates(current):
+            norm = _normalize_resolution(resolution) or {}
+            results, reviewer = evaluate_gates(current, str(norm.get("commit") or ""))
+            failed = [r for r in results if not r["passed"]]
+            if failed:
+                f = failed[0]
+                why = (f"gate {f['gate']} failed (exit {f['exit_code']}): "
+                       f"{f['output_tail'][-600:].strip()}")
+                return _reopen_with_feedback(ident, why, results)
+            extras = {"gate_results": results}
+            hold_review = reviewer
     item = update_status(
         ident, "closed", session_id, session_uuid=session_uuid, resolution=resolution,
         expect_owner="" if force else str(session_id or ""),
+        hold_review=hold_review, extras=extras,
     )
+    if item and item.get("status") == "in_review":
+        _notify_review(item, hold_review, session_id)
+        return item
     if item and item.get("status") == "closed":
         try:
             with _FileLock(_lock_path()):
