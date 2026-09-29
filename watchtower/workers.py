@@ -694,6 +694,11 @@ def worker_turn_open(w: Dict[str, Any]) -> bool:
                 event_type = ev.get("type")
                 if event_type == "result":
                     turn_open = False
+                elif ev.get("parent_tool_use_id"):
+                    # A background subagent's own messages; they keep
+                    # streaming after the main turn's result and must not
+                    # re-open it (queued input would be held for hours).
+                    continue
                 elif event_type in ("assistant", "user", "stream_event"):
                     turn_open = True
                 elif (
