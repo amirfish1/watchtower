@@ -3803,6 +3803,40 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+def read_exit_file(path: str) -> Dict[str, Any]:
+    """The wrapper's exit record (``ended_at``, ``rc``, ``signal``), or {}."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def record_liveness(rec: Dict[str, Any], exit_file: str = "") -> Tuple[str, str, Dict[str, Any]]:
+    """``('alive'|'dead', reason, extra)`` for one worker record or a ticket's
+    ``claim_proc`` (WT-31): dead on the exit file's ``ended_at``, a gone pid,
+    or a reused pid (start-token mismatch). A listed record's ``alive`` flag
+    is trusted; a bare ``claim_proc`` is probed. ``extra`` carries rc/signal
+    and ``ended_at`` when the exit file has them."""
+    exit_info = read_exit_file(str(rec.get("exit_file") or exit_file or ""))
+    if exit_info.get("ended_at"):
+        rc, sig = exit_info.get("rc"), int(exit_info.get("signal") or 0)
+        why = (f"killed by signal {sig}" if sig else
+               "exited without submitting" if not rc else f"exited rc {rc}")
+        return "dead", why, {"rc": rc, "signal": sig, "ended_at": exit_info["ended_at"]}
+    alive = rec["alive"] if "alive" in rec else _pid_alive(int(rec.get("pid") or 0))
+    if not alive:
+        return "dead", "process gone" + (" (wrapper missing ended_at: killed along with it)"
+                                         if exit_info else ""), {}
+    token = str(rec.get("pid_started") or "")
+    if token:
+        cur = _pid_start_token(int(rec.get("pid") or 0))
+        if cur and cur != token:
+            return "dead", "pid reused (start token mismatch)", {}
+    return "alive", "", {}
+
+
 def _find_engine_ancestor_pid(engine: str, max_depth: int = 8) -> int:
     """Return the nearest live agent CLI ancestor of the current process."""
     expected = str(engine or "").strip().lower()

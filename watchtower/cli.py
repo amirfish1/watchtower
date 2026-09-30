@@ -2296,6 +2296,7 @@ def cmd_reopen(args: argparse.Namespace) -> int:
                 reason=args.reason, force=args.force,
                 sent_back_reason=str(args.resume or ""),
                 sent_back_by=str(args.worker or "client"),
+                claim_proc=q._inheritable_proc(item, str(sid)),
             )
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)

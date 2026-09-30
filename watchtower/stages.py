@@ -255,12 +255,7 @@ def _legacy_meta(item: Dict[str, Any], role: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------- liveness
 
 def _read_exit(path: str) -> Dict[str, Any]:
-    try:
-        with open(path) as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+    return workers.read_exit_file(path)
 
 
 def _activity_mtime(rec: Dict[str, Any]) -> float:
@@ -316,23 +311,13 @@ def _check_session(item: Dict[str, Any], ss: Dict[str, Any],
             return "alive", "", {}
         return "dead", ("worker record gone (pre-supervision spawn)" if adopted
                         else "worker record gone"), {}
-    exit_info = _read_exit(str(rec.get("exit_file") or ss.get("exit_file") or ""))
-    if exit_info.get("ended_at"):
-        rc, sig = exit_info.get("rc"), int(exit_info.get("signal") or 0)
-        why = (f"killed by signal {sig}" if sig else
-               "exited without submitting" if not rc else f"exited rc {rc}")
-        facts = _log_facts(rec)
-        return "dead", why + (f"; {facts}" if facts else ""), {"rc": rc, "signal": sig}
-    if not rec.get("alive"):
-        why = "process gone" + (" (wrapper missing ended_at: killed along with it)"
-                                if exit_info else "")
-        facts = _log_facts(rec)
-        return "dead", why + (f"; {facts}" if facts else ""), {}
-    token = str(rec.get("pid_started") or "")
-    if token:
-        cur = workers._pid_start_token(int(rec.get("pid") or 0))
-        if cur and cur != token:
-            return "dead", "pid reused (start token mismatch)", {}
+    state, why, extra = workers.record_liveness(dict(rec, alive=bool(rec.get("alive"))),
+                                                str(ss.get("exit_file") or ""))
+    if state == "dead":
+        if "pid reused" not in why:
+            facts = _log_facts(rec)
+            why += f"; {facts}" if facts else ""
+        return "dead", why, {k: v for k, v in extra.items() if k in ("rc", "signal")}
     spawned = _parse_iso(rec.get("started_at")) or _parse_iso(ss.get("spawned_at"))
     age = now - spawned if spawned else 0
     if max_age_s() > 0 and spawned and age >= max_age_s():
@@ -358,14 +343,7 @@ def session_alive(worker_id: str) -> bool:
         return False
     if rec is None or not rec.get("alive"):
         return False
-    if _read_exit(str(rec.get("exit_file") or "")).get("ended_at"):
-        return False
-    token = str(rec.get("pid_started") or "")
-    if token:
-        cur = workers._pid_start_token(int(rec.get("pid") or 0))
-        if cur and cur != token:
-            return False
-    return True
+    return workers.record_liveness(rec)[0] == "alive"
 
 
 def _kill(pid: int) -> None:

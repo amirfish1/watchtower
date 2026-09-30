@@ -2275,6 +2275,7 @@ def claim_next(
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
         _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
+        item["claim_proc"] = _claim_proc_for(session_id, real_sid or "")
         _bind_pending_unlocked(item, str(session_id), str(real_sid or ""), item["claimed_at"])
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
@@ -2360,6 +2361,7 @@ def claim_by_ref(
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
         _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
+        item["claim_proc"] = _claim_proc_for(session_id, real_sid or "")
         _bind_pending_unlocked(item, str(session_id), str(real_sid or ""), item["claimed_at"])
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
@@ -2633,7 +2635,10 @@ def update_status(
                     it["claimed_at"] = now
                     if real_sid:
                         it["claimed_session_id"] = real_sid
+                    it["claim_proc"] = _claim_proc_for(session_id, real_sid or "")
                     _append_history(it, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=now)
+                if status == "closed" and not hold_review:
+                    _drop_claim_proc_unlocked(it)   # hold_review keeps it (WT-30)
                 if status == "closed":
                     it["closed_at"] = now
                     it["needs_input"] = False  # a closed ticket isn't waiting
@@ -2701,6 +2706,7 @@ def update_status(
                     it["claimed_machine"] = None
                     it["claimed_at"] = None
                     it["closed_at"] = None
+                    _drop_claim_proc_unlocked(it)
                     # Back to the pool: the stale close attribution and
                     # resolution must not survive on a claimable ticket
                     # (parity with the GitHub backend's reopen, which pops
@@ -3417,6 +3423,7 @@ def accept(ident: Any, by: str = "human", force: bool = False) -> Optional[Dict[
                 it["updated_at"] = now
                 it.pop("gate_pending", None)
                 it.pop("gate_stages", None)
+                _drop_claim_proc_unlocked(it)
                 it["gate_accepted_by"] = str(by)
                 _append_history(it, "accept", by=_by("human", str(by)), at=now)
                 _escalate_stuck_blockers(data["items"])
@@ -3489,9 +3496,12 @@ def reject_with(ident: Any, why: str, by_label: str = "human",
         # WT-30 D1: keep the ORIGINAL claimer (worker id) so the orphan sweep
         # can tell a spawned builder from an ambient session; the session id
         # rides in claimed_session_id.
+        # WT-31: the re-bind inherits the builder's process (kept through
+        # hold_review), so its death is provable even after its record is pruned.
         item = reopen_and_claim(ident, str(current.get("claimed_by") or sid),
                                 session_uuid=sid, reason=why,
-                                sent_back_reason=why, sent_back_by=by_label)
+                                sent_back_reason=why, sent_back_by=by_label,
+                                claim_proc=_inheritable_proc(current, sid))
         if item is None:
             return None
         with _FileLock(_lock_path()):
@@ -4265,9 +4275,13 @@ def reopen_and_claim(
     force: bool = False,
     sent_back_reason: str = "",
     sent_back_by: str = "",
+    claim_proc: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """``sent_back_reason`` / ``sent_back_by`` (WT-34): mark the re-bound claim
     as sent back (see ``_sent_back_held_unlocked``), file store only.
+
+    ``claim_proc`` (WT-31): the prior claim's process record; the re-bind
+    inherits it (``bound: inherited``). Without it the claim binds fresh.
 
     Reopen a closed/blocked ticket and claim it under ``session_id`` in one
     lock acquisition -- the re-entry re-bind primitive for same-topic routing
@@ -4348,6 +4362,8 @@ def reopen_and_claim(
                 it["claimed_session_id"] = real_sid
             it["claimed_at"] = now
             it["updated_at"] = now
+            it["claim_proc"] = (dict(claim_proc, bound="inherited") if claim_proc
+                                else _claim_proc_for(session_id, real_sid or ""))
             _append_history(
                 it, "claim",
                 by=_by("worker", str(session_id), str(real_sid or "")),
@@ -4725,6 +4741,7 @@ def release_stalled_sent_back(now: Optional[float] = None) -> List[Dict[str, Any
             it["claimed_at"] = None
             it.pop("claimed_session_id", None)  # identity lives in sent_back_released
             it["updated_at"] = at
+            _drop_claim_proc_unlocked(it)
             it.pop("resume", None)
             it.pop("sent_back", None)
             _append_history(it, "sent_back_release", by=_by("system"), at=at, reason=reason)
@@ -4781,6 +4798,66 @@ def _close_owner_guard_unlocked(it: Dict[str, Any], ident: Any, owner: str,
             f"`wt claim {ref_label} --worker {owner}` to take it back; do not "
             "close it without claiming. Pass --force to override deliberately."
         )
+
+
+# --- Claim process binding (WT-31) --------------------------------------------
+# ``claim_proc`` records, in the claim's own lock, which process the claim is
+# bound to, so liveness.claim_owner can prove the claimant dead from the
+# stored pid / start token / exit file even after workers.json prunes the
+# record. ``bound``: ``record`` (a WT worker record), ``ambient`` (no record:
+# never judged dead), ``inherited`` (a re-bind carrying the prior process).
+
+def _claim_proc_from_record(rec: Dict[str, Any], session_id: str, bound: str) -> Dict[str, Any]:
+    return {"worker_id": str(rec.get("worker_id") or ""),
+            "session_id": str(session_id or rec.get("session_id") or ""),
+            "engine": str(rec.get("engine") or ""), "pid": int(rec.get("pid") or 0),
+            "pid_started": str(rec.get("pid_started") or ""),
+            "exit_file": str(rec.get("exit_file") or ""),
+            "record_started_at": str(rec.get("started_at") or ""), "bound": bound}
+
+
+def _claim_proc_for(claimer: Any, session_id: Any = "") -> Dict[str, Any]:
+    """A fresh ``claim_proc`` for ``claimer`` (worker id, or a session uuid
+    mapped through the origin ledger)."""
+    claimer, sid = str(claimer or ""), str(session_id or "")
+    try:
+        from . import workers as _workers
+        rows = [w for w in _workers._load().get("workers", []) if isinstance(w, dict)]
+    except Exception:  # noqa: BLE001
+        rows = []
+    wid = claimer
+    if claimer and not any(str(w.get("worker_id") or "") == claimer for w in rows):
+        try:
+            from . import origins as _origins
+            wid = str((_origins.get(claimer) or {}).get("worker_id") or "") or claimer
+        except Exception:  # noqa: BLE001
+            pass
+    rec = next((w for w in reversed(rows) if wid and str(w.get("worker_id") or "") == wid), None)
+    if rec is None and _coerce_session_uuid(claimer):
+        rec = next((w for w in reversed(rows) if str(w.get("session_id") or "") == claimer), None)
+    if rec is None:
+        return {"worker_id": wid, "session_id": sid, "engine": "", "pid": 0,
+                "pid_started": "", "exit_file": "", "record_started_at": "",
+                "bound": "ambient"}
+    return _claim_proc_from_record(rec, sid, "record")
+
+
+def _inheritable_proc(it: Dict[str, Any], session_id: str) -> Optional[Dict[str, Any]]:
+    """The ticket's current (else last) claim process, when it belongs to
+    ``session_id`` -- what a re-bind to that session inherits."""
+    for key in ("claim_proc", "prior_claim_proc"):
+        cp = it.get(key)
+        if isinstance(cp, dict) and (not session_id or not cp.get("session_id")
+                                     or str(cp["session_id"]) == str(session_id)):
+            return dict(cp)
+    return None
+
+
+def _drop_claim_proc_unlocked(it: Dict[str, Any]) -> None:
+    """The claim ended: keep its process as ``prior_claim_proc``."""
+    cp = it.pop("claim_proc", None)
+    if cp:
+        it["prior_claim_proc"] = cp
 
 
 def _affinity_reserved(it: Dict[str, Any], now: float) -> bool:
@@ -5018,10 +5095,13 @@ def _engine_and_transcript(worker_id: str, session_id: str) -> Tuple[str, str]:
 def _park_unlocked(it: Dict[str, Any], worker_id: str, session_id: str, machine: str,
                    now: str, actor: Any, reason: str = "") -> None:
     engine, transcript = _engine_and_transcript(worker_id, session_id)
+    # WT-31: the parked session's process travels with the park (resume_claim
+    # inherits it when that worker is gone).
+    proc = it.pop("claim_proc", None) or _claim_proc_for(worker_id, session_id)
     it["parked"] = {
         "worker_id": worker_id, "session_id": session_id, "machine": machine,
         "engine": engine, "repo_path": it.get("repo_path") or "",
-        "transcript_path": transcript, "at": now,
+        "transcript_path": transcript, "at": now, "proc": proc,
     }
     it["status"] = PARKED_STATUS
     it.pop("resume", None)
@@ -5079,6 +5159,21 @@ def _pa_cas(ident: Any, gen: int, expect_state: Any, expect_status: Any, mutate)
     return None
 
 
+def _resume_proc(parked: Dict[str, Any]) -> Dict[str, Any]:
+    """WT-31: a resume binds fresh when the parked worker's process is still
+    alive, else inherits the process it parked with."""
+    fresh = _claim_proc_for(parked.get("worker_id") or "", parked.get("session_id") or "")
+    prior = parked.get("proc")
+    if fresh.get("bound") == "record":
+        try:
+            from . import workers as _workers
+            if _workers.record_liveness(fresh)[0] == "alive":
+                return fresh
+        except Exception:  # noqa: BLE001
+            pass
+    return dict(prior, bound="inherited") if prior else fresh
+
+
 def resume_claim(ident: Any, gen: int) -> Optional[Dict[str, Any]]:
     """CAS ``awaiting_answer`` -> ``in_progress`` bound to the parked worker
     and session (state ``delivering``). Refuses, in the same lock, when that
@@ -5103,6 +5198,7 @@ def resume_claim(ident: Any, gen: int) -> Optional[Dict[str, Any]]:
             it["claimed_machine"] = parked.get("machine") or machine_tag()
             it["claimed_at"] = now
             it["updated_at"] = now
+            it["claim_proc"] = _resume_proc(parked)
             it.pop("parked", None)
             _pa_set_state(it, pa, "delivering", now)
             pa["route"] = "resume"
@@ -5120,6 +5216,7 @@ def _release_claim_to_open_unlocked(it: Dict[str, Any], now: str, reason: str) -
     it["claimed_by"] = None
     it["claimed_machine"] = None
     it["claimed_at"] = None
+    _drop_claim_proc_unlocked(it)
     it["needs_input"] = False
     it["block_question"] = ""
     it["block_kind"] = ""
@@ -5280,10 +5377,11 @@ def block(
                 if it.get("status") == "open" and not park:
                     it["status"] = "in_progress"
                 if session_id and not park and not was_parked:
+                    real = _coerce_session_uuid(session_id)
                     if not it.get("claimed_by"):
                         it["claimed_by"] = str(session_id)
                         it["claimed_machine"] = machine_tag()
-                    real = _coerce_session_uuid(session_id)
+                        it["claim_proc"] = _claim_proc_for(session_id, real or "")
                     if real and not it.get("claimed_session_id"):
                         it["claimed_session_id"] = real
                 actor = _by("worker", str(session_id), str(_coerce_session_uuid(session_id) or ""))
@@ -5358,6 +5456,7 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     it["claimed_by"] = None
                     it["claimed_machine"] = None
                     it["claimed_at"] = None
+                    _drop_claim_proc_unlocked(it)
                     it["block_question"] = ""
                     it["block_kind"] = ""
                     it["block_commit"] = ""
