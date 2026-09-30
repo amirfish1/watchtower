@@ -121,14 +121,14 @@ def test_legacy_floor_park_is_reopened_without_bumping_the_queue(wt_env):
 
 def test_unapproved_model_pin_is_ignored_and_reported(wt_env, run_cli):
     wt_env.config.set_engine(QUEUE, "codex")
-    wt_env.config.set_model(QUEUE, "gpt-6.1-sol")  # set_model stays permissive
-    assert wt_env.config.model(QUEUE) != "gpt-6.1-sol"
-    assert "gpt-6.1-sol" in wt_env.config.model_pin_warning(QUEUE)
+    wt_env.config.set_model(QUEUE, "gpt-9-imaginary")  # set_model stays permissive
+    assert wt_env.config.model(QUEUE) != "gpt-9-imaginary"
+    assert "gpt-9-imaginary" in wt_env.config.model_pin_warning(QUEUE)
     wt_env.queue.enqueue(note="x", project=QUEUE, source="test")
     res = run_cli("status", "--json")
     row = next(r for r in __import__("json").loads(res.out) if r["queue"] == QUEUE)
     assert row["worker_model"] == wt_env.config.model(QUEUE)
-    assert "gpt-6.1-sol" in row["model_pin_warning"]
+    assert "gpt-9-imaginary" in row["model_pin_warning"]
     wt_env.config.set_model(QUEUE, "gpt-5.5")
     assert wt_env.config.model(QUEUE) == "gpt-5.5"
     assert wt_env.config.model_pin_warning(QUEUE) == ""

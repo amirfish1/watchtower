@@ -38,8 +38,8 @@ def test_blocked_model_still_refused(sources):
 
 def test_new_models_ranked(sources):
     tiers = config.model_floor_tiers()
-    assert "gpt-6.1-sol" in tiers and "claude-fable-5-1" in tiers
-    assert "gpt-6-astra" not in tiers
+    assert "claude-fable-5-1" in tiers
+    assert "gpt-6.1-sol" not in tiers  # codex ids stay unranked
 
 
 def test_missing_sources_fall_back(tmp_path, monkeypatch):

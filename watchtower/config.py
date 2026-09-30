@@ -1107,13 +1107,13 @@ def model_floor_tiers() -> tuple[str, ...]:
     """``MODEL_FLOOR_TIERS`` plus engine-advertised models it doesn't rank yet.
 
     Unranked discovered models are appended above the static ladder, oldest
-    first within an engine (discovered lists run best/newest first), so a new
-    model is ranked instead of failing the floor check.
+    first (discovered lists run best/newest first), so a new model is ranked
+    instead of failing the floor check. Claude only: its ordering is
+    unambiguous, while codex ids have no defined place on the cross-engine
+    ladder and stay unranked (fail closed).
     """
-    extra = []
-    for eng in ("claude", "codex"):
-        extra += [m for m in reversed(list(discovered_models(eng)))
-                  if m not in MODEL_FLOOR_TIERS and not is_blocked_model(m)]
+    extra = [m for m in reversed(list(discovered_models("claude")))
+             if m not in MODEL_FLOOR_TIERS and not is_blocked_model(m)]
     return MODEL_FLOOR_TIERS + tuple(extra)
 
 
