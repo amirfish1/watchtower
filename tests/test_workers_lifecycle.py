@@ -1696,6 +1696,23 @@ def test_claim_empty_queue_surplus_worker_stops(wt, capsys):
     assert json.loads(out) == {"stop": True}
 
 
+def test_claim_surplus_stop_releases_worker(wt, capsys):
+    """WT-17: a surplus STOP must detach the worker from queue staffing, like
+    the reconciler and context-budget stops do. Otherwise the stopped worker
+    stays counted live and keeps receiving new-ticket nudges it refuses, so
+    fresh tickets sit unclaimed with nobody spawned to cover them."""
+    cli = _reloaded_cli(wt)
+    wt.config.set_auto_drain("Q", True)  # desired 1
+    _live_worker(wt, "Q")
+    _live_worker(wt, "Q")
+    cli.cmd_claim(_claim_ns("Q", "q-live-0", json_out=True))
+    assert json.loads(capsys.readouterr().out.strip()) == {"stop": True}
+    assert wt.workers.live_worker_count("Q") == 1
+    stopped = next(w for w in wt.workers.list_workers(prune=False)
+                   if w.get("worker_id") == "q-live-0")
+    assert wt.workers._worker_released(stopped)
+
+
 def test_claim_empty_queue_surplus_worker_stops_text(wt, capsys):
     cli = _reloaded_cli(wt)
     wt.config.set_auto_drain("Q", True)

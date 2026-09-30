@@ -978,6 +978,11 @@ def cmd_claim(args: argparse.Namespace) -> int:
                     else "manual run done — auto-drain off and no "
                          "run-requested ticket left to claim"
                 )
+                # Detach it from staffing like every other STOP path does:
+                # otherwise it stays counted live and keeps getting new-ticket
+                # nudges it (correctly) refuses, and nobody spawns to cover
+                # them (WT-17).
+                workers._mark_worker_released(worker)
                 _log("STOP", f"{worker} — {why}", queue=args.queue)
                 if args.json:
                     print(json.dumps({"stop": True}))
