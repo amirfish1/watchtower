@@ -44,6 +44,18 @@ def fixture_model_catalogs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def hermetic_session_origins(tmp_path, monkeypatch):
+    """WT-27: the origin ledger and spawn-env markers never touch the real
+    ~/.watchtower, and a suite run from inside a worker session does not make
+    every test look like a worker descendant."""
+    from watchtower import origins
+    monkeypatch.setattr(origins, "ORIGINS_FILE", tmp_path / "session-origins.json")
+    for key in (origins.ENV_WORKER, origins.ENV_SESSION, origins.ENV_REF,
+                origins.ENV_QUEUE, origins.ENV_ROLE):
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
     """Keep the real outbox, the real delegate and the real caller identity
     out of every test.
@@ -150,6 +162,7 @@ _ENV_FILES = {
     "WATCHTOWER_LAUNCH_FAILURES_FILE": "launch-failures.json",
     "WATCHTOWER_WORKER_SESSIONS_FILE": "worker-sessions.json",
     "WATCHTOWER_WORKER_IDS_FILE": "worker-ids.json",
+    "WATCHTOWER_SESSION_ORIGINS_FILE": "session-origins.json",
     "WATCHTOWER_CODEX_THREAD_REGISTRY": "codex-threads.json",
     "WATCHTOWER_GH_CONNECTIVITY_FILE": "gh-connectivity.json",
     "WATCHTOWER_GH_LIST_CACHE_FILE": "gh-list-cache.json",

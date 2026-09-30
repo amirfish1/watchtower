@@ -31,6 +31,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
+from . import origins
+
 try:
     import fcntl
 except ImportError:  # pragma: no cover - Windows fallback
@@ -155,7 +157,8 @@ def _worker_runbook_ref() -> str:
     return _WORKER_RUNBOOK_URL
 
 
-def _spawn_env(worker_id: str = "", verify: bool = False) -> Dict[str, str]:
+def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "",
+               ref: str = "", queue: str = "", role: str = "") -> Dict[str, str]:
     """Environment for a spawned worker subprocess.
 
     The child inherits the parent's environment so legitimate overrides
@@ -196,6 +199,15 @@ def _spawn_env(worker_id: str = "", verify: bool = False) -> Dict[str, str]:
         env["WT_WORKER_ID"] = worker_id
     if verify:
         env["WT_VERIFY"] = "1"
+    # WT-27: origin markers. A process started inside this session (a probe, a
+    # test, a helper) reads them via origins.env_parent so its own session can
+    # be badged in CCC with this worker/ticket/role. Stale values never leak.
+    for key in (origins.ENV_SESSION, origins.ENV_REF, origins.ENV_QUEUE, origins.ENV_ROLE):
+        env.pop(key, None)
+    for key, val in ((origins.ENV_SESSION, session_id), (origins.ENV_REF, ref),
+                     (origins.ENV_QUEUE, queue), (origins.ENV_ROLE, role)):
+        if val:
+            env[key] = val
     # Commit attribution: distinct from interactive Hermes on this VM
     # (`Amir Fish (hermes)` / Agent-Machine: hermes).
     env["GIT_AUTHOR_NAME"] = "Amir Fish (watchtower)"
@@ -3919,6 +3931,11 @@ def record_worker(
     _add_worker_id(worker_id)
     # If a session_id is somehow known at record time, ledger it (survives prune).
     _add_worker_session_id(rec.get("session_id", ""))
+    if rec.get("session_id"):
+        origins.note_spawn(
+            rec["session_id"], role=stage or ("adhoc" if kind == "adhoc" else "worker"),
+            ref=ref, queue=ticket_queue or queue, worker_id=worker_id, engine=engine,
+            via="record_worker")
     _upsert_codex_worker_registry(rec)
     return rec
 
@@ -3953,6 +3970,13 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                     backfilled = True
                     # Ledger it so it survives this worker being pruned later.
                     _add_worker_session_id(sid)
+                    origins.note_spawn(
+                        sid, role=str(w.get("stage") or "") or (
+                            "adhoc" if w.get("kind") == "adhoc" else "worker"),
+                        ref=str(w.get("ref") or ""),
+                        queue=str(w.get("ticket_queue") or w.get("queue") or ""),
+                        worker_id=str(w.get("worker_id") or ""),
+                        engine=str(w.get("engine") or ""), via="log_backfill")
                     _upsert_codex_worker_registry(w)
                     # A session means this engine really did launch -- end any
                     # failure streak so the next one starts from the default.
@@ -6617,7 +6641,7 @@ def spawn_workers(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 cwd=repo_path,
-                env=_spawn_env(worker_id),
+                env=_spawn_env(worker_id, role="worker"),
             )
         except OSError as e:
             popen_error = e
@@ -6746,7 +6770,7 @@ def spawn_run_once_worker(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             cwd=repo_path,
-            env=_spawn_env(worker_id),
+            env=_spawn_env(worker_id, role="worker"),
         )
     finally:
         logf.close()
@@ -6861,6 +6885,13 @@ def build_adhoc_command(
                 "--permission-mode", "bypassPermissions"]
         if model:
             argv += ["--model", model]
+        if not session_id and origins.env_parent():
+            # WT-27: a worker (or its descendant) building a claude command
+            # itself -- a probe, a test -- gets a pinned session id plus a
+            # durable origin record, so CCC can badge it.
+            session_id = str(uuid.uuid4())
+            origins.note_spawn(session_id, role="probe", engine="claude",
+                               via="build_adhoc_command")
         if session_id:
             # Plain `-p` text output never names the session, so the log
             # backfill can't ledger it; pin the id instead (CCC-1241).
@@ -6971,7 +7002,9 @@ def spawn_adhoc(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             cwd=repo_path,
-            env=_spawn_env(worker_id, verify=verify),
+            env=_spawn_env(worker_id, verify=verify, session_id=session_id,
+                           ref=ticket_ref, queue=ticket_queue,
+                           role=stage or "adhoc"),
         )
     finally:
         logf.close()
