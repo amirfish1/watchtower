@@ -1048,31 +1048,44 @@ def is_approved_effort(eng: str, model: str, value: str) -> bool:
     return not effort_value or effort_value in approved_efforts(eng, model)
 
 
+def _effort_rejected(eng: str, model_value: str, effort_value: str) -> bool:
+    """True only when a readable catalog lists ``model_value`` and does not
+    offer ``effort_value`` for it. A missing catalog or a model it does not
+    list may just be a stale catalog, so that is never a rejection."""
+    effort_value = str(effort_value or "").strip().lower()
+    canon = canonical_model(eng, model_value)
+    cat = _models.catalog(eng)
+    if not effort_value or not canon or cat is None or canon not in cat:
+        return False
+    return effort_value not in cat[canon]
+
+
+def effort_pin_warning(queue: str) -> str:
+    """Why the queue's pinned effort will be dropped at launch, or ""."""
+    eng = engine(queue)
+    eff = str(_queue_entry(queue).get("effort") or "").strip().lower()
+    mdl = model(queue)
+    if eff and _effort_rejected(eng, mdl, eff):
+        return (f"effort {eff!r} not listed for {mdl!r} in the {eng} catalog; "
+                "kept, but dropped at launch (`wt models --engine "
+                f"{eng}`)")
+    return ""
+
+
 def sanitize_worker_settings(*, log=None) -> List[Dict[str, Any]]:
-    """Drop explicit per-queue efforts the model catalog rejects. Self-heal.
+    """Report (never delete) queue efforts the model catalog rejects.
 
-    Motivation (2026-09-17): a queue pinned to an effort-less model (kimi's
-    pinned models accept no explicit effort) with ``"effort": "high"`` set
-    made every consumer that validates via :func:`is_approved_effort` flag
-    the queue's worker config as permanently invalid, until a human cleared
-    the key by hand. Any such config now heals itself: the daemon runs this
-    at start and hourly.
+    WT-19: this used to pop the key, and a stale catalog made valid pins
+    (VM-NEXT, CHUCK ``effort: medium``) vanish silently. A user pin is now
+    never modified: an unapproved one is kept, surfaced by
+    :func:`effort_pin_warning`, and dropped per launch by
+    :func:`launch_effort`. A missing/stale catalog reports nothing.
 
-    Conservative scope on purpose: ONLY an invalid explicit effort is
-    dropped. The model and engine are left alone -- a model missing from the
-    catalog may be catalog lag, but an invalid effort is silently ignored at
-    spawn anyway, so dropping it loses nothing. Malformed entries (non-dict
-    queue values, unparseable fields) are skipped, never fatal, and the file
-    is written at most once per call, only when something changed.
-
-    ``log`` is an optional callable invoked once per healed queue with a
-    human-readable message. Returns the list of changes:
-    ``{"queue", "dropped_effort", "engine", "model"}``.
+    ``log`` is called once per flagged queue. Returns
+    ``{"queue", "unapproved_effort", "engine", "model"}`` rows.
     """
-    data = _load()
-    changes: List[Dict[str, Any]] = []
-    dirty = False
-    for queue_name, entry in data.items():
+    findings: List[Dict[str, Any]] = []
+    for queue_name, entry in _load().items():
         if not isinstance(entry, dict):
             continue
         effort_value = str(entry.get("effort") or "").strip().lower()
@@ -1081,33 +1094,20 @@ def sanitize_worker_settings(*, log=None) -> List[Dict[str, Any]]:
         try:
             eng = engine(queue_name)
             model_value = str(entry.get("model") or "").strip()
-            approved = is_approved_effort(eng, model_value, effort_value)
+            rejected = _effort_rejected(eng, model_value, effort_value)
         except Exception:
             continue  # a queue we cannot evaluate is left exactly as-is
-        if approved:
+        if not rejected:
             continue
-        entry.pop("effort", None)
-        dirty = True
-        changes.append(
-            {
-                "queue": queue_name,
-                "dropped_effort": effort_value,
-                "engine": eng,
-                "model": model_value,
-            }
-        )
+        findings.append({"queue": queue_name, "unapproved_effort": effort_value,
+                         "engine": eng, "model": model_value})
         if log is not None:
             try:
-                log(
-                    f"queue {queue_name}: dropped invalid effort "
-                    f"{effort_value!r} (engine {eng}, "
-                    f"model {model_value or 'default'})"
-                )
+                log(f"queue {queue_name}: effort {effort_value!r} not listed "
+                    f"for model {model_value!r} (engine {eng}); kept")
             except Exception:
                 pass
-    if dirty:
-        _save(data)
-    return changes
+    return findings
 
 
 def set_desired_workers(queue: str, n: int) -> Dict[str, Any]:

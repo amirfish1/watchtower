@@ -151,6 +151,8 @@ def _print_status(rows: List[dict]) -> None:
             )
             if r.get("model_pin_warning"):
                 print(f"  ⚠ {r['queue']}: {r['model_pin_warning']}")
+            if r.get("effort_pin_warning"):
+                print(f"  ⚠ {r['queue']}: {r['effort_pin_warning']}")
 
     rows_w = workers.list_workers(prune=False)
     workers.annotate_activity(rows_w, q.list_items())
@@ -353,6 +355,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         r["worker_engine"] = _cfg.engine(r["queue"])
         r["worker_model"] = _cfg.model(r["queue"])
         r["model_pin_warning"] = _cfg.model_pin_warning(r["queue"])
+        r["effort_pin_warning"] = _cfg.effort_pin_warning(r["queue"])
         from . import roles as _roles
         r["roles"] = _roles.role_table(r["queue"])
     if args.json:
@@ -3971,21 +3974,13 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
                 last_config_sanitize = now
                 from . import config as _config
                 for change in _config.sanitize_worker_settings():
-                    print(
-                        f"[watchtower] queue {change['queue']}: dropped "
-                        f"invalid effort {change['dropped_effort']!r} "
-                        f"(engine {change['engine']}, "
-                        f"model {change['model'] or 'default'})",
-                        flush=True,
+                    note = (
+                        f"effort {change['unapproved_effort']!r} not listed for "
+                        f"model {change['model'] or 'default'} (engine "
+                        f"{change['engine']}); kept, dropped per launch"
                     )
-                    _q._log(
-                        "WARN",
-                        f"self-heal: dropped invalid effort "
-                        f"{change['dropped_effort']!r} (engine "
-                        f"{change['engine']}, model "
-                        f"{change['model'] or 'default'})",
-                        queue=change["queue"],
-                    )
+                    print(f"[watchtower] queue {change['queue']}: {note}", flush=True)
+                    _q._log("WARN", note, queue=change["queue"])
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] config sanitize failed: {e}", flush=True)
         # Group-chat nudge scheduler: same never-kill-the-loop contract as the

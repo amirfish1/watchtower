@@ -3120,6 +3120,25 @@ def _record_launch_failure(
     return rec
 
 
+def _launch_effort(queue: str, engine: str, model: str, effort: str) -> str:
+    """Per-launch effort: drop a catalog-rejected pin for this launch only (the
+    stored pin stays), with a log line (WT-19)."""
+    if not effort:
+        return effort
+    from . import config
+    if config._effort_rejected(engine, model or config.model(queue), effort):
+        msg = (f"effort {effort!r} not listed for {model or config.model(queue)!r} "
+               f"in the {engine} catalog; launching without it")
+        print(f"[watchtower] {queue}: {msg}", flush=True)
+        try:
+            from .queue import _log
+            _log("WARN", msg, queue=queue)
+        except Exception:
+            pass
+        return ""
+    return effort
+
+
 def _alert_launch_failure_queue(queue: str) -> str:
     """Which queue a spawn-then-die self-report is filed into.
 
@@ -6242,6 +6261,7 @@ def spawn_workers(
             file=sys.stderr, flush=True,
         )
         model = ""
+    effort = _launch_effort(queue, engine, model, effort)
     log_dir = WORKERS_FILE.parent / "logs"
     spawned: List[Dict[str, Any]] = []
     for spawn_index in range(n):
@@ -6420,6 +6440,7 @@ def spawn_run_once_worker(
     effort = config.effort(queue)
     if _is_fable_model(model):
         model = ""
+    effort = _launch_effort(queue, engine, model, effort)
     worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
     goal = run_once_goal(queue, worker_id, ref, repo_path)
     argv = build_drain_command(
