@@ -4123,8 +4123,13 @@ def cmd_config(args: argparse.Namespace) -> int:
         # "why did nothing pick up my new ticket for 3 minutes" has to be
         # answerable from the queue's own config output.
         cfg.setdefault("grace_s", config.grace_s(args.queue))
-        print(f"{args.queue}: {cfg}")
         from . import roles as _roles
+        if getattr(args, "json", False):
+            print(json.dumps({"queue": args.queue, "config": cfg,
+                              "roles": _roles.role_table(args.queue)},
+                             indent=2, sort_keys=True, default=str))
+            return 0
+        print(f"{args.queue}: {cfg}")
         for role, r in _roles.role_table(args.queue).items():
             print(f"  {role:<13} {r['engine']}/{r['model'] or '(engine default)'}  [{r['source']}]")
         eng, mdl = config.engine(args.queue), str(cfg.get("model") or "")
@@ -6325,6 +6330,9 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--json", action="store_true",
+                   help="with no setting flags: print the queue config and "
+                        "role table as JSON")
     s.add_argument("--auto-drain", default=None, choices=["on", "off"],
                    dest="auto_drain",
                    help="on = auto-spawn workers; off = backlog mode")
