@@ -592,8 +592,9 @@ claim keeps it as `prior_claim_proc`. `liveness.claim_owner(item)` answers
    code that makes it impossible. Rows must stay disjoint on reachable states.
 3. A stage row needs its key rule in `prove()`, and `stages.desired()` must
    agree over the whole product (D2.3).
-4. A new dim: add it to `DIMS`, `project()`, every box (`ALL()` fills omitted
-   dims) and `synth()` in `tests/liveness_golden.py`.
+4. A new dim: add it to `DIMS`, `_FROZEN`, `project()` and `synth()` in
+   `tests/liveness_golden.py`; boxes built with `_box()` admit every value of a
+   dim they omit.
 5. A new answer move: declare it in `ANSWER_TRANSITIONS` with its writer. Write
    it only through `pa_transition` / `pa_bump_attempts` with literal
    arguments, or in a function listed in `liveness.PA_INLOCK_WRITERS`; the AST
