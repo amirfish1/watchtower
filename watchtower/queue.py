@@ -1323,6 +1323,8 @@ def enqueue(
     value: str = "",
     confidence: str = "",
     model_floor: str = "",
+    planner_model: str = "",
+    verifier_model: str = "",
     submitter: str = "",
     submitter_explicit: bool = False,
     pre_ack: bool = False,
@@ -1420,6 +1422,8 @@ def enqueue(
             "run_requested": False,
             "pre_ack": bool(pre_ack),
             "blocked_by": blockers,
+            **({"planner_model": str(planner_model).strip()} if str(planner_model or "").strip() else {}),
+            **({"verifier_model": str(verifier_model).strip()} if str(verifier_model or "").strip() else {}),
             **({"gates": validate_gates(gates)} if gates else {}),
             **({"accept": str(accept_line).strip()} if str(accept_line or "").strip() else {}),
             "submitter": str(submitter or ""),
@@ -1622,6 +1626,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
         "needs_input", "block_question", "model_floor", "blocked_by", "gates", "accept",
+        "planner_model", "verifier_model",
     })
     with _FileLock(_lock_path()):
         data = _load_unlocked()
@@ -2741,17 +2746,18 @@ def gate_stage_label(stage: str) -> str:
 
 
 def verifier_target(item: Dict[str, Any]) -> Dict[str, Any]:
-    """Engine/model the verify gate's verifier runs on (WT-6). Precedence, per
-    field: the queue's ``--verifier-engine/--verifier-model`` override, else
-    the claiming worker's recorded engine+model, else the queue's configured
-    engine/model. Returns ``{engine, model, source, blocked}``; ``blocked`` is
-    True when the resolved model is on the policy deny-list (the caller must
-    then not spawn -- never substitute)."""
-    from . import config as _config
+    """Engine/model the verify gate's verifier runs on (WT-6, WT-14): the
+    ``verifier`` role from :func:`roles.effective_role_model` (ticket override,
+    else the queue's ``--verifier-engine/--verifier-model``, else a different
+    family than the builder). The builder is the claiming worker's recorded
+    engine+model when known. Returns ``{engine, model, source, blocked}``;
+    ``blocked`` is True when the resolved model is on the policy deny-list
+    (the caller must then not spawn -- never substitute)."""
+    from . import config as _config, roles as _roles
     queue = str(item.get("project") or "")
-    engine, model, source = "", "", "queue"
+    ticket = dict(item)
     wid = str(item.get("claimed_by") or "")
-    if wid:
+    if wid and not ticket.get("model_floor"):
         try:
             from . import workers as _workers
             rec = next((w for w in _workers._load().get("workers", [])
@@ -2759,21 +2765,10 @@ def verifier_target(item: Dict[str, Any]) -> Dict[str, Any]:
                         and w.get("engine")), None)
         except Exception:
             rec = None
-        if rec:
-            engine, source = str(rec["engine"]), "worker"
-            model = str(rec.get("model") or "")
-    q_engine = _config.engine(queue)
-    if not engine:
-        engine = q_engine
-    if not model and engine == q_engine:
-        model = _config.raw_model(queue)
-    o_eng, o_model = _config.verifier_override(queue)
-    if o_eng or o_model:
-        source = "override"
-        if o_eng and o_eng != engine:
-            engine = o_eng
-            model = ""
-        model = o_model or model
+        if rec and rec.get("model"):
+            # The worker that built it is the builder, whatever the queue says now.
+            ticket["model_floor"] = str(rec["model"])
+    engine, model, source = _roles.effective_role_model(queue, ticket, "verifier")
     model = _config.canonical_model(engine, model) if model else ""
     return {"engine": engine, "model": model, "source": source,
             "blocked": bool(model and _config.is_blocked_model(model))}

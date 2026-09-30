@@ -194,6 +194,7 @@ def vcfg(wt, tmp_path, monkeypatch):
     monkeypatch.setattr(workers, "WORKERS_FILE", tmp_path / "workers.json")
     monkeypatch.setattr(workers, "WORKER_IDS_FILE", tmp_path / "worker-ids.json")
     monkeypatch.setattr(workers, "WORKER_SESSIONS_FILE", tmp_path / "worker-sessions.json")
+    monkeypatch.setattr(workers, "engine_available", lambda e: e in ("codex", "claude"))
     config.set_engine("GT", "codex")
     config.set_model("GT", "gpt-5.5")
     wt.config, wt.workers = config, workers
@@ -210,30 +211,40 @@ def _verify_item(q):
     return q.get(a["ref"])
 
 
-def test_verifier_inherits_queue_engine_model(vcfg):
+def test_verifier_defaults_to_a_different_family_than_the_builder(vcfg):
     t = vcfg.q.verifier_target(_verify_item(vcfg.q))
-    assert (t["engine"], t["model"], t["source"]) == ("codex", "gpt-5.5", "queue")
+    # builder is codex; strongest ranked (priced) claude model in the fixture catalog
+    assert (t["engine"], t["model"], t["source"]) == ("claude", "claude-opus-5-5", "default")
 
 
-def test_claimed_worker_model_beats_queue_config(vcfg):
+def test_claimed_worker_is_the_builder_for_the_default(vcfg):
     q = vcfg.q
     item = _verify_item(q)
     _worker_rec(vcfg, "claude", "claude-sonnet-5")
     t = q.verifier_target(item)
-    assert (t["engine"], t["model"], t["source"]) == ("claude", "claude-sonnet-5", "worker")
+    assert t["engine"] == "codex" and t["source"] == "default"
 
 
-def test_verifier_override_beats_both(vcfg):
+def test_queue_verifier_override_beats_default(vcfg):
     q = vcfg.q
     item = _verify_item(q)
     _worker_rec(vcfg, "claude", "claude-sonnet-5")
     vcfg.config.set_verifier("GT", "codex", "gpt-5.5")
     t = q.verifier_target(item)
-    assert (t["engine"], t["model"], t["source"]) == ("codex", "gpt-5.5", "override")
+    assert (t["engine"], t["model"], t["source"]) == ("codex", "gpt-5.5", "queue")
     assert "codex/gpt-5.5" in q.checks_block(item)
 
 
+def test_ticket_verifier_model_beats_queue_override(vcfg):
+    q = vcfg.q
+    vcfg.config.set_verifier("GT", "codex", "gpt-5.5")
+    item = dict(_verify_item(q), verifier_model="claude-sonnet-5-5")
+    t = q.verifier_target(item)
+    assert (t["engine"], t["model"], t["source"]) == ("claude", "claude-sonnet-5-5", "ticket")
+
+
 def test_blocked_verifier_model_is_flagged_not_substituted(vcfg, monkeypatch):
+    vcfg.config.set_verifier("GT", "codex", "gpt-5.5")
     monkeypatch.setenv("WATCHTOWER_BLOCKED_MODELS", "gpt-5.5")
     t = vcfg.q.verifier_target(_verify_item(vcfg.q))
     assert t["model"] == "gpt-5.5" and t["blocked"] is True
@@ -247,6 +258,7 @@ def test_spawn_verifier_passes_engine_model_and_refuses_blocked(vcfg, monkeypatc
     monkeypatch.setattr(cli.workers, "spawn_adhoc",
                         lambda goal, eng, **kw: calls.append((eng, kw)) or {"worker_id": "v1"})
     cli.q = q
+    vcfg.config.set_verifier("GT", "codex", "gpt-5.5")
     item = _verify_item(q)
     cli._spawn_verifier(item)
     assert calls[0][0] == "codex" and calls[0][1]["model"] == "gpt-5.5"

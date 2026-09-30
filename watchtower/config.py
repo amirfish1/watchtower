@@ -828,31 +828,52 @@ def raw_model(queue: str) -> str:
     return canonical_model(eng, _ccc_worker_model_default(eng) or default_model(eng))
 
 
-def set_verifier(queue: str, eng: Any = None, model_value: Any = None) -> Dict[str, Any]:
-    """Per-queue verify-gate engine/model override (WT-6); "" clears a field,
-    None leaves it. A model is stored canonicalised against the effective
-    verifier engine (blocked models are rejected at spawn, not here)."""
+ROLE_KEYS = ("planner", "plan_reviewer", "verifier")
+
+
+def set_role(queue: str, role: str, eng: Any = None, model_value: Any = None) -> Dict[str, Any]:
+    """Per-queue engine/model override for a non-builder role (WT-6, WT-14);
+    "" clears a field, None leaves it. A model is stored canonicalised against
+    the role's effective engine and must be in that engine's catalog (blocked
+    models are rejected at spawn, not here)."""
+    if role not in ROLE_KEYS:
+        raise ValueError(f"unknown role {role!r}; expected one of {ROLE_KEYS}")
     data = _load()
     q = data.setdefault(queue, {})
     if eng is not None:
         e = str(eng or "").strip().lower()
+        if e and e not in _models.ENGINES:
+            raise ValueError(f"unknown engine {e!r}; expected one of {_models.ENGINES}")
         if e:
-            q["verifier_engine"] = e
+            q[f"{role}_engine"] = e
         else:
-            q.pop("verifier_engine", None)
+            q.pop(f"{role}_engine", None)
     if model_value is not None:
         m = str(model_value or "").strip()
         if m:
-            q["verifier_model"] = canonical_model(q.get("verifier_engine") or engine(queue), m)
+            role_eng = q.get(f"{role}_engine") or engine(queue)
+            m = canonical_model(role_eng, m)
+            if not is_approved_model(role_eng, m):
+                raise ValueError(f"{m!r} is not approved for {role_eng}; "
+                                 f"run `wt models --engine {role_eng}`")
+            q[f"{role}_model"] = m
         else:
-            q.pop("verifier_model", None)
+            q.pop(f"{role}_model", None)
     _save(data)
     return q
 
 
-def verifier_override(queue: str) -> Tuple[str, str]:
+def role_override(queue: str, role: str) -> Tuple[str, str]:
     e = _queue_entry(queue)
-    return str(e.get("verifier_engine") or ""), str(e.get("verifier_model") or "")
+    return str(e.get(f"{role}_engine") or ""), str(e.get(f"{role}_model") or "")
+
+
+def set_verifier(queue: str, eng: Any = None, model_value: Any = None) -> Dict[str, Any]:
+    return set_role(queue, "verifier", eng, model_value)
+
+
+def verifier_override(queue: str) -> Tuple[str, str]:
+    return role_override(queue, "verifier")
 
 
 def model(queue: str) -> str:

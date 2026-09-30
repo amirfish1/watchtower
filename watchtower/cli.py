@@ -353,6 +353,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         r["worker_engine"] = _cfg.engine(r["queue"])
         r["worker_model"] = _cfg.model(r["queue"])
         r["model_pin_warning"] = _cfg.model_pin_warning(r["queue"])
+        from . import roles as _roles
+        r["roles"] = _roles.role_table(r["queue"])
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
@@ -674,11 +676,14 @@ def _bad_model_floor(args: argparse.Namespace) -> bool:
     """Reject a --model-floor no model catalog knows (WT-13; formerly an
     argparse choices list)."""
     from . import config
-    floor = getattr(args, "model_floor", None)
-    if floor and not config.is_valid_model_floor(floor):
-        print(f"error: --model-floor {floor!r} is not a model in any catalog "
-              "(see `wt models --engine <engine>`)", file=sys.stderr)
-        return True
+    for attr, flag in (("model_floor", "--model-floor/--builder-model"),
+                       ("planner_model", "--planner-model"),
+                       ("verifier_model", "--verifier-model")):
+        value = getattr(args, attr, None)
+        if value and not config.is_valid_model_floor(value):
+            print(f"error: {flag} {value!r} is not a model in any catalog "
+                  "(see `wt models --engine <engine>`)", file=sys.stderr)
+            return True
     return False
 
 
@@ -694,8 +699,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
     fields = {}
     for name in (
         "title", "note", "text", "url", "type", "readiness", "priority",
-        "value", "confidence", "model_floor", "selector", "screenshot_path",
-        "repo_path", "accept",
+        "value", "confidence", "model_floor", "planner_model", "verifier_model",
+        "selector", "screenshot_path", "repo_path", "accept",
     ):
         value = getattr(args, name, None)
         if value is not None:
@@ -789,6 +794,8 @@ def cmd_add(args: argparse.Namespace) -> int:
             value=getattr(args, "value", "") or "",
             confidence=getattr(args, "confidence", "") or "",
             model_floor=getattr(args, "model_floor", "") or "",
+            planner_model=getattr(args, "planner_model", "") or "",
+            verifier_model=getattr(args, "verifier_model", "") or "",
             submitter=submitter,
             submitter_explicit=bool((getattr(args, "submitter", "") or "").strip()),
             pre_ack=bool(getattr(args, "pre_ack", False)),
@@ -3516,11 +3523,18 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
         changed.append(f"grace_s={config.grace_s(args.queue)}")
-    if (getattr(args, "verifier_engine", None) is not None
-            or getattr(args, "verifier_model", None) is not None):
-        config.set_verifier(args.queue, args.verifier_engine, args.verifier_model)
-        changed.append("verifier=%s/%s" % (config.verifier_override(args.queue)[0] or "(worker)",
-                                           config.verifier_override(args.queue)[1] or "(worker)"))
+    for role in config.ROLE_KEYS:
+        r_eng = getattr(args, f"{role}_engine", None)
+        r_model = getattr(args, f"{role}_model", None)
+        if r_eng is None and r_model is None:
+            continue
+        try:
+            config.set_role(args.queue, role, r_eng, r_model)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        r = config.role_override(args.queue, role)
+        changed.append("%s=%s/%s" % (role, r[0] or "(default)", r[1] or "(default)"))
     if getattr(args, "gate", None) is not None:
         try:
             config.set_gates(args.queue, [] if args.gate == ["none"] else args.gate)
@@ -3592,6 +3606,9 @@ def cmd_config(args: argparse.Namespace) -> int:
         # answerable from the queue's own config output.
         cfg.setdefault("grace_s", config.grace_s(args.queue))
         print(f"{args.queue}: {cfg}")
+        from . import roles as _roles
+        for role, r in _roles.role_table(args.queue).items():
+            print(f"  {role:<13} {r['engine']}/{r['model'] or '(engine default)'}  [{r['source']}]")
         eng, mdl = config.engine(args.queue), str(cfg.get("model") or "")
         from . import models as _catalogs
         if _catalogs.catalog_warning(eng):
@@ -5034,6 +5051,13 @@ def build_parser() -> argparse.ArgumentParser:
                                help="filer's best-guess minimum model this ticket "
                                     "needs (FEAT-NEXT-120); empty is fine, never a "
                                     "blocker at filing time")
+        subparser.add_argument("--builder-model", default="", dest="model_floor",
+                               help="alias of --model-floor: the builder model this "
+                                    "ticket needs (WT-14)")
+        subparser.add_argument("--planner-model", default="", dest="planner_model",
+                               help="model that plans this ticket (overrides the queue)")
+        subparser.add_argument("--verifier-model", default="", dest="verifier_model",
+                               help="model that verifies this ticket (overrides the queue)")
         subparser.add_argument("--worker", default="",
                                help="worker/owner id to claim under when --claim is "
                                     "set; defaults to wt-cli-<shell> (stable per "
@@ -5112,6 +5136,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--model-floor", default=None, dest="model_floor",
                    help="filer's best-guess minimum model this ticket needs "
                         "(FEAT-NEXT-120)")
+    s.add_argument("--builder-model", default=None, dest="model_floor",
+                   help="alias of --model-floor (WT-14)")
+    s.add_argument("--planner-model", default=None, dest="planner_model",
+                   help="model that plans this ticket; empty clears")
+    s.add_argument("--verifier-model", default=None, dest="verifier_model",
+                   help="model that verifies this ticket; empty clears")
     s.add_argument("--selector", default=None)
     s.add_argument("--screenshot-path", default=None, dest="screenshot_path")
     s.add_argument("--repo-path", default=None, dest="repo_path")
@@ -5711,12 +5741,16 @@ def build_parser() -> argparse.ArgumentParser:
                        "immediately. Gives a human time to label a ticket "
                        "watchtower:no-auto-drain; pressing run ignores it."
                    ))
-    s.add_argument("--verifier-engine", default=None, dest="verifier_engine",
-                   help="engine the verify gate's verifier runs on (default: "
-                        "the worker's own engine); empty string clears")
-    s.add_argument("--verifier-model", default=None, dest="verifier_model",
-                   help="model the verify gate's verifier runs on (default: "
-                        "the worker's own model); empty string clears")
+    for _role, _what, _default in (
+        ("planner", "the planner", "the builder's engine at its strongest ranked model"),
+        ("plan-reviewer", "the plan reviewer", "a different engine family than the builder"),
+        ("verifier", "the verify gate's verifier", "a different engine family than the builder"),
+    ):
+        s.add_argument(f"--{_role}-engine", default=None, dest=f"{_role.replace('-', '_')}_engine",
+                       help=f"engine {_what} runs on (default: {_default}); empty string clears")
+        s.add_argument(f"--{_role}-model", default=None, dest=f"{_role.replace('-', '_')}_model",
+                       help=f"model {_what} runs on (default: strongest ranked model of its "
+                            f"engine); empty string clears")
     s.add_argument("--gate", action="append", default=None, metavar="GATE",
                    help="queue default acceptance gate (repeatable, ordered): "
                         "cmd:<command>, verify, review or review:<target>; "
