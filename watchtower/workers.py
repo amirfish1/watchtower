@@ -4534,7 +4534,18 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             f"`wt claim -q {queue} --worker <your-id>{claim_filter} --json` and drain the queue."
         )
         # ...and the session that filed it (or pressed ▶) already knows.
-        delivered = notify_workers(queue, nudge, exclude=_self_identities())
+        exclude = set(_self_identities())
+        if not run_requested:
+            # A worker mid-ticket is not who a new ticket is for: nudging it
+            # steers it off its claim, and it drains the queue on its own
+            # when it finishes (WT-15). Idle workers get first shot; if none
+            # is idle the reconcile below decides whether to staff up.
+            exclude |= {
+                str(it.get("claimed_by") or "")
+                for it in (_q.list_items(project=queue) or [])
+                if it.get("status") == "in_progress" and it.get("claimed_by")
+            }
+        delivered = notify_workers(queue, nudge, exclude=exclude)
         if delivered:
             reason = f"nudged {delivered} live worker(s) — immediate pickup"
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
