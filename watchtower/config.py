@@ -393,6 +393,23 @@ def gates(queue: str) -> List[str]:
     return list(_queue_entry(queue).get("gates") or [])
 
 
+def set_post_fix_assessment(queue: str, enabled: bool) -> Dict[str, Any]:
+    data = _load()
+    q = data.setdefault(queue, {})
+    if enabled:
+        q["post_fix_assessment"] = True
+    else:
+        q.pop("post_fix_assessment", None)
+    _save(data)
+    return q
+
+
+def post_fix_assessment(queue: str) -> bool:
+    """WT-21: opt-in per queue. When on, every bug that closes as completed
+    gets an independent six-point post-fix assessment."""
+    return bool(_queue_entry(queue).get("post_fix_assessment", False))
+
+
 def product_gate(queue: str) -> bool:
     """False unless explicitly opted in. When on, workers must post a
     decision-grade pitch (wt block --kind rationale) and wait for a human
@@ -828,7 +845,7 @@ def raw_model(queue: str) -> str:
     return canonical_model(eng, _ccc_worker_model_default(eng) or default_model(eng))
 
 
-ROLE_KEYS = ("planner", "plan_reviewer", "verifier")
+ROLE_KEYS = ("planner", "plan_reviewer", "verifier", "assessor")
 
 
 def set_role(queue: str, role: str, eng: Any = None, model_value: Any = None) -> Dict[str, Any]:

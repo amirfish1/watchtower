@@ -1304,6 +1304,73 @@ def _notify_ticket_event(
             pass  # best-effort -- a delivery hiccup never fails the transition
 
 
+def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: str,
+                       proj: str, annotation_id: str, url: str, title: str,
+                       selector: str, screenshot_path: str, repo_path: str,
+                       lane: str, item_type: str, readiness: str, priority: str,
+                       value: str, confidence: str, model_floor: str,
+                       planner_model: str, verifier_model: str, submitter: str,
+                       submitter_explicit: bool, pre_ack: bool,
+                       blocked_by: Optional[List[str]], gates: Optional[List[str]],
+                       accept_line: str, assessment_origin: str = "") -> Dict[str, Any]:
+    """Append a new ``open`` item to an already-loaded local store (the caller
+    holds the store lock and saves). Shared by :func:`enqueue` and the
+    post-fix-assessment filer so both create identical tickets."""
+    blockers = _validate_blocked_by(data["items"], "", list(blocked_by or []))
+    data["counter"] = int(data.get("counter", 0)) + 1
+    number = data["counter"]
+    now = _now_iso()
+    item = {
+        "number": number,
+        "project": proj,
+        "id": str(annotation_id or ""),
+        "status": "open",
+        "lane": lane,
+        "source": str(source or "wt"),
+        "note": note,
+        "text": _clip(text or note, 24000),
+        "url": _clip(url, 1000),
+        "title": _clip(title, 200),
+        "selector": _clip(selector, 1000),
+        "screenshot_path": str(screenshot_path or ""),
+        "repo_path": str(repo_path or ""),
+        "type": effective_type(item_type),
+        "readiness": _norm_choice(readiness, VALID_READINESS),
+        "priority": _norm_choice(priority, VALID_PRIORITIES),
+        "value": _norm_choice(value, VALID_VALUES),
+        "confidence": _norm_choice(confidence, VALID_CONFIDENCES),
+        "model_floor": _norm_model_floor(model_floor),
+        "needs_input": False,
+        "block_question": "",
+        # The two ticket-level eligibility inputs (2026-07-26 design). The
+        # GitHub backend stores these as labels; here they are plain
+        # booleans, so both backends hand downstream code the same shape.
+        "no_auto_drain": False,
+        "run_requested": False,
+        "pre_ack": bool(pre_ack),
+        "blocked_by": blockers,
+        **({"planner_model": str(planner_model).strip()} if str(planner_model or "").strip() else {}),
+        **({"verifier_model": str(verifier_model).strip()} if str(verifier_model or "").strip() else {}),
+        **({"gates": validate_gates(gates)} if gates else {}),
+        **({"accept": str(accept_line).strip()} if str(accept_line or "").strip() else {}),
+        "submitter": str(submitter or ""),
+        "submitter_explicit": bool(submitter_explicit),
+        "claimed_by": None,
+        "claimed_at": None,
+        "closed_at": None,
+        "claimed_session_id": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    if assessment_origin:
+        item["assessment_origin"] = str(assessment_origin)
+    _append_history(item, "filed", by=_by("system"), at=now, source=item["source"], project=proj,
+                    submitter=str(submitter or ""))
+    data["items"].append(item)
+    _normalize_items(data["items"])  # assign this item's seq/ref
+    return next(it for it in data["items"] if it.get("number") == number)
+
+
 def enqueue(
     *,
     note: str,
@@ -1331,6 +1398,7 @@ def enqueue(
     blocked_by: Optional[List[str]] = None,
     gates: Optional[List[str]] = None,
     accept_line: str = "",
+    assessment_origin: str = "",
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
 
@@ -1389,58 +1457,15 @@ def enqueue(
         return saved
     with _FileLock(_lock_path()):
         data = _load_unlocked()
-        blockers = _validate_blocked_by(data["items"], "", list(blocked_by or []))
-        data["counter"] = int(data.get("counter", 0)) + 1
-        number = data["counter"]
-        now = _now_iso()
-        item = {
-            "number": number,
-            "project": proj,
-            "id": str(annotation_id or ""),
-            "status": "open",
-            "lane": lane,
-            "source": str(source or "wt"),
-            "note": note,
-            "text": _clip(text or note, 24000),
-            "url": _clip(url, 1000),
-            "title": _clip(title, 200),
-            "selector": _clip(selector, 1000),
-            "screenshot_path": str(screenshot_path or ""),
-            "repo_path": str(repo_path or ""),
-            "type": effective_type(item_type),
-            "readiness": _norm_choice(readiness, VALID_READINESS),
-            "priority": _norm_choice(priority, VALID_PRIORITIES),
-            "value": _norm_choice(value, VALID_VALUES),
-            "confidence": _norm_choice(confidence, VALID_CONFIDENCES),
-            "model_floor": _norm_model_floor(model_floor),
-            "needs_input": False,
-            "block_question": "",
-            # The two ticket-level eligibility inputs (2026-07-26 design). The
-            # GitHub backend stores these as labels; here they are plain
-            # booleans, so both backends hand downstream code the same shape.
-            "no_auto_drain": False,
-            "run_requested": False,
-            "pre_ack": bool(pre_ack),
-            "blocked_by": blockers,
-            **({"planner_model": str(planner_model).strip()} if str(planner_model or "").strip() else {}),
-            **({"verifier_model": str(verifier_model).strip()} if str(verifier_model or "").strip() else {}),
-            **({"gates": validate_gates(gates)} if gates else {}),
-            **({"accept": str(accept_line).strip()} if str(accept_line or "").strip() else {}),
-            "submitter": str(submitter or ""),
-            "submitter_explicit": bool(submitter_explicit),
-            "claimed_by": None,
-            "claimed_at": None,
-            "closed_at": None,
-            "claimed_session_id": None,
-            "created_at": now,
-            "updated_at": now,
-        }
-        _append_history(item, "filed", by=_by("system"), at=now, source=item["source"], project=proj,
-                        submitter=str(submitter or ""))
-        data["items"].append(item)
-        _normalize_items(data["items"])  # assign this item's seq/ref
+        saved = _new_item_unlocked(
+            data, note=note, text=text, source=source, proj=proj, annotation_id=annotation_id,
+            url=url, title=title, selector=selector, screenshot_path=screenshot_path,
+            repo_path=repo_path, lane=lane, item_type=item_type, readiness=readiness,
+            priority=priority, value=value, confidence=confidence, model_floor=model_floor,
+            planner_model=planner_model, verifier_model=verifier_model, submitter=submitter,
+            submitter_explicit=submitter_explicit, pre_ack=pre_ack, blocked_by=blocked_by,
+            gates=gates, accept_line=accept_line, assessment_origin=assessment_origin)
         _save_unlocked(data)
-        saved = next(it for it in data["items"] if it.get("number") == number)
     _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
     return saved
 
@@ -2877,6 +2902,18 @@ def verifier_target(item: Dict[str, Any]) -> Dict[str, Any]:
     engine+model when known. Returns ``{engine, model, source, blocked}``;
     ``blocked`` is True when the resolved model is on the policy deny-list
     (the caller must then not spawn -- never substitute)."""
+    return _role_target(item, "verifier")
+
+
+def assessor_target(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Engine/model the post-fix assessor runs on (WT-21): the ``assessor``
+    role, a different family than the builder unless configured."""
+    return _role_target(item, "assessor")
+
+
+def _role_target(item: Dict[str, Any], role: str) -> Dict[str, Any]:
+    """Resolve ``role`` for a ticket against the claiming worker's recorded
+    engine+model as builder. Returns ``{engine, model, source, blocked}``."""
     from . import config as _config, roles as _roles
     queue = str(item.get("project") or "")
     ticket = dict(item)
@@ -2892,7 +2929,7 @@ def verifier_target(item: Dict[str, Any]) -> Dict[str, Any]:
         if rec and rec.get("model"):
             # The worker that built it is the builder, whatever the queue says now.
             ticket["model_floor"] = str(rec["model"])
-    engine, model, source = _roles.effective_role_model(queue, ticket, "verifier")
+    engine, model, source = _roles.effective_role_model(queue, ticket, role)
     model = _config.canonical_model(engine, model) if model else ""
     return {"engine": engine, "model": model, "source": source,
             "blocked": bool(model and _config.is_blocked_model(model))}
@@ -3011,7 +3048,8 @@ def accept(ident: Any, by: str = "human", force: bool = False) -> Optional[Dict[
     res = item.get("resolution") or {}
     _notify_ticket_event(item, "closed", detail=res.get("summary", "") if isinstance(res, dict) else "",
                          actor=by)
-    return item
+    assessment_mark_due(item.get("ref") or ident)
+    return get(item.get("ref") or ident) or item
 
 
 def verdict(ident: Any, passed: bool, findings: str = "", by: str = "verifier") -> Optional[Dict[str, Any]]:
@@ -3185,7 +3223,441 @@ def close(
             res if isinstance(res, str) else ""
         )
         _notify_ticket_event(item, "closed", detail=summary, actor=session_id)
+        if not declined:
+            assessment_mark_due(item.get("ref") or ident)
+            item = get(item.get("ref") or ident) or item
     return item
+
+
+# ---------------------------------------------------------------------------
+# Post-fix assessment (WT-21)
+#
+# A queue opted in with ``wt config --post-fix-assessment on`` gets, for every
+# bug ticket that closes as completed, an independent assessor session that
+# answers six questions about the fix and WatchTower files the follow-ups.
+# State lives on ``item["assessment"]``; every transition is one store
+# transaction (lock + a single _save_unlocked), and filing is one transaction
+# per op so concurrent/repeat runners cannot double-write.
+# ---------------------------------------------------------------------------
+
+ASSESSMENT_POINTS = ("logging", "ui_message", "automation", "monitoring", "auditors", "other")
+ASSESSMENT_QUESTIONS = {
+    "logging": "Was logging adequate to diagnose this without guessing?",
+    "ui_message": "Was the message the user saw adequate?",
+    "automation": "Can it be fully automated (detect -> ask -> act -> recover -> notify)?",
+    "monitoring": "Did internal monitoring alert the owner?",
+    "auditors": "Would the auditors / self-healing have caught it?",
+    "other": "Any other small improvements?",
+}
+_ASSESS_TYPE = {"logging": "bug", "ui_message": "bug", "automation": "feature",
+                "monitoring": "feature", "auditors": "feature", "other": "feature"}
+ASSESSMENT_SOURCE = "post-fix-assessment"
+_ASSESS_MAX_PER_POINT = 3
+_ASSESS_MAX_TOTAL = 8
+# Test hook: called as hook(stage, idx) at "before_lock" / "after_commit".
+_ASSESS_OP_HOOK = None
+
+
+class AssessmentFenced(Exception):
+    """The attempt this runner belongs to is no longer current."""
+
+
+def _assessment_title_key(title: Any) -> str:
+    import re as _re2
+    return " ".join(_re2.sub(r"[^a-z0-9 ]", "", str(title or "").lower()).split())
+
+
+def assessment_due(item: Dict[str, Any]) -> bool:
+    """True when a just-closed ``item`` should get a post-fix assessment."""
+    from . import config as _config
+    if item.get("status") != "closed" or item.get("assessment"):
+        return False
+    proj = str(item.get("project") or "")
+    try:
+        if not _config.post_fix_assessment(proj):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    if _github_backend_for_project(proj) is not None:
+        return False
+    if effective_type(item) != "bug":
+        return False
+    if item.get("source") == ASSESSMENT_SOURCE or item.get("assessment_origin"):
+        return False
+    if item.get("product_nack"):
+        return False
+    res = item.get("resolution") or {}
+    summary = str(res.get("summary", "") if isinstance(res, dict) else res).strip().lower()
+    if summary.startswith(("duplicate of", "dup of", "duplicate:")):
+        return False
+    return True
+
+
+def assessment_mark_due(ident: Any) -> Optional[Dict[str, Any]]:
+    """Best-effort: flag a freshly closed ticket ``due`` (idempotent)."""
+    try:
+        with _FileLock(_lock_path()):
+            data = _load_unlocked()
+            for it in data["items"]:
+                if _matches(it, ident):
+                    if not assessment_due(it):
+                        return None
+                    it["assessment"] = {"status": "due", "attempt": 0, "token": ""}
+                    it["updated_at"] = _now_iso()
+                    _save_unlocked(data)
+                    return it
+    except Exception:  # noqa: BLE001 - never break a close
+        return None
+    return None
+
+
+def _assessment_update(ident: Any, fn) -> Optional[Dict[str, Any]]:
+    """Run ``fn(item, assessment_dict)`` under the store lock; one save. ``fn``
+    returning ``"skip"`` leaves the store untouched."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                a = dict(it.get("assessment") or {})
+                if fn(it, a, data) == "skip":
+                    return it
+                it["assessment"] = a
+                it["updated_at"] = _now_iso()
+                _save_unlocked(data)
+                return it
+    return None
+
+
+def assessment_reserve(ident: Any, force: bool = False) -> Optional[str]:
+    """Reserve the next assessment attempt and return its token, or None when
+    another actor already holds it (or it is finished). The only route to
+    ``running``."""
+    import uuid as _uuid
+    out: List[str] = []
+
+    def _do(it, a, data):
+        st = a.get("status", "")
+        if it.get("status") != "closed":
+            return "skip"
+        if not (st in ("due", "failed") or force):
+            return "skip"
+        if force and st == "filing":
+            done = [{"attempt": a.get("attempt", 0), "ref": o.get("result_ref"), "kind": o.get("kind")}
+                    for o in (a.get("pending") or {}).get("ops", []) if o.get("result_ref")
+                    and o.get("outcome") == "filed"]
+            a["abandoned"] = list(a.get("abandoned") or []) + done
+        a.pop("pending", None)
+        a["attempt"] = int(a.get("attempt", 0)) + 1
+        a["token"] = _uuid.uuid4().hex
+        a["status"] = "running"
+        a["reserved_at"] = _now_iso()
+        a.pop("reason", None)
+        out.append(a["token"])
+
+    _assessment_update(ident, _do)
+    return out[0] if out else None
+
+
+def assessment_set_running(ident: Any, token: str, info: Dict[str, Any]) -> None:
+    def _do(it, a, data):
+        if a.get("token") != token or a.get("assessor"):
+            return "skip"
+        a["assessor"] = dict(info)
+    _assessment_update(ident, _do)
+
+
+def assessment_fail(ident: Any, token: str, reason: str) -> None:
+    def _do(it, a, data):
+        if token and a.get("token") != token:
+            return "skip"
+        a["status"] = "failed"
+        a["reason"] = _clip(reason, 500)
+        a["at"] = _now_iso()
+        _append_history(it, "assessment", by=_by("system"), outcome="failed",
+                        text=_clip(reason, 500))
+    _assessment_update(ident, _do)
+
+
+def assessment_release_due(ident: Any, token: str) -> None:
+    """Dead assessor on its first attempt: back to ``due`` for a fresh token."""
+    def _do(it, a, data):
+        if a.get("token") != token or a.get("status") != "running":
+            return "skip"
+        a["status"] = "due"
+    _assessment_update(ident, _do)
+
+
+def _norm_followup(f: Any, default_queue: str) -> Dict[str, str]:
+    if isinstance(f, str):
+        f = {"title": f}
+    if not isinstance(f, dict):
+        raise ValueError("a follow-up must be an object with a title")
+    title = _clip(f.get("title", ""), 200).strip()
+    if not title:
+        raise ValueError("a follow-up needs a title")
+    return {"title": title, "note": _clip(f.get("note", "") or f.get("text", ""), 4000),
+            "queue": _norm_project(f.get("queue") or default_queue) or default_queue}
+
+
+def _validate_assessment_payload(data: Dict[str, Any], bug: Dict[str, Any],
+                                 payload: Any) -> Dict[str, Dict[str, Any]]:
+    """Normalise + validate; raises ValueError (nothing written)."""
+    if not isinstance(payload, dict):
+        raise ValueError("assessment payload must be a JSON object")
+    pts = payload.get("points", payload)
+    if not isinstance(pts, dict):
+        raise ValueError("'points' must be an object")
+    unknown = set(pts) - set(ASSESSMENT_POINTS)
+    if unknown:
+        raise ValueError(f"unknown point(s): {sorted(unknown)}; expected {list(ASSESSMENT_POINTS)}")
+    missing = [p for p in ASSESSMENT_POINTS if p not in pts]
+    if missing:
+        raise ValueError(f"missing point(s): {missing}")
+    default_queue = str(bug.get("project") or "")
+    by_ref = {str(i.get("ref")): i for i in data["items"]}
+    out: Dict[str, Dict[str, Any]] = {}
+    total = 0
+    for p in ASSESSMENT_POINTS:
+        raw = pts[p]
+        if isinstance(raw, str):
+            raw = {"verdict": "adequate", "note": raw}
+        if not isinstance(raw, dict):
+            raise ValueError(f"point {p!r} must be an object")
+        extra = set(raw) - {"verdict", "note", "followups", "existing"}
+        if extra:
+            raise ValueError(f"point {p!r}: unknown key(s) {sorted(extra)}")
+        verdict = str(raw.get("verdict") or "adequate").strip().lower()
+        if verdict not in ("adequate", "gap"):
+            raise ValueError(f"point {p!r}: verdict must be 'adequate' or 'gap'")
+        fups = [_norm_followup(f, default_queue) for f in (raw.get("followups") or [])]
+        existing = [str(r).strip() for r in (raw.get("existing") or []) if str(r).strip()]
+        if verdict == "gap" and not fups and not existing:
+            raise ValueError(f"point {p!r} is a gap but has no follow-up and no existing ref")
+        if len(fups) > _ASSESS_MAX_PER_POINT:
+            raise ValueError(f"point {p!r}: at most {_ASSESS_MAX_PER_POINT} follow-ups")
+        total += len(fups)
+        for f in fups:
+            if _github_backend_for_project(f["queue"]) is not None:
+                raise ValueError(f"follow-up queue {f['queue']} is GitHub-backed; not supported")
+            if f["queue"] != default_queue and not any(
+                    _norm_project(i.get("project")) == f["queue"] for i in data["items"]):
+                from . import config as _config
+                if f["queue"] not in _config.all_queues():
+                    raise ValueError(f"unknown follow-up queue {f['queue']!r}")
+        for r in existing:
+            t = by_ref.get(r)
+            if t is None:
+                raise ValueError(f"existing ref {r} is unknown")
+            if t.get("status") == "closed":
+                raise ValueError(f"{r} is closed; file a new follow-up instead")
+        note = _clip(raw.get("note", ""), 2000).strip()
+        if not note and verdict == "adequate":
+            note = "nothing to add"
+        out[p] = {"verdict": verdict, "note": note, "followups": fups, "existing": existing}
+    if total > _ASSESS_MAX_TOTAL:
+        raise ValueError(f"at most {_ASSESS_MAX_TOTAL} follow-ups in total (got {total})")
+    return out
+
+
+def _assessment_summary_text(ref: str, points: Dict[str, Dict[str, Any]]) -> str:
+    lines = [f"Post-fix assessment of {ref}:"]
+    for p in ASSESSMENT_POINTS:
+        v = points[p]
+        bits = [f"{f['queue']}: {f['title']}" for f in v["followups"]] + v["existing"]
+        lines.append(f"- {p} [{v['verdict']}]: {v['note']}"
+                     + (f" -> {'; '.join(bits)}" if bits else ""))
+    return "\n".join(lines)
+
+
+def assessment_accept_submission(ident: Any, token: str, payload: Any) -> List[Dict[str, Any]]:
+    """Phase 1: fence, validate, and persist the op list; ``running`` ->
+    ``filing``. A resubmission of the same payload on the same token is a
+    resume and returns the stored ops."""
+    import hashlib as _hashlib
+    out: List[List[Dict[str, Any]]] = []
+    phash = _hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+    def _do(it, a, data):
+        if not a or a.get("token") != token:
+            raise AssessmentFenced("stale or unknown assessment token")
+        st = a.get("status")
+        if st == "filing":
+            if (a.get("pending") or {}).get("payload_hash") != phash:
+                raise ValueError("an assessment submission is already being filed; "
+                                 "resubmit the same payload to resume")
+            out.append(a["pending"]["ops"])
+            return "skip"
+        if st != "running":
+            raise AssessmentFenced(f"assessment is {st or 'not started'}, not running")
+        points = _validate_assessment_payload(data, it, payload)
+        ref, attempt = str(it.get("ref")), int(a.get("attempt", 1))
+        ops: List[Dict[str, Any]] = []
+        seen = set()
+        for p in ASSESSMENT_POINTS:
+            for i, f in enumerate(points[p]["followups"]):
+                k = (f["queue"], _assessment_title_key(f["title"]))
+                if k in seen:
+                    continue
+                seen.add(k)
+                ops.append({"kind": "file", "point": p, "key": f"{ref}#a{attempt}#{p}#{i}", **f})
+            for r in points[p]["existing"]:
+                ops.append({"kind": "link", "point": p, "target": r,
+                            "marker": f"[wt-assess {ref}#a{attempt}#{p}]",
+                            "note": points[p]["note"]})
+        ops.append({"kind": "summary", "target": ref,
+                    "marker": f"[wt-assess {ref}#a{attempt}#summary]",
+                    "text": _assessment_summary_text(ref, points)})
+        a["points"] = points
+        a["pending"] = {"payload_hash": phash, "submitted_at": _now_iso(), "ops": ops}
+        a["status"] = "filing"
+        out.append(ops)
+
+    if _assessment_update(ident, _do) is None:
+        raise ValueError(f"no item {ident}")
+    return out[0]
+
+
+def _has_marker(item: Dict[str, Any], marker: str) -> bool:
+    return any(h.get("event") == "comment" and marker in str(h.get("text", ""))
+               for h in (item.get("history") or []))
+
+
+def _assessment_apply_op(ident: Any, token: str, idx: int) -> Dict[str, Any]:
+    """Phase 2: fenced check + write + done-record in ONE store transaction."""
+    hook = _ASSESS_OP_HOOK
+    if hook:
+        hook("before_lock", idx)
+    logs: List[tuple] = []
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        bug = next((i for i in data["items"] if _matches(i, ident)), None)
+        if bug is None:
+            raise ValueError(f"no item {ident}")
+        a = dict(bug.get("assessment") or {})
+        if a.get("status") != "filing" or a.get("token") != token:
+            raise AssessmentFenced(
+                f"superseded by attempt {a.get('attempt')}" if a.get("token") != token
+                else f"assessment is {a.get('status')}")
+        ops = a["pending"]["ops"]
+        op = ops[idx]
+        if op.get("done"):
+            return op
+        ref = str(bug.get("ref"))
+        now = _now_iso()
+        if op["kind"] == "file":
+            adopted = next((i for i in data["items"]
+                            if i.get("assessment_origin") == op["key"]), None)
+            if adopted is not None:
+                op.update(result_ref=adopted.get("ref"), outcome="adopted")
+            else:
+                tk = _assessment_title_key(op["title"])
+                match = next((i for i in data["items"]
+                              if i is not bug
+                              and _norm_project(i.get("project")) == op["queue"]
+                              and i.get("status") in ("open", "in_progress", "in_review")
+                              and _assessment_title_key(i.get("title") or i.get("note")) == tk), None)
+                if match is not None:
+                    marker = f"[wt-assess {op['key']}]"
+                    if not _has_marker(match, marker):
+                        _append_history(match, "comment", by=_by("system"), at=now,
+                                        text=f"{marker} Also raised by the post-fix assessment of {ref} "
+                                             f"({op['point']}): {op['note'] or op['title']}")
+                        match["updated_at"] = now
+                    op.update(result_ref=match.get("ref"), outcome="linked")
+                else:
+                    new = _new_item_unlocked(
+                        data, note=op["title"],
+                        text=(f"{op['note']}\n\n(Filed by the post-fix assessment of {ref}, "
+                              f"point: {op['point']} -- {ASSESSMENT_QUESTIONS[op['point']]})").strip(),
+                        source=ASSESSMENT_SOURCE, proj=op["queue"], annotation_id="", url="",
+                        title=op["title"], selector="", screenshot_path="",
+                        repo_path=str(bug.get("repo_path") or "") if op["queue"] == _norm_project(bug.get("project")) else "",
+                        lane="normal", item_type=_ASSESS_TYPE[op["point"]], readiness="",
+                        priority="", value="", confidence="", model_floor="", planner_model="",
+                        verifier_model="", submitter="", submitter_explicit=False, pre_ack=False,
+                        blocked_by=[ref], gates=None, accept_line="", assessment_origin=op["key"])
+                    op.update(result_ref=new.get("ref"), outcome="filed")
+                    logs.append(("ENQUEUE", f"{new.get('ref')} — {op['title']}", op["queue"]))
+        else:
+            target = bug if op["kind"] == "summary" else next(
+                (i for i in data["items"] if str(i.get("ref")) == op["target"]), None)
+            if target is None:
+                op.update(outcome="skipped")
+            elif _has_marker(target, op["marker"]):
+                op.update(result_ref=op.get("target"), outcome="skipped")
+            else:
+                text = op["text"] if op["kind"] == "summary" else (
+                    f"{op['marker']} Post-fix assessment of {ref} ({op['point']}): {op['note']}")
+                _append_history(target, "comment", by=_by("system"), at=now, text=text)
+                target["updated_at"] = now
+                op.update(result_ref=op.get("target"), outcome="commented")
+        op["done"] = True
+        bug["assessment"] = a
+        bug["updated_at"] = now
+        _save_unlocked(data)
+    for verb, detail, qn in logs:
+        _log(verb, detail, queue=qn)
+    if hook:
+        hook("after_commit", idx)
+    return op
+
+
+def assessment_finalize(ident: Any, token: str) -> Optional[Dict[str, Any]]:
+    def _do(it, a, data):
+        if a.get("status") != "filing" or a.get("token") != token:
+            raise AssessmentFenced("assessment is no longer filing under this token")
+        ops = a["pending"]["ops"]
+        if not all(o.get("done") for o in ops):
+            raise ValueError("not every assessment op is done; resume")
+        files = [o["result_ref"] for o in ops if o["kind"] == "file" and o.get("result_ref")]
+        a["followups"] = files
+        a["existing"] = [o["target"] for o in ops if o["kind"] == "link"]
+        a["status"] = "done"
+        a["at"] = _now_iso()
+        _append_history(it, "assessment", by=_by("system"), outcome="done",
+                        text=f"{len(files)} follow-up(s) filed: {', '.join(files) or 'none'}")
+    return _assessment_update(ident, _do)
+
+
+def assessment_run_ops(ident: Any, token: str = "") -> Optional[Dict[str, Any]]:
+    """Phases 2+3 for whatever is pending; token defaults to the stored one
+    (resume). Raises AssessmentFenced when superseded."""
+    item = get(ident)
+    if item is None:
+        return None
+    a = item.get("assessment") or {}
+    token = token or a.get("token", "")
+    if a.get("status") != "filing":
+        raise ValueError(f"{item.get('ref')} assessment is {a.get('status') or 'absent'}, not filing")
+    for idx in range(len(a["pending"]["ops"])):
+        _assessment_apply_op(ident, token, idx)
+    return assessment_finalize(ident, token)
+
+
+def assessment_targets_for_sweep(now_ts: Optional[float] = None) -> Dict[str, List[Dict[str, Any]]]:
+    """Items the reconcile sweep should act on: ``due``, stale ``filing`` (>5
+    min) and ``running`` older than 10 min (caller checks worker liveness)."""
+    import time as _time
+    now_ts = now_ts if now_ts is not None else _time.time()
+
+    def age(iso: str) -> float:
+        try:
+            return now_ts - datetime.strptime(
+                iso, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+        except Exception:  # noqa: BLE001
+            return 0.0
+
+    res: Dict[str, List[Dict[str, Any]]] = {"due": [], "filing": [], "running": []}
+    for it in list_items():
+        a = it.get("assessment") or {}
+        st = a.get("status")
+        if st == "due":
+            res["due"].append(it)
+        elif st == "filing" and age(it.get("updated_at", "")) > 300:
+            res["filing"].append(it)
+        elif st == "running" and age(a.get("reserved_at", "")) > 600:
+            res["running"].append(it)
+    return res
 
 
 def release(ident: Any, session_id: str = "", force: bool = False) -> Optional[Dict[str, Any]]:

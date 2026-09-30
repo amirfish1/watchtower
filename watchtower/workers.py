@@ -4383,6 +4383,124 @@ def _answer_in_flight(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Post-fix assessment spawning (WT-21)
+# ---------------------------------------------------------------------------
+
+def assessment_repo(item: Dict[str, Any]) -> str:
+    """Local repo the assessor runs in: the ticket's repo_path, else the
+    queue's configured one. Never falls back to the caller's cwd. Raises
+    ValueError with a fixable message when unresolvable."""
+    from . import config
+    queue = str(item.get("project") or "")
+    path = str(item.get("repo_path") or "").strip() or str(config.repo_path(queue) or "").strip()
+    if not path or path.startswith("host:") or not os.path.isdir(path):
+        raise ValueError(f"no local repo for queue {queue} (set wt config -q {queue} --repo-path)")
+    return path
+
+
+def assessor_goal(item: Dict[str, Any], token: str) -> str:
+    from . import queue as _q
+    res = item.get("resolution") or {}
+    ref = item.get("ref", "?")
+    points = "\n".join(f'  - "{p}": {_q.ASSESSMENT_QUESTIONS[p]}' for p in _q.ASSESSMENT_POINTS)
+    return (
+        f"You are the independent post-fix assessor for the bug ticket {ref}. You did "
+        f"not build the fix. Read the ticket, look at the fix"
+        + (f" (commit {res['commit']}: `git show {res['commit']}`)" if res.get("commit") else "")
+        + f", and judge it against six points, in the repo you are in.\n\n"
+        f"TICKET {ref}: {item.get('title') or item.get('note', '')}\n{item.get('text', '')}\n\n"
+        f"RESOLUTION SUMMARY: {res.get('summary', '') if isinstance(res, dict) else res}\n\n"
+        f"THE SIX POINTS:\n{points}\n\n"
+        f"For each point answer verdict \"adequate\" (one line why; may be blank) or \"gap\". "
+        f"A gap needs 1-3 concrete followups ({{\"title\", \"note\", optional \"queue\"}}) "
+        f"and/or \"existing\": [refs of OPEN tickets that already cover it] -- check "
+        f"`wt ls --status open` first so you do not duplicate. Be concrete and small; "
+        f"'nothing to add' is a valid, good answer. Do not edit code or file tickets yourself.\n\n"
+        f"Submit exactly once with:\n"
+        f"  wt assess submit {ref} --token {token} --json '{{\"logging\": {{\"verdict\": \"adequate\", "
+        f"\"note\": \"...\"}}, \"ui_message\": {{...}}, \"automation\": {{...}}, "
+        f"\"monitoring\": {{...}}, \"auditors\": {{...}}, \"other\": {{...}}}}'\n"
+        f"(or --file PATH). All six keys are required. Then stop."
+    )
+
+
+def start_assessment(item: Dict[str, Any], *, force: bool = False,
+                     dry_run: bool = False) -> Dict[str, Any]:
+    """Reserve an attempt for ``item`` and spawn its assessor. Returns
+    ``{"status": spawned|skipped|failed|dry_run, ...}``; never raises."""
+    from . import queue as _q
+    ref = str(item.get("ref") or "")
+    try:
+        repo = assessment_repo(item)
+        target = _q.assessor_target(item)
+        if dry_run:
+            return {"status": "dry_run", "repo": repo, "assessor": target,
+                    "prompt": assessor_goal(item, "<token>")}
+    except Exception as exc:  # noqa: BLE001
+        if dry_run:
+            return {"status": "failed", "reason": str(exc)}
+        token = _q.assessment_reserve(ref, force=force)
+        if token:
+            _q.assessment_fail(ref, token, str(exc))
+            return {"status": "failed", "reason": str(exc)}
+        return {"status": "skipped"}
+    token = _q.assessment_reserve(ref, force=force)
+    if not token:
+        return {"status": "skipped"}
+    try:
+        if target["blocked"]:
+            raise ValueError(f"model {target['model']!r} for the assessor ({target['engine']}) "
+                             f"is blocked by model policy; not substituting another model")
+        rec = spawn_adhoc(assessor_goal(item, token), target["engine"], model=target["model"],
+                          repo_path=repo, name=f"assess-{ref}", report_to="")
+    except Exception as exc:  # noqa: BLE001
+        _q.assessment_fail(ref, token, f"could not spawn the assessor: {exc}")
+        return {"status": "failed", "reason": str(exc)}
+    _q.assessment_set_running(ref, token, {"engine": target["engine"], "model": target["model"],
+                                           "source": target["source"],
+                                           "worker_id": rec.get("worker_id", "")})
+    return {"status": "spawned", "token": token, "worker_id": rec.get("worker_id", ""),
+            "assessor": target}
+
+
+def spawn_due_assessments(max_actions: int = 3) -> List[str]:
+    """Reconcile-sweep: spawn due assessors, resume stale ``filing`` ones and
+    settle dead ``running`` ones. At most ``max_actions`` per tick."""
+    from . import queue as _q
+    acted: List[str] = []
+    cands = _q.assessment_targets_for_sweep()
+    for it in cands["running"]:
+        if len(acted) >= max_actions:
+            return acted
+        a = it.get("assessment") or {}
+        wid = (a.get("assessor") or {}).get("worker_id", "")
+        rec = next((w for w in _load().get("workers", [])
+                    if isinstance(w, dict) and w.get("worker_id") == wid), None) if wid else None
+        if rec and _pid_alive(int(rec.get("pid", 0) or 0)):
+            continue
+        if int(a.get("attempt", 1)) <= 1:
+            _q.assessment_release_due(it["ref"], a.get("token", ""))
+        else:
+            _q.assessment_fail(it["ref"], a.get("token", ""),
+                               f"assessor exited without submitting (attempt {a.get('attempt')})")
+        acted.append(f"{it['ref']}:settled")
+    for it in cands["filing"]:
+        if len(acted) >= max_actions:
+            return acted
+        try:
+            _q.assessment_run_ops(it["ref"])
+            acted.append(f"{it['ref']}:resumed")
+        except Exception:  # noqa: BLE001
+            pass
+    for it in _q.assessment_targets_for_sweep()["due"]:
+        if len(acted) >= max_actions:
+            return acted
+        if start_assessment(it).get("status") == "spawned":
+            acted.append(f"{it['ref']}:spawned")
+    return acted
+
+
 def requeue_orphaned_tickets(
     grace_s: float = 120.0, answer_grace_s: Optional[float] = None
 ) -> List[Dict[str, Any]]:
@@ -5320,6 +5438,10 @@ def _reconcile_once_locked(dry_run: bool = False,
         try:
             result["requeued"] = [it.get("ref", "")
                                   for it in requeue_orphaned_tickets()]
+        except Exception:
+            pass
+        try:
+            result["assessments"] = spawn_due_assessments()
         except Exception:
             pass
         # Nudge any live worker already on an affected queue so the reopened

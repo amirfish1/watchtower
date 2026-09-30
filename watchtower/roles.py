@@ -11,6 +11,7 @@ Defaults when unset:
   planner       builder's engine at its strongest ranked model
   plan_reviewer a different engine family than the builder
   verifier      a different engine family than the builder
+  assessor      a different engine family than the builder (WT-21)
 Nothing here names a model; ranking and availability come from the catalogs
 (``models``) and the installed engine CLIs.
 """
@@ -20,7 +21,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from . import config, models
 
-ROLES = ("planner", "plan_reviewer", "builder", "verifier")
+ROLES = ("planner", "plan_reviewer", "builder", "verifier", "assessor")
 # Order in which a *different* family is tried for reviewer/verifier defaults.
 _CROSS_FAMILY_ORDER = ("codex", "claude", "kimi", "devin")
 

@@ -666,6 +666,11 @@ def cmd_find(args: argparse.Namespace) -> int:
     res = item.get("resolution") if item.get("status") == "closed" else None
     if res and res.get("summary"):
         print(f"  resolution: {res['summary']}")
+    asmt = item.get("assessment") or {}
+    if asmt:
+        print(f"  assessment: {asmt.get('status')} (attempt {asmt.get('attempt', 0)})"
+              + (f" -- {asmt['reason']}" if asmt.get("reason") else "")
+              + (f" -- follow-ups: {', '.join(asmt['followups'])}" if asmt.get("followups") else ""))
     timeline = item_with_timeline.get("timeline") or []
     if timeline:
         print("  activity:")
@@ -1391,6 +1396,174 @@ def _verify_close_commit(ref: str, sha: str) -> Tuple[str, str]:
     return verified, ""
 
 
+def _assessment_repo_problem(queue: str) -> str:
+    """Why ``queue`` cannot host an assessor (its config repo_path must be a
+    local git checkout), or "" when it can."""
+    path = str(config_mod_repo_path(queue) or "").strip()
+    if not path or path.startswith("host:") or not os.path.isdir(path):
+        return f"set --repo-path first (queue {queue} has no local repo directory)"
+    r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return f"--repo-path {path} is not a git checkout; set --repo-path first"
+    return ""
+
+
+def config_mod_repo_path(queue: str) -> str:
+    from . import config
+    return config.repo_path(queue)
+
+
+def _maybe_assess(item: dict) -> None:
+    """Best-effort: if the just-closed ``item`` is due a post-fix assessment,
+    reserve it and spawn the assessor. Never changes the exit code."""
+    try:
+        cur = q.get(item["ref"]) or item
+        if (cur.get("assessment") or {}).get("status") != "due":
+            return
+        res = workers.start_assessment(cur)
+        if res["status"] == "spawned":
+            a = res["assessor"]
+            print(f"  assessor spawned: {res['worker_id']} "
+                  f"({a['engine']}{'/' + a['model'] if a['model'] else ''}, {a['source']})")
+        elif res["status"] == "failed":
+            print(f"warning: post-fix assessment of {cur['ref']} failed to start: "
+                  f"{res['reason']} (retry: wt assess run {cur['ref']})", file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _read_json_arg(args: argparse.Namespace):
+    if getattr(args, "json_text", None):
+        return json.loads(args.json_text)
+    path = getattr(args, "file", "") or ""
+    if path:
+        raw = sys.stdin.read() if path == "-" else Path(path).read_text()
+        return json.loads(raw)
+    raise ValueError("give the assessment as --json '<object>' or --file PATH")
+
+
+def cmd_assess(args: argparse.Namespace) -> int:
+    """`wt assess submit|show|run|resume|new` -- post-fix assessment (WT-21)."""
+    action = args.assess_cmd
+    if action == "new":
+        return _assess_new(args)
+    item = q.get(args.ref)
+    if not item:
+        print(f"not found: {args.ref}", file=sys.stderr)
+        return 1
+    ref = item["ref"]
+    if action == "show":
+        a = item.get("assessment") or {}
+        if args.json:
+            print(json.dumps(a, indent=2))
+            return 0 if a else 1
+        if not a:
+            print(f"{ref}: no assessment")
+            return 1
+        print(f"{ref}: assessment {a.get('status')} (attempt {a.get('attempt', 0)})"
+              + (f" -- {a['reason']}" if a.get("reason") else ""))
+        for p, v in (a.get("points") or {}).items():
+            print(f"  {p:<11}[{v.get('verdict')}] {v.get('note')}")
+        if a.get("followups"):
+            print(f"  followups: {', '.join(a['followups'])}")
+        if a.get("existing"):
+            print(f"  linked existing: {', '.join(a['existing'])}")
+        return 0
+    if action == "run":
+        res = workers.start_assessment(item, force=args.force, dry_run=args.dry_run)
+        if args.dry_run:
+            if res["status"] == "failed":
+                print(f"cannot assess {ref}: {res['reason']}", file=sys.stderr)
+                return 1
+            t = res["assessor"]
+            print(f"repo: {res['repo']}\nassessor: {t['engine']}/{t['model'] or '(default)'} "
+                  f"({t['source']}){' BLOCKED' if t['blocked'] else ''}\n\n{res['prompt']}")
+            return 0
+        print(f"ASSESS {res['status'].upper()}: {ref}"
+              + (f" -- {res['reason']}" if res.get("reason") else ""))
+        return 0 if res["status"] in ("spawned", "skipped") else 1
+    if action == "resume":
+        try:
+            q.assessment_run_ops(ref)
+        except q.AssessmentFenced as exc:
+            print(f"ASSESS SUPERSEDED: {ref} -- {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"ASSESS INCOMPLETE: {ref} -- {exc}; resume with wt assess resume {ref}",
+                  file=sys.stderr)
+            return 1
+        print(f"ASSESSED: {ref}")
+        return 0
+    # submit
+    try:
+        payload = _read_json_arg(args)
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    token = args.token or ""
+    try:
+        if args.force:
+            token = q.assessment_reserve(ref, force=True) or ""
+        if not token:
+            print("error: --token is required (or --force from a human)", file=sys.stderr)
+            return 2
+        q.assessment_accept_submission(ref, token, payload)
+    except q.AssessmentFenced as exc:
+        print(f"ASSESS SUPERSEDED: {ref} -- {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        done = q.assessment_run_ops(ref, token)
+    except q.AssessmentFenced as exc:
+        print(f"ASSESS SUPERSEDED: {ref} -- {exc}; nothing more written", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"ASSESS INCOMPLETE: {ref} -- {exc}; resume with wt assess resume {ref}",
+              file=sys.stderr)
+        return 1
+    a = (done or {}).get("assessment") or {}
+    print(f"ASSESSED: {ref} -- {len(a.get('followups') or [])} follow-up(s): "
+          f"{', '.join(a.get('followups') or []) or 'nothing to add'}")
+    return 0
+
+
+def _assess_new(args: argparse.Namespace) -> int:
+    """`wt assess new -q QUEUE --title ... (--commit SHA | --no-code)`: file a
+    bug for something that was fixed without a ticket (e.g. an auditor
+    self-heal) and close it through the normal close path, so gates run and the
+    assessment fires on close/accept exactly as for any bug."""
+    import contextlib
+    import io
+    if bool(args.commit) == bool(args.no_code):
+        print("error: exactly one of --commit <SHA> / --no-code is required", file=sys.stderr)
+        return 2
+    queue = args.queue
+    repo = args.repo_path or config_mod_repo_path(queue)
+    try:
+        item = q.enqueue(note=args.title, title=args.title, text=args.text or args.title,
+                         project=queue, item_type="bug", repo_path=repo or "",
+                         source=args.source)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    ns = argparse.Namespace(
+        ref=item["ref"], worker=args.worker, summary=args.summary or args.title,
+        commit=args.commit, no_code=args.no_code, caveat=None, follow_up=None,
+        unresolved=None, enqueue_follow_ups=False, force=False)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf if args.json else sys.stdout):
+        rc = cmd_close(ns)
+    cur = q.get(item["ref"]) or item
+    a = cur.get("assessment") or {}
+    if args.json:
+        print(json.dumps({"ref": cur["ref"], "status": cur.get("status"),
+                          "assessment": a.get("status", ""), "close_exit": rc}))
+    return rc
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     if not (args.summary or "").strip():
         print(
@@ -1452,6 +1625,7 @@ def cmd_close(args: argparse.Namespace) -> int:
     print(f"CLOSED: {item['ref']}" + (f" — {summary}" if summary else ""))
 
     _rename_claiming_session(item, summary)
+    _maybe_assess(item)
     if args.commit:
         # WT-16: a landed fix reaches the installed tree right away instead of
         # waiting for the daemon's next sync tick. Best-effort; a dirty tree
@@ -1736,6 +1910,8 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         v = item.get("verifier") or {}
         via = f" [{v['engine']}{'/' + v['model'] if v.get('model') else ''}]" if v.get("engine") else ""
         print(f"VERDICT {'PASS' if args.passed else 'FAIL'}{via}: {item['ref']} -> {item.get('status')}")
+    if item.get("status") == "closed":
+        _maybe_assess(item)
     if not args.passed and item.get("status") == "in_progress" and item.get("claimed_session_id"):
         return _resume_rejected(item, item.get("gate_feedback") or args.findings or "", args.engine)
     return 0
@@ -1764,8 +1940,10 @@ def cmd_accept(args: argparse.Namespace) -> int:
         return 1
     if args.json:
         print(json.dumps(item, indent=2))
+        _maybe_assess(item)
         return 0
     print(f"ACCEPTED: {item['ref']} -> closed")
+    _maybe_assess(item)
     return 0
 
 
@@ -3722,6 +3900,16 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
         changed.append(f"gates={config.gates(args.queue) or 'none'}")
+    if getattr(args, "post_fix_assessment", None) is not None:
+        enabled = args.post_fix_assessment == "on"
+        if enabled:
+            why = _assessment_repo_problem(args.queue)
+            if why:
+                print(f"error: cannot enable post-fix assessment on {args.queue}: {why}",
+                      file=sys.stderr)
+                return 2
+        config.set_post_fix_assessment(args.queue, enabled)
+        changed.append(f"post_fix_assessment={'on' if enabled else 'off'}")
     if getattr(args, "product_gate", None) is not None:
         enabled = args.product_gate == "on"
         if enabled and config.backend(args.queue) == "github":
@@ -4878,6 +5066,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "accept"),
     ("Tickets", "reject"),
     ("Tickets", "verdict"),
+    ("Tickets", "assess"),
     ("Tickets", "plan"),
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
@@ -4897,6 +5086,7 @@ COMMAND_HELP: Dict[str, str] = {
     "release": "give up a claim without closing it; returns the ticket to open",
     "accept": "accept an in_review ticket (closes it, unblocks dependents)",
     "verdict": "file an independent verifier's pass/fail on an in_review ticket",
+    "assess": "post-fix assessment (WT-21): `submit`/`show`/`run`/`resume`, or `new` for a fix with no ticket",
     "plan": "plan stage (plan gate): `submit` a plan, `verdict` it, `show`/`wait` for it",
     "reject": "reject an in_review ticket back to open and resume its worker",
     "reopen": "reopen a closed ticket, returning it to the open pool (no dispatch)",
@@ -5465,6 +5655,38 @@ def build_parser() -> argparse.ArgumentParser:
     p4.add_argument("--timeout", type=int, default=1800)
     s.set_defaults(func=cmd_plan)
 
+    s = sub.add_parser("assess", help=COMMAND_HELP.get("assess", ""))
+    ass = s.add_subparsers(dest="assess_cmd", required=True)
+    p1 = ass.add_parser("submit", help="assessor: file the six-point assessment")
+    p1.add_argument("ref")
+    p1.add_argument("--token", default="")
+    p1.add_argument("--json", dest="json_text", default="", metavar="JSON")
+    p1.add_argument("--file", default="", help="JSON file ('-' = stdin)")
+    p1.add_argument("--force", action="store_true",
+                    help="human: reserve a fresh attempt and submit under it")
+    p2 = ass.add_parser("show", help="print the ticket's assessment state")
+    p2.add_argument("ref")
+    p2.add_argument("--json", action="store_true")
+    p3 = ass.add_parser("run", help="(re)start the assessor for a closed bug")
+    p3.add_argument("ref")
+    p3.add_argument("--force", action="store_true")
+    p3.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="print the resolved repo, assessor and prompt; spawn nothing")
+    p4 = ass.add_parser("resume", help="finish filing a half-filed assessment (no LLM)")
+    p4.add_argument("ref")
+    p5 = ass.add_parser("new", help="file + close a bug fixed without a ticket, then assess it")
+    p5.add_argument("-q", "--queue", required=True)
+    p5.add_argument("--title", required=True)
+    p5.add_argument("--text", default="")
+    p5.add_argument("--summary", default="")
+    p5.add_argument("--commit", default="", metavar="SHA")
+    p5.add_argument("--no-code", action="store_true", dest="no_code")
+    p5.add_argument("--repo-path", default="", dest="repo_path")
+    p5.add_argument("--worker", default="")
+    p5.add_argument("--source", default="wt")
+    p5.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_assess)
+
     s = sub.add_parser("verdict", help=COMMAND_HELP.get("verdict", ""))
     s.add_argument("ref")
     g = s.add_mutually_exclusive_group(required=True)
@@ -5905,7 +6127,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="on = auto-spawn workers; off = backlog mode")
     s.add_argument("--workers", default=None, type=int,
                    help="number of concurrent workers the reconciler should maintain")
-    s.add_argument("--workers-local-path", default=None, dest="workers_local_path",
+    s.add_argument("--workers-local-path", "--repo-path", default=None, dest="workers_local_path",
                    help="local repo path workers operate in (cwd for spawned workers)")
     s.add_argument("--backend", default=None, choices=["file", "github"],
                    help="queue backing store: file (default) or github")
@@ -5941,6 +6163,7 @@ def build_parser() -> argparse.ArgumentParser:
         ("planner", "the planner", "the builder's engine at its strongest ranked model"),
         ("plan-reviewer", "the plan reviewer", "a different engine family than the builder"),
         ("verifier", "the verify gate's verifier", "a different engine family than the builder"),
+        ("assessor", "the post-fix assessor", "a different engine family than the builder"),
     ):
         s.add_argument(f"--{_role}-engine", default=None, dest=f"{_role.replace('-', '_')}_engine",
                        help=f"engine {_what} runs on (default: {_default}); empty string clears")
@@ -5951,6 +6174,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="queue default acceptance gate (repeatable, ordered): "
                         "cmd:<command>, verify, review or review:<target>; "
                         "--gate none clears them")
+    s.add_argument("--post-fix-assessment", default=None, choices=["on", "off"],
+                   dest="post_fix_assessment",
+                   help="on = every bug that closes as completed gets an independent "
+                        "six-point post-fix assessment (needs a local --repo-path)")
     s.add_argument("--product-gate", default=None, choices=["on", "off"],
                    dest="product_gate",
                    help="on = workers must get a human Ack (wt ack) after a "

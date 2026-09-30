@@ -18,6 +18,9 @@ cd watchtower && pip install -e .
 
 It files a ticket, starts `wt wait` in the background, claims and closes the ticket (standing in for a real worker), and shows `wt wait` unblock the instant the queue empties. Read [`examples/quickstart-demo.sh`](examples/quickstart-demo.sh); it is a plain shell script, nothing hidden.
 
+
+See [`docs/post-fix-assessment.md`](docs/post-fix-assessment.md) for the opt-in post-fix assessment (`wt assess`, `wt config --post-fix-assessment`).
+
 ## Quick start (3 steps)
 
 **Requirements:** Python 3.11+, macOS or Linux. An agent CLI, [Claude Code](https://claude.ai/code) or [Codex](https://github.com/openai/codex), is only needed once you want WatchTower to spawn real AI workers instead of draining tickets yourself.
