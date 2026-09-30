@@ -709,18 +709,17 @@ def cmd_edit(args: argparse.Namespace) -> int:
         if value is not None:
             fields[name] = value
     after = getattr(args, "after", None)
-    if getattr(args, "clear_after", False):
-        fields["blocked_by"] = []
-    elif after:
-        try:
-            existing = list((q.get(args.ref) or {}).get("blocked_by") or [])
-        except Exception:
-            existing = []
-        fields["blocked_by"] = existing + [a for a in after if a not in existing]
-    if getattr(args, "clear_gates", False):
-        fields["gates"] = []
-    elif getattr(args, "gate", None):
-        fields["gates"] = list(args.gate)
+    # --clear-X + --X means "replace": clear first, then apply the new values.
+    if after or getattr(args, "clear_after", False):
+        existing = []
+        if not getattr(args, "clear_after", False):
+            try:
+                existing = list((q.get(args.ref) or {}).get("blocked_by") or [])
+            except Exception:
+                existing = []
+        fields["blocked_by"] = existing + [a for a in (after or []) if a not in existing]
+    if getattr(args, "clear_gates", False) or getattr(args, "gate", None):
+        fields["gates"] = list(getattr(args, "gate", None) or [])
     new_queue = getattr(args, "queue", None)
     if not fields and new_queue is None:
         print(

@@ -72,3 +72,14 @@ def test_ticket_role_flags_on_add_and_edit(wt_env, run_cli):
     it = wt_env.queue.get(ref)
     assert it["verifier_model"] == "gpt-5.5" and not it.get("planner_model")
     assert run_cli("edit", ref, "--verifier-model", "bogus").code == 1
+
+
+def test_edit_clear_then_apply_replaces(wt_env, run_cli):
+    a = run_cli("add", "-q", "RQ3", "--title", "a", "--note", "n", "--gate", "verify")
+    b = run_cli("add", "-q", "RQ3", "--title", "b", "--note", "n")
+    c = run_cli("add", "-q", "RQ3", "--title", "c", "--note", "n", "--after", a.out.split()[1])
+    ra, rb, rc = (x.out.split()[1] for x in (a, b, c))
+    assert run_cli("edit", ra, "--clear-gates", "--gate", "plan", "--gate", "verify").code == 0
+    assert wt_env.queue.get(ra)["gates"] == ["plan", "verify"]
+    assert run_cli("edit", rc, "--clear-after", "--after", rb).code == 0
+    assert wt_env.queue.get(rc)["blocked_by"] == [rb]
