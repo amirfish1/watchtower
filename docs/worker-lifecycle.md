@@ -194,6 +194,40 @@ exits immediately. A wind-down STOP makes either engine exit between tickets.
 
 ---
 
+## Stage sessions (planner, plan reviewer, verifier, assessor)
+
+Stage sessions are owned by the reconciler, not by whichever build worker ran
+`wt claim` / `wt close`. Ticket state is the intent; the CLI only calls
+`stages.request()`, which appends to `~/.watchtower/stage-wake` and logs
+`STAGE_QUEUED`. Only the one real daemon (`wt start --auto-spawn`, never
+`--dry-run`, always under `reconcile.lock`) or a manual `wt stages tick` spawns
+or respawns. The daemon sleeps in 0.5 s chunks and runs a stage pass as soon as
+the wake file's mtime advances; a lost wake is caught by the next full tick.
+
+Supervision key per stage: `plan:r<round>`, `review:r<round>`,
+`verify:<verify_cycle>`, `assess:<assessment.cycle>`. Two attempts per key: the
+first death respawns, the second escalates to `needs_input` (`wt answer REF
+"retry"` grants a fresh budget). Classified launch failures (auth, quota, engine
+missing, rejected model, untrusted cwd) set the shared cooldown and are refunded
+(max 3 per key); any other immediate death consumes an attempt and sets no
+cooldown. Sessions run under `_exitwrap.py`, which records exit code/signal.
+Idle is judged by the claude transcript mtime (claude -p writes nothing to its
+log until it exits), other engines by log mtime. Dead stage records are kept
+30 min (`WATCHTOWER_ADHOC_DEAD_KEEP_S`). Engine starts are staggered host-wide
+(`WATCHTOWER_SPAWN_STAGGER_S`, claude 3 s, others 1 s). The cwd is the ticket's
+`repo_path`, else the queue's; never the daemon's.
+
+| Verb | Meaning |
+|------|---------|
+| `STAGE_QUEUED` | A CLI transition requested a stage; wake file touched. |
+| `STAGE_SPAWN` | A stage session started (`attempt n/2`, `cause=initial|respawn|retry|adopted`). |
+| `STAGE_DEAD` | A session died or could not start, with the reason and exit forensics. |
+| `STAGE_WAIT` | Spawn deferred by an engine launch cooldown (logged once). |
+| `STAGE_DEFER` | Per-tick spawn cap (`WATCHTOWER_STAGE_SPAWNS_PER_TICK`) reached. |
+| `STAGE_BLOCK` | Out of attempts; the ticket is waiting for a human. |
+| `ASSESS_RESUME` | An assessor was respawned with a rotated (fenced) token. |
+| `SPAWN_GATE` | The host-wide spawn stagger timed out and proceeded. |
+
 ## Auditable idle decisions
 
 The unified activity log at `~/.watchtower/activity.log` contains the evidence,

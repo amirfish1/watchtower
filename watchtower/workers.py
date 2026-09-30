@@ -2980,6 +2980,8 @@ def _classify_launch_failure_log(
         # Kimi's lapsed plan: "provider.auth_error: 403 Your current
         # subscription does not have access". Logged in fine; needs billing.
         reason = "engine subscription has no access"
+    elif "not inside a trusted directory" in lower:
+        reason = "engine refused the working directory (not trusted)"
     elif "not logged in" in lower or "please run /login" in lower:
         reason = "engine authentication required"
     elif _AUTH_FAILED_RE.search(lower):
@@ -3936,6 +3938,7 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         kept: List[Dict[str, Any]] = []
         backfilled = False
+        died_seen = {id(w): w.get("died_at") for w in data["workers"]}
         for w in data["workers"]:
             # Backfill the cloud session UUID from the worker's output log once
             # it appears (the worker has to start its first turn before the init
@@ -3982,10 +3985,12 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                 # WT-24: a dead stage session keeps its record for a short
                 # window (forensics + the stage watcher's death reason).
                 kept.append(w)
+                if w.get("died_at") and not died_seen.get(id(w)):
+                    backfilled = True  # persist the died_at stamp
             else:
                 # This record is about to be dropped -- last chance to learn why
                 # the worker died (see _postmortem_launch_failure).
-                if prune:
+                if prune and not w.get("died_at"):   # stage records were post-mortemed at stamping
                     postmortem.append(dict(w))
                 # Dead worker: unlink its FIFO node so it doesn't linger on disk.
                 fifo = w.get("fifo")
@@ -5302,7 +5307,8 @@ def backfill_recent_session_titles(
 
 
 def reconcile_once(dry_run: bool = False,
-                   only_queue: str = "") -> Dict[str, Any]:
+                   only_queue: str = "",
+                   supervise_stages: bool = True) -> Dict[str, Any]:
     """One reconciler tick.
 
     Loads the registry + live workers + queue depths and for each registered
@@ -5339,7 +5345,8 @@ def reconcile_once(dry_run: bool = False,
     """
     from .queue import _FileLock
     with _FileLock(WORKERS_FILE.parent / "reconcile.lock"):
-        return _reconcile_once_locked(dry_run, only_queue=only_queue)
+        return _reconcile_once_locked(dry_run, only_queue=only_queue,
+                                      supervise_stages=supervise_stages)
 
 
 def reopen_legacy_floor_parks(reconcile_id: str = "") -> List[Dict[str, Any]]:
@@ -5486,7 +5493,8 @@ def spawn_floor_routed_workers(
 
 
 def _reconcile_once_locked(dry_run: bool = False,
-                           only_queue: str = "") -> Dict[str, Any]:
+                           only_queue: str = "",
+                           supervise_stages: bool = True) -> Dict[str, Any]:
     from . import config, health
     import sys
     reconcile_id = f"reconcile-{uuid.uuid4().hex[:12]}"
@@ -5584,11 +5592,14 @@ def _reconcile_once_locked(dry_run: bool = False,
                                   for it in requeue_orphaned_tickets()]
         except Exception:
             pass
-        try:
-            from . import stages as _stages
-            result["stages"] = [f"{r}:{a}" for r, a in _stages.reconcile_stages()]
-        except Exception:
-            pass
+        # Single supervisor (WT-24): only a real auto-spawn daemon supervises stage
+        # sessions -- never a --dry-run or spawn-less one.
+        if supervise_stages and not dry_run:
+            try:
+                from . import stages as _stages
+                result["stages"] = [f"{r}:{a}" for r, a in _stages.reconcile_stages()]
+            except Exception:
+                pass
         # Nudge any live worker already on an affected queue so the reopened
         # ticket is re-claimed right away. Without this, a requeue only gets
         # picked up when the spawn pass below decides actual<desired (it won't,

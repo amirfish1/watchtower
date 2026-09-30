@@ -288,7 +288,7 @@ def test_daemon_loop_calls_nudge_tick_and_survives_its_exception(wt, monkeypatch
 
     monkeypatch.setattr(wt.chats, "nudge_tick", _boom)
     monkeypatch.setattr(
-        wt.workers, "reconcile_once", lambda dry_run=False: {"spawned": [], "stopped": []}
+        wt.workers, "reconcile_once", lambda dry_run=False, **_kw: {"spawned": [], "stopped": []}
     )
     monkeypatch.setattr(
         wt.messages, "drain_outbox",
@@ -342,7 +342,7 @@ def test_daemon_restart_replaces_detached_dashboard_before_binding(wt, monkeypat
 
     monkeypatch.setattr(wt.dashboard, "ThreadingHTTPServer", _Server)
     monkeypatch.setattr(
-        wt.workers, "reconcile_once", lambda dry_run=False: {"spawned": [], "stopped": []}
+        wt.workers, "reconcile_once", lambda dry_run=False, **_kw: {"spawned": [], "stopped": []}
     )
     monkeypatch.setattr(wt.messages, "drain_outbox", lambda: {})
 
@@ -394,7 +394,7 @@ def test_periodic_self_update_skipped_within_interval(wt, monkeypatch):
 
     monkeypatch.setattr(wt.dashboard, "ThreadingHTTPServer", _Server)
     monkeypatch.setattr(
-        wt.workers, "reconcile_once", lambda dry_run=False: {"spawned": [], "stopped": []}
+        wt.workers, "reconcile_once", lambda dry_run=False, **_kw: {"spawned": [], "stopped": []}
     )
     monkeypatch.setattr(wt.messages, "drain_outbox", lambda: {})
 
@@ -427,7 +427,7 @@ def test_periodic_self_update_fires_after_interval_elapses(wt, monkeypatch):
 
     monkeypatch.setattr(wt.dashboard, "ThreadingHTTPServer", _Server)
     monkeypatch.setattr(
-        wt.workers, "reconcile_once", lambda dry_run=False: {"spawned": [], "stopped": []}
+        wt.workers, "reconcile_once", lambda dry_run=False, **_kw: {"spawned": [], "stopped": []}
     )
     monkeypatch.setattr(wt.messages, "drain_outbox", lambda: {})
 
@@ -453,9 +453,9 @@ def test_periodic_self_update_fires_after_interval_elapses(wt, monkeypatch):
 
     real_reconcile = wt.workers.reconcile_once
 
-    def _advance_then_reconcile(dry_run=False):
+    def _advance_then_reconcile(dry_run=False, **kw):
         fake_now[0] += wt.cli._SELF_UPDATE_CHECK_INTERVAL_S + 1
-        return real_reconcile(dry_run=dry_run)
+        return real_reconcile(dry_run=dry_run, **kw)
 
     monkeypatch.setattr(wt.workers, "reconcile_once", _advance_then_reconcile)
 

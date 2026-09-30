@@ -400,15 +400,25 @@ def no_engines(wt_env, monkeypatch):
 
 
 @pytest.fixture()
-def instant_daemon(monkeypatch):
+def instant_daemon(monkeypatch, tmp_path):
     """Emulate a watcher that wakes the instant a stage is requested (WT-24).
 
     CLI transitions only ``stages.request`` (they never spawn); tests that
     assert on the resulting planner / verifier / assessor spawn use this so the
     stage pass runs right after the request. Tests of the no-local-spawn rule
     itself must NOT use it."""
-    from watchtower import stages
+    from watchtower import stages, workers
     real = stages.request
+    real_repo = workers.assessment_repo
+
+    def repo(item):      # tests rarely configure a repo; stage cwd is never the daemon's
+        try:
+            return real_repo(item)
+        except ValueError:
+            return str(tmp_path)
+
+    repo.real = real_repo
+    monkeypatch.setattr(workers, "assessment_repo", repo)
 
     def request(ref, why=""):
         out = real(ref, why)

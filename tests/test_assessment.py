@@ -136,7 +136,8 @@ def test_blocked_assessor_model_fails_without_spawn(wt, monkeypatch):
     assert "policy" in wt.q.get(b["ref"])["assessment"]["reason"]
 
 
-def test_no_repo_fails_and_never_uses_cwd(wt):
+def test_no_repo_fails_and_never_uses_cwd(wt, monkeypatch):
+    monkeypatch.setattr(wt.workers, "assessment_repo", wt.workers.assessment_repo.real)
     wt.config.set_repo_path("AS", "")
     b = _bug(wt.q)
     _close(wt.q, b["ref"])

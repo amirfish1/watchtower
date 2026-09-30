@@ -485,10 +485,10 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
                      f"{cooldown.get('cooldown_until_human', '')} ({cooldown.get('reason', '')})",
                      queue=project)
             return "wait"
-        repo = str(item.get("repo_path") or "")
+        # ticket repo_path, else the queue's repo; never the daemon's cwd
+        repo = workers.assessment_repo(item)
         token = ""
         if role == "assessor":
-            repo = workers.assessment_repo(item)
             a = item.get("assessment") or {}
             if a.get("status") == "due":
                 token = q.assessment_reserve(ref) or ""
@@ -578,6 +578,7 @@ def _supervise(d: Dict[str, Any], rows: List[Dict[str, Any]], budget: _Budget) -
         return
     project = str(item.get("project") or "")
     ss = dict(item.get("stage_session") or {})
+    ss_old = dict(ss)
     adopted = False
     if ss.get("escalated") and ss.get("key") == key:
         return  # waiting for a human (needs_input is set)
@@ -601,6 +602,9 @@ def _supervise(d: Dict[str, Any], rows: List[Dict[str, Any]], budget: _Budget) -
         else:
             ss = {"key": key, "role": role, "attempt": 0, "worker_id": "", "escalated": False,
                   "deaths": list(ss.get("deaths") or [])[-10:], "refunds": 0}
+            for carry in ("retry_note", "retry_at"):   # a human retry moved the key (assess:N+1)
+                if ss_old.get(carry):
+                    ss[carry] = ss_old[carry]
             _ss_set(ref, **ss)
     elif not ss.get("role"):
         ss["role"] = role
@@ -635,6 +639,13 @@ def _supervise(d: Dict[str, Any], rows: List[Dict[str, Any]], budget: _Budget) -
             return
         cause = "respawn"
     else:
+        last = (ss.get("deaths") or [{}])[-1]
+        if (int(ss.get("attempt") or 0) >= MAX_ATTEMPTS and last.get("key") == key
+                and not ss.get("retry_at")):
+            # The last attempt died at launch (no worker left to check): out of budget.
+            _escalate(q.get(ref) or item, role, key, ss)
+            budget.acted.append((ref, "blocked"))
+            return
         cause = "retry" if ss.get("retry_at") else (
             "respawn" if ss.get("deaths") and ss.get("attempt") else "initial")
     if budget.spawns <= 0:

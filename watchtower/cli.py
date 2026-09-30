@@ -4435,7 +4435,10 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
         pass
     last_config_sanitize = 0.0  # 0 -> the first tick below heals at daemon start
     while True:
-        result = workers.reconcile_once(dry_run=dry_run)
+        # Only a real auto-spawn daemon supervises stage sessions (WT-24).
+        result = workers.reconcile_once(
+            dry_run=dry_run,
+            **({} if getattr(args, "auto_spawn", False) else {"supervise_stages": False}))
         # Drain queued cross-agent messages each tick. Best-effort: a messaging
         # hiccup must never kill the reconcile loop.
         try:
@@ -4597,10 +4600,14 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
         # cuts latency) and run a stage-only pass.
         from . import stages as _stages
         remaining = float(interval)
+        supervising = bool(getattr(args, "auto_spawn", False)) and not dry_run
         while remaining > 0:
             slept_from = time.time()
             if not _stages.sleep_until_wake(remaining, sleep=time.sleep):
                 break
+            if not supervising:     # a dry-run / spawn-less daemon never supervises
+                remaining -= max(0.5, time.time() - slept_from)
+                continue
             try:
                 acted = workers.reconcile_stages_only()
                 if acted:
