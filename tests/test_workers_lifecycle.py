@@ -4696,6 +4696,22 @@ def test_dispatch_still_nudges_for_an_unclaimed_ticket(wt):
     assert item["ref"] in msg["message"]["content"][0]["text"]
 
 
+def test_dispatch_nudges_idle_workers_not_ones_holding_a_ticket(wt):
+    """WT-15: a worker mid-ticket is not disturbed by a new ticket while
+    another worker is idle and can take it."""
+    wt.config.set_auto_drain("Q", True)
+    busy = _live_worker(wt, "Q")
+    _live_worker(wt, "Q")  # idle
+    held = wt.q.enqueue(project="Q", note="in flight")
+    wt.q.claim_by_ref(held["ref"], busy["worker_id"])
+    item = wt.q.enqueue(project="Q", note="new")
+
+    reason = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+
+    assert reason == "nudged 1 live worker(s) — immediate pickup"
+    assert [_fifo_pending(fd) for fd in wt._readers] == [False, True]
+
+
 def test_dispatch_does_not_nudge_the_session_that_filed_the_ticket(wt, monkeypatch):
     """Telling a session about its own `wt add` is never news -- and it lands
     as a steer mid-turn (same class as WATCHTOWER-21's comment echo)."""
