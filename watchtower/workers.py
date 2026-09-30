@@ -3272,7 +3272,7 @@ def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any
         simultaneously-pruned casualties logs one LAUNCH_FAIL, not five).
     """
     log_path = str(worker.get("log") or "")
-    queue = str(worker.get("queue") or "")
+    queue = str(worker.get("ticket_queue") or worker.get("queue") or "")
     if not log_path or not queue or worker.get("session_id"):
         return None
     started_at = worker.get("started_at")
@@ -3384,11 +3384,20 @@ def _wait_for_immediate_launch_failure(
     worker_id: str,
     log_path: Path,
     model: str = "",
+    classified_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    if _LAUNCH_FAILURE_GRACE_S <= 0:
+    """Watch the first seconds after spawn for a launch failure.
+
+    ``classified_only`` (WT-24, stage sessions): an UNclassified non-zero exit
+    does not set the shared cooldown; the caller gets
+    ``{"classified": False, "reason", "exit_code"}`` and decides (a stage death
+    consumes an attempt). A classifier hit is recorded as always and returned
+    with ``"classified": True``. The default path is unchanged for builders."""
+    grace = _stage_launch_grace_s() if classified_only else _LAUNCH_FAILURE_GRACE_S
+    if grace <= 0:
         return None
     try:
-        exit_code = proc.wait(timeout=_LAUNCH_FAILURE_GRACE_S)
+        exit_code = proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         return None
     classified = _classify_launch_failure_log(log_path)
@@ -3405,8 +3414,10 @@ def _wait_for_immediate_launch_failure(
         tail = _last_log_line(log_path)
         if tail:
             reason += f": {tail}"
+        if classified_only:
+            return {"classified": False, "reason": reason, "exit_code": exit_code}
         classified = {"reason": reason}
-    return _record_launch_failure(
+    rec = _record_launch_failure(
         queue=queue,
         engine=engine,
         worker_id=worker_id,
@@ -3417,6 +3428,89 @@ def _wait_for_immediate_launch_failure(
         model=model,
         exit_code=exit_code,
     )
+    if classified_only and isinstance(rec, dict):
+        rec = dict(rec, classified=True)
+    return rec
+
+
+def _stage_launch_grace_s() -> float:
+    """Immediate-failure window for stage sessions; per call so tests tune it."""
+    try:
+        return float(os.environ.get("WATCHTOWER_STAGE_LAUNCH_GRACE_S",
+                                    str(_LAUNCH_FAILURE_GRACE_S)))
+    except ValueError:
+        return _LAUNCH_FAILURE_GRACE_S
+
+
+def _spawn_stagger_s(engine: str) -> float:
+    raw = os.environ.get("WATCHTOWER_SPAWN_STAGGER_S")
+    if raw not in (None, ""):
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 3.0 if str(engine).lower() == "claude" else 1.0
+
+
+_SPAWN_GATE_MAX_WAIT_S = 30.0
+
+
+def _spawn_gate(engine: str) -> float:
+    """Host-wide stagger between engine starts (WT-24). A cross-process file
+    lock plus a last-spawn epoch per engine: concurrent ``claude -p`` starts
+    (the 2026-09-30 silent-death suspect) can no longer land in the same
+    second, whichever process spawns them. Waits at most 30 s, then logs
+    SPAWN_GATE timeout and proceeds. Returns the seconds waited."""
+    stagger = _spawn_stagger_s(engine)
+    if stagger <= 0:
+        return 0.0
+    import fcntl
+    base = WORKERS_FILE.parent
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(base / "spawn-gate.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return 0.0
+    started = time.time()
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() - started > _SPAWN_GATE_MAX_WAIT_S:
+                    _log_spawn_gate_timeout(engine)
+                    return time.time() - started
+                time.sleep(0.05)
+        state_path = base / "spawn-gate.json"
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            state = {}
+        last = float(state.get(engine) or 0)
+        wait = last + stagger - time.time()
+        if wait > 0:
+            wait = min(wait, max(0.0, _SPAWN_GATE_MAX_WAIT_S - (time.time() - started)))
+            time.sleep(wait)
+        state[engine] = time.time()
+        try:
+            state_path.write_text(json.dumps(state))
+        except OSError:
+            pass
+        return time.time() - started
+    finally:
+        try:
+            os.close(fd)  # releases the flock
+        except OSError:
+            pass
+
+
+def _log_spawn_gate_timeout(engine: str) -> None:
+    try:
+        from .queue import _log
+        _log("SPAWN_GATE", f"timeout waiting for the {engine} spawn gate; proceeding")
+    except Exception:
+        pass
 
 
 def _last_log_line(log_path: Path, limit: int = 160) -> str:
@@ -3785,6 +3879,9 @@ def record_worker(
     model: str = "",
     kind: str = "",
     ref: str = "",
+    stage: str = "",
+    ticket_queue: str = "",
+    exit_file: str = "",
 ) -> Dict[str, Any]:
     with _WorkersFileLock():
         data = _load()
@@ -3805,6 +3902,12 @@ def record_worker(
             rec["kind"] = kind
         if ref:
             rec["ref"] = ref
+        if stage:
+            rec["stage"] = stage
+        if ticket_queue:
+            rec["ticket_queue"] = ticket_queue
+        if exit_file:
+            rec["exit_file"] = exit_file
         if session_id:
             rec["session_id"] = session_id
         data["workers"].append(rec)
@@ -3875,6 +3978,10 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
             )
             if alive or pending_audit or w.get("rebound_at"):
                 kept.append(w)
+            elif w.get("stage") and _stage_record_kept(w, prune, postmortem):
+                # WT-24: a dead stage session keeps its record for a short
+                # window (forensics + the stage watcher's death reason).
+                kept.append(w)
             else:
                 # This record is about to be dropped -- last chance to learn why
                 # the worker died (see _postmortem_launch_failure).
@@ -3903,6 +4010,31 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
         except Exception:
             pass  # a post-mortem must never break a plain worker listing
     return out
+
+
+def _adhoc_dead_keep_s() -> float:
+    try:
+        return float(os.environ.get("WATCHTOWER_ADHOC_DEAD_KEEP_S", "1800"))
+    except ValueError:
+        return 1800.0
+
+
+def _stage_record_kept(w: Dict[str, Any], prune: bool, postmortem: List[Dict[str, Any]]) -> bool:
+    """Decide whether a dead stage record stays (called under the workers
+    lock). Stamps ``died_at`` on the first dead observation and queues the
+    launch-failure post-mortem exactly once, at that moment."""
+    if not prune:
+        return True
+    now = time.time()
+    died = w.get("died_at")
+    if not died:
+        w["died_at"] = now
+        postmortem.append(dict(w))
+        return True
+    try:
+        return (now - float(died)) < _adhoc_dead_keep_s()
+    except (TypeError, ValueError):
+        return False
 
 
 def worker_model(worker_id: str, queue: str) -> str:
@@ -3940,6 +4072,8 @@ def worker_counts(prune: bool = False) -> Dict[str, Dict[str, int]]:
     """
     out: Dict[str, Dict[str, int]] = {}
     for w in list_workers(prune=prune):
+        if w.get("stage") and not w.get("alive"):
+            continue  # kept-dead stage record (WT-24): not a queue worker
         row = out.setdefault(w.get("queue", ""), {"total": 0, "live": 0})
         row["total"] += 1
         if w.get("alive") and not _worker_released(w):
@@ -4484,40 +4618,23 @@ def start_assessment(item: Dict[str, Any], *, force: bool = False,
 
 
 def spawn_due_assessments(max_actions: int = 3) -> List[str]:
-    """Reconcile-sweep: spawn due assessors, resume stale ``filing`` ones and
-    settle dead ``running`` ones. At most ``max_actions`` per tick."""
-    from . import queue as _q
-    acted: List[str] = []
-    cands = _q.assessment_targets_for_sweep()
-    for it in cands["running"]:
-        if len(acted) >= max_actions:
-            return acted
-        a = it.get("assessment") or {}
-        wid = (a.get("assessor") or {}).get("worker_id", "")
-        rec = next((w for w in _load().get("workers", [])
-                    if isinstance(w, dict) and w.get("worker_id") == wid), None) if wid else None
-        if rec and _pid_alive(int(rec.get("pid", 0) or 0)):
-            continue
-        if int(a.get("attempt", 1)) <= 1:
-            _q.assessment_release_due(it["ref"], a.get("token", ""))
-        else:
-            _q.assessment_fail(it["ref"], a.get("token", ""),
-                               f"assessor exited without submitting (attempt {a.get('attempt')})")
-        acted.append(f"{it['ref']}:settled")
-    for it in cands["filing"]:
-        if len(acted) >= max_actions:
-            return acted
-        try:
-            _q.assessment_run_ops(it["ref"])
-            acted.append(f"{it['ref']}:resumed")
-        except Exception:  # noqa: BLE001
-            pass
-    for it in _q.assessment_targets_for_sweep()["due"]:
-        if len(acted) >= max_actions:
-            return acted
-        if start_assessment(it).get("status") == "spawned":
-            acted.append(f"{it['ref']}:spawned")
-    return acted
+    """Compatibility wrapper (WT-24): the reconciler's stage pass now owns
+    assessor spawn/watch/respawn and stale-``filing`` resume. Returns the same
+    ``ref:spawned|resumed|settled`` strings."""
+    from . import stages
+    tags = {"spawned": "spawned", "launch_failed": "spawned", "resumed": "resumed",
+            "blocked": "settled", "failed": "settled"}
+    return [f"{ref}:{tags[action]}" for ref, action in stages.reconcile_stages()
+            if action in tags][:max(0, max_actions)]
+
+
+def reconcile_stages_only() -> List[Any]:
+    """A stage-only pass under ``reconcile.lock`` (daemon wake path): skips the
+    fleet maintenance of a full tick."""
+    from .queue import _FileLock
+    from . import stages
+    with _FileLock(WORKERS_FILE.parent / "reconcile.lock"):
+        return stages.reconcile_stages()
 
 
 def requeue_orphaned_tickets(
@@ -4661,7 +4778,7 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             # Plan-gated (WT-22): plan first; no worker until it is accepted
             # (cmd_plan's accept verdict dispatches again).
             from . import cli as _cli
-            _cli.start_pending_plans(queue)
+            _cli.start_pending_plans(queue)  # requests the stage; the daemon spawns it
             reason = "planning first — no worker until the plan is accepted"
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
@@ -5468,7 +5585,8 @@ def _reconcile_once_locked(dry_run: bool = False,
         except Exception:
             pass
         try:
-            result["assessments"] = spawn_due_assessments()
+            from . import stages as _stages
+            result["stages"] = [f"{r}:{a}" for r, a in _stages.reconcile_stages()]
         except Exception:
             pass
         # Nudge any live worker already on an affected queue so the reopened
@@ -6766,8 +6884,17 @@ def spawn_adhoc(
     report_to: str = "",
     dry_run: bool = False,
     verify: bool = False,
+    stage: str = "",
+    ticket_ref: str = "",
+    ticket_queue: str = "",
 ) -> Dict[str, Any]:
     """Spawn one one-shot ad-hoc agent on ``prompt`` and return its record.
+
+    ``stage`` (planner/plan_reviewer/verifier/assessor, WT-24) marks a stage
+    session owned by ``stages.py``: its argv runs under ``_exitwrap`` (exit
+    forensics), the start goes through ``_spawn_gate``, the record carries
+    ``stage``/``ref``/``ticket_queue``, and an immediate launch failure comes
+    back on the record as ``launch_failure`` (classified -> shared cooldown).
 
     ``report_to`` (worker id, @agent name, or session UUID) appends the
     WT-native reply-to footer so the agent reports back via `wt send`.
@@ -6818,6 +6945,12 @@ def spawn_adhoc(
             rec["model"] = model
         return rec
     log_dir.mkdir(parents=True, exist_ok=True)
+    exit_file = ""
+    if stage:
+        exit_file = f"{log_path}.exit"
+        argv = [sys.executable, str(Path(__file__).with_name("_exitwrap.py")),
+                "--exit-file", exit_file, "--"] + list(argv)
+        _spawn_gate(engine)
     logf = open(log_path, "ab")
     try:
         proc = subprocess.Popen(
@@ -6834,6 +6967,17 @@ def spawn_adhoc(
     rec = record_worker(
         proc.pid, label.upper(), engine, worker_id, repo_path, str(log_path),
         model=model, kind="adhoc", session_id=session_id,
+        ref=ticket_ref, stage=stage, ticket_queue=ticket_queue, exit_file=exit_file,
     )
     rec["argv"] = argv
+    if stage:
+        try:
+            failure = _wait_for_immediate_launch_failure(
+                proc, queue=ticket_queue or label.upper(), engine=engine,
+                worker_id=worker_id, log_path=log_path, model=model,
+                classified_only=True)
+        except Exception:  # noqa: BLE001 - a probe must never fail the spawn
+            failure = None
+        if failure:
+            rec["launch_failure"] = failure
     return rec

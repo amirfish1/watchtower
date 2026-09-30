@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
-from . import health, queue as q, resume_verify, workers
+from . import health, queue as q, resume_verify, stages, workers
 
 DAEMON_PID_FILE = Path(
     os.environ.get("WATCHTOWER_DAEMON_PID")
@@ -982,7 +982,6 @@ def cmd_claim(args: argparse.Namespace) -> int:
             print(f"error: {ref} not found", file=sys.stderr)
             return 1
     else:
-        start_pending_plans(args.queue)
         try:
             item = q.claim_next(
                 worker,
@@ -1127,35 +1126,11 @@ def _plan_review_goal(item: dict) -> str:
     )
 
 
-def _spawn_plan_role(item: dict, role: str, goal: str, name: str) -> bool:
-    """Spawn the planner / plan reviewer for ``item`` on its role model
-    (roles.effective_role_model). A blocked model or a spawn failure marks the
-    plan stage ``failed`` so the build proceeds (loudly) instead of stalling
-    with nobody to answer."""
-    from . import roles
-    ticket = dict(item)
-    gate_model = q.plan_gate(item)
-    if role == "planner" and gate_model:
-        ticket["planner_model"] = gate_model
-    try:
-        eng, mdl, source = roles.effective_role_model(item.get("project", ""), ticket, role)
-        if mdl and config_is_blocked(mdl):
-            raise ValueError(f"model {mdl!r} for the {role} ({eng}) is blocked by "
-                             f"model policy; not substituting another model")
-        rec = workers.spawn_adhoc(goal, eng, model=mdl,
-                                  repo_path=str(item.get("repo_path") or ""),
-                                  name=name, report_to="")
-        q.plan_set_role(item["ref"], "planner" if role == "planner" else "reviewer",
-                        {"engine": eng, "model": mdl, "source": source,
-                         "worker_id": rec.get("worker_id", "")})
-        print(f"  {role} spawned: {rec.get('worker_id', '?')} "
-              f"({eng}{'/' + mdl if mdl else ''}, {source})")
-        return True
-    except Exception as exc:  # noqa: BLE001
-        q.plan_fail(item["ref"], f"could not spawn the {role}: {exc}")
-        print(f"warning: plan stage failed for {item['ref']} ({exc}); "
-              "building without a plan", file=sys.stderr)
-        return False
+def _spawn_plan_role(item: dict, role: str, goal: str = "", name: str = "") -> bool:
+    """Shim (WT-24): the daemon spawns planner / reviewer sessions. The ticket's
+    plan state is the intent; this only wakes the daemon."""
+    stages.request(item["ref"], f"plan {role}")
+    return True
 
 
 def config_is_blocked(model: str) -> bool:
@@ -1165,14 +1140,15 @@ def config_is_blocked(model: str) -> bool:
 
 def _start_plan_stage(item: dict) -> dict:
     """On claim: if the ticket has a plan gate and planning has not begun,
-    start it and spawn the planner. Returns the (refreshed) item."""
+    start it and ask the daemon for the planner (WT-24: the daemon spawns
+    stage sessions, never this process). Returns the (refreshed) item."""
     if q.plan_gate(item) is None:
         return item
     started = q.plan_start(item["ref"])
     if started is None:
         return item
     if started.pop("_plan_started", False):
-        _spawn_plan_role(started, "planner", _plan_goal(started), f"plan-{item['ref']}")
+        stages.request(item["ref"], "plan start")
     return q.get(item["ref"]) or started
 
 
@@ -1181,7 +1157,7 @@ def start_pending_plans(queue: str) -> int:
     ``queue`` whose planning has not begun (WT-22). Planning happens BEFORE a
     build worker claims; ``_claim_candidates`` keeps the ticket unclaimable
     until the plan settles. Best-effort; returns how many planners started."""
-    n = recover_plan_discussions(queue) * 0  # WT-26: re-message stalled discussions
+    n = 0
     try:
         for it in q.list_items(project=queue) or []:
             if it.get("status") != "open" or q.plan_gate(it) is None:
@@ -1190,8 +1166,7 @@ def start_pending_plans(queue: str) -> int:
                 continue
             started = q.plan_start(it["ref"])
             if started is not None and started.pop("_plan_started", False):
-                _spawn_plan_role(started, "planner", _plan_goal(started),
-                                 f"plan-{it['ref']}")
+                stages.request(it["ref"], "plan-gated add")
                 n += 1
     except Exception:  # noqa: BLE001
         pass
@@ -1291,8 +1266,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                            f"--accept --version {plan.get('version')} --reasons ...` or "
                            f"`--reject` with what still must change.")
             else:
-                _spawn_plan_role(item, "plan_reviewer", _plan_review_goal(item),
-                                 f"plan-review-{ref}")
+                stages.request(ref, "plan filed")
         elif action == "verdict":
             item = q.plan_verdict(ref, bool(args.accept), args.reasons or "",
                                   by=args.by or _default_worker_id(),
@@ -1316,9 +1290,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                            f"then file the amended plan with `wt plan submit {ref} --file ...`. "
                            f"Do not rewrite the plan wholesale; fix the objections.")
             elif status == "planning":
-                _spawn_plan_role(item, "planner",
-                                 _plan_goal(item, feedback=args.reasons or ""),
-                                 f"plan-{ref}-r{item['plan']['round']}")
+                stages.request(ref, "plan rejected")
             elif status == "blocked":
                 reviews = item["plan"].get("reviews") or []
                 disc = item["plan"].get("discussion") or {}
@@ -1349,11 +1321,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
             print(f"PLAN DECISION {decision.upper()}: {ref} -> plan {status}; "
                   f"human block cleared")
             if status == "planning":
-                reviews = item["plan"].get("reviews") or []
-                last = reviews[-1].get("reasons", "") if reviews else ""
-                _spawn_plan_role(item, "planner",
-                                 _plan_goal(item, feedback=(text or last)),
-                                 f"plan-{ref}-r{item['plan']['round']}")
+                stages.request(ref, "plan retry")
             elif item.get("status") == "open":
                 try:
                     workers.dispatch_after_enqueue(item.get("project", ""), ref)
@@ -1401,6 +1369,36 @@ def cmd_plan(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    return 0
+
+
+def cmd_stages(args: argparse.Namespace) -> int:
+    """`wt stages tick|show` -- manual / daemonless stage supervision (WT-24)."""
+    if args.stages_cmd == "tick":
+        from .queue import _FileLock
+        with _FileLock(workers.WORKERS_FILE.parent / "reconcile.lock"):
+            acted = stages.reconcile_stages(only_ref=args.ref or "")
+        for ref, action in acted:
+            print(f"{ref}: {action}")
+        if not acted:
+            print("no stage work due")
+        return 0
+    item = q.get(args.ref)
+    if not item:
+        print(f"error: no item {args.ref}", file=sys.stderr)
+        return 1
+    ss = item.get("stage_session") or {}
+    if args.json:
+        print(json.dumps(ss, indent=2))
+        return 0 if ss else 1
+    if not ss:
+        print(f"{item['ref']}: no stage session")
+        return 1
+    print(f"{item['ref']}: {ss.get('role')} key={ss.get('key')} attempt "
+          f"{ss.get('attempt')}/{stages.MAX_ATTEMPTS} worker={ss.get('worker_id') or '-'}"
+          + (" ESCALATED" if ss.get("escalated") else ""))
+    for d in ss.get("deaths") or []:
+        print(f"  death {d.get('at')} attempt {d.get('attempt')}: {d.get('reason')}")
     return 0
 
 
@@ -1565,19 +1563,13 @@ def config_mod_repo_path(queue: str) -> str:
 
 def _maybe_assess(item: dict) -> None:
     """Best-effort: if the just-closed ``item`` is due a post-fix assessment,
-    reserve it and spawn the assessor. Never changes the exit code."""
+    ask the daemon for the assessor (WT-24: never spawned from here). Never
+    changes the exit code."""
     try:
         cur = q.get(item["ref"]) or item
         if (cur.get("assessment") or {}).get("status") != "due":
             return
-        res = workers.start_assessment(cur)
-        if res["status"] == "spawned":
-            a = res["assessor"]
-            print(f"  assessor spawned: {res['worker_id']} "
-                  f"({a['engine']}{'/' + a['model'] if a['model'] else ''}, {a['source']})")
-        elif res["status"] == "failed":
-            print(f"warning: post-fix assessment of {cur['ref']} failed to start: "
-                  f"{res['reason']} (retry: wt assess run {cur['ref']})", file=sys.stderr)
+        stages.request(cur["ref"], "assessment due")
     except Exception:  # noqa: BLE001
         pass
 
@@ -1620,8 +1612,8 @@ def cmd_assess(args: argparse.Namespace) -> int:
             print(f"  linked existing: {', '.join(a['existing'])}")
         return 0
     if action == "run":
-        res = workers.start_assessment(item, force=args.force, dry_run=args.dry_run)
         if args.dry_run:
+            res = workers.start_assessment(item, force=args.force, dry_run=True)
             if res["status"] == "failed":
                 print(f"cannot assess {ref}: {res['reason']}", file=sys.stderr)
                 return 1
@@ -1629,9 +1621,20 @@ def cmd_assess(args: argparse.Namespace) -> int:
             print(f"repo: {res['repo']}\nassessor: {t['engine']}/{t['model'] or '(default)'} "
                   f"({t['source']}){' BLOCKED' if t['blocked'] else ''}\n\n{res['prompt']}")
             return 0
-        print(f"ASSESS {res['status'].upper()}: {ref}"
-              + (f" -- {res['reason']}" if res.get("reason") else ""))
-        return 0 if res["status"] in ("spawned", "skipped") else 1
+        queued = stages.request_assessment(ref, force=True)
+        if queued is None:
+            print(f"ASSESS SKIPPED: {ref} -- not a closed ticket", file=sys.stderr)
+            return 1
+        print(f"ASSESS QUEUED: {ref} -- the watcher will spawn the assessor")
+        wait = float(getattr(args, "wait", 0) or 0)
+        deadline = time.time() + wait
+        while wait and time.time() < deadline:
+            ss = (q.get(ref) or {}).get("stage_session") or {}
+            if ss.get("worker_id") and ss.get("role") == "assessor":
+                print(f"  assessor spawned: {ss['worker_id']}")
+                break
+            time.sleep(1)
+        return 0
     if action == "resume":
         try:
             q.assessment_run_ops(ref)
@@ -1769,7 +1772,7 @@ def cmd_close(args: argparse.Namespace) -> int:
               + (f" — {summary}" if summary else ""))
         _rename_claiming_session(item, summary)
         if pending == "verify":
-            _spawn_verifier(item)
+            stages.request(item["ref"], "verify")
         return 0
     print(f"CLOSED: {item['ref']}" + (f" — {summary}" if summary else ""))
 
@@ -2022,29 +2025,9 @@ def _verifier_goal(item: dict) -> str:
 
 
 def _spawn_verifier(item: dict) -> None:
-    """Spawn the independent verifier session for an in_review ticket whose
-    pending stage is ``verify``. Best-effort: on failure the ticket stays in
-    review and a human can `wt verdict` or `wt accept --force`."""
-    try:
-        vt = q.verifier_target(item)
-        if vt["blocked"]:
-            raise ValueError(
-                f"model {vt['model']!r} for the verifier ({vt['engine']}) is blocked "
-                f"by model policy; not substituting another model")
-        rec = workers.spawn_adhoc(
-            _verifier_goal(item), vt["engine"], model=vt["model"],
-            repo_path=str(item.get("repo_path") or ""),
-            name=f"verify-{item['ref']}", report_to="", verify=True,
-        )
-        q.set_verifier_info(item["ref"], {"engine": vt["engine"], "model": vt["model"],
-                                          "source": vt["source"],
-                                          "worker_id": rec.get("worker_id", "")})
-        print(f"  verifier spawned: {rec.get('worker_id', '?')} "
-              f"({vt['engine']}{'/' + vt['model'] if vt['model'] else ''}, {vt['source']})")
-    except Exception as exc:  # noqa: BLE001
-        print(f"warning: could not spawn verifier for {item['ref']}: {exc}; "
-              f"file a verdict with `wt verdict` or `wt accept --force`",
-              file=sys.stderr)
+    """Shim (WT-24): the daemon spawns the verifier for an in_review/verify
+    ticket; this only wakes it."""
+    stages.request(item["ref"], "verify")
 
 
 def cmd_verdict(args: argparse.Namespace) -> int:
@@ -2490,6 +2473,15 @@ def cmd_answer(args: argparse.Namespace) -> int:
         print(f"NOTE: {item['ref']} plan gate is STILL BLOCKED; a free-text answer "
               f"does not accept it. Decide with `wt plan decide {item['ref']} "
               f"--accept [--text/--file amended plan]` or `--retry [--retries N]`.")
+    ss = item.get("stage_session") or {}
+    if ss.get("retry_at") and ss.get("retry_at") == item.get("answered_at"):
+        # WT-24: an answer on a stage escalation is a retry of that stage, not
+        # a message for the builder session (even when one is retained).
+        role = str(ss.get("role") or "stage")
+        print(f"ANSWERED: {item['ref']} — {role.replace('_', ' ')} retry queued; the "
+              f"watcher will spawn a fresh {role.replace('_', ' ')} (attempt 1, "
+              f"key {ss.get('key')})")
+        return 0
     sid = item.get("claimed_session_id")
     if not sid:
         print(f"ANSWERED: {item['ref']} — needs_input cleared. "
@@ -4520,6 +4512,8 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
             chats.nudge_tick(deliver=_chat_deliver)
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] nudge_tick failed: {e}", flush=True)
+        if result.get("stages"):
+            print(f"[watchtower] stages: {result['stages']}", flush=True)
         for rec in result.get("spawned", []):
             tag = " (dry-run)" if rec.get("dry_run") else ""
             eng = rec.get("engine", "claude")
@@ -4598,7 +4592,22 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
                     print(f"[watchtower] deploy sync refused: {res['reason']}", flush=True)
             except Exception as e:  # noqa: BLE001 - never kill the loop
                 print(f"[watchtower] deploy sync failed: {e}", flush=True)
-        time.sleep(interval)
+        # WT-24: sleep until the next tick, but wake early when a CLI transition
+        # queued a stage session (the ticket state is the intent; the wake only
+        # cuts latency) and run a stage-only pass.
+        from . import stages as _stages
+        remaining = float(interval)
+        while remaining > 0:
+            slept_from = time.time()
+            if not _stages.sleep_until_wake(remaining, sleep=time.sleep):
+                break
+            try:
+                acted = workers.reconcile_stages_only()
+                if acted:
+                    print(f"[watchtower] stages: {acted}", flush=True)
+            except Exception as e:  # noqa: BLE001 - never kill the loop
+                print(f"[watchtower] stage pass failed: {e}", flush=True)
+            remaining -= max(0.5, time.time() - slept_from)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -5226,6 +5235,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "verdict"),
     ("Tickets", "assess"),
     ("Tickets", "plan"),
+    ("Tickets", "stages"),
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
@@ -5246,6 +5256,7 @@ COMMAND_HELP: Dict[str, str] = {
     "verdict": "file an independent verifier's pass/fail on an in_review ticket",
     "assess": "post-fix assessment (WT-21): `submit`/`show`/`run`/`resume`, or `new` for a fix with no ticket",
     "plan": "plan stage (plan gate): `submit` a plan, `verdict` it, `show`/`wait` for it",
+    "stages": "stage-session supervision (planner/verifier/assessor): `tick` one pass, `show` a ticket",
     "reject": "reject an in_review ticket back to open and resume its worker",
     "reopen": "reopen a closed ticket, returning it to the open pool (no dispatch)",
     "close": "close a ticket (record how you fixed it)",
@@ -5829,6 +5840,15 @@ def build_parser() -> argparse.ArgumentParser:
     p4.add_argument("--timeout", type=int, default=1800)
     s.set_defaults(func=cmd_plan)
 
+    s = sub.add_parser("stages", help=COMMAND_HELP.get("stages", ""))
+    sg = s.add_subparsers(dest="stages_cmd", required=True)
+    g1 = sg.add_parser("tick", help="run one stage-supervision pass in the foreground")
+    g1.add_argument("--ref", default="")
+    g2 = sg.add_parser("show", help="print a ticket's stage-supervision record")
+    g2.add_argument("ref")
+    g2.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_stages)
+
     s = sub.add_parser("assess", help=COMMAND_HELP.get("assess", ""))
     ass = s.add_subparsers(dest="assess_cmd", required=True)
     p1 = ass.add_parser("submit", help="assessor: file the six-point assessment")
@@ -5844,6 +5864,8 @@ def build_parser() -> argparse.ArgumentParser:
     p3 = ass.add_parser("run", help="(re)start the assessor for a closed bug")
     p3.add_argument("ref")
     p3.add_argument("--force", action="store_true")
+    p3.add_argument("--wait", type=float, default=20,
+                    help="seconds to wait for the watcher to spawn the assessor")
     p3.add_argument("--dry-run", action="store_true", dest="dry_run",
                     help="print the resolved repo, assessor and prompt; spawn nothing")
     p4 = ass.add_parser("resume", help="finish filing a half-filed assessment (no LLM)")

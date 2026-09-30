@@ -13,7 +13,7 @@ ALL_ADEQUATE = {p: {"verdict": "adequate", "note": ""} for p in
 
 
 @pytest.fixture()
-def wt(tmp_path, monkeypatch):
+def wt(tmp_path, monkeypatch, instant_daemon):
     monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "queue.json"))
     monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
     monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
@@ -347,25 +347,36 @@ def test_resubmit_same_payload_resumes_different_payload_refused(wt):
         q.assessment_accept_submission(ref, token, ALL_ADEQUATE)
 
 
-def test_sweep_spawns_due_and_settles_dead_running(wt):
+def _age_stage(q, ref, seconds=120):
+    """Backdate the stage session so its (recordless, fake) worker reads as dead."""
+    import datetime as _dt
+    old = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(seconds=seconds)
+           ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    q.stage_session_update(ref, lambda it, ss: ss.update(spawned_at=old))
+
+
+def test_sweep_spawns_due_respawns_dead_then_escalates(wt):
     q = wt.q
     b = _bug(q)
-    _close(q, b["ref"])
+    _close(q, b["ref"])                      # library close: nothing spawns inline
+    assert q.get(b["ref"])["assessment"]["status"] == "due"
     assert wt.workers.spawn_due_assessments() == [f"{b['ref']}:spawned"]
-    assert wt.workers.spawn_due_assessments() == []
-    # dead assessor, attempt 1 -> due again; attempt 2 -> failed
-    def age(ref):
-        def _do(it, a, data):
-            a["reserved_at"] = "2020-01-01T00:00:00Z"
-        q._assessment_update(ref, _do)
-    age(b["ref"])
-    acted = wt.workers.spawn_due_assessments()
-    assert acted == [f"{b['ref']}:settled", f"{b['ref']}:spawned"]  # re-issued with a new token
-    assert q.get(b["ref"])["assessment"]["attempt"] == 2
-    age(b["ref"])
-    wt.workers.spawn_due_assessments()
     a = q.get(b["ref"])["assessment"]
-    assert a["status"] == "failed" and "attempt 2" in a["reason"]
+    assert a["status"] == "running" and a["attempt"] == 1 and a["cycle"] == 1
+    t1 = a["token"]
+    assert wt.workers.spawn_due_assessments() == []          # alive (just spawned)
+    _age_stage(q, b["ref"])
+    assert wt.workers.spawn_due_assessments() == [f"{b['ref']}:spawned"]   # respawn
+    a = q.get(b["ref"])["assessment"]
+    assert a["attempt"] == 2 and a["token"] != t1 and t1 in a["fenced_tokens"]
+    assert a["assessor"]["worker_id"] == "assess-2"
+    with pytest.raises(q.AssessmentFenced, match="superseded"):
+        q.assessment_accept_submission(b["ref"], t1, ALL_ADEQUATE)
+    _age_stage(q, b["ref"])
+    assert wt.workers.spawn_due_assessments() == [f"{b['ref']}:settled"]
+    it = q.get(b["ref"])
+    assert it["assessment"]["status"] == "failed" and it["needs_input"] is True
+    assert "died twice" in it["assessment"]["reason"]
 
 
 def test_enqueue_persists_assessment_origin_and_validates_blockers(wt):

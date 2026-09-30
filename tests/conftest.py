@@ -397,3 +397,28 @@ def no_engines(wt_env, monkeypatch):
         monkeypatch.setenv(var, missing)
     for engine in ("claude", "codex", "kimi"):
         assert not wt_env.workers.engine_available(engine)
+
+
+@pytest.fixture()
+def instant_daemon(monkeypatch):
+    """Emulate a watcher that wakes the instant a stage is requested (WT-24).
+
+    CLI transitions only ``stages.request`` (they never spawn); tests that
+    assert on the resulting planner / verifier / assessor spawn use this so the
+    stage pass runs right after the request. Tests of the no-local-spawn rule
+    itself must NOT use it."""
+    from watchtower import stages
+    real = stages.request
+
+    def request(ref, why=""):
+        out = real(ref, why)
+        stages.reconcile_stages(only_ref=ref)
+        return out
+
+    monkeypatch.setattr(stages, "request", request)
+    return stages
+
+
+@pytest.fixture(autouse=True)
+def no_spawn_stagger(monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_SPAWN_STAGGER_S", "0")

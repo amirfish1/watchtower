@@ -2597,8 +2597,19 @@ def update_status(
                         it["status"] = "in_review"
                         it["closed_at"] = None
                         it["gate_pending"] = hold_review
+                        if hold_review == "verify":
+                            # WT-24: the supervision key for the verifier stage;
+                            # closed_at is cleared here so it cannot serve.
+                            if it.get("verifier"):
+                                it["verifier_history"] = (
+                                    list(it.get("verifier_history") or [])
+                                    + [it["verifier"]])[-10:]
+                                it.pop("verifier", None)
+                            it["verify_cycle"] = int(it.get("verify_cycle") or 0) + 1
                         _append_history(it, "in_review", by=_by("system"), at=now,
-                                        reviewer=hold_review)
+                                        reviewer=hold_review,
+                                        **({"verify_cycle": it["verify_cycle"]}
+                                           if hold_review == "verify" else {}))
                 if extras:
                     it.update(extras)
                 if status == "open":
@@ -2801,6 +2812,9 @@ def plan_submit(ident: Any, text: str, by: str = "planner") -> Optional[Dict[str
                          f"(plan status {(current.get('plan') or {}).get('status') or 'none'})")
 
     def _do(it, plan):
+        disc = plan.get("discussion")
+        if not (disc and disc.get("status") == "active"):
+            _plan_archive_role(plan, "reviewer")
         plan.update(status="reviewing", text=_clip(text, 24000),
                     version=int(plan.get("version") or 0) + 1)
         disc = plan.get("discussion")
@@ -2811,6 +2825,15 @@ def plan_submit(ident: Any, text: str, by: str = "planner") -> Optional[Dict[str
                         text=_clip(text, 4000), round=plan.get("round", 1),
                         version=plan["version"], planner=str(by))
     return _plan_update(ident, _do)
+
+
+def _plan_archive_role(plan: Dict[str, Any], role: str) -> None:
+    """Move a finished stage's role metadata into ``role_history`` so the next
+    supervision key never adopts it (WT-24)."""
+    info = plan.pop(role, None)
+    if info:
+        plan["role_history"] = (list(plan.get("role_history") or [])
+                                + [dict(info, role=role)])[-10:]
 
 
 def _plan_reachable(plan: Dict[str, Any]) -> bool:
@@ -2871,6 +2894,8 @@ def plan_verdict(ident: Any, accepted: bool, reasons: str = "",
         elif rnd > int(plan.get("revision_limit", PLAN_MAX_REVISIONS)):
             plan["status"] = "blocked"
         else:
+            _plan_archive_role(plan, "planner")
+            _plan_archive_role(plan, "reviewer")
             plan.update(status="planning", round=rnd + 1)
         _append_history(it, "plan_review", by=_by("system"), at=now,
                         passed=bool(accepted), text=_clip(reasons, 1000), round=rnd,
@@ -3124,6 +3149,53 @@ def _role_target(item: Dict[str, Any], role: str) -> Dict[str, Any]:
     model = _config.canonical_model(engine, model) if model else ""
     return {"engine": engine, "model": model, "source": source,
             "blocked": bool(model and _config.is_blocked_model(model))}
+
+
+def stage_session_update(ident: Any, fn) -> Optional[Dict[str, Any]]:
+    """Run ``fn(item, stage_session_dict)`` under the store lock (WT-24); one
+    save. ``fn`` returning ``"skip"`` leaves the store untouched."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                ss = dict(it.get("stage_session") or {})
+                if fn(it, ss) == "skip":
+                    return it
+                it["stage_session"] = ss
+                it["updated_at"] = _now_iso()
+                _save_unlocked(data)
+                return it
+    return None
+
+
+def _stage_retry_reset(it: Dict[str, Any], text: str, now: str) -> bool:
+    """Human ``answer`` on a stage escalation (WT-24), same store transaction:
+    per-role retry transition + a fresh attempt budget. True when it applied."""
+    ss = it.get("stage_session") or {}
+    if not ss.get("escalated"):
+        return False
+    role = str(ss.get("role") or "")
+    if role in ("planner", "plan_reviewer"):
+        plan = dict(it.get("plan") or {})
+        if plan.get("escalated") == "stage_watch":
+            plan["status"] = ss.get("escalated_from") or (
+                "planning" if role == "planner" else "reviewing")
+            plan.pop("escalated", None)
+            it["plan"] = plan
+    elif role == "assessor":
+        a = dict(it.get("assessment") or {})
+        if a.get("status") == "failed":
+            _assessment_new_cycle(a, "human retry")
+            it["assessment"] = a
+            _append_history(it, "assessment", by=_by("system"), at=now, outcome="retry")
+    it["stage_session"] = {
+        "key": ss.get("key", ""), "role": role, "attempt": 0, "escalated": False,
+        "deaths": list(ss.get("deaths") or [])[-10:], "retry_at": now,
+        "retry_note": _clip(text, 2000),
+    }
+    _append_history(it, "stage_retry", by=_by("human"), at=now, role=role,
+                    text=_clip(text, 500))
+    return True
 
 
 def set_verifier_info(ident: Any, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -3493,13 +3565,56 @@ def assessment_mark_due(ident: Any) -> Optional[Dict[str, Any]]:
                 if _matches(it, ident):
                     if not assessment_due(it):
                         return None
-                    it["assessment"] = {"status": "due", "attempt": 0, "token": ""}
+                    it["assessment"] = {"status": "due", "attempt": 0, "token": "",
+                                        "cycle": 1}
                     it["updated_at"] = _now_iso()
                     _save_unlocked(data)
                     return it
     except Exception:  # noqa: BLE001 - never break a close
         return None
     return None
+
+
+def _assessment_new_cycle(a: Dict[str, Any], reason: str = "") -> None:
+    """Start a new assessment cycle inside a store transaction (WT-24): fence
+    the current token, archive the assessor, and go back to ``due``. Every
+    human retry / forced run goes through here so no path carries a stale
+    assessor into the next cycle. ``attempt`` is kept for display only."""
+    if a.get("token"):
+        a["fenced_tokens"] = (list(a.get("fenced_tokens") or []) + [a["token"]])[-10:]
+    if a.get("assessor"):
+        a["assessor_history"] = (list(a.get("assessor_history") or []) + [a["assessor"]])[-10:]
+    a.pop("assessor", None)
+    a.pop("token", None)
+    a.pop("reason", None)
+    a.pop("reserved_at", None)
+    a["cycle"] = int(a.get("cycle") or 1) + 1
+    a["status"] = "due"
+    if reason:
+        a["cycle_reason"] = reason
+
+
+def assessment_rotate(ident: Any, old_token: str) -> Optional[str]:
+    """Respawn within a cycle (WT-24): while ``running`` on ``old_token``, fence
+    it, mint a new token, ``attempt += 1`` and clear the assessor metadata, in
+    one transaction. None when the ticket moved on (submitted / forced)."""
+    import uuid as _uuid
+    out: List[str] = []
+
+    def _do(it, a, data):
+        if a.get("status") != "running" or a.get("token") != old_token:
+            return "skip"
+        a["fenced_tokens"] = (list(a.get("fenced_tokens") or []) + [old_token])[-10:]
+        if a.get("assessor"):
+            a["assessor_history"] = (list(a.get("assessor_history") or []) + [a["assessor"]])[-10:]
+        a.pop("assessor", None)
+        a["token"] = _uuid.uuid4().hex
+        a["attempt"] = int(a.get("attempt", 0)) + 1
+        a["reserved_at"] = _now_iso()
+        out.append(a["token"])
+
+    _assessment_update(ident, _do)
+    return out[0] if out else None
 
 
 def _assessment_update(ident: Any, fn) -> Optional[Dict[str, Any]]:
@@ -3538,6 +3653,8 @@ def assessment_reserve(ident: Any, force: bool = False) -> Optional[str]:
                     and o.get("outcome") == "filed"]
             a["abandoned"] = list(a.get("abandoned") or []) + done
         a.pop("pending", None)
+        a.pop("assessor", None)
+        a.setdefault("cycle", 1)
         a["attempt"] = int(a.get("attempt", 0)) + 1
         a["token"] = _uuid.uuid4().hex
         a["status"] = "running"
@@ -3669,6 +3786,8 @@ def assessment_accept_submission(ident: Any, token: str, payload: Any) -> List[D
     phash = _hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
     def _do(it, a, data):
+        if a and token and token in (a.get("fenced_tokens") or []):
+            raise AssessmentFenced("superseded by a respawn")
         if not a or a.get("token") != token:
             raise AssessmentFenced("stale or unknown assessment token")
         st = a.get("status")
@@ -4282,6 +4401,7 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     at=now,
                     text=_clip(text, 24000),
                 )
+                stage_retry = _stage_retry_reset(it, text, now)
                 if it.get("status") == "in_progress" and not it.get("claimed_session_id"):
                     it["status"] = "open"
                     it["claimed_by"] = None
@@ -4304,6 +4424,12 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     f"{it.get('ref', '?')} — {_clip(text, 240)}",
                     queue=it.get("project", ""),
                 )
+                if stage_retry:
+                    try:
+                        from . import stages as _stages
+                        _stages.request(str(it.get("ref") or ""), "answer")
+                    except Exception:  # noqa: BLE001 - the tick recovers from state
+                        pass
                 return it
     return None
 

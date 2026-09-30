@@ -206,6 +206,19 @@ def _worker_rec(v, engine, model):
         {"worker_id": "w1", "queue": "GT", "engine": engine, "model": model}]}))
 
 
+def _to_review(q, ref, fresh=False):
+    """Put a claimed verify-gated ticket in in_review/verify (what `wt close` does)."""
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked()
+        for it in data["items"]:
+            if it["ref"] == ref:
+                it.update(status="in_review", gate_pending="verify", needs_input=False)
+                if fresh:
+                    it.pop("stage_session", None)
+                    it.pop("verifier", None)
+        q._save_unlocked(data)
+
+
 def _verify_item(q):
     a = _claimed(q, gates=["verify"])
     return q.get(a["ref"])
@@ -250,7 +263,8 @@ def test_blocked_verifier_model_is_flagged_not_substituted(vcfg, monkeypatch):
     assert t["model"] == "gpt-5.5" and t["blocked"] is True
 
 
-def test_spawn_verifier_passes_engine_model_and_refuses_blocked(vcfg, monkeypatch, capsys):
+def test_spawn_verifier_passes_engine_model_and_refuses_blocked(vcfg, monkeypatch, capsys,
+                                                                 instant_daemon):
     import watchtower.cli as cli
     importlib.reload(cli)
     q = vcfg.q
@@ -260,19 +274,26 @@ def test_spawn_verifier_passes_engine_model_and_refuses_blocked(vcfg, monkeypatc
     cli.q = q
     vcfg.config.set_verifier("GT", "codex", "gpt-5.5")
     item = _verify_item(q)
+    _to_review(q, item["ref"])
     cli._spawn_verifier(item)
     assert calls[0][0] == "codex" and calls[0][1]["model"] == "gpt-5.5"
-    assert q.get(item["ref"])["verifier"]["engine"] == "codex"
+    assert calls[0][1]["verify"] is True and calls[0][1]["stage"] == "verifier"
+    v = q.get(item["ref"])["verifier"]
+    assert v["engine"] == "codex" and v["stage_key"] == "verify:0"
+    # a blocked model is never substituted: no spawn, the ticket needs a human
     monkeypatch.setenv("WATCHTOWER_BLOCKED_MODELS", "gpt-5.5")
     calls.clear()
-    cli._spawn_verifier(item)
-    assert calls == [] and "blocked" in capsys.readouterr().err
+    _to_review(q, item["ref"], fresh=True)
+    cli._spawn_verifier(q.get(item["ref"]))
+    assert calls == []
+    blocked = q.get(item["ref"])
+    assert blocked["needs_input"] is True and "blocked" in blocked["block_question"]
 
 
 # --- Plan stage (WT-11) ------------------------------------------------------
 
 @pytest.fixture()
-def plan_cli(vcfg, monkeypatch):
+def plan_cli(vcfg, monkeypatch, instant_daemon):
     import watchtower.cli as cli
     importlib.reload(cli)
     cli.q = vcfg.q
