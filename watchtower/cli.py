@@ -108,6 +108,13 @@ def _print_status(rows: List[dict]) -> None:
     dash_state   = _svc_state(DASHBOARD_PID_FILE)
     print(f"service:  daemon={daemon_state}  dashboard={dash_state}")
     print(f"store:    {q.store_path()}")
+    try:
+        from . import deploy
+        _dw = deploy.warning_line()
+    except Exception:  # noqa: BLE001
+        _dw = ""
+    if _dw:
+        print(_dw)
     print()
     counts = workers.worker_counts()
     if not rows:
@@ -324,6 +331,8 @@ def cmd_deploy(args: argparse.Namespace) -> int:
     if st["dirty"]:
         line += f", dirty: {', '.join(st['dirty'][:5])}"
     print(line)
+    if st.get("restored"):
+        print(f"restored stale files: {', '.join(st['restored'])}")
     if st.get("action"):
         print(f"{st['action']}" + (f": {st['reason']}" if st.get("reason") else ""))
     return 1 if st.get("action") == "refused" else 0
@@ -1268,6 +1277,8 @@ def cmd_close(args: argparse.Namespace) -> int:
             res = deploy.sync()
             if res["action"] == "moved":
                 print(f"DEPLOYED: installed copy {res['was'][:8]} -> {res['head'][:8]}")
+            elif res["action"] == "refused":
+                print(f"WARNING: installed copy not updated: {res['reason']}", file=sys.stderr)
         except Exception:  # noqa: BLE001
             pass
 
