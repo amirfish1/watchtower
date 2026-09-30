@@ -148,16 +148,14 @@ VALID_CONFIDENCES = ("H", "M", "L", "")
 # checked against the claiming queue's configured model at claim time (see
 # config.model_floor_met). Canonical model ids, not aliases -- keep in sync
 # with config.py's MODEL_EFFORTS as new models get approved.
-VALID_MODEL_FLOORS = (
-    "kimi-code/k3",
-    "kimi-code/kimi-for-coding",
-    "kimi-code/kimi-for-coding-highspeed",
-    "claude-sonnet-5",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-opus-5-5",
-    "",
-)
+def _valid_model_floors() -> Tuple[str, ...]:
+    # Derived from the one explicit ranking so a new model cannot be rankable
+    # in config yet rejected as a ticket floor (WT-10).
+    from . import config
+    return tuple(config.MODEL_FLOOR_TIERS) + ("",)
+
+
+VALID_MODEL_FLOORS = _valid_model_floors()
 
 # Legacy CCC store — WatchTower reads it if present so it works on this machine
 # today, before any WatchTower-native queue exists.
@@ -1854,6 +1852,7 @@ def _claim_candidates(
     item_types: Optional[List[str]] = None,
     readiness_filters: Optional[List[str]] = None,
     all_items: Optional[List[Dict[str, Any]]] = None,
+    worker_model: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return ``items`` filtered + sorted exactly as claim_next() would pick
     from them — the single source of truth for "is this ticket claimable
@@ -1861,8 +1860,19 @@ def _claim_candidates(
     caller that needs to know what a worker COULD claim (without claiming it)
     goes through here instead of re-implementing the filter, so it can never
     silently drift out of sync (``project`` is expected pre-normalized).
+
+    ``worker_model`` (canonical id, WT-10): when not None, tickets whose
+    ``model_floor`` that model does not meet are skipped, so a weaker worker
+    just takes the next ticket instead of claiming and parking it. None
+    disables the filter.
     """
     candidates = [it for it in items if it.get("status") == "open"]
+    if worker_model is not None:
+        from . import config
+        candidates = [
+            it for it in candidates
+            if config.model_meets_floor(worker_model, it.get("model_floor") or "")
+        ]
     if any(it.get("blocked_by") for it in candidates):
         # Dependencies (WT-4): waiting/stuck tickets are not claimable. Blockers
         # may live in other queues, so resolve against ``all_items`` if given.
@@ -1900,6 +1910,7 @@ def count_claimable(
     project: Optional[str] = None,
     lane: Optional[str] = None,
     item_types: Optional[List[str]] = None,
+    worker_model: Optional[str] = None,
 ) -> int:
     """How many tickets claim_next() would currently pick from for ``project``,
     in default (non-shaping) mode. Used by the reconciler to decide whether a
@@ -1914,7 +1925,10 @@ def count_claimable(
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
         data = _load_unlocked()
-        return len(_claim_candidates(data["items"], project=proj, lane=lane, item_types=item_types))
+        return len(_claim_candidates(
+            data["items"], project=proj, lane=lane, item_types=item_types,
+            worker_model=worker_model,
+        ))
 
 
 def count_manual_eligible(
@@ -2021,6 +2035,7 @@ def claim_next(
     oldest: bool = False,
     item_types: Optional[List[str]] = None,
     readiness_filters: Optional[List[str]] = None,
+    worker_model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Atomically move the next ``open`` item to ``in_progress`` and return it.
 
@@ -2029,6 +2044,8 @@ def claim_next(
     oldest within tier. Pass ``oldest=True`` for pure FIFO regardless of priority.
 
     ``item_types``: if non-empty, only claim items whose type is in the list.
+    ``worker_model``: canonical model id of the claiming worker; tickets with a
+      higher ``model_floor`` are skipped (WT-10). None = no floor filtering.
     ``readiness_filters``: if non-empty, only claim items whose readiness is in
       the list (bypasses default exclusion of unready items). If empty/None,
       excludes needs-shaping/needs-spec unless ``shaping=True``.
@@ -2165,6 +2182,7 @@ def claim_next(
         candidates = _claim_candidates(
             data["items"], project=proj, lane=lane, shaping=shaping, oldest=oldest,
             item_types=item_types, readiness_filters=readiness_filters,
+            worker_model=worker_model,
         )
         if not candidates:
             return None
@@ -2239,6 +2257,7 @@ def peek_next(
     project: Optional[str] = None,
     lane: Optional[str] = None,
     item_types: Optional[List[str]] = None,
+    worker_model: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return a copy of the next claimable open item without claiming it.
 
@@ -2250,8 +2269,36 @@ def peek_next(
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
         data = _load_unlocked()
-        candidates = _claim_candidates(data["items"], project=proj, lane=lane, item_types=item_types)
+        candidates = _claim_candidates(
+            data["items"], project=proj, lane=lane, item_types=item_types,
+            worker_model=worker_model,
+        )
         return dict(candidates[0]) if candidates else None
+
+
+def floor_routed_candidates(
+    project: str,
+    queue_model: str,
+    item_types: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Claimable open tickets whose ``model_floor`` ``queue_model`` does not
+    meet, in claim order (WT-10). The reconciler spawns one floor-model
+    run-once worker per entry. File-backed queues only; a GitHub-backed queue
+    returns [] (its backend has no floor filter)."""
+    if _github_backend_for_project(project) is not None:
+        return []
+    proj = _norm_project(project)
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        every = _claim_candidates(
+            data["items"], project=proj, item_types=item_types,
+            all_items=data["items"],
+        )
+        from . import config
+        return [
+            dict(it) for it in every
+            if not config.model_meets_floor(queue_model, it.get("model_floor") or "")
+        ]
 
 
 def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:

@@ -510,11 +510,11 @@ def test_invalid_backend_is_rejected_by_the_config_api(wt_env):
         wt_env.config.set_backend(QUEUE, "sqlite")
 
 
-def test_ticket_model_floor_above_the_queue_model_parks_instead_of_working_it(
+def test_ticket_model_floor_above_the_queue_model_is_skipped_not_parked(
     wt_env, run_cli, monkeypatch
 ):
-    """A ticket that named a higher model floor must not be quietly worked by a
-    cheaper queue — it parks blocked with the reason."""
+    """A ticket that named a higher model floor is invisible to a cheaper
+    worker (WT-10): the claim finds nothing, and the ticket stays open."""
     wt_env.config.set_engine(QUEUE, "claude")
     wt_env.config.set_model(QUEUE, "claude-sonnet-5")
     wt_env.config.set_auto_drain(QUEUE, True)
@@ -524,11 +524,10 @@ def test_ticket_model_floor_above_the_queue_model_parks_instead_of_working_it(
         model_floor="claude-opus-5",
     )
     res = run_cli("claim", "--queue", QUEUE, "--worker", "sess-floor")
-    assert res.code == 1, res.output
-    assert "model floor" in res.err
-    parked = wt_env.queue.get(item["ref"])
-    assert parked["needs_input"] is True
-    assert "claude-opus-5" in parked["block_question"]
+    assert res.code == 0, res.output
+    untouched = wt_env.queue.get(item["ref"])
+    assert untouched["status"] == "open"
+    assert untouched["needs_input"] is False
 
 
 # =========================================================================== #
