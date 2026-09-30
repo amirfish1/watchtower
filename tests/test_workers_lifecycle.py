@@ -4758,3 +4758,45 @@ def test_notify_workers_exclude_skips_by_worker_id_and_session_id(wt):
     assert msg["message"]["content"][0]["text"] == "nudge"
     assert other["worker_id"] not in {by_worker["worker_id"],
                                       by_session["worker_id"]}
+
+
+def test_spawn_env_marks_worker_and_verifier(wt, monkeypatch):
+    """WT-23: repos key off WT_WORKER_ID / WT_VERIFY to refuse production side
+    effects; stale values from the spawner never leak to an ordinary worker."""
+    monkeypatch.setenv("WT_VERIFY", "1")
+    monkeypatch.setenv("WT_WORKER_ID", "spawner")
+
+    plain = wt.workers._spawn_env("q-abc123")
+    assert plain["WT_WORKER_ID"] == "q-abc123"
+    assert "WT_VERIFY" not in plain
+
+    ver = wt.workers._spawn_env("verify-q-1-codex-deadbeef", verify=True)
+    assert ver["WT_VERIFY"] == "1"
+    assert ver["WT_WORKER_ID"] == "verify-q-1-codex-deadbeef"
+
+    assert "WT_VERIFY" not in wt.workers._spawn_env()
+    assert "WT_WORKER_ID" not in wt.workers._spawn_env()
+
+
+def test_spawn_adhoc_verify_sets_marker(wt, monkeypatch):
+    captured = {}
+
+    class _P:
+        pid = 4242
+
+    def fake_popen(argv, **kw):
+        captured["env"] = kw.get("env")
+        return _P()
+
+    monkeypatch.setattr(wt.workers.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wt.workers, "record_worker", lambda *a, **k: {"worker_id": a[3]})
+    monkeypatch.setattr(wt.workers, "WORKERS_FILE", wt.tmp / "workers.json")
+    rec = wt.workers.spawn_adhoc("check", "codex", repo_path=str(wt.tmp), name="verify-X-1", verify=True)
+    assert captured["env"]["WT_VERIFY"] == "1"
+    assert captured["env"]["WT_WORKER_ID"] == rec["worker_id"]
+
+
+def test_verifier_goal_forbids_production_side_effects(wt):
+    from watchtower import cli
+    goal = cli._verifier_goal({"ref": "X-1", "text": "it works"})
+    assert "paid APIs" in goal and "WT_VERIFY=1" in goal

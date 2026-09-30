@@ -155,7 +155,7 @@ def _worker_runbook_ref() -> str:
     return _WORKER_RUNBOOK_URL
 
 
-def _spawn_env() -> Dict[str, str]:
+def _spawn_env(worker_id: str = "", verify: bool = False) -> Dict[str, str]:
     """Environment for a spawned worker subprocess.
 
     The child inherits the parent's environment so legitimate overrides
@@ -171,6 +171,11 @@ def _spawn_env() -> Dict[str, str]:
     variables are stripped so the worker does not inherit pytest sandbox
     variables that point at temporary test files and operate against test
     fixture state (OPS-544).
+
+    WT-23: ``WT_WORKER_ID`` names the spawned session and ``WT_VERIFY=1`` marks
+    a verifier, so a repo's scripts can refuse to run paid-API / customer-message
+    side effects when loaded by a verifier. Stale values inherited from the
+    spawner are always cleared first.
     """
     env = os.environ.copy()
     if "PYTEST_CURRENT_TEST" in os.environ:
@@ -185,6 +190,12 @@ def _spawn_env() -> Dict[str, str]:
     for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
         env.pop(key, None)
     env["WT_WORKER_COMMIT"] = "1"
+    env.pop("WT_VERIFY", None)
+    env.pop("WT_WORKER_ID", None)
+    if worker_id:
+        env["WT_WORKER_ID"] = worker_id
+    if verify:
+        env["WT_VERIFY"] = "1"
     # Commit attribution: distinct from interactive Hermes on this VM
     # (`Amir Fish (hermes)` / Agent-Machine: hermes).
     env["GIT_AUTHOR_NAME"] = "Amir Fish (watchtower)"
@@ -6477,7 +6488,7 @@ def spawn_workers(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 cwd=repo_path,
-                env=_spawn_env(),
+                env=_spawn_env(worker_id),
             )
         except OSError as e:
             popen_error = e
@@ -6606,7 +6617,7 @@ def spawn_run_once_worker(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             cwd=repo_path,
-            env=_spawn_env(),
+            env=_spawn_env(worker_id),
         )
     finally:
         logf.close()
@@ -6750,6 +6761,7 @@ def spawn_adhoc(
     name: str = "",
     report_to: str = "",
     dry_run: bool = False,
+    verify: bool = False,
 ) -> Dict[str, Any]:
     """Spawn one one-shot ad-hoc agent on ``prompt`` and return its record.
 
@@ -6804,7 +6816,7 @@ def spawn_adhoc(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             cwd=repo_path,
-            env=_spawn_env(),
+            env=_spawn_env(worker_id, verify=verify),
         )
     finally:
         logf.close()

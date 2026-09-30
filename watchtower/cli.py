@@ -1889,7 +1889,12 @@ def _verifier_goal(item: dict) -> str:
            f"material deviations:\n{(item.get('plan') or {}).get('text', '')}\n\n"
            if (item.get("plan") or {}).get("status") == "accepted" else "")
         + "Drive a real browser/app where the criterion is user-visible; read the "
-        "code and run it otherwise. Do NOT edit files or fix anything. When "
+        "code and run it otherwise. Do NOT edit files or fix anything. Do NOT "
+        "execute scripts that call paid APIs, send customer messages, or touch "
+        "production data unless the ticket explicitly says to: importing a "
+        "script can run it, so load only the function you need, or prefer the "
+        "mocks and the test suite. WT_VERIFY=1 is set in your environment; "
+        "never run production side effects. When "
         f"done, file your verdict on the ticket (not to anyone else): "
         f"`wt verdict {ref} --pass --findings \"what you checked\"` or "
         f"`wt verdict {ref} --fail --findings \"what is wrong, with evidence\"`."
@@ -1909,7 +1914,7 @@ def _spawn_verifier(item: dict) -> None:
         rec = workers.spawn_adhoc(
             _verifier_goal(item), vt["engine"], model=vt["model"],
             repo_path=str(item.get("repo_path") or ""),
-            name=f"verify-{item['ref']}", report_to="",
+            name=f"verify-{item['ref']}", report_to="", verify=True,
         )
         q.set_verifier_info(item["ref"], {"engine": vt["engine"], "model": vt["model"],
                                           "source": vt["source"],
