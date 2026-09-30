@@ -721,6 +721,27 @@ def test_nacked_blocker_escalates(wt):
     assert q.get(b["ref"])["needs_input"] is True
 
 
+def test_ls_json_emits_waiting_on_from_blocker_rule(wt, capsys):
+    import json
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+
+    def rows():
+        assert wt.cli.main(["ls", "-q", "DEP", "--status", "all", "--json"]) == 0
+        return {r["ref"]: r for r in json.loads(capsys.readouterr().out)}
+
+    got = rows()
+    assert got[a["ref"]]["waiting_on"] == []
+    assert got[b["ref"]]["waiting_on"] == [a["ref"]]
+    q.claim_next("w1", project="DEP")
+    q.close(a["ref"], session_id="w1",
+            resolution={"summary": "partial", "unresolved": ["x"]})
+    assert rows()[b["ref"]]["waiting_on"] == [a["ref"]]  # stuck != completed
+    q.answer(b["ref"], "go ahead")
+    assert rows()[b["ref"]]["waiting_on"] == []
+
+
 def test_blocked_by_rejects_unknown_self_and_cycles(wt):
     q = wt.q
     a = _file(q, "first")

@@ -1749,6 +1749,34 @@ def blocker_verdict(
     return ("waiting", waiting) if waiting else ("ok", "")
 
 
+def waiting_on(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]) -> List[str]:
+    """Blocker refs of ``it`` not yet completed (WT-9), in ``blocked_by`` order.
+
+    Uses ``_blocker_state`` so display and the claim gate share one rule: a
+    blocker counts as completed only when closed, not declined, and with no
+    unresolved items. A stuck blocker a human already answered for counts as
+    completed (same as ``blocker_verdict``); a missing blocker is ignored.
+    Empty when unblocked and for tickets that are not open/in-flight."""
+    if it.get("status") == "closed":
+        return []
+    out: List[str] = []
+    for ref in it.get("blocked_by") or []:
+        blocker = by_ref.get(str(ref))
+        if blocker is None:
+            continue
+        state = _blocker_state(blocker)
+        if state == "satisfied":
+            continue
+        if (
+            state == "stuck"
+            and str(ref) in (it.get("blocker_escalated") or [])
+            and not it.get("needs_input")
+        ):
+            continue
+        out.append(str(ref))
+    return out
+
+
 def _refs_index(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {str(it.get("ref")): it for it in items if it.get("ref")}
 

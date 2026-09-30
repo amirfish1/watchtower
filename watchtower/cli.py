@@ -470,7 +470,10 @@ def cmd_ls(args: argparse.Namespace) -> int:
         items = [i for i in items if i.get("status") == want]
     limit = args.limit or len(items)
     if args.json:
-        print(json.dumps(items[:limit], indent=2))
+        # Blockers may live in other queues, so resolve against every queue.
+        by_ref = q._refs_index(q.list_items(fresh=True) + all_items)
+        rows = [dict(i, waiting_on=q.waiting_on(i, by_ref)) for i in items[:limit]]
+        print(json.dumps(rows, indent=2))
         return 0
     if not items:
         print(f"(no {('' if want=='all' else want+' ')}items in {args.queue})")
