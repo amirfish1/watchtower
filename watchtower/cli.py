@@ -1603,8 +1603,11 @@ def _verify_close_commit(ref: str, sha: str) -> Tuple[str, str]:
                 "`wt block <ref> --progress \"...\"` instead of closing"
             )
         return "", (
-            f"error: {candidate} is not a commit in {repo} or any other configured "
-            "repo; commit the verified work or use "
+            f"error: {candidate} is not a commit in {repo}, any other configured "
+            f"repo, or the current directory ({os.getcwd()}). If the work lives in "
+            "a different repo, run `wt close` from inside that repo or set the "
+            f"ticket's repo with `wt edit {ref} --repo-path <path>`; otherwise "
+            "commit the verified work or use "
             "`wt block <ref> --progress \"...\"` instead of closing"
         )
     return verified, ""

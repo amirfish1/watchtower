@@ -150,6 +150,7 @@ def test_cli_block_with_invalid_commit_is_refused_same_as_close(
     assert rc == 1
     err = capsys.readouterr().err
     assert "is not a commit in" in err
+    assert "--repo-path" in err  # OPS-1322: tells the caller how to point at the right repo
     # Ticket must not have been blocked with a bogus commit recorded.
     assert wt.q.get(item["ref"]).get("needs_input") is not True
 
