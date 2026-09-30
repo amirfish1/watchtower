@@ -388,6 +388,19 @@ def test_plan_submit_rejects_oversize_text_instead_of_clipping(plan_cli):
         q.plan_submit(a["ref"], "x" * (q.PLAN_TEXT_MAX + 1))
 
 
+def test_plan_history_keeps_full_text_for_later_revisions(plan_cli):
+    """OPS-1317: history clipped prior plans at 4000 chars, so a delta-only
+    revision referenced sections a reviewer could not retrieve."""
+    q = plan_cli.q
+    a = _claimed(q, gates=["plan"])
+    plan_cli.cli._start_plan_stage(q.get(a["ref"]))
+    text = "section one. " * 500 + "TAIL-MARKER"
+    assert len(text) > 4000
+    q.plan_submit(a["ref"], text)
+    event = [h for h in q.get(a["ref"])["history"] if h["event"] == "plan"][-1]
+    assert event["text"].endswith("TAIL-MARKER")
+
+
 def test_plan_gated_ticket_unclaimable_until_plan_accepted(plan_cli):
     """WT-22: planning happens before a build worker claims."""
     q, cli, calls = plan_cli.q, plan_cli.cli, plan_cli.calls
