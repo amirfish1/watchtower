@@ -1173,48 +1173,104 @@ def start_pending_plans(queue: str) -> int:
     return n
 
 
+def _plan_role_alive(item: dict, role: str) -> bool:
+    """Is the ``role`` session of ``item``'s plan running right now? An
+    optimisation before a send; the guarantee is the live-only transport."""
+    wid = ((item.get("plan") or {}).get(role) or {}).get("worker_id")
+    return bool(wid) and stages.session_alive(str(wid))
+
+
 def _plan_send(item: dict, role: str, text: str) -> bool:
-    """Message the planner/reviewer session of ``item`` (durable outbox on
-    failure; never spawns). False when the role has no worker id or delivery
-    neither succeeded nor parked."""
+    """Message the planner/reviewer session of ``item`` over a live-only
+    transport (UDS / WT stdin FIFO): never parks in the outbox, never spawns or
+    resumes a session. True only when a running peer took it."""
     wid = ((item.get("plan") or {}).get(role) or {}).get("worker_id")
     if not wid:
         return False
     try:
         from . import messages
-        res = messages.send(str(wid), text)
-        return bool(res.get("ok") or res.get("queued"))
+        res = messages.send(str(wid), text, live_only=True)
+        return bool(res.get("ok"))
     except Exception:  # noqa: BLE001
         return False
 
 
+def _plan_discussion_goal(item: dict, role: str) -> str:
+    """Prompt for one supervised discussion turn (WT-29): everything the
+    session needs is on the ticket, so nothing is resumed or messaged in."""
+    ref = item["ref"]
+    plan = item.get("plan") or {}
+    disc = plan.get("discussion") or {}
+    version = plan.get("version") or plan.get("round", 1)
+    base = (f"\nTICKET:\n{item.get('text') or item.get('note') or item.get('title') or ''}\n"
+            + (f"\nACCEPT LINE: {item['accept']}\n" if item.get("accept") else ""))
+    msgs = (disc.get("messages") or [])[-10:]
+    transcript = "\n".join(f"- [{m.get('from')}] {str(m.get('text') or '')[:600]}" for m in msgs)
+    transcript = f"\nDISCUSSION SO FAR:\n{transcript}\n" if transcript else ""
+    objections = f"\nREVIEWER OBJECTIONS:\n{disc.get('objections', '')}\n"
+    if role == "planner":
+        return (
+            f"You are the PLANNER for WatchTower ticket {ref}, in plan discussion round "
+            f"{disc.get('round')}. Your previous session has ended; this is a fresh turn. "
+            f"Do not write code or edit files.\n{base}"
+            f"\nPLAN v{version} (as reviewed):\n{plan.get('text', '')}\n{objections}{transcript}"
+            f"\nFix the objections rather than rewriting the plan wholesale. If you "
+            f"disagree with one, say so: `wt plan discuss {ref} --from planner --text \"...\"`. "
+            f"Then file the amended plan: `wt plan submit {ref} --file <path-to-plan.md>`."
+        )
+    return (
+        f"You are the independent PLAN REVIEWER for WatchTower ticket {ref}. You reviewed "
+        f"an earlier version and rejected it; the planner has filed an amended plan. Your "
+        f"previous session has ended; this is a fresh turn. Do not edit files.\n{base}"
+        f"{objections}{transcript}\nAMENDED PLAN v{version}:\n{plan.get('text', '')}\n\n"
+        f"Check it against the ticket and the real code, then file your verdict on this "
+        f"exact version: `wt plan verdict {ref} --accept --version {version} --reasons "
+        f"\"why it is sound\"` or `wt plan verdict {ref} --reject --version {version} "
+        f"--reasons \"what still must change\"`. Reject only for real remaining defects."
+    )
+
+
 def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
-    """Re-message the awaited party of any stalled planner<->reviewer
-    discussion (lost message / restart). Bounded by
-    q.PLAN_DISCUSSION_MAX_NUDGES, after which the plan blocks for a human with
-    a recorded reason. Never spawns. Returns the number of reminders sent."""
+    """Fallback reminders for stalled planner<->reviewer discussions the stage
+    supervisor does not own (github-backed tickets). Supervised tickets are
+    skipped: their turns are sessions the supervisor staffs and kills.
+
+    A reminder goes out only to a peer that is running, over the live-only
+    transport. A dead or unreachable peer blocks the plan for a human at once
+    (nobody to remind); a delivered reminder counts toward
+    q.PLAN_DISCUSSION_MAX_NUDGES. Never spawns. Returns delivered reminders."""
     n = 0
     try:
         for it in q.list_items(project=queue) or []:
             if (it.get("plan") or {}).get("status") not in ("discussing", "reviewing"):
                 continue
-            nudged = q.plan_discussion_nudge(it["ref"], stale_s)
-            if nudged is None:
+            if any(d["key"].startswith("discuss:") for d in stages.desired([it])):
                 continue
-            ref, role = nudged["ref"], nudged.get("_nudge", "")
+            role = q.plan_discussion_due(it["ref"], stale_s)
             if not role:
+                continue
+            ref = it["ref"]
+            disc = (it.get("plan") or {}).get("discussion") or {}
+            wid = ((it.get("plan") or {}).get(role) or {}).get("worker_id") or ""
+            if not _plan_role_alive(it, role):
+                nudged = q.plan_discussion_record_nudge(
+                    ref, False, f"{role} session is not running (worker {wid or '-'} "
+                                f"exited); no one to deliver to")
+            else:
+                ok = _plan_send(it, role,
+                                f"Reminder: {ref} plan discussion is waiting on you ({role}). "
+                                f"Objections: {disc.get('objections', '')}. "
+                                f"See `wt plan show {ref}`.")
+                nudged = q.plan_discussion_record_nudge(
+                    ref, ok, f"reminder to {role} undelivered (no live transport to worker {wid})")
+                n += 1 if ok else 0
+            if nudged and (nudged.get("plan") or {}).get("status") == "blocked":
                 q.block(ref, str(nudged.get("claimed_session_id") or ""),
                         question=(f"Plan discussion stalled: "
                                   f"{nudged['plan']['discussion'].get('reason', '')}. "
                                   f"Decide with `wt plan decide {ref} --accept|--retry`."),
                         progress=f"Plan v{nudged['plan'].get('version')}:\n"
                                  f"{nudged['plan'].get('text', '')}")
-                continue
-            disc = nudged["plan"]["discussion"]
-            _plan_send(nudged, role,
-                       f"Reminder: {ref} plan discussion is waiting on you ({role}). "
-                       f"Objections: {disc.get('objections', '')}. See `wt plan show {ref}`.")
-            n += 1
     except Exception:  # noqa: BLE001
         pass
     return n
@@ -1257,14 +1313,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
             plan = item["plan"]
             print(f"PLAN FILED: {ref} round {plan['round']} v{plan.get('version')} -> reviewing")
             if (plan.get("discussion") or {}).get("status") == "active":
-                # One coordinated discussion: the SAME reviewer gives an explicit
-                # verdict on this exact version; no second reviewer is spawned.
-                _plan_send(item, "reviewer",
-                           f"The planner filed amended plan v{plan.get('version')} for {ref} "
-                           f"addressing your objections. Read it (`wt plan show {ref}`) and "
-                           f"give an explicit verdict on that version: `wt plan verdict {ref} "
-                           f"--accept --version {plan.get('version')} --reasons ...` or "
-                           f"`--reject` with what still must change.")
+                # The amended plan needs a verdict on this exact version from
+                # a supervised reviewer turn (WT-29); no message to a dead peer.
+                stages.request(ref, "plan discussion: reviewer")
             else:
                 stages.request(ref, "plan filed")
         elif action == "verdict":
@@ -1280,15 +1331,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 except Exception:  # noqa: BLE001
                     pass
             if status == "discussing":
-                disc = item["plan"]["discussion"]
-                _plan_send(item, "planner",
-                           f"The reviewer rejected plan v{item['plan'].get('version')} of "
-                           f"{ref} (discussion round {disc.get('round')}/"
-                           f"{item['plan'].get('discussion_rounds', q.PLAN_DISCUSSION_ROUNDS)}"
-                           f"). Objections: {args.reasons or ''}\nDiscuss them directly with "
-                           f"the reviewer (`wt plan discuss {ref} --from planner --text ...`), "
-                           f"then file the amended plan with `wt plan submit {ref} --file ...`. "
-                           f"Do not rewrite the plan wholesale; fix the objections.")
+                stages.request(ref, "plan discussion: planner")
             elif status == "planning":
                 stages.request(ref, "plan rejected")
             elif status == "blocked":
@@ -1307,9 +1350,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
         elif action == "discuss":
             item = q.plan_discuss(ref, args.sender, args.text)
             peer = "reviewer" if args.sender == "planner" else "planner"
-            sent = _plan_send(item, peer, f"[{ref} plan discussion, from the {args.sender}] "
-                                          f"{args.text}")
-            print(f"DISCUSSION: {ref} {args.sender} -> {peer} ({'sent' if sent else 'queued/unreachable'})")
+            sent = (_plan_role_alive(item, peer)
+                    and _plan_send(item, peer, f"[{ref} plan discussion, from the "
+                                               f"{args.sender}] {args.text}"))
+            print(f"DISCUSSION: {ref} {args.sender} -> {peer} "
+                  + ("(delivered live)" if sent else
+                     "(recorded; peer not running / not reachable live, its next turn sees it)"))
         elif action == "decide":
             text = args.text or ""
             if args.file:
@@ -2044,7 +2090,7 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(item, indent=2))
     else:
-        v = item.get("verifier") or {}
+        v = item.get("verifier") or (item.get("verifier_history") or [{}])[-1] or {}
         via = f" [{v['engine']}{'/' + v['model'] if v.get('model') else ''}]" if v.get("engine") else ""
         print(f"VERDICT {'PASS' if args.passed else 'FAIL'}{via}: {item['ref']} -> {item.get('status')}")
     if item.get("status") == "closed":

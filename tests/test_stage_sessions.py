@@ -298,7 +298,8 @@ def test_forced_assess_run_fences_and_spawns_a_new_worker(stg):
 
 # ------------------------------------------------- 7/8 adoption never crosses a key
 
-def test_plan_round_change_keeps_no_stale_adoption(stg):
+def test_plan_round_change_keeps_no_stale_adoption(stg, monkeypatch):
+    monkeypatch.setattr(stg.q, "_plan_reachable", lambda plan: False)   # force the legacy path
     ref = _plan_ticket(stg)
     _tick(stg)
     _kill(stg, ref)
@@ -310,9 +311,6 @@ def test_plan_round_change_keeps_no_stale_adoption(stg):
     # legacy path (roles unreachable): a rejection goes back to planning, round 2
     stg.q.plan_verdict(ref, False, "no")
     plan = stg.q.get(ref)["plan"]
-    if plan["status"] == "discussing":                  # WT-26 path keeps the roles
-        plan = stg.q.plan_submit(ref, "v2")["plan"]
-        pytest.skip("discussion path keeps role metadata by design")
     assert plan["status"] == "planning" and plan["round"] == 2
     assert "planner" not in plan and plan["role_history"]
     _tick(stg)
@@ -744,3 +742,150 @@ def _engine_of(ns, ref):
     item = ns.q.get(ref)
     role = "planner" if (item.get("plan") or {}).get("status") else "verifier"
     return ns.stages._role_target(item, role)["engine"]
+
+
+# ------------------------------------------- WT-29: plan-discussion turn sessions
+
+def _to_discussion(ns, reasons="missing tests"):
+    """Planner v1 filed and exited, reviewer rejected: the WT-28 shape."""
+    ns.script[:] = [EXIT0]
+    ref = _plan_ticket(ns)
+    _tick(ns)                                   # planner spawn (exits at once)
+    ns.q.plan_submit(ref, "plan v1 text")
+    _tick(ns)                                   # reviewer spawn
+    ns.script[:] = [SLEEP]
+    ns.q.plan_verdict(ref, False, reasons)
+    assert ns.q.get(ref)["plan"]["status"] == "discussing"
+    return ref
+
+
+def test_reject_after_planner_exited_respawns_planner_without_human(stg, monkeypatch):
+    from watchtower import messages
+    monkeypatch.setattr(messages, "send", lambda *a, **k: pytest.fail("no message to a dead peer"))
+    ref = _to_discussion(stg)
+    it = stg.q.get(ref)
+    old_wid = it["plan"]["planner"]["worker_id"]
+    assert _wait(lambda: not stg.stages.session_alive(old_wid))
+    _tick(stg)
+    it = stg.q.get(ref)
+    ss = _ss(stg, ref)
+    assert ss["key"] == "discuss:r1:d1:planner" and ss["attempt"] == 1
+    assert it["plan"]["planner"]["worker_id"] not in ("", old_wid)
+    assert it["plan"]["discussion"]["participants"]["planner"] == it["plan"]["planner"]["worker_id"]
+    assert it["needs_input"] is False
+    prompt = stg.spawned[-1]["prompt"]
+    assert "plan v1 text" in prompt and "missing tests" in prompt
+    # the amended plan goes to a fresh supervised reviewer turn
+    stg.q.plan_submit(ref, "plan v2 text")
+    _tick(stg)
+    ss = _ss(stg, ref)
+    assert ss["key"] == "discuss:r1:v2:reviewer" and ss["role"] == "plan_reviewer"
+    prompt = stg.spawned[-1]["prompt"]
+    assert "plan v2 text" in prompt and "--version 2" in prompt
+    stg.q.plan_verdict(ref, True, "ok", version_seen=2)
+    assert stg.q.get(ref)["plan"]["status"] == "accepted"
+
+
+def test_dead_reviewer_during_discussion_is_respawned(stg):
+    ref = _to_discussion(stg)
+    _tick(stg)                                  # planner turn
+    stg.q.plan_submit(ref, "plan v2 text")
+    _tick(stg)                                  # reviewer turn
+    _kill(stg, ref)
+    _tick(stg)
+    ss = _ss(stg, ref)
+    assert ss["key"] == "discuss:r1:v2:reviewer" and ss["attempt"] == 2
+    assert stg.q.get(ref)["needs_input"] is False
+
+
+def test_discussion_turn_killed_twice_escalates_then_answer_retry_resumes(stg, monkeypatch):
+    ref = _to_discussion(stg)
+    _tick(stg)
+    for _ in range(2):
+        _kill(stg, ref)
+        _tick(stg)
+    it = stg.q.get(ref)
+    assert it["plan"]["status"] == "blocked" and it["needs_input"] is True
+    assert "discussion turn" in it["block_question"]
+    assert it["plan"]["discussion"]["status"] == "active"
+    n = len(stg.spawned)
+    _tick(stg)
+    assert len(stg.spawned) == n                # escalated: no more spawns
+    import argparse
+    stg.cli.cmd_answer(argparse.Namespace(ref=ref, text="retry", worker="", engine="",
+                                          tid=False))
+    it = stg.q.get(ref)
+    assert it["plan"]["status"] == "discussing"
+    _tick(stg)
+    assert len(stg.spawned) == n + 1
+    assert _ss(stg, ref)["key"] == "discuss:r1:d1:planner" and _ss(stg, ref)["attempt"] == 1
+
+
+def test_live_planner_is_adopted_not_duplicated_on_reject(stg):
+    stg.script[:] = [SLEEP]
+    ref = _plan_ticket(stg)
+    _tick(stg)
+    wid = stg.q.get(ref)["plan"]["planner"]["worker_id"]
+    stg.q.plan_submit(ref, "plan v1 text")
+    _tick(stg)                                  # reviewer
+    stg.q.plan_verdict(ref, False, "bad")
+    n = len(stg.spawned)
+    _tick(stg)
+    ss = _ss(stg, ref)
+    assert len(stg.spawned) == n                # adopted, nothing spawned
+    assert ss["key"] == "discuss:r1:d1:planner" and ss["attempt"] == 0
+    assert ss["worker_id"] == wid
+    os.killpg(int(ss["pid"]), signal.SIGKILL)
+    assert _wait(lambda: not stg.stages.session_alive(wid))
+    _tick(stg)
+    assert len(stg.spawned) == n + 1
+    assert _ss(stg, ref)["attempt"] == 1        # the adopted death used no budget
+
+
+def test_discussion_keys_in_desired(stg):
+    ref = _plan_ticket(stg)
+    stg.q.plan_start(ref)
+    stg.q.plan_set_role(ref, "planner", {"worker_id": "p1"})
+    stg.q.plan_submit(ref, "v1")
+    stg.q.plan_set_role(ref, "reviewer", {"worker_id": "r1"})
+    stg.q.plan_verdict(ref, False, "bad")
+    d = stg.stages.desired([stg.q.get(ref)])
+    assert [(x["role"], x["key"]) for x in d] == [("planner", "discuss:r1:d1:planner")]
+    stg.q.plan_submit(ref, "v2")
+    d = stg.stages.desired([stg.q.get(ref)])
+    assert [(x["role"], x["key"]) for x in d] == [("plan_reviewer", "discuss:r1:v2:reviewer")]
+    it = stg.q.get(ref)
+    assert stg.stages.desired([dict(it, needs_input=True)]) == []
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(stg.stages, "_github_backed", lambda i: True)
+        assert stg.stages.desired([it]) == []
+
+
+def test_refunds_are_capped_then_consume_attempts(stg, monkeypatch):
+    def missing(engine, prompt, **kw):
+        raise ValueError(f"{engine} CLI not found on PATH")
+    monkeypatch.setattr(stg.workers, "build_adhoc_command", missing)
+    ref = _verify_ticket(stg)
+    cap = stg.stages.MAX_REFUNDS
+    for _ in range(cap + 2):
+        stg.workers._save_launch_failures({})            # lift the cooldown between ticks
+        _tick(stg)
+    deaths = _ss(stg, ref)["deaths"]
+    assert sum(1 for d in deaths if d.get("refunded")) == cap
+    assert len(deaths) > cap and not deaths[-1].get("refunded")
+
+
+def test_concurrent_spawn_gate_staggers_engine_starts(stg, monkeypatch):
+    import threading
+    monkeypatch.setenv("WATCHTOWER_SPAWN_STAGGER_S", "0.3")
+    stamps = []
+
+    def run():
+        stg.workers._spawn_gate("codex")
+        stamps.append(time.time())
+    ts = [threading.Thread(target=run) for _ in range(4)]
+    [t.start() for t in ts]
+    [t.join(30) for t in ts]
+    stamps.sort()
+    assert len(stamps) == 4
+    assert all(b - a >= 0.25 for a, b in zip(stamps, stamps[1:]))
