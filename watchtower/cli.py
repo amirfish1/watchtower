@@ -1090,6 +1090,9 @@ def cmd_claim(args: argparse.Namespace) -> int:
     else:
         print(f"CLAIMED: {item['ref']} -> {worker}")
         print(item.get("text") or item.get("note") or "")
+        if item.get("gate_feedback"):
+            print("\nGATE FEEDBACK (the previous attempt was sent back): "
+                  + str(item["gate_feedback"]))
         brief = answers.claim_brief(item, worker, str(item.get("claimed_session_id") or ""))
         if brief:
             print("\n" + brief)
@@ -2118,7 +2121,37 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     return 0
 
 
+def _context_requeue_bytes() -> int:
+    try:
+        return int(os.environ.get(
+            "WATCHTOWER_ANSWER_REQUEUE_BYTES",
+            str(2 * int(os.environ.get("WATCHTOWER_CONTEXT_RECYCLE_BYTES", "2500000") or 0)),
+        ) or 0)
+    except (TypeError, ValueError):
+        return 5_000_000
+
+
+def _log_resume(item: dict, what: str) -> None:
+    """One RESUME line per attempt (WT-30 D7)."""
+    q._log("RESUME", f"{item.get('ref', '?')} — {what}", queue=item.get("project", ""))
+
+
 def _resume_rejected(item: dict, reason: str, engine: str = "") -> int:
+    sid = str(item.get("claimed_session_id") or "")
+    limit = _context_requeue_bytes()
+    if sid and limit > 0:
+        size = workers._claude_transcript_bytes(sid)
+        if size >= limit:
+            # D6: over the context budget -- a fresh worker takes it with the
+            # rejection text (gate_feedback survives the release).
+            q.set_resume_state(item["ref"], sid, "skipped")
+            q.release(item["ref"], session_id=str(item.get("claimed_by") or ""))
+            _log_resume(item, f"skipped: builder session {sid[:8]} over the context "
+                              f"budget ({size} bytes >= {limit})")
+            print(f"RESUME: {item['ref']} — builder session {sid[:8]} is over the "
+                  f"context budget ({size} bytes); released for a fresh worker with "
+                  f"the rejection text.")
+            return 0
     prompt = (
         f"Your work on ticket {item['ref']} was sent back: {reason}. Address it, "
         f"then close again with `wt close {item['ref']} --worker <your-id> "
@@ -2210,8 +2243,9 @@ def cmd_reopen(args: argparse.Namespace) -> int:
                   f"reopened to the open pool only.")
             return 0
         try:
+            # WT-30 D1: keep the original claimer (worker id) on the re-bind.
             claimed = q.reopen_and_claim(
-                args.ref, str(sid), session_uuid=str(sid),
+                args.ref, str(item.get("claimed_by") or sid), session_uuid=str(sid),
                 reason=args.reason, force=args.force,
             )
         except ValueError as exc:
@@ -2484,10 +2518,18 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
     except Exception as e:  # never lose the answer to a delivery-layer crash
         sent = {"ok": False, "error": str(e)}
     if sent.get("ok"):
+        if bound:
+            q.set_resume_state(item["ref"], str(sid), "running",
+                               transport=str(sent.get("transport") or ""))
+        _log_resume(item, str(sent.get("transport") or "?"))
         print(f"ANSWERED: {item['ref']} — delivered to session {sid} via "
               f"{sent.get('transport', '?')} to apply your answer and close.")
         return 0
     if sent.get("queued"):
+        if bound:
+            q.set_resume_state(item["ref"], str(sid), "queued",
+                               outbox_id=str(sent.get("id") or ""))
+        _log_resume(item, "queued")
         # Busy or momentarily unreachable: the durable outbox will deliver once
         # the session goes idle. The answer_grace in requeue_orphaned_tickets
         # keeps the sweep from reopening the ticket in the meantime.
@@ -2507,13 +2549,36 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
         worker_id=item.get("claimed_by", ""),
     )
     if started:
+        if bound:
+            q.set_resume_state(item["ref"], str(sid), "headless")
+        _log_resume(item, "headless")
         print(f"ANSWERED: {item['ref']} — resuming session {sid} in {repo} "
               f"to apply your answer and close.")
-    else:
-        print(f"ANSWERED: {item['ref']} — needs_input cleared, but delivery "
-              f"failed ({sent.get('error', 'unknown')}); {delivery_engine} "
-              "resume also failed to stay running. Resume manually: "
-              f"wt discuss {item['ref']} --engine {delivery_engine}")
+        return 0
+    # D7: every transport failed. Release the claim (the next tick / a fresh
+    # worker takes it) instead of leaving it held by a session that never woke.
+    err = str(sent.get("error") or "unknown")
+    _log_resume(item, f"failed: {err}")
+    if bound:
+        if answer_text and not item.get("gate_feedback"):
+            from datetime import datetime as _dt, timezone as _tz
+            stamp = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+            q.update(item["ref"], text=(
+                f"{item.get('text') or item.get('note') or ''}\n\n"
+                f"[ANSWERED while blocked, {stamp}] Q: "
+                f"{item.get('block_question') or '(see history)'}\nA: {answer_text}\n"
+                f"(Original session {str(sid)[:8]} could not be resumed — apply this "
+                f"answer fresh.)"))
+        q.set_resume_state(item["ref"], str(sid), "failed", error=err)
+        q.release(item["ref"], session_id=str(item.get("claimed_by") or worker or ""),
+                  force=True)
+        print(f"ANSWERED: {item['ref']} — delivery failed ({err}) and {delivery_engine} "
+              "resume did not stay running; claim released for a fresh worker.")
+        return 0
+    print(f"ANSWERED: {item['ref']} — needs_input cleared, but delivery "
+          f"failed ({err}); {delivery_engine} "
+          "resume also failed to stay running. Resume manually: "
+          f"wt discuss {item['ref']} --engine {delivery_engine}")
     return 0
 
 

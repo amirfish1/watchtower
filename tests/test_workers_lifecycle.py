@@ -1124,7 +1124,7 @@ def test_reconcile_nudges_live_worker_on_orphan_requeue(wt):
     _age_worker_log(wt, rec, wt.workers.WARM_TTL_S - 30)  # warm: nudge, don't reap
 
     r = wt.workers.reconcile_once(dry_run=False)
-    assert ref in r["requeued"]
+    assert ref in [x["ref"] for x in r["requeued"]]
 
     fd = wt._readers[-1]
     data = os.read(fd, 65536).decode()

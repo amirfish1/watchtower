@@ -29,7 +29,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from . import origins
 
@@ -4724,6 +4724,113 @@ def reconcile_stages_only() -> List[Any]:
         return stages.reconcile_stages()
 
 
+def _requeue_ref(entry: Any) -> str:
+    """``result["requeued"]`` holds ``{"ref", "reason"}``; bare refs still parse."""
+    return str(entry.get("ref") if isinstance(entry, dict) else entry or "")
+
+
+RESUME_START_S = 45.0  # delegate resume start window (WT-30 D3 (e))
+
+
+def _resume_start_s() -> float:
+    try:
+        return float(os.environ.get("WATCHTOWER_RESUME_START_S", str(RESUME_START_S)))
+    except (TypeError, ValueError):
+        return RESUME_START_S
+
+
+def _resolve_claimer(claimer: str, known_workers: Optional[List[Dict[str, Any]]] = None,
+                     known_ids: Optional[set] = None) -> Tuple[str, str]:
+    """Classify a ticket's ``claimed_by`` for the orphan sweep (WT-30 D2):
+    ``(kind, worker_id)`` with kind ``builder | stage | unknown``. First
+    conclusive answer wins; ``unknown`` (ambient sessions, OPS-104) and
+    ``stage`` (WT-24 supervises those) are never reopened by the sweep."""
+    claimer = str(claimer or "")
+    if known_workers is None:
+        known_workers = list_workers(prune=False)
+    if known_ids is None:
+        known_ids = ({str(w.get("worker_id", "")) for w in known_workers}
+                     | set(_load_worker_id_ledger()))
+    if claimer in known_ids:
+        return "builder", claimer
+    if not _is_worker_session_id(claimer):
+        return "unknown", ""
+    for w in known_workers:
+        if str(w.get("session_id") or "") == claimer:
+            if w.get("stage"):
+                return "stage", ""
+            return "builder", str(w.get("worker_id") or "")
+    try:
+        from . import origins as _origins
+        rec = _origins.get(claimer) or {}
+    except Exception:
+        rec = {}
+    role = str(rec.get("role") or "").strip()
+    if role:
+        if role in ("worker", "adhoc"):
+            return "builder", str(rec.get("worker_id") or "")
+        return "stage", ""
+    if claimer in set(_load_worker_session_ledger()):
+        return "builder", ""
+    return "unknown", ""
+
+
+def _effective_resume(resume: Dict[str, Any], now: float) -> Tuple[str, str, float]:
+    """``(state, transport, age_s)`` of the resume evidence, folding in the
+    outbox row for a ``queued`` resume (WT-30 R3)."""
+    state = str(resume.get("state") or "")
+    transport = str(resume.get("transport") or "")
+    at = str(resume.get("at") or "")
+    if state == "queued":
+        from . import messages
+        entry = None
+        try:
+            entry = messages.outbox_entry(str(resume.get("outbox_id") or ""))
+        except Exception:
+            entry = None
+        status = (entry or {}).get("status")
+        if status == "pending":
+            return "queued", "", 0.0
+        if status == "delivered":
+            state = "running"
+            transport = str(entry.get("transport") or "")
+            at = str(entry.get("delivered_at") or at)
+        else:
+            return "failed", "", 0.0
+    age = _iso_age_s(at, now) if at else 0.0
+    return state, transport, age
+
+
+def _builder_held(it: Dict[str, Any], wid: str, live_ids: set,
+                  live_sessions: set, now: float) -> bool:
+    """True while the ticket's builder/resume still shows evidence of life."""
+    sid = str(it.get("claimed_session_id") or "")
+    if wid and wid in live_ids:
+        return True                                   # (a)
+    if sid and sid in live_sessions:
+        return True                                   # (b)
+    from . import messages
+    try:
+        if sid and messages.live_resume_child(sid):
+            return True                               # (c)
+    except Exception:
+        pass
+    resume = it.get("resume") if isinstance(it.get("resume"), dict) else None
+    if not resume:
+        return False
+    state, transport, age = _effective_resume(resume, now)
+    if state == "queued":
+        return True                                   # (d)
+    if state in ("pending", "running") and transport in ("delegate", ""):
+        if age < _resume_start_s():
+            return True                               # (e) start window
+        try:
+            return messages.session_state(sid) == "busy"  # busy counts for delegate only
+        except Exception:
+            return False
+    return False
+
+
 def requeue_orphaned_tickets(
     grace_s: float = 120.0, answer_grace_s: Optional[float] = None
 ) -> List[Dict[str, Any]]:
@@ -4758,6 +4865,8 @@ def requeue_orphaned_tickets(
             answer_grace_s = 300.0
     known_workers = list_workers(prune=False)
     live_ids = {str(w.get("worker_id", "")) for w in known_workers if w.get("alive")}
+    live_sessions = {str(w.get("session_id") or "") for w in known_workers
+                     if w.get("alive") and w.get("session_id")}
     # Union with the persistent ledger, not just the current (prunable) store:
     # workers.json drops a dead worker's record on the next routine read, often
     # within seconds, which used to make every genuinely-dead worker look
@@ -4784,20 +4893,29 @@ def requeue_orphaned_tickets(
         # reopening now would duplicate that work (see _answer_in_flight).
         pa_at = ((it.get("pending_answer") or {}).get("state_at")
                  if it.get("pending_answer") else None)
-        if _answer_in_flight(
+        has_resume = isinstance(it.get("resume"), dict)
+        # A ticket carrying resume evidence is judged by that evidence below
+        # (WT-30 D3); the flat answer grace only covers answers that carry none.
+        if not has_resume and _answer_in_flight(
             pa_at or it.get("answered_at"), str(it.get("claimed_session_id") or ""),
             now, answer_grace_s,
         ):
             continue
         claimer = str(it.get("claimed_by") or "")
+        wid = ""
+        if claimer:
+            kind, wid = _resolve_claimer(claimer, known_workers, known_ids)
+            if kind != "builder":
+                continue  # stage (WT-24) or never a spawned worker (OPS-104)
         if claimer and claimer in live_ids:
             continue  # its worker is alive — leave it
-        if claimer and claimer not in known_ids:
-            continue  # never a spawned worker — no evidence it's dead (OPS-104)
+        if _builder_held(it, wid, live_ids, live_sessions, now):
+            continue
         # Grace window guards against a just-claimed ticket whose worker record
-        # hasn't been written yet (spawn/claim race).
+        # hasn't been written yet (spawn/claim race). A reject reclaim cannot
+        # have that race, so it is skipped when resume evidence is present.
         claimed_at = it.get("claimed_at")
-        if claimed_at:
+        if claimed_at and not has_resume:
             try:
                 from datetime import datetime, timezone
                 ts = datetime.fromisoformat(str(claimed_at).replace("Z", "+00:00")).timestamp()
@@ -4817,10 +4935,17 @@ def requeue_orphaned_tickets(
             # close back to "open" — this ticket briefly (and wrongly)
             # reappearing as open/in_progress right after a real close was
             # reported as OPS-72. The guard makes the write a no-op instead.
-            item = _q.update_status(ref, "open", quiet=True, require_status="in_progress",
-                                     reason="worker gone")
+            why = "worker gone"
+            if it.get("gate_feedback") and has_resume:
+                why = (f"worker gone (verify-rejected; builder "
+                       f"{wid or str(it.get('claimed_session_id') or '')[:8]} dead)")
+            sid_d = str(it.get("claimed_session_id") or "")
+            item = _q.update_status(
+                ref, "open", quiet=True, require_status="in_progress", reason=why,
+                orphan=({"session_id": sid_d, "claimed_by": claimer}
+                        if (sid_d or claimer) else None))
             if item:
-                reopened.append(item)
+                reopened.append(dict(item, requeue_reason=why))
         except Exception:
             pass
     return reopened
@@ -5672,8 +5797,9 @@ def _reconcile_once_locked(dry_run: bool = False,
         # the spawn pass below re-drains them. Without this a queue reads depth=0
         # ("Ready") while work is unfinished. Must run BEFORE the depth read.
         try:
-            result["requeued"] = [it.get("ref", "")
-                                  for it in requeue_orphaned_tickets()]
+            result["requeued"] = [
+                {"ref": it.get("ref", ""), "reason": it.get("requeue_reason") or "worker gone"}
+                for it in requeue_orphaned_tickets()]
         except Exception:
             pass
         # WT-28: park legacy blocks, then route answers to parked tickets.
@@ -5699,8 +5825,8 @@ def _reconcile_once_locked(dry_run: bool = False,
         # existing worker happens to poll again on its own — leaving the ticket
         # visibly "open" but unworked for however long that takes.
         try:
-            requeued_queues = {ref.rsplit("-", 1)[0]
-                               for ref in result["requeued"] if ref}
+            requeued_queues = {_requeue_ref(r).rsplit("-", 1)[0]
+                               for r in result["requeued"] if _requeue_ref(r)}
             for q_name in requeued_queues:
                 claim_filter = "".join(
                     f" --type {t}" for t in config.claim_types(q_name)
@@ -6582,9 +6708,11 @@ def _reconcile_once_locked(dry_run: bool = False,
             q = (w.get("queue", "") if isinstance(w, dict) else "")
             reason = (w.get("reason", "") if isinstance(w, dict) else "")
             _log("STOP", str(wid) + (f" — {reason}" if reason else ""), queue=q)
-        for ref in result.get("requeued", []):
+        for entry in result.get("requeued", []):
+            ref = _requeue_ref(entry)
+            reason = (entry.get("reason") if isinstance(entry, dict) else "") or "worker gone"
             q = ref.rsplit("-", 1)[0] if "-" in ref else ""
-            _log("REQUEUE", f"{ref} — worker gone, reopened for re-drain", queue=q)
+            _log("REQUEUE", f"{ref} — {reason}, reopened for re-drain", queue=q)
         for fallback in result.get("fallbacks", []):
             _log(
                 "FALLBACK",

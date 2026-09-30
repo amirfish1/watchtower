@@ -2231,6 +2231,7 @@ def claim_next(
         item["status"] = "in_progress"
         item["claimed_by"] = str(session_id)
         item["claimed_machine"] = machine_tag()
+        item.pop("resume", None)  # WT-30: evidence belongs to the previous claim
         if real_sid:
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
@@ -2291,6 +2292,7 @@ def claim_by_ref(
         item["status"] = "in_progress"
         item["claimed_by"] = str(session_id)
         item["claimed_machine"] = machine_tag()
+        item.pop("resume", None)  # WT-30: evidence belongs to the previous claim
         if real_sid:
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
@@ -2460,8 +2462,13 @@ def update_status(
     hold_review: str = "",
     extras: Optional[Dict[str, Any]] = None,
     answer_fate: str = "handoff",
+    orphan: Optional[Dict[str, str]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """``answer_fate`` (WT-28): what a reopen does with a ticket's
+    """``orphan`` (WT-30): ``{"session_id", "claimed_by"}`` of the claim the
+    orphan sweep is displacing; recorded on the reopen event so a later resume of
+    that session can be told to STOP even after a fresh worker re-claims.
+
+    ``answer_fate`` (WT-28): what a reopen does with a ticket's
     ``pending_answer``: ``handoff`` keeps it as ``handed_off`` for the next
     claimer, ``discard`` (forced release/reopen) drops it to history.
 
@@ -2578,6 +2585,8 @@ def update_status(
                 it["status"] = status
                 now = _now_iso()
                 it["updated_at"] = now
+                if status != "in_progress" or session_id:
+                    it.pop("resume", None)  # WT-30: claim left/replaced
                 if status == "closed":
                     _clear_parked_unlocked(it)
                 if status == "in_progress" and session_id:
@@ -2675,7 +2684,12 @@ def update_status(
                     it["blocked_at"] = None
                     it.pop("parked", None)
                     _reopen_pending_unlocked(it, now, answer_fate, reason)
-                    _append_history(it, "reopen", by=_by(by_kind, str(session_id or ""), str(real_sid or "")), at=now, reason=_clip(reason, 4000))
+                    _orphan_fields = ({
+                        "orphan": True,
+                        "displaced_session_id": str((orphan or {}).get("session_id") or ""),
+                        "displaced_claimed_by": str((orphan or {}).get("claimed_by") or ""),
+                    } if orphan else {})
+                    _append_history(it, "reopen", by=_by(by_kind, str(session_id or ""), str(real_sid or "")), at=now, reason=_clip(reason, 4000), **_orphan_fields)
                 _save_unlocked(data)
                 if status == "closed" or (status == "open" and answer_fate == "discard"):
                     _supersede_outbox(it.get("ref"))
@@ -3434,9 +3448,20 @@ def reject_with(ident: Any, why: str, by_label: str = "human",
         return None
     sid = str(current.get("claimed_session_id") or "")
     if sid and _github_backend_for_project(_project_from_ident(ident)) is None:
-        item = reopen_and_claim(ident, sid, session_uuid=sid, reason=why)
+        # WT-30 D1: keep the ORIGINAL claimer (worker id) so the orphan sweep
+        # can tell a spawned builder from an ambient session; the session id
+        # rides in claimed_session_id.
+        item = reopen_and_claim(ident, str(current.get("claimed_by") or sid),
+                                session_uuid=sid, reason=why)
         if item is None:
             return None
+        with _FileLock(_lock_path()):
+            data = _load_unlocked()
+            for it in data["items"]:
+                if _matches(it, ident):
+                    it["resume"] = {"sid": sid, "state": "pending", "at": _now_iso()}
+                    _save_unlocked(data)
+                    break
     else:
         item = update_status(ident, "open", reason=why, by_kind="human")
         if item is None:
@@ -3453,6 +3478,46 @@ def reject_with(ident: Any, why: str, by_label: str = "human",
                 _save_unlocked(data)
                 return it
     return item
+
+
+RESUME_TERMINAL_STATES = ("failed", "skipped")
+
+
+def set_resume_state(ident: Any, sid: str, state: str, transport: str = "",
+                     error: str = "", outbox_id: str = "",
+                     at: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Record resume evidence on an in_progress ticket (WT-30 D3).
+
+    Guarded: the ticket must still be in_progress under ``sid`` and the current
+    state must not be terminal (failed/skipped). A write-back from the outbox
+    drain (``outbox_id`` with a non-``queued`` state) only applies when the
+    ticket's ``resume.outbox_id`` is that row. Creates the record when absent
+    (``wt reopen --resume`` / answers have no reject stamp)."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            if it.get("status") != "in_progress" or str(it.get("claimed_session_id") or "") != str(sid):
+                return None
+            cur = it.get("resume") if isinstance(it.get("resume"), dict) else None
+            if cur and cur.get("state") in RESUME_TERMINAL_STATES:
+                return None
+            if outbox_id and state != "queued" and (not cur or cur.get("outbox_id") != outbox_id):
+                return None
+            rec = dict(cur or {"sid": str(sid)})
+            rec["state"] = state
+            rec["at"] = at or _now_iso()
+            if transport:
+                rec["transport"] = transport
+            if error:
+                rec["error"] = _clip(error, 500)
+            if outbox_id:
+                rec["outbox_id"] = outbox_id
+            it["resume"] = rec
+            _save_unlocked(data)
+            return it
+    return None
 
 
 def reject(ident: Any, reason: str, by: str = "human") -> Optional[Dict[str, Any]]:
@@ -4215,6 +4280,7 @@ def reopen_and_claim(
             it["status"] = "in_progress"
             it["claimed_by"] = str(session_id)
             it["claimed_machine"] = machine_tag()
+            it.pop("resume", None)
             if real_sid:
                 it["claimed_session_id"] = real_sid
             it["claimed_at"] = now
@@ -4539,6 +4605,7 @@ def _park_unlocked(it: Dict[str, Any], worker_id: str, session_id: str, machine:
         "transcript_path": transcript, "at": now,
     }
     it["status"] = PARKED_STATUS
+    it.pop("resume", None)
     it["claimed_by"] = None
     it["claimed_session_id"] = None
     it["claimed_machine"] = None
@@ -4768,6 +4835,7 @@ def block(
                 it["updated_at"] = now
                 if commit:
                     it["block_commit"] = commit
+                it.pop("resume", None)
                 if it.get("status") == "open" and not park:
                     it["status"] = "in_progress"
                 if session_id and not park and not was_parked:

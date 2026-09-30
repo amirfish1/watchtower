@@ -398,7 +398,7 @@ def test_answer_and_message_resume_share_boot_verifier(wt, tmp_path, monkeypatch
     assert len(verified) == 2
 
 
-def test_answer_fallback_failure_names_engine_for_manual_resume(
+def test_answer_total_delivery_failure_releases_with_qa_embedded(
     wt, tmp_path, monkeypatch, capsys
 ):
     cli, q, workers = wt
@@ -417,8 +417,13 @@ def test_answer_fallback_failure_names_engine_for_manual_resume(
     assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
 
     output = capsys.readouterr().out
-    assert "codex resume also failed to stay running" in output
-    assert f"wt discuss {item['ref']} --engine codex" in output
+    # WT-30 D7: every transport failed -> release the claim, no "resume manually".
+    assert "codex resume did not stay running" in output
+    assert "claim released" in output
+    assert "Resume manually" not in output
+    after = q.get(item["ref"])
+    assert after["status"] == "open"
+    assert "[ANSWERED while blocked" in after["text"]
 
 
 def test_answered_ticket_not_reopened_while_answer_in_flight(wt, tmp_path):

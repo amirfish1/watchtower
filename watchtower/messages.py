@@ -705,19 +705,17 @@ def session_state(sid: str, now: Optional[float] = None) -> str:
 
 
 def _displaced_claim_for_session(sid: str) -> Optional[Dict[str, str]]:
-    """If ``sid`` was a worker that got reaped mid-ticket and its claim was
-    taken over, return ``{"ref", "reason"}`` describing the displacement; else
-    None. Used to guard a headless resume so a revived worker does not silently
-    resume onto -- and re-commit -- work another worker already redrained.
+    """If ``sid`` had a claim taken from it by the orphan sweep (its worker was
+    found dead mid-ticket), return ``{"ref", "reason"}``; else None. Used to
+    guard a headless resume so a revived worker does not silently resume onto --
+    and re-commit -- work another worker already redrained.
 
-    Signal (false-positive-free by construction): the ticket still records this
-    session as owner (``claimed_session_id == sid``) AND its history carries a
-    ``reopen`` event with reason "worker gone" (the reaper's mark -- a normally
-    closed ticket never has one) AND it is no longer actively in_progress under
-    this session (status is ``open`` = reopened, or ``closed`` = reassigned and
-    closed by another). A worker that finished its own ticket has no reopen
-    event, so it is never flagged; one that was reaped-then-legitimately
-    reclaimed by ITSELF is back to in_progress, so it is not flagged either.
+    Keys on the reopen event's displacement record (WT-30 R2: ``orphan`` +
+    ``displaced_session_id``), not on the ticket's CURRENT ``claimed_session_id``
+    -- a fresh worker's claim overwrites that. Legacy events with only the
+    "worker gone" reason still match while the ticket records ``sid``. A later
+    claim/reopen by ``sid`` itself (legitimate self-reclaim), or the ticket being
+    in_progress under ``sid``, clears the displacement.
 
     Best-effort: any lookup failure returns None -- the guard must never break
     delivery."""
@@ -729,21 +727,36 @@ def _displaced_claim_for_session(sid: str) -> Optional[Dict[str, str]]:
     except Exception:
         return None
     for it in items:
-        if str(it.get("claimed_session_id") or "") != sid:
+        status = str(it.get("status") or "")
+        if status == "in_progress" and str(it.get("claimed_session_id") or "") == sid:
+            continue  # legitimately theirs
+        hist = it.get("history") or []
+        hit = -1
+        legacy = False
+        for i, e in enumerate(hist):
+            if e.get("event") != "reopen":
+                continue
+            if e.get("orphan") is True and str(e.get("displaced_session_id") or "") == sid:
+                hit, legacy = i, False
+            elif (not e.get("displaced_session_id")
+                  and "worker gone" in str(e.get("reason") or "").lower()
+                  and str(it.get("claimed_session_id") or "") == sid
+                  and status in ("open", "closed")):
+                hit, legacy = i, True
+        if hit < 0:
             continue
-        status = it.get("status")
-        if status not in ("open", "closed"):
-            continue  # in_progress under this session -> still legitimately theirs
-        reaped = any(
-            e.get("event") == "reopen"
-            and "worker gone" in str(e.get("reason") or "").lower()
-            for e in (it.get("history") or [])
-        )
-        if not reaped:
-            continue  # closed/released normally, not taken away
-        reason = ("reopened after you were reaped for idling"
-                  if status == "open"
-                  else "reassigned and closed by another worker after you were reaped")
+        if any(e.get("event") in ("claim", "reopen")
+               and str((e.get("by") or {}).get("session_id") or "") == sid
+               for e in hist[hit + 1:]):
+            continue  # sid re-bound itself after the displacement
+        if legacy:
+            reason = ("reopened after you were reaped for idling" if status == "open"
+                      else "reassigned and closed by another worker after you were reaped")
+        else:
+            reason = {
+                "open": "reopened after your process was found dead",
+                "closed": "reassigned and closed by another worker",
+            }.get(status, "taken over by another worker")
         return {"ref": str(it.get("ref") or "?"), "reason": reason}
     return None
 
@@ -1964,6 +1977,47 @@ def outbox_row(msg_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def outbox_entry(msg_id: str) -> Optional[Dict[str, Any]]:
+    """Resume-evidence view of one outbox row (WT-30): status, transport of the
+    delivery, real delivery time and last error; None when the row is gone."""
+    for m in _load_outbox()["messages"]:
+        if str(m.get("id")) == str(msg_id):
+            return {"status": m.get("status"), "last_error": m.get("last_error", ""),
+                    "transport": str(m.get("transport") or ""),
+                    "delivered_at": str(m.get("delivered_at") or "")}
+    return None
+
+
+def live_resume_child(sid: str) -> bool:
+    """True when the resume ledger holds a still-running ``claude ... <sid>``
+    child (pid alive and argv identity matches, as ``reap_resume_children``)."""
+    if not sid:
+        return False
+    with queue_mod._FileLock(_resume_ledger_lock()):
+        entries = _load_resume_ledger()
+    for e in entries:
+        if not isinstance(e, dict) or str(e.get("sid") or "") != sid:
+            continue
+        try:
+            pid = int(e.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+        except OSError:
+            return True
+        cmd = _pid_command(pid)
+        if "claude" in cmd and sid in cmd:
+            return True
+    return False
+
+
 def outbox_cancel_ticket(ref: str, reason: str) -> List[str]:
     """Cancel pending generation-bound answer rows of ``ref`` (R4-4): the row
     is marked stale so the drain never retries it. A transport already started
@@ -2115,6 +2169,7 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
         return result
     outcomes: Dict[str, Dict[str, Any]] = {}
     stale: Dict[str, str] = {}
+    writebacks: List[Tuple[str, str, str, str, str, str, str]] = []
     for m in due:
         reason = _ticket_stale_reason(m)
         if reason:
@@ -2167,8 +2222,13 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             if res.get("ok"):
                 m["status"] = "delivered"
                 m["delivered_at"] = _iso(now)
+                m["transport"] = str(res.get("transport") or "")
                 m["last_error"] = ""
                 result["delivered"].append(str(m["id"]))
+                if m.get("ticket"):
+                    writebacks.append((str(m["ticket"]), str(m.get("ticket_session") or ""),
+                                       str(m["id"]), "running", m["transport"], "",
+                                       m["delivered_at"]))
                 if m.get("dedupe_key"):
                     ledger = _load_ledger()
                     ledger["entries"][str(m["dedupe_key"])] = {
@@ -2185,6 +2245,9 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
                 if attempts >= MAX_ATTEMPTS:
                     m["status"] = "dead"
                     result["dead"].append(str(m["id"]))
+                    if m.get("ticket"):
+                        writebacks.append((str(m["ticket"]), str(m.get("ticket_session") or ""),
+                                           str(m["id"]), "failed", "", m["last_error"], ""))
                     queue_mod._log(
                         "DEADMSG",
                         f"{m.get('id','?')} to {m.get('to','?')} after "
@@ -2194,6 +2257,17 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
                     m["next_attempt_at"] = _iso(now + _backoff_s(attempts))
                     result["retried"].append(str(m["id"]))
         _save_outbox(data)
+    # Outside the outbox lock (no nested locks): push delivery / dead-letter
+    # outcomes to the ticket's resume evidence (WT-30 R3). The sweep reads the
+    # outbox row itself, so a lost write-back only leaves a stale state.
+    for ref, sid, msg_id, state, transport, error, at in writebacks:
+        try:
+            queue_mod.set_resume_state(ref, sid, state, transport=transport, error=error,
+                                       outbox_id=msg_id, at=at or None)
+            queue_mod._log("RESUME", f"{ref} — " + (f"{transport or '?'} (outbox)" if state == "running"
+                                                   else "failed (outbox dead)"))
+        except Exception:  # noqa: BLE001
+            pass
     return result
 
 
