@@ -309,9 +309,10 @@ def test_close_guard_rejects_crosscloser_but_allows_force_and_unclaimed(wt):
     assert wt.q.get(x["ref"])["status"] == "in_progress"
 
     # Own in_progress ticket closes normally.
+    # (WT-28: one active claim per worker, so the own-ticket case uses worker-c.)
     a = wt.q.enqueue(project="OWN", note="mine", source="test")
-    wt.q.claim_by_ref(a["ref"], "worker-a")
-    assert wt.q.close(a["ref"], "worker-a", resolution="ok")["status"] == "closed"
+    wt.q.claim_by_ref(a["ref"], "worker-c")
+    assert wt.q.close(a["ref"], "worker-c", resolution="ok")["status"] == "closed"
 
     # force lets a human re-close an already-closed ticket.
     forced = wt.q.close(a["ref"], "human-x", resolution="override", force=True)

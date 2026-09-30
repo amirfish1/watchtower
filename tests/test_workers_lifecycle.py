@@ -4822,3 +4822,25 @@ def test_spawn_adhoc_claude_ledgers_pinned_session_id(wt, monkeypatch):
     assert sid in wt.workers._load_worker_session_ledger()
     codex = wt.workers.spawn_adhoc("check", "codex", repo_path=str(wt.tmp), name="verify-X-1", dry_run=True)
     assert "session_id" not in codex and "--session-id" not in codex["argv"]
+
+
+def test_retained_parked_worker_does_not_consume_spawn_budget(wt, monkeypatch):
+    """WT-28: an idle worker retaining a parked ticket waits for its answer; it
+    must not cover the queue's spawn budget, so claimable work still staffs."""
+    wt.config.set_auto_drain("Q", True)  # desired_workers defaults to 1
+    parked = wt.q.enqueue(project="Q", note="needs a human call")
+    wt.q.enqueue(project="Q", note="unrelated claimable work")
+    worker = _live_worker(wt, "Q")
+    claimed = wt.q.claim_next(worker["worker_id"], project="Q",
+                              session_uuid=worker["session_id"])
+    assert claimed["ref"] == parked["ref"]
+    blocked = wt.q.block(parked["ref"], question="fix or dismiss?",
+                         session_id=worker["worker_id"], origin="worker")
+    assert blocked["status"] == "awaiting_answer"
+    assert worker["worker_id"] in wt.workers.retained_parked_ids("Q")
+
+    r = wt.workers.reconcile_once(dry_run=False)
+    assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1
+    # The retained worker is excluded from the live count the claim-time STOP uses.
+    assert wt.workers.live_worker_count(
+        "Q", exclude=wt.workers.retained_parked_ids("Q")) <= 1

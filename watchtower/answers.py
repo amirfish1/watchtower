@@ -386,9 +386,10 @@ def _retry(it: Dict[str, Any], gen: int, now: float) -> str:
     if int(pa.get("attempts") or 0) + 1 >= MAX_DELIVERY_ATTEMPTS:
         _fallback_reopen(ref, gen, "answer delivery gave up; handed off")
         return "handed_off"
-    q.pa_bump_attempts(ref, gen, "delivering")
-    fresh = q.get(ref) or it
-    _deliver_bound(fresh, gen)
+    bumped = q.pa_bump_attempts(ref, gen, "delivering")
+    if not bumped:
+        return "stale"  # CAS lost (re-block / new gen / state moved): no delivery
+    _deliver_bound(bumped, gen)
     return "redelivered"
 
 
@@ -407,7 +408,8 @@ def _check_queued(it: Dict[str, Any], gen: int, now: float) -> str:
     if int(pa.get("attempts") or 0) + 1 >= MAX_DELIVERY_ATTEMPTS:
         _fallback_reopen(ref, gen, "queued answer never delivered; handed off")
         return "handed_off"
-    q.pa_bump_attempts(ref, gen, "queued")
+    if not q.pa_bump_attempts(ref, gen, "queued"):
+        return ""
     if q.pa_transition(ref, gen, "queued", "delivering", from_status="in_progress"):
         _deliver_bound(q.get(ref) or it, gen)
         return "redelivered"

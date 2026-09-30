@@ -2282,13 +2282,11 @@ def claim_by_ref(
         reserved = _affinity_gate_unlocked(item, str(session_id), str(real_sid or ""), time.time())
         if reserved:
             raise ValueError(reserved)
-        # WT-28: an answer-bearing ticket (affinity/handoff) keeps the
-        # one-ticket-at-a-time rule in-lock; a plain explicit claim keeps its
-        # historical behaviour (a worker may `wt claim --ref` a second ticket).
-        if item.get("pending_answer"):
-            held_now = _held_unlocked(data["items"], str(session_id), "", item.get("project"))
-            if held_now:
-                _raise_claim_refused(held_now, session_id)
+        # WT-28: in-lock worker-or-session exclusivity on every claim path.
+        held_now = _held_unlocked(data["items"], str(session_id), str(real_sid or ""),
+                                  item.get("project"))
+        if held_now:
+            _raise_claim_refused(held_now, session_id)
         item["status"] = "in_progress"
         item["claimed_by"] = str(session_id)
         item["claimed_machine"] = machine_tag()
@@ -4726,6 +4724,22 @@ def pa_transition(ident: Any, gen: int, from_state: Any, to_state: str, *,
                         route=route or pa.get("route", ""), reason=_clip(reason, 500),
                         state=to_state)
     return _pa_cas(ident, gen, from_state, from_status, _mut)
+
+
+def mark_park_retention_expired(ident: Any) -> bool:
+    """Stamp ``parked.retention_expired_at`` once (PARK-EXPIRED is logged only
+    when this returns True)."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                pk = it.get("parked")
+                if it.get("status") != PARKED_STATUS or not pk or pk.get("retention_expired_at"):
+                    return False
+                pk["retention_expired_at"] = _now_iso()
+                _save_unlocked(data)
+                return True
+    return False
 
 
 def pa_bump_attempts(ident: Any, gen: int, state: str) -> Optional[Dict[str, Any]]:

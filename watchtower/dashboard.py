@@ -119,6 +119,7 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     items = q.list_items()
     rows = health.all_status(stuck_minutes=stuck_minutes, items=items)
     counts = workers.worker_counts()
+    retained = workers.retained_counts()
     wrows = workers.list_workers(prune=False)
     workers.annotate_activity(wrows, items)
     workers_by_queue: Dict[str, List[Dict[str, Any]]] = {}
@@ -128,6 +129,7 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
         wc = counts.get(r["queue"], {"total": 0, "live": 0})
         r["workers_total"] = wc["total"]
         r["workers_live"] = wc["live"]
+        r["workers_retained"] = retained.get(r["queue"], 0)
         queue_workers = workers_by_queue.get(r["queue"], [])
         live_workers = [
             worker for worker in queue_workers

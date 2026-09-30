@@ -1842,6 +1842,17 @@ def _idle_snapshot(
         }
     ]
     owned_refs = set(owned_by_worker + owned_by_session)
+    # WT-28: a worker retaining a parked ticket (or an unexpired affinity
+    # reservation) for an unanswered question is never idle-released.
+    parked_refs = sorted(
+        str(it.get("ref") or "")
+        for it in (_parked_rows(items=items or []) + _affinity_rows(items=items or []))
+        if worker_id and worker_id in {
+            str((it.get("parked") or {}).get("worker_id") or ""),
+            str((it.get("pending_answer") or {}).get("prior_worker_id") or "")
+            if it.get("status") == "open" else "",
+        }
+    )
     blocked_refs = [
         str(item.get("ref") or "")
         for item in (items or [])
@@ -1889,6 +1900,8 @@ def _idle_snapshot(
             reasons.append("owned_by_session")
         if blocked_refs:
             reasons.append("blocked_ticket")
+    if parked_refs:
+        reasons.append("parked_retention")
     if not session_id:
         reasons.append("session_identity_missing")
     if not worker_id:
@@ -1927,6 +1940,7 @@ def _idle_snapshot(
         "worker_refs": sorted(owned_by_worker),
         "session_refs": sorted(owned_by_session),
         "blocked_refs": sorted(blocked_refs),
+        "parked_refs": parked_refs,
         "reasons": sorted(set(reasons)),
     }
     snapshot["fingerprint"] = _audit_fingerprint(snapshot)
@@ -2622,9 +2636,12 @@ def _signal_worker(pid: int, sig: int) -> str:
 
 
 def _fresh_park_owners(now: float) -> set:
-    return {str((it.get("parked") or {}).get("worker_id"))
-            for it in _parked_rows(now=now)
-            if _iso_age_s(str((it.get("parked") or {}).get("at") or ""), now) < PARK_GRACE_S}
+    ids = {str((it.get("parked") or {}).get("worker_id"))
+           for it in _parked_rows(now=now)
+           if _iso_age_s(str((it.get("parked") or {}).get("at") or ""), now) < park_grace_s()}
+    ids |= {str((it.get("pending_answer") or {}).get("prior_worker_id") or "")
+            for it in _affinity_rows(now=now)} - {""}
+    return ids
 
 
 def reap_released_workers(
@@ -4090,8 +4107,67 @@ def worker_model(worker_id: str, queue: str) -> str:
     return config.queue_model_id(queue)
 
 
+def _env_s(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 PARK_RETENTION_S = 55 * 60.0  # keep a parked ticket's worker alive this long (WT-28)
-PARK_GRACE_S = 120.0          # defer a released owner's SIGTERM this long after a park
+PARK_GRACE_S = 55 * 60.0      # defer a released owner's SIGTERM this long (WATCHTOWER_PARK_GRACE_S)
+
+
+def park_retention_s() -> float:
+    return _env_s("WATCHTOWER_PARK_RETENTION_S", PARK_RETENTION_S)
+
+
+def park_grace_s() -> float:
+    return _env_s("WATCHTOWER_PARK_GRACE_S", PARK_GRACE_S)
+
+
+def _affinity_rows(queue: Optional[str] = None,
+                   items: Optional[List[Dict[str, Any]]] = None,
+                   now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Tickets reserved (unexpired affinity) for their parked worker's answer."""
+    from . import queue as _q
+    now = time.time() if now is None else now
+    if items is None:
+        try:
+            items = _q.list_items()
+        except Exception:
+            return []
+    out = []
+    for it in items:
+        if queue and it.get("project") != queue:
+            continue
+        if it.get("status") == "open" and _q._affinity_reserved(it, now):
+            out.append(it)
+    return out
+
+
+def expire_parked_retention(now: Optional[float] = None) -> List[str]:
+    """Log PARK-EXPIRED once per park whose retention window has passed."""
+    from . import queue as _q
+    now = time.time() if now is None else now
+    done: List[str] = []
+    try:
+        items = _q.list_items()
+    except Exception:
+        return done
+    for it in items:
+        pk = it.get("parked") or {}
+        if it.get("status") != _q.PARKED_STATUS or pk.get("retention_expired_at"):
+            continue
+        at = str(pk.get("at") or "")
+        if not at or _iso_age_s(at, now) < park_retention_s():
+            continue
+        if _q.mark_park_retention_expired(it["ref"]):
+            _q._log("PARK-EXPIRED", f"{it['ref']} — {pk.get('worker_id') or '-'} no longer "
+                    f"retained after {int(park_retention_s() // 60)}m; answer will resume or hand off",
+                    queue=it.get("project", ""))
+            done.append(str(it["ref"]))
+    return done
 
 
 def _parked_rows(queue: Optional[str] = None, items: Optional[List[Dict[str, Any]]] = None,
@@ -4114,7 +4190,7 @@ def _parked_rows(queue: Optional[str] = None, items: Optional[List[Dict[str, Any
         if not parked.get("worker_id"):
             continue
         at = str(parked.get("at") or "")
-        if at and _iso_age_s(at, now) >= PARK_RETENTION_S:
+        if at and _iso_age_s(at, now) >= park_retention_s():
             continue
         rows.append(it)
     return rows
@@ -4129,13 +4205,31 @@ def retained_parked_ids(queue: Optional[str] = None,
                         items: Optional[List[Dict[str, Any]]] = None) -> set:
     """Worker ids kept alive (never STOPped, not counted against the spawn
     budget) because they own a parked ticket within the retention window."""
-    return {str((it.get("parked") or {}).get("worker_id")) for it in _parked_rows(queue, items)}
+    ids = {str((it.get("parked") or {}).get("worker_id")) for it in _parked_rows(queue, items)}
+    ids |= {str((it.get("pending_answer") or {}).get("prior_worker_id") or "")
+            for it in _affinity_rows(queue, items)} - {""}
+    return ids
 
 
 def parked_label(item: Dict[str, Any]) -> str:
     pk = item.get("parked") or {}
     return (f"parked by {pk.get('worker_id') or '-'} session={pk.get('session_id') or '-'} "
             f"at {pk.get('at') or '-'}")
+
+
+def retained_counts() -> Dict[str, int]:
+    """Per-queue count of live workers retained for a parked answer (WT-28),
+    shown next to ``live`` in status / the dashboard."""
+    try:
+        retained = retained_parked_ids()
+    except Exception:
+        return {}
+    out: Dict[str, int] = {}
+    for w in list_workers():
+        if (w.get("alive") and not _worker_released(w)
+                and str(w.get("worker_id") or "") in retained):
+            out[w.get("queue", "")] = out.get(w.get("queue", ""), 0) + 1
+    return out
 
 
 def live_worker_count(queue: Optional[str] = None, exclude: Optional[set] = None) -> int:
@@ -5808,6 +5902,7 @@ def _reconcile_once_locked(dry_run: bool = False,
                 from . import answers as _answers, queue as _qpa
                 _qpa.migrate_legacy_blocks()
                 result["answers_routed"] = _answers.route_pending_answers(time.time())
+                expire_parked_retention()
             except Exception:
                 pass
         # Single supervisor (WT-24): only a real auto-spawn daemon supervises stage

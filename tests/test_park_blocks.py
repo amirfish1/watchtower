@@ -199,3 +199,103 @@ def test_retained_parked_ids_window(wt, monkeypatch):
     aged = json.loads(json.dumps(wt.q.get(it["ref"])))
     aged["parked"]["at"] = "2000-01-01T00:00:00Z"
     assert workers.retained_parked_ids("PK", items=[aged]) == set()
+
+
+# ---------------------------------------------------------------- verifier round 1
+def _age_park(wt, ref, at="2000-01-01T00:00:00Z"):
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == ref:
+            it["parked"]["at"] = at
+    wt.q._save_unlocked(data)
+
+
+def test_claim_by_ref_exclusivity_is_worker_or_session(wt, monkeypatch):
+    it = _parked(wt)  # parked by w1 / SID
+    ans = wt.q.answer(it["ref"], "go", session_id="human")
+    monkeypatch.setattr(wt.answers, "worker_alive", lambda wid: True)
+    monkeypatch.setattr(wt.answers, "_wake", lambda *a, **k: None)
+    wt.answers.route_answer(it["ref"], ans["pending_answer"]["gen"])
+    other = wt.q.enqueue(project="PK", note="B", source="test")
+    wt.q.claim_by_ref(other["ref"], "w1", session_uuid=SID)
+    # Same session under a different worker label must not hold two tickets.
+    with pytest.raises(ValueError):
+        wt.q.claim_by_ref(it["ref"], "alias-w1", session_uuid=SID)
+    # A plain explicit second claim by the same worker is refused too.
+    third = wt.q.enqueue(project="PK", note="C", source="test")
+    with pytest.raises(ValueError):
+        wt.q.claim_by_ref(third["ref"], "w1", session_uuid=SID)
+
+
+def test_retry_stops_delivery_when_bump_cas_is_lost(wt, monkeypatch):
+    it = _parked(wt)
+    ans = wt.q.answer(it["ref"], "first", session_id="human")
+    gen = ans["pending_answer"]["gen"]
+    monkeypatch.setattr(wt.answers, "worker_alive", lambda wid: False)
+    monkeypatch.setattr(wt.answers, "_resumable", lambda engine, sid: True)
+    monkeypatch.setattr(wt.answers, "_deliver_bound", lambda *a, **k: {"route": "resume"})
+    wt.answers.route_answer(it["ref"], gen)
+    cur = wt.q.get(it["ref"])
+    assert cur["pending_answer"]["state"] == "delivering"
+    calls = []
+    monkeypatch.setattr(wt.answers, "_deliver_bound", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(wt.q, "pa_bump_attempts", lambda *a, **k: None)  # CAS lost
+    assert wt.answers._retry(cur, gen, 0.0) == "stale"
+    assert calls == []
+
+
+def test_idle_snapshot_blocks_release_for_parked_owner(wt):
+    import watchtower.workers as workers
+    it = _parked(wt)
+    w = {"worker_id": "w1", "session_id": SID, "queue": "PK", "engine": "claude",
+         "pid": 1, "alive": True}
+    snap = workers._idle_snapshot(w, 10, items=[wt.q.get(it["ref"])])
+    assert "parked_retention" in snap["reasons"]
+    assert snap["parked_refs"] == [it["ref"]]
+    _age_park(wt, it["ref"])
+    snap = workers._idle_snapshot(w, 10, items=[wt.q.get(it["ref"])])
+    assert "parked_retention" not in snap["reasons"]
+
+
+def test_fresh_park_owner_survives_reap_grace_until_expiry(wt, monkeypatch):
+    import time
+    import watchtower.workers as workers
+    it = _parked(wt)
+    assert "w1" in workers._fresh_park_owners(time.time())
+    assert workers.park_grace_s() == 55 * 60.0
+    monkeypatch.setenv("WATCHTOWER_PARK_GRACE_S", "1")
+    assert workers.park_grace_s() == 1.0
+    assert "w1" not in workers._fresh_park_owners(time.time() + 60)
+    monkeypatch.delenv("WATCHTOWER_PARK_GRACE_S")
+    _age_park(wt, it["ref"])
+    assert "w1" not in workers._fresh_park_owners(time.time())
+
+
+def test_affinity_reservation_retains_its_worker(wt, monkeypatch):
+    import watchtower.workers as workers
+    it = _parked(wt)
+    ans = wt.q.answer(it["ref"], "go", session_id="human")
+    monkeypatch.setattr(wt.answers, "worker_alive", lambda wid: True)
+    monkeypatch.setattr(wt.answers, "_wake", lambda *a, **k: None)
+    wt.answers.route_answer(it["ref"], ans["pending_answer"]["gen"])
+    assert wt.q.get(it["ref"])["status"] == "open"
+    assert "w1" in workers.retained_parked_ids("PK")
+
+
+def test_park_expired_is_logged_once(wt):
+    import watchtower.workers as workers
+    it = _parked(wt)
+    assert workers.expire_parked_retention() == []
+    _age_park(wt, it["ref"])
+    assert workers.expire_parked_retention() == [it["ref"]]
+    assert workers.expire_parked_retention() == []
+    assert wt.q.get(it["ref"])["parked"]["retention_expired_at"]
+
+
+def test_retained_counts_per_queue(wt, monkeypatch):
+    import watchtower.workers as workers
+    _parked(wt)
+    monkeypatch.setattr(workers, "list_workers", lambda *a, **k: [
+        {"worker_id": "w1", "queue": "PK", "alive": True},
+        {"worker_id": "w2", "queue": "PK", "alive": True}])
+    assert workers.retained_counts() == {"PK": 1}
