@@ -111,3 +111,16 @@ def test_github_connectivity_alert_false_under_threshold_true_at_it(tmp_path, mo
     assert result["outage_duration"] == "5m"
     assert result["last_error"] == "gh auth unavailable"
     assert result["consecutive_failures"] == 5
+
+
+def test_model_floor_above_worker_model_is_not_claimable():
+    """A ticket whose model_floor the queue's worker can't meet is skipped by
+    claim_next, so it must not read as stuck (OPS-1278: endless nudges to an
+    idle worker whose `wt claim` returned nothing)."""
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    it = _item(created_at=old)
+    it["model_floor"] = "claude-opus-5"
+    row = health.queue_status("Q", [it], worker_model="claude-haiku-4-5")
+    assert row["claimable_depth"] == 0
+    assert row["stuck"] is False
+    assert health.queue_status("Q", [it])["claimable_depth"] == 1

@@ -92,6 +92,7 @@ def queue_status(
     auto_drain: bool = True,
     claim_types: Optional[List[str]] = None,
     waiting_refs: Optional[set] = None,
+    worker_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute the status row for a single queue from its items.
 
@@ -127,6 +128,14 @@ def queue_status(
         if it.get("claimable", True)
         and it.get("readiness", "") not in q.UNCLAIMABLE_READINESS
         and it.get("ref") not in (waiting_refs or ())
+        # Mirror the remaining claim_next() gates (queue._claim_candidates):
+        # an unsettled plan or a model_floor above the queue's worker model
+        # means the drainer's `wt claim` returns nothing, so it isn't "stuck".
+        and not q.plan_pending(it)
+        and (
+            not worker_model
+            or config.model_meets_floor(worker_model, it.get("model_floor") or "")
+        )
     ]
     if claim_types:
         claimable_depth = sum(
@@ -276,6 +285,7 @@ def all_status(
             drain_window_minutes=drain_window_minutes,
             auto_drain=config.auto_drain(name),
             claim_types=config.claim_types(name),
+            worker_model=config.queue_model_id(name) or None,
         )
         for name, items in by_queue.items()
     ]
