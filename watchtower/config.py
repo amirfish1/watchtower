@@ -123,6 +123,62 @@ MODEL_EFFORTS = {
     ),
 }
 
+# Models the engines themselves advertise (WT-12). Codex's own cache and CCC's
+# Claude list are the live sources; MODEL_EFFORTS above is only the fallback
+# for what they don't cover. The machine-wide deny-list still wins.
+CODEX_MODELS_CACHE = Path(
+    os.environ.get("WATCHTOWER_CODEX_MODELS_CACHE")
+    or (Path.home() / ".codex" / "models_cache.json")
+)
+CLAUDE_MODELS_FILE = Path(
+    os.environ.get("WATCHTOWER_CLAUDE_MODELS_FILE")
+    or (Path.home() / ".claude" / "command-center" / "claude-models.json")
+)
+
+
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(Path(path).expanduser().read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def discovered_models(eng: str) -> Dict[str, tuple]:
+    """``{model id: efforts}`` advertised by the engine's own model list,
+    best/newest first. Empty when the source is missing or unreadable."""
+    eng = str(eng or "").strip().lower()
+    out: Dict[str, tuple] = {}
+    if eng == "codex":
+        data = _read_json(CODEX_MODELS_CACHE)
+        rows = data.get("models") if isinstance(data, dict) else None
+        rows = [r for r in rows or () if isinstance(r, dict) and r.get("slug")
+                and r.get("visibility") == "list"]
+        for r in sorted(rows, key=lambda r: r.get("priority") or 0):
+            levels = [str(x.get("effort") if isinstance(x, dict) else x).lower()
+                      for x in r.get("supported_reasoning_levels") or ()]
+            out[str(r["slug"])] = tuple(e for e in VALID_EFFORTS if e in levels) \
+                or VALID_EFFORTS
+    elif eng == "claude":
+        data = _read_json(CLAUDE_MODELS_FILE)
+        rows = data.get("records") if isinstance(data, dict) else None
+        rows = [r for r in rows or () if isinstance(r, dict) and r.get("id")]
+        for r in sorted(rows, key=lambda r: str(r.get("released_at") or ""),
+                        reverse=True):
+            mid = str(r["id"])
+            out[mid if mid.startswith("claude-") else f"claude-{mid}"] = VALID_EFFORTS
+    return out
+
+
+def model_catalog(eng: str) -> Dict[str, tuple]:
+    """Discovered models first, then hard-coded fallback entries not already
+    covered, as ``{model id: efforts}``."""
+    eng = str(eng or "").strip().lower()
+    out = dict(discovered_models(eng))
+    for model, efforts in MODEL_EFFORTS.get(eng, ()):
+        out.setdefault(model, efforts)
+    return out
+
+
 # Short aliases that callers may type (e.g. ``opus-5``) but that the engine CLI
 # does not accept verbatim as a ``--model`` value. Each resolves to the canonical
 # WatchTower identifier before being stored or passed to a worker.
@@ -221,7 +277,7 @@ def policy_fallback_model(eng: str) -> str:
         candidate = canonical_model(eng, candidate)
         if candidate and not is_blocked_model(candidate):
             return candidate
-    for candidate, _ in MODEL_EFFORTS.get(eng, ()):
+    for candidate in model_catalog(eng):
         if not is_blocked_model(candidate):
             return candidate
     return ""
@@ -988,9 +1044,7 @@ def approved_models(eng: str) -> tuple[str, ...]:
     Includes both canonical engine-CLI identifiers and any supported aliases.
     """
     eng = str(eng or "").strip().lower()
-    canonical = tuple(
-        model for model, _ in MODEL_EFFORTS.get(eng, ())
-    )
+    canonical = tuple(m for m in model_catalog(eng) if not is_blocked_model(m))
     return canonical + tuple(MODEL_ALIASES.get(eng, {}).keys())
 
 
@@ -1012,6 +1066,20 @@ MODEL_FLOOR_TIERS = (
 )
 
 
+def model_floor_tiers() -> tuple[str, ...]:
+    """``MODEL_FLOOR_TIERS`` plus engine-advertised models it doesn't rank yet.
+
+    Unranked discovered models are appended above the static ladder, oldest
+    first within an engine (discovered lists run best/newest first), so a new
+    model is ranked instead of silently failing open.
+    """
+    extra = []
+    for eng in ("claude", "codex"):
+        extra += [m for m in reversed(list(discovered_models(eng)))
+                  if m not in MODEL_FLOOR_TIERS and not is_blocked_model(m)]
+    return MODEL_FLOOR_TIERS + tuple(extra)
+
+
 def model_floor_met(queue: str, floor: str) -> bool:
     """True if ``queue``'s configured model meets or exceeds ``floor``'s tier.
 
@@ -1023,12 +1091,13 @@ def model_floor_met(queue: str, floor: str) -> bool:
     occasionally under-enforcing one.
     """
     floor = str(floor or "").strip()
-    if not floor or floor not in MODEL_FLOOR_TIERS:
+    tiers = model_floor_tiers()
+    if not floor or floor not in tiers:
         return True
     queue_model = canonical_model(engine(queue), model(queue))
-    if queue_model not in MODEL_FLOOR_TIERS:
+    if queue_model not in tiers:
         return True
-    return MODEL_FLOOR_TIERS.index(queue_model) >= MODEL_FLOOR_TIERS.index(floor)
+    return tiers.index(queue_model) >= tiers.index(floor)
 
 
 # SIDE-39 -- the recognizable opening of the claim-time model-floor auto-park
@@ -1080,10 +1149,11 @@ def next_model_floor_tier(eng: str, current_model: str) -> str:
     current = str(current_model or "").strip()
     if current not in MODEL_FLOOR_TIERS:
         return ""
-    engine_models = {
-        m for m, _ in MODEL_EFFORTS.get(str(eng or "").strip().lower(), ())
-    }
-    for candidate in MODEL_FLOOR_TIERS[MODEL_FLOOR_TIERS.index(current) + 1:]:
+    engine_models = set(model_catalog(eng))
+    tiers = model_floor_tiers()
+    if current not in tiers:
+        return ""
+    for candidate in tiers[tiers.index(current) + 1:]:
         if candidate in engine_models:
             return candidate
     return ""
@@ -1113,12 +1183,7 @@ def approved_efforts(eng: str, model: str = "") -> tuple[str, ...]:
     model_value = canonical_model(eng, model)
     if not model_value:
         return VALID_EFFORTS
-    for candidate, efforts in MODEL_EFFORTS.get(
-        str(eng or "").strip().lower(), ()
-    ):
-        if candidate == model_value:
-            return efforts
-    return ()
+    return model_catalog(eng).get(model_value, ())
 
 
 def is_approved_effort(eng: str, model: str, value: str) -> bool:

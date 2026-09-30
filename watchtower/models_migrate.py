@@ -39,7 +39,7 @@ def _counts_and_items() -> Dict[str, List[dict]]:
 
 
 def _floor_warnings(queue_name: str, items: List[dict], new_model: str) -> List[str]:
-    tiers = config.MODEL_FLOOR_TIERS
+    tiers = config.model_floor_tiers()
     if new_model not in tiers:
         return []
     out = []

@@ -3530,13 +3530,23 @@ def cmd_config(args: argparse.Namespace) -> int:
         # answerable from the queue's own config output.
         cfg.setdefault("grace_s", config.grace_s(args.queue))
         print(f"{args.queue}: {cfg}")
+        eng, mdl = config.engine(args.queue), str(cfg.get("model") or "")
+        if not config.is_approved_model(eng, mdl):
+            print(f"warning: {mdl!r} is not an approved {eng} model; "
+                  f"run `wt models --engine {eng}`", file=sys.stderr)
     else:
         print(f"{args.queue}: {', '.join(changed)}")
     return 0
 
 
 def _validate_queue_worker_settings(args: argparse.Namespace, config: Any) -> bool:
-    """Reject incompatible model/effort combinations before queue mutation."""
+    """Reject incompatible model/effort combinations before queue mutation.
+
+    Only a flag that changes the model, engine or effort is validated (WT-12);
+    an unrelated `wt config` call or plain view never errors on a stored pin.
+    """
+    if all(getattr(args, k, None) is None for k in ("engine", "model", "effort")):
+        return True
     engine = getattr(args, "engine", None) or config.engine(args.queue)
     existing = config.get_queue_config(args.queue)
     model_arg = getattr(args, "model", None)
