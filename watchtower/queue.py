@@ -2838,7 +2838,7 @@ def plan_submit(ident: Any, text: str, by: str = "planner") -> Optional[Dict[str
             disc.update(awaiting="reviewer", nudges=0, updated_at=_now_iso())
             plan["discussion"] = disc
         _append_history(it, "plan", by=_by("system"), at=_now_iso(),
-                        text=_clip(text, 4000), round=plan.get("round", 1),
+                        text=_clip(text, PLAN_TEXT_MAX), round=plan.get("round", 1),
                         version=plan["version"], planner=str(by))
     return _plan_update(ident, _do)
 
