@@ -2129,3 +2129,49 @@ def test_delegate_rejection_preserves_code_and_reason(wt, monkeypatch):
     res = wt.messages._deliver_delegate({"session_id": "s1"}, "hi", "answer")
     assert res["ok"] is False
     assert "session_gone" in res["error"] and "no such session" in res["error"]
+
+
+# --- WT-29: live-only transport for plan-discussion traffic -------------------
+
+def _live_only_setup(monkeypatch, messages, uds=None, fifo=None):
+    calls = []
+    monkeypatch.setattr(messages, "resolve_target",
+                        lambda t: {"session_id": "sid-x", "engine": "claude"})
+    monkeypatch.setattr(messages, "_deliver_uds",
+                        uds or (lambda r, t: {"ok": False, "error": "no uds"}))
+    monkeypatch.setattr(messages, "_deliver_fifo",
+                        fifo or (lambda r, t: {"ok": False, "error": "no fifo"}))
+    for name in ("_deliver_resume", "_deliver_gemini_resume", "_deliver_codex_app_server",
+                 "_deliver_antigravity_language_server", "_deliver_delegate"):
+        monkeypatch.setattr(messages, name,
+                            lambda *a, _n=name, **k: calls.append(_n) or {"ok": True, "transport": _n})
+    monkeypatch.setattr(messages.tty_mod, "deliver_tty",
+                        lambda r, t: calls.append("tty") or {"ok": True, "transport": "tty"})
+    return calls
+
+
+def test_live_only_chain_never_resumes_or_delegates(monkeypatch):
+    from watchtower import messages
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "http://127.0.0.1:1")
+    calls = _live_only_setup(monkeypatch, messages)
+    for qof in (True, False):
+        res = messages.send("w1", "hi", live_only=True, queue_on_fail=qof)
+        assert res["ok"] is False and res["queued"] is False
+        assert "uds" in res["error"] and "fifo" in res["error"]
+    assert calls == []
+    assert messages.outbox_list() == []
+
+
+def test_live_only_succeeds_via_uds_or_fifo(monkeypatch):
+    from watchtower import messages
+    receipts = []
+    from watchtower import receipts as rc
+    monkeypatch.setattr(rc, "record", lambda sid, text, transport, **kw:
+                        receipts.append(transport) or {"id": "r1"})
+    _live_only_setup(monkeypatch, messages, uds=lambda r, t: {"ok": True, "transport": "uds"})
+    res = messages.send("w1", "hi", live_only=True)
+    assert res["ok"] and res["transport"] == "uds"
+    _live_only_setup(monkeypatch, messages, fifo=lambda r, t: {"ok": True, "transport": "fifo"})
+    res = messages.send("w1", "hi", live_only=True)
+    assert res["ok"] and res["transport"] == "fifo"
+    assert receipts == ["uds", "fifo"]

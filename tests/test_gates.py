@@ -487,6 +487,7 @@ def _sent(cli, monkeypatch):
 
 
 def test_first_rejection_starts_one_discussion_and_reviewer_accepts_version(plan_cli, monkeypatch):
+    """WT-29: each turn is a supervised spawn seeded from the ticket; no messages."""
     q, cli, calls = plan_cli.q, plan_cli.cli, plan_cli.calls
     sent = _sent(cli, monkeypatch)
     ref = _planned(plan_cli)
@@ -495,13 +496,18 @@ def test_first_rejection_starts_one_discussion_and_reviewer_accepts_version(plan
     it = q.get(ref)
     assert it["plan"]["status"] == "discussing" and it["needs_input"] is False
     assert it["plan"]["discussion"]["round"] == 1
-    assert len(calls) == n_spawns                      # no duplicate planner spawn
-    assert sent[-1][0] == it["plan"]["planner"]["worker_id"] and "missing tests" in sent[-1][1]
+    assert len(calls) == n_spawns + 1                  # one fresh planner turn
+    assert "plan v1" in calls[-1]["goal"] and "missing tests" in calls[-1]["goal"]
+    assert it["stage_session"]["key"] == "discuss:r1:d1:planner"
+    assert sent == []                                  # nothing sent to a dead peer
     assert q.plan_pending(it)
     cli.cmd_plan(_ns(plan_cmd="discuss", ref=ref, sender="reviewer", text="add a restart test"))
+    assert sent == []                                  # peer not running: recorded only
     cli.cmd_plan(_ns(plan_cmd="submit", ref=ref, text="plan v2 with tests"))
-    assert len(calls) == n_spawns                      # same reviewer is re-asked
-    assert sent[-1][0] == it["plan"]["reviewer"]["worker_id"]
+    assert len(calls) == n_spawns + 2                  # one fresh reviewer turn
+    assert "plan v2 with tests" in calls[-1]["goal"] and "--version 2" in calls[-1]["goal"]
+    assert "add a restart test" in calls[-1]["goal"]
+    assert sent == []
     with pytest.raises(ValueError):
         q.plan_verdict(ref, True, version_seen=1)      # stale version refused
     assert q.get(ref)["plan"]["status"] == "reviewing"
@@ -528,16 +534,110 @@ def test_discussion_bounded_then_explained_human_block(plan_cli, monkeypatch):
     assert it["plan"]["discussion"]["status"] == "escalated"
 
 
-def test_stalled_discussion_nudges_then_escalates(plan_cli, monkeypatch):
+def _live_only_spies(monkeypatch, fail_test):
+    """UDS/FIFO fail; every adapter that could start an unsupervised turn fails
+    the test if reached."""
+    from watchtower import messages
+    monkeypatch.setattr(messages, "resolve_target",
+                        lambda t: {"session_id": "s-" + str(t), "engine": "claude"})
+    monkeypatch.setattr(messages, "_deliver_uds", lambda r, t: {"ok": False, "error": "no uds"})
+    monkeypatch.setattr(messages, "_deliver_fifo", lambda r, t: {"ok": False, "error": "no fifo"})
+    for name in ("_deliver_resume", "_deliver_gemini_resume", "_deliver_codex_app_server",
+                 "_deliver_antigravity_language_server", "_deliver_delegate"):
+        monkeypatch.setattr(messages, name, lambda *a, _n=name, **k: fail_test(_n))
+
+
+def test_plan_send_is_live_only(plan_cli, monkeypatch):
+    cli = plan_cli.cli
+    from watchtower import messages
+    seen = []
+    monkeypatch.setattr(messages, "send", lambda t, x, **kw: seen.append(kw) or
+                        {"ok": False, "queued": True})
+    item = {"plan": {"planner": {"worker_id": "w1"}}}
+    assert cli._plan_send(item, "planner", "hi") is False
+    assert seen == [{"live_only": True}]
+    assert cli._plan_send(item, "reviewer", "hi") is False      # no worker id
+
+
+def test_discuss_peer_exits_after_precheck_is_recorded_not_delivered(plan_cli, monkeypatch, capsys):
     q, cli = plan_cli.q, plan_cli.cli
-    sent = _sent(cli, monkeypatch)
     ref = _planned(plan_cli)
     cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, reject=True, reasons="bad"))
-    before = len(sent)
+    from watchtower import messages
+    monkeypatch.setattr(cli, "_plan_role_alive", lambda item, role: True)   # died after the check
+    _live_only_spies(monkeypatch, lambda n: pytest.fail(f"{n} must not run"))
+    capsys.readouterr()
+    assert cli.cmd_plan(_ns(plan_cmd="discuss", ref=ref, sender="reviewer", text="hello")) == 0
+    assert "recorded" in capsys.readouterr().out
+    assert [m["text"] for m in q.get(ref)["plan"]["discussion"]["messages"]] == ["hello"]
+    assert messages.outbox_list() == []
+
+
+def test_discuss_to_dead_peer_is_recorded_not_sent(plan_cli, monkeypatch):
+    q, cli = plan_cli.q, plan_cli.cli
+    ref = _planned(plan_cli)
+    cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, reject=True, reasons="bad"))
+    monkeypatch.setattr(cli, "_plan_role_alive", lambda item, role: False)
+    monkeypatch.setattr(cli, "_plan_send", lambda *a: pytest.fail("must not send"))
+    assert cli.cmd_plan(_ns(plan_cmd="discuss", ref=ref, sender="reviewer", text="yo")) == 0
+
+
+def _github_plan(plan_cli, monkeypatch):
+    """A discussing ticket the stage supervisor does not own."""
+    from watchtower import stages
+    ref = _planned(plan_cli)
+    plan_cli.cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, reject=True, reasons="bad"))
+    monkeypatch.setattr(stages, "_github_backed", lambda it: True)
+    return ref
+
+
+def test_supervised_discussion_is_skipped_by_fallback_nudge(plan_cli, monkeypatch):
+    q, cli = plan_cli.q, plan_cli.cli
+    ref = _planned(plan_cli)
+    cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, reject=True, reasons="bad"))
+    monkeypatch.setattr(cli, "_plan_send", lambda *a: pytest.fail("must not send"))
+    assert cli.recover_plan_discussions("GT", stale_s=0) == 0
+    assert q.get(ref)["plan"]["discussion"]["nudges"] == 0
+
+
+def test_fallback_nudge_to_dead_peer_blocks_immediately(plan_cli, monkeypatch):
+    q, cli = plan_cli.q, plan_cli.cli
+    ref = _github_plan(plan_cli, monkeypatch)
+    monkeypatch.setattr(cli, "_plan_role_alive", lambda item, role: False)
+    assert cli.recover_plan_discussions("GT", stale_s=0) == 0
+    it = q.get(ref)
+    assert it["plan"]["status"] == "blocked" and it["plan"]["discussion"]["nudges"] == 0
+    assert "not running" in it["block_question"] and "wt plan decide" in it["block_question"]
+    assert it["needs_input"] is True
+
+
+def test_fallback_nudge_undelivered_blocks_without_resume_or_outbox(plan_cli, monkeypatch):
+    q, cli = plan_cli.q, plan_cli.cli
+    from watchtower import messages
+    ref = _github_plan(plan_cli, monkeypatch)
+    monkeypatch.setattr(cli, "_plan_role_alive", lambda item, role: True)
+    _live_only_spies(monkeypatch, lambda n: pytest.fail(f"{n} must not run"))
+    assert cli.recover_plan_discussions("GT", stale_s=0) == 0
+    it = q.get(ref)
+    assert it["plan"]["status"] == "blocked" and it["plan"]["discussion"]["nudges"] == 0
+    assert "undelivered" in it["block_question"]
+    assert messages.outbox_list() == []
+
+
+def test_fallback_nudge_delivered_counts_then_escalates(plan_cli, monkeypatch):
+    q, cli = plan_cli.q, plan_cli.cli
+    from watchtower import messages
+    ref = _github_plan(plan_cli, monkeypatch)
+    sent = []
+    monkeypatch.setattr(cli, "_plan_role_alive", lambda item, role: True)
+    monkeypatch.setattr(messages, "send",
+                        lambda t, x, **kw: sent.append(kw) or {"ok": True, "transport": "uds"})
     assert cli.recover_plan_discussions("GT", stale_s=3600) == 0   # fresh: nothing due
-    for _ in range(q.PLAN_DISCUSSION_MAX_NUDGES):
+    for n in range(q.PLAN_DISCUSSION_MAX_NUDGES):
         assert cli.recover_plan_discussions("GT", stale_s=0) == 1
-    assert len(sent) == before + q.PLAN_DISCUSSION_MAX_NUDGES
+        assert q.get(ref)["plan"]["discussion"]["nudges"] == n + 1
+    assert all(kw == {"live_only": True} for kw in sent)
     cli.recover_plan_discussions("GT", stale_s=0)
     it = q.get(ref)
-    assert it["plan"]["status"] == "blocked" and "unresponsive" in it["block_question"]
+    assert it["plan"]["status"] == "blocked"
+    assert "unresponsive after" in it["block_question"] and "delivered reminders" in it["block_question"]

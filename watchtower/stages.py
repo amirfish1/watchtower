@@ -221,6 +221,16 @@ def desired(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 entry = ("planner", f"plan:r{rnd}")
             elif pst == "reviewing" and (plan.get("discussion") or {}).get("status") != "active":
                 entry = ("plan_reviewer", f"review:r{rnd}")
+            else:
+                # WT-29: each planner<->reviewer discussion turn is its own
+                # supervised session (own key, own attempt budget).
+                disc = plan.get("discussion") or {}
+                if disc.get("status") == "active":
+                    if pst == "discussing" and disc.get("awaiting") == "planner":
+                        entry = ("planner", f"discuss:r{rnd}:d{int(disc.get('round') or 1)}:planner")
+                    elif pst == "reviewing" and disc.get("awaiting") == "reviewer":
+                        entry = ("plan_reviewer",
+                                 f"discuss:r{rnd}:v{int(plan.get('version') or rnd)}:reviewer")
         if entry:
             out.append({"ref": ref, "role": entry[0], "key": entry[1], "project": project})
     return out
@@ -332,6 +342,28 @@ def _check_session(item: Dict[str, Any], ss: Dict[str, Any],
     return "alive", "", {}
 
 
+def session_alive(worker_id: str) -> bool:
+    """True when the worker's process is running right now: a worker record,
+    a live pid with the matching start token, and no ``ended_at`` in its exit
+    file. The same facts ``_check_session`` uses, minus the age/idle limits."""
+    if not worker_id:
+        return False
+    try:
+        rec = _record_for(worker_id, workers.list_workers(prune=False))
+    except Exception:  # noqa: BLE001
+        return False
+    if rec is None or not rec.get("alive"):
+        return False
+    if _read_exit(str(rec.get("exit_file") or "")).get("ended_at"):
+        return False
+    token = str(rec.get("pid_started") or "")
+    if token:
+        cur = workers._pid_start_token(int(rec.get("pid") or 0))
+        if cur and cur != token:
+            return False
+    return True
+
+
 def _kill(pid: int) -> None:
     if not pid:
         return
@@ -368,9 +400,11 @@ def _role_target(item: Dict[str, Any], role: str) -> Dict[str, Any]:
 
 
 def _goal(item: Dict[str, Any], role: str, *, token: str, respawn: bool,
-          note: str) -> str:
+          note: str, key: str = "") -> str:
     from . import cli
-    if role == "planner":
+    if key.startswith("discuss:") and role in ("planner", "plan_reviewer"):
+        goal = cli._plan_discussion_goal(item, "planner" if role == "planner" else "reviewer")
+    elif role == "planner":
         plan = item.get("plan") or {}
         reviews = plan.get("reviews") or []
         feedback = ""
@@ -445,7 +479,7 @@ def _escalate(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any]) -> 
         "verifier": f"`wt answer {ref} \"retry\"`, `wt verdict {ref} --pass|--fail`, or `wt accept {ref} --force`",
         "assessor": f"`wt answer {ref} \"retry\"` or `wt assess run {ref}`",
     }[role]
-    question = (f"The {role.replace('_', ' ')} stage ({key}) died twice: {reasons}."
+    question = (f"The {role.replace('_', ' ')} {'discussion turn' if key.startswith('discuss:') else 'stage'} ({key}) died twice: {reasons}."
                 + (f" Logs: {logs}." if logs else "") + f" Decide: {exits}.")
     plan_status = (item.get("plan") or {}).get("status", "")
 
@@ -500,10 +534,16 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
                 return "skip"
             item = q.get(ref) or item
         goal = _goal(item, role, token=token, respawn=cause in ("respawn", "adopted"),
-                     note=str(ss.get("retry_note") or ""))
-        name = {"planner": f"plan-{ref}-r{(item.get('plan') or {}).get('round', 1)}",
+                     note=str(ss.get("retry_note") or ""), key=key)
+        plan_now = item.get("plan") or {}
+        name = {"planner": f"plan-{ref}-r{plan_now.get('round', 1)}",
                 "plan_reviewer": f"plan-review-{ref}",
                 "verifier": f"verify-{ref}", "assessor": f"assess-{ref}"}[role]
+        if key.startswith("discuss:"):
+            name = (f"plan-{ref}-r{plan_now.get('round', 1)}-d"
+                    f"{(plan_now.get('discussion') or {}).get('round', 1)}"
+                    if role == "planner"
+                    else f"plan-review-{ref}-v{plan_now.get('version', 1)}")
         rec = workers.spawn_adhoc(goal, engine, model=target["model"], repo_path=repo,
                                   name=name, report_to="", verify=(role == "verifier"),
                                   stage=role, ticket_ref=ref, ticket_queue=project)
@@ -615,6 +655,20 @@ def _supervise(d: Dict[str, Any], rows: List[Dict[str, Any]], budget: _Budget) -
         else:
             ss = {"key": key, "role": role, "attempt": 0, "worker_id": "", "escalated": False,
                   "deaths": list(ss.get("deaths") or [])[-10:], "refunds": 0}
+            if key.startswith("discuss:"):
+                # WT-29: a participant that is still running is adopted (no
+                # message, no budget); otherwise a fresh turn spawns this tick.
+                prior = _legacy_meta(item, role)
+                pwid = str(prior.get("worker_id") or "")
+                if pwid and session_alive(pwid):
+                    prec = _record_for(pwid, workers.list_workers(prune=False)) or {}
+                    ss.update(worker_id=pwid, pid=prec.get("pid"),
+                              pid_started=prec.get("pid_started", ""),
+                              exit_file=prec.get("exit_file", ""), log=prec.get("log", ""),
+                              engine=prior.get("engine", ""), model=prior.get("model", ""),
+                              spawned_at=str(prec.get("started_at") or _iso()))
+                    _log("STAGE_SPAWN", f"{ref} {role} {pwid} (live) attempt 0/"
+                         f"{MAX_ATTEMPTS} cause=adopted_prior", queue=project)
             for carry in ("retry_note", "retry_at"):   # a human retry moved the key (assess:N+1)
                 if ss_old.get(carry):
                     ss[carry] = ss_old[carry]

@@ -228,6 +228,33 @@ log until it exits), other engines by log mtime. Dead stage records are kept
 | `ASSESS_RESUME` | An assessor was respawned with a rotated (fenced) token. |
 | `SPAWN_GATE` | The host-wide spawn stagger timed out and proceeded. |
 
+### Plan discussion turns (WT-29)
+
+After a plan rejection, the planner<->reviewer discussion runs as stage
+sessions, not as messages to the original one-shot sessions (they have
+usually exited by then). Each turn has its own key and its own 2-attempt budget:
+
+- `discuss:r<round>:d<n>:planner` while `plan.status == discussing` and the
+  discussion awaits the planner (amend the plan, answer the objections).
+- `discuss:r<round>:v<version>:reviewer` while `reviewing` and the discussion
+  awaits the reviewer (a verdict on that exact version).
+
+`wt plan verdict` / `wt plan submit` only call `stages.request`. The supervisor
+adopts the participant if its session is still running (attempt 0, no message);
+otherwise it spawns a fresh session that same tick, seeded with the ticket, the
+plan, the objections and the last discussion messages. Dying twice escalates
+like any stage (`wt answer REF retry` restarts the turn).
+
+Plan messages (`wt plan discuss`, fallback reminders) use the live-only
+transport (`messages.send(..., live_only=True)`: UDS, then WT stdin FIFO; never
+the delegate, a resume, or the outbox). A send result is never taken as
+liveness: `wt plan discuss` to a peer that is not running is recorded in the
+transcript and reported as "recorded". The reminder/nudge fallback
+(`recover_plan_discussions`) only covers tickets outside the supervisor
+(github-backed queues): a dead peer blocks the plan for a human at once, an
+undelivered reminder blocks without counting, and only delivered reminders
+count toward `PLAN_DISCUSSION_MAX_NUDGES`.
+
 ## Auditable idle decisions
 
 The unified activity log at `~/.watchtower/activity.log` contains the evidence,

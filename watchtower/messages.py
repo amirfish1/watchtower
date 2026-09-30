@@ -1546,8 +1546,12 @@ def deliver(
     *, force_queue: bool = False, prefer_uds: bool = False,
     notify: bool = False,
     delegate_timeout_s: Optional[float] = None,
+    live_only: bool = False,
 ) -> Dict[str, Any]:
     """Try each adapter in order.
+
+    ``live_only=True`` uses ``_deliver_live_only``: UDS then FIFO, nothing that
+    can open a turn in a process nobody supervises.
 
     ``notify=True`` swaps in the much shorter event-notice chain
     (``_deliver_notify``): live transports only, never a resume.
@@ -1563,10 +1567,13 @@ def deliver(
     Every success is recorded as a delivery receipt (WT-77) so "delivered"
     can later be verified against the target transcript — the result
     carries ``receipt_id``."""
-    result = _deliver_unreceipted(
-        resolved, text, mode, force_queue=force_queue, prefer_uds=prefer_uds,
-        notify=notify, delegate_timeout_s=delegate_timeout_s,
-    )
+    if live_only:
+        result = _deliver_live_only(resolved, text)
+    else:
+        result = _deliver_unreceipted(
+            resolved, text, mode, force_queue=force_queue, prefer_uds=prefer_uds,
+            notify=notify, delegate_timeout_s=delegate_timeout_s,
+        )
     sid = str(resolved.get("session_id") or "")
     if result.get("ok") and sid:
         try:
@@ -1616,6 +1623,25 @@ def _deliver_uds(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     if not result:
         return {"ok": False, "error": "uds declined (no row, held, or unconfirmed)"}
     return {"ok": True, "transport": "uds"}
+
+
+def _deliver_live_only(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Strictest chain (WT-29): hand the message to a target that is running
+    right now -- native peer socket, else WT stdin FIFO -- and nothing else.
+    Never the CCC delegate, a headless resume, a codex/gemini/antigravity turn
+    or a tty write: each of those can start a turn WT cannot supervise and
+    still report ``ok``."""
+    errors: List[str] = []
+    r = _deliver_uds(resolved, text)
+    if r.get("ok"):
+        return r
+    errors.append(f"uds: {r.get('error', 'failed')}")
+    r = _deliver_fifo(resolved, text)
+    if r.get("ok"):
+        return r
+    errors.append(f"fifo: {r.get('error', 'failed')}")
+    return {"ok": False, "busy": False, "live_only": True,
+            "error": "; ".join(errors)}
 
 
 def _deliver_notify(
@@ -2035,9 +2061,12 @@ def send(
     delegate_timeout_s: Optional[float] = None,
     ticket_ref: str = "",
     ticket_session: str = "",
+    live_only: bool = False,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
+    ``live_only=True`` (WT-29) delivers only over UDS/FIFO to a running target
+    and never parks, whatever ``queue_on_fail`` says.
     ``ticket_ref``/``ticket_session`` ride along onto the parked row so the
     daemon cancels it once the ticket closes or changes session.
 
@@ -2066,6 +2095,9 @@ def send(
         extra["notify"] = True
     if delegate_timeout_s is not None:
         extra["delegate_timeout_s"] = delegate_timeout_s
+    if live_only:
+        extra["live_only"] = True
+        queue_on_fail = False
     result = deliver(resolved, text, mode, **extra)
     if result.get("ok"):
         out = {"ok": True, "transport": result.get("transport", "?")}

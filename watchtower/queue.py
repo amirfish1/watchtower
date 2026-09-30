@@ -2783,8 +2783,16 @@ def plan_start(ident: Any) -> Optional[Dict[str, Any]]:
 
 
 def plan_set_role(ident: Any, role: str, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Record which planner/reviewer (engine/model/source/worker) was spawned."""
-    return _plan_update(ident, lambda it, plan: plan.__setitem__(role, dict(info)))
+    """Record which planner/reviewer (engine/model/source/worker) was spawned.
+    During an active discussion the new session also becomes the participant."""
+    def _do(it, plan):
+        plan[role] = dict(info)
+        disc = plan.get("discussion")
+        if disc and disc.get("status") == "active" and info.get("worker_id"):
+            disc["participants"] = dict(disc.get("participants") or {},
+                                        **{role: info["worker_id"]})
+            plan["discussion"] = disc
+    return _plan_update(ident, _do)
 
 
 def plan_fail(ident: Any, reason: str) -> Optional[Dict[str, Any]]:
@@ -2932,12 +2940,9 @@ def plan_discuss(ident: Any, role: str, text: str) -> Optional[Dict[str, Any]]:
     return _plan_update(ident, _do)
 
 
-def plan_discussion_nudge(ident: Any, stale_s: float = 900.0) -> Optional[Dict[str, Any]]:
-    """Recovery for a stalled discussion (restart / lost message). When the
-    awaited party has been silent for ``stale_s`` this bumps ``nudges`` and
-    returns the item with ``_nudge`` = the role to re-message (no new spawn);
-    after PLAN_DISCUSSION_MAX_NUDGES the plan blocks with a recorded reason.
-    Returns None when nothing is due."""
+def plan_discussion_due(ident: Any, stale_s: float = 900.0) -> Optional[str]:
+    """Read-only: the role a stalled active discussion is waiting on (silent
+    for ``stale_s``), else None."""
     current = get(ident)
     if current is None:
         return None
@@ -2953,26 +2958,36 @@ def plan_discussion_nudge(ident: Any, stale_s: float = 900.0) -> Optional[Dict[s
         age = stale_s
     if age < stale_s:
         return None
-    due = []
+    return str(disc["awaiting"])
 
+
+def plan_discussion_record_nudge(ident: Any, delivered: bool,
+                                 reason: str = "") -> Optional[Dict[str, Any]]:
+    """Record the outcome of a reminder to the awaited party (WT-29). A
+    delivered reminder bumps ``nudges`` and blocks the plan once it exceeds
+    PLAN_DISCUSSION_MAX_NUDGES; an undelivered one blocks right away with
+    ``reason`` (nobody is there to remind) and leaves ``nudges`` alone."""
     def _do(it, plan):
-        disc = plan["discussion"]
-        disc["nudges"] = int(disc.get("nudges") or 0) + 1
+        disc = plan.get("discussion") or {}
+        if disc.get("status") != "active":
+            return
+        role = disc.get("awaiting")
         disc["updated_at"] = _now_iso()
-        if disc["nudges"] > PLAN_DISCUSSION_MAX_NUDGES:
-            disc.update(status="escalated",
-                        reason=f"{disc.get('awaiting')} unresponsive after "
-                               f"{PLAN_DISCUSSION_MAX_NUDGES} reminders")
-            plan["status"] = "blocked"
-            _append_history(it, "plan_discussion", by=_by("system"), at=_now_iso(),
-                            text=disc["reason"], role="system", round=disc.get("round"))
+        if delivered:
+            disc["nudges"] = int(disc.get("nudges") or 0) + 1
+            if disc["nudges"] <= PLAN_DISCUSSION_MAX_NUDGES:
+                plan["discussion"] = disc
+                return
+            reason_txt = (f"{role} unresponsive after "
+                          f"{PLAN_DISCUSSION_MAX_NUDGES} delivered reminders")
         else:
-            due.append(disc["awaiting"])
+            reason_txt = reason or f"{role} unreachable"
+        disc.update(status="escalated", reason=reason_txt)
+        plan["status"] = "blocked"
+        _append_history(it, "plan_discussion", by=_by("system"), at=_now_iso(),
+                        text=reason_txt, role="system", round=disc.get("round"))
         plan["discussion"] = disc
-    item = _plan_update(ident, _do)
-    if item is None:
-        return None
-    return dict(item, _nudge=due[0] if due else "")
+    return _plan_update(ident, _do)
 
 
 def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
