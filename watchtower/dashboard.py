@@ -150,7 +150,8 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
         ))
         r["awaiting_human"] = sum(
             1 for item in queue_items
-            if item.get("status") in ("open", "in_progress") and item.get("needs_input")
+            if item.get("status") in ("open", "in_progress", "awaiting_answer")
+            and item.get("needs_input")
         )
         engine = config.engine(r["queue"])
         model = config.model(r["queue"])

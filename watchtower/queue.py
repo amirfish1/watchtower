@@ -106,7 +106,10 @@ try:  # POSIX cross-process locking; degrade gracefully if unavailable.
 except Exception:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore
 
-VALID_STATUSES = ("open", "in_progress", "in_review", "closed")
+VALID_STATUSES = ("open", "in_progress", "in_review", "awaiting_answer", "closed")
+# WT-28: a worker-blocked ticket on the local store leaves the worker's claim and waits
+# as ``awaiting_answer`` with a ``parked`` record (who to route the answer to).
+PARKED_STATUS = "awaiting_answer"
 VALID_LANES = ("normal", "express")
 
 VALID_ITEM_TYPES = ("bug", "feature", "")
@@ -1882,6 +1885,7 @@ def _claim_candidates(
     readiness_filters: Optional[List[str]] = None,
     all_items: Optional[List[Dict[str, Any]]] = None,
     worker_model: Optional[str] = None,
+    claimer: Optional[Tuple[str, str]] = None,
 ) -> List[Dict[str, Any]]:
     """Return ``items`` filtered + sorted exactly as claim_next() would pick
     from them — the single source of truth for "is this ticket claimable
@@ -1896,6 +1900,13 @@ def _claim_candidates(
     disables the filter.
     """
     candidates = [it for it in items if it.get("status") == "open"]
+    # WT-28: a ticket whose answer is reserved for its parked worker
+    # (affinity) is claimable only by that worker until the reservation
+    # expires; everyone else, and every counting caller, drops it.
+    _now_ts = time.time()
+    candidates = [it for it in candidates
+                  if not _affinity_reserved(it, _now_ts)
+                  or (claimer is not None and _affinity_owner(it, claimer[0], claimer[1]))]
     # Plan gate (WT-22): a ticket is planned BEFORE a build worker claims it,
     # so one whose plan has not settled is not claimable yet.
     candidates = [it for it in candidates if not plan_pending(it)]
@@ -1923,12 +1934,15 @@ def _claim_candidates(
         candidates = [it for it in candidates if it.get("readiness", "") not in UNCLAIMABLE_READINESS]
     if item_types:
         candidates = [it for it in candidates if effective_type(it) in item_types]
+    _own = ((lambda it: 0 if _affinity_reserved(it, _now_ts) else 1)
+            if claimer is not None else (lambda it: 1))
     if oldest:
-        candidates = sorted(candidates, key=lambda it: int(it.get("number", 0)))
+        candidates = sorted(candidates, key=lambda it: (_own(it), int(it.get("number", 0))))
     else:
         candidates = sorted(
             candidates,
             key=lambda it: (
+                _own(it),
                 0 if it.get("lane") == "express" else 1,
                 _prio_rank(it),
                 _type_rank(it),
@@ -2174,17 +2188,7 @@ def claim_next(
             return {"stop": True, "reason": "context_budget"}
 
     if held:
-        refs = ", ".join(str(it.get("ref") or "?") for it in held)
-        ref0 = str(held[0].get("ref") or "<ref>")
-        raise ValueError(
-            f"claim refused: you still hold {refs} in_progress on this queue. "
-            "Committing a fix does not finish a ticket -- record its outcome "
-            "first, then claim again:\n"
-            f"  wt close {ref0} --worker {session_id} --summary \"...\" "
-            "--commit <SHA>   (--no-code if nothing was committed)\n"
-            f"  wt block {ref0} --worker {session_id} --question \"...\" "
-            "--progress \"...\"   (needs a human decision)"
-        )
+        _raise_claim_refused(held, session_id)
 
     backend = _github_backend_for_project(project)
     if backend is not None:
@@ -2211,10 +2215,15 @@ def claim_next(
         data = _load_unlocked()
         if _escalate_stuck_blockers(data["items"]):
             _save_unlocked(data)
+        # WT-28: one-ticket-at-a-time re-checked inside the lock (the pre-lock
+        # read above can be stale when a resume/affinity claim lands between).
+        held_now = _held_unlocked(data["items"], str(session_id), "", proj)
+        if held_now:
+            _raise_claim_refused(held_now, session_id)
         candidates = _claim_candidates(
             data["items"], project=proj, lane=lane, shaping=shaping, oldest=oldest,
             item_types=item_types, readiness_filters=readiness_filters,
-            worker_model=worker_model,
+            worker_model=worker_model, claimer=(str(session_id), str(real_sid or "")),
         )
         if not candidates:
             return None
@@ -2227,6 +2236,7 @@ def claim_next(
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
         _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
+        _bind_pending_unlocked(item, str(session_id), str(real_sid or ""), item["claimed_at"])
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
     _notify_ticket_event(
@@ -2268,6 +2278,16 @@ def claim_by_ref(
         status = item.get("status", "open")
         if status != "open":
             raise ValueError(f"{ref} is not open (status={status})")
+        reserved = _affinity_gate_unlocked(item, str(session_id), str(real_sid or ""), time.time())
+        if reserved:
+            raise ValueError(reserved)
+        # WT-28: an answer-bearing ticket (affinity/handoff) keeps the
+        # one-ticket-at-a-time rule in-lock; a plain explicit claim keeps its
+        # historical behaviour (a worker may `wt claim --ref` a second ticket).
+        if item.get("pending_answer"):
+            held_now = _held_unlocked(data["items"], str(session_id), "", item.get("project"))
+            if held_now:
+                _raise_claim_refused(held_now, session_id)
         item["status"] = "in_progress"
         item["claimed_by"] = str(session_id)
         item["claimed_machine"] = machine_tag()
@@ -2276,6 +2296,7 @@ def claim_by_ref(
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
         _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
+        _bind_pending_unlocked(item, str(session_id), str(real_sid or ""), item["claimed_at"])
         _save_unlocked(data)
     _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
     _notify_ticket_event(
@@ -2438,8 +2459,13 @@ def update_status(
     by_kind: str = "worker",
     hold_review: str = "",
     extras: Optional[Dict[str, Any]] = None,
+    answer_fate: str = "handoff",
 ) -> Optional[Dict[str, Any]]:
-    """``hold_review`` (close only, WT-5): land the ticket in ``in_review``
+    """``answer_fate`` (WT-28): what a reopen does with a ticket's
+    ``pending_answer``: ``handoff`` keeps it as ``handed_off`` for the next
+    claimer, ``discard`` (forced release/reopen) drops it to history.
+
+    ``hold_review`` (close only, WT-5): land the ticket in ``in_review``
     instead of ``closed`` -- the same close bookkeeping runs, but it does not
     count as done until ``accept``. ``extras`` are extra ticket fields
     (gate results) written in the same locked step.
@@ -2540,9 +2566,20 @@ def update_status(
                         f"you are {expect_owner}. Only the claiming worker may close "
                         "an in-progress ticket. Pass --force to override deliberately."
                     )
+                prev_status = it.get("status")
+                if (status == "closed" and expect_owner and prev_status == PARKED_STATUS
+                        and (it.get("parked") or {}).get("worker_id")
+                        and str(it["parked"]["worker_id"]) != expect_owner):
+                    raise ValueError(
+                        f"{it.get('ref', ident)} is parked by {it['parked']['worker_id']}; "
+                        f"you are {expect_owner}. Only that worker may close it. "
+                        "Pass --force to override deliberately."
+                    )
                 it["status"] = status
                 now = _now_iso()
                 it["updated_at"] = now
+                if status == "closed":
+                    _clear_parked_unlocked(it)
                 if status == "in_progress" and session_id:
                     it["claimed_by"] = str(session_id)
                     it["claimed_machine"] = machine_tag()
@@ -2636,8 +2673,12 @@ def update_status(
                     it["block_kind"] = ""
                     it["block_commit"] = ""
                     it["blocked_at"] = None
+                    it.pop("parked", None)
+                    _reopen_pending_unlocked(it, now, answer_fate, reason)
                     _append_history(it, "reopen", by=_by(by_kind, str(session_id or ""), str(real_sid or "")), at=now, reason=_clip(reason, 4000))
                 _save_unlocked(data)
+                if status == "closed" or (status == "open" and answer_fate == "discard"):
+                    _supersede_outbox(it.get("ref"))
                 verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
                 verb = "REVIEW" if it.get("status") == "in_review" else verbs.get(status, status.upper())
                 summary = ""
@@ -3039,6 +3080,8 @@ def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
              "text": _clip(text, 3000), **({"retries": int(retries)} if decision == "retry" else {})}]
         _append_history(it, "plan_decision", by=who, at=now, decision=decision,
                         text=_clip(text, 4000), round=rnd)
+        if it.get("status") == PARKED_STATUS and it.get("parked"):
+            _write_pending_answer_unlocked(it, text or decision, now)
         it["needs_input"] = False
         it["answered_at"] = now
         it["block_question"] = ""
@@ -3497,6 +3540,11 @@ def close(
         _notify_review(item, hold_review, session_id)
         return item
     if item and item.get("status") == "closed":
+        try:
+            from . import messages
+            messages.ledger_clear_ref(str(item.get("ref") or ident))
+        except Exception:  # noqa: BLE001 - ledger rows are best-effort hygiene
+            pass
         try:
             with _FileLock(_lock_path()):
                 data = _load_unlocked()
@@ -4015,8 +4063,17 @@ def release(ident: Any, session_id: str = "", force: bool = False) -> Optional[D
     ref that's already closed or reopened by someone else is left alone
     rather than clobbered (WT-86, same pattern as the OPS-72 orphan-reopen
     guard)."""
+    current = get(ident)
+    if current is not None and current.get("status") == PARKED_STATUS:
+        if not force:
+            raise ValueError(
+                f"{current.get('ref', ident)} is parked awaiting an answer: "
+                f"{current.get('block_question') or '(no question recorded)'} "
+                f"-- releasing would discard it. Use `wt answer "
+                f"{current.get('ref', ident)} \"...\"`, or --force if the park is stale.")
+        return update_status(ident, "open", session_id, require_status=PARKED_STATUS,
+                             reason="released (forced)", answer_fate="discard")
     if not force:
-        current = get(ident)
         if current is not None and current.get("needs_input"):
             raise ValueError(
                 f"{current.get('ref', ident)} is blocked awaiting human input: "
@@ -4054,6 +4111,16 @@ def reopen(ident: Any, reason: str = "", session_id: str = "",
         raise ValueError(
             f"{current.get('ref', ident)} is already open — nothing to reopen"
         )
+    if current.get("status") == PARKED_STATUS:
+        if not force:
+            raise ValueError(
+                f"{current.get('ref', ident)} is parked awaiting an answer: "
+                f"{current.get('block_question') or '(no question recorded)'} "
+                f"-- reopening would discard it. Use `wt answer "
+                f"{current.get('ref', ident)} \"...\"`, or pass --force if the park is stale.")
+        return update_status(ident, "open", session_id, reason=reason or "reopened (forced)",
+                             by_kind="worker" if session_id else "human",
+                             answer_fate="discard")
     if not force and current.get("needs_input"):
         raise ValueError(
             f"{current.get('ref', ident)} is blocked awaiting human input: "
@@ -4307,6 +4374,337 @@ def is_acked(res: Dict[str, Any], field: str, index: int) -> bool:
     return isinstance(acks, dict) and str(index) in acks
 
 
+# --- Parked blocks (WT-28) ---------------------------------------------------
+# A worker `wt block` on the local store parks the ticket: it leaves the
+# worker's claim (``awaiting_answer`` + ``parked`` = where the answer goes) so
+# the worker can take the next ticket and a dead worker leaves no zombie claim.
+# `wt answer` writes ``pending_answer`` (keyed by ``gen``); every routing step
+# is a compare-and-swap on (gen, state, status) inside the store lock, so a
+# stale router can never deliver or rebind a ticket whose state moved on.
+
+def _iso_ts(value: Any) -> float:
+    try:
+        return datetime.fromisoformat(str(value or "").replace("Z", "+00:00")).timestamp()
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _raise_claim_refused(held: List[Dict[str, Any]], session_id: str) -> None:
+    refs = ", ".join(str(it.get("ref") or "?") for it in held)
+    ref0 = str(held[0].get("ref") or "<ref>")
+    raise ValueError(
+        f"claim refused: you still hold {refs} in_progress on this queue. "
+        "Committing a fix does not finish a ticket -- record its outcome "
+        "first, then claim again:\n"
+        f"  wt close {ref0} --worker {session_id} --summary \"...\" "
+        "--commit <SHA>   (--no-code if nothing was committed)\n"
+        f"  wt block {ref0} --worker {session_id} --question \"...\" "
+        "--progress \"...\"   (needs a human decision)"
+    )
+
+
+def _held_unlocked(items: List[Dict[str, Any]], worker_id: str, session_id: str = "",
+                   project: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Active (non-blocked) in_progress claims held by this worker id or
+    session, evaluated on the in-lock item list."""
+    out = []
+    for it in items:
+        if it.get("status") != "in_progress" or it.get("needs_input"):
+            continue
+        if project and it.get("project") != project:
+            continue
+        if ((worker_id and str(it.get("claimed_by") or "") == worker_id)
+                or (session_id and str(it.get("claimed_session_id") or "") == session_id)):
+            out.append(it)
+    return out
+
+
+def _affinity_reserved(it: Dict[str, Any], now: float) -> bool:
+    pa = it.get("pending_answer")
+    return bool(pa and pa.get("state") == "affinity"
+                and _iso_ts(pa.get("affinity_until")) > now)
+
+
+def _affinity_owner(it: Dict[str, Any], worker_id: str, real_sid: str) -> bool:
+    pa = it.get("pending_answer") or {}
+    return bool((worker_id and worker_id == str(pa.get("prior_worker_id") or ""))
+                or (real_sid and real_sid == str(pa.get("prior_session_id") or "")))
+
+
+def _affinity_gate_unlocked(it: Dict[str, Any], worker_id: str, real_sid: str,
+                            now: float) -> str:
+    """"" when this claimer may take ``it``; else why it is reserved."""
+    if not _affinity_reserved(it, now) or _affinity_owner(it, worker_id, real_sid):
+        return ""
+    pa = it["pending_answer"]
+    until = datetime.fromtimestamp(_iso_ts(pa.get("affinity_until")), timezone.utc).strftime("%H:%M")
+    return (f"{it.get('ref', '?')} is reserved for {pa.get('prior_worker_id') or 'its parked worker'}'s "
+            f"answer until {until}Z")
+
+
+def _pa_set_state(it: Dict[str, Any], pa: Dict[str, Any], state: str, now: str) -> None:
+    pa["state"] = state
+    pa["state_at"] = now
+    if state in ("delivered", "handed_off") and it.get("carried_answers"):
+        pa["carried"] = list(it.pop("carried_answers"))
+
+
+def _bind_pending_unlocked(it: Dict[str, Any], worker_id: str, real_sid: str, now: str) -> None:
+    """A successful claim of a ticket carrying an answer: the answer is in the
+    claim output itself, so the record is settled as delivered."""
+    pa = it.get("pending_answer")
+    if not pa or pa.get("state") == "delivered":
+        return
+    _pa_set_state(it, pa, "delivered", now)
+    pa["route"] = "claim"
+    pa["claimed_by"] = worker_id
+    _append_history(it, "answer_route", by=_by("system"), at=now, gen=pa.get("gen"),
+                    route="claim", reason=f"claimed by {worker_id}")
+
+
+def _reopen_pending_unlocked(it: Dict[str, Any], now: str, fate: str, reason: str) -> None:
+    pa = it.get("pending_answer")
+    if not pa:
+        return
+    if fate == "discard":
+        _append_history(it, "answer_discarded", by=_by("system"), at=now, gen=pa.get("gen"),
+                        text=_clip(str(pa.get("answer") or ""), 4000))
+        it.pop("pending_answer", None)
+        it.pop("carried_answers", None)
+    elif pa.get("state") != "handed_off":
+        _pa_set_state(it, pa, "handed_off", now)
+        pa["route"] = pa.get("route") or "reopen"
+        pa["reason"] = _clip(reason or pa.get("reason") or "", 500)
+
+
+def _clear_parked_unlocked(it: Dict[str, Any]) -> None:
+    for key in ("parked", "pending_answer", "carried_answers"):
+        it.pop(key, None)
+
+
+def _supersede_outbox(ref: Any) -> None:
+    """Cancel already-enqueued answer rows for ``ref`` (R4-4). Best effort and
+    outside the store lock; the drain-time gen check is the real guard, and a
+    transport already started cannot be recalled (at-least-once)."""
+    if not ref:
+        return
+    try:
+        from . import messages
+        messages.outbox_cancel_ticket(str(ref), "ticket answer superseded/closed")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _supersede_pending_unlocked(it: Dict[str, Any], now: str) -> Optional[int]:
+    """Any block on a ticket carrying ``pending_answer`` supersedes it in the
+    same lock, so a router holding the old gen fails its CAS (R4-2)."""
+    pa = it.get("pending_answer")
+    if not pa:
+        return None
+    gen = pa.get("gen")
+    carried = list(it.get("carried_answers") or [])
+    carried += list(pa.get("carried") or [])
+    carried.append({"gen": gen, "question": pa.get("question", ""),
+                    "answer": pa.get("answer", "")})
+    it["carried_answers"] = carried[-10:]
+    it.pop("pending_answer", None)
+    _append_history(it, "superseded", by=_by("system"), at=now, gen=gen,
+                    state=pa.get("state"))
+    return int(gen) if gen is not None else None
+
+
+def answer_session(it: Dict[str, Any]) -> str:
+    """The session an answer for ``it`` belongs to: the parked one when the
+    ticket is parked/routing, else the claimant's."""
+    parked = it.get("parked") or {}
+    pa = it.get("pending_answer") or {}
+    return str(parked.get("session_id") or pa.get("prior_session_id")
+               or it.get("claimed_session_id") or "")
+
+
+def _engine_and_transcript(worker_id: str, session_id: str) -> Tuple[str, str]:
+    try:
+        from . import answers
+        return answers.engine_for(worker_id, session_id), answers.transcript_for(session_id)
+    except Exception:  # noqa: BLE001
+        return "", ""
+
+
+def _park_unlocked(it: Dict[str, Any], worker_id: str, session_id: str, machine: str,
+                   now: str, actor: Any, reason: str = "") -> None:
+    engine, transcript = _engine_and_transcript(worker_id, session_id)
+    it["parked"] = {
+        "worker_id": worker_id, "session_id": session_id, "machine": machine,
+        "engine": engine, "repo_path": it.get("repo_path") or "",
+        "transcript_path": transcript, "at": now,
+    }
+    it["status"] = PARKED_STATUS
+    it["claimed_by"] = None
+    it["claimed_session_id"] = None
+    it["claimed_machine"] = None
+    it["claimed_at"] = None
+    _append_history(it, "park", by=actor, at=now, worker=worker_id, session=session_id,
+                    reason=reason)
+
+
+def _write_pending_answer_unlocked(it: Dict[str, Any], text: str, now: str) -> Dict[str, Any]:
+    """Answer on a parked ticket: persist ``pending_answer`` (state routing)."""
+    parked = it.get("parked") or {}
+    gen = int(it.get("last_answer_gen") or 0) + 1
+    it["last_answer_gen"] = gen
+    it["pending_answer"] = {
+        "gen": gen, "state": "routing", "question": it.get("block_question", ""),
+        "answer": _clip(text, 24000), "prior_worker_id": parked.get("worker_id", ""),
+        "prior_session_id": parked.get("session_id", ""),
+        "prior_engine": parked.get("engine", ""),
+        "transcript_path": parked.get("transcript_path", ""),
+        "repo_path": parked.get("repo_path", ""),
+        "route": "", "reason": "", "attempts": 0, "state_at": now,
+    }
+    return it["pending_answer"]
+
+
+def _pa_cas(ident: Any, gen: int, expect_state: Any, expect_status: Any, mutate) -> Optional[Dict[str, Any]]:
+    """Compare-and-swap on a ticket's ``pending_answer``: inside the store
+    lock, apply ``mutate(item, pa)`` only when the record still has this
+    ``gen``, one of ``expect_state`` and one of ``expect_status``. Returns the
+    item on success, None when the CAS failed (the caller stops: no delivery,
+    no write)."""
+    states = (expect_state,) if isinstance(expect_state, str) else tuple(expect_state)
+    statuses = (expect_status,) if isinstance(expect_status, str) else tuple(expect_status)
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            pa = it.get("pending_answer")
+            if (not pa or int(pa.get("gen") or -1) != int(gen)
+                    or pa.get("state") not in states or it.get("status") not in statuses):
+                return None
+            mutate(it, pa)
+            it["updated_at"] = _now_iso()
+            _save_unlocked(data)
+            return it
+    return None
+
+
+def resume_claim(ident: Any, gen: int) -> Optional[Dict[str, Any]]:
+    """CAS ``awaiting_answer`` -> ``in_progress`` bound to the parked worker
+    and session (state ``delivering``). Refuses, in the same lock, when that
+    worker or session already holds an active claim (no double claim)."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            pa = it.get("pending_answer")
+            parked = it.get("parked") or {}
+            if (not pa or int(pa.get("gen") or -1) != int(gen) or pa.get("state") != "routing"
+                    or it.get("status") != PARKED_STATUS or not parked):
+                return None
+            if _held_unlocked(data["items"], str(parked.get("worker_id") or ""),
+                              str(parked.get("session_id") or ""), it.get("project")):
+                return None
+            now = _now_iso()
+            it["status"] = "in_progress"
+            it["claimed_by"] = parked.get("worker_id") or None
+            it["claimed_session_id"] = parked.get("session_id") or None
+            it["claimed_machine"] = parked.get("machine") or machine_tag()
+            it["claimed_at"] = now
+            it["updated_at"] = now
+            it.pop("parked", None)
+            _pa_set_state(it, pa, "delivering", now)
+            pa["route"] = "resume"
+            _append_history(it, "answer_route", by=_by("system"), at=now, gen=gen,
+                            route="resume", reason="parked session resumed")
+            _save_unlocked(data)
+            return it
+    return None
+
+
+def _release_claim_to_open_unlocked(it: Dict[str, Any], now: str, reason: str) -> None:
+    """Back to the claim pool as part of an answer handoff (keeps the
+    session handle, drops the claim and the block)."""
+    it["status"] = "open"
+    it["claimed_by"] = None
+    it["claimed_machine"] = None
+    it["claimed_at"] = None
+    it["needs_input"] = False
+    it["block_question"] = ""
+    it["block_kind"] = ""
+    it["block_commit"] = ""
+    it["blocked_at"] = None
+    it.pop("parked", None)
+    _append_history(it, "reopen", by=_by("system"), at=now, reason=_clip(reason, 500))
+
+
+def pa_transition(ident: Any, gen: int, from_state: Any, to_state: str, *,
+                  from_status: Any, reopen: bool = False, route: str = "",
+                  reason: str = "", fields: Optional[Dict[str, Any]] = None,
+                  ) -> Optional[Dict[str, Any]]:
+    """One routing step as a CAS (see ``_pa_cas``): move the record to
+    ``to_state``; ``reopen`` also returns the ticket to the claim pool. None
+    when the CAS lost (the caller stops without delivering)."""
+    def _mut(it, pa):
+        now = _now_iso()
+        if reopen:
+            _release_claim_to_open_unlocked(it, now, reason or "answer handoff")
+        _pa_set_state(it, pa, to_state, now)
+        if route:
+            pa["route"] = route
+        if reason:
+            pa["reason"] = _clip(reason, 500)
+        pa.update(fields or {})
+        _append_history(it, "answer_route", by=_by("system"), at=now, gen=gen,
+                        route=route or pa.get("route", ""), reason=_clip(reason, 500),
+                        state=to_state)
+    return _pa_cas(ident, gen, from_state, from_status, _mut)
+
+
+def pa_bump_attempts(ident: Any, gen: int, state: str) -> Optional[Dict[str, Any]]:
+    """Count one delivery attempt (CAS on ``state``)."""
+    def _mut(it, pa):
+        pa["attempts"] = int(pa.get("attempts") or 0) + 1
+        pa["state_at"] = _now_iso()
+    return _pa_cas(ident, gen, state, ("in_progress",), _mut)
+
+
+def migrate_legacy_blocks(queue: Optional[str] = None, dry_run: bool = False) -> List[str]:
+    """Park tickets blocked the old way (``in_progress`` + ``needs_input`` held
+    by a worker). Local queues only; idempotent. Returns the refs selected."""
+    proj = _norm_project(queue) if queue else None
+    picked: List[str] = []
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        github = set(_github_projects())
+        for it in data["items"]:
+            if it.get("status") != "in_progress" or not it.get("needs_input"):
+                continue
+            if proj and it.get("project") != proj:
+                continue
+            if _norm_project(it.get("project") or "") in github:
+                continue
+            claimant = str(it.get("claimed_by") or "")
+            if not claimant or (it.get("stage_session") or {}).get("escalated"):
+                continue
+            if (it.get("plan") or {}).get("status") == "blocked":
+                continue
+            last = next((h for h in reversed(it.get("history") or [])
+                         if h.get("event") == "block"), None)
+            if not last or (last.get("by") or {}).get("kind") != "worker":
+                continue
+            picked.append(str(it.get("ref")))
+            if dry_run:
+                continue
+            _park_unlocked(it, claimant, str(it.get("claimed_session_id") or ""),
+                           str(it.get("claimed_machine") or ""),
+                           str(it.get("blocked_at") or _now_iso()), _by("system"),
+                           reason="migrated_legacy_block")
+        if picked and not dry_run:
+            _save_unlocked(data)
+    return picked
+
+
 def block(
     ident: Any,
     session_id: str = "",
@@ -4314,10 +4712,17 @@ def block(
     progress: str = "",
     kind: str = "input",
     commit: str = "",
+    origin: str = "system",
 ) -> Optional[Dict[str, Any]]:
     """Park a ticket that needs a human decision.
 
-    The ticket STAYS ``in_progress`` bound to its session (so ``claim_next``,
+    ``origin`` (WT-28): ``"worker"`` (``wt block``) on the local store PARKS
+    the ticket -- status ``awaiting_answer``, claim released, ``parked``
+    records the session the answer returns to -- so the worker can take the
+    next ticket. Plan-gate / stage-escalation / verifier blocks and GitHub
+    queues keep the legacy behaviour below.
+
+    The legacy path: the ticket STAYS ``in_progress`` bound to its session (so ``claim_next``,
     which only picks ``open``, can never hand it to another worker) and is flagged
     ``needs_input`` with the worker's specific ``question``. The worker process
     may then exit to save tokens — continuity is not lost, because the Claude
@@ -4348,6 +4753,14 @@ def block(
         for it in data["items"]:
             if _matches(it, ident):
                 now = _now_iso()
+                was_parked = it.get("status") == PARKED_STATUS
+                _supersede_pending_unlocked(it, now)
+                park_worker = str(it.get("claimed_by") or session_id or "")
+                park = (origin == "worker" and not was_parked
+                        and it.get("status") in ("open", "in_progress") and bool(park_worker))
+                park_sid = str(it.get("claimed_session_id")
+                               or _coerce_session_uuid(session_id) or "")
+                park_machine = str(it.get("claimed_machine") or machine_tag())
                 it["needs_input"] = True
                 it["block_question"] = _clip(question, 4000)
                 it["block_kind"] = kind
@@ -4355,9 +4768,9 @@ def block(
                 it["updated_at"] = now
                 if commit:
                     it["block_commit"] = commit
-                if it.get("status") == "open":
+                if it.get("status") == "open" and not park:
                     it["status"] = "in_progress"
-                if session_id:
+                if session_id and not park and not was_parked:
                     if not it.get("claimed_by"):
                         it["claimed_by"] = str(session_id)
                         it["claimed_machine"] = machine_tag()
@@ -4372,7 +4785,10 @@ def block(
                     question=_clip(question, 4000), kind=kind,
                     commit=commit,
                 )
+                if park:
+                    _park_unlocked(it, park_worker, park_sid, park_machine, now, actor)
                 _save_unlocked(data)
+                _supersede_outbox(it.get("ref"))
                 if progress:
                     _log(
                         "PROGRESS",
@@ -4425,7 +4841,10 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     text=_clip(text, 24000),
                 )
                 stage_retry = _stage_retry_reset(it, text, now)
-                if it.get("status") == "in_progress" and not it.get("claimed_session_id"):
+                if (it.get("status") == PARKED_STATUS and it.get("parked")
+                        and not stage_retry):
+                    _write_pending_answer_unlocked(it, text, now)
+                elif it.get("status") == "in_progress" and not it.get("claimed_session_id"):
                     it["status"] = "open"
                     it["claimed_by"] = None
                     it["claimed_machine"] = None
@@ -4496,6 +4915,8 @@ def gate_ack(
                 "at": now,
                 "comment": _clip(comment, 4000),
             }
+            if it.get("status") == PARKED_STATUS and it.get("parked"):
+                _write_pending_answer_unlocked(it, comment or "approved", now)
             _append_history(
                 it, "gate_ack",
                 by=_by("human", str(by or ""), str(session_id or "")),
@@ -4563,6 +4984,7 @@ def gate_nack(
             it["claimed_by"] = None
             it["claimed_machine"] = None
             it["claimed_at"] = None
+            it.pop("parked", None)
             it["readiness"] = "needs-rationale"
             it["updated_at"] = now
             it["product_nack"] = {
@@ -4627,7 +5049,10 @@ def list_blocked(project: Optional[str] = None) -> List[Dict[str, Any]]:
     every worker holding a blocked ticket there read as fully productive to
     the reconciler's staffing math (see ``list_active_claims``), so a queue
     stuck entirely behind blocked tickets never got replacement workers."""
-    return [it for it in list_items(project=project) if it.get("needs_input")]
+    return [it for it in list_items(project=project)
+            if it.get("needs_input")
+            or (it.get("status") == PARKED_STATUS
+                and (it.get("pending_answer") or {}).get("state") == "routing")]
 
 
 def list_active_claims(project: Optional[str] = None) -> List[Dict[str, Any]]:

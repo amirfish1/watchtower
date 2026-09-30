@@ -2788,8 +2788,12 @@ class GitHubIssuesBackend:
         session_id: str = "",
         question: str = "",
         progress: str = "",
+        origin: str = "system",
+        **_ignored: Any,
     ) -> Optional[Dict[str, Any]]:
-        """Record a worker's request for input on a GitHub-backed ticket."""
+        """Record a worker's request for input on a GitHub-backed ticket.
+        ``origin`` is accepted and ignored: GitHub queues keep the legacy
+        hold-while-blocked behaviour (WT-28b)."""
         item = self.get(ident)
         if item is None:
             return None

@@ -30,9 +30,12 @@ open  →  in_progress  →  closed
 |-------|---------|
 | `open` | Unclaimed. Available for the next `wt claim`. |
 | `in_progress` | Claimed by a worker. Has a `claimed_session_id`. Not reclaimable by another worker. |
+| `awaiting_answer` | Parked by `wt block` (WT-28): claim released, waiting for a human answer. Not claimable. |
 | `closed` | Done. Has a resolution. Immutable. |
 
-`needs_input` is a flag on an `in_progress` ticket — NOT a fourth state. A
+`needs_input` is a flag on an `in_progress` ticket (the legacy hold-while-blocked
+form, still used by plan-gate / stage-escalation blocks and GitHub-backed queues
+until WT-28b) — NOT a separate state. A
 ticket stays `in_progress` while blocked; the flag signals that it is waiting
 for human input before the worker can continue. Keeping it a flag (not a state)
 prevents agents from using it as a comfortable parking lot for hard tickets.
@@ -146,6 +149,30 @@ worker reaches a decision it can't make alone
 
 The blocked ticket stays `in_progress` and is NOT reclaimable. Continuity lives
 in the resumable session, not in a running process.
+
+### Parking (WT-28)
+
+A worker `wt block` on a local queue now **parks** the ticket: status
+`awaiting_answer`, claim released, `parked` = `{worker_id, session_id, machine,
+engine, repo_path, transcript_path, at}`. The worker may claim the next ticket
+immediately. A retained parked worker is never STOPped for ~55 minutes and does
+not consume the spawn budget while idle.
+
+`wt answer` / `wt ack` / `wt plan decide` on a parked ticket write a
+`pending_answer` (`gen`-keyed; states `routing -> affinity | delivering | queued
+| delivered | handed_off`) and route it through compare-and-swap transitions so
+a stale router is a no-op:
+
+| Route | When | Effect |
+|---|---|---|
+| `affinity` | parked worker still alive | ticket reopens reserved for that worker, which is woken; nothing is bound |
+| `resume` | worker gone, session resumable | `resume_claim` rebinds the ticket to the parked session and the answer is delivered to it |
+| `reopen` | no session / over the context budget / session busy elsewhere | ticket opens; the next claimer gets question + answer + transcript pointer (`answer_brief`) |
+
+Answer outbox rows are generation-bound (R4-4): the drain re-checks the ticket's
+`gen` and cancels on re-block, forced release/reopen and close. Delivery is
+at-least-once; the `[answer REF#gen]` tag lets a session ignore a repeat.
+`wt migrate-blocks [--dry-run] [-q Q]` (and the reconciler) parks legacy blocks.
 
 ### Resolution is mandatory
 

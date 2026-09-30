@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
-from . import health, queue as q, resume_verify, stages, workers
+from . import answers, health, queue as q, resume_verify, stages, workers
 
 DAEMON_PID_FILE = Path(
     os.environ.get("WATCHTOWER_DAEMON_PID")
@@ -506,7 +506,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
     if getattr(args, "unresolved", False):
         want = "unresolved"
     if want == "active":
-        items = [i for i in items if i.get("status") in ("open", "in_progress", "in_review")]
+        items = [i for i in items if i.get("status") in ("open", "in_progress", "in_review", "awaiting_answer")]
     elif want == "blocked":
         items = [i for i in items if i.get("needs_input")]
     elif want == "unresolved":
@@ -1005,7 +1005,16 @@ def cmd_claim(args: argparse.Namespace) -> int:
             from . import config
             drain_on = config.auto_drain(args.queue)
             desired = config.desired_workers(args.queue) if drain_on else 0
-            live = workers.live_worker_count(args.queue)
+            retained = workers.retained_parked_ids(args.queue)
+            live = workers.live_worker_count(args.queue, exclude=retained)
+            if worker in retained:
+                owned = ", ".join(sorted(workers.retained_parked_refs(args.queue, worker)))
+                if args.json:
+                    print(json.dumps({}))
+                else:
+                    print(f"(nothing open in {args.queue}; you own parked {owned or 'a ticket'} "
+                          f"awaiting an answer -- stay idle)")
+                return 0
             if live > desired:
                 from watchtower.queue import _log
                 # With auto-drain off, desired_workers only staffs manual runs;
@@ -1068,6 +1077,9 @@ def cmd_claim(args: argparse.Namespace) -> int:
         # events under the same identity keeps a re-claimed ticket's earlier
         # activity from reading as another worker's (CCC-675).
         shown = _mark_self(item, worker, session_uuid)
+        brief = answers.claim_brief(item, worker, str(item.get("claimed_session_id") or ""))
+        if brief:
+            shown = dict(shown, answer_brief=brief)
         checks = q.checks_block(item)
         if checks:
             shown = dict(shown, checks_after_close=checks)
@@ -1078,6 +1090,9 @@ def cmd_claim(args: argparse.Namespace) -> int:
     else:
         print(f"CLAIMED: {item['ref']} -> {worker}")
         print(item.get("text") or item.get("note") or "")
+        brief = answers.claim_brief(item, worker, str(item.get("claimed_session_id") or ""))
+        if brief:
+            print("\n" + brief)
         plan_note = _plan_note(item)
         if plan_note:
             print("\n" + plan_note)
@@ -1265,7 +1280,7 @@ def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
                     ref, ok, f"reminder to {role} undelivered (no live transport to worker {wid})")
                 n += 1 if ok else 0
             if nudged and (nudged.get("plan") or {}).get("status") == "blocked":
-                q.block(ref, str(nudged.get("claimed_session_id") or ""),
+                q.block(ref, str(nudged.get("claimed_session_id") or ""), origin="plan_gate",
                         question=(f"Plan discussion stalled: "
                                   f"{nudged['plan']['discussion'].get('reason', '')}. "
                                   f"Decide with `wt plan decide {ref} --accept|--retry`."),
@@ -1341,7 +1356,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                        if disc.get("reason") else
                        f"The planner and plan reviewer still disagree after "
                        f"{len(reviews)} rounds.")
-                q.block(ref, str(item.get("claimed_session_id") or ""),
+                q.block(ref, str(item.get("claimed_session_id") or ""), origin="plan_gate",
                         question=(f"{why} Last reviewer reasons: "
                                   f"{reviews[-1].get('reasons', '')}. Decide with "
                                   f"`wt plan decide {ref} --accept|--retry`."),
@@ -1373,6 +1388,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
                     workers.dispatch_after_enqueue(item.get("project", ""), ref)
                 except Exception:  # noqa: BLE001
                     pass
+            routed = _route_parked_answer(item)
+            if routed is not None:
+                return routed
             if item.get("claimed_session_id"):
                 prompt = (f"A human decided the blocked plan on ticket {ref}: "
                           f"{decision} (plan is now {status}). "
@@ -2247,6 +2265,7 @@ def cmd_block(args: argparse.Namespace) -> int:
         question=args.question, progress=args.progress,
         kind=getattr(args, "kind", "input"),
         commit=commit,
+        origin="worker",
     )
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
@@ -2255,6 +2274,10 @@ def cmd_block(args: argparse.Namespace) -> int:
         print(json.dumps(item, indent=2))
         return 0
     print(f"BLOCKED: {item['ref']} — {item.get('block_question') or '(no question)'}")
+    if item.get("status") == q.PARKED_STATUS:
+        print("  parked: the ticket left your claim; the human's answer returns to this "
+              "session. You may claim the next ticket now.")
+        return 0
     sid = item.get("claimed_session_id")
     if sid:
         print(f"  session {sid} — resume with: wt discuss {item['ref']}")
@@ -2278,9 +2301,13 @@ def cmd_blocked(args: argparse.Namespace) -> int:
         return 0
     for it in rows:
         kind = "GATE" if it.get("block_kind") == "rationale" else "input"
-        print(f"{it['ref']:<12} [{kind}] {it.get('block_question') or '(no question)'}")
-        print(f"             session={it.get('claimed_session_id') or '-'}  "
+        print(f"{it['ref']:<12} [{kind}] {it.get('block_question') or '(no question)'}"
+              + ("  (answered, routing)"
+                 if (it.get('pending_answer') or {}).get('state') == 'routing' else ""))
+        print(f"             session={q.answer_session(it) or '-'}  "
               f"repo={it.get('repo_path') or '-'}")
+        if it.get("status") == q.PARKED_STATUS:
+            print(f"             {workers.parked_label(it)}")
         if it.get("block_kind") == "rationale":
             print(f"             decide with: wt ack {it['ref']} [-m ...]  |  "
                   f"wt nack {it['ref']} -m \"why not\" [--close]")
@@ -2490,6 +2517,27 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
     return 0
 
 
+def cmd_migrate_blocks(args: argparse.Namespace) -> int:
+    """Park tickets blocked the legacy way (WT-28). Idempotent."""
+    refs = q.migrate_legacy_blocks(args.queue, dry_run=args.dry_run)
+    verb = "would park" if args.dry_run else "parked"
+    for r in refs:
+        print(f"{verb}: {r}")
+    print(f"{len(refs)} ticket(s) {verb.replace('would park', 'eligible')}.")
+    return 0
+
+
+def _route_parked_answer(item: dict, tid: bool = False) -> Optional[int]:
+    """WT-28: an answer on a parked ticket is routed back to the session that
+    parked it (affinity / resume / handoff). None for a legacy (held) block."""
+    pa = item.get("pending_answer") or {}
+    if item.get("status") != q.PARKED_STATUS or pa.get("state") != "routing":
+        return None
+    res = answers.route_answer(item["ref"], int(pa["gen"]), tid=tid)
+    print(f"ANSWERED: {item['ref']} — routed: {res.get('route')} ({res.get('reason')}).")
+    return 0
+
+
 def cmd_answer(args: argparse.Namespace) -> int:
     """Inject a human answer onto a blocked ticket and hand it to the session.
 
@@ -2528,6 +2576,9 @@ def cmd_answer(args: argparse.Namespace) -> int:
               f"watcher will spawn a fresh {role.replace('_', ' ')} (attempt 1, "
               f"key {ss.get('key')})")
         return 0
+    routed = _route_parked_answer(item, tid=bool(getattr(args, "tid", False)))
+    if routed is not None:
+        return routed
     sid = item.get("claimed_session_id")
     if not sid:
         print(f"ANSWERED: {item['ref']} — needs_input cleared. "
@@ -2587,6 +2638,9 @@ def cmd_gate_ack(args: argparse.Namespace) -> int:
         return 0
     print(f"ACKED: {item['ref']} — product gate approved."
           + (f" Comment: {args.comment}" if args.comment else ""))
+    routed = _route_parked_answer(item)
+    if routed is not None:
+        return routed
     sid = item.get("claimed_session_id")
     if not sid:
         print("  (no resumable session; the next worker to claim it will see "
@@ -2735,7 +2789,7 @@ def cmd_discuss(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
-    sid = item.get("claimed_session_id")
+    sid = q.answer_session(item)
     if not sid:
         print(f"(no resumable session on {args.ref} — it was never claimed with a "
               f"real session id)", file=sys.stderr)
@@ -5325,6 +5379,7 @@ COMMAND_HELP: Dict[str, str] = {
     "ack": "approve a product-gate pitch (Ack); resolution-caveat acks moved to unresolved-ack",
     "nack": "decline a product-gate pitch: icebox it, or --close to close as Declined",
     "answer": "answer a blocked ticket; auto-resumes its session",
+    "migrate-blocks": "park tickets blocked the legacy way (WT-28)",
     "comment": "append a ticket activity comment",
     "discuss": "attach to a blocked ticket's session (claude --resume)",
     "ready": "mark a ticket ready for workers (dispatch its queue); 'wt run' is an alias",
@@ -5583,9 +5638,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument(
         "--status",
         default="active",
-        choices=["active", "open", "in_progress", "in_review", "blocked", "closed",
-                 "unresolved", "all"],
-        help="which tickets to show (default: active = open + in_progress + in_review; "
+        choices=["active", "open", "in_progress", "in_review", "awaiting_answer",
+                 "blocked", "closed", "unresolved", "all"],
+        help="which tickets to show (default: active = open + in_progress + in_review + "
+             "awaiting_answer; "
              "blocked = parked for human input; unresolved = closed with "
              "unresolved items flagged in the resolution)",
     )
@@ -6039,6 +6095,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_gate_nack)
+
+    s = sub.add_parser("migrate-blocks", help="park tickets blocked the legacy way (WT-28)")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("-q", "--queue", default=None, help="limit to one queue")
+    s.set_defaults(func=cmd_migrate_blocks)
 
     s = sub.add_parser("answer")
     s.add_argument("ref")

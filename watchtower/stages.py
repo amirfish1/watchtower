@@ -496,7 +496,7 @@ def _escalate(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any]) -> 
     if role == "assessor":
         a = item.get("assessment") or {}
         q.assessment_fail(ref, a.get("token", ""), f"assessor died twice: {reasons}")
-    q.block(ref, "", question=question, kind="input")
+    q.block(ref, "", origin="stage", question=question, kind="input")
     _log("STAGE_BLOCK", f"{ref} {role} {key}: {reasons}", queue=project)
 
 
@@ -610,10 +610,10 @@ def _spawn_error(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
     if role == "assessor":
         a = item.get("assessment") or {}
         q.assessment_fail(ref, a.get("token", ""), f"could not spawn the assessor: {exc}")
-        q.block(ref, "", question=f"Could not spawn the assessor: {exc}. Fix it, then "
+        q.block(ref, "", origin="stage", question=f"Could not spawn the assessor: {exc}. Fix it, then "
                                    f"`wt assess run {ref}`.", kind="input")
         return "failed"
-    q.block(ref, "", question=f"Could not spawn the verifier: {exc}. File a verdict with "
+    q.block(ref, "", origin="stage", question=f"Could not spawn the verifier: {exc}. File a verdict with "
                               f"`wt verdict {ref}` or `wt accept {ref} --force`.", kind="input")
     _log("STAGE_BLOCK", f"{ref} {role} {key}: {exc}", queue=project)
     return "failed"

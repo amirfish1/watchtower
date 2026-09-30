@@ -168,7 +168,7 @@ def test_cli_block_json_returns_the_blocked_ticket(wt, capsys):
 
     blocked = json.loads(capsys.readouterr().out)
     assert blocked["ref"] == item["ref"]
-    assert blocked["status"] == "in_progress"
+    assert blocked["status"] == "awaiting_answer"  # WT-28: a worker block parks
     assert blocked["block_question"] == "approve the rollout?"
 
 

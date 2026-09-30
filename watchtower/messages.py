@@ -134,6 +134,13 @@ def _outbox_file() -> Path:
     ).expanduser()
 
 
+def _ledger_file() -> Path:
+    return Path(
+        os.environ.get("WATCHTOWER_DELIVERY_LEDGER_FILE")
+        or (_outbox_file().parent / "delivery-ledger.json")
+    ).expanduser()
+
+
 def _agents_lock() -> Path:
     return _agents_file().with_suffix(".lock")
 
@@ -1808,8 +1815,16 @@ def outbox_add(
     notify: bool = False,
     ticket_ref: str = "",
     ticket_session: str = "",
+    dedupe_key: str = "",
+    ticket_gen: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Append a pending message to the durable outbox. Locked + atomic.
+
+    ``dedupe_key`` (WT-28): at most one live (non-dead, non-cancelled) row per
+    key; a second call returns the existing row, and the delivery ledger is
+    marked ``queued{msg_id}`` in the same lock. ``ticket_gen`` binds the row to
+    the ticket's answer generation: the drain skips it once that gen is no
+    longer current (R4-4).
 
     ``notify`` persists the event-notice delivery class so ``drain_outbox``
     retries it over the live-only chain instead of resuming the target.
@@ -1838,11 +1853,133 @@ def outbox_add(
     if ticket_ref:
         msg["ticket"] = str(ticket_ref)
         msg["ticket_session"] = str(ticket_session or "")
+    if ticket_gen is not None:
+        msg["ticket_gen"] = int(ticket_gen)
+    if dedupe_key:
+        msg["dedupe_key"] = str(dedupe_key)
     with queue_mod._FileLock(_outbox_lock()):
         data = _load_outbox()
+        if dedupe_key:
+            for old in data["messages"]:
+                if (old.get("dedupe_key") == dedupe_key
+                        and old.get("status") not in ("dead", "cancelled")):
+                    return old
         data["messages"].append(msg)
         _save_outbox(data)
+        if dedupe_key:
+            ledger = _load_ledger()
+            ledger["entries"][str(dedupe_key)] = {
+                "state": "queued", "msg_id": msg["id"], "at": _iso(now),
+                "ref": str(ticket_ref or "")}
+            _save_ledger(ledger)
     return msg
+
+
+# --------------------------------------------------- delivery ledger (WT-28)
+LEDGER_TTL_S = 7 * 24 * 3600
+DEDUPE_LEASE_S = 120.0
+
+
+def _load_ledger() -> Dict[str, Any]:
+    try:
+        with open(_ledger_file(), "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"entries": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+        return {"entries": {}}
+    return data
+
+
+def _save_ledger(data: Dict[str, Any]) -> None:
+    cutoff = time.time() - LEDGER_TTL_S
+    data["entries"] = {k: v for k, v in data["entries"].items()
+                       if _parse_iso(v.get("at")) >= cutoff}
+    path = _ledger_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def ledger_reserve(key: str, ref: str = "", now: Optional[float] = None) -> Dict[str, Any]:
+    """Durable dedupe (WT-28). ``{"action": ...}``: ``sent`` (already
+    delivered), ``queued`` (a live outbox row holds it; ``msg_id``),
+    ``in_flight`` (another caller holds a fresh reservation) or ``proceed``
+    (reserved for this caller)."""
+    now = time.time() if now is None else float(now)
+    with queue_mod._FileLock(_outbox_lock()):
+        ledger = _load_ledger()
+        entry = ledger["entries"].get(key) or {}
+        state = entry.get("state")
+        if state == "sent":
+            return {"action": "sent"}
+        if state == "queued":
+            row = next((m for m in _load_outbox()["messages"]
+                        if str(m.get("id")) == str(entry.get("msg_id"))), None)
+            if row is not None and row.get("status") not in ("dead", "cancelled"):
+                return {"action": "queued", "msg_id": entry.get("msg_id")}
+        if state == "reserved" and now - _parse_iso(entry.get("at")) < DEDUPE_LEASE_S:
+            return {"action": "in_flight"}
+        ledger["entries"][key] = {"state": "reserved", "at": _iso(now), "ref": ref}
+        _save_ledger(ledger)
+    return {"action": "proceed"}
+
+
+def ledger_mark(key: str, state: str, msg_id: str = "") -> None:
+    with queue_mod._FileLock(_outbox_lock()):
+        ledger = _load_ledger()
+        entry = dict(ledger["entries"].get(key) or {})
+        entry.update(state=state, at=_iso(time.time()))
+        if msg_id:
+            entry["msg_id"] = msg_id
+        ledger["entries"][key] = entry
+        _save_ledger(ledger)
+
+
+def ledger_release(key: str) -> None:
+    """Drop a ``reserved`` entry after a failed attempt (never a sent/queued one)."""
+    with queue_mod._FileLock(_outbox_lock()):
+        ledger = _load_ledger()
+        if (ledger["entries"].get(key) or {}).get("state") == "reserved":
+            ledger["entries"].pop(key, None)
+            _save_ledger(ledger)
+
+
+def ledger_clear_ref(ref: str) -> None:
+    with queue_mod._FileLock(_outbox_lock()):
+        ledger = _load_ledger()
+        kept = {k: v for k, v in ledger["entries"].items() if v.get("ref") != ref}
+        if len(kept) != len(ledger["entries"]):
+            ledger["entries"] = kept
+            _save_ledger(ledger)
+
+
+def outbox_row(msg_id: str) -> Optional[Dict[str, Any]]:
+    """``{status, last_error}`` of one outbox row, or None when it is gone."""
+    for m in _load_outbox()["messages"]:
+        if str(m.get("id")) == str(msg_id):
+            return {"status": m.get("status"), "last_error": m.get("last_error", "")}
+    return None
+
+
+def outbox_cancel_ticket(ref: str, reason: str) -> List[str]:
+    """Cancel pending generation-bound answer rows of ``ref`` (R4-4): the row
+    is marked stale so the drain never retries it. A transport already started
+    cannot be recalled (at-least-once)."""
+    cancelled: List[str] = []
+    with queue_mod._FileLock(_outbox_lock()):
+        data = _load_outbox()
+        for m in data["messages"]:
+            if (m.get("ticket") == ref and m.get("ticket_gen") is not None
+                    and m.get("status") == "pending"):
+                m["status"] = "cancelled"
+                m["last_error"] = reason
+                cancelled.append(str(m.get("id")))
+        if cancelled:
+            _save_outbox(data)
+    return cancelled
 
 
 def outbox_list(status: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1935,6 +2072,13 @@ def _ticket_stale_reason(m: Dict[str, Any]) -> str:
     if bound and current != bound:
         return (f"ticket {ref} changed session "
                 f"({bound[:8]} -> {current[:8] or 'unclaimed'})")
+    if m.get("ticket_gen") is not None:
+        # R4-4: an answer row is bound to the answer generation it carries; a
+        # re-block or new answer moves the ticket on, even when the SAME
+        # session is rebound (status and session above would still match).
+        pa = item.get("pending_answer") or {}
+        if int(pa.get("gen") or -1) != int(m["ticket_gen"]):
+            return f"ticket {ref} answer gen {m['ticket_gen']} superseded"
     return ""
 
 
@@ -2025,6 +2169,12 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
                 m["delivered_at"] = _iso(now)
                 m["last_error"] = ""
                 result["delivered"].append(str(m["id"]))
+                if m.get("dedupe_key"):
+                    ledger = _load_ledger()
+                    ledger["entries"][str(m["dedupe_key"])] = {
+                        "state": "sent", "at": _iso(now), "msg_id": str(m["id"]),
+                        "ref": str(m.get("ticket") or "")}
+                    _save_ledger(ledger)
                 queue_mod._log(
                     "SEND",
                     f"{m.get('to','?')} via {res.get('transport','?')} "
@@ -2062,6 +2212,8 @@ def send(
     ticket_ref: str = "",
     ticket_session: str = "",
     live_only: bool = False,
+    dedupe_key: str = "",
+    ticket_gen: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
@@ -2124,6 +2276,8 @@ def send(
         error=str(result.get("error") or ""), delay_s=delay, ttl_s=ttl_s,
         engine=engine, notify=notify,
         ticket_ref=ticket_ref, ticket_session=ticket_session,
+        **({"dedupe_key": dedupe_key} if dedupe_key else {}),
+        **({"ticket_gen": ticket_gen} if ticket_gen is not None else {}),
     )
     return {
         "ok": False,
@@ -2232,6 +2386,8 @@ def deliver_message(
     delegate_timeout_s: Optional[float] = None,
     ticket_ref: str = "",
     ticket_session: str = "",
+    dedupe_key: str = "",
+    ticket_gen: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One delivery entry point for every WT caller (CCC-1000 Phase 3).
 
@@ -2263,6 +2419,12 @@ def deliver_message(
     ``ticket_ref`` (with the ``ticket_session`` it is addressed to) marks a
     held message as about that ticket, so the outbox cancels it rather than
     retrying once the ticket closes or changes session (WT-1).
+
+    ``dedupe_key`` (WT-28) makes the call idempotent across retries and
+    crashes through the durable delivery ledger: an already-sent key is not
+    sent again, a key held by a live outbox row returns that row, and a fresh
+    reservation elsewhere returns ``in_flight`` (try later). ``ticket_gen``
+    binds a held row to the ticket's answer generation (R4-4).
     """
     verb = str(verb or "engine_default").strip().lower()
     if verb not in DELIVERY_VERBS:
@@ -2283,6 +2445,41 @@ def deliver_message(
     if ticket_ref:
         send_kwargs["ticket_ref"] = ticket_ref
         send_kwargs["ticket_session"] = ticket_session
+    if ticket_gen is not None:
+        send_kwargs["ticket_gen"] = ticket_gen
+    if dedupe_key:
+        reserved = ledger_reserve(dedupe_key, ref=ticket_ref)
+        act = reserved.get("action")
+        if act == "sent":
+            return {"ok": True, "deduped": True, "transport": "ledger", "verb": verb}
+        if act == "queued":
+            return {"ok": False, "queued": True, "deduped": True,
+                    "id": reserved.get("msg_id"), "verb": verb}
+        if act == "in_flight":
+            return {"ok": False, "deduped": True, "in_flight": True, "verb": verb,
+                    "error": "delivery in flight elsewhere"}
+        send_kwargs["dedupe_key"] = dedupe_key
+    try:
+        result = _deliver_message_send(target, text, verb, on_busy, expire, engine,
+                                       position, send_kwargs)
+    except Exception:
+        if dedupe_key:
+            ledger_release(dedupe_key)
+        raise
+    if dedupe_key:
+        if result.get("ok"):
+            ledger_mark(dedupe_key, "sent")
+        elif not result.get("queued"):
+            ledger_release(dedupe_key)
+    if not result.get("ok") and on_busy == "drop":
+        return {"ok": False, "dropped": True,
+                "error": str(result.get("error") or "delivery failed")}
+    result.setdefault("verb", verb)
+    return result
+
+
+def _deliver_message_send(target, text, verb, on_busy, expire, engine, position,
+                          send_kwargs) -> Dict[str, Any]:
     result = send(
         target,
         text,
@@ -2294,10 +2491,6 @@ def deliver_message(
         prefer_uds=(verb == "steer"),
         **send_kwargs,
     )
-    if not result.get("ok") and on_busy == "drop":
-        return {"ok": False, "dropped": True,
-                "error": str(result.get("error") or "delivery failed")}
-    result.setdefault("verb", verb)
     return result
 
 

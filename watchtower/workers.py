@@ -2621,6 +2621,12 @@ def _signal_worker(pid: int, sig: int) -> str:
     return "pid"
 
 
+def _fresh_park_owners(now: float) -> set:
+    return {str((it.get("parked") or {}).get("worker_id"))
+            for it in _parked_rows(now=now)
+            if _iso_age_s(str((it.get("parked") or {}).get("at") or ""), now) < PARK_GRACE_S}
+
+
 def reap_released_workers(
     ttl_s: float = RELEASED_TTL_S,
     kill_grace_s: float = _RELEASED_KILL_GRACE_S,
@@ -2665,6 +2671,8 @@ def reap_released_workers(
             if age_s < ttl_s:
                 continue
             worker_id = str(row.get("worker_id") or "")
+            if worker_id in _fresh_park_owners(now):
+                continue  # WT-28: owns a park younger than the grace
             pid = int(row.get("pid", 0) or 0)
             if not _pid_alive(pid):
                 continue  # sweep_orphan_stop_signals() cleans up its sentinel
@@ -4082,12 +4090,62 @@ def worker_model(worker_id: str, queue: str) -> str:
     return config.queue_model_id(queue)
 
 
-def live_worker_count(queue: Optional[str] = None) -> int:
+PARK_RETENTION_S = 55 * 60.0  # keep a parked ticket's worker alive this long (WT-28)
+PARK_GRACE_S = 120.0          # defer a released owner's SIGTERM this long after a park
+
+
+def _parked_rows(queue: Optional[str] = None, items: Optional[List[Dict[str, Any]]] = None,
+                 now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Parked (``awaiting_answer``) tickets still inside the retention window."""
+    from . import queue as _q
+    now = time.time() if now is None else now
+    if items is None:
+        try:
+            items = _q.list_items()
+        except Exception:
+            return []
+    rows = []
+    for it in items:
+        if it.get("status") != _q.PARKED_STATUS:
+            continue
+        if queue and it.get("project") != queue:
+            continue
+        parked = it.get("parked") or {}
+        if not parked.get("worker_id"):
+            continue
+        at = str(parked.get("at") or "")
+        if at and _iso_age_s(at, now) >= PARK_RETENTION_S:
+            continue
+        rows.append(it)
+    return rows
+
+
+def retained_parked_refs(queue: Optional[str], worker_id: str) -> List[str]:
+    return [str(it.get("ref")) for it in _parked_rows(queue)
+            if (it.get("parked") or {}).get("worker_id") == worker_id]
+
+
+def retained_parked_ids(queue: Optional[str] = None,
+                        items: Optional[List[Dict[str, Any]]] = None) -> set:
+    """Worker ids kept alive (never STOPped, not counted against the spawn
+    budget) because they own a parked ticket within the retention window."""
+    return {str((it.get("parked") or {}).get("worker_id")) for it in _parked_rows(queue, items)}
+
+
+def parked_label(item: Dict[str, Any]) -> str:
+    pk = item.get("parked") or {}
+    return (f"parked by {pk.get('worker_id') or '-'} session={pk.get('session_id') or '-'} "
+            f"at {pk.get('at') or '-'}")
+
+
+def live_worker_count(queue: Optional[str] = None, exclude: Optional[set] = None) -> int:
     n = 0
     for w in list_workers():
         if not w.get("alive") or _worker_released(w):
             continue
         if queue and w.get("queue") != queue:
+            continue
+        if exclude and str(w.get("worker_id") or "") in exclude:
             continue
         n += 1
     return n
@@ -4724,8 +4782,10 @@ def requeue_orphaned_tickets(
         # via the liveness-aware messaging primitive, so the original worker can
         # look dead here while the resumed/steered session works the answer;
         # reopening now would duplicate that work (see _answer_in_flight).
+        pa_at = ((it.get("pending_answer") or {}).get("state_at")
+                 if it.get("pending_answer") else None)
         if _answer_in_flight(
-            it.get("answered_at"), str(it.get("claimed_session_id") or ""),
+            pa_at or it.get("answered_at"), str(it.get("claimed_session_id") or ""),
             now, answer_grace_s,
         ):
             continue
@@ -5616,6 +5676,14 @@ def _reconcile_once_locked(dry_run: bool = False,
                                   for it in requeue_orphaned_tickets()]
         except Exception:
             pass
+        # WT-28: park legacy blocks, then route answers to parked tickets.
+        if not dry_run:
+            try:
+                from . import answers as _answers, queue as _qpa
+                _qpa.migrate_legacy_blocks()
+                result["answers_routed"] = _answers.route_pending_answers(time.time())
+            except Exception:
+                pass
         # Single supervisor (WT-24): only a real auto-spawn daemon supervises stage
         # sessions -- never a --dry-run or spawn-less one.
         if supervise_stages and not dry_run:
@@ -5758,6 +5826,11 @@ def _reconcile_once_locked(dry_run: bool = False,
                 busy_worker_ids.setdefault(qn, set()).add(wid)
     except Exception:
         busy_worker_ids = {}
+
+    try:
+        retained_parked = retained_parked_ids()
+    except Exception:
+        retained_parked = set()
 
     # Use health for queue depth + stuck ground-truth -- one call covers all queues.
     health_by_queue: Dict[str, Dict[str, Any]] = {
@@ -6167,7 +6240,15 @@ def _reconcile_once_locked(dry_run: bool = False,
         # logging and the nudge/stuck check, which cares about real processes.
         # A worker that holds a blocked ticket but is *also* actively working
         # an in_progress one isn't idle, so it stays out of blocked_count.
-        staffed = actual - blocked_count
+        # WT-28: an idle worker retaining a parked ticket is waiting for its
+        # answer, not draining; it must not consume the spawn budget either.
+        retained_here = [
+            w for w in live
+            if str(w.get("worker_id") or "") in retained_parked
+            and str(w.get("worker_id") or "") not in busy_ids_here
+            and w not in unwakeable_blocked
+        ]
+        staffed = actual - blocked_count - len(retained_here)
         blocked_note = f", {blocked_count} blocked" if blocked_count else ""
 
         if not dry_run and depth > 0 and wakeable_blocked:

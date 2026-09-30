@@ -456,7 +456,7 @@ def test_reconcile_live_equals_desired_skips(wt):
     assert not r["spawned"]
 
 
-def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
+def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt, monkeypatch):
     """A worker parked on a human question (``needs_input``) is alive but does
     no dispatch work until answered, which can take hours. Before WT-129 it
     still counted toward desired_workers, so one blocked ticket could occupy
@@ -477,6 +477,9 @@ def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
     )
     assert claimed["ref"] == blocked["ref"]
     wt.q.block(blocked["ref"], question="fix or dismiss?", session_id=worker["worker_id"])
+    # Legacy hold-while-blocked scenario (GitHub / plan-gate style); WT-28
+    # parking has its own coverage in test_park_blocks.py.
+    monkeypatch.setattr(wt.q, "migrate_legacy_blocks", lambda *a, **k: [])
 
     r = wt.workers.reconcile_once(dry_run=False)
     assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 0
