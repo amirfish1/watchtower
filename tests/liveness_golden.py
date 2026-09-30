@@ -223,3 +223,233 @@ def states(lv, vocab: Optional[Dict[str, tuple]] = None, **fixed: Any) -> Iterat
     pools = [(fixed[d],) if d in fixed else vocab[d] for d in dims]
     for combo in itertools.product(*pools):
         yield lv.State(*combo)
+
+
+# ------------------------------------------------ D2.6 answer-transition scan
+import ast  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+PKG = Path(__file__).resolve().parent.parent / "watchtower"
+
+
+def package_sources() -> Dict[str, str]:
+    return {p.stem: p.read_text() for p in sorted(PKG.glob("*.py"))}
+
+
+def _callee(node: ast.Call) -> str:
+    f = node.func
+    return f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else ""
+
+
+def _const_str(node: Any) -> Optional[str]:
+    return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+
+def _str_or_tuple(node: Any) -> Optional[tuple]:
+    """A str literal or tuple/list of str literals, as a tuple; else None."""
+    s = _const_str(node)
+    if s is not None:
+        return (s,)
+    if isinstance(node, (ast.Tuple, ast.List)):
+        out = tuple(_const_str(e) for e in node.elts)
+        return out if out and all(x is not None for x in out) else None
+    return None
+
+
+def _is_pa_ref(node: Any) -> bool:
+    """``pa`` or ``<x>["pending_answer"]`` -- a pending-answer dict."""
+    if isinstance(node, ast.Name):
+        return node.id == "pa"
+    return (isinstance(node, ast.Subscript)
+            and _const_str(getattr(node, "slice", None)) == "pending_answer")
+
+
+def _top_defs(tree: ast.Module):
+    """Top-level functions (methods count under their own name)."""
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node
+        elif isinstance(node, ast.ClassDef):
+            for sub in node.body:
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    yield sub
+
+
+def _wrapper_args(call: ast.Call, name: str) -> Dict[str, Any]:
+    pos = {"pa_transition": ("ident", "gen", "from_state", "to_state"),
+           "pa_bump_attempts": ("ident", "gen", "state")}[name]
+    out: Dict[str, Any] = {pos[i]: a for i, a in enumerate(call.args[:len(pos)])}
+    out.update({k.arg: k.value for k in call.keywords if k.arg})
+    return out
+
+
+class Scan:
+    """Wrapper-aware scan of every ``pending_answer`` state write. Each
+    violation is ``(function, message)``; ``edges`` maps a function to the
+    ``(old, new, old_status, new_status)`` tuples its call sites can make."""
+
+    def __init__(self, lv, q, sources: Optional[Dict[str, str]] = None):
+        self.lv, self.q = lv, q
+        self.sources = sources if sources is not None else package_sources()
+        self.violations: List[tuple] = []
+        self.edges: Dict[str, set] = {}
+        self.writes_delivered: set = set()
+        self.wrappers = lv.PA_WRAPPERS
+        self.inlock = lv.PA_INLOCK_WRITERS
+        by_id = {e["id"]: e for e in q.ANSWER_TRANSITIONS}
+        self._by_id = by_id
+        for mod, src in self.sources.items():
+            tree = ast.parse(src, filename=f"{mod}.py")
+            for fn in _top_defs(tree):
+                self._scan_def(mod, fn)
+
+    def bad(self, fn: str, msg: str) -> None:
+        self.violations.append((fn, msg))
+
+    # a/d/e: direct writes, per enclosing top-level function
+    def _scan_def(self, mod: str, fn: ast.AST) -> None:
+        name = fn.name
+        if name in self.wrappers and mod == "queue":
+            self._scan_wrapper(fn)
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if (isinstance(t, ast.Subscript) and _const_str(t.slice) == "state"
+                            and _is_pa_ref(t.value) and name != "_pa_set_state"):
+                        self.bad(name, "writes pa['state'] outside _pa_set_state")
+                    if isinstance(t, ast.Subscript) and _const_str(t.slice) == "pending_answer":
+                        self._inlock(name, self._dict_state(node.value), "assigns pending_answer")
+            if isinstance(node, ast.Dict):
+                keys = {_const_str(k) for k in node.keys if k is not None}
+                if {"state", "gen"} <= keys and name != "_write_pending_answer_unlocked":
+                    self.bad(name, "builds a pending_answer dict literal")
+            if isinstance(node, ast.Delete):
+                for t in node.targets:
+                    if isinstance(t, ast.Subscript) and _const_str(t.slice) == "pending_answer":
+                        self._inlock(name, "none", "deletes pending_answer")
+            if not isinstance(node, ast.Call):
+                continue
+            callee = _callee(node)
+            if callee == "pop" and node.args and _const_str(node.args[0]) == "pending_answer":
+                self._inlock(name, "none", "pops pending_answer")
+            elif callee == "_pa_set_state" and name not in self.wrappers:
+                to = _const_str(node.args[2]) if len(node.args) > 2 else None
+                self._inlock(name, to, "calls _pa_set_state")
+            elif callee == "_pa_cas" and name not in self.wrappers:
+                self.bad(name, "calls _pa_cas (only the PA_WRAPPERS may)")
+            elif callee in self.wrappers and name not in self.wrappers:
+                self._call_site(name, node, callee)
+
+    @staticmethod
+    def _dict_state(node: Any) -> Optional[str]:
+        if isinstance(node, ast.Dict):
+            for k, v in zip(node.keys, node.values):
+                if k is not None and _const_str(k) == "state":
+                    return _const_str(v)
+        return None
+
+    def _inlock(self, fn: str, to: Optional[str], what: str) -> None:
+        if fn not in self.inlock:
+            self.bad(fn, f"{what} but is not a PA_INLOCK_WRITER")
+            return
+        if to is None:
+            self.bad(fn, f"{what} with a non-literal state")
+            return
+        tos = {self._by_id[e]["to"] for e in self.inlock[fn]}
+        if to not in tos:
+            self.bad(fn, f"{what} to {to!r}, not in its edges {self.inlock[fn]}")
+        if to == "delivered":
+            self.writes_delivered.add(fn)
+            if fn not in self.lv.RECEIPT_CONFIRMED_WRITERS:
+                self.bad(fn, "moves an answer to delivered without a receipt")
+
+    # b: wrapper bodies
+    def _scan_wrapper(self, fn: ast.FunctionDef) -> None:
+        name, spec = fn.name, self.wrappers[fn.name]
+        params = {s[1] for s in spec.values() if s[0] in ("param", "reopen")}
+        cas = [n for n in ast.walk(fn) if isinstance(n, ast.Call) and _callee(n) == "_pa_cas"]
+        if len(cas) != 1:
+            self.bad(name, f"wrapper has {len(cas)} _pa_cas calls, expected 1")
+        else:
+            args = cas[0].args
+            for idx, side in ((2, "from"), (3, "from_status")):
+                want = spec[side]
+                got = args[idx] if len(args) > idx else None
+                ok = (isinstance(got, ast.Name) and got.id == want[1]) if want[0] == "param" \
+                    else (_str_or_tuple(got) == tuple(want[1]))
+                if not ok:
+                    self.bad(name, f"wrapper's _pa_cas {side} is not {want}")
+        for n in ast.walk(fn):
+            if isinstance(n, ast.Call) and _callee(n) == "_pa_set_state":
+                arg = n.args[2] if len(n.args) > 2 else None
+                if spec["to"][0] != "param" or not (isinstance(arg, ast.Name)
+                                                    and arg.id == spec["to"][1]):
+                    self.bad(name, "wrapper's _pa_set_state does not pass its to_state param")
+            if isinstance(n, (ast.Assign, ast.AugAssign, ast.AnnAssign)):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                for t in targets:
+                    for sub in ast.walk(t):
+                        if isinstance(sub, ast.Name) and sub.id in params:
+                            self.bad(name, f"wrapper rebinds {sub.id}")
+                        if (isinstance(sub, ast.Subscript)
+                                and _const_str(sub.slice) == "status"):
+                            self.bad(name, "wrapper writes status directly")
+            if isinstance(n, ast.Call) and _callee(n) == "_release_claim_to_open_unlocked":
+                if not self._under_if_reopen(fn, n):
+                    self.bad(name, "wrapper releases the claim outside `if reopen:`")
+
+    @staticmethod
+    def _under_if_reopen(fn: ast.AST, target: ast.AST) -> bool:
+        for n in ast.walk(fn):
+            if (isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "reopen"
+                    and any(target is x for s in n.body for x in ast.walk(s))):
+                return True
+        return False
+
+    # c/f: wrapper call sites
+    def _call_site(self, fn: str, call: ast.Call, wrapper: str) -> None:
+        spec = self.wrappers[wrapper]
+        args = _wrapper_args(call, wrapper)
+
+        def side(key):
+            s = spec[key]
+            if s[0] == "param":
+                v = _str_or_tuple(args.get(s[1]))
+                if v is None:
+                    self.bad(fn, f"{wrapper} call passes a non-literal {s[1]}")
+                return v
+            if s[0] == "literal":
+                return tuple(s[1])
+            return None
+
+        froms, statuses = side("from"), side("from_status")
+        tos = froms if spec["to"][0] == "same" else side("to")
+        reopen = False
+        if spec["to_status"][0] == "reopen" and "reopen" in args:
+            r = args["reopen"]
+            if not (isinstance(r, ast.Constant) and isinstance(r.value, bool)):
+                self.bad(fn, f"{wrapper} call passes a non-literal reopen")
+                return
+            reopen = r.value
+        if froms is None or tos is None or statuses is None:
+            return
+        pairs = zip(froms, froms) if spec["to"][0] == "same" else \
+            ((a, b) for a in froms for b in tos)
+        for old, new in pairs:
+            for st in statuses:
+                if self.lv.pair_unreachable(old, st):
+                    continue
+                new_st = "open" if reopen else st
+                edge = (old, new, st, new_st)
+                self.edges.setdefault(fn, set()).add(edge)
+                if self.lv.pair_unreachable(new, new_st):
+                    self.bad(fn, f"{wrapper} can land in unreachable {new}/{new_st}")
+                    continue
+                ids = [e["id"] for e in self.q.ANSWER_TRANSITIONS
+                       if edge in self.q.answer_edges(e["id"]) and fn in e["writers"]]
+                if not ids:
+                    self.bad(fn, f"{wrapper} makes {edge}, not an edge {fn} writes")
+                if new == "delivered" and old != "delivered":
+                    self.writes_delivered.add(fn)
+                    if fn not in self.lv.RECEIPT_CONFIRMED_WRITERS:
+                        self.bad(fn, "moves an answer to delivered without a receipt")
