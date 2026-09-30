@@ -485,3 +485,37 @@ migration has run (2026-08-20 spec).
   bounces is "lazy." Needs real numbers from production data.
 - **Per-queue engine override** — today the engine (claude/codex) is a spawn-time
   flag; it could live in the registry instead.
+
+## Orphan sweep and verifier-rejection reclaim (WT-30)
+
+`requeue_orphaned_tickets` (reconciler tick) reopens an `in_progress` ticket
+whose claimer is gone. A verifier/reviewer rejection re-binds the ticket to the
+builder's session but **keeps `claimed_by` = the builder's worker id** (the
+session id rides in `claimed_session_id`), stamps `resume = {sid, state, at}` and
+delivers the rejection to that session.
+
+`workers._resolve_claimer` classifies `claimed_by` as `builder | stage |
+unknown`: a known worker id, a `list_workers` row with that session id, the
+session-origin ledger (`worker`/`adhoc` = builder, any other role = stage,
+terminal), then `worker-sessions.json`. `unknown` (ambient sessions, OPS-104) and
+`stage` (WT-24) are never reopened by the sweep.
+
+A builder ticket is **held** while any evidence of life exists: (a) its worker
+is alive, (b) a live worker row owns the session, (c) a live resume child in the
+resume ledger, (d) the resume is still queued in the outbox, (e) **delegate
+transport only**: within `WATCHTOWER_RESUME_START_S` (45 s) of the real delivery
+time, or the transcript is busy. For local transports process identity is the
+only liveness evidence: a transcript written just before the process died does
+**not** hold the ticket (busy protects against forking a parallel resume, not
+against reclaiming from a dead process). Otherwise the ticket reopens on that
+tick (`REQUEUE <ref> — worker gone (verify-rejected; builder <id> dead)`), with
+`gate_feedback` kept for the next claimer (`wt claim` prints it). The reopen
+event records `orphan`, `displaced_session_id` and `displaced_claimed_by`, so a
+later resume of the displaced session gets the STOP preamble even after a fresh
+worker re-claims; a legitimate self-reclaim clears it.
+
+Every resume attempt logs `RESUME <ref> — <transport|queued|headless|failed|skipped>`.
+A builder over the context budget is skipped (released with the rejection text);
+a total delivery failure releases the claim instead of asking a human to resume
+manually. `drain_outbox` writes delivery / dead-letter outcomes back to the
+ticket's `resume` state, and the sweep also reads the outbox row itself.
