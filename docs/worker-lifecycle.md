@@ -547,3 +547,56 @@ Close ownership (already-closed, foreign in_progress, foreign parked, and a
 holder whose claim was released) is enforced in the store lock on every mutating
 outcome of a worker-attributed `wt close`, including the failed-gate reopen,
 which also compare-and-swaps on the pre-gate status.
+
+## Liveness state table (WT-31)
+
+`watchtower/liveness.py` is the single state table: `project(item)` maps a
+ticket to a `State` over the dims `status, gated, backend, plan, disc, awaiting,
+gate_pending, assessment, block, readiness, dep, claimed, parked, answer`, and
+`classify(state)` returns the one `Row` it is in (`id`, `owner`, `proof`,
+`recover`), or raises when the state is in `UNREACHABLE` or in no row.
+`prove(item, row)` names what proves the owner is at work (for stage rows, the
+exact `stages.desired()` role and key).
+
+Answer states (`pending_answer.state`, vocab `queue.ANSWER_STATES`) move only
+along `queue.ANSWER_TRANSITIONS` (E1–E17). Each edge declares `from`, `to`
+(`"="` = self-loop), the `(old_status, new_status)` pairs and its writers.
+`_pa_cas` checks every move at runtime (strict under
+`WATCHTOWER_STRICT_EDGES=1`, which the test suite sets; production logs
+`ANSWER_EDGE_UNDECLARED`), as do `block()` and `update(needs_input=True)` for
+their in-lock supersession (E17).
+
+Plan gate vs answers (D1a): while `PLAN_ACTIVE` (plan-gated, plan not
+`accepted`/`failed`) the plan stage owns the ticket. A worker `wt block` stays
+legacy `needs_input` instead of parking, `resume_claim` refuses, and
+`route_answer` / the reconciler hand a pending answer to the plan stage
+(`plan gate active; answer handed to the plan stage`). `desired()` spawns no
+stage while an answer is in flight (`ANSWER_INFLIGHT`).
+
+Every claim write records `claim_proc` (`worker_id, session_id, engine, pid,
+pid_started, exit_file, record_started_at, bound`); `bound` is `record` (a WT
+worker record), `ambient` (no record: never provably dead) or `inherited` (a
+re-bind that kept the builder's process: reject, `reopen --resume`, a resume
+after the parked worker exited). Parking moves it to `parked.proc`; ending a
+claim keeps it as `prior_claim_proc`. `liveness.claim_owner(item)` answers
+`alive | dead | unproven` from it.
+
+### Adding a state value, a dim or an edge
+
+1. Add the value to its vocabulary tuple in `queue.py` (`VALID_STATUSES`,
+   `PLAN_STATUSES`, `ANSWER_STATES`, ...). `tests/test_liveness_table.py`
+   now fails: the frozen copy in `liveness._FROZEN` differs (D2.4) and the
+   value is in no row (D2.1).
+2. Add it to `liveness._FROZEN`, then either widen a row's boxes, add a row
+   (with owner, proof and recover), or add an `UNREACHABLE` entry citing the
+   code that makes it impossible. Rows must stay disjoint on reachable states.
+3. A stage row needs its key rule in `prove()`, and `stages.desired()` must
+   agree over the whole product (D2.3).
+4. A new dim: add it to `DIMS`, `project()`, every box (`ALL()` fills omitted
+   dims) and `synth()` in `tests/liveness_golden.py`.
+5. A new answer move: declare it in `ANSWER_TRANSITIONS` with its writer. Write
+   it only through `pa_transition` / `pa_bump_attempts` with literal
+   arguments, or in a function listed in `liveness.PA_INLOCK_WRITERS`; the AST
+   scan (D2.6) rejects anything else. Only `RECEIPT_CONFIRMED_WRITERS` may move
+   an answer to `delivered`. Add a golden in `tests/test_liveness_goldens.py`
+   that drives the real function through the edge (`Golden.step(..., edge=)`).
