@@ -4646,6 +4646,14 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
                  if str(it.get("ref") or "") == ref),
                 None,
             )
+        if item and _q.plan_pending(item):
+            # Plan-gated (WT-22): plan first; no worker until it is accepted
+            # (cmd_plan's accept verdict dispatches again).
+            from . import cli as _cli
+            _cli.start_pending_plans(queue)
+            reason = "planning first — no worker until the plan is accepted"
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
         if not config.auto_drain(queue):
             # Drain off parks the backlog, but not a run somebody just asked
             # for -- bailing here is what made ▶ report "Running" and do

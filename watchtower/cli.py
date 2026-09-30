@@ -982,6 +982,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
             print(f"error: {ref} not found", file=sys.stderr)
             return 1
     else:
+        start_pending_plans(args.queue)
         try:
             item = q.claim_next(
                 worker,
@@ -1175,6 +1176,28 @@ def _start_plan_stage(item: dict) -> dict:
     return q.get(item["ref"]) or started
 
 
+def start_pending_plans(queue: str) -> int:
+    """Start the plan stage for every open, unclaimed plan-gated ticket on
+    ``queue`` whose planning has not begun (WT-22). Planning happens BEFORE a
+    build worker claims; ``_claim_candidates`` keeps the ticket unclaimable
+    until the plan settles. Best-effort; returns how many planners started."""
+    n = 0
+    try:
+        for it in q.list_items(project=queue) or []:
+            if it.get("status") != "open" or q.plan_gate(it) is None:
+                continue
+            if (it.get("plan") or {}).get("status"):
+                continue
+            started = q.plan_start(it["ref"])
+            if started is not None and started.pop("_plan_started", False):
+                _spawn_plan_role(started, "planner", _plan_goal(started),
+                                 f"plan-{it['ref']}")
+                n += 1
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
+
 def _plan_note(item: dict) -> str:
     """Claim-time instruction for the build worker about the plan stage."""
     if q.plan_gate(item) is None:
@@ -1213,6 +1236,12 @@ def cmd_plan(args: argparse.Namespace) -> int:
                                   by=args.by or _default_worker_id())
             status = item["plan"]["status"]
             print(f"PLAN {'ACCEPTED' if args.accept else 'REJECTED'}: {ref} -> {status}")
+            if status == "accepted" and item.get("status") == "open":
+                # The ticket just became claimable: wake/staff a build worker.
+                try:
+                    workers.dispatch_after_enqueue(item.get("project", ""), ref)
+                except Exception:  # noqa: BLE001
+                    pass
             if status == "planning":
                 _spawn_plan_role(item, "planner",
                                  _plan_goal(item, feedback=args.reasons or ""),

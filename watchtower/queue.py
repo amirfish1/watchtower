@@ -1896,6 +1896,9 @@ def _claim_candidates(
     disables the filter.
     """
     candidates = [it for it in items if it.get("status") == "open"]
+    # Plan gate (WT-22): a ticket is planned BEFORE a build worker claims it,
+    # so one whose plan has not settled is not claimable yet.
+    candidates = [it for it in candidates if not plan_pending(it)]
     if worker_model is not None:
         from . import config
         candidates = [
@@ -2717,6 +2720,15 @@ def plan_gate(item: Dict[str, Any]) -> Optional[str]:
         if g.startswith("plan:"):
             return g[5:].strip()
     return None
+
+
+def plan_pending(item: Dict[str, Any]) -> bool:
+    """True while a plan-gated ticket's plan has not settled (not yet started,
+    planning, reviewing, or blocked on a human): no build worker may claim it.
+    ``accepted`` and ``failed`` (the build proceeds, loudly) release it."""
+    if plan_gate(item) is None:
+        return False
+    return (item.get("plan") or {}).get("status", "") not in ("accepted", "failed")
 
 
 def _plan_update(ident: Any, fn) -> Optional[Dict[str, Any]]:

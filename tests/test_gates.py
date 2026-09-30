@@ -354,3 +354,20 @@ def test_plan_submit_out_of_turn_is_refused(plan_cli):
     a = _claimed(q, gates=["plan"])
     with pytest.raises(ValueError):
         q.plan_submit(a["ref"], "x")
+
+
+def test_plan_gated_ticket_unclaimable_until_plan_accepted(plan_cli):
+    """WT-22: planning happens before a build worker claims."""
+    q, cli, calls = plan_cli.q, plan_cli.cli, plan_cli.calls
+    a = _file(q, "t", gates=["plan"])
+    assert q.claim_next("w1", project="GT") is None     # plan not started
+    assert cli.start_pending_plans("GT") == 1           # planner spawned, unclaimed
+    assert q.get(a["ref"])["status"] == "open" and len(calls) == 1
+    assert cli.start_pending_plans("GT") == 0           # idempotent
+    assert q.claim_next("w1", project="GT") is None     # planning
+    cli.cmd_plan(_ns(plan_cmd="submit", ref=a["ref"], text="plan"))
+    assert q.claim_next("w1", project="GT") is None     # reviewing
+    cli.cmd_plan(_ns(plan_cmd="verdict", ref=a["ref"], accept=True, reasons="ok"))
+    got = q.claim_next("w1", project="GT")
+    assert got and got["ref"] == a["ref"]
+    assert "ACCEPTED PLAN" in cli._plan_note(q.get(a["ref"]))
