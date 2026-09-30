@@ -39,7 +39,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 VALID_BACKENDS = ("file", "github")
-VALID_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+from . import models as _models
+
+VALID_EFFORTS = _models.VALID_EFFORTS
 STANDARD_EFFORTS = VALID_EFFORTS[:-1]
 
 # How long a ticket is left alone before auto-drain may claim it. With
@@ -63,151 +65,8 @@ VALID_NOTIFY_EVENTS = ("claimed", "closed", "needs_input", "awaits_decision")
 # wording), and dropping it would silently stall the gate.
 DEFAULT_NOTIFY_EVENTS = ("closed", "needs_input", "awaits_decision")
 
-# WatchTower's explicitly supported worker model identifiers. This is a
-# deployment policy rather than a claim about every model an account may be
-# entitled to: the engine CLIs do not offer a portable, machine-readable model
-# discovery command. Keep this conservative and update it intentionally when a
-# fleet adopts a new model.
-MODEL_EFFORTS = {
-    "codex": (
-        ("gpt-6-astra", VALID_EFFORTS),
-        ("gpt-5.6", VALID_EFFORTS),
-        ("gpt-5.6-sol", VALID_EFFORTS),
-        ("gpt-5.6-terra", VALID_EFFORTS),
-        ("gpt-5.6-luna", VALID_EFFORTS),
-        ("gpt-5.5", STANDARD_EFFORTS),
-        ("gpt-5.4", STANDARD_EFFORTS),
-    ),
-    "claude": (
-        ("claude-opus-5-5", VALID_EFFORTS),
-        ("claude-opus-5", VALID_EFFORTS),
-        ("claude-opus-4-8", VALID_EFFORTS),
-        ("claude-sonnet-5-5", VALID_EFFORTS),
-        ("claude-sonnet-5", VALID_EFFORTS),
-    ),
-    # kimi has no effort flag on its CLI; pinned models accept no explicit
-    # effort. Plain kimi-for-coding is the low-cost tier ($0.95/$4 per 1M
-    # tok); highspeed is the fast tier at 2x ($1.90/$8) — pick per queue.
-    "kimi": (
-        ("kimi-code/k3", ()),
-        ("kimi-code/kimi-for-coding", ()),
-        ("kimi-code/kimi-for-coding-highspeed", ()),
-    ),
-    # devin (Devin CLI) has no effort flag; effort is baked into the model id
-    # suffix (-medium/-high/-max), same shape as kimi. `devin models list` is
-    # the full vocabulary; only the swe-2 family is approved for WT workers.
-    "devin": (
-        ("swe-2", ()),
-        ("swe-2-medium", ()),
-        ("swe-2-high", ()),
-        ("swe-2-max", ()),
-    ),
-    # antigravity (AGY, spawn-only via `wt spawn --engine antigravity`) has no
-    # effort flag; effort is baked into the model id suffix (-high/-medium/
-    # -low), so pinned models accept no explicit effort — same shape as kimi.
-    # Curated to the Gemini ids AGY serves (`agy models` lists the full
-    # vocabulary, which also carries other vendors' models; those are reached
-    # through their own engines, not through AGY).
-    "antigravity": (
-        ("gemini-3.1-pro-high", ()),
-        ("gemini-3.1-pro-low", ()),
-        ("gemini-3.6-flash-high", ()),
-        ("gemini-3.6-flash-medium", ()),
-        ("gemini-3.6-flash-low", ()),
-        ("gemini-3.7-flash-high", ()),
-        ("gemini-3.7-flash-medium", ()),
-        ("gemini-3.7-flash-low", ()),
-        ("gemini-3.8-flash-high", ()),
-        ("gemini-3.8-flash-medium", ()),
-        ("gemini-3.8-flash-low", ()),
-    ),
-}
-
-# Models the engines themselves advertise (WT-12). Codex's own cache and CCC's
-# Claude list are the live sources; MODEL_EFFORTS above is only the fallback
-# for what they don't cover. The machine-wide deny-list still wins.
-CODEX_MODELS_CACHE = Path(
-    os.environ.get("WATCHTOWER_CODEX_MODELS_CACHE")
-    or (Path.home() / ".codex" / "models_cache.json")
-)
-CLAUDE_MODELS_FILE = Path(
-    os.environ.get("WATCHTOWER_CLAUDE_MODELS_FILE")
-    or (Path.home() / ".claude" / "command-center" / "claude-models.json")
-)
-
-
-def _read_json(path: Path) -> Any:
-    try:
-        return json.loads(Path(path).expanduser().read_text())
-    except (OSError, ValueError):
-        return None
-
-
-def discovered_models(eng: str) -> Dict[str, tuple]:
-    """``{model id: efforts}`` advertised by the engine's own model list,
-    best/newest first. Empty when the source is missing or unreadable."""
-    eng = str(eng or "").strip().lower()
-    out: Dict[str, tuple] = {}
-    if eng == "codex":
-        data = _read_json(CODEX_MODELS_CACHE)
-        rows = data.get("models") if isinstance(data, dict) else None
-        rows = [r for r in rows or () if isinstance(r, dict) and r.get("slug")
-                and r.get("visibility") == "list"]
-        for r in sorted(rows, key=lambda r: r.get("priority") or 0):
-            levels = [str(x.get("effort") if isinstance(x, dict) else x).lower()
-                      for x in r.get("supported_reasoning_levels") or ()]
-            out[str(r["slug"])] = tuple(e for e in VALID_EFFORTS if e in levels) \
-                or VALID_EFFORTS
-    elif eng == "claude":
-        data = _read_json(CLAUDE_MODELS_FILE)
-        rows = data.get("records") if isinstance(data, dict) else None
-        rows = [r for r in rows or () if isinstance(r, dict) and r.get("id")]
-        for r in sorted(rows, key=lambda r: str(r.get("released_at") or ""),
-                        reverse=True):
-            mid = str(r["id"])
-            out[mid if mid.startswith("claude-") else f"claude-{mid}"] = VALID_EFFORTS
-    return out
-
-
-def model_catalog(eng: str) -> Dict[str, tuple]:
-    """Discovered models first, then hard-coded fallback entries not already
-    covered, as ``{model id: efforts}``."""
-    eng = str(eng or "").strip().lower()
-    out = dict(discovered_models(eng))
-    for model, efforts in MODEL_EFFORTS.get(eng, ()):
-        out.setdefault(model, efforts)
-    return out
-
-
-# Short aliases that callers may type (e.g. ``opus-5``) but that the engine CLI
-# does not accept verbatim as a ``--model`` value. Each resolves to the canonical
-# WatchTower identifier before being stored or passed to a worker.
-MODEL_ALIASES: Dict[str, Dict[str, str]] = {
-    "claude": {
-        "opus-5-5": "claude-opus-5-5",
-        "opus-5": "claude-opus-5",
-    },
-    # CCC's antigravity model picker stores its display label as the "id"
-    # (unlike every other engine, where the id is already the canonical CLI
-    # value) because that label is also what AGY's own settings.json expects.
-    # A `wt config --model` set from that picker therefore arrives here as
-    # "Gemini 3.8 Flash (High)", not "gemini-3.8-flash-high" -- alias it so
-    # the picker's choices resolve to a MODEL_EFFORTS-approved id instead of
-    # tripping the "not approved" queue-config validation.
-    "antigravity": {
-        "Gemini 3.1 Pro (High)": "gemini-3.1-pro-high",
-        "Gemini 3.1 Pro (Low)": "gemini-3.1-pro-low",
-        "Gemini 3.6 Flash (High)": "gemini-3.6-flash-high",
-        "Gemini 3.6 Flash (Medium)": "gemini-3.6-flash-medium",
-        "Gemini 3.6 Flash (Low)": "gemini-3.6-flash-low",
-        "Gemini 3.7 Flash (High)": "gemini-3.7-flash-high",
-        "Gemini 3.7 Flash (Medium)": "gemini-3.7-flash-medium",
-        "Gemini 3.7 Flash (Low)": "gemini-3.7-flash-low",
-        "Gemini 3.8 Flash (High)": "gemini-3.8-flash-high",
-        "Gemini 3.8 Flash (Medium)": "gemini-3.8-flash-medium",
-        "Gemini 3.8 Flash (Low)": "gemini-3.8-flash-low",
-    },
-}
+# Model ids/aliases/efforts/ranks come from each engine's own catalog
+# (see models.py); nothing in this module names a model.
 
 # Claude short forms that carry a version (``sonnet-5``, ``opus-4-8``) and so
 # need the ``claude-`` prefix to be a valid ``--model`` flag value. Bare family
@@ -277,7 +136,7 @@ def policy_fallback_model(eng: str) -> str:
         candidate = canonical_model(eng, candidate)
         if candidate and not is_blocked_model(candidate):
             return candidate
-    for candidate in model_catalog(eng):
+    for candidate in _models.catalog(eng) or ():
         if not is_blocked_model(candidate):
             return candidate
     return ""
@@ -889,7 +748,7 @@ def fallback_engine(failed_engine: str) -> str:
         if not candidate or candidate == failed or candidate in seen:
             continue
         seen.add(candidate)
-        if candidate in MODEL_EFFORTS and _workers.engine_available(candidate):
+        if candidate in _models.ENGINES and _workers.engine_available(candidate):
             return candidate
     return ""
 
@@ -940,7 +799,7 @@ def _usable_pin(queue: str, eng: str) -> str:
         return pin
     # Approved for ANY engine: a spawn may override the queue's engine, and
     # the pin then rides along (a pin for no engine at all is the bad case).
-    if any(pin in approved_models(e) for e in MODEL_EFFORTS):
+    if is_approved_model(eng, pin) or any(pin in approved_models(e) for e in _models.ENGINES):
         return pin
     return ""
 
@@ -1051,9 +910,8 @@ def canonical_model(eng: str, model_value: str) -> str:
 
     Two layers, in order:
 
-    1. The explicit ``MODEL_ALIASES`` table, for remaps where the short form
-       does not simply prefix (``opus-5`` -> ``claude-opus-5`` survived a
-       retarget from ``claude-opus-4-8``, so it must stay table-driven).
+    1. The catalog's aliases (``models.aliases``): display labels such as
+       antigravity's picker labels, and claude ids without their prefix.
     2. A structural fallback for claude's *versioned* short forms
        (``sonnet-5`` -> ``claude-sonnet-5``). CCC stores these bare for its
        own ``/model`` picker, but the claude CLI's ``--model`` flag rejects
@@ -1065,7 +923,7 @@ def canonical_model(eng: str, model_value: str) -> str:
     """
     eng = str(eng or "").strip().lower()
     m = str(model_value or "").strip()
-    aliased = MODEL_ALIASES.get(eng, {}).get(m)
+    aliased = _models.aliases(eng).get(m)
     if aliased:
         return aliased
     if eng == "claude" and m and not m.lower().startswith("claude-") \
@@ -1075,64 +933,43 @@ def canonical_model(eng: str, model_value: str) -> str:
 
 
 def approved_models(eng: str) -> tuple[str, ...]:
-    """Return the intentionally supported model identifiers for one engine.
-
-    Includes both canonical engine-CLI identifiers and any supported aliases.
-    """
+    """Model identifiers the engine's catalog offers (minus policy-blocked
+    ones), plus their aliases. Empty when no catalog is readable -- see
+    :func:`models.catalog_warning`; :func:`is_approved_model` then accepts
+    any explicit pin."""
     eng = str(eng or "").strip().lower()
-    canonical = tuple(m for m in model_catalog(eng) if not is_blocked_model(m))
-    return canonical + tuple(MODEL_ALIASES.get(eng, {}).keys())
+    canonical = tuple(m for m in (_models.catalog(eng) or ()) if not is_blocked_model(m))
+    return canonical + tuple(_models.aliases(eng))
 
 
-# FEAT-NEXT-120 — per-ticket model floor. Index in this tuple is the tier
-# (0 = lowest). Cross-engine on purpose: a ticket's floor is one model id
-# from any approved engine's list, compared against whichever engine/model
-# the CLAIMING queue actually runs. Keep in sync with queue.py's
-# VALID_MODEL_FLOORS and MODEL_EFFORTS above as new models get approved --
-# no ordering is implied by MODEL_EFFORTS itself (kimi's own list there
-# already isn't junior->senior), this is the single explicit ranking.
-MODEL_FLOOR_TIERS = (
-    "kimi-code/k3",
-    "kimi-code/kimi-for-coding",
-    "claude-sonnet-5",
-    "kimi-code/kimi-for-coding-highspeed",
-    "claude-sonnet-5-5",
-    "claude-opus-4-8",
-    "claude-opus-5",
-    "claude-opus-5-5",
-)
-
-
-def model_floor_tiers() -> tuple[str, ...]:
-    """``MODEL_FLOOR_TIERS`` plus engine-advertised models it doesn't rank yet.
-
-    Unranked discovered models are appended above the static ladder, oldest
-    first (discovered lists run best/newest first), so a new model is ranked
-    instead of failing the floor check. Claude only: its ordering is
-    unambiguous, while codex ids have no defined place on the cross-engine
-    ladder and stay unranked (fail closed).
-    """
-    extra = [m for m in reversed(list(discovered_models("claude")))
-             if m not in MODEL_FLOOR_TIERS and not is_blocked_model(m)]
-    return MODEL_FLOOR_TIERS + tuple(extra)
-
-
+# FEAT-NEXT-120 -- per-ticket model floor: one model id from any catalog,
+# compared against whichever engine/model the CLAIMING queue actually runs.
+# Ranks are data-derived (models.rank): catalog output price, or a user
+# override in ~/.watchtower/models.json.
 def model_meets_floor(model_id: str, floor: str) -> bool:
-    """True if ``model_id`` (canonical) meets or exceeds ``floor``'s tier.
+    """True if ``model_id`` (canonical) meets or exceeds ``floor``'s rank.
 
     An empty or unranked *floor* is not enforceable, so it is met. An
     unranked *model* fails CLOSED against a ranked floor (WT-10): routing the
     ticket to a known floor model is cheap, silently letting an unknown model
     work it is the bug this replaced.
     """
-    floor = str(floor or "").strip()
-    tiers = model_floor_tiers()
-    if not floor or floor not in tiers:
+    floor_rank = _models.rank(floor)
+    if not str(floor or "").strip() or floor_rank is None:
         return True
-    model_id = str(model_id or "").strip()
-    if model_id not in tiers:
-        return False
-    return tiers.index(model_id) >= tiers.index(floor)
+    model_rank = _models.rank(model_id)
+    return model_rank is not None and model_rank >= floor_rank
+
+
+def floor_engine(floor_model: str) -> str:
+    """Engine whose catalog serves ``floor_model`` ("" when none does)."""
+    return _models.engine_of(floor_model)
+
+
+def is_valid_model_floor(value: str) -> bool:
+    """A ticket floor is empty or any model some catalog knows."""
+    value = str(value or "").strip()
+    return not value or _models.known(value)
 
 
 def queue_model_id(queue: str) -> str:
@@ -1144,26 +981,6 @@ def model_floor_met(queue: str, floor: str) -> bool:
     """True if ``queue``'s configured model meets or exceeds ``floor``'s tier
     (fails closed on an unranked queue model; see ``model_meets_floor``)."""
     return model_meets_floor(queue_model_id(queue), floor)
-
-
-def unranked_models() -> List[str]:
-    """Claude/kimi models in MODEL_EFFORTS with no MODEL_FLOOR_TIERS rank.
-
-    Those two engines have an unambiguous ordering; a model that falls off
-    the ranking is surfaced (tests, dashboard) rather than ignored.
-    """
-    return [
-        m for eng in ("claude", "kimi") for m, _ in MODEL_EFFORTS.get(eng, ())
-        if m not in MODEL_FLOOR_TIERS
-    ]
-
-
-def floor_engine(floor_model: str) -> str:
-    """Engine that serves ``floor_model`` ("" when no approved engine does)."""
-    for eng, models in MODEL_EFFORTS.items():
-        if any(m == floor_model for m, _ in models):
-            return eng
-    return ""
 
 
 # The recognizable opening of the retired claim-time floor-park question
@@ -1184,6 +1001,8 @@ def is_approved_model(eng: str, value: str) -> bool:
         return True
     if is_blocked_model(canonical_model(eng, model_value)):
         return False
+    if _models.catalog(eng) is None:
+        return True  # unknown catalog: never reject an explicit pin
     return model_value in approved_models(eng)
 
 
@@ -1196,7 +1015,10 @@ def approved_efforts(eng: str, model: str = "") -> tuple[str, ...]:
     model_value = canonical_model(eng, model)
     if not model_value:
         return VALID_EFFORTS
-    return model_catalog(eng).get(model_value, ())
+    cat = _models.catalog(eng)
+    if cat is None:
+        return VALID_EFFORTS
+    return cat.get(model_value, ())
 
 
 def is_approved_effort(eng: str, model: str, value: str) -> bool:

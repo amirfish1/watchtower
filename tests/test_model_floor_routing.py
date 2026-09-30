@@ -17,11 +17,14 @@ def _sonnet_queue(wt_env):
     wt_env.config.set_grace_s(QUEUE, 0)
 
 
-def test_every_claude_and_kimi_model_is_ranked(wt_env):
-    assert wt_env.config.unranked_models() == []
-    assert set(wt_env.queue.VALID_MODEL_FLOORS) == set(
-        wt_env.config.MODEL_FLOOR_TIERS
-    ) | {""}
+def test_every_priced_catalog_model_is_ranked_and_a_valid_floor(wt_env):
+    from watchtower import models
+    for eng in ("claude", "kimi"):
+        for m in models.catalog(eng):
+            assert models.rank(m) is not None, m
+            assert wt_env.config.is_valid_model_floor(m)
+    assert wt_env.config.is_valid_model_floor("")
+    assert not wt_env.config.is_valid_model_floor("not-a-model")
 
 
 def test_sonnet_5_5_queue_does_not_meet_an_opus_5_5_floor(wt_env):

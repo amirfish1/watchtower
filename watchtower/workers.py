@@ -4229,7 +4229,7 @@ def build_drain_command(
         # attached (empty) prompt before any other flags. Its NDJSON envelope
         # also differs from Claude's; see _stream_json_user_line.
         # Like kimi, AGY has no --effort flag -- effort is baked into the
-        # model id suffix (-high/-medium/-low; see MODEL_EFFORTS). Passing
+        # model id suffix (-high/-medium/-low; see the model catalog). Passing
         # --effort here (even the fleet-wide default) makes AGY exit 1 with
         # "--effort is not supported for model ...".
         argv = [

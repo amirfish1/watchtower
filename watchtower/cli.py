@@ -661,6 +661,18 @@ def cmd_find(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bad_model_floor(args: argparse.Namespace) -> bool:
+    """Reject a --model-floor no model catalog knows (WT-13; formerly an
+    argparse choices list)."""
+    from . import config
+    floor = getattr(args, "model_floor", None)
+    if floor and not config.is_valid_model_floor(floor):
+        print(f"error: --model-floor {floor!r} is not a model in any catalog "
+              "(see `wt models --engine <engine>`)", file=sys.stderr)
+        return True
+    return False
+
+
 def cmd_edit(args: argparse.Namespace) -> int:
     """Patch fields (title/priority/type/readiness/...) on an existing
     ticket, in place -- no refile/close churn (WT-71). Only flags the
@@ -668,6 +680,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
     --queue moves the ticket to a different queue in place (WT-83), also
     without refile/close churn -- its ref is reassigned within the target
     queue since refs are derived from project+number."""
+    if _bad_model_floor(args):
+        return 1
     fields = {}
     for name in (
         "title", "note", "text", "url", "type", "readiness", "priority",
@@ -730,6 +744,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
+    if _bad_model_floor(args):
+        return 1
     submitter = (getattr(args, "submitter", "") or "").strip()
     if not submitter:
         # Same auto-detection --report-to already relies on: a Claude session
@@ -3566,7 +3582,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         cfg.setdefault("grace_s", config.grace_s(args.queue))
         print(f"{args.queue}: {cfg}")
         eng, mdl = config.engine(args.queue), str(cfg.get("model") or "")
-        if not config.is_approved_model(eng, mdl):
+        from . import models as _catalogs
+        if _catalogs.catalog_warning(eng):
+            print(f"warning: {_catalogs.catalog_warning(eng)}", file=sys.stderr)
+        elif not config.is_approved_model(eng, mdl):
             print(f"warning: {mdl!r} is not an approved {eng} model; "
                   f"run `wt models --engine {eng}`", file=sys.stderr)
     else:
@@ -3586,6 +3605,10 @@ def _validate_queue_worker_settings(args: argparse.Namespace, config: Any) -> bo
     existing = config.get_queue_config(args.queue)
     model_arg = getattr(args, "model", None)
     model = existing.get("model", "") if model_arg is None else model_arg
+    if model:
+        from . import models as _catalogs
+        if _catalogs.catalog_warning(engine):
+            print(f"warning: {_catalogs.catalog_warning(engine)}", file=sys.stderr)
     if not config.is_approved_model(engine, model):
         choices = ", ".join(config.approved_models(engine))
         print(
@@ -3616,6 +3639,10 @@ def cmd_models(args: argparse.Namespace) -> int:
         print("error: --engine is required (or use `wt models migrate|unpin`)", file=sys.stderr)
         return 2
     models = list(config.approved_models(args.engine))
+    from . import models as _catalogs
+    warning = _catalogs.catalog_warning(args.engine)
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
     payload = {"engine": args.engine, "models": models}
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -4993,7 +5020,6 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--confidence", default="", choices=["H", "M", "L", ""],
                                help="confidence: H, M, or L")
         subparser.add_argument("--model-floor", default="", dest="model_floor",
-                               choices=list(q.VALID_MODEL_FLOORS),
                                help="filer's best-guess minimum model this ticket "
                                     "needs (FEAT-NEXT-120); empty is fine, never a "
                                     "blocker at filing time")
@@ -5073,7 +5099,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--confidence", default=None, choices=["H", "M", "L"],
                    help="confidence: H, M, or L")
     s.add_argument("--model-floor", default=None, dest="model_floor",
-                   choices=[m for m in q.VALID_MODEL_FLOORS if m],
                    help="filer's best-guess minimum model this ticket needs "
                         "(FEAT-NEXT-120)")
     s.add_argument("--selector", default=None)

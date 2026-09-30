@@ -28,6 +28,22 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def fixture_model_catalogs(monkeypatch):
+    """Model lists come from fixture catalogs, never this machine's real
+    ~/.codex / CCC files (WT-13)."""
+    d = Path(__file__).parent / "fixtures" / "models"
+    for env, attr, name in (
+        ("WATCHTOWER_CODEX_MODELS_CACHE", "CODEX_MODELS_CACHE", "codex.json"),
+        ("WATCHTOWER_CLAUDE_MODELS_FILE", "CLAUDE_MODELS_FILE", "claude.json"),
+        ("WATCHTOWER_DEVIN_MODELS_FILE", "DEVIN_MODELS_FILE", "devin.json"),
+        ("WATCHTOWER_MODELS_FILE", "USER_MODELS_FILE", "models.json"),
+    ):
+        monkeypatch.setenv(env, str(d / name))
+        if "watchtower.models" in sys.modules:
+            monkeypatch.setattr(sys.modules["watchtower.models"], attr, d / name)
+
+
+@pytest.fixture(autouse=True)
 def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
     """Keep the real outbox, the real delegate and the real caller identity
     out of every test.

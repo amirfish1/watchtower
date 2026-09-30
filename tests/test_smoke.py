@@ -648,7 +648,7 @@ def test_model_floor_met_ranks_across_engines(store):
 
 def test_model_floor_accepts_claude_opus_5(store, capsys):
     """MYTOPOFMIND-12: ``claude-opus-5`` is an approved model (WT-116) but was
-    missing from VALID_MODEL_FLOORS/MODEL_FLOOR_TIERS, so ``wt add
+    missing from the old hard-coded floor lists, so ``wt add
     --model-floor claude-opus-5`` failed argparse's choices check with
     "invalid choice" -- opus-5 not recognized as a valid floor -- and any
     ticket that did carry it as a floor silently failed open (ranked as
@@ -657,7 +657,7 @@ def test_model_floor_accepts_claude_opus_5(store, capsys):
     import watchtower.config as config
     import watchtower.queue as q
 
-    assert "claude-opus-5" in q.VALID_MODEL_FLOORS
+    assert config.is_valid_model_floor("claude-opus-5")
 
     config.set_engine("Q", "claude")
     config.set_model("Q", "claude-opus-4-8")

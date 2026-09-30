@@ -1,0 +1,34 @@
+{
+ "records": [
+  {
+   "id": "fable-5-1",
+   "output_per_mtok": 50,
+   "released_at": "2026-09-01"
+  },
+  {
+   "id": "opus-5-5",
+   "output_per_mtok": 20,
+   "released_at": "2026-09-22"
+  },
+  {
+   "id": "sonnet-5-5",
+   "output_per_mtok": 10,
+   "released_at": "2026-09-28"
+  },
+  {
+   "id": "opus-5",
+   "output_per_mtok": 15,
+   "released_at": "2026-06-01"
+  },
+  {
+   "id": "opus-4-8",
+   "output_per_mtok": 14,
+   "released_at": "2026-03-01"
+  },
+  {
+   "id": "sonnet-5",
+   "output_per_mtok": 7,
+   "released_at": "2026-05-01"
+  }
+ ]
+}

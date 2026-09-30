@@ -15,16 +15,17 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import config
+from . import config, models
 
-ENGINES = ("claude", "codex", "kimi", "devin", "antigravity")
+ENGINES = models.ENGINES
 
 
 def _engine_of(model_id: str, prefer: str = "") -> str:
     """Engine whose approved list contains ``model_id`` (``prefer`` first)."""
     order = ([prefer] if prefer else []) + [e for e in ENGINES if e != prefer]
     for eng in order:
-        if model_id and config.is_approved_model(eng, config.canonical_model(eng, model_id)):
+        canon = config.canonical_model(eng, model_id)
+        if model_id and canon in config.approved_models(eng) and config.is_approved_model(eng, canon):
             return eng
     return ""
 
@@ -39,13 +40,14 @@ def _counts_and_items() -> Dict[str, List[dict]]:
 
 
 def _floor_warnings(queue_name: str, items: List[dict], new_model: str) -> List[str]:
-    tiers = config.model_floor_tiers()
-    if new_model not in tiers:
+    new_rank = models.rank(new_model)
+    if new_rank is None:
         return []
     out = []
     for it in items:
         floor = str(it.get("model_floor") or "")
-        if floor in tiers and tiers.index(floor) > tiers.index(new_model):
+        floor_rank = models.rank(floor) if floor else None
+        if floor_rank is not None and floor_rank > new_rank:
             out.append(
                 f"{it.get('ref', '?')} ({it.get('status')}) has model floor {floor}, "
                 f"above {new_model}: it will BLOCK on {queue_name}"

@@ -146,16 +146,8 @@ VALID_CONFIDENCES = ("H", "M", "L", "")
 # FEAT-NEXT-120 — a filer's best-guess minimum model this ticket needs. Not a
 # blocker at filing time (empty is fine, filer never waits for certainty);
 # checked against the claiming queue's configured model at claim time (see
-# config.model_floor_met). Canonical model ids, not aliases -- keep in sync
-# with config.py's MODEL_EFFORTS as new models get approved.
-def _valid_model_floors() -> Tuple[str, ...]:
-    # Derived from the one explicit ranking so a new model cannot be rankable
-    # in config yet rejected as a ticket floor (WT-10).
-    from . import config
-    return tuple(config.MODEL_FLOOR_TIERS) + ("",)
-
-
-VALID_MODEL_FLOORS = _valid_model_floors()
+# config.model_floor_met). Canonical model ids, not aliases; validity is
+# config.is_valid_model_floor (any model a catalog knows), never a fixed list.
 
 # Legacy CCC store — WatchTower reads it if present so it works on this machine
 # today, before any WatchTower-native queue exists.
@@ -864,6 +856,13 @@ def _norm_choice(value: Any, valid_values: tuple, default: str = "") -> str:
     return default
 
 
+def _norm_model_floor(value: Any) -> str:
+    """A known model id, else "" (an unknown floor is dropped, never fatal)."""
+    from . import config
+    s = str(value or "").strip()
+    return s if config.is_valid_model_floor(s) else ""
+
+
 def _prio_rank(it: Dict[str, Any]) -> int:
     """Numeric rank for priority sorting (lower = higher priority)."""
     return {"p0": 0, "p1": 1, "p2": 2, "p3": 3, "p4": 4}.get(it.get("priority", ""), 5)
@@ -1411,7 +1410,7 @@ def enqueue(
             "priority": _norm_choice(priority, VALID_PRIORITIES),
             "value": _norm_choice(value, VALID_VALUES),
             "confidence": _norm_choice(confidence, VALID_CONFIDENCES),
-            "model_floor": _norm_choice(model_floor, VALID_MODEL_FLOORS),
+            "model_floor": _norm_model_floor(model_floor),
             "needs_input": False,
             "block_question": "",
             # The two ticket-level eligibility inputs (2026-07-26 design). The
