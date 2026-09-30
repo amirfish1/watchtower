@@ -719,3 +719,28 @@ def test_trusted_directory_refusal_is_a_classified_launch_failure(stg, tmp_path)
     log.write_text("Error: Not inside a trusted directory and --skip-git-repo-check was not specified.")
     c = stg.workers._classify_launch_failure_log(log)
     assert c and "not trusted" in c["reason"]
+
+
+# ------------------------------------------------ missing engine CLI (WT-24 fix)
+
+@pytest.mark.parametrize("make", ["plan", "verify"])
+def test_missing_engine_cli_sets_cooldown_and_refunds_not_fail_open(stg, monkeypatch, make):
+    def missing(engine, prompt, **kw):
+        raise ValueError(f"{engine} CLI not found on PATH")
+    monkeypatch.setattr(stg.workers, "build_adhoc_command", missing)
+    ref = _plan_ticket(stg) if make == "plan" else _verify_ticket(stg)
+    _tick(stg)
+    item = stg.q.get(ref)
+    ss = _ss(stg, ref)
+    assert (item.get("plan") or {}).get("status") != "failed"   # gate not released
+    assert item["needs_input"] is False
+    assert ss["attempt"] == 0 and ss["deaths"][-1].get("refunded") is True
+    assert "CLI" in ss["deaths"][-1]["reason"]
+    assert stg.workers.active_launch_failure_cooldown("ST", _engine_of(stg, ref)) is not None
+    assert _activity(stg, "STAGE_DEAD", ref)
+
+
+def _engine_of(ns, ref):
+    item = ns.q.get(ref)
+    role = "planner" if (item.get("plan") or {}).get("status") else "verifier"
+    return ns.stages._role_target(item, role)["engine"]

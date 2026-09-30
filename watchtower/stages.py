@@ -407,7 +407,7 @@ def _ss_set(ref: str, **fields: Any) -> Optional[Dict[str, Any]]:
 
 def _record_death(ref: str, project: str, role: str, key: str, reason: str,
                   extra: Dict[str, Any], rec: Optional[Dict[str, Any]],
-                  refunded: bool = False) -> Dict[str, Any]:
+                  refunded: bool = False, unspawned: bool = False) -> Dict[str, Any]:
     captured: Dict[str, Any] = {}
 
     def _do(it, ss):
@@ -418,7 +418,8 @@ def _record_death(ref: str, project: str, role: str, key: str, reason: str,
         if refunded:
             death["refunded"] = True
             ss["refunds"] = int(ss.get("refunds") or 0) + 1
-            ss["attempt"] = max(0, attempt_no - 1)
+            if not unspawned:   # a spawn that never started did not bump the attempt
+                ss["attempt"] = max(0, attempt_no - 1)
         ss["deaths"] = (list(ss.get("deaths") or []) + [death])[-10:]
         ss["worker_id"] = ""
         ss["dead_reason"] = reason[:500]
@@ -470,6 +471,7 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
     """Spawn one stage session. Returns a short action tag; never raises."""
     ref, project = str(item["ref"]), str(item.get("project") or "")
     attempt = int(ss.get("attempt") or 0) + 1
+    engine = ""
     try:
         target = _role_target(item, role)
         if target["blocked"]:
@@ -506,7 +508,7 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
                                   name=name, report_to="", verify=(role == "verifier"),
                                   stage=role, ticket_ref=ref, ticket_queue=project)
     except Exception as exc:  # noqa: BLE001
-        return _spawn_error(item, role, key, ss, exc)
+        return _spawn_error(item, role, key, ss, exc, engine=engine)
     info = {"engine": engine, "model": target["model"], "source": target["source"],
             "worker_id": rec.get("worker_id", ""), "stage_key": key}
     if role == "planner":
@@ -546,11 +548,22 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
 
 
 def _spawn_error(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
-                 exc: Exception) -> str:
+                 exc: Exception, engine: str = "") -> str:
     """A spawn that could not start: blocked model / missing repo / engine. The
-    pre-WT-24 semantics: plan stage fails open; verifier and assessor need a human."""
+    pre-WT-24 semantics: plan stage fails open; verifier and assessor need a human.
+    A missing engine CLI is the exception: it is an engine-missing launch failure
+    (shared cooldown + refunded death), so the plan gate is not released."""
     ref, project = str(item["ref"]), str(item.get("project") or "")
     _log("STAGE_DEAD", f"{ref} {role} - could not spawn: {exc}", queue=project)
+    if engine and "CLI not found" in str(exc):
+        reason = f"engine CLI missing: {exc}"[:300]
+        workers._record_launch_failure(
+            queue=project, engine=engine, worker_id="", pid=0, log_path=Path(os.devnull),
+            reason=reason, exit_code=None)
+        refunded = int(ss.get("refunds") or 0) < MAX_REFUNDS
+        _record_death(ref, project, role, str(key), reason, {"rc": None}, None,
+                      refunded=refunded, unspawned=True)
+        return "launch_failed"
     if role in ("planner", "plan_reviewer"):
         q.plan_fail(ref, f"could not spawn the {role}: {exc}")
         return "failed"
