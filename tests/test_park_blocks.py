@@ -17,10 +17,16 @@ def wt(tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
     monkeypatch.setenv("WATCHTOWER_OUTBOX_FILE", str(tmp_path / "outbox.json"))
     monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
+    monkeypatch.setenv("WATCHTOWER_WORKERS_FILE", str(tmp_path / "workers.json"))
+    monkeypatch.setenv("WATCHTOWER_WORKER_IDS_FILE", str(tmp_path / "worker-ids.json"))
+    monkeypatch.setenv("WATCHTOWER_WORKER_SESSIONS_FILE", str(tmp_path / "worker-sessions.json"))
+    monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "config.json"))
     monkeypatch.delenv("WATCHTOWER_MACHINE", raising=False)
     import watchtower.queue as q
     import watchtower.messages as messages
+    import watchtower.workers as _workers
     importlib.reload(q)
+    importlib.reload(_workers)
     import watchtower.answers as answers
     import watchtower.cli as cli
     importlib.reload(answers)
