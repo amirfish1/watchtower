@@ -114,6 +114,18 @@
          <code class="inline-code">--effort</code>.</p>
     </div>
     <div class="cli-cmd">
+      <h3><span class="verb">wt</span> models migrate / unpin</h3>
+      <div class="sig">wt models migrate --from MODEL --to MODEL [--queues A,B] [--engine E] [--include-default] [--apply]
+wt models unpin (--queues A,B | --all-matching MODEL) [--apply]</div>
+      <p>Bulk-move queues from one model to another after a model bump. Dry run by default: lists every queue whose
+         effective model (the resolution <code class="inline-code">wt config</code> uses) equals <code>--from</code>, with engine,
+         auto-drain and open/WIP counts. <code>--to</code> must be approved (exit 1 otherwise); a cross-engine move needs
+         <code>--engine</code>. Only pinned queues are rewritten; queues inheriting the default move with
+         <code>--include-default</code>, which rewrites the matching keys in CCC's <code>spawn-defaults.json</code> and prints which.
+         Warns about open/WIP tickets whose model floor is above the new model and about queues on a policy-blocked model.
+         <code>unpin</code> clears the explicit model so a queue follows the default.</p>
+    </div>
+    <div class="cli-cmd">
       <h3><span class="verb">wt</span> set</h3>
       <div class="sig">wt set -q QUEUE [--backend {file,github}] [--github-repo REPO] [--github-assignee WHO]
        [--repo-path PATH] [--engine {claude,codex,kimi}] [--model MODEL]

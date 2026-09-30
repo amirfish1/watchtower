@@ -3486,6 +3486,9 @@ def cmd_models(args: argparse.Namespace) -> int:
     """List model identifiers WatchTower intentionally supports per engine."""
     from . import config
 
+    if not args.engine:
+        print("error: --engine is required (or use `wt models migrate|unpin`)", file=sys.stderr)
+        return 2
     models = list(config.approved_models(args.engine))
     payload = {"engine": args.engine, "models": models}
     if args.json:
@@ -3494,6 +3497,69 @@ def cmd_models(args: argparse.Namespace) -> int:
         print(f"{args.engine} approved models:")
         for model in models:
             print(f"  {model}")
+    return 0
+
+
+def _csv(value: Optional[str]) -> Optional[List[str]]:
+    return [q.strip() for q in value.split(",") if q.strip()] if value else None
+
+
+def cmd_models_migrate(args: argparse.Namespace) -> int:
+    """`wt models migrate`: bulk-move queues (and optionally the host default)."""
+    from . import models_migrate as mm
+
+    try:
+        plan = mm.plan_migrate(args.from_model, args.to_model, queues=_csv(args.queues),
+                               engine=args.to_engine or "",
+                               include_default=args.include_default)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    applied = []
+    if args.apply and not plan["refused"]:
+        applied = mm.apply_migrate(plan)
+    if args.json:
+        print(json.dumps({**plan, "applied": applied, "dry_run": not args.apply}, indent=2))
+    else:
+        print(f"{plan['from']} -> {plan['to']} ({'APPLY' if args.apply else 'dry run'})")
+        print(mm.format_rows(plan["rows"], "action") if plan["rows"]
+              else f"no queues resolve to {plan['from']}")
+        for ch in plan["default_changes"]:
+            print(f"default: {plan['defaults_file']} {ch['key']} {ch['from']} -> {ch['to']}")
+        if args.include_default and not plan["default_changes"]:
+            print(f"default: nothing in {plan['defaults_file']} resolves to {plan['from']}")
+        for w in plan["warnings"]:
+            print(f"warning: {w}")
+        for line in applied:
+            print(f"changed: {line}")
+        if not args.apply:
+            print("dry run: nothing written; re-run with --apply")
+    if plan["refused"]:
+        print(f"error: cross-engine move for {', '.join(plan['refused'])}; "
+              f"pass --engine {plan['engine']} to allow it (nothing written)", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_models_unpin(args: argparse.Namespace) -> int:
+    """`wt models unpin`: clear explicit queue models so they follow the default."""
+    from . import models_migrate as mm
+
+    queues = _csv(args.queues)
+    if not queues and not args.all_matching:
+        print("error: pass --queues A,B or --all-matching <model>", file=sys.stderr)
+        return 2
+    plan = mm.plan_unpin(queues=queues, matching=args.all_matching or "")
+    applied = mm.apply_unpin(plan) if args.apply else []
+    if args.json:
+        print(json.dumps({**plan, "applied": applied, "dry_run": not args.apply}, indent=2))
+    else:
+        print(f"unpin ({'APPLY' if args.apply else 'dry run'})")
+        print(mm.format_rows(plan["rows"], "after") if plan["rows"] else "no pinned queues match")
+        for line in applied:
+            print(f"changed: {line}")
+        if not args.apply:
+            print("dry run: nothing written; re-run with --apply")
     return 0
 
 
@@ -4481,7 +4547,7 @@ COMMAND_HELP: Dict[str, str] = {
     "migrate-store": "one-time JSON -> SQLite store migration (idempotent)",
     "export-json": "dump the store as classic {counter, items} JSON",
     "status": "per-queue depth / age / stuck flag",
-    "models": "list WatchTower-approved model identifiers per engine",
+    "models": "list approved models per engine; `migrate`/`unpin` bulk-move queue models",
     "config": "recommended queue configuration: settings plus auto-drain policy",
     "set": "compatibility alias for basic queue settings; prefer `wt config`",
     "drain": "enable or disable auto-drain for a queue",
@@ -4663,11 +4729,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("models")
-    s.add_argument("--engine", required=True,
+    s.add_argument("--engine", default=None,
                    choices=["claude", "codex", "kimi", "devin", "antigravity"],
                    help="engine whose supported worker model identifiers to list")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_models)
+    ms = s.add_subparsers(dest="models_cmd")
+    m = ms.add_parser("migrate", help="bulk-move queues (and the default) from one model to another")
+    m.add_argument("--from", required=True, dest="from_model", help="model queues resolve to now")
+    m.add_argument("--to", required=True, dest="to_model", help="approved model to move to")
+    m.add_argument("--queues", default=None, help="comma-separated queues (default: all matching)")
+    m.add_argument("--engine", default=None, dest="to_engine",
+                   help="allow a cross-engine move onto this engine")
+    m.add_argument("--include-default", action="store_true",
+                   help="also update the host worker default in CCC spawn-defaults.json")
+    m.add_argument("--apply", action="store_true", help="write changes (default: dry run)")
+    m.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    m.set_defaults(func=cmd_models_migrate)
+    u = ms.add_parser("unpin", help="clear a queue's explicit model so it follows the default")
+    u.add_argument("--queues", default=None, help="comma-separated queues")
+    u.add_argument("--all-matching", default=None, metavar="MODEL",
+                   help="every queue pinned to MODEL")
+    u.add_argument("--apply", action="store_true", help="write changes (default: dry run)")
+    u.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    u.set_defaults(func=cmd_models_unpin)
 
     s = sub.add_parser("ls")
     s.add_argument("-q", "--queue", required=True)
