@@ -467,7 +467,7 @@ def _queue_for_repo_path(repo_path: str) -> str:
     try:
         from . import config
         configured = []
-        for name, conf in (config.all_queues() or {}).items():
+        for name, conf in (config.all_queues(include_archived=True) or {}).items():
             cfg_rp = str((conf or {}).get("repo_path") or "").rstrip("/")
             if not cfg_rp:
                 continue
@@ -549,7 +549,7 @@ def _github_projects() -> List[str]:
         from . import config
         return [
             _norm_project(name)
-            for name in config.all_queues()
+            for name in config.all_queues(include_archived=True)
             if config.backend(name) == "github"
         ]
     except Exception:

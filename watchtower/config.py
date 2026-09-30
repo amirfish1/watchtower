@@ -1204,9 +1204,37 @@ def desired_workers(queue: str) -> int:
     return int(_queue_entry(queue).get("desired_workers", 1))
 
 
-def all_queues() -> Dict[str, Any]:
-    """Return all configured queues (any queue with an entry in the config file)."""
-    return dict(_load())
+def is_archived(queue: str) -> bool:
+    return bool(_queue_entry(queue).get("archived", False))
+
+
+def set_archived(queue: str, archived: bool) -> Dict[str, Any]:
+    """Retire (or restore) a queue. Archiving also turns auto_drain off and
+    records when; the queue's tickets are untouched."""
+    data = _load()
+    q = data.get(queue)
+    if not isinstance(q, dict):
+        q = data[queue] = {}
+    if archived:
+        q["archived"] = True
+        q["archived_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        q["auto_drain"] = False
+    else:
+        q.pop("archived", None)
+        q.pop("archived_at", None)
+    _save(data)
+    return q
+
+
+def all_queues(include_archived: bool = False) -> Dict[str, Any]:
+    """Return all configured queues (any queue with an entry in the config file).
+
+    Archived queues (``wt queue archive``) are hidden unless ``include_archived``.
+    """
+    return {
+        k: v for k, v in _load().items()
+        if include_archived or not (isinstance(v, dict) and v.get("archived"))
+    }
 
 
 def ensure_entry(queue: str) -> Dict[str, Any]:

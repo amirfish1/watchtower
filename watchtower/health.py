@@ -222,8 +222,12 @@ def all_status(
     drain_window_minutes: int = DRAIN_WINDOW_MINUTES,
     fresh: bool = False,
     items: Optional[List[Dict[str, Any]]] = None,
+    include_archived: bool = False,
 ) -> List[Dict[str, Any]]:
     """Status rows for every queue (or one, if ``project`` is given).
+
+    Archived queues (``wt queue archive``) are omitted unless
+    ``include_archived``; naming one via ``project`` still shows it.
 
     Empty queues (all closed, depth 0) are still listed so a drained queue
     shows up as healthy rather than vanishing.
@@ -239,7 +243,12 @@ def all_status(
     """
     now = now or datetime.now(timezone.utc)
     by_queue: Dict[str, List[Dict[str, Any]]] = {}
-    configured = config.all_queues()
+    configured = config.all_queues(include_archived=True)
+    hidden = (
+        set() if include_archived
+        else {n for n in configured if config.is_archived(n) and n != project}
+    )
+    configured = {n: v for n, v in configured.items() if n not in hidden}
     if project:
         if project in configured:
             by_queue.setdefault(project, [])
@@ -248,6 +257,8 @@ def all_status(
             by_queue.setdefault(name, [])
     fetched = items if items is not None else q.list_items(project=project, fresh=fresh)
     for it in fetched:
+        if (it.get("project") or "GEN") in hidden:
+            continue
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
     by_ref = q._refs_index(fetched)
     waiting_refs = {

@@ -122,6 +122,8 @@ def _print_status(rows: List[dict]) -> None:
         for r in rows:
             flag = {"stuck": "STUCK", "backlog": "backlog",
                     "active": "draining", "clear": "ok"}.get(r.get("state"), "ok")
+            if _cfg.is_archived(r["queue"]):
+                flag = "archived"
             wc = counts.get(r["queue"], {"total": 0, "live": 0})
             wcell = f"{wc['total']} ({wc['live']} live)"
             drain_val = _cfg.auto_drain(r["queue"])
@@ -308,7 +310,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     # snapshot. On a GitHub queue that is an ETag revalidation, so the usual
     # answer is a ~0.5s 304 that costs no rate limit.
     rows = health.all_status(
-        project=args.queue, stuck_minutes=args.stuck_minutes, fresh=True
+        project=args.queue, stuck_minutes=args.stuck_minutes, fresh=True,
+        include_archived=getattr(args, "all", False),
     )
     if args.json:
         print(json.dumps(rows, indent=2))
@@ -368,6 +371,81 @@ def _waiting_note(item: dict, by_ref: dict) -> str:
     if state == "stuck":
         return f"blocked: {ref} declined/unresolved"
     return ""
+
+
+def cmd_queue_archive(args: argparse.Namespace) -> int:
+    """Retire a queue: hidden from status/migrate/dashboard, history kept."""
+    from . import config
+    name = args.name
+    if name not in config.all_queues(include_archived=True):
+        print(f"wt: unknown queue {name!r}", file=sys.stderr)
+        return 1
+    if config.is_archived(name):
+        print(f"{name}: already archived")
+        return 0
+    live = [it for it in q.list_items(project=name, fresh=True)
+            if it.get("status") in ("open", "in_progress")]
+    if live and not args.force:
+        if args.json:
+            print(json.dumps({"queue": name, "archived": False,
+                              "blocked_by_tickets": [it.get("ref") for it in live]}, indent=2))
+        else:
+            print(f"{name}: refusing to archive, {len(live)} open/WIP ticket(s):", file=sys.stderr)
+            for it in live:
+                print(f"  {it.get('ref')}  [{it.get('status')}]  {it.get('title', '')}", file=sys.stderr)
+            print("close/move them first, or pass --force", file=sys.stderr)
+        return 1
+    if not args.apply:
+        if args.json:
+            print(json.dumps({"queue": name, "archived": False, "dry_run": True,
+                              "open_tickets": len(live)}, indent=2))
+        else:
+            print(f"{name}: would archive (auto_drain off, hidden from status); "
+                  f"re-run with --apply")
+        return 0
+    config.set_archived(name, True)
+    if args.json:
+        print(json.dumps({"queue": name, "archived": True}, indent=2))
+    else:
+        print(f"{name}: archived (history kept; `wt status --all` shows it, "
+              f"`wt queue unarchive {name}` restores)")
+    return 0
+
+
+def cmd_queue_unarchive(args: argparse.Namespace) -> int:
+    from . import config
+    name = args.name
+    if not config.is_archived(name):
+        print(f"wt: {name!r} is not archived", file=sys.stderr)
+        return 1
+    config.set_archived(name, False)
+    if args.json:
+        print(json.dumps({"queue": name, "archived": False}, indent=2))
+    else:
+        print(f"{name}: unarchived (auto_drain is still off; `wt drain on {name}` to staff it)")
+    return 0
+
+
+def cmd_queue_ls(args: argparse.Namespace) -> int:
+    from . import config
+    rows = []
+    for name, entry in sorted(config.all_queues(include_archived=True).items()):
+        arch = config.is_archived(name)
+        if args.archived and not arch:
+            continue
+        if not (args.archived or args.all) and arch:
+            continue
+        at = entry.get("archived_at", "") if isinstance(entry, dict) else ""
+        rows.append({"queue": name, "archived": arch, "archived_at": at})
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        for r in rows:
+            tag = f"  archived {r['archived_at']}".rstrip() if r["archived"] else ""
+            print(f"{r['queue']}{tag}")
+        if not rows:
+            print("(no queues)")
+    return 0
 
 
 def cmd_ls(args: argparse.Namespace) -> int:
@@ -4725,8 +4803,37 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status")
     s.add_argument("-q", "--queue", default=None)
     s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
+    s.add_argument("--all", action="store_true", help="also show archived queues")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser(
+        "queue",
+        help="retire or restore a queue (archive / unarchive / ls)",
+        description=(
+            "Retire dead queues without deleting history. An archived queue is "
+            "hidden from `wt status`, `wt models migrate/unpin`, the dashboard "
+            "and the reconciler; `wt find <ref>` still reads its tickets."
+        ),
+    )
+    qs = s.add_subparsers(dest="queue_cmd", metavar="<action>")
+    a = qs.add_parser("archive", help="retire a queue (dry run unless --apply)")
+    a.add_argument("name", metavar="QUEUE")
+    a.add_argument("--apply", action="store_true", help="write the change (default: dry run)")
+    a.add_argument("--force", action="store_true",
+                   help="archive even if the queue has open or in-progress tickets")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=cmd_queue_archive)
+    a = qs.add_parser("unarchive", help="restore an archived queue (auto_drain stays off)")
+    a.add_argument("name", metavar="QUEUE")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=cmd_queue_unarchive)
+    a = qs.add_parser("ls", help="list configured queues")
+    a.add_argument("--archived", action="store_true", help="list only archived queues")
+    a.add_argument("--all", action="store_true", help="list active and archived queues")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=cmd_queue_ls)
+    s.set_defaults(func=lambda args: (s.print_help(), 2)[1])
 
     s = sub.add_parser("models")
     s.add_argument("--engine", default=None,

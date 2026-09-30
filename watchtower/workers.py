@@ -2823,7 +2823,7 @@ def _legacy_claude_continuity(worker_id: str, session_id: str) -> Dict[str, Any]
     known_names: set = set()
     try:
         from . import config
-        known_names |= set(config.all_queues())
+        known_names |= set(config.all_queues(include_archived=True))
     except Exception:
         pass
     try:
