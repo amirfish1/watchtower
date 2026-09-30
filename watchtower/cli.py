@@ -1080,6 +1080,11 @@ def cmd_claim(args: argparse.Namespace) -> int:
         brief = answers.claim_brief(item, worker, str(item.get("claimed_session_id") or ""))
         if brief:
             shown = dict(shown, answer_brief=brief)
+        fb = _sent_back_view(item)
+        if fb:
+            shown = dict(shown, sent_back_feedback=fb["reason"])
+        if item.get("handed_back"):
+            shown = dict(shown, handed_back=True)
         checks = q.checks_block(item)
         if checks:
             shown = dict(shown, checks_after_close=checks)
@@ -1088,11 +1093,25 @@ def cmd_claim(args: argparse.Namespace) -> int:
             shown = dict(shown, plan_instructions=plan_note)
         _print_item(shown)
     else:
-        print(f"CLAIMED: {item['ref']} -> {worker}")
+        fb = _sent_back_view(item)
+        if item.get("handed_back"):
+            age = q._age_min((item.get("sent_back") or {}).get("at"))
+            print(f"HANDED BACK: {item['ref']} -> {worker} (sent back {age}m ago; "
+                  "fix this before any new ticket)")
+        else:
+            print(f"CLAIMED: {item['ref']} -> {worker}")
         print(item.get("text") or item.get("note") or "")
-        if item.get("gate_feedback"):
-            print("\nGATE FEEDBACK (the previous attempt was sent back): "
-                  + str(item["gate_feedback"]))
+        if fb:
+            print(f"\nSENT BACK by {fb['by']} {fb['age']}m ago: {fb['reason']}")
+            if item.get("handed_back") and fb.get("deadline"):
+                print(f"Released to the pool at {fb['deadline']} if you show no "
+                      f"progress (a `wt comment {item['ref']}` counts).")
+            elif item.get("sent_back_released"):
+                print(f"(released from {fb['released_from']} for no progress)")
+        if item.get("gate_feedback") and str(item["gate_feedback"]) != (fb or {}).get("reason"):
+            print("\n" + ("EARLIER GATE FEEDBACK" if fb else
+                          "GATE FEEDBACK (the previous attempt was sent back)")
+                  + ": " + str(item["gate_feedback"]))
         brief = answers.claim_brief(item, worker, str(item.get("claimed_session_id") or ""))
         if brief:
             print("\n" + brief)
@@ -1103,6 +1122,22 @@ def cmd_claim(args: argparse.Namespace) -> int:
         if checks:
             print("\n" + checks)
     return 0
+
+
+def _sent_back_view(item: dict) -> dict:
+    """WT-34: the current send-back feedback (live marker, else the released one)."""
+    sb = item.get("sent_back")
+    if isinstance(sb, dict) and sb.get("reason"):
+        dl = q._sent_back_deadline(item, q._sent_back_minutes(item))
+        return {"reason": str(sb["reason"]), "by": str(sb.get("by") or "?"),
+                "age": q._age_min(sb.get("at")),
+                "deadline": q._hhmmz(dl) if dl else ""}
+    rel = item.get("sent_back_released")
+    if isinstance(rel, dict) and rel.get("reason"):
+        return {"reason": str(rel["reason"]), "by": str(rel.get("by") or "?"),
+                "age": q._age_min(rel.get("sent_back_at")), "deadline": "",
+                "released_from": str(rel.get("worker_id") or "?")}
+    return {}
 
 
 def _plan_goal(item: dict, feedback: str = "") -> str:
@@ -2139,6 +2174,12 @@ def _log_resume(item: dict, what: str) -> None:
     q._log("RESUME", f"{item.get('ref', '?')} — {what}", queue=item.get("project", ""))
 
 
+def _sent_back_minutes_label(item: dict) -> str:
+    from . import config
+    n = config.sent_back_release_min(str(item.get("project") or ""))
+    return f"{n} minutes" if n else "a long while"
+
+
 def _resume_rejected(item: dict, reason: str, engine: str = "") -> int:
     sid = str(item.get("claimed_session_id") or "")
     limit = _context_requeue_bytes()
@@ -2156,9 +2197,12 @@ def _resume_rejected(item: dict, reason: str, engine: str = "") -> int:
                   f"the rejection text.")
             return 0
     prompt = (
-        f"Your work on ticket {item['ref']} was sent back: {reason}. Address it, "
-        f"then close again with `wt close {item['ref']} --worker <your-id> "
-        f"--summary \"...\" --commit <SHA>` (or `--no-code`).\n\n"
+        f"Your work on ticket {item['ref']} was sent back: {reason}. Address it "
+        f"before any other ticket, then close again with `wt close "
+        f"{item['ref']} --worker <your-id> --summary \"...\" --commit <SHA>` "
+        f"(or `--no-code`). If you show no progress within "
+        f"{_sent_back_minutes_label(item)} it is released to another worker; "
+        f"a `wt comment {item['ref']}` counts as progress.\n\n"
         + q.checks_block(item)
     ).strip()
     return _deliver_to_blocked_session(item, reason, prompt, engine or "",
@@ -2250,6 +2294,8 @@ def cmd_reopen(args: argparse.Namespace) -> int:
             claimed = q.reopen_and_claim(
                 args.ref, str(item.get("claimed_by") or sid), session_uuid=str(sid),
                 reason=args.reason, force=args.force,
+                sent_back_reason=str(args.resume or ""),
+                sent_back_by=str(args.worker or "client"),
             )
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -4236,6 +4282,13 @@ def cmd_config(args: argparse.Namespace) -> int:
                   file=sys.stderr)
         config.set_product_gate(args.queue, enabled)
         changed.append(f"product_gate={'on' if enabled else 'off'}")
+    if getattr(args, "sent_back_release_min", None) is not None:
+        try:
+            config.set_sent_back_release_min(args.queue, args.sent_back_release_min)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        changed.append(f"sent_back_release_min={args.sent_back_release_min}")
     if getattr(args, "fallback_to_default_worker", None) is not None:
         enabled = args.fallback_to_default_worker == "on"
         config.set_fallback_to_default_worker(args.queue, enabled)
@@ -4291,6 +4344,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         # "why did nothing pick up my new ticket for 3 minutes" has to be
         # answerable from the queue's own config output.
         cfg.setdefault("grace_s", config.grace_s(args.queue))
+        cfg.setdefault("sent_back_release_min", config.sent_back_release_min(args.queue))
         from . import roles as _roles
         if getattr(args, "json", False):
             print(json.dumps({"queue": args.queue, "config": cfg,
@@ -6568,6 +6622,11 @@ def build_parser() -> argparse.ArgumentParser:
                    dest="product_gate",
                    help="on = workers must get a human Ack (wt ack) after a "
                         "minimal-diagnosis pitch before implementing")
+    s.add_argument("--sent-back-release-min", type=int, default=None,
+                   dest="sent_back_release_min", metavar="N",
+                   help="minutes a verifier-rejected (sent-back) claim may show no "
+                        "progress before it is released to the pool (default 30; "
+                        "0 disables)")
     s.add_argument("--fallback-to-default-worker", default=None,
                    choices=["on", "off"], dest="fallback_to_default_worker",
                    help="revert to CCC default worker if current model is "

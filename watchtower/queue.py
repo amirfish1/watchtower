@@ -1945,6 +1945,7 @@ def _claim_candidates(
                 _own(it),
                 0 if it.get("lane") == "express" else 1,
                 _prio_rank(it),
+                0 if it.get("sent_back_released") else 1,  # WT-34
                 _type_rank(it),
                 int(it.get("number", 0)),
             ),
@@ -2151,6 +2152,16 @@ def claim_next(
         # next claim on it (OPS-854). Re-read each held ticket directly
         # (a strict single-issue read) and trust that over the snapshot.
         held = _reverify_held_claims(held)
+    # WT-34: a sent-back claim is handed back first (decided in the claim lock
+    # below), so it never counts as a stale "you still hold X" here.
+    sb_pre = [h for h in held if h.get("sent_back")]
+    held = [h for h in held if not h.get("sent_back")]
+    real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
+    if not sb_pre and _github_backend_for_project(project) is None:
+        with _FileLock(_lock_path()):
+            sb_pre = _sent_back_held_unlocked(
+                _load_unlocked()["items"], str(session_id), str(real_sid or ""),
+                _norm_project(project) if project else None)
 
     try:
         from . import workers as _workers
@@ -2172,7 +2183,7 @@ def claim_next(
         # RELEASED_TTL_S, up to hours later. Defer the recycle to the next
         # clean boundary instead of stranding it -- the guard below then
         # tells the worker exactly which ticket to finish first.
-        if not held:
+        if not held and not sb_pre:
             # This path itself tells the worker to exit, so persist the same
             # queue detachment that a reconciler stop signal establishes.
             # Without it, the worker remains countable and receives
@@ -2188,7 +2199,7 @@ def claim_next(
             return {"stop": True, "reason": "context_budget"}
 
     if held:
-        _raise_claim_refused(held, session_id)
+        _raise_claim_refused(held, session_id, sb_pre[0] if sb_pre else None)
 
     backend = _github_backend_for_project(project)
     if backend is not None:
@@ -2209,7 +2220,6 @@ def claim_next(
             )
         return item
 
-    real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
         data = _load_unlocked()
@@ -2217,9 +2227,16 @@ def claim_next(
             _save_unlocked(data)
         # WT-28: one-ticket-at-a-time re-checked inside the lock (the pre-lock
         # read above can be stale when a resume/affinity claim lands between).
-        held_now = _held_unlocked(data["items"], str(session_id), str(real_sid or ""), proj)
+        held_now = [h for h in _held_unlocked(data["items"], str(session_id),
+                                              str(real_sid or ""), proj)
+                    if not h.get("sent_back")]
+        # WT-34: a sent-back claim comes first -- hand it back (same lock).
+        sb_now = _sent_back_held_unlocked(data["items"], str(session_id),
+                                          str(real_sid or ""), proj)
         if held_now:
-            _raise_claim_refused(held_now, session_id)
+            _raise_claim_refused(held_now, session_id, sb_now[0] if sb_now else None)
+        if sb_now:
+            return _handback_unlocked(data, sb_now[0])
         candidates = _claim_candidates(
             data["items"], project=proj, lane=lane, shaping=shaping, oldest=oldest,
             item_types=item_types, readiness_filters=readiness_filters,
@@ -2232,6 +2249,7 @@ def claim_next(
         item["claimed_by"] = str(session_id)
         item["claimed_machine"] = machine_tag()
         item.pop("resume", None)  # WT-30: evidence belongs to the previous claim
+        _clear_sent_back_unlocked(item)
         if real_sid:
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
@@ -2245,6 +2263,25 @@ def claim_next(
         actor=(item.get("claimed_by"), item.get("claimed_session_id")),
     )
     return item
+
+
+def _handback_unlocked(data: Dict[str, Any], it: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the held sent-back ticket as this claim (idempotent); the release
+    clock restarts once, at the first hand-back."""
+    sb = it["sent_back"]
+    now = _now_iso()
+    if not sb.get("handed_back_at"):
+        sb["handed_back_at"] = now
+        it["updated_at"] = now
+        _append_history(it, "handback", by=_by("system"), at=now,
+                        reason="sent-back claim handed back before any new ticket")
+        _save_unlocked(data)
+    age = _age_min(sb.get("at"))
+    _log("CLAIM", f"{it.get('ref', '?')} by {str(it.get('claimed_by') or '')[:16]} "
+                  f"(handback: sent back {age}m ago)", queue=it.get("project", ""))
+    out = dict(it)
+    out["handed_back"] = True
+    return out
 
 
 def claim_by_ref(
@@ -2277,6 +2314,12 @@ def claim_by_ref(
         if item is None:
             return None
         status = item.get("status", "open")
+        sb_held = _sent_back_held_unlocked(data["items"], str(session_id),
+                                           str(real_sid or ""), item.get("project"))
+        if sb_held:  # WT-34
+            if any(item is h for h in sb_held):
+                return _handback_unlocked(data, item)
+            _raise_sent_back_refused(sb_held[0], session_id)
         if status != "open":
             raise ValueError(f"{ref} is not open (status={status})")
         reserved = _affinity_gate_unlocked(item, str(session_id), str(real_sid or ""), time.time())
@@ -2291,6 +2334,7 @@ def claim_by_ref(
         item["claimed_by"] = str(session_id)
         item["claimed_machine"] = machine_tag()
         item.pop("resume", None)  # WT-30: evidence belongs to the previous claim
+        _clear_sent_back_unlocked(item)
         if real_sid:
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
@@ -2461,8 +2505,14 @@ def update_status(
     extras: Optional[Dict[str, Any]] = None,
     answer_fate: str = "handoff",
     orphan: Optional[Dict[str, str]] = None,
+    close_owner: str = "",
 ) -> Optional[Dict[str, Any]]:
-    """``orphan`` (WT-30): ``{"session_id", "claimed_by"}`` of the claim the
+    """``close_owner`` (WT-34): run the close-ownership guard
+    (``_close_owner_guard_unlocked``) in the lock for ANY target status -- the
+    failed-gate reopen of a worker-attributed close passes it. ``expect_owner``
+    is the same guard, applied only when ``status == "closed"``.
+
+    ``orphan`` (WT-30): ``{"session_id", "claimed_by"}`` of the claim the
     orphan sweep is displacing; recorded on the reopen event so a later resume of
     that session can be told to STOP even after a fresh worker re-claims.
 
@@ -2543,50 +2593,20 @@ def update_status(
                 # Ownership guard for close (see expect_owner docstring). Runs
                 # inside the lock against the fresh item, so it's race-free with
                 # a concurrent close by the fresh worker that re-drained the
-                # ticket after a reap. A live claim is also bound to its worker:
-                # a different worker cannot replace its resolution. The
-                # reap-duplicate always lands in the closed case anyway, because
-                # by the time the reaped session resumes from checkpoint the
-                # fresh worker has already closed the re-drained ticket.
-                if status == "closed" and expect_owner and it.get("status") == "closed":
-                    ref_label = it.get("ref", ident)
-                    closer = str(it.get("closed_by") or it.get("claimed_by") or "?")
-                    when = it.get("closed_at") or "?"
-                    raise ValueError(
-                        f"{ref_label} is already closed (by {closer} at {when}). "
-                        f"You are {expect_owner} — you were likely reaped mid-ticket "
-                        f"and it was re-drained by another worker. Your work may "
-                        f"duplicate theirs: do NOT re-commit; run `wt find {ref_label} "
-                        f"--json` to compare. Pass --force to close anyway."
-                    )
-                if (
-                    status == "closed"
-                    and expect_owner
-                    and it.get("status") == "in_progress"
-                    and it.get("claimed_by")
-                    and str(it.get("claimed_by")) != expect_owner
-                ):
-                    raise ValueError(
-                        f"{it.get('ref', ident)} is claimed by {it.get('claimed_by')}; "
-                        f"you are {expect_owner}. Only the claiming worker may close "
-                        "an in-progress ticket. Pass --force to override deliberately."
-                    )
-                prev_status = it.get("status")
-                if (status == "closed" and expect_owner and prev_status == PARKED_STATUS
-                        and (it.get("parked") or {}).get("worker_id")
-                        and str(it["parked"]["worker_id"]) != expect_owner):
-                    raise ValueError(
-                        f"{it.get('ref', ident)} is parked by {it['parked']['worker_id']}; "
-                        f"you are {expect_owner}. Only that worker may close it. "
-                        "Pass --force to override deliberately."
-                    )
+                # ticket after a reap, and with a replacement claim that lands
+                # while a failing gate runs (WT-34).
+                _close_owner_guard_unlocked(
+                    it, ident, close_owner or (expect_owner if status == "closed" else ""),
+                    str(real_sid or ""))
                 it["status"] = status
                 now = _now_iso()
                 it["updated_at"] = now
                 if status != "in_progress" or session_id:
                     it.pop("resume", None)  # WT-30: claim left/replaced
+                    _clear_sent_back_unlocked(it)
                 if status == "closed":
                     _clear_parked_unlocked(it)
+                    it.pop("sent_back_released", None)
                 if status == "in_progress" and session_id:
                     it["claimed_by"] = str(session_id)
                     it["claimed_machine"] = machine_tag()
@@ -3450,7 +3470,8 @@ def reject_with(ident: Any, why: str, by_label: str = "human",
         # can tell a spawned builder from an ambient session; the session id
         # rides in claimed_session_id.
         item = reopen_and_claim(ident, str(current.get("claimed_by") or sid),
-                                session_uuid=sid, reason=why)
+                                session_uuid=sid, reason=why,
+                                sent_back_reason=why, sent_back_by=by_label)
         if item is None:
             return None
         with _FileLock(_lock_path()):
@@ -3533,8 +3554,12 @@ def reject(ident: Any, reason: str, by: str = "human") -> Optional[Dict[str, Any
 
 
 def _reopen_with_feedback(ident: Any, reason: str, results: List[Dict[str, Any]],
-                          by_kind: str = "worker") -> Optional[Dict[str, Any]]:
-    item = update_status(ident, "open", reason=reason, by_kind=by_kind,
+                          by_kind: str = "worker", close_owner: str = "",
+                          session_id: str = "", session_uuid: str = "",
+                          require_status: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    item = update_status(ident, "open", session_id, session_uuid=session_uuid,
+                         reason=reason, by_kind=by_kind,
+                         close_owner=close_owner, require_status=require_status,
                          extras={"gate_feedback": _clip(reason, 4000),
                                  "gate_results": results})
     return item
@@ -3591,7 +3616,21 @@ def close(
                 f = failed[0]
                 why = (f"gate {f['gate']} failed (exit {f['exit_code']}): "
                        f"{f['output_tail'][-600:].strip()}")
-                return _reopen_with_feedback(ident, why, results)
+                # WT-34: the writeback re-checks ownership and the pre-gate
+                # status in its own lock (gates can run for minutes).
+                item = _reopen_with_feedback(
+                    ident, why, results,
+                    close_owner="" if force else str(session_id or ""),
+                    session_id=str(session_id or ""), session_uuid=session_uuid,
+                    require_status=current.get("status"))
+                if item is None:
+                    now_it = get(ident) or {}
+                    raise ValueError(
+                        f"{current.get('ref', ident)} changed while its gates ran "
+                        f"(was {current.get('status')}, now {now_it.get('status')}); "
+                        "nothing was written. Re-check with "
+                        f"`wt find {current.get('ref', ident)}` before closing again.")
+                return item
             extras = {"gate_results": results, "gate_stages": stages}
             hold_review = stages[0] if stages else ""
     item = update_status(
@@ -4204,8 +4243,13 @@ def reopen_and_claim(
     session_uuid: str = "",
     reason: str = "",
     force: bool = False,
+    sent_back_reason: str = "",
+    sent_back_by: str = "",
 ) -> Optional[Dict[str, Any]]:
-    """Reopen a closed/blocked ticket and claim it under ``session_id`` in one
+    """``sent_back_reason`` / ``sent_back_by`` (WT-34): mark the re-bound claim
+    as sent back (see ``_sent_back_held_unlocked``), file store only.
+
+    Reopen a closed/blocked ticket and claim it under ``session_id`` in one
     lock acquisition -- the re-entry re-bind primitive for same-topic routing
     (CLIENT-CHAT-19). ``session_id``/``session_uuid`` should be the ticket's
     OWN preserved ``claimed_session_id`` (reopen preserves it; see ``reopen``'s
@@ -4279,6 +4323,7 @@ def reopen_and_claim(
             it["claimed_by"] = str(session_id)
             it["claimed_machine"] = machine_tag()
             it.pop("resume", None)
+            _clear_sent_back_unlocked(it)
             if real_sid:
                 it["claimed_session_id"] = real_sid
             it["claimed_at"] = now
@@ -4288,6 +4333,14 @@ def reopen_and_claim(
                 by=_by("worker", str(session_id), str(real_sid or "")),
                 at=now,
             )
+            if sent_back_reason:
+                it["sent_back"] = {
+                    "at": now, "by": str(sent_back_by or "human"),
+                    "worker_id": str(session_id), "session_id": str(real_sid or ""),
+                    "reason": _clip(sent_back_reason, 4000),
+                    "hist_from": len(it["history"]),
+                    "handed_back_at": None, "progress_at": None,
+                }
             _save_unlocked(data)
             _log(
                 "CLAIM",
@@ -4453,9 +4506,15 @@ def _iso_ts(value: Any) -> float:
         return 0.0
 
 
-def _raise_claim_refused(held: List[Dict[str, Any]], session_id: str) -> None:
+def _raise_claim_refused(held: List[Dict[str, Any]], session_id: str,
+                         sent_back: Optional[Dict[str, Any]] = None) -> None:
     refs = ", ".join(str(it.get("ref") or "?") for it in held)
     ref0 = str(held[0].get("ref") or "<ref>")
+    sb_tail = ""
+    if sent_back is not None:
+        sb_tail = (f"\nthen fix {sent_back.get('ref')} (sent back "
+                   f"{_age_min((sent_back.get('sent_back') or {}).get('at'))}m ago) "
+                   "before anything new")
     raise ValueError(
         f"claim refused: you still hold {refs} in_progress on this queue. "
         "Committing a fix does not finish a ticket -- record its outcome "
@@ -4463,7 +4522,7 @@ def _raise_claim_refused(held: List[Dict[str, Any]], session_id: str) -> None:
         f"  wt close {ref0} --worker {session_id} --summary \"...\" "
         "--commit <SHA>   (--no-code if nothing was committed)\n"
         f"  wt block {ref0} --worker {session_id} --question \"...\" "
-        "--progress \"...\"   (needs a human decision)"
+        "--progress \"...\"   (needs a human decision)" + sb_tail
     )
 
 
@@ -4481,6 +4540,226 @@ def _held_unlocked(items: List[Dict[str, Any]], worker_id: str, session_id: str 
                 or (session_id and str(it.get("claimed_session_id") or "") == session_id)):
             out.append(it)
     return out
+
+
+# --- Sent-back claims (WT-34) ------------------------------------------------
+# A verifier/human rejection re-binds the ticket to the session that built it
+# (reopen_and_claim). ``sent_back`` marks that claim so the claim gate hands it
+# back before anything new, and so a silent holder loses it after N minutes.
+# State table: WT-31 row work.sent_back (sent_back in none|held|progressing).
+SENT_BACK_PROGRESS_EVENTS = ("comment", "progress", "block", "park", "in_review")
+SENT_BACK_FAILED_RESUME_GRACE_S = 300.0
+
+
+def _clear_sent_back_unlocked(it: Dict[str, Any]) -> None:
+    it.pop("sent_back", None)
+
+
+def _sent_back_held_unlocked(items: List[Dict[str, Any]], worker_id: str,
+                             session_id: str = "",
+                             project: Optional[str] = None) -> List[Dict[str, Any]]:
+    """in_progress sent-back claims this worker id OR session holds, oldest
+    first (in-lock item list)."""
+    out = []
+    for it in items:
+        sb = it.get("sent_back")
+        if not isinstance(sb, dict) or it.get("status") != "in_progress":
+            continue
+        if project and it.get("project") != project:
+            continue
+        if ((worker_id and str(it.get("claimed_by") or "") == worker_id)
+                or (session_id and (str(it.get("claimed_session_id") or "") == session_id
+                                    or str(sb.get("session_id") or "") == session_id))):
+            out.append(it)
+    out.sort(key=lambda it: _iso_ts((it.get("sent_back") or {}).get("at")))
+    return out
+
+
+def _sent_back_progress(it: Dict[str, Any]) -> str:
+    """``at`` of the first claimer event after the send-back ('' = none yet)."""
+    sb = it.get("sent_back") or {}
+    ids = {str(x) for x in (sb.get("worker_id"), sb.get("session_id"),
+                            it.get("claimed_by"), it.get("claimed_session_id")) if x}
+    hist = it.get("history") or []
+    start = int(sb.get("hist_from") or 0)
+    if len(hist) < start:
+        floor = _iso_ts(sb.get("at"))
+        cand = [h for h in hist if _iso_ts(h.get("at")) >= floor]
+    else:
+        cand = hist[start:]
+    for h in cand:
+        if h.get("event") not in SENT_BACK_PROGRESS_EVENTS:
+            continue
+        by = h.get("by") or {}
+        if str(by.get("worker") or "") in ids or str(by.get("session_id") or "") in ids:
+            return str(h.get("at") or "")
+    return ""
+
+
+def _sent_back_deadline(it: Dict[str, Any], minutes: int) -> float:
+    """Epoch deadline after which a silent sent-back claim is released (0 = never)."""
+    if minutes <= 0:
+        return 0.0
+    sb = it.get("sent_back") or {}
+    dl = _iso_ts(sb.get("handed_back_at") or sb.get("at")) + minutes * 60.0
+    r = it.get("resume")
+    if isinstance(r, dict) and r.get("state") == "failed":
+        dl = min(dl, _iso_ts(r.get("at")) + SENT_BACK_FAILED_RESUME_GRACE_S)
+    return dl
+
+
+def _sent_back_minutes(it: Dict[str, Any]) -> int:
+    try:
+        from . import config as _config
+        return _config.sent_back_release_min(str(it.get("project") or ""))
+    except Exception:  # noqa: BLE001
+        return 30
+
+
+def _age_min(iso: Any, now: Optional[float] = None) -> int:
+    return max(0, int(((now if now is not None else time.time()) - _iso_ts(iso)) // 60))
+
+
+def _hhmmz(epoch: float) -> str:
+    return datetime.fromtimestamp(epoch, timezone.utc).strftime("%H:%MZ")
+
+
+def _raise_sent_back_refused(sb_item: Dict[str, Any], session_id: str) -> None:
+    sb = sb_item.get("sent_back") or {}
+    ref = str(sb_item.get("ref") or "?")
+    dl = _sent_back_deadline(sb_item, _sent_back_minutes(sb_item))
+    tail = (f" It is released to the pool at {_hhmmz(dl)} if you show no progress "
+            "(a `wt comment` counts)." if dl else "")
+    raise ValueError(
+        f"claim refused: {ref} was sent back to you {_age_min(sb.get('at'))}m ago by "
+        f"{sb.get('by') or '?'} and still needs fixing first: "
+        f"{_clip(sb.get('reason'), 300)}\n"
+        f"  fix it, then `wt close {ref} --worker {session_id} --summary \"...\" "
+        f"--commit <SHA>`.{tail}"
+    )
+
+
+def sent_back_claims(project: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Live sent-back claims still waiting on their holder (no progress yet).
+    Stamps ``progress_at`` the first time progress is seen. File store only."""
+    proj = _norm_project(project) if project else None
+    out: List[Dict[str, Any]] = []
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        dirty = False
+        for it in data["items"]:
+            sb = it.get("sent_back")
+            if (not isinstance(sb, dict) or it.get("status") != "in_progress"
+                    or it.get("needs_input")):
+                continue
+            if proj and it.get("project") != proj:
+                continue
+            if sb.get("progress_at"):
+                continue
+            prog = _sent_back_progress(it)
+            if prog:
+                sb["progress_at"] = prog
+                dirty = True
+                continue
+            out.append(dict(it))
+        if dirty:
+            _save_unlocked(data)
+    return out
+
+
+def release_stalled_sent_back(now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Release sent-back claims with no progress past their deadline to the pool,
+    keeping the rejection text. One lock; CAS on status + unchanged marker."""
+    now_ts = time.time() if now is None else float(now)
+    released: List[Dict[str, Any]] = []
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        dirty = False
+        for it in data["items"]:
+            sb = it.get("sent_back")
+            if (not isinstance(sb, dict) or it.get("status") != "in_progress"
+                    or it.get("needs_input")):
+                continue
+            if sb.get("progress_at"):
+                continue
+            prog = _sent_back_progress(it)
+            if prog:
+                sb["progress_at"] = prog
+                dirty = True
+                continue
+            dl = _sent_back_deadline(it, _sent_back_minutes(it))
+            if not dl or now_ts < dl:
+                continue
+            at = _now_iso()
+            reason = (f"sent back {_age_min(sb.get('at'), now_ts)}m ago with no progress; "
+                      f"released from {it.get('claimed_by') or sb.get('worker_id') or '?'}")
+            it["sent_back_released"] = {
+                "worker_id": str(sb.get("worker_id") or it.get("claimed_by") or ""),
+                "session_id": str(sb.get("session_id") or it.get("claimed_session_id") or ""),
+                "sent_back_at": sb.get("at"), "released_at": at,
+                "by": sb.get("by"), "reason": sb.get("reason") or "",
+            }
+            it["status"] = "open"
+            it["claimed_by"] = None
+            it["claimed_machine"] = None
+            it["claimed_at"] = None
+            it["updated_at"] = at
+            it.pop("resume", None)
+            it.pop("sent_back", None)
+            _append_history(it, "sent_back_release", by=_by("system"), at=at, reason=reason)
+            _append_history(it, "comment", by=_by("system"), at=at,
+                            text=f"Released to the pool: {reason}. Rejection: "
+                                 f"{_clip(it['sent_back_released']['reason'], 1500)}")
+            _log("RELEASE", f"{it.get('ref', '?')} — {reason}", queue=it.get("project", ""))
+            released.append(dict(it))
+            dirty = True
+        if dirty:
+            _save_unlocked(data)
+    return released
+
+
+def _close_owner_guard_unlocked(it: Dict[str, Any], ident: Any, owner: str,
+                                real_sid: str) -> None:
+    """Close-ownership checks, run in the lock on every mutating outcome of a
+    worker-attributed close (the writeback AND the failed-gate reopen)."""
+    if not owner:
+        return
+    status = it.get("status")
+    if status == "closed":
+        ref_label = it.get("ref", ident)
+        closer = str(it.get("closed_by") or it.get("claimed_by") or "?")
+        when = it.get("closed_at") or "?"
+        raise ValueError(
+            f"{ref_label} is already closed (by {closer} at {when}). "
+            f"You are {owner} — you were likely reaped mid-ticket "
+            f"and it was re-drained by another worker. Your work may "
+            f"duplicate theirs: do NOT re-commit; run `wt find {ref_label} "
+            f"--json` to compare. Pass --force to close anyway."
+        )
+    if status == "in_progress" and it.get("claimed_by") and str(it.get("claimed_by")) != owner:
+        raise ValueError(
+            f"{it.get('ref', ident)} is claimed by {it.get('claimed_by')}; "
+            f"you are {owner}. Only the claiming worker may close "
+            "an in-progress ticket. Pass --force to override deliberately."
+        )
+    if (status == PARKED_STATUS and (it.get("parked") or {}).get("worker_id")
+            and str(it["parked"]["worker_id"]) != owner):
+        raise ValueError(
+            f"{it.get('ref', ident)} is parked by {it['parked']['worker_id']}; "
+            f"you are {owner}. Only that worker may close it. "
+            "Pass --force to override deliberately."
+        )
+    rel = it.get("sent_back_released")
+    if (status == "open" and not it.get("claimed_by") and isinstance(rel, dict)
+            and ((rel.get("worker_id") and str(rel["worker_id"]) == owner)
+                 or (real_sid and str(rel.get("session_id") or "") == real_sid))):
+        ref_label = it.get("ref", ident)
+        raise ValueError(
+            f"{ref_label} was released to the pool at {rel.get('released_at')} "
+            f"after {owner} showed no progress on the sent-back work. Run "
+            f"`wt claim {ref_label} --worker {owner}` to take it back; do not "
+            "close it without claiming. Pass --force to override deliberately."
+        )
 
 
 def _affinity_reserved(it: Dict[str, Any], now: float) -> bool:
@@ -4604,6 +4883,7 @@ def _park_unlocked(it: Dict[str, Any], worker_id: str, session_id: str, machine:
     }
     it["status"] = PARKED_STATUS
     it.pop("resume", None)
+    _clear_sent_back_unlocked(it)
     it["claimed_by"] = None
     it["claimed_session_id"] = None
     it["claimed_machine"] = None
@@ -4850,6 +5130,7 @@ def block(
                 if commit:
                     it["block_commit"] = commit
                 it.pop("resume", None)
+                _clear_sent_back_unlocked(it)
                 if it.get("status") == "open" and not park:
                     it["status"] = "in_progress"
                 if session_id and not park and not was_parked:

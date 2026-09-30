@@ -519,3 +519,31 @@ A builder over the context budget is skipped (released with the rejection text);
 a total delivery failure releases the claim instead of asking a human to resume
 manually. `drain_outbox` writes delivery / dead-letter outcomes back to the
 ticket's `resume` state, and the sweep also reads the outbox row itself.
+
+## Sent-back claims (WT-34)
+
+A rejection (`wt reject`, verifier FAIL, `wt reopen --resume`) re-binds the
+ticket to its builder and stamps `sent_back` (`at`, `by`, `worker_id`,
+`session_id`, `reason`, `hist_from`, `handed_back_at`, `progress_at`). While the
+marker is live:
+
+- **Hand-back first.** `wt claim` by that worker id or session returns the
+  sent-back ticket (`HANDED BACK:` / `handed_back: true`, idempotent) instead of
+  a new one; `wt claim <other-ref>` is refused with the rejection text. The
+  decision is made in the same lock as the claim.
+- **Age bound.** With no claimer `comment`/`progress`/`block`/`park`/`in_review`
+  event after the send-back, `reconcile_once` releases it to the pool after
+  `sent_back_release_min` minutes (default 30, `wt config -q Q
+  --sent-back-release-min N`, 0 disables; the clock restarts once at the first
+  hand-back; a `failed` resume shortens it to 5 min). The release keeps
+  `gate_feedback`, records `sent_back_released` (the next claimer sees the
+  rejection text; the former holder may `wt claim` it back) and sorts the ticket
+  ahead of same-priority peers. The orphan sweep still owns dead sessions.
+- **Nudge.** The stuck-queue nudge names each held sent-back ticket, its age and
+  the release time; those holders are excluded from the generic broadcast.
+- `wt block`/park, close, release and any new claim clear the marker.
+
+Close ownership (already-closed, foreign in_progress, foreign parked, and a
+holder whose claim was released) is enforced in the store lock on every mutating
+outcome of a worker-attributed `wt close`, including the failed-gate reopen,
+which also compare-and-swaps on the pre-gate status.

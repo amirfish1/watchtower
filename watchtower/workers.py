@@ -1260,6 +1260,53 @@ def _maybe_wake_blocked_workers(queue: str, wakeable: List[Dict[str, Any]]) -> i
     return delivered
 
 
+def _release_stalled_sent_back() -> List[Dict[str, Any]]:
+    """WT-34: release silent sent-back claims and tell the former holder."""
+    from . import queue as _q
+    released = _q.release_stalled_sent_back()
+    for it in released:
+        rel = it.get("sent_back_released") or {}
+        wid = str(rel.get("worker_id") or "")
+        if not wid:
+            continue
+        note = (f"{it.get('ref')} was sent back to you and showed no progress, so it "
+                "was released to the pool for another worker. If it is still open "
+                f"you may `wt claim {it.get('ref')} --worker {wid}` to take it back; "
+                "do not close it without claiming.")
+        try:
+            notify_workers(str(it.get("project") or ""), note, only={wid})
+        except Exception:
+            pass
+    return released
+
+
+def _nudge_sent_back_holders(queue: str) -> set:
+    """WT-34: targeted nudge naming each held sent-back ticket and its age.
+    Returns the worker ids nudged, to exclude from the generic broadcast."""
+    from . import queue as _q
+    from .queue import _log
+    out: set = set()
+    for it in _q.sent_back_claims(queue):
+        sb = it.get("sent_back") or {}
+        wid = str(sb.get("worker_id") or it.get("claimed_by") or "")
+        if not wid:
+            continue
+        mins = _q._sent_back_minutes(it)
+        dl = _q._sent_back_deadline(it, mins)
+        tail = (f" It is released to another worker at {_q._hhmmz(dl)} without progress."
+                if dl else "")
+        msg = (f"{it.get('ref')} was sent back to you {_q._age_min(sb.get('at'))}m ago "
+               f"and is still unfixed. Work it before any other ticket, then `wt close`."
+               f"{tail} A `wt comment {it.get('ref')}` counts as progress.")
+        try:
+            if notify_workers(queue, msg, only={wid}):
+                out.add(wid)
+        except Exception:
+            pass
+        _log("NUDGE", f"{it.get('ref')} sent-back holder {wid} nudged", queue=queue)
+    return out
+
+
 def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
     """Nudge live workers on a stuck-but-staffed queue to retry/continue.
 
@@ -1280,7 +1327,11 @@ def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
         f"{claim_filter} "
         "--json` and keep draining."
     )
-    delivered = notify_workers(queue, nudge)
+    try:
+        held = _nudge_sent_back_holders(queue)  # WT-34: they get a targeted nudge
+    except Exception:
+        held = set()
+    delivered = notify_workers(queue, nudge, exclude=held or None)
     _log("NUDGE", f"stuck queue — nudged {delivered}/{live_count} live worker(s)",
          queue=queue)
     return delivered
@@ -5915,6 +5966,14 @@ def _reconcile_once_locked(dry_run: bool = False,
                 for it in requeue_orphaned_tickets()]
         except Exception:
             pass
+        # WT-34: a live session that sits on a sent-back claim without any
+        # progress loses it to the pool (the orphan sweep above owns dead ones).
+        if not dry_run:
+            try:
+                result["sent_back_released"] = [
+                    {"ref": it.get("ref", "")} for it in _release_stalled_sent_back()]
+            except Exception:
+                pass
         # WT-28: park legacy blocks, then route answers to parked tickets.
         if not dry_run:
             try:

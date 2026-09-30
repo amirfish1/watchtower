@@ -417,6 +417,34 @@ def product_gate(queue: str) -> bool:
     return bool(_queue_entry(queue).get("product_gate", False))
 
 
+DEFAULT_SENT_BACK_RELEASE_MIN = 30
+
+
+def set_sent_back_release_min(queue: str, minutes: Any) -> Dict[str, Any]:
+    """WT-34: minutes a sent-back claim may sit without progress before it is
+    released to the pool. 0 disables the bound; ``None`` clears the override."""
+    data = _load()
+    q = data.setdefault(queue, {})
+    if minutes is None:
+        q.pop("sent_back_release_min", None)
+    else:
+        n = int(minutes)
+        if n < 0:
+            raise ValueError("sent-back release minutes must be >= 0")
+        q["sent_back_release_min"] = n
+    _save(data)
+    return q
+
+
+def sent_back_release_min(queue: str) -> int:
+    """WT-34: default 30; 0 = never auto-release a sent-back claim."""
+    try:
+        return max(0, int(_queue_entry(queue).get(
+            "sent_back_release_min", DEFAULT_SENT_BACK_RELEASE_MIN)))
+    except (TypeError, ValueError):
+        return DEFAULT_SENT_BACK_RELEASE_MIN
+
+
 def set_grace_s(queue: str, seconds: Any) -> Dict[str, Any]:
     """Set this queue's auto-drain grace period in seconds (see DEFAULT_GRACE_S).
 
