@@ -380,6 +380,14 @@ def test_plan_submit_out_of_turn_is_refused(plan_cli):
         q.plan_submit(a["ref"], "x")
 
 
+def test_plan_submit_rejects_oversize_text_instead_of_clipping(plan_cli):
+    """OPS-1300: a plan over the limit was silently cut mid-sentence."""
+    q = plan_cli.q
+    a = _claimed(q, gates=["plan"])
+    with pytest.raises(ValueError, match="condense"):
+        q.plan_submit(a["ref"], "x" * (q.PLAN_TEXT_MAX + 1))
+
+
 def test_plan_gated_ticket_unclaimable_until_plan_accepted(plan_cli):
     """WT-22: planning happens before a build worker claims."""
     q, cli, calls = plan_cli.q, plan_cli.cli, plan_cli.calls

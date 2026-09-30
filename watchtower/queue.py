@@ -2805,6 +2805,9 @@ def plan_fail(ident: Any, reason: str) -> Optional[Dict[str, Any]]:
     return _plan_update(ident, _do)
 
 
+PLAN_TEXT_MAX = 24000
+
+
 def plan_submit(ident: Any, text: str, by: str = "planner") -> Optional[Dict[str, Any]]:
     """The planner files (or revises) the plan; moves to ``reviewing``. Each
     submission is a new ``version``; during a discussion (WT-26) the amended
@@ -2812,6 +2815,11 @@ def plan_submit(ident: Any, text: str, by: str = "planner") -> Optional[Dict[str
     text = str(text or "").strip()
     if not text:
         raise ValueError("plan text is empty")
+    if len(text) > PLAN_TEXT_MAX:
+        # Clipping silently stored a plan cut mid-sentence (OPS-1300) that the
+        # reviewer then judged as if complete; make the planner condense it.
+        raise ValueError(f"plan text is {len(text)} chars, over the {PLAN_TEXT_MAX} "
+                         f"limit; condense it (keep test and rollout sections) and resubmit")
     current = get(ident)
     if current is None:
         return None
