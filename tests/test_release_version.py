@@ -59,6 +59,10 @@ def test_cut_release_rejects_bad_versions(arg):
     assert proc.returncode == 2, proc.stdout + proc.stderr
 
 
+@pytest.mark.skipif(
+    not (REPO_ROOT / ".git").exists(),
+    reason="cut-release.sh needs git metadata; absent in an exact-commit archive export",
+)
 def test_cut_release_refuses_wrong_branch(tmp_path):
     # The guard that matters most: a release cut from a feature branch would tag
     # code that never landed on main.

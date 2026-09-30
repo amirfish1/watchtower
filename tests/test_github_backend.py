@@ -1564,6 +1564,23 @@ def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
     monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 0.0)
     github_backend._LIST_CACHE.clear()
 
+    # Drive the cache clock by hand: real 50 ms / 200 ms windows expire under
+    # CPU load (full suite, sibling agents) and made the "within the TTL"
+    # assertions flaky.
+    import time as _real_time
+
+    class _FakeClock:
+        now = _real_time.time()
+
+        def time(self):
+            return self.now
+
+        def __getattr__(self, name):
+            return getattr(_real_time, name)
+
+    clock = _FakeClock()
+    monkeypatch.setattr(github_backend, "time", clock)
+
     backend = github_backend.GitHubIssuesBackend("T", repo="acme/cache-test")
     calls = {"n": 0}
     good_issue = {
@@ -1594,8 +1611,7 @@ def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
         raise github_backend.GitHubBackendError("API rate limit already exceeded")
 
     monkeypatch.setattr(backend, "_run", failing_run)
-    import time as _time
-    _time.sleep(0.06)  # expire the TTL so the next call actually attempts gh
+    clock.now += 0.06  # expire the TTL so the next call actually attempts gh
     third = backend._list_issues()
     assert third == [good_issue]  # stale-but-good data, served silently
     assert calls["n"] == 2  # exactly one real attempt, not one per call
