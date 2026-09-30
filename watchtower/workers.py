@@ -4118,12 +4118,14 @@ PARK_RETENTION_S = 55 * 60.0  # keep a parked ticket's worker alive this long (W
 PARK_GRACE_S = 55 * 60.0      # defer a released owner's SIGTERM this long (WATCHTOWER_PARK_GRACE_S)
 
 
-def park_retention_s() -> float:
-    return _env_s("WATCHTOWER_PARK_RETENTION_S", PARK_RETENTION_S)
-
-
 def park_grace_s() -> float:
     return _env_s("WATCHTOWER_PARK_GRACE_S", PARK_GRACE_S)
+
+
+def park_retention_s() -> float:
+    """One configurable window (``WATCHTOWER_PARK_GRACE_S``) shared by idle
+    retention, PARK-EXPIRED and the released-worker reap deferral."""
+    return park_grace_s()
 
 
 def _affinity_rows(queue: Optional[str] = None,
@@ -4205,9 +4207,26 @@ def retained_parked_ids(queue: Optional[str] = None,
                         items: Optional[List[Dict[str, Any]]] = None) -> set:
     """Worker ids kept alive (never STOPped, not counted against the spawn
     budget) because they own a parked ticket within the retention window."""
+    if items is None:
+        try:
+            from . import queue as _q
+            items = _q.list_items()
+        except Exception:
+            items = []
     ids = {str((it.get("parked") or {}).get("worker_id")) for it in _parked_rows(queue, items)}
     ids |= {str((it.get("pending_answer") or {}).get("prior_worker_id") or "")
             for it in _affinity_rows(queue, items)} - {""}
+    # A worker actively working another ticket is busy, not retained; a known
+    # dead or released worker retains nothing.
+    busy = {str(it.get("claimed_by") or "") for it in items
+            if it.get("status") == "in_progress" and not it.get("needs_input")}
+    ids -= busy
+    try:
+        for w in list_workers(prune=False):
+            if not w.get("alive") or _worker_released(w):
+                ids.discard(str(w.get("worker_id") or ""))
+    except Exception:
+        pass
     return ids
 
 

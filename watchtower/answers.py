@@ -410,7 +410,8 @@ def _check_queued(it: Dict[str, Any], gen: int, now: float) -> str:
         return "handed_off"
     if not q.pa_bump_attempts(ref, gen, "queued"):
         return ""
-    if q.pa_transition(ref, gen, "queued", "delivering", from_status="in_progress"):
-        _deliver_bound(q.get(ref) or it, gen)
+    moved = q.pa_transition(ref, gen, "queued", "delivering", from_status="in_progress")
+    if moved:
+        _deliver_bound(moved, gen)  # the CAS-returned item, never a reload
         return "redelivered"
     return ""

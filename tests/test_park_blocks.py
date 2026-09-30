@@ -299,3 +299,74 @@ def test_retained_counts_per_queue(wt, monkeypatch):
         {"worker_id": "w1", "queue": "PK", "alive": True},
         {"worker_id": "w2", "queue": "PK", "alive": True}])
     assert workers.retained_counts() == {"PK": 1}
+
+
+# ---------------------------------------------------------------- verifier round 2
+def test_claim_next_exclusivity_is_worker_or_session(wt):
+    it = _parked(wt)  # w1 / SID parked
+    b = wt.q.enqueue(project="PK", note="B", source="test")
+    wt.q.claim_by_ref(b["ref"], "w1", session_uuid=SID)
+    wt.q.enqueue(project="PK", note="C", source="test")
+    with pytest.raises(ValueError):
+        wt.q.claim_next("alias-w1", project="PK", session_uuid=SID)
+    assert wt.q.get(it["ref"])["status"] == "awaiting_answer"
+
+
+def test_check_queued_delivers_the_cas_item_not_a_reload(wt, monkeypatch):
+    it = _parked(wt)
+    ans = wt.q.answer(it["ref"], "first", session_id="human")
+    gen = ans["pending_answer"]["gen"]
+    monkeypatch.setattr(wt.answers, "worker_alive", lambda wid: False)
+    monkeypatch.setattr(wt.answers, "_resumable", lambda engine, sid: True)
+    monkeypatch.setattr(wt.answers, "_deliver_bound", lambda *a, **k: {"route": "resume"})
+    wt.answers.route_answer(it["ref"], gen)
+    # Force the record into `queued` with a gone outbox row.
+    wt.q.pa_transition(it["ref"], gen, "delivering", "queued", from_status="in_progress")
+    cur = wt.q.get(it["ref"])
+    seen = []
+    real_transition = wt.q.pa_transition
+
+    def racing(ref, g, frm, to, **kw):
+        out = real_transition(ref, g, frm, to, **kw)
+        # the ticket is re-blocked and answered again right after the CAS
+        data = wt.q._load_unlocked()
+        for x in data["items"]:
+            if x["ref"] == ref:
+                x["pending_answer"] = dict(x["pending_answer"], gen=g + 1, state="routing",
+                                           answer="NEW")
+                x["status"] = "awaiting_answer"
+        wt.q._save_unlocked(data)
+        return out
+
+    monkeypatch.setattr(wt.q, "pa_transition", racing)
+    monkeypatch.setattr(wt.answers, "_deliver_bound",
+                        lambda item, g: seen.append((item["pending_answer"]["gen"], g)))
+    assert wt.answers._check_queued(cur, gen, 0.0) == "redelivered"
+    assert seen == [(gen, gen)]  # gen1's item, never the newer gen2 record
+
+
+def test_one_window_governs_retention_expiry_and_reap(wt, monkeypatch):
+    import time
+    import watchtower.workers as workers
+    _parked(wt)
+    monkeypatch.setenv("WATCHTOWER_PARK_GRACE_S", "1")
+    assert workers.park_retention_s() == workers.park_grace_s() == 1.0
+    assert workers.retained_parked_ids("PK") == {"w1"}
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 60)
+    assert workers.retained_parked_ids("PK") == set()
+    assert "w1" not in workers._fresh_park_owners(time.time())
+
+
+def test_retained_ids_exclude_busy_and_dead_owners(wt, monkeypatch):
+    import watchtower.workers as workers
+    _parked(wt)
+    assert workers.retained_parked_ids("PK") == {"w1"}
+    b = wt.q.enqueue(project="PK", note="B", source="test")
+    wt.q.claim_by_ref(b["ref"], "w1", session_uuid=SID)
+    assert workers.retained_parked_ids("PK") == set()  # busy on B
+    wt.q.close(b["ref"], "w1", resolution="ok")
+    assert workers.retained_parked_ids("PK") == {"w1"}
+    monkeypatch.setattr(workers, "list_workers", lambda *a, **k: [
+        {"worker_id": "w1", "queue": "PK", "alive": False}])
+    assert workers.retained_parked_ids("PK") == set()  # known dead

@@ -2217,7 +2217,7 @@ def claim_next(
             _save_unlocked(data)
         # WT-28: one-ticket-at-a-time re-checked inside the lock (the pre-lock
         # read above can be stale when a resume/affinity claim lands between).
-        held_now = _held_unlocked(data["items"], str(session_id), "", proj)
+        held_now = _held_unlocked(data["items"], str(session_id), str(real_sid or ""), proj)
         if held_now:
             _raise_claim_refused(held_now, session_id)
         candidates = _claim_candidates(
