@@ -1690,11 +1690,17 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                         data["items"], str(it.get("ref") or ""),
                         list(fields["blocked_by"] or []),
                     )
+                edge_from = _pa_edge_start(it)
                 for k, v in fields.items():
                     if k in ALLOWED:
                         # "item_type" and "type" are aliases — store as "type"
                         key = "type" if k == "item_type" else k
                         it[key] = v
+                superseded = bool(fields.get("needs_input")) and edge_from is not None
+                if superseded:
+                    # A new block supersedes the pending answer, as block() does (E17).
+                    _supersede_pending_unlocked(it, now)
+                    _check_answer_edge_from(it, edge_from)
                 changed = {
                     ("type" if k == "item_type" else k): v
                     for k, v in fields.items()
@@ -1704,6 +1710,8 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                     _append_history(it, "edit", by=_by("system"), at=now, fields=changed)
                 it["updated_at"] = now
                 _save_unlocked(data)
+                if superseded:
+                    _supersede_outbox(it.get("ref"))
                 return it
     return None
 
@@ -1840,6 +1848,10 @@ def _escalate_stuck_blockers(items: List[Dict[str, Any]]) -> bool:
     changed = False
     for it in items:
         if it.get("status") != "open" or it.get("needs_input") or not it.get("blocked_by"):
+            continue
+        # WT-31: an answer in flight settles first (block ∧ INFLIGHT is
+        # unreachable); a settled one stays with the ticket.
+        if (it.get("pending_answer") or {}).get("state") in ANSWER_INFLIGHT:
             continue
         state, ref = blocker_verdict(it, by_ref)
         if state != "stuck":
@@ -4994,6 +5006,19 @@ def _check_answer_edge(it: Dict[str, Any], edge: Tuple[str, str, str, str]) -> N
     _log("ANSWER_EDGE_UNDECLARED", detail, queue=str(it.get("project") or ""))
 
 
+def _pa_edge_start(it: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """``(state, status)`` before an in-lock write that may move
+    ``pending_answer``; None when the ticket carries none."""
+    pa = it.get("pending_answer")
+    return (str(pa.get("state")), str(it.get("status"))) if pa else None
+
+
+def _check_answer_edge_from(it: Dict[str, Any], old: Optional[Tuple[str, str]]) -> None:
+    if old is not None:
+        _check_answer_edge(it, (old[0], str((it.get("pending_answer") or {}).get("state") or "none"),
+                                old[1], str(it.get("status"))))
+
+
 def _plan_active_unlocked(it: Dict[str, Any]) -> bool:
     """PLAN_ACTIVE (WT-31 D1a): plan-gated and the plan has not settled. The
     plan stage owns the ticket, so an answer goes to it, not to a parked
@@ -5177,7 +5202,8 @@ def _resume_proc(parked: Dict[str, Any]) -> Dict[str, Any]:
 def resume_claim(ident: Any, gen: int) -> Optional[Dict[str, Any]]:
     """CAS ``awaiting_answer`` -> ``in_progress`` bound to the parked worker
     and session (state ``delivering``). Refuses, in the same lock, when that
-    worker or session already holds an active claim (no double claim)."""
+    worker or session already holds an active claim (no double claim) or the
+    plan gate is active (the answer goes to the plan stage instead)."""
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -5187,6 +5213,8 @@ def resume_claim(ident: Any, gen: int) -> Optional[Dict[str, Any]]:
             parked = it.get("parked") or {}
             if (not pa or int(pa.get("gen") or -1) != int(gen) or pa.get("state") != "routing"
                     or it.get("status") != PARKED_STATUS or not parked):
+                return None
+            if _plan_active_unlocked(it):   # WT-31 D1a: the plan stage owns it
                 return None
             if _held_unlocked(data["items"], str(parked.get("worker_id") or ""),
                               str(parked.get("session_id") or ""), it.get("project")):
@@ -5291,7 +5319,7 @@ def migrate_legacy_blocks(queue: Optional[str] = None, dry_run: bool = False) ->
             claimant = str(it.get("claimed_by") or "")
             if not claimant or (it.get("stage_session") or {}).get("escalated"):
                 continue
-            if (it.get("plan") or {}).get("status") == "blocked":
+            if (it.get("plan") or {}).get("status") == "blocked" or _plan_active_unlocked(it):
                 continue
             last = next((h for h in reversed(it.get("history") or [])
                          if h.get("event") == "block"), None)
@@ -5323,8 +5351,9 @@ def block(
     ``origin`` (WT-28): ``"worker"`` (``wt block``) on the local store PARKS
     the ticket -- status ``awaiting_answer``, claim released, ``parked``
     records the session the answer returns to -- so the worker can take the
-    next ticket. Plan-gate / stage-escalation / verifier blocks and GitHub
-    queues keep the legacy behaviour below.
+    next ticket. Plan-gate / stage-escalation / verifier blocks, worker blocks
+    while the plan gate is active (WT-31) and GitHub queues keep the legacy
+    behaviour below.
 
     The legacy path: the ticket STAYS ``in_progress`` bound to its session (so ``claim_next``,
     which only picks ``open``, can never hand it to another worker) and is flagged
@@ -5358,10 +5387,14 @@ def block(
             if _matches(it, ident):
                 now = _now_iso()
                 was_parked = it.get("status") == PARKED_STATUS
+                edge_from = _pa_edge_start(it)
                 _supersede_pending_unlocked(it, now)
                 park_worker = str(it.get("claimed_by") or session_id or "")
+                # WT-31 D1a: under an active plan gate the plan stage owns the
+                # ticket, so a worker block stays legacy (needs_input).
                 park = (origin == "worker" and not was_parked
-                        and it.get("status") in ("open", "in_progress") and bool(park_worker))
+                        and it.get("status") in ("open", "in_progress") and bool(park_worker)
+                        and not _plan_active_unlocked(it))
                 park_sid = str(it.get("claimed_session_id")
                                or _coerce_session_uuid(session_id) or "")
                 park_machine = str(it.get("claimed_machine") or machine_tag())
@@ -5394,6 +5427,7 @@ def block(
                 )
                 if park:
                     _park_unlocked(it, park_worker, park_sid, park_machine, now, actor)
+                _check_answer_edge_from(it, edge_from)   # E17
                 _save_unlocked(data)
                 _supersede_outbox(it.get("ref"))
                 if progress:

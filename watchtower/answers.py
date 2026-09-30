@@ -236,6 +236,9 @@ def _wake(item: Dict[str, Any], pa: Dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------- routing
+PLAN_ACTIVE_REASON = "plan gate active; answer handed to the plan stage"
+
+
 def _fallback_reopen(ref: str, gen: int, reason: str) -> Optional[Dict[str, Any]]:
     return q.pa_transition(ref, gen, ("routing", "delivering", "queued"), "handed_off",
                            from_status=("awaiting_answer", "in_progress"), reopen=True,
@@ -254,6 +257,12 @@ def route_answer(ref: str, gen: int, tid: bool = False) -> Dict[str, Any]:
         q.pa_transition(ref, gen, "routing", "routing", from_status="awaiting_answer",
                         fields={"tid": True})
         pa = (q.get(ref) or {}).get("pending_answer") or pa
+    if q._plan_active_unlocked(item):
+        # WT-31 D1a: the plan stage owns the ticket; never resume the parked
+        # session past the gate (E5).
+        done = q.pa_transition(ref, gen, "routing", "handed_off", from_status="awaiting_answer",
+                               reopen=True, route="reopen", reason=PLAN_ACTIVE_REASON)
+        return {"route": "reopen" if done else "noop", "reason": PLAN_ACTIVE_REASON}
     wid, sid = str(pa.get("prior_worker_id") or ""), str(pa.get("prior_session_id") or "")
     engine = str(pa.get("prior_engine") or "") or engine_for(wid, sid)
     limit = requeue_bytes()
@@ -293,9 +302,11 @@ def route_answer(ref: str, gen: int, tid: bool = False) -> Dict[str, Any]:
     bound = q.resume_claim(ref, gen)
     if bound is None:
         # The parked worker/session holds another claim (or the CAS lost).
-        if (q.get(ref) or {}).get("pending_answer", {}).get("gen") != gen:
+        now_it = q.get(ref) or {}
+        if now_it.get("pending_answer", {}).get("gen") != gen:
             return {"route": "noop", "reason": "superseded"}
-        why = "parked session already holds another ticket"
+        why = (PLAN_ACTIVE_REASON if q._plan_active_unlocked(now_it)
+               else "parked session already holds another ticket")
         done = q.pa_transition(ref, gen, "routing", "handed_off", from_status="awaiting_answer",
                                reopen=True, route="reopen", reason=why)
         return {"route": "reopen" if done else "noop", "reason": why}
@@ -352,6 +363,17 @@ def route_pending_answers(now: Optional[float] = None) -> List[str]:
             if q._github_backend_for_project(str(it.get("project") or "")) is not None:
                 continue
             gen, state = int(pa.get("gen") or 0), pa.get("state")
+            if q._plan_active_unlocked(it) and state in ("delivering", "queued", "affinity"):
+                # WT-31 D1a: the gate turned on mid-flight; hand the answer to
+                # the plan stage (E10 / E11).
+                if state == "affinity":
+                    done = q.pa_transition(ref, gen, "affinity", "handed_off", from_status="open",
+                                           reason=PLAN_ACTIVE_REASON)
+                else:
+                    done = _fallback_reopen(ref, gen, PLAN_ACTIVE_REASON)
+                if done:
+                    acted.append(f"{ref}:plan_handoff")
+                continue
             if state == "routing" and _age(pa, now) >= ROUTE_LEASE_S:
                 route_answer(ref, gen)
                 acted.append(f"{ref}:routed")

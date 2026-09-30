@@ -404,7 +404,22 @@ def _goal(item: Dict[str, Any], role: str, *, token: str, respawn: bool,
                  f"died without finishing; start fresh.")
     if note:
         goal += f"\n\nHuman note: {note}"
+    pa = item.get("pending_answer") or {}
+    if pa.get("state") == "handed_off" and pa.get("answer"):
+        # WT-31 D1a: an answer handed to the plan stage reaches it here; it is
+        # confirmed (E13) only by the stage's receipt, not by this spawn.
+        q_ = str(pa.get("question") or "").strip()
+        goal += ("\n\nA human answered the ticket's open question"
+                 + (f" ({q_[:500]})" if q_ else "") + f":\n{pa['answer']}")
     return goal
+
+
+def _confirm_stage_answer(ref: str, gen: int) -> Optional[Dict[str, Any]]:
+    """The plan stage confirmed it received the handed-off answer (E13; the
+    status is untouched). Called by the phase-C receipt ledger; a stage that
+    dies first leaves the record handed_off for its next attempt."""
+    return q.pa_transition(ref, gen, "handed_off", "delivered",
+                           from_status=("open", "in_progress"))
 
 
 # -------------------------------------------------------------------- spawn
