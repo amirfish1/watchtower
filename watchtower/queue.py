@@ -2706,9 +2706,15 @@ def effective_gates(item: Dict[str, Any]) -> List[str]:
 # and the build worker gets the accepted plan. A rejected plan is revised up to
 # PLAN_MAX_REVISIONS times; the ticket blocks only if they still disagree. No
 # human step. State lives on ``item["plan"]``:
-#   {status: planning|reviewing|accepted|blocked|failed, round, text,
+#   {status: planning|reviewing|discussing|accepted|blocked|failed, round, text,
+#    version, accepted_version, discussion: {status, round, objections, ...},
 #    reviews: [{round, accepted, reasons, by, at}], planner: {...}, reviewer: {...}}
 PLAN_MAX_REVISIONS = 2
+# WT-26: after the FIRST rejection the planner and reviewer talk directly
+# (status ``discussing``, state in ``plan["discussion"]``); up to this many
+# discussion rounds (one per reviewer rejection) before a bounded human block.
+PLAN_DISCUSSION_ROUNDS = 3
+PLAN_DISCUSSION_MAX_NUDGES = 3
 
 
 def plan_gate(item: Dict[str, Any]) -> Optional[str]:
@@ -2753,7 +2759,7 @@ def plan_start(ident: Any) -> Optional[Dict[str, Any]]:
     fresh = []
 
     def _do(it, plan):
-        if plan.get("status") in ("planning", "reviewing", "accepted", "failed", "blocked"):
+        if plan.get("status") in ("planning", "reviewing", "discussing", "accepted", "failed", "blocked"):
             return
         plan.update(status="planning", round=1, text="", reviews=[])
         _append_history(it, "plan_start", by=_by("system"), at=_now_iso())
@@ -2781,30 +2787,47 @@ def plan_fail(ident: Any, reason: str) -> Optional[Dict[str, Any]]:
 
 
 def plan_submit(ident: Any, text: str, by: str = "planner") -> Optional[Dict[str, Any]]:
-    """The planner files (or revises) the plan; moves to ``reviewing``."""
+    """The planner files (or revises) the plan; moves to ``reviewing``. Each
+    submission is a new ``version``; during a discussion (WT-26) the amended
+    plan goes back to the same reviewer for an explicit verdict on it."""
     text = str(text or "").strip()
     if not text:
         raise ValueError("plan text is empty")
     current = get(ident)
     if current is None:
         return None
-    if (current.get("plan") or {}).get("status") != "planning":
+    if (current.get("plan") or {}).get("status") not in ("planning", "discussing"):
         raise ValueError(f"{current.get('ref', ident)} is not waiting for a plan "
                          f"(plan status {(current.get('plan') or {}).get('status') or 'none'})")
 
     def _do(it, plan):
-        plan.update(status="reviewing", text=_clip(text, 24000))
+        plan.update(status="reviewing", text=_clip(text, 24000),
+                    version=int(plan.get("version") or 0) + 1)
+        disc = plan.get("discussion")
+        if disc and disc.get("status") == "active":
+            disc.update(awaiting="reviewer", nudges=0, updated_at=_now_iso())
+            plan["discussion"] = disc
         _append_history(it, "plan", by=_by("system"), at=_now_iso(),
                         text=_clip(text, 4000), round=plan.get("round", 1),
-                        planner=str(by))
+                        version=plan["version"], planner=str(by))
     return _plan_update(ident, _do)
 
 
+def _plan_reachable(plan: Dict[str, Any]) -> bool:
+    return bool((plan.get("planner") or {}).get("worker_id")
+                and (plan.get("reviewer") or {}).get("worker_id"))
+
+
 def plan_verdict(ident: Any, accepted: bool, reasons: str = "",
-                 by: str = "plan-reviewer") -> Optional[Dict[str, Any]]:
-    """The plan reviewer's verdict. Accept -> ``accepted``. Reject -> back to
-    ``planning`` with the reasons (round + 1) while revisions remain, else
-    ``blocked`` (the caller then blocks the ticket for a human)."""
+                 by: str = "plan-reviewer",
+                 version_seen: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    """The plan reviewer's verdict on plan ``version_seen`` (default: current).
+    Accept -> ``accepted`` (records ``accepted_version``). The first reject
+    with both roles reachable opens a planner<->reviewer discussion
+    (``discussing``, WT-26); each further reject is another discussion round
+    until PLAN_DISCUSSION_ROUNDS, then ``blocked`` with a recorded reason (the
+    caller blocks the ticket for a human). Without reachable roles: back to
+    ``planning`` (round + 1) while revisions remain, else ``blocked``."""
     current = get(ident)
     if current is None:
         return None
@@ -2814,18 +2837,117 @@ def plan_verdict(ident: Any, accepted: bool, reasons: str = "",
 
     def _do(it, plan):
         rnd = int(plan.get("round") or 1)
+        version = int(plan.get("version") or rnd)
+        if version_seen is not None and int(version_seen) != version:
+            raise ValueError(f"verdict is for plan v{version_seen} but the ticket holds "
+                             f"v{version}; review the current plan")
         plan["reviews"] = list(plan.get("reviews") or []) + [
-            {"round": rnd, "accepted": bool(accepted), "reasons": _clip(reasons, 3000),
-             "by": str(by), "at": _now_iso()}]
+            {"round": rnd, "version": version, "accepted": bool(accepted),
+             "reasons": _clip(reasons, 3000), "by": str(by), "at": _now_iso()}]
+        disc = plan.get("discussion") or None
+        now = _now_iso()
         if accepted:
-            plan["status"] = "accepted"
+            plan.update(status="accepted", accepted_version=version)
+            if disc:
+                disc.update(status="agreed", awaiting="", updated_at=now,
+                            reason=f"reviewer accepted v{version}")
+        elif disc or _plan_reachable(plan):
+            drnd = int((disc or {}).get("round") or 0) + 1
+            disc = disc or {"started_at": now, "started_by": str(by), "messages": [],
+                            "participants": {
+                                "planner": plan["planner"]["worker_id"],
+                                "reviewer": plan["reviewer"]["worker_id"]}}
+            disc.update(round=drnd, objections=_clip(reasons, 3000), updated_at=now,
+                        awaiting="planner", nudges=0)
+            cap = int(plan.get("discussion_rounds", PLAN_DISCUSSION_ROUNDS))
+            if drnd > cap:
+                disc.update(status="escalated", awaiting="",
+                            reason=f"no agreement after {cap} discussion rounds")
+                plan["status"] = "blocked"
+            else:
+                disc["status"] = "active"
+                plan["status"] = "discussing"
+            plan["discussion"] = disc
         elif rnd > int(plan.get("revision_limit", PLAN_MAX_REVISIONS)):
             plan["status"] = "blocked"
         else:
             plan.update(status="planning", round=rnd + 1)
-        _append_history(it, "plan_review", by=_by("system"), at=_now_iso(),
-                        passed=bool(accepted), text=_clip(reasons, 1000), round=rnd)
+        _append_history(it, "plan_review", by=_by("system"), at=now,
+                        passed=bool(accepted), text=_clip(reasons, 1000), round=rnd,
+                        version=version)
     return _plan_update(ident, _do)
+
+
+def plan_discuss(ident: Any, role: str, text: str) -> Optional[Dict[str, Any]]:
+    """Record one peer message in the planner<->reviewer discussion (WT-26).
+    The CLI forwards it to the counterpart; state only keeps the transcript
+    (last 30) so a restart can re-deliver it. No state transition."""
+    role = str(role or "").strip().lower()
+    if role not in ("planner", "reviewer"):
+        raise ValueError("role must be 'planner' or 'reviewer'")
+    text = str(text or "").strip()
+    if not text:
+        raise ValueError("discussion message is empty")
+    current = get(ident)
+    if current is None:
+        return None
+    plan = current.get("plan") or {}
+    if not plan.get("discussion") or plan["discussion"].get("status") != "active":
+        raise ValueError(f"{current.get('ref', ident)} has no active plan discussion")
+
+    def _do(it, plan):
+        disc = plan["discussion"]
+        disc["messages"] = (list(disc.get("messages") or []) + [
+            {"round": disc.get("round"), "from": role, "text": _clip(text, 3000),
+             "at": _now_iso()}])[-30:]
+        disc["updated_at"] = _now_iso()
+        plan["discussion"] = disc
+        _append_history(it, "plan_discussion", by=_by("system"), at=_now_iso(),
+                        text=_clip(text, 1000), role=role, round=disc.get("round"))
+    return _plan_update(ident, _do)
+
+
+def plan_discussion_nudge(ident: Any, stale_s: float = 900.0) -> Optional[Dict[str, Any]]:
+    """Recovery for a stalled discussion (restart / lost message). When the
+    awaited party has been silent for ``stale_s`` this bumps ``nudges`` and
+    returns the item with ``_nudge`` = the role to re-message (no new spawn);
+    after PLAN_DISCUSSION_MAX_NUDGES the plan blocks with a recorded reason.
+    Returns None when nothing is due."""
+    current = get(ident)
+    if current is None:
+        return None
+    plan = current.get("plan") or {}
+    disc = plan.get("discussion") or {}
+    if disc.get("status") != "active" or not disc.get("awaiting"):
+        return None
+    try:
+        age = time.time() - datetime.fromisoformat(
+            str(disc.get("updated_at") or plan.get("updated_at") or "").replace("Z", "+00:00")
+        ).timestamp()
+    except Exception:
+        age = stale_s
+    if age < stale_s:
+        return None
+    due = []
+
+    def _do(it, plan):
+        disc = plan["discussion"]
+        disc["nudges"] = int(disc.get("nudges") or 0) + 1
+        disc["updated_at"] = _now_iso()
+        if disc["nudges"] > PLAN_DISCUSSION_MAX_NUDGES:
+            disc.update(status="escalated",
+                        reason=f"{disc.get('awaiting')} unresponsive after "
+                               f"{PLAN_DISCUSSION_MAX_NUDGES} reminders")
+            plan["status"] = "blocked"
+            _append_history(it, "plan_discussion", by=_by("system"), at=_now_iso(),
+                            text=disc["reason"], role="system", round=disc.get("round"))
+        else:
+            due.append(disc["awaiting"])
+        plan["discussion"] = disc
+    item = _plan_update(ident, _do)
+    if item is None:
+        return None
+    return dict(item, _nudge=due[0] if due else "")
 
 
 def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
@@ -2861,7 +2983,9 @@ def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
             plan["status"] = "accepted"
         else:
             plan.update(status="planning", round=rnd + 1,
-                        revision_limit=rnd + int(retries) - 1)
+                        revision_limit=rnd + int(retries) - 1,
+                        discussion_rounds=int(retries))
+            plan.pop("discussion", None)
         plan["decisions"] = list(plan.get("decisions") or []) + [
             {"decision": decision, "round": rnd, "by": str(by or "human"), "at": now,
              "text": _clip(text, 3000), **({"retries": int(retries)} if decision == "retry" else {})}]

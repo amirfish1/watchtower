@@ -1181,7 +1181,7 @@ def start_pending_plans(queue: str) -> int:
     ``queue`` whose planning has not begun (WT-22). Planning happens BEFORE a
     build worker claims; ``_claim_candidates`` keeps the ticket unclaimable
     until the plan settles. Best-effort; returns how many planners started."""
-    n = 0
+    n = recover_plan_discussions(queue) * 0  # WT-26: re-message stalled discussions
     try:
         for it in q.list_items(project=queue) or []:
             if it.get("status") != "open" or q.plan_gate(it) is None:
@@ -1193,6 +1193,53 @@ def start_pending_plans(queue: str) -> int:
                 _spawn_plan_role(started, "planner", _plan_goal(started),
                                  f"plan-{it['ref']}")
                 n += 1
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
+
+def _plan_send(item: dict, role: str, text: str) -> bool:
+    """Message the planner/reviewer session of ``item`` (durable outbox on
+    failure; never spawns). False when the role has no worker id or delivery
+    neither succeeded nor parked."""
+    wid = ((item.get("plan") or {}).get(role) or {}).get("worker_id")
+    if not wid:
+        return False
+    try:
+        from . import messages
+        res = messages.send(str(wid), text)
+        return bool(res.get("ok") or res.get("queued"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
+    """Re-message the awaited party of any stalled planner<->reviewer
+    discussion (lost message / restart). Bounded by
+    q.PLAN_DISCUSSION_MAX_NUDGES, after which the plan blocks for a human with
+    a recorded reason. Never spawns. Returns the number of reminders sent."""
+    n = 0
+    try:
+        for it in q.list_items(project=queue) or []:
+            if (it.get("plan") or {}).get("status") not in ("discussing", "reviewing"):
+                continue
+            nudged = q.plan_discussion_nudge(it["ref"], stale_s)
+            if nudged is None:
+                continue
+            ref, role = nudged["ref"], nudged.get("_nudge", "")
+            if not role:
+                q.block(ref, str(nudged.get("claimed_session_id") or ""),
+                        question=(f"Plan discussion stalled: "
+                                  f"{nudged['plan']['discussion'].get('reason', '')}. "
+                                  f"Decide with `wt plan decide {ref} --accept|--retry`."),
+                        progress=f"Plan v{nudged['plan'].get('version')}:\n"
+                                 f"{nudged['plan'].get('text', '')}")
+                continue
+            disc = nudged["plan"]["discussion"]
+            _plan_send(nudged, role,
+                       f"Reminder: {ref} plan discussion is waiting on you ({role}). "
+                       f"Objections: {disc.get('objections', '')}. See `wt plan show {ref}`.")
+            n += 1
     except Exception:  # noqa: BLE001
         pass
     return n
@@ -1211,6 +1258,9 @@ def _plan_note(item: dict) -> str:
         return f"Plan stage did not run ({plan.get('reason', '')}); plan the work yourself."
     if status == "blocked":
         return "Plan stage is blocked awaiting a human decision; do not build yet."
+    if status == "discussing":
+        return (f"PLAN IN DISCUSSION: the planner and reviewer are resolving the "
+                f"reviewer's objections. Do NOT start building. Run `wt plan wait {ref}`.")
     return (f"PLAN PENDING: a planner and a reviewer are producing the plan. Do NOT "
             f"start building. Run `wt plan wait {ref}` (blocks until it is accepted "
             f"and prints it), then follow the accepted plan.")
@@ -1229,11 +1279,24 @@ def cmd_plan(args: argparse.Namespace) -> int:
             if args.file:
                 text = Path(args.file).expanduser().read_text()
             item = q.plan_submit(ref, text, by=args.by or _default_worker_id())
-            print(f"PLAN FILED: {ref} round {item['plan']['round']} -> reviewing")
-            _spawn_plan_role(item, "plan_reviewer", _plan_review_goal(item), f"plan-review-{ref}")
+            plan = item["plan"]
+            print(f"PLAN FILED: {ref} round {plan['round']} v{plan.get('version')} -> reviewing")
+            if (plan.get("discussion") or {}).get("status") == "active":
+                # One coordinated discussion: the SAME reviewer gives an explicit
+                # verdict on this exact version; no second reviewer is spawned.
+                _plan_send(item, "reviewer",
+                           f"The planner filed amended plan v{plan.get('version')} for {ref} "
+                           f"addressing your objections. Read it (`wt plan show {ref}`) and "
+                           f"give an explicit verdict on that version: `wt plan verdict {ref} "
+                           f"--accept --version {plan.get('version')} --reasons ...` or "
+                           f"`--reject` with what still must change.")
+            else:
+                _spawn_plan_role(item, "plan_reviewer", _plan_review_goal(item),
+                                 f"plan-review-{ref}")
         elif action == "verdict":
             item = q.plan_verdict(ref, bool(args.accept), args.reasons or "",
-                                  by=args.by or _default_worker_id())
+                                  by=args.by or _default_worker_id(),
+                                  version_seen=getattr(args, "version", None))
             status = item["plan"]["status"]
             print(f"PLAN {'ACCEPTED' if args.accept else 'REJECTED'}: {ref} -> {status}")
             if status == "accepted" and item.get("status") == "open":
@@ -1242,18 +1305,39 @@ def cmd_plan(args: argparse.Namespace) -> int:
                     workers.dispatch_after_enqueue(item.get("project", ""), ref)
                 except Exception:  # noqa: BLE001
                     pass
-            if status == "planning":
+            if status == "discussing":
+                disc = item["plan"]["discussion"]
+                _plan_send(item, "planner",
+                           f"The reviewer rejected plan v{item['plan'].get('version')} of "
+                           f"{ref} (discussion round {disc.get('round')}/"
+                           f"{item['plan'].get('discussion_rounds', q.PLAN_DISCUSSION_ROUNDS)}"
+                           f"). Objections: {args.reasons or ''}\nDiscuss them directly with "
+                           f"the reviewer (`wt plan discuss {ref} --from planner --text ...`), "
+                           f"then file the amended plan with `wt plan submit {ref} --file ...`. "
+                           f"Do not rewrite the plan wholesale; fix the objections.")
+            elif status == "planning":
                 _spawn_plan_role(item, "planner",
                                  _plan_goal(item, feedback=args.reasons or ""),
                                  f"plan-{ref}-r{item['plan']['round']}")
             elif status == "blocked":
                 reviews = item["plan"].get("reviews") or []
+                disc = item["plan"].get("discussion") or {}
+                why = (f"Planner/reviewer discussion did not resolve it: {disc['reason']}."
+                       if disc.get("reason") else
+                       f"The planner and plan reviewer still disagree after "
+                       f"{len(reviews)} rounds.")
                 q.block(ref, str(item.get("claimed_session_id") or ""),
-                        question=(f"The planner and plan reviewer still disagree after "
-                                  f"{len(reviews)} rounds. Last reviewer reasons: "
-                                  f"{reviews[-1].get('reasons', '')}. Decide the approach."),
+                        question=(f"{why} Last reviewer reasons: "
+                                  f"{reviews[-1].get('reasons', '')}. Decide with "
+                                  f"`wt plan decide {ref} --accept|--retry`."),
                         progress=f"Plan (round {item['plan'].get('round')}):\n"
                                  f"{item['plan'].get('text', '')}")
+        elif action == "discuss":
+            item = q.plan_discuss(ref, args.sender, args.text)
+            peer = "reviewer" if args.sender == "planner" else "planner"
+            sent = _plan_send(item, peer, f"[{ref} plan discussion, from the {args.sender}] "
+                                          f"{args.text}")
+            print(f"DISCUSSION: {ref} {args.sender} -> {peer} ({'sent' if sent else 'queued/unreachable'})")
         elif action == "decide":
             text = args.text or ""
             if args.file:
@@ -1294,6 +1378,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 for r in plan.get("reviews") or []:
                     print(f"  review r{r['round']}: {'accept' if r['accepted'] else 'reject'}"
                           f" -- {r.get('reasons', '')}")
+                disc = plan.get("discussion")
+                if disc:
+                    print(f"  discussion: {disc.get('status')} round {disc.get('round')} "
+                          f"awaiting={disc.get('awaiting') or '-'} "
+                          f"{disc.get('reason') or ''}".rstrip())
+                    for m in disc.get("messages") or []:
+                        print(f"    {m['from']}: {m['text']}")
         elif action == "wait":
             deadline = time.time() + args.timeout
             while True:
@@ -5717,6 +5808,12 @@ def build_parser() -> argparse.ArgumentParser:
     p3 = ps.add_parser("show", help="print the ticket's plan state")
     p3.add_argument("ref")
     p3.add_argument("--json", action="store_true")
+    p6 = ps.add_parser("discuss", help="planner/reviewer: message the counterpart in the plan discussion")
+    p6.add_argument("ref")
+    p6.add_argument("--from", dest="sender", choices=["planner", "reviewer"], required=True)
+    p6.add_argument("--text", required=True)
+    p2.add_argument("--version", type=int, default=None,
+                    help="plan version this verdict is for (rejects a stale verdict)")
     p5 = ps.add_parser("decide", help="human: settle a plan blocked by exhausted review")
     p5.add_argument("ref")
     g = p5.add_mutually_exclusive_group(required=True)

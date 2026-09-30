@@ -326,8 +326,11 @@ def test_plan_flow_accept_then_builder_gets_plan(plan_cli):
         "plan_start", "plan", "plan_review"]
 
 
-def test_plan_reject_revises_then_blocks(plan_cli):
+def test_plan_reject_revises_then_blocks(plan_cli, monkeypatch):
+    # roles without worker ids cannot be messaged: legacy respawn-with-feedback path
     q, cli, calls = plan_cli.q, plan_cli.cli, plan_cli.calls
+    monkeypatch.setattr(cli.workers, "spawn_adhoc",
+                        lambda goal, eng, **kw: calls.append({"goal": goal, "engine": eng, **kw}) or {})
     a = _claimed(q, gates=["plan"])
     cli._start_plan_stage(q.get(a["ref"]))
     for n in range(q.PLAN_MAX_REVISIONS + 1):
@@ -388,7 +391,9 @@ def _block_plan(plan_cli, session=False):
     if session:
         _set_session(q, a["ref"], "sess-1")
     cli._start_plan_stage(q.get(a["ref"]))
-    for n in range(q.PLAN_MAX_REVISIONS + 1):
+    for n in range(20):
+        if q.get(a["ref"])["plan"]["status"] == "blocked":
+            break
         cli.cmd_plan(_ns(plan_cmd="submit", ref=a["ref"], text=f"plan v{n}"))
         cli.cmd_plan(_ns(plan_cmd="verdict", ref=a["ref"], reject=True, reasons=f"bad {n}"))
     return a["ref"]
@@ -417,11 +422,14 @@ def test_plan_decide_retry_grants_budget(plan_cli):
     assert cli.cmd_plan(_ns(plan_cmd="decide", ref=ref, retry=True, accept=False,
                             retries=1)) == 0
     it = q.get(ref)
-    assert it["plan"]["status"] == "planning" and it["plan"]["round"] == q.PLAN_MAX_REVISIONS + 2
+    assert it["plan"]["status"] == "planning"
     assert it["needs_input"] is False and it["status"] == "in_progress"  # session kept
     cli.cmd_plan(_ns(plan_cmd="submit", ref=ref, text="v4"))
     cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, reject=True, reasons="still bad"))
-    assert q.get(ref)["plan"]["status"] == "blocked"  # only one extra round
+    assert q.get(ref)["plan"]["status"] == "discussing"
+    cli.cmd_plan(_ns(plan_cmd="submit", ref=ref, text="v5"))
+    cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, reject=True, reasons="still bad"))
+    assert q.get(ref)["plan"]["status"] == "blocked"  # the granted budget is spent
 
 
 def test_plan_decide_requires_blocked_plan(plan_cli):
@@ -437,3 +445,78 @@ def test_answer_on_blocked_plan_warns(plan_cli, capsys):
     ref = _block_plan(plan_cli)
     cli.cmd_answer(argparse.Namespace(ref=ref, text="ok", worker="", engine="", tid=False))
     assert "plan gate is STILL BLOCKED" in capsys.readouterr().out
+
+
+# --- WT-26: planner <-> reviewer discussion after the first rejection --------
+
+def _planned(plan_cli, monkeypatch=None):
+    q, cli = plan_cli.q, plan_cli.cli
+    a = _claimed(q, gates=["plan"])
+    cli._start_plan_stage(q.get(a["ref"]))
+    cli.cmd_plan(_ns(plan_cmd="submit", ref=a["ref"], text="plan v1"))
+    return a["ref"]
+
+
+def _sent(cli, monkeypatch):
+    sent = []
+    from watchtower import messages
+    monkeypatch.setattr(messages, "send",
+                        lambda target, text, **kw: sent.append((target, text)) or {"ok": True})
+    return sent
+
+
+def test_first_rejection_starts_one_discussion_and_reviewer_accepts_version(plan_cli, monkeypatch):
+    q, cli, calls = plan_cli.q, plan_cli.cli, plan_cli.calls
+    sent = _sent(cli, monkeypatch)
+    ref = _planned(plan_cli)
+    n_spawns = len(calls)
+    cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, reject=True, reasons="missing tests"))
+    it = q.get(ref)
+    assert it["plan"]["status"] == "discussing" and it["needs_input"] is False
+    assert it["plan"]["discussion"]["round"] == 1
+    assert len(calls) == n_spawns                      # no duplicate planner spawn
+    assert sent[-1][0] == it["plan"]["planner"]["worker_id"] and "missing tests" in sent[-1][1]
+    assert q.plan_pending(it)
+    cli.cmd_plan(_ns(plan_cmd="discuss", ref=ref, sender="reviewer", text="add a restart test"))
+    cli.cmd_plan(_ns(plan_cmd="submit", ref=ref, text="plan v2 with tests"))
+    assert len(calls) == n_spawns                      # same reviewer is re-asked
+    assert sent[-1][0] == it["plan"]["reviewer"]["worker_id"]
+    with pytest.raises(ValueError):
+        q.plan_verdict(ref, True, version_seen=1)      # stale version refused
+    assert q.get(ref)["plan"]["status"] == "reviewing"
+    assert cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, accept=True, version=2,
+                            reasons="ok")) == 0
+    done = q.get(ref)
+    assert done["plan"]["status"] == "accepted" and done["plan"]["accepted_version"] == 2
+    assert done["plan"]["discussion"]["status"] == "agreed"
+    assert "plan v2 with tests" in cli._plan_note(done)
+    assert "plan_discussion" in [h["event"] for h in done["history"]]
+
+
+def test_discussion_bounded_then_explained_human_block(plan_cli, monkeypatch):
+    q, cli = plan_cli.q, plan_cli.cli
+    _sent(cli, monkeypatch)
+    ref = _planned(plan_cli)
+    for n in range(q.PLAN_DISCUSSION_ROUNDS + 1):
+        cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, reject=True, reasons=f"no {n}"))
+        if q.get(ref)["plan"]["status"] == "discussing":
+            cli.cmd_plan(_ns(plan_cmd="submit", ref=ref, text=f"v{n + 2}"))
+    it = q.get(ref)
+    assert it["plan"]["status"] == "blocked" and it["needs_input"] is True
+    assert "discussion rounds" in it["block_question"]
+    assert it["plan"]["discussion"]["status"] == "escalated"
+
+
+def test_stalled_discussion_nudges_then_escalates(plan_cli, monkeypatch):
+    q, cli = plan_cli.q, plan_cli.cli
+    sent = _sent(cli, monkeypatch)
+    ref = _planned(plan_cli)
+    cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, reject=True, reasons="bad"))
+    before = len(sent)
+    assert cli.recover_plan_discussions("GT", stale_s=3600) == 0   # fresh: nothing due
+    for _ in range(q.PLAN_DISCUSSION_MAX_NUDGES):
+        assert cli.recover_plan_discussions("GT", stale_s=0) == 1
+    assert len(sent) == before + q.PLAN_DISCUSSION_MAX_NUDGES
+    cli.recover_plan_discussions("GT", stale_s=0)
+    it = q.get(ref)
+    assert it["plan"]["status"] == "blocked" and "unresponsive" in it["block_question"]
