@@ -144,6 +144,26 @@ VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "needs-rationale", ""
 # needs-rationale is the product-gate icebox (a human Nacked; revival needs a new rationale — see the 2026-09-01 design).
 UNCLAIMABLE_READINESS = ("needs-shaping", "needs-spec", "needs-rationale")
 VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
+
+# --- WT-31 state vocabularies --------------------------------------------------
+# The dimensions of the liveness state table (watchtower/liveness.py). A value
+# added here without a table row (or an UNREACHABLE entry) and a golden fails
+# tests/test_liveness_table.py; see docs/worker-lifecycle.md.
+BACKENDS = ("file", "github")
+PLAN_STATUSES = ("", "planning", "reviewing", "discussing", "accepted", "failed", "blocked")
+DISC_STATUSES = ("none", "active", "agreed", "escalated")
+DISC_AWAITING = ("none", "planner", "reviewer")
+GATE_KINDS = ("none", "verify", "review")
+ASSESSMENT_STATUSES = ("none", "due", "running", "filing", "done", "failed")
+BLOCK_KINDS = ("input", "rationale", "awaiting-client")
+DEP_VERDICTS = ("ok", "waiting", "stuck")
+# ``pending_answer.state`` (WT-28). ``none`` = no record; ``affinity_expired``
+# is projection-only (``affinity`` past its reservation), never stored.
+ANSWER_STATES = ("none", "routing", "delivering", "queued", "delivered", "affinity",
+                 "affinity_expired", "handed_off")
+ANSWER_SETTLED = ("none", "delivered", "handed_off")
+ANSWER_INFLIGHT = ("routing", "delivering", "queued", "affinity", "affinity_expired")
+_PA_STORED = ("routing", "delivering", "queued", "delivered", "affinity", "handed_off")
 VALID_VALUES = ("H", "M", "L", "")
 VALID_CONFIDENCES = ("H", "M", "L", "")
 # FEAT-NEXT-120 — a filer's best-guess minimum model this ticket needs. Not a
@@ -4786,7 +4806,127 @@ def _affinity_gate_unlocked(it: Dict[str, Any], worker_id: str, real_sid: str,
             f"answer until {until}Z")
 
 
+# --- Answer transitions (WT-31 D1b) ------------------------------------------
+# Every change of ``pending_answer.state`` is one declared edge: (from states)
+# -> to state, with the status moves it may make and the functions allowed to
+# write it. ``none`` = no record. tests/test_liveness_table.py scans the code
+# (every writer and wrapper call site) against this table, and ``_pa_cas``
+# checks each CAS step at runtime. Adding an edge: docs/worker-lifecycle.md.
+_ANY_PA = _PA_STORED
+
+
+def _same(*statuses: str) -> Tuple[Tuple[str, str], ...]:
+    return tuple((s, s) for s in statuses)
+
+
+ANSWER_TRANSITIONS: Tuple[Dict[str, Any], ...] = (
+    {"id": "E1", "from": ("none",), "to": "routing",
+     "status": _same("awaiting_answer"),
+     "writers": ("_write_pending_answer_unlocked",), "callers": ("answer",)},
+    {"id": "E2", "from": ("routing",), "to": "routing",
+     "status": _same("awaiting_answer"), "writers": ("route_answer",)},
+    {"id": "E3", "from": ("routing",), "to": "delivering",
+     "status": (("awaiting_answer", "in_progress"),),
+     "writers": ("resume_claim",), "callers": ("route_answer",)},
+    {"id": "E4", "from": ("routing",), "to": "affinity",
+     "status": (("awaiting_answer", "open"),), "writers": ("route_answer",)},
+    {"id": "E5", "from": ("routing",), "to": "handed_off",
+     "status": (("awaiting_answer", "open"),),
+     "writers": ("route_answer", "_fallback_reopen"),
+     "callers": ("route_pending_answers",)},
+    {"id": "E6", "from": ("delivering",), "to": "queued",
+     "status": _same("in_progress"), "writers": ("_deliver_bound",),
+     "callers": ("route_answer", "_retry", "_check_queued")},
+    {"id": "E7", "from": ("queued",), "to": "delivering",
+     "status": _same("in_progress"), "writers": ("_check_queued",),
+     "callers": ("route_pending_answers",)},
+    {"id": "E8", "from": ("delivering", "queued"), "to": "=",   # attempts self-loop
+     "status": _same("in_progress"), "writers": ("_retry", "_check_queued"),
+     "callers": ("route_pending_answers",)},
+    {"id": "E9", "from": ("delivering", "queued"), "to": "delivered",
+     "status": _same("in_progress"), "writers": ("_on_answer_confirmed",)},
+    {"id": "E10", "from": ("delivering", "queued"), "to": "handed_off",
+     "status": (("in_progress", "open"),), "writers": ("_fallback_reopen",),
+     "callers": ("route_answer", "route_pending_answers", "_deliver_bound",
+                 "_retry", "_check_queued")},
+    {"id": "E11", "from": ("affinity",), "to": "handed_off",
+     "status": _same("open"), "writers": ("route_pending_answers",)},
+    {"id": "E12", "from": ("affinity", "handed_off"), "to": "delivered",
+     "status": (("open", "in_progress"),), "writers": ("_bind_pending_unlocked",),
+     "callers": ("claim_next", "claim_by_ref")},
+    {"id": "E13", "from": ("handed_off",), "to": "delivered",
+     "status": _same("open", "in_progress"), "writers": ("_confirm_stage_answer",)},
+    # Handoff reopen (update_status -> open): release, reopen, the orphan sweep,
+    # a failed-gate close. ``routing`` (parked owner's failed-gate close) and
+    # ``affinity`` (failed-gate close of an open ticket) reach it too.
+    {"id": "E14", "from": ("routing", "delivering", "queued", "delivered", "affinity"),
+     "to": "handed_off",
+     "status": (("in_progress", "open"), ("awaiting_answer", "open"), ("open", "open")),
+     "writers": ("_reopen_pending_unlocked",),
+     "callers": ("update_status", "release", "reopen", "requeue_orphaned_tickets",
+                 "_reopen_with_feedback", "close")},
+    {"id": "E15", "from": _ANY_PA, "to": "none",
+     "status": (("in_progress", "open"), ("awaiting_answer", "open")),
+     "writers": ("_reopen_pending_unlocked",),
+     "callers": ("update_status", "release", "reopen")},
+    {"id": "E16", "from": _ANY_PA, "to": "none",
+     "status": tuple((s, t) for s in ("open", "in_progress", "awaiting_answer")
+                     for t in ("closed", "in_review")),
+     "writers": ("_clear_parked_unlocked",), "callers": ("update_status", "close")},
+    # Any block supersedes the record (carried to the next one); a worker block
+    # parks unless the plan gate is active (then open -> in_progress, R6-1).
+    {"id": "E17", "from": _ANY_PA, "to": "none",
+     "status": (("open", "in_progress"), ("open", "awaiting_answer"), ("open", "open"),
+                ("in_progress", "in_progress"), ("in_progress", "awaiting_answer"),
+                ("awaiting_answer", "awaiting_answer")),
+     "writers": ("_supersede_pending_unlocked",), "callers": ("block", "update")},
+)
+
+
+def answer_edges(edge_id: Optional[str] = None) -> set:
+    """Expanded ``(old_state, new_state, old_status, new_status)`` tuples of one
+    declared edge (or of all of them)."""
+    out = set()
+    for e in ANSWER_TRANSITIONS:
+        if edge_id is not None and e["id"] != edge_id:
+            continue
+        for old in e["from"]:
+            new = old if e["to"] == "=" else e["to"]
+            for fs, ts in e["status"]:
+                out.add((old, new, fs, ts))
+    return out
+
+
+_ANSWER_EDGE_SET = answer_edges()
+
+
+class UndeclaredEdge(RuntimeError):
+    """A ``pending_answer`` step that ANSWER_TRANSITIONS does not declare."""
+
+
+def _check_answer_edge(it: Dict[str, Any], edge: Tuple[str, str, str, str]) -> None:
+    """Runtime half of the transition check: strict (tests,
+    ``WATCHTOWER_STRICT_EDGES=1``) raises before the write; production logs
+    ANSWER_EDGE_UNDECLARED and lets the write stand."""
+    if edge in _ANSWER_EDGE_SET:
+        return
+    detail = (f"{it.get('ref', '?')} {edge[0]}->{edge[1]} "
+              f"status {edge[2]}->{edge[3]}")
+    if os.environ.get("WATCHTOWER_STRICT_EDGES") == "1":
+        raise UndeclaredEdge(f"undeclared answer transition: {detail}")
+    _log("ANSWER_EDGE_UNDECLARED", detail, queue=str(it.get("project") or ""))
+
+
+def _plan_active_unlocked(it: Dict[str, Any]) -> bool:
+    """PLAN_ACTIVE (WT-31 D1a): plan-gated and the plan has not settled. The
+    plan stage owns the ticket, so an answer goes to it, not to a parked
+    session. Same predicate as ``plan_pending``."""
+    return plan_pending(it)
+
+
 def _pa_set_state(it: Dict[str, Any], pa: Dict[str, Any], state: str, now: str) -> None:
+    if state not in _PA_STORED:
+        raise ValueError(f"not a storable answer state: {state!r}")
     pa["state"] = state
     pa["state_at"] = now
     if state in ("delivered", "handed_off") and it.get("carried_answers"):
@@ -4822,8 +4962,9 @@ def _reopen_pending_unlocked(it: Dict[str, Any], now: str, fate: str, reason: st
 
 
 def _clear_parked_unlocked(it: Dict[str, Any]) -> None:
-    for key in ("parked", "pending_answer", "carried_answers"):
-        it.pop(key, None)
+    it.pop("parked", None)
+    it.pop("pending_answer", None)   # E16
+    it.pop("carried_answers", None)
 
 
 def _supersede_outbox(ref: Any) -> None:
@@ -4927,7 +5068,11 @@ def _pa_cas(ident: Any, gen: int, expect_state: Any, expect_status: Any, mutate)
             if (not pa or int(pa.get("gen") or -1) != int(gen)
                     or pa.get("state") not in states or it.get("status") not in statuses):
                 return None
+            old = (str(pa.get("state")), str(it.get("status")))
             mutate(it, pa)
+            new_pa = it.get("pending_answer")
+            _check_answer_edge(it, (old[0], str((new_pa or {}).get("state") or "none"),
+                                    old[1], str(it.get("status"))))
             it["updated_at"] = _now_iso()
             _save_unlocked(data)
             return it

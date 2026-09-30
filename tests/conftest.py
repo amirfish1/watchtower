@@ -44,6 +44,13 @@ def fixture_model_catalogs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def strict_answer_edges(monkeypatch):
+    """WT-31 D2.6g: an undeclared ``pending_answer`` transition raises in
+    tests (production only logs ANSWER_EDGE_UNDECLARED)."""
+    monkeypatch.setenv("WATCHTOWER_STRICT_EDGES", "1")
+
+
+@pytest.fixture(autouse=True)
 def hermetic_session_origins(tmp_path, monkeypatch):
     """WT-27: the origin ledger and spawn-env markers never touch the real
     ~/.watchtower, and a suite run from inside a worker session does not make
