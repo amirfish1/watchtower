@@ -1057,6 +1057,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
             return 1
 
     _rename_claiming_session(item)
+    item = _start_plan_stage(item)
 
     if args.json:
         # The claim just made is by definition the caller's; marking history
@@ -1066,13 +1067,187 @@ def cmd_claim(args: argparse.Namespace) -> int:
         checks = q.checks_block(item)
         if checks:
             shown = dict(shown, checks_after_close=checks)
+        plan_note = _plan_note(item)
+        if plan_note:
+            shown = dict(shown, plan_instructions=plan_note)
         _print_item(shown)
     else:
         print(f"CLAIMED: {item['ref']} -> {worker}")
         print(item.get("text") or item.get("note") or "")
+        plan_note = _plan_note(item)
+        if plan_note:
+            print("\n" + plan_note)
         checks = q.checks_block(item)
         if checks:
             print("\n" + checks)
+    return 0
+
+
+def _plan_goal(item: dict, feedback: str = "") -> str:
+    ref = item["ref"]
+    plan = item.get("plan") or {}
+    return (
+        f"You are the PLANNER for WatchTower ticket {ref}. Do not write code or "
+        f"edit files. Read the ticket and the relevant code, then write an "
+        f"implementation plan: approach, files to change, risks, the test list, "
+        f"and any open decisions you resolved (decide them yourself; nobody "
+        f"will answer questions).\n\nTICKET:\n"
+        f"{item.get('text') or item.get('note') or item.get('title') or ''}\n"
+        + (f"\nACCEPT LINE: {item['accept']}\n" if item.get("accept") else "")
+        + (f"\nYour previous plan (round {int(plan.get('round') or 2) - 1}):\n"
+           f"{plan.get('text', '')}\n\nThe reviewer REJECTED it: {feedback}\n"
+           f"Revise the plan to address that.\n" if feedback else "")
+        + f"\nWhen done, file the plan (not to anyone else): "
+        f"`wt plan submit {ref} --file <path-to-plan.md>` or "
+        f"`wt plan submit {ref} --text \"...\"`."
+    )
+
+
+def _plan_review_goal(item: dict) -> str:
+    ref = item["ref"]
+    plan = item.get("plan") or {}
+    return (
+        f"You are an independent PLAN REVIEWER for WatchTower ticket {ref}. "
+        f"You did not write the plan. Do not edit files. Check the plan against "
+        f"the ticket and the real code: is the approach sound, are the files "
+        f"and risks right, is the test list adequate, does it satisfy the "
+        f"accept line?\n\nTICKET:\n"
+        f"{item.get('text') or item.get('note') or item.get('title') or ''}\n"
+        + (f"\nACCEPT LINE: {item['accept']}\n" if item.get("accept") else "")
+        + f"\nPLAN (round {plan.get('round', 1)}):\n{plan.get('text', '')}\n\n"
+        f"File your verdict on the ticket: `wt plan verdict {ref} --accept "
+        f"--reasons \"why it is sound\"` or `wt plan verdict {ref} --reject "
+        f"--reasons \"what must change\"`. Reject only for real defects; a "
+        f"different-but-workable approach is an accept."
+    )
+
+
+def _spawn_plan_role(item: dict, role: str, goal: str, name: str) -> bool:
+    """Spawn the planner / plan reviewer for ``item`` on its role model
+    (roles.effective_role_model). A blocked model or a spawn failure marks the
+    plan stage ``failed`` so the build proceeds (loudly) instead of stalling
+    with nobody to answer."""
+    from . import roles
+    ticket = dict(item)
+    gate_model = q.plan_gate(item)
+    if role == "planner" and gate_model:
+        ticket["planner_model"] = gate_model
+    try:
+        eng, mdl, source = roles.effective_role_model(item.get("project", ""), ticket, role)
+        if mdl and config_is_blocked(mdl):
+            raise ValueError(f"model {mdl!r} for the {role} ({eng}) is blocked by "
+                             f"model policy; not substituting another model")
+        rec = workers.spawn_adhoc(goal, eng, model=mdl,
+                                  repo_path=str(item.get("repo_path") or ""),
+                                  name=name, report_to="")
+        q.plan_set_role(item["ref"], "planner" if role == "planner" else "reviewer",
+                        {"engine": eng, "model": mdl, "source": source,
+                         "worker_id": rec.get("worker_id", "")})
+        print(f"  {role} spawned: {rec.get('worker_id', '?')} "
+              f"({eng}{'/' + mdl if mdl else ''}, {source})")
+        return True
+    except Exception as exc:  # noqa: BLE001
+        q.plan_fail(item["ref"], f"could not spawn the {role}: {exc}")
+        print(f"warning: plan stage failed for {item['ref']} ({exc}); "
+              "building without a plan", file=sys.stderr)
+        return False
+
+
+def config_is_blocked(model: str) -> bool:
+    from . import config
+    return config.is_blocked_model(model)
+
+
+def _start_plan_stage(item: dict) -> dict:
+    """On claim: if the ticket has a plan gate and planning has not begun,
+    start it and spawn the planner. Returns the (refreshed) item."""
+    if q.plan_gate(item) is None:
+        return item
+    started = q.plan_start(item["ref"])
+    if started is None:
+        return item
+    if started.pop("_plan_started", False):
+        _spawn_plan_role(started, "planner", _plan_goal(started), f"plan-{item['ref']}")
+    return q.get(item["ref"]) or started
+
+
+def _plan_note(item: dict) -> str:
+    """Claim-time instruction for the build worker about the plan stage."""
+    if q.plan_gate(item) is None:
+        return ""
+    plan = item.get("plan") or {}
+    status = plan.get("status", "")
+    ref = item["ref"]
+    if status == "accepted":
+        return f"ACCEPTED PLAN (follow it):\n{plan.get('text', '')}"
+    if status == "failed":
+        return f"Plan stage did not run ({plan.get('reason', '')}); plan the work yourself."
+    if status == "blocked":
+        return "Plan stage is blocked awaiting a human decision; do not build yet."
+    return (f"PLAN PENDING: a planner and a reviewer are producing the plan. Do NOT "
+            f"start building. Run `wt plan wait {ref}` (blocks until it is accepted "
+            f"and prints it), then follow the accepted plan.")
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """`wt plan submit|verdict|show|wait REF` -- the plan stage (WT-11)."""
+    action, ref = args.plan_cmd, args.ref
+    item = q.get(ref)
+    if not item:
+        print(f"error: no item {ref}", file=sys.stderr)
+        return 1
+    try:
+        if action == "submit":
+            text = args.text or ""
+            if args.file:
+                text = Path(args.file).expanduser().read_text()
+            item = q.plan_submit(ref, text, by=args.by or _default_worker_id())
+            print(f"PLAN FILED: {ref} round {item['plan']['round']} -> reviewing")
+            _spawn_plan_role(item, "plan_reviewer", _plan_review_goal(item), f"plan-review-{ref}")
+        elif action == "verdict":
+            item = q.plan_verdict(ref, bool(args.accept), args.reasons or "",
+                                  by=args.by or _default_worker_id())
+            status = item["plan"]["status"]
+            print(f"PLAN {'ACCEPTED' if args.accept else 'REJECTED'}: {ref} -> {status}")
+            if status == "planning":
+                _spawn_plan_role(item, "planner",
+                                 _plan_goal(item, feedback=args.reasons or ""),
+                                 f"plan-{ref}-r{item['plan']['round']}")
+            elif status == "blocked":
+                reviews = item["plan"].get("reviews") or []
+                q.block(ref, str(item.get("claimed_session_id") or ""),
+                        question=(f"The planner and plan reviewer still disagree after "
+                                  f"{len(reviews)} rounds. Last reviewer reasons: "
+                                  f"{reviews[-1].get('reasons', '')}. Decide the approach."),
+                        progress=f"Plan (round {item['plan'].get('round')}):\n"
+                                 f"{item['plan'].get('text', '')}")
+        elif action == "show":
+            plan = item.get("plan") or {}
+            if args.json:
+                print(json.dumps(plan, indent=2))
+            else:
+                print(f"{ref} plan: {plan.get('status', 'none')} (round {plan.get('round', 0)})")
+                if plan.get("text"):
+                    print(plan["text"])
+                for r in plan.get("reviews") or []:
+                    print(f"  review r{r['round']}: {'accept' if r['accepted'] else 'reject'}"
+                          f" -- {r.get('reasons', '')}")
+        elif action == "wait":
+            deadline = time.time() + args.timeout
+            while True:
+                item = q.get(ref) or item
+                plan = item.get("plan") or {}
+                if plan.get("status") in ("accepted", "failed", "blocked", ""):
+                    break
+                if time.time() >= deadline:
+                    print(f"TIMEOUT: plan for {ref} still {plan.get('status')}", file=sys.stderr)
+                    return 2
+                time.sleep(5)
+            print(_plan_note(item) or f"{ref} has no plan stage")
+            return 0 if plan.get("status") in ("accepted", "failed") else 1
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -1508,7 +1683,10 @@ def _verifier_goal(item: dict) -> str:
         f"real running app or code"
         + (f" at commit {commit}" if commit else "")
         + f", that this acceptance criterion holds:\n\n{target}\n\n"
-        "Drive a real browser/app where the criterion is user-visible; read the "
+        + (f"The build was also required to follow this accepted plan; flag "
+           f"material deviations:\n{(item.get('plan') or {}).get('text', '')}\n\n"
+           if (item.get("plan") or {}).get("status") == "accepted" else "")
+        + "Drive a real browser/app where the criterion is user-visible; read the "
         "code and run it otherwise. Do NOT edit files or fix anything. When "
         f"done, file your verdict on the ticket (not to anyone else): "
         f"`wt verdict {ref} --pass --findings \"what you checked\"` or "
@@ -4701,6 +4879,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "accept"),
     ("Tickets", "reject"),
     ("Tickets", "verdict"),
+    ("Tickets", "plan"),
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
@@ -4719,6 +4898,7 @@ COMMAND_HELP: Dict[str, str] = {
     "release": "give up a claim without closing it; returns the ticket to open",
     "accept": "accept an in_review ticket (closes it, unblocks dependents)",
     "verdict": "file an independent verifier's pass/fail on an in_review ticket",
+    "plan": "plan stage (plan gate): `submit` a plan, `verdict` it, `show`/`wait` for it",
     "reject": "reject an in_review ticket back to open and resume its worker",
     "reopen": "reopen a closed ticket, returning it to the open pool (no dispatch)",
     "close": "close a ticket (record how you fixed it)",
@@ -5263,6 +5443,28 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_accept)
+
+    s = sub.add_parser("plan", help=COMMAND_HELP.get("plan", ""))
+    ps = s.add_subparsers(dest="plan_cmd", required=True)
+    p1 = ps.add_parser("submit", help="planner: file the plan for a plan-gated ticket")
+    p1.add_argument("ref")
+    p1.add_argument("--text", default="")
+    p1.add_argument("--file", default="")
+    p1.add_argument("--by", default="")
+    p2 = ps.add_parser("verdict", help="plan reviewer: accept or reject the plan")
+    p2.add_argument("ref")
+    g = p2.add_mutually_exclusive_group(required=True)
+    g.add_argument("--accept", action="store_true")
+    g.add_argument("--reject", action="store_true")
+    p2.add_argument("--reasons", default="")
+    p2.add_argument("--by", default="")
+    p3 = ps.add_parser("show", help="print the ticket's plan state")
+    p3.add_argument("ref")
+    p3.add_argument("--json", action="store_true")
+    p4 = ps.add_parser("wait", help="builder: block until the plan is accepted, print it")
+    p4.add_argument("ref")
+    p4.add_argument("--timeout", type=int, default=1800)
+    s.set_defaults(func=cmd_plan)
 
     s = sub.add_parser("verdict", help=COMMAND_HELP.get("verdict", ""))
     s.add_argument("ref")

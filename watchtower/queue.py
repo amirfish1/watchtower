@@ -2645,12 +2645,16 @@ def validate_gates(gates: Any) -> List[str]:
             if not g[4:].strip():
                 raise ValueError("gate 'cmd:' needs a command, e.g. cmd:pytest -q")
             g = "cmd:" + g[4:].strip()
-        elif g not in ("review", "verify") and not (
+        elif g.startswith("plan:"):
+            if not g[5:].strip():
+                raise ValueError("gate 'plan:' needs a model, e.g. plan:claude-opus-5-5")
+            g = "plan:" + g[5:].strip()
+        elif g not in ("review", "verify", "plan") and not (
             g.startswith("review:") and g[7:].strip()
         ):
             raise ValueError(
-                f"unknown gate {g!r}: use cmd:<command>, verify, review or "
-                f"review:<target>"
+                f"unknown gate {g!r}: use cmd:<command>, plan, plan:<model>, "
+                f"verify, review or review:<target>"
             )
         out.append(g)
     return out
@@ -2665,6 +2669,126 @@ def effective_gates(item: Dict[str, Any]) -> List[str]:
         return list(_config.gates(str(item.get("project") or "")))
     except Exception:
         return []
+
+
+# --- Plan stage (WT-11) ------------------------------------------------------
+# ``plan`` / ``plan:<model>`` gate: BEFORE the build, a planner session (role
+# ``planner``, WT-14) writes a plan onto the ticket, a spawned plan reviewer
+# (role ``plan_reviewer``, a different family by default) accepts or rejects it,
+# and the build worker gets the accepted plan. A rejected plan is revised up to
+# PLAN_MAX_REVISIONS times; the ticket blocks only if they still disagree. No
+# human step. State lives on ``item["plan"]``:
+#   {status: planning|reviewing|accepted|blocked|failed, round, text,
+#    reviews: [{round, accepted, reasons, by, at}], planner: {...}, reviewer: {...}}
+PLAN_MAX_REVISIONS = 2
+
+
+def plan_gate(item: Dict[str, Any]) -> Optional[str]:
+    """None when the ticket has no plan gate; else the gate's planner model
+    ("" when the gate is a bare ``plan``)."""
+    for g in effective_gates(item):
+        if g == "plan":
+            return ""
+        if g.startswith("plan:"):
+            return g[5:].strip()
+    return None
+
+
+def _plan_update(ident: Any, fn) -> Optional[Dict[str, Any]]:
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                plan = dict(it.get("plan") or {})
+                fn(it, plan)
+                it["plan"] = plan
+                it["updated_at"] = _now_iso()
+                _save_unlocked(data)
+                return it
+    return None
+
+
+def plan_start(ident: Any) -> Optional[Dict[str, Any]]:
+    """Begin planning (idempotent: a ticket already past ``planning`` keeps its
+    state). Returns the item with ``item["plan"]``; ``item["_plan_started"]``
+    is True only when this call started a fresh round the caller must spawn a
+    planner for."""
+    fresh = []
+
+    def _do(it, plan):
+        if plan.get("status") in ("planning", "reviewing", "accepted", "failed", "blocked"):
+            return
+        plan.update(status="planning", round=1, text="", reviews=[])
+        _append_history(it, "plan_start", by=_by("system"), at=_now_iso())
+        fresh.append(True)
+
+    item = _plan_update(ident, _do)
+    if item is not None:
+        item = dict(item, _plan_started=bool(fresh))
+    return item
+
+
+def plan_set_role(ident: Any, role: str, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Record which planner/reviewer (engine/model/source/worker) was spawned."""
+    return _plan_update(ident, lambda it, plan: plan.__setitem__(role, dict(info)))
+
+
+def plan_fail(ident: Any, reason: str) -> Optional[Dict[str, Any]]:
+    """The plan stage could not run (e.g. blocked model, engine missing): the
+    build proceeds without a plan, loudly (history event)."""
+    def _do(it, plan):
+        plan.update(status="failed", reason=_clip(reason, 1000))
+        _append_history(it, "plan_failed", by=_by("system"), at=_now_iso(),
+                        text=_clip(reason, 500))
+    return _plan_update(ident, _do)
+
+
+def plan_submit(ident: Any, text: str, by: str = "planner") -> Optional[Dict[str, Any]]:
+    """The planner files (or revises) the plan; moves to ``reviewing``."""
+    text = str(text or "").strip()
+    if not text:
+        raise ValueError("plan text is empty")
+    current = get(ident)
+    if current is None:
+        return None
+    if (current.get("plan") or {}).get("status") != "planning":
+        raise ValueError(f"{current.get('ref', ident)} is not waiting for a plan "
+                         f"(plan status {(current.get('plan') or {}).get('status') or 'none'})")
+
+    def _do(it, plan):
+        plan.update(status="reviewing", text=_clip(text, 24000))
+        _append_history(it, "plan", by=_by("system"), at=_now_iso(),
+                        text=_clip(text, 4000), round=plan.get("round", 1),
+                        planner=str(by))
+    return _plan_update(ident, _do)
+
+
+def plan_verdict(ident: Any, accepted: bool, reasons: str = "",
+                 by: str = "plan-reviewer") -> Optional[Dict[str, Any]]:
+    """The plan reviewer's verdict. Accept -> ``accepted``. Reject -> back to
+    ``planning`` with the reasons (round + 1) while revisions remain, else
+    ``blocked`` (the caller then blocks the ticket for a human)."""
+    current = get(ident)
+    if current is None:
+        return None
+    if (current.get("plan") or {}).get("status") != "reviewing":
+        raise ValueError(f"{current.get('ref', ident)} has no plan under review "
+                         f"(plan status {(current.get('plan') or {}).get('status') or 'none'})")
+
+    def _do(it, plan):
+        rnd = int(plan.get("round") or 1)
+        plan["reviews"] = list(plan.get("reviews") or []) + [
+            {"round": rnd, "accepted": bool(accepted), "reasons": _clip(reasons, 3000),
+             "by": str(by), "at": _now_iso()}]
+        if accepted:
+            plan["status"] = "accepted"
+        elif rnd > PLAN_MAX_REVISIONS:
+            plan["status"] = "blocked"
+        else:
+            plan.update(status="planning", round=rnd + 1)
+        _append_history(it, "plan_review", by=_by("system"), at=_now_iso(),
+                        passed=bool(accepted), text=_clip(reasons, 1000), round=rnd)
+    return _plan_update(ident, _do)
 
 
 def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str) -> Dict[str, Any]:
@@ -2798,6 +2922,10 @@ def checks_block(item: Dict[str, Any]) -> str:
     for g in gates:
         if g.startswith("cmd:"):
             lines.append(f"- WatchTower runs: {g[4:]}")
+        elif g == "plan" or g.startswith("plan:"):
+            lines.append(f"- Plan first: a planner writes and a reviewer accepts a plan "
+                         f"before you build; `wt plan wait {item.get('ref', '<ref>')}` "
+                         f"prints it. Follow the accepted plan.")
         elif g == "verify":
             has_verify = True
             what = str(item.get("accept") or "").strip() or "the ticket text"
