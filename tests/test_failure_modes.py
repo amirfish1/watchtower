@@ -66,6 +66,10 @@ def test_missing_engine_binary_sets_a_cooldown_so_the_reconciler_stops_retrying(
     [
         ("Error: not logged in. Please run /login", "engine authentication required"),
         ("authentication failed: token expired", "engine authentication failed"),
+        (
+            'API Error: 401 {"type":"error","error":{"type":"authentication_error"}}',
+            "engine authentication failed",
+        ),
         ("You've hit your usage limit. Try again later.", "engine usage limit"),
         ("HTTP 503 upstream connect error", "engine api unavailable"),
         (
@@ -97,6 +101,18 @@ def test_launch_failure_log_is_classified_into_an_actionable_reason(
     verdict = wt_env.workers._classify_launch_failure_log(log)
     assert verdict is not None, f"{log_text!r} was not classified"
     assert verdict["reason"] == expected
+
+
+def test_agent_prose_mentioning_authentication_is_not_an_auth_failure(wt_env, tmp_path):
+    """A worker that finished its job and wrote about card authentication and a
+    failed write is not an engine login failure (PLAN-VM-NEXT-85-R3)."""
+    log = tmp_path / "worker.log"
+    log.write_text(
+        "- **Delayed authentication:** a card that finishes its 3D Secure check "
+        "last now wins.\n"
+        "- **Tests:** a crash after the Stripe write and a failed mark.\n"
+    )
+    assert wt_env.workers._classify_launch_failure_log(log) is None
 
 
 def test_worker_that_dies_unauthenticated_is_recorded_not_registered(wt_env, fake_bin):

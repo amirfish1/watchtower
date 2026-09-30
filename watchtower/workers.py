@@ -2937,6 +2937,14 @@ def _parse_usage_retry_at(text: str, now: Optional[float] = None) -> Optional[fl
     return candidate.timestamp()
 
 
+# The engine's own auth-error phrasing, as one phrase. Matching the two words
+# anywhere in the log flagged a worker that finished fine: its answer was a
+# card-payment plan mentioning "Delayed authentication" and "a failed mark".
+_AUTH_FAILED_RE = re.compile(
+    r"authentication[ _-]?(?:failed|error)|failed to authenticate"
+)
+
+
 def _classify_launch_failure_log(
     log_path: Path, now: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
@@ -2963,7 +2971,7 @@ def _classify_launch_failure_log(
         reason = "engine subscription has no access"
     elif "not logged in" in lower or "please run /login" in lower:
         reason = "engine authentication required"
-    elif "authentication" in lower and ("failed" in lower or "error" in lower):
+    elif _AUTH_FAILED_RE.search(lower):
         reason = "engine authentication failed"
     elif (
         "cannot find module" in lower
