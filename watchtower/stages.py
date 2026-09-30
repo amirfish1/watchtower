@@ -200,6 +200,10 @@ def desired(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         ref = str(it.get("ref") or "")
         if not ref:
             continue
+        if (it.get("pending_answer") or {}).get("state") in q.ANSWER_INFLIGHT:
+            # WT-31 D1a: an answer in flight owns the ticket until it settles
+            # (row answer.* / answer.plan_conflict); no stage session meanwhile.
+            continue
         project = str(it.get("project") or "")
         status = str(it.get("status") or "")
         plan = it.get("plan") or {}
