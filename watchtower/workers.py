@@ -5076,6 +5076,13 @@ def requeue_orphaned_tickets(
         items = _q.list_items()
     except Exception:
         return reopened
+    from . import liveness as _liveness
+    by_ref = _q._refs_index(items)
+    ctx = _liveness.ResolverContext(now)
+
+    def github_of(item: Dict[str, Any]) -> bool:
+        return _liveness._github(str(item.get("project") or ""))
+
     for it in items:
         if it.get("status") != "in_progress":
             continue
@@ -5122,6 +5129,30 @@ def requeue_orphaned_tickets(
             except Exception:
                 pass
         ref = it.get("ref")
+        # WT-31: the resolver vetoes a reopen when the bound process (or its
+        # session) is provably alive; a dead builder of a review rejection that
+        # was never resumed is resumed first (WT-30).
+        verdict = None
+        if not github_of(it):
+            try:
+                verdict = _liveness.claim_owner(it, ctx)
+            except Exception:
+                verdict = None
+            if verdict is not None and verdict.verdict == "alive":
+                continue
+            if (verdict is not None and verdict.verdict == "dead"
+                    and _liveness._resume_first(it)):
+                done = _q.recover_claim(
+                    ref, expect=_liveness._expect(it, by_ref), action="resume",
+                    reason="builder dead; resuming its session with the rejection",
+                    evidence=verdict.evidence, state="work.claimed")
+                if done:
+                    try:
+                        from . import cli as _cli
+                        _cli._resume_rejected(done, str(done.get("gate_feedback") or ""))
+                    except Exception:
+                        pass
+                continue
         try:
             # quiet=True: the reconciler emits the single REQUEUE line for this
             # event, so suppress update_status's primitive REOPEN to avoid a
@@ -5138,10 +5169,18 @@ def requeue_orphaned_tickets(
                 why = (f"worker gone (verify-rejected; builder "
                        f"{wid or str(it.get('claimed_session_id') or '')[:8]} dead)")
             sid_d = str(it.get("claimed_session_id") or "")
-            item = _q.update_status(
-                ref, "open", quiet=True, require_status="in_progress", reason=why,
-                orphan=({"session_id": sid_d, "claimed_by": claimer}
-                        if (sid_d or claimer) else None))
+            if github_of(it):
+                item = _q.update_status(
+                    ref, "open", quiet=True, require_status="in_progress", reason=why,
+                    orphan=({"session_id": sid_d, "claimed_by": claimer}
+                            if (sid_d or claimer) else None))
+            else:
+                # CAS on the snapshot this decision was made from (claim
+                # fields, claim_proc, state fingerprint); records the backstop.
+                item = _q.recover_claim(
+                    ref, expect=_liveness._expect(it, by_ref), action="reopen", reason=why,
+                    evidence=(f"{verdict.verdict}: {verdict.evidence}" if verdict else ""),
+                    state="work.claimed")
             if item:
                 reopened.append(dict(item, requeue_reason=why))
         except Exception:
@@ -6023,6 +6062,13 @@ def _reconcile_once_locked(dry_run: bool = False,
             try:
                 from . import stages as _stages
                 result["stages"] = [f"{r}:{a}" for r, a in _stages.reconcile_stages()]
+            except Exception:
+                pass
+            # WT-31 D3: the liveness backstop, after every specific handler.
+            try:
+                from . import liveness as _liveness
+                result["backstop"] = [f"{a['ref']}:{a['action']}:{a['result']}"
+                                      for a in _liveness.sweep()]
             except Exception:
                 pass
         # Nudge any live worker already on an affected queue so the reopened

@@ -1478,11 +1478,15 @@ def cmd_stages(args: argparse.Namespace) -> int:
     """`wt stages tick|show` -- manual / daemonless stage supervision (WT-24)."""
     if args.stages_cmd == "tick":
         from .queue import _FileLock
+        from . import liveness
         with _FileLock(workers.WORKERS_FILE.parent / "reconcile.lock"):
             acted = stages.reconcile_stages(only_ref=args.ref or "")
+            backstop = liveness.sweep(only_ref=args.ref or "")   # WT-31 D3
         for ref, action in acted:
             print(f"{ref}: {action}")
-        if not acted:
+        for a in backstop:
+            print(f"{a['ref']}: backstop {a['action']} ({a['result']}) — {a['reason']}")
+        if not acted and not backstop:
             print("no stage work due")
         return 0
     item = q.get(args.ref)
@@ -1501,6 +1505,34 @@ def cmd_stages(args: argparse.Namespace) -> int:
           + (" ESCALATED" if ss.get("escalated") else ""))
     for d in ss.get("deaths") or []:
         print(f"  death {d.get('at')} attempt {d.get('attempt')}: {d.get('reason')}")
+    return 0
+
+
+def cmd_liveness(args: argparse.Namespace) -> int:
+    """`wt liveness [-q Q] [REF] [--json]` (WT-31): each live ticket's state-table
+    row, owner, proof verdict, idle time and the backstop action it is due.
+    Read-only: nothing is changed."""
+    from . import liveness
+    ref = args.ref or ""
+    if ref:
+        item = q.get(ref)
+        if not item:
+            print(f"error: no item {ref}", file=sys.stderr)
+            return 1
+        ref = str(item.get("ref") or ref)
+    rows = liveness.report(queue=args.queue or "", ref=ref)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no live tickets")
+        return 0
+    for r in rows:
+        due = f"  -> {r['action']}: {r['reason']}" if r["action"] else ""
+        idle = f" idle {r['idle_s']}s" if r["idle_s"] else ""
+        print(f"{r['ref']:<14} {r['row']:<24} owner={r['owner'] or '-'} "
+              f"proof={r['proof'] or '-'} {r['verdict'] or '-'}"
+              + (f" ({r['evidence']})" if r["evidence"] else "") + idle + due)
     return 0
 
 
@@ -5471,6 +5503,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "assess"),
     ("Tickets", "plan"),
     ("Tickets", "stages"),
+    ("Tickets", "liveness"),
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
@@ -5492,6 +5525,7 @@ COMMAND_HELP: Dict[str, str] = {
     "assess": "post-fix assessment (WT-21): `submit`/`show`/`run`/`resume`, or `new` for a fix with no ticket",
     "plan": "plan stage (plan gate): `submit` a plan, `verdict` it, `show`/`wait` for it",
     "stages": "stage-session supervision (planner/verifier/assessor): `tick` one pass, `show` a ticket",
+    "liveness": "who owns each live ticket, is it proven at work, and what the backstop would do (read-only)",
     "reject": "reject an in_review ticket back to open and resume its worker",
     "reopen": "reopen a closed ticket, returning it to the open pool (no dispatch)",
     "close": "close a ticket (record how you fixed it)",
@@ -6085,6 +6119,12 @@ def build_parser() -> argparse.ArgumentParser:
     g2.add_argument("ref")
     g2.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_stages)
+
+    s = sub.add_parser("liveness", help=COMMAND_HELP.get("liveness", ""))
+    s.add_argument("ref", nargs="?", default="")
+    s.add_argument("-q", "--queue", default="")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_liveness)
 
     s = sub.add_parser("assess", help=COMMAND_HELP.get("assess", ""))
     ass = s.add_subparsers(dest="assess_cmd", required=True)

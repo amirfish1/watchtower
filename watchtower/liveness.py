@@ -585,3 +585,453 @@ def claim_owner(item: Dict[str, Any], ctx: Optional[ResolverContext] = None) -> 
     if blocked:
         return Verdict("unproven", "", f"{why}; {blocked}", cp)
     return Verdict("dead", "", why, cp)
+
+
+# --------------------------------------------------------------- backstop (D3)
+# A floor under every row's own handler: once per reconciler tick (after
+# reconcile_stages) and on ``wt stages tick``. It acts only where the row's
+# owner is not proven at work and the ticket has been idle for STALL_S (the
+# answer floors and 1-tick rows use their own clocks), and never twice on the
+# same (ref, row, fingerprint): a second stall escalates to a human instead.
+# Every write is a CAS (``queue.recover_claim`` / ``queue.pa_transition``).
+
+STALL_S = 1800.0
+_SKIP_OWNERS = ("human", "terminal", "dependency")
+_LOOP_GUARDED = ("stage", "spawn", "reopen", "resume", "assessment_run_ops")
+# "1 tick" rows whose state can be transient between two writes of one
+# command (plan_verdict, then block) wait this long before acting.
+ONE_TICK_S = 120.0
+
+
+def stall_s() -> float:
+    try:
+        return float(os.environ.get("WATCHTOWER_STALL_S", STALL_S))
+    except (TypeError, ValueError):
+        return STALL_S
+
+
+def fingerprint(item: Dict[str, Any],
+                by_ref: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+    """The state a backstop decision was made on: the projected dims plus the
+    fields any owner's progress moves (``updated_at``, history length,
+    ``answered_at``, ``pending_answer``, the backstop count, the stage key).
+    ``backstop.fingerprint`` / ``.at`` are left out, so the record can store
+    the fingerprint it produced."""
+    import hashlib
+    import json
+    try:
+        dims: Any = list(project(item, by_ref if by_ref is not None else {}))
+    except Exception as exc:  # noqa: BLE001 - an unprojectable state still fingerprints
+        dims = ["unprojectable", str(exc)]
+    bs = item.get("backstop") if isinstance(item.get("backstop"), dict) else {}
+    payload = [dims, item.get("updated_at"), len(item.get("history") or []),
+               item.get("answered_at"), item.get("pending_answer"),
+               [bs.get("state"), bs.get("action"), bs.get("count")],
+               (item.get("stage_session") or {}).get("key")]
+    return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()
+                        ).hexdigest()[:16]
+
+
+def _store_activity(item: Dict[str, Any]) -> float:
+    ss = item.get("stage_session") or {}
+    hist = item.get("history") or []
+    ts = [q._iso_ts(item.get("updated_at")), q._iso_ts(item.get("claimed_at")),
+          q._iso_ts(ss.get("spawned_at")),
+          q._iso_ts((item.get("pending_answer") or {}).get("state_at")),
+          q._iso_ts((item.get("parked") or {}).get("at"))]
+    ts += [q._iso_ts(h.get("at")) for h in hist[-5:] if isinstance(h, dict)]
+    return max(ts)
+
+
+def _file_activity(item: Dict[str, Any], ctx: "ResolverContext") -> float:
+    """Transcript / log mtimes of the claim's session and the stage session."""
+    ts = [0.0]
+    cp = claim_proc_of(item) or {}
+    sid = str(cp.get("session_id") or item.get("claimed_session_id") or "")
+    if sid:
+        try:
+            ts.append(_transcript_mtime(str(cp.get("engine") or "claude"), sid))
+        except Exception:  # noqa: BLE001
+            pass
+    ss = item.get("stage_session") or {}
+    if ss.get("worker_id"):
+        rec = next((w for w in ctx.rows() if str(w.get("worker_id") or "") == ss["worker_id"]),
+                   None)
+        try:
+            from . import stages
+            ts.append(stages._activity_mtime(rec or {"log": ss.get("log", "")}))
+        except Exception:  # noqa: BLE001
+            pass
+    return max(ts)
+
+
+def last_activity(item: Dict[str, Any], ctx: Optional["ResolverContext"] = None) -> float:
+    """Latest sign of progress: store timestamps (``updated_at``, history, the
+    stage spawn, ``pending_answer.state_at``, ``parked.at``) and the claim's /
+    stage's transcript or log mtime."""
+    return max(_store_activity(item), _file_activity(item, ctx or ResolverContext()))
+
+
+def _stage_verdict(item: Dict[str, Any], proof: Dict[str, str], ctx: "ResolverContext",
+                   now: float) -> Tuple[str, str]:
+    from . import workers
+    ss = item.get("stage_session") or {}
+    if ss.get("key") != proof.get("key"):
+        return "none", f"no stage session for {proof.get('key')}"
+    wid = str(ss.get("worker_id") or "")
+    if wid:
+        rec = next((w for w in ctx.rows() if str(w.get("worker_id") or "") == wid), None)
+        if rec and rec.get("alive") and workers.record_liveness(rec)[0] == "alive":
+            return "alive", f"stage {wid} running"
+        return "dead", f"stage {wid} not running"
+    if q._iso_ts(ss.get("waiting_until")) > now:
+        return "alive", f"launch cooldown until {ss.get('waiting_until')}"
+    return "none", "no stage session running"
+
+
+def _staffed(queue: str, ctx: "ResolverContext") -> bool:
+    from . import workers
+    return any(str(w.get("queue") or "") == queue and w.get("alive")
+               and not workers._worker_released(w) and w.get("kind") != "adhoc"
+               and not w.get("stage") for w in ctx.rows())
+
+
+def _sent_back_window(item: Dict[str, Any], now: float) -> bool:
+    """A live sent-back claim inside its release window (WT-34 owns it)."""
+    sb = item.get("sent_back")
+    if not isinstance(sb, dict) or sb.get("progress_at"):
+        return False
+    dl = q._sent_back_deadline(item, q._sent_back_minutes(item))
+    return bool(dl) and now < dl
+
+
+def _resume_first(item: Dict[str, Any]) -> bool:
+    """A review rejection whose builder session was never resumed (WT-30):
+    resume it before handing the work to someone else."""
+    r = item.get("resume")
+    if not (item.get("gate_feedback") and isinstance(r, dict) and r.get("state") == "pending"):
+        return False
+    sid = str(item.get("claimed_session_id") or "")
+    engine = str((item.get("claim_proc") or {}).get("engine") or "claude")
+    try:
+        from . import answers
+        return answers._resumable(engine, sid)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _answer_floor(item: Dict[str, Any], row: Row, ctx: "ResolverContext",
+                  now: float) -> Tuple[str, str, str, str]:
+    """(verdict, evidence, action, reason) for the answer rows."""
+    from . import answers
+    pa = item.get("pending_answer") or {}
+    age = now - q._iso_ts(pa.get("state_at"))
+    lease = float(answers.ROUTE_LEASE_S)
+    if row.id == "answer.parked_bare":
+        return "none", "parked with no answer record", "reopen", "parked with no answer (handoff)"
+    if row.id == "answer.plan_conflict":
+        return "conflict", f"answer {pa.get('state')} under an active plan gate", \
+            "answer_plan_conflict", answers.PLAN_ACTIVE_REASON
+    if row.id == "answer.affinity_expired":
+        return "expired", f"reserved until {pa.get('affinity_until')}", "answer_handoff", \
+            "affinity expired (backstop)"
+    if row.id == "answer.affinity":
+        if answers.worker_alive(str(pa.get("prior_worker_id") or "")):
+            return "alive", "prior worker alive", "", ""
+        if age < lease:
+            return "unproven", "prior worker gone", "", ""
+        return "dead", "prior worker gone", "answer_handoff", "prior worker gone (backstop)"
+    if row.id == "answer.routing":
+        if age < 2 * lease:
+            return "lease", f"routing {int(age)}s", "", ""
+        return "stale", f"routing {int(age)}s > 2x lease", "answer_handoff", \
+            f"answer stuck routing {int(age)}s (backstop)"
+    if row.id == "answer.queued":
+        floor = float(answers.ANSWER_QUEUE_TTL_S) + lease
+        if age < floor:
+            return "lease", f"queued {int(age)}s", "", ""
+        return "stale", f"queued {int(age)}s > TTL+lease", "answer_handoff", \
+            f"queued answer never delivered in {int(age)}s (backstop)"
+    # answer.delivering
+    v = claim_owner(item, ctx)
+    if age >= lease * (answers.MAX_DELIVERY_ATTEMPTS + 1):
+        return v.verdict, f"delivering {int(age)}s", "answer_handoff", \
+            f"answer delivery stuck {int(age)}s (backstop)"
+    if v.verdict == "dead" and age >= lease:
+        return "dead", v.evidence, "answer_handoff", f"resumed session dead: {v.evidence}"
+    return v.verdict, v.evidence or f"delivering {int(age)}s", "", ""
+
+
+def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = None,
+           ctx: Optional[ResolverContext] = None, now: Optional[float] = None,
+           stall: Optional[float] = None) -> Dict[str, Any]:
+    """Read-only: the ticket's row, owner, proof verdict, idle time and the
+    backstop action it is due (``action`` '' = none). ``wt liveness`` prints
+    this; ``sweep`` applies it."""
+    ctx = ctx or ResolverContext()
+    now = ctx.now if now is None else now
+    stall = stall_s() if stall is None else stall
+    by_ref = by_ref if by_ref is not None else {}
+    out: Dict[str, Any] = {"ref": str(item.get("ref") or ""),
+                           "queue": str(item.get("project") or ""), "row": "", "owner": "",
+                           "proof": "", "verdict": "", "evidence": "", "idle_s": 0,
+                           "action": "", "reason": ""}
+    try:
+        row = row_of(item, by_ref, now)
+    except (UndeclaredState, UnreachableState, UnclassifiedState) as exc:
+        out.update(row="?", verdict="unclassified", evidence=str(exc))
+        return out
+    proof = prove(item, row)
+    out.update(row=row.id, owner=row.owner, proof=proof["kind"]
+               + (f":{proof['role']}:{proof['key']}" if proof["kind"] == "stage_session" else ""))
+    github = _github(out["queue"])
+    verdict, evidence, action, reason = "", "", "", ""
+    min_idle: Optional[float] = stall
+    if row.id.startswith("answer.") and row.id != "answer.await_human":
+        verdict, evidence, action, reason = _answer_floor(item, row, ctx, now)
+        min_idle = None
+    elif row.id == "plan.blocked":
+        verdict, evidence = "unowned", "plan blocked with no open question"
+        action, reason, min_idle = "unblocked_plan", "plan blocked but nobody is asked", ONE_TICK_S
+    elif row.id == "dep.stuck":
+        verdict, evidence = "unescalated", f"blocker {q.blocker_verdict(item, by_ref)[1]} stuck"
+        action, reason, min_idle = "escalate_blockers", "stuck blocker not escalated", None
+    elif row.owner in _SKIP_OWNERS:
+        verdict = "human" if row.owner == "human" else row.owner
+    elif proof["kind"] == "stage_session":
+        verdict, evidence = _stage_verdict(item, proof, ctx, now)
+        if verdict != "alive":
+            action, reason = "stage", f"{proof['role']} not at work ({evidence})"
+    elif row.id == "assess.filing":
+        verdict, evidence = "due", "assessment ops pending"
+        action, reason = "assessment_run_ops", "assessment filing stalled"
+    elif proof["kind"] == "claim_owner":
+        v = claim_owner(item, ctx)
+        verdict, evidence = v.verdict, v.evidence or v.source
+        if _sent_back_window(item, now):
+            evidence = "sent back; inside its release window (WT-34)"
+        elif v.verdict == "alive":
+            pass
+        elif github:
+            action, reason = "escalate", f"claim owner {v.verdict} ({v.evidence})"
+        elif v.verdict == "dead":
+            action = "resume" if _resume_first(item) else "reopen"
+            reason = f"claim owner dead ({v.evidence})"
+        else:
+            action, reason = "escalate", f"claim owner unproven ({v.evidence})"
+    elif proof["kind"] == "staffing":
+        from . import config, workers
+        queue = out["queue"]
+        if _staffed(queue, ctx):
+            verdict = "staffed"
+        elif github or not config.auto_drain(queue):
+            verdict, evidence = "unstaffed", "auto_drain off" if not github else "github"
+        else:
+            engine = config.engine(queue)
+            cooldown = workers.active_launch_failure_cooldown(queue, engine)
+            if cooldown:
+                verdict, evidence = "unstaffed", f"{engine} launch cooldown"
+            else:
+                verdict, evidence = "unstaffed", "no effective worker"
+                action, reason = "spawn", "open work, no effective worker"
+    if action and min_idle is not None:
+        idle = now - _store_activity(item)
+        if idle >= min_idle:
+            idle = now - max(_store_activity(item), _file_activity(item, ctx))
+        out["idle_s"] = int(max(0.0, idle))
+        if idle < min_idle:
+            action, reason = "", ""
+    elif action:
+        out["idle_s"] = int(max(0.0, now - _store_activity(item)))
+    if action in _LOOP_GUARDED:
+        bs = item.get("backstop") if isinstance(item.get("backstop"), dict) else {}
+        if bs.get("state") == row.id and bs.get("fingerprint") == fingerprint(item, by_ref):
+            if bs.get("action") == "resume" and action in ("resume", "reopen"):
+                action, reason = "reopen", "resumed builder made no progress"
+            else:
+                action = "escalate"
+                reason = (f"second stall in {row.id} after backstop "
+                          f"{bs.get('action')} ({reason})")
+    if action == "stage":
+        from . import stages
+        if not any(d["role"] == proof["role"] and d["key"] == proof["key"]
+                   for d in stages.desired([item])):
+            action, reason = "escalate", f"no supervisor for state {row.id}"
+    out.update(verdict=verdict, evidence=evidence, action=action, reason=reason)
+    return out
+
+
+# Answer floors: one declared edge each (E5 / E10 / E11), CAS on the gen.
+def _floor_routing(ref: str, gen: int, reason: str) -> Optional[Dict[str, Any]]:
+    return q.pa_transition(ref, gen, "routing", "handed_off", from_status="awaiting_answer",
+                           reopen=True, route="reopen", reason=reason)
+
+
+def _floor_bound(ref: str, gen: int, reason: str) -> Optional[Dict[str, Any]]:
+    return q.pa_transition(ref, gen, ("delivering", "queued"), "handed_off",
+                           from_status="in_progress", reopen=True, route="reopen",
+                           reason=reason)
+
+
+def _floor_affinity(ref: str, gen: int, reason: str) -> Optional[Dict[str, Any]]:
+    return q.pa_transition(ref, gen, "affinity", "handed_off", from_status="open",
+                           reason=reason)
+
+
+def _answer_handoff(item: Dict[str, Any], reason: str) -> bool:
+    pa = item.get("pending_answer") or {}
+    ref, gen, state = str(item["ref"]), int(pa.get("gen") or 0), pa.get("state")
+    if state == "routing":
+        return _floor_routing(ref, gen, reason) is not None
+    if state in ("delivering", "queued"):
+        return _floor_bound(ref, gen, reason) is not None
+    if state == "affinity":
+        return _floor_affinity(ref, gen, reason) is not None
+    return False
+
+
+def _escalation_question(item: Dict[str, Any], a: Dict[str, Any]) -> str:
+    ref = a["ref"]
+    return (f"WatchTower backstop: {ref} stalled in state {a['row']} (owner {a['owner']}, "
+            f"{a['verdict'] or '-'}: {a['evidence'] or '-'}); {a['reason']}. Decide: "
+            f"`wt answer {ref} \"...\"` to continue, `wt release {ref} --force` to hand "
+            f"it to the pool, or close it.")
+
+
+def _expect(item: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    return {"status": item.get("status"), "claimed_by": item.get("claimed_by"),
+            "claimed_session_id": item.get("claimed_session_id"),
+            "claim_proc": item.get("claim_proc"), "fingerprint": fingerprint(item, by_ref)}
+
+
+def _log_backstop(a: Dict[str, Any], result: str) -> None:
+    q._log("BACKSTOP", f"{a['ref']} state={a['row']} owner={a['owner']} proof={a['proof']} "
+           f"verdict={a['verdict'] or '-'} evidence={(a['evidence'] or '-')[:200]} "
+           f"idle={a['idle_s']}s action={a['action']}"
+           + ("" if result == "done" else f" ({result})"), queue=a["queue"])
+
+
+def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
+           spawned: set) -> str:
+    """Carry out one decided action; returns ``done`` or why it did not."""
+    ref, action, reason = a["ref"], a["action"], a["reason"]
+    evidence = f"{a['verdict']}: {a['evidence']}"
+    if action in ("answer_handoff", "answer_plan_conflict"):
+        ok = _answer_handoff(item, reason)
+        if ok:
+            q._log("BACKSTOP_ANSWER_PLAN_CONFLICT" if action == "answer_plan_conflict"
+                   else "BACKSTOP_ANSWER_HANDOFF", f"{ref} {a['row']}: {reason}",
+                   queue=a["queue"])
+        return "done" if ok else "race"
+    if action == "escalate_blockers":
+        q.escalate_stuck_blockers()
+        now_it = q.get(ref) or {}
+        if not now_it.get("needs_input"):
+            q._log("BACKSTOP_NO_ESCALATION", f"{ref} dep.stuck: the stuck-blocker "
+                   "escalation did not flag it", queue=a["queue"])
+            return "no_escalation"
+        return "done"
+    if action == "escalate" or action == "unblocked_plan":
+        question = _escalation_question(item, a)
+        if action == "unblocked_plan":
+            question = (f"The plan for {ref} is blocked and nobody is asked: "
+                        f"`wt plan decide {ref} --accept` or `--retry`, or "
+                        f"`wt answer {ref} \"retry\"`.")
+            q._log("BACKSTOP_UNBLOCKED_PLAN", f"{ref} plan blocked with no open question",
+                   queue=a["queue"])
+        if _github(a["queue"]):
+            return "done" if q.block(ref, "", question=question, origin="system") else "race"
+        if a["row"] == "assess.run.file":
+            asmt = item.get("assessment") or {}
+            q.assessment_fail(ref, str(asmt.get("token") or ""), a["reason"])
+            item = q.get(ref) or item
+        done = q.recover_claim(ref, expect=_expect(item, by_ref), action="escalate",
+                               reason=reason, evidence=evidence, state=a["row"],
+                               question=question)
+        return "done" if done else "race"
+    if action in ("reopen", "resume"):
+        done = q.recover_claim(ref, expect=_expect(item, by_ref), action=action,
+                               reason=f"backstop: {reason}", evidence=evidence,
+                               state=a["row"])
+        if not done:
+            return "race"
+        if action == "resume":
+            from . import cli
+            try:
+                cli._resume_rejected(done, str(done.get("gate_feedback") or ""))
+            except Exception as exc:  # noqa: BLE001 - the next stall reopens it
+                return f"resume failed: {exc}"
+        return "done"
+    # stage / spawn / assessment_run_ops: record first (CAS), then act.
+    if action == "spawn" and a["queue"] in spawned:
+        return "queue already staffed this sweep"
+    marked = q.recover_claim(ref, expect=_expect(item, by_ref), action="mark",
+                             reason=f"backstop {action}: {reason}", evidence=evidence,
+                             state=a["row"])
+    if not marked:
+        return "race"
+    try:
+        if action == "stage":
+            from . import stages
+            stages.reconcile_stages(only_ref=ref)
+        elif action == "assessment_run_ops":
+            q.assessment_run_ops(ref)
+        elif action == "spawn":
+            from . import config, workers
+            queue = a["queue"]
+            repo = config.repo_path(queue) or str(item.get("repo_path") or "")
+            if not repo:
+                return "no repo path for the queue"
+            spawned.add(queue)
+            workers.spawn_workers(queue, 1, engine=config.engine(queue), repo_path=repo)
+    except Exception as exc:  # noqa: BLE001 - one ticket never stops the sweep
+        return f"failed: {exc}"
+    return "done"
+
+
+def report(queue: str = "", ref: str = "", now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """``assess`` for every ticket (or one), read-only (``wt liveness``)."""
+    items = q.list_items()
+    by_ref = q._refs_index(items)
+    ctx = ResolverContext(now)
+    out = []
+    for it in items:
+        if ref and str(it.get("ref") or "") != ref:
+            continue
+        if queue and str(it.get("project") or "") != queue:
+            continue
+        if not ref and it.get("status") == "closed" and \
+                (it.get("assessment") or {}).get("status") in (None, "", "none", "done"):
+            continue
+        out.append(assess(it, by_ref, ctx))
+    return out
+
+
+def sweep(now: Optional[float] = None, only_ref: str = "") -> List[Dict[str, Any]]:
+    """One backstop pass: ``assess`` every live ticket and apply the due
+    actions. Logs one BACKSTOP line per action. Returns the acted rows."""
+    try:
+        items = q.list_items()
+    except Exception:  # noqa: BLE001
+        return []
+    by_ref = q._refs_index(items)
+    ctx = ResolverContext(now)
+    acted: List[Dict[str, Any]] = []
+    spawned: set = set()
+    for it in items:
+        if only_ref and str(it.get("ref") or "") != only_ref:
+            continue
+        if it.get("status") == "closed" and \
+                (it.get("assessment") or {}).get("status") not in ("due", "running", "filing"):
+            continue
+        try:
+            a = assess(it, by_ref, ctx)
+            if not a["action"]:
+                continue
+            result = _apply(it, a, by_ref, spawned)
+            _log_backstop(a, result)
+            acted.append(dict(a, result=result))
+        except Exception as exc:  # noqa: BLE001 - one ticket never stops the sweep
+            q._log("BACKSTOP", f"{it.get('ref', '?')} error: {exc}",
+                   queue=str(it.get("project") or ""))
+    return acted
