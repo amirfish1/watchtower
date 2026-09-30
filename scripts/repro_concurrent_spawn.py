@@ -48,10 +48,10 @@ def run_round(cmd: list, n: int, gap: float, watch_s: float) -> list:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--n", type=int, default=4)
+    ap.add_argument("--n", type=int, default=8)
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--cmd", default="claude -p 'reply with OK'")
-    ap.add_argument("--watch", type=float, default=20.0)
+    ap.add_argument("--watch", type=float, default=60.0)
     a = ap.parse_args()
     cmd = shlex.split(a.cmd)
     for label, gap in (("burst", 0.0), ("staggered", 3.0)):
