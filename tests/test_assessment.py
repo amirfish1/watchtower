@@ -455,3 +455,23 @@ def test_assessor_role_config_and_default_family(wt):
     assert wt.config.role_override("AS", "assessor")[0] == "codex"
     import watchtower.roles as roles
     assert "assessor" in roles.ROLES
+
+
+def test_retry_attempt_records_the_new_assessor_not_the_dead_one(wt):
+    q = wt.q
+    b = _bug(q)
+    _close(q, b["ref"])
+    t1 = q.assessment_reserve(b["ref"])
+    q.assessment_set_running(b["ref"], t1, {"worker_id": "worker-3"})
+    q.assessment_release_due(b["ref"], t1)          # dead assessor, attempt 1
+    t2 = q.assessment_reserve(b["ref"])
+    assert t2 and t2 != t1
+    assert "assessor" not in q.get(b["ref"])["assessment"]
+    q.assessment_set_running(b["ref"], t2, {"worker_id": "worker-4"})
+    assert q.get(b["ref"])["assessment"]["assessor"]["worker_id"] == "worker-4"
+    t3 = q.assessment_rotate(b["ref"], t2)           # respawn within a cycle
+    q.assessment_set_running(b["ref"], t3, {"worker_id": "worker-5"})
+    assert q.get(b["ref"])["assessment"]["assessor"]["worker_id"] == "worker-5"
+    t4 = q.assessment_reserve(b["ref"], force=True)  # human force
+    q.assessment_set_running(b["ref"], t4, {"worker_id": "worker-6"})
+    assert q.get(b["ref"])["assessment"]["assessor"]["worker_id"] == "worker-6"
