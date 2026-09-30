@@ -4872,6 +4872,141 @@ def _drop_claim_proc_unlocked(it: Dict[str, Any]) -> None:
         it["prior_claim_proc"] = cp
 
 
+# --- Backstop recovery (WT-31 D3) ---------------------------------------------
+# ``liveness.sweep`` decides from a ``list_items`` snapshot; ``recover_claim``
+# applies its decision in the store lock only when the ticket is exactly as
+# decided (claim fields, ``claim_proc`` and the state fingerprint), and writes
+# the ``backstop`` record + history in the same step (the loop guard reads it).
+RECOVER_ACTIONS = ("reopen", "resume", "escalate", "mark")
+
+
+def _recover_mismatch(it: Dict[str, Any], expect: Dict[str, Any],
+                      items: List[Dict[str, Any]]) -> str:
+    """Why ``it`` is no longer the snapshot the backstop decided on ('' = same)."""
+    for key in ("status", "claimed_by", "claimed_session_id", "claim_proc"):
+        if key in expect and (it.get(key) or None) != (expect.get(key) or None):
+            return f"{key} changed"
+    if it.get("needs_input"):
+        return "blocked for a human"
+    if (it.get("pending_answer") or {}).get("state") in ANSWER_INFLIGHT:
+        return "answer in flight"
+    fp = expect.get("fingerprint")
+    if fp:
+        from . import liveness as _lv
+        if _lv.fingerprint(it, _refs_index(items)) != fp:
+            return "state fingerprint changed"
+    return ""
+
+
+def _recover_reopen_unlocked(it: Dict[str, Any], now: str, reason: str) -> None:
+    """Back to the claim pool (``update_status(open)`` parity, answer handoff
+    E14), keeping ``gate_feedback`` and the session handle."""
+    edge_from = _pa_edge_start(it)
+    displaced = {"orphan": True,
+                 "displaced_session_id": str(it.get("claimed_session_id") or ""),
+                 "displaced_claimed_by": str(it.get("claimed_by") or "")}
+    it["status"] = "open"
+    it.pop("resume", None)
+    _clear_sent_back_unlocked(it)
+    it["claimed_by"] = None
+    it["claimed_machine"] = None
+    it["claimed_at"] = None
+    it["closed_at"] = None
+    _drop_claim_proc_unlocked(it)
+    it.pop("gate_pending", None)
+    it["needs_input"] = False
+    it["block_question"] = ""
+    it["block_kind"] = ""
+    it["block_commit"] = ""
+    it["blocked_at"] = None
+    it.pop("parked", None)
+    _reopen_pending_unlocked(it, now, "handoff", reason)
+    _append_history(it, "reopen", by=_by("system"), at=now, reason=_clip(reason, 4000),
+                    **(displaced if displaced["displaced_claimed_by"]
+                       or displaced["displaced_session_id"] else {}))
+    _check_answer_edge_from(it, edge_from)
+
+
+def _recover_escalate_unlocked(it: Dict[str, Any], now: str, question: str) -> None:
+    """Flag for a human (legacy block: the claim stays; an open ticket moves to
+    in_progress like ``block``); a settled answer is carried (E17)."""
+    edge_from = _pa_edge_start(it)
+    _supersede_pending_unlocked(it, now)
+    it["needs_input"] = True
+    it["block_question"] = _clip(question, 4000)
+    it["block_kind"] = "input"
+    it["blocked_at"] = now
+    it.pop("resume", None)
+    _clear_sent_back_unlocked(it)
+    if it.get("status") == "open":
+        it["status"] = "in_progress"
+    _append_history(it, "block", by=_by("system"), at=now, question=_clip(question, 4000),
+                    kind="input")
+    _check_answer_edge_from(it, edge_from)
+
+
+def recover_claim(ident: Any, *, expect: Dict[str, Any], action: str, reason: str,
+                  evidence: str = "", state: str = "",
+                  question: str = "") -> Optional[Dict[str, Any]]:
+    """Apply one backstop decision (WT-31 D3) as a compare-and-swap.
+
+    ``expect`` is the snapshot decided on (``status``, ``claimed_by``,
+    ``claimed_session_id``, ``claim_proc``, ``fingerprint``); any difference,
+    a ``needs_input`` block or an answer in flight makes this a no-op
+    (``BACKSTOP_SKIP race``, returns None). ``action``: ``reopen`` (handoff
+    reopen to the pool), ``resume`` (keep the claim; the caller resumes the
+    claimed session), ``escalate`` (``needs_input`` with ``question``),
+    ``mark`` (record only; the caller acts). Every applied action writes
+    ``backstop = {state, action, count, at, fingerprint}`` (the post-write
+    fingerprint the loop guard compares) and a ``backstop`` history event in
+    the same step. Local store only (a GitHub-backed ticket escalates through
+    ``block``)."""
+    if action not in RECOVER_ACTIONS:
+        raise ValueError(f"action must be one of {RECOVER_ACTIONS}")
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        return None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            why = _recover_mismatch(it, expect, data["items"])
+            if why:
+                _log("BACKSTOP_SKIP", f"{it.get('ref', '?')} race: {why} (action={action})",
+                     queue=str(it.get("project") or ""))
+                return None
+            now = _now_iso()
+            prev = it.get("backstop") if isinstance(it.get("backstop"), dict) else {}
+            count = int(prev.get("count") or 0) + 1 if prev.get("state") == state else 1
+            if action == "reopen":
+                _recover_reopen_unlocked(it, now, reason)
+            elif action == "escalate":
+                _recover_escalate_unlocked(it, now, question or reason)
+            elif action == "resume" and isinstance(it.get("claim_proc"), dict):
+                it["claim_proc"] = dict(it["claim_proc"], resumed_at=now)
+            it["updated_at"] = now
+            _append_history(it, "backstop", by=_by("system"), at=now, state=state,
+                             action=action, reason=_clip(reason, 500),
+                             evidence=_clip(evidence, 500))
+            it["backstop"] = {"state": state, "action": action, "count": count, "at": now}
+            from . import liveness as _lv
+            it["backstop"]["fingerprint"] = _lv.fingerprint(it, _refs_index(data["items"]))
+            _save_unlocked(data)
+            return it
+    return None
+
+
+def escalate_stuck_blockers() -> bool:
+    """``_escalate_stuck_blockers`` over the whole store, in its own lock
+    (the backstop's system_op for ``dep.stuck``; claims run it too)."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        if _escalate_stuck_blockers(data["items"]):
+            _save_unlocked(data)
+            return True
+    return False
+
+
 def _affinity_reserved(it: Dict[str, Any], now: float) -> bool:
     pa = it.get("pending_answer")
     return bool(pa and pa.get("state") == "affinity"
@@ -4921,8 +5056,8 @@ ANSWER_TRANSITIONS: Tuple[Dict[str, Any], ...] = (
      "status": (("awaiting_answer", "open"),), "writers": ("route_answer",)},
     {"id": "E5", "from": ("routing",), "to": "handed_off",
      "status": (("awaiting_answer", "open"),),
-     "writers": ("route_answer", "_fallback_reopen"),
-     "callers": ("route_pending_answers",)},
+     "writers": ("route_answer", "_fallback_reopen", "_floor_routing"),
+     "callers": ("route_pending_answers", "sweep")},
     {"id": "E6", "from": ("delivering",), "to": "queued",
      "status": _same("in_progress"), "writers": ("_deliver_bound",),
      "callers": ("route_answer", "_retry", "_check_queued")},
@@ -4935,11 +5070,12 @@ ANSWER_TRANSITIONS: Tuple[Dict[str, Any], ...] = (
     {"id": "E9", "from": ("delivering", "queued"), "to": "delivered",
      "status": _same("in_progress"), "writers": ("_on_answer_confirmed",)},
     {"id": "E10", "from": ("delivering", "queued"), "to": "handed_off",
-     "status": (("in_progress", "open"),), "writers": ("_fallback_reopen",),
+     "status": (("in_progress", "open"),), "writers": ("_fallback_reopen", "_floor_bound"),
      "callers": ("route_answer", "route_pending_answers", "_deliver_bound",
-                 "_retry", "_check_queued")},
+                 "_retry", "_check_queued", "sweep")},
     {"id": "E11", "from": ("affinity",), "to": "handed_off",
-     "status": _same("open"), "writers": ("route_pending_answers",)},
+     "status": _same("open"), "writers": ("route_pending_answers", "_floor_affinity"),
+     "callers": ("sweep",)},
     {"id": "E12", "from": ("affinity", "handed_off"), "to": "delivered",
      "status": (("open", "in_progress"),), "writers": ("_bind_pending_unlocked",),
      "callers": ("claim_next", "claim_by_ref")},
@@ -4953,7 +5089,7 @@ ANSWER_TRANSITIONS: Tuple[Dict[str, Any], ...] = (
      "status": (("in_progress", "open"), ("awaiting_answer", "open"), ("open", "open")),
      "writers": ("_reopen_pending_unlocked",),
      "callers": ("update_status", "release", "reopen", "requeue_orphaned_tickets",
-                 "_reopen_with_feedback", "close")},
+                 "_reopen_with_feedback", "close", "recover_claim", "sweep")},
     {"id": "E15", "from": _ANY_PA, "to": "none",
      "status": (("in_progress", "open"), ("awaiting_answer", "open")),
      "writers": ("_reopen_pending_unlocked",),
@@ -4968,7 +5104,8 @@ ANSWER_TRANSITIONS: Tuple[Dict[str, Any], ...] = (
      "status": (("open", "in_progress"), ("open", "awaiting_answer"), ("open", "open"),
                 ("in_progress", "in_progress"), ("in_progress", "awaiting_answer"),
                 ("awaiting_answer", "awaiting_answer")),
-     "writers": ("_supersede_pending_unlocked",), "callers": ("block", "update")},
+     "writers": ("_supersede_pending_unlocked",),
+     "callers": ("block", "update", "recover_claim", "sweep")},
 )
 
 
