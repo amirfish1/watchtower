@@ -866,12 +866,48 @@ def fallback_model(eng: str) -> str:
     return resolved
 
 
+def _usable_pin(queue: str, eng: str) -> str:
+    """The queue's explicit model pin, or "" when it is unset or not approved
+    for ``eng``. A raw config entry written around ``wt config`` (another tool,
+    an old file) must not make the effective model unspawnable or unstable
+    (WT-10): an unapproved pin is ignored and surfaced by
+    :func:`model_pin_warning`. Blocked-by-policy pins are handled by the caller."""
+    pin = str(_queue_entry(queue).get("model", "") or "").strip()
+    if not pin:
+        return ""
+    resolved = canonical_model(eng, pin)
+    if is_blocked_model(resolved):
+        return pin  # model() substitutes the policy fallback for these
+    if pin in ("sonnet", "opus", "haiku") or "fable" in pin.lower():
+        # Bare claude family names are valid --model values; a fable pin must
+        # reach spawn_workers, which refuses it loudly (WT-89).
+        return pin
+    # Approved for ANY engine: a spawn may override the queue's engine, and
+    # the pin then rides along (a pin for no engine at all is the bad case).
+    if any(pin in approved_models(e) for e in MODEL_EFFORTS):
+        return pin
+    return ""
+
+
+def model_pin_warning(queue: str) -> str:
+    """Why the queue's stored model pin is being ignored, or ""."""
+    eng = engine(queue)
+    pin = str(_queue_entry(queue).get("model", "") or "").strip()
+    if pin and not _usable_pin(queue, eng):
+        return (
+            f"pinned model {pin!r} is not approved for {eng}; ignored, "
+            f"running {model(queue) or '(engine default)'!r} "
+            f"(`wt models --engine {eng}`)"
+        )
+    return ""
+
+
 def raw_model(queue: str) -> str:
     """The queue's configured/inherited model exactly as :func:`model` would
     resolve it, but WITHOUT the blocked-model substitution -- for callers that
     must fail loudly instead of quietly swapping models (the verify gate)."""
     eng = engine(queue)
-    explicit = _queue_entry(queue).get("model", "")
+    explicit = _usable_pin(queue, eng)
     if explicit:
         return canonical_model(eng, explicit)
     return canonical_model(eng, _ccc_worker_model_default(eng) or default_model(eng))
@@ -914,7 +950,7 @@ def model(queue: str) -> str:
     Supported aliases are resolved to their canonical engine-CLI identifiers.
     """
     eng = engine(queue)
-    explicit = _queue_entry(queue).get("model", "")
+    explicit = _usable_pin(queue, eng)
     if explicit:
         resolved = canonical_model(eng, explicit)
     else:
@@ -1006,87 +1042,65 @@ MODEL_FLOOR_TIERS = (
     "kimi-code/kimi-for-coding",
     "claude-sonnet-5",
     "kimi-code/kimi-for-coding-highspeed",
+    "claude-sonnet-5-5",
     "claude-opus-4-8",
     "claude-opus-5",
     "claude-opus-5-5",
 )
 
 
-def model_floor_met(queue: str, floor: str) -> bool:
-    """True if ``queue``'s configured model meets or exceeds ``floor``'s tier.
+def model_meets_floor(model_id: str, floor: str) -> bool:
+    """True if ``model_id`` (canonical) meets or exceeds ``floor``'s tier.
 
-    Fails OPEN (returns True, i.e. does not block a claim) for an empty
-    floor, an unranked floor value, or a queue running a model this ranking
-    doesn't cover -- a per-ticket floor is an interim, best-effort signal
-    (the filer never blocks on certainty at filing time), not a hard
-    guarantee; spuriously refusing a claim over a ranking gap is worse than
-    occasionally under-enforcing one.
+    An empty or unranked *floor* is not enforceable, so it is met. An
+    unranked *model* fails CLOSED against a ranked floor (WT-10): routing the
+    ticket to a known floor model is cheap, silently letting an unknown model
+    work it is the bug this replaced.
     """
     floor = str(floor or "").strip()
     if not floor or floor not in MODEL_FLOOR_TIERS:
         return True
-    queue_model = canonical_model(engine(queue), model(queue))
-    if queue_model not in MODEL_FLOOR_TIERS:
-        return True
-    return MODEL_FLOOR_TIERS.index(queue_model) >= MODEL_FLOOR_TIERS.index(floor)
+    model_id = str(model_id or "").strip()
+    if model_id not in MODEL_FLOOR_TIERS:
+        return False
+    return MODEL_FLOOR_TIERS.index(model_id) >= MODEL_FLOOR_TIERS.index(floor)
 
 
-# SIDE-39 -- the recognizable opening of the claim-time model-floor auto-park
-# question. cli.py's claim path builds the block question from this constant,
-# and workers.bump_timeboxed_model_floor_blocks() matches on it to tell a
-# floor-park apart from an ordinary human-decision block (which must never be
-# auto-answered). Single source of truth so detection cannot drift from the
-# text the block actually writes.
-MODEL_FLOOR_BLOCK_PREFIX = "This ticket's model floor is"
-
-# SIDE-39 -- minutes a model-floor-parked ticket may sit blocked before the
-# reconciler auto-bumps its queue's model one tier (see
-# workers.bump_timeboxed_model_floor_blocks). Distinct from
-# health.STUCK_MINUTES, which is queue-level (no close anywhere in the
-# queue); this timebox is per-ticket, keyed off ``blocked_at``.
-DEFAULT_MODEL_FLOOR_BUMP_MINUTES = 30
+def queue_model_id(queue: str) -> str:
+    """The queue's configured model as a canonical id ("" when unset)."""
+    return canonical_model(engine(queue), model(queue))
 
 
-def model_floor_bump_minutes(queue: str) -> int:
-    """Per-queue override for the model-floor auto-bump timebox.
+def model_floor_met(queue: str, floor: str) -> bool:
+    """True if ``queue``'s configured model meets or exceeds ``floor``'s tier
+    (fails closed on an unranked queue model; see ``model_meets_floor``)."""
+    return model_meets_floor(queue_model_id(queue), floor)
 
-    A ``model_floor_bump_minutes`` key on the queue's config entry wins;
-    anything missing or unparseable falls back to
-    ``DEFAULT_MODEL_FLOOR_BUMP_MINUTES``. Zero/negative values also fall
-    back rather than meaning "bump instantly" -- an accidental 0 turning
-    every floor-park into an immediate escalation is worse than a slow one.
+
+def unranked_models() -> List[str]:
+    """Claude/kimi models in MODEL_EFFORTS with no MODEL_FLOOR_TIERS rank.
+
+    Those two engines have an unambiguous ordering; a model that falls off
+    the ranking is surfaced (tests, dashboard) rather than ignored.
     """
-    raw = _queue_entry(queue).get(
-        "model_floor_bump_minutes", DEFAULT_MODEL_FLOOR_BUMP_MINUTES
-    )
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return DEFAULT_MODEL_FLOOR_BUMP_MINUTES
-    return value if value > 0 else DEFAULT_MODEL_FLOOR_BUMP_MINUTES
+    return [
+        m for eng in ("claude", "kimi") for m, _ in MODEL_EFFORTS.get(eng, ())
+        if m not in MODEL_FLOOR_TIERS
+    ]
 
 
-def next_model_floor_tier(eng: str, current_model: str) -> str:
-    """The next ``MODEL_FLOOR_TIERS`` entry above ``current_model`` that
-    belongs to engine ``eng``, or "" when there is none.
-
-    The global ladder is cross-engine on purpose (see its comment), so a
-    naive index+1 could hand a claude queue a kimi model id -- which the
-    claude CLI rejects at spawn, killing every worker on the queue. Climbing
-    is therefore restricted to the same engine's models: "" comes back when
-    ``current_model`` is unranked or already this engine's top ranked tier,
-    and the caller leaves the ticket blocked for a human.
-    """
-    current = str(current_model or "").strip()
-    if current not in MODEL_FLOOR_TIERS:
-        return ""
-    engine_models = {
-        m for m, _ in MODEL_EFFORTS.get(str(eng or "").strip().lower(), ())
-    }
-    for candidate in MODEL_FLOOR_TIERS[MODEL_FLOOR_TIERS.index(current) + 1:]:
-        if candidate in engine_models:
-            return candidate
+def floor_engine(floor_model: str) -> str:
+    """Engine that serves ``floor_model`` ("" when no approved engine does)."""
+    for eng, models in MODEL_EFFORTS.items():
+        if any(m == floor_model for m, _ in models):
+            return eng
     return ""
+
+
+# The recognizable opening of the retired claim-time floor-park question
+# (SIDE-39). Nothing writes it any more (WT-10); workers.reopen_legacy_floor_parks
+# matches on it to put old parked tickets back in the pool.
+MODEL_FLOOR_BLOCK_PREFIX = "This ticket's model floor is"
 
 
 def is_approved_model(eng: str, value: str) -> bool:

@@ -135,11 +135,15 @@ def _print_status(rows: List[dict]) -> None:
             if ctypes:
                 label = f"{ctypes[0]}s only" if len(ctypes) == 1 else ",".join(ctypes)
                 note = f"{note} [{label}]".strip()
+            eff = r.get("worker_model") or _cfg.model(r["queue"])
+            note = f"{note} [{r.get('worker_engine') or _cfg.engine(r['queue'])}:{eff or 'default'}]".strip()
             print(
                 f"{r['queue']:<14}{r['depth']:>5}{r['in_progress']:>5}{r['closed']:>6}"
                 f"  {r['oldest_open_age']:>8}  {r['since_progress']:>8}"
                 f"  {wcell:<12}{drain_cell:<7}{flag}  {note}"
             )
+            if r.get("model_pin_warning"):
+                print(f"  ⚠ {r['queue']}: {r['model_pin_warning']}")
 
     rows_w = workers.list_workers(prune=False)
     workers.annotate_activity(rows_w, q.list_items())
@@ -313,6 +317,13 @@ def cmd_status(args: argparse.Namespace) -> int:
         project=args.queue, stuck_minutes=args.stuck_minutes, fresh=True,
         include_archived=getattr(args, "all", False),
     )
+    from . import config as _cfg
+    for r in rows:
+        # The model the next worker on this queue will actually run, plus any
+        # stored pin we are ignoring (WT-10).
+        r["worker_engine"] = _cfg.engine(r["queue"])
+        r["worker_model"] = _cfg.model(r["queue"])
+        r["model_pin_warning"] = _cfg.model_pin_warning(r["queue"])
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
@@ -920,6 +931,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 oldest=getattr(args, "oldest", False),
                 item_types=getattr(args, "type", None) or [],
                 readiness_filters=getattr(args, "readiness", None) or [],
+                worker_model=workers.worker_model(worker, args.queue),
             )
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
@@ -963,36 +975,23 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 print("STOP: reconciler requested shutdown; exiting")
             return 0
 
-    # FEAT-NEXT-120 — per-ticket model floor. Checked here, after a genuine
-    # claim (not the nothing-open/stop early-returns above), so an
-    # under-tiered queue never silently works a ticket that named a higher
-    # floor. Auto-parks it via the existing block() path -- "worker parks
-    # the ticket blocked with a note" per the design -- rather than
-    # bouncing it back to open, so a human sees exactly why and can either
-    # reconfigure the queue's model or hand it to a stronger one.
+    # WT-10 fallback: the file backend filters floors in claim_next, so this
+    # only fires for a backend that cannot (GitHub-backed queues) or a by-ref
+    # claim of a ticket above this worker's model. The ticket goes straight
+    # back to open (never parked blocked) for the reconciler to route.
     model_floor = str(item.get("model_floor") or "").strip()
     if model_floor:
         from . import config
-        if not config.model_floor_met(args.queue, model_floor):
-            queue_model = config.canonical_model(config.engine(args.queue), config.model(args.queue))
-            q.block(
-                item["ref"],
-                session_uuid,
-                question=(
-                    # Built from the shared prefix so the reconciler's SIDE-39
-                    # timebox watchdog can recognize a floor-park (and only a
-                    # floor-park) from the question text alone.
-                    f"{config.MODEL_FLOOR_BLOCK_PREFIX} {model_floor!r}, but queue "
-                    f"{args.queue!r} is configured for {queue_model or '(unset)'!r}. "
-                    "Reassign to a queue running at least that model, or bump this "
-                    "queue's --model, then answer to resume."
-                ),
-                progress=f"Auto-parked at claim time by {worker} — floor not met.",
+        my_model = workers.worker_model(worker, args.queue)
+        if not config.model_meets_floor(my_model, model_floor):
+            q.update_status(
+                item["ref"], "open", worker, require_status="in_progress",
+                reason=f"model floor {model_floor} not met by {my_model or '(unset)'}",
             )
             print(
                 f"error: {item['ref']} requires model floor {model_floor!r}; "
-                f"queue {args.queue!r} runs {queue_model or '(unset)'!r} — "
-                "parked blocked instead of claimed",
+                f"this worker runs {my_model or '(unset)'!r} — released back to "
+                "open for a floor-model worker",
                 file=sys.stderr,
             )
             return 1

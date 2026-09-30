@@ -3746,6 +3746,7 @@ def record_worker(
     session_id: str = "",
     model: str = "",
     kind: str = "",
+    ref: str = "",
 ) -> Dict[str, Any]:
     with _WorkersFileLock():
         data = _load()
@@ -3764,6 +3765,8 @@ def record_worker(
             rec["model"] = model
         if kind:
             rec["kind"] = kind
+        if ref:
+            rec["ref"] = ref
         if session_id:
             rec["session_id"] = session_id
         data["workers"].append(rec)
@@ -3862,6 +3865,22 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
         except Exception:
             pass  # a post-mortem must never break a plain worker listing
     return out
+
+
+def worker_model(worker_id: str, queue: str) -> str:
+    """Canonical model id the claiming ``worker_id`` runs (WT-10).
+
+    The model recorded at spawn wins (a floor-routed run-once worker runs a
+    different model than its queue); a worker with no record or no recorded
+    model runs whatever the queue is configured for.
+    """
+    from . import config
+    for w in _load().get("workers", []):
+        if w.get("worker_id") == worker_id and w.get("model"):
+            return config.canonical_model(
+                str(w.get("engine") or config.engine(queue)), str(w["model"])
+            )
+    return config.queue_model_id(queue)
 
 
 def live_worker_count(queue: Optional[str] = None) -> int:
@@ -5031,43 +5050,20 @@ def reconcile_once(dry_run: bool = False,
         return _reconcile_once_locked(dry_run, only_queue=only_queue)
 
 
-def bump_timeboxed_model_floor_blocks(
-    reconcile_id: str = "",
-) -> List[Dict[str, Any]]:
-    """SIDE-39 -- per-ticket watchdog for model-floor auto-parks.
+def reopen_legacy_floor_parks(reconcile_id: str = "") -> List[Dict[str, Any]]:
+    """Reopen tickets parked by the retired claim-time model-floor park.
 
-    A ticket whose ``model_floor`` exceeds its queue's model is parked
-    blocked at claim time (FEAT-NEXT-120, see ``cli.cmd_claim``) and then
-    waits on a human indefinitely. Once such a ticket has sat blocked past
-    ``config.model_floor_bump_minutes(queue)`` (keyed off ``blocked_at``,
-    which ``queue.block()`` stamps), this bumps the queue's configured model
-    ONE same-engine tier up ``config.MODEL_FLOOR_TIERS``, records the
-    auto-answer on the ticket, and reopens it so the now-stronger queue
-    re-claims it.
-
-    Deliberately conservative:
-      - Only blocks carrying the recognizable claim-time question
-        (``config.MODEL_FLOOR_BLOCK_PREFIX``) on a ticket with a non-empty
-        ``model_floor`` are touched. An ordinary human-decision block is
-        NEVER auto-answered -- that would silently erase a real question.
-      - At most one tier bump per queue per pass. A still-unmet floor simply
-        re-parks at the next claim with a fresh ``blocked_at``, so escalation
-        proceeds one tier per timebox, each step logged.
-      - No higher same-engine tier (queue already at its engine's top, or
-        running an unranked model): the ticket stays blocked for a human.
-      - If the floor is already met (a human raised the queue's model after
-        the park), the ticket is answered + reopened without any bump.
-
-    Distinct from ``health.STUCK_MINUTES``, which is queue-level ("no close
-    anywhere in the queue lately"); this watchdog is per-ticket.
+    Before WT-10 a worker claimed a ticket above its model and parked it
+    blocked (``config.MODEL_FLOOR_BLOCK_PREFIX``), and SIDE-39 then bumped the
+    WHOLE queue's model a tier every 30 minutes. Floors are now filtered at
+    claim time and routed per ticket, so any such park still on the books is
+    just put back in the pool; the queue's configured model is never touched.
+    Ordinary human-decision blocks are left alone.
     """
-    from . import config, health
     from . import queue as q
 
     out: List[Dict[str, Any]] = []
-    now = datetime.now(timezone.utc)
     actor = reconcile_id or "watchtower-reconciler"
-    bumped_queues: Set[str] = set()
     try:
         blocked = q.list_blocked() or []
     except Exception:
@@ -5076,78 +5072,124 @@ def bump_timeboxed_model_floor_blocks(
         ref = str(it.get("ref") or "")
         queue_name = str(it.get("project") or "")
         floor = str(it.get("model_floor") or "").strip()
-        question = str(it.get("block_question") or "")
-        if not ref or not queue_name or not floor:
+        if not (ref and queue_name and floor):
             continue
-        if not question.startswith(config.MODEL_FLOOR_BLOCK_PREFIX):
-            # A human-decision block that happens to sit on a floor-carrying
-            # ticket. Not ours to answer.
+        from . import config
+        if not str(it.get("block_question") or "").startswith(
+            config.MODEL_FLOOR_BLOCK_PREFIX
+        ):
             continue
-        age_s = health._age_seconds(it.get("blocked_at"), now)
-        if age_s is None or age_s < config.model_floor_bump_minutes(queue_name) * 60:
-            continue
-        eng = config.engine(queue_name)
-        queue_model = config.canonical_model(eng, config.model(queue_name))
-        bumped_to = ""
-        if config.model_floor_met(queue_name, floor):
-            # Human already raised the queue since the park; just unblock.
-            pass
-        elif queue_name in bumped_queues:
-            # One tier per queue per pass; this ticket gets the next pass.
-            continue
-        else:
-            bumped_to = config.next_model_floor_tier(eng, queue_model)
-            if not bumped_to:
-                out.append({
-                    "ref": ref, "queue": queue_name, "action": "left_blocked",
-                    "reason": (
-                        f"no {eng} tier above {queue_model or '(unset)'!r} "
-                        f"to meet floor {floor!r}"
-                    ),
-                })
-                continue
-            config.set_model(queue_name, bumped_to)
-            bumped_queues.add(queue_name)
-        answer_text = (
-            f"[auto] Model-floor timebox: blocked {age_s // 60} min on floor "
-            f"{floor!r} with queue model {queue_model or '(unset)'!r}. "
-            + (
-                f"Bumped queue {queue_name!r} model to {bumped_to!r} and reopened "
-                f"for a stronger worker. (SIDE-39 reconciler watchdog)"
-                if bumped_to else
-                f"Queue model now satisfies the floor; reopened for re-claim. "
-                f"(SIDE-39 reconciler watchdog)"
-            )
-        )
         try:
-            q.answer(ref, answer_text, session_id=actor)
-            # answer() reopens on its own when no resumable session is bound;
-            # otherwise the ticket is still in_progress -- CAS it back to open
-            # so the pool (not the stale claim) owns it. A CAS miss just means
-            # answer() already reopened it (or someone else raced us): fine.
+            q.answer(
+                ref,
+                f"[auto] Model floor {floor!r} is now routed per ticket to a "
+                "floor-model worker; reopened. (WT-10)",
+                session_id=actor,
+            )
             q.update_status(
                 ref, "open", actor, require_status="in_progress",
-                reason="model-floor timebox auto-bump (SIDE-39)",
+                reason="legacy model-floor park reopened (WT-10)",
             )
         except Exception:
             continue
         q._log(
-            "FLOOR_BUMP",
-            (
-                f"{ref} — blocked {age_s // 60}m on floor {floor!r}; "
-                + (
-                    f"queue model {queue_model or '(unset)'!r} -> {bumped_to!r}, reopened"
-                    if bumped_to else
-                    f"floor now met by {queue_model or '(unset)'!r}, reopened"
-                )
-            ),
+            "FLOOR_REOPEN",
+            f"{ref} — legacy floor park ({floor!r}) reopened for routing",
             queue=queue_name,
         )
-        out.append({
-            "ref": ref, "queue": queue_name,
-            "action": "bumped" if bumped_to else "reopened",
-            "floor": floor, "from_model": queue_model, "to_model": bumped_to,
-        })
+        out.append({"ref": ref, "queue": queue_name, "action": "reopened",
+                    "floor": floor})
+    return out
+
+
+# Minimum gap before re-spawning a floor worker for the same ticket, so a
+# worker that dies at launch cannot turn the reconciler into a spawn loop.
+FLOOR_SPAWN_RETRY_S = 600
+
+
+def spawn_floor_routed_workers(
+    reconcile_id: str = "", dry_run: bool = False,
+) -> List[Dict[str, Any]]:
+    """WT-10: per-ticket routing for tickets whose ``model_floor`` exceeds the
+    queue's model.
+
+    Normal workers never see those tickets (``claim_next`` filters on the
+    worker's model), so each one gets a single run-once worker at the floor
+    model pinned to that ref. The queue's configured model is never changed.
+    Tickets are taken in claim order (priority, then age), so the ticket the
+    rest of the queue waits on is not starved. A queue with auto-drain off only
+    routes tickets a human pressed run on. A failed spawn is logged
+    (``FLOOR_SPAWN_FAIL``) and the ticket stays open; it is retried after
+    ``FLOOR_SPAWN_RETRY_S``.
+    """
+    from . import config
+    from . import queue as q
+
+    out: List[Dict[str, Any]] = []
+    try:
+        tracked = list_workers()
+    except Exception:
+        tracked = []
+    now = time.time()
+    routed_refs: Set[str] = set()
+    for w in tracked:
+        if not w.get("ref"):
+            continue
+        started = 0.0
+        try:
+            started = datetime.strptime(
+                str(w.get("started_at") or ""), "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+        if w.get("alive") or now - started < FLOOR_SPAWN_RETRY_S:
+            routed_refs.add(str(w["ref"]))
+    for queue_name in sorted(config.all_queues()):
+        try:
+            queue_model = config.queue_model_id(queue_name)
+            types = config.claim_types(queue_name) or None
+            tickets = q.floor_routed_candidates(queue_name, queue_model, types)
+        except Exception:
+            continue
+        auto_on = config.auto_drain(queue_name)
+        for it in tickets:
+            ref = str(it.get("ref") or "")
+            floor = str(it.get("model_floor") or "")
+            if not ref or ref in routed_refs:
+                continue
+            if not auto_on and not it.get("run_requested"):
+                continue
+            eng = config.floor_engine(floor)
+            if not eng or not engine_available(eng):
+                out.append({"ref": ref, "queue": queue_name, "action": "skipped",
+                            "floor": floor,
+                            "reason": f"no available engine serves {floor!r}"})
+                continue
+            entry = {"ref": ref, "queue": queue_name, "action": "spawn",
+                     "floor": floor, "engine": eng}
+            if dry_run:
+                out.append(entry)
+                continue
+            try:
+                rec = spawn_run_once_worker(
+                    queue_name, ref, repo_path=str(it.get("repo_path") or ""),
+                    engine=eng, model=floor,
+                )
+            except Exception as exc:
+                q._log("FLOOR_SPAWN_FAIL",
+                       f"{ref} — could not spawn a {floor} worker: {exc}",
+                       queue=queue_name)
+                out.append({**entry, "action": "failed", "reason": str(exc)})
+                continue
+            routed_refs.add(ref)
+            q._log(
+                "FLOOR_SPAWN",
+                f"{ref} — floor {floor!r} above queue model "
+                f"{queue_model or '(unset)'!r}; spawned {rec.get('worker_id')}"
+                " at the floor model",
+                queue=queue_name,
+            )
+            out.append({**entry, "worker_id": rec.get("worker_id")})
     return out
 
 
@@ -5179,7 +5221,7 @@ def _reconcile_once_locked(dry_run: bool = False,
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
                               "released": [], "zombies_released": [],
                               "reaped": [], "requeued": [],
-                              "model_floor_bumped": [],
+                              "model_floor_reopened": [], "model_floor_routed": [],
                               "stop_signals_swept": [],
                               "backfilled": [],
                               "session_title_backfilled": [],
@@ -5271,12 +5313,14 @@ def _reconcile_once_locked(dry_run: bool = False,
                 notify_workers(q_name, nudge)
         except Exception:
             pass
-        # SIDE-39: per-ticket watchdog for model-floor auto-parks. Runs before
-        # the depth reads below so a ticket it reopens counts as claimable on
-        # this same pass (the spawn decision then staffs the bumped queue
-        # immediately instead of one tick later).
+        # WT-10: reopen any legacy claim-time floor parks, then route tickets
+        # above the queue's model to per-ticket floor-model workers. Runs before
+        # the depth reads below, which exclude those tickets for normal workers.
         try:
-            result["model_floor_bumped"] = bump_timeboxed_model_floor_blocks(
+            result["model_floor_reopened"] = reopen_legacy_floor_parks(
+                reconcile_id=reconcile_id
+            )
+            result["model_floor_routed"] = spawn_floor_routed_workers(
                 reconcile_id=reconcile_id
             )
         except Exception:
@@ -5419,7 +5463,9 @@ def _reconcile_once_locked(dry_run: bool = False,
         a hand-rolled copy of the filter here disagreed with claim_next's."""
         total = _total_open_by_q.get(qn, 0)
         types = config.claim_types(qn) or None
-        claimable = _q.count_claimable(project=qn, item_types=types)
+        claimable = _q.count_claimable(
+            project=qn, item_types=types, worker_model=config.queue_model_id(qn),
+        )
         return claimable, total
 
     def _manual_depth(qn: str) -> int:
@@ -5849,7 +5895,9 @@ def _reconcile_once_locked(dry_run: bool = False,
                 continue
             from . import queue as _q
             # Peek at the next ticket to get its repo_path; fall back to queue config.
-            peeked = _q.peek_next(project=q_name)
+            peeked = _q.peek_next(
+                project=q_name, worker_model=config.queue_model_id(q_name),
+            )
             repo_path = (
                 config.repo_path(q_name)
                 or (peeked or {}).get("repo_path", "")
@@ -6402,10 +6450,9 @@ def spawn_run_once_worker(
             _close_fd_quiet(None)
     rec = record_worker(
         proc.pid, queue, engine, worker_id, repo_path, str(log_path),
-        fifo=fifo_path or "", model=model,
+        fifo=fifo_path or "", model=model, ref=ref,
     )
     rec["argv"] = argv
-    rec["ref"] = ref
     if effort:
         rec["effort"] = effort
     # WT-103: run-once spawns bypass reconcile(), which is the only other

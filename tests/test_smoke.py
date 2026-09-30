@@ -631,9 +631,19 @@ def test_model_floor_met_ranks_across_engines(store):
     config.set_model("Q", "claude-sonnet-5")
     assert config.model_floor_met("Q", "claude-opus-4-8") is False
 
-    # Empty or unranked floors never block a claim (fail open).
+    # Empty or unranked floors are not enforceable, so they are met.
     assert config.model_floor_met("Q", "") is True
     assert config.model_floor_met("Q", "gpt-5.6") is True
+
+    # WT-10: sonnet-5-5 is ranked, and below opus-5-5.
+    config.set_model("Q", "claude-sonnet-5-5")
+    assert config.model_floor_met("Q", "claude-opus-5-5") is False
+    assert config.model_floor_met("Q", "claude-sonnet-5") is True
+
+    # An unranked queue model fails closed against a ranked floor.
+    config.set_engine("Q", "codex")
+    config.set_model("Q", "gpt-5.5")
+    assert config.model_floor_met("Q", "claude-sonnet-5") is False
 
 
 def test_model_floor_accepts_claude_opus_5(store, capsys):
@@ -679,20 +689,15 @@ def test_add_and_claim_honor_model_floor(store, capsys):
     ]) == 0
     ref = capsys.readouterr().out.split()[1]
 
+    # WT-10: the sonnet-5 worker skips the opus-4-8 ticket instead of
+    # claiming and parking it.
     rc = cli.main(["claim", "-q", "Q", "--worker", "w1", "--json"])
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "model floor" in err
-    assert "claude-opus-4-8" in err
-
+    assert rc == 0
     item = q.get(ref)
-    assert item["status"] == "in_progress"  # parked, not reopened
-    assert item["needs_input"] is True
-    assert "claude-opus-4-8" in item["block_question"]
+    assert item["status"] == "open"
+    assert item["needs_input"] is False
 
-    # Bumping the queue's model to meet the floor is enough for the same
-    # check to pass -- the re-claim/reopen mechanics of answer() are a
-    # pre-existing, separately-tested path, not re-exercised here.
+    # A queue whose model meets the floor can claim it.
     config.set_model("Q", "claude-opus-4-8")
     assert config.model_floor_met("Q", "claude-opus-4-8") is True
 
