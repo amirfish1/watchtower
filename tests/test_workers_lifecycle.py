@@ -4800,3 +4800,22 @@ def test_verifier_goal_forbids_production_side_effects(wt):
     from watchtower import cli
     goal = cli._verifier_goal({"ref": "X-1", "text": "it works"})
     assert "paid APIs" in goal and "WT_VERIFY=1" in goal
+
+
+def test_spawn_adhoc_claude_ledgers_pinned_session_id(wt, monkeypatch):
+    """CCC-1241: `claude -p` text logs never name the session, so stage-role
+    sessions (planner/reviewer/verifier) missed the worker-session ledger and
+    CCC showed them under Coding. spawn_adhoc pins the id and ledgers it."""
+    class _P:
+        pid = 4243
+
+    monkeypatch.setattr(wt.workers.shutil, "which", lambda b: "/usr/bin/" + b)
+    monkeypatch.setattr(wt.workers.subprocess, "Popen", lambda argv, **kw: _P())
+    monkeypatch.setattr(wt.workers, "WORKERS_FILE", wt.tmp / "workers.json")
+    rec = wt.workers.spawn_adhoc("check", "claude", repo_path=str(wt.tmp), name="verify-X-1", verify=True)
+    sid = rec["session_id"]
+    argv = rec["argv"]
+    assert argv[argv.index("--session-id") + 1] == sid
+    assert sid in wt.workers._load_worker_session_ledger()
+    codex = wt.workers.spawn_adhoc("check", "codex", repo_path=str(wt.tmp), name="verify-X-1", dry_run=True)
+    assert "session_id" not in codex and "--session-id" not in codex["argv"]

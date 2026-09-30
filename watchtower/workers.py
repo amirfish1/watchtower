@@ -6690,7 +6690,7 @@ ADHOC_REPORT_FOOTER = (
 
 def build_adhoc_command(
     engine: str, prompt: str, *, model: str = "", repo_path: str = "",
-    log_path: str = "",
+    log_path: str = "", session_id: str = "",
 ) -> List[str]:
     """Argv for a one-shot ad-hoc agent. All engines run in print/exec mode
     with the goal in argv -- no FIFO, no drain loop; the process exits when
@@ -6732,6 +6732,10 @@ def build_adhoc_command(
                 "--permission-mode", "bypassPermissions"]
         if model:
             argv += ["--model", model]
+        if session_id:
+            # Plain `-p` text output never names the session, so the log
+            # backfill can't ledger it; pin the id instead (CCC-1241).
+            argv += ["--session-id", session_id]
         argv.append(prompt)
         return argv
     if engine == "kimi":
@@ -6794,8 +6798,13 @@ def spawn_adhoc(
     worker_id = f"{label}-{engine}-{uuid.uuid4().hex[:8]}"
     log_dir = WORKERS_FILE.parent / "logs"
     log_path = log_dir / f"{worker_id}.log"
+    # Claude's print mode is the one engine whose log never carries its session
+    # id, so mint it here: the ledger then knows the planner/reviewer/verifier
+    # session at spawn time and CCC files it under Workers (CCC-1241).
+    session_id = str(uuid.uuid4()) if engine == "claude" else ""
     argv = build_adhoc_command(
         engine, prompt, model=model, repo_path=repo_path, log_path=str(log_path),
+        session_id=session_id,
     )
     if dry_run:
         rec = {
@@ -6803,6 +6812,8 @@ def spawn_adhoc(
             "engine": engine, "repo_path": repo_path, "argv": argv,
             "kind": "adhoc", "dry_run": True,
         }
+        if session_id:
+            rec["session_id"] = session_id
         if model:
             rec["model"] = model
         return rec
@@ -6822,7 +6833,7 @@ def spawn_adhoc(
         logf.close()
     rec = record_worker(
         proc.pid, label.upper(), engine, worker_id, repo_path, str(log_path),
-        model=model, kind="adhoc",
+        model=model, kind="adhoc", session_id=session_id,
     )
     rec["argv"] = argv
     return rec
