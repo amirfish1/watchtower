@@ -27,6 +27,40 @@ from . import queue as q
 # Minutes of no progress (no ticket closed) before an open queue is "stuck".
 STUCK_MINUTES = 10
 
+# History events that count as queue progress besides a close or a claim
+# (WT-31 D5): stage sessions, plan / verify / review / assessment steps,
+# answers and backstop actions. Prefix match on the ``plan`` family.
+PROGRESS_EVENTS = ("stage_spawn", "stage_death", "stage_escalated", "stage_retry",
+                   "verify", "in_review", "assessment", "answer_route", "answer",
+                   "backstop")
+PROGRESS_PREFIXES = ("plan",)
+
+
+def _progress_event(event: Any) -> bool:
+    ev = str(event or "")
+    return ev in PROGRESS_EVENTS or ev.startswith(PROGRESS_PREFIXES)
+
+
+def _last_event_at(it: Dict[str, Any], stage_only: bool = False) -> Optional[str]:
+    """ISO time of the ticket's latest progress event (stage events only when
+    ``stage_only``)."""
+    best: Optional[str] = None
+    for h in it.get("history") or []:
+        if not isinstance(h, dict) or not isinstance(h.get("at"), str):
+            continue
+        ev = h.get("event")
+        if (str(ev or "").startswith("stage_") if stage_only else _progress_event(ev)):
+            if best is None or h["at"] > best:
+                best = h["at"]
+    return best
+
+
+def stage_stuck_after_s(stuck_minutes: int = STUCK_MINUTES) -> float:
+    """A stage-owned ticket with no stage event for this long reads stuck:
+    past the stage idle limit (plus a tick), never sooner than the queue rule."""
+    from . import stages
+    return max(stuck_minutes * 60.0, stages.idle_limit_s() + 120.0)
+
 # Window (minutes) over which the drain rate is measured: tickets closed in the
 # last DRAIN_WINDOW_MINUTES divided by the window gives closes/min, which feeds
 # the ETA estimate. A short window keeps the rate responsive to current pace.
@@ -118,6 +152,7 @@ def queue_status(
     ``claimable_depth > 0`` and the reconciler spawns workers that can never
     claim anything, forever."""
     now = now or datetime.now(timezone.utc)
+    now_ts = now.timestamp()
     open_items = [it for it in items if it.get("status") == "open"]
     in_progress = [it for it in items if it.get("status") == "in_progress"]
     closed = [it for it in items if it.get("status") == "closed"]
@@ -132,6 +167,9 @@ def queue_status(
         # an unsettled plan or a model_floor above the queue's worker model
         # means the drainer's `wt claim` returns nothing, so it isn't "stuck".
         and not q.plan_pending(it)
+        # WT-28/31: an answer reserved for its parked worker is claimable by
+        # that worker only, so it is not open work for the pool.
+        and not q._affinity_reserved(it, now_ts)
         and (
             not worker_model
             or config.model_meets_floor(worker_model, it.get("model_floor") or "")
@@ -164,8 +202,26 @@ def queue_status(
         (str(it["claimed_at"]) for it in in_progress if it.get("claimed_at") and isinstance(it.get("claimed_at"), str)),
         default=None,
     )
-    progress_ref = max((r for r in (last_close, last_claim) if r), default=None) or oldest_created
+    # WT-31 D5: stage sessions, plan/verify/assessment steps, answers and the
+    # backstop are progress too.
+    last_event = max((e for e in (_last_event_at(it) for it in items) if e), default=None)
+    progress_ref = max((r for r in (last_close, last_claim, last_event) if r),
+                       default=None) or oldest_created
     since_progress = _age_seconds(progress_ref, now)
+
+    # Stage-owned tickets (planner / reviewer / verifier / assessor due): a
+    # queue whose only live work is a dead stage reads stuck at depth 0.
+    from . import stages
+    owned = stages.desired(items)
+    stage_owned = len(owned)
+    stage_stuck = False
+    if owned:
+        by_ref = {str(it.get("ref")): it for it in items}
+        last_stage = max((_last_event_at(by_ref[d["ref"]], stage_only=True)
+                          or str(by_ref[d["ref"]].get("updated_at") or "")
+                          for d in owned), default="")
+        stage_age = _age_seconds(last_stage, now)
+        stage_stuck = stage_age is not None and stage_age >= stage_stuck_after_s(stuck_minutes)
 
     stuck = bool(
         claimable_depth > 0
@@ -192,7 +248,17 @@ def queue_status(
     eta_human = "empty" if eta_seconds == 0 else _fmt_eta(eta_seconds)
 
     # Display state, derived from raw `stuck` + the queue's auto_drain policy.
-    if depth == 0:
+    # ``stuck`` stays the claimable-work signal (nudges and spawns read it); a
+    # stalled stage sets state=stuck with stuck_reason=stage (health field
+    # only: no alarm banner).
+    stuck_reason = ""
+    if stuck and auto_drain and claimable_depth > 0:
+        stuck_reason = "claimable"
+    elif stage_stuck:
+        stuck_reason = "stage"
+    if stuck_reason == "stage":
+        state = "stuck"
+    elif depth == 0:
         state = "clear"
     elif claimable_depth == 0:
         state = "backlog"   # open items exist but all filtered out by claim_types — parked
@@ -217,6 +283,9 @@ def queue_status(
         "since_progress_s": since_progress,
         "since_progress": _fmt_age(since_progress),
         "stuck": stuck,
+        "stage_owned": stage_owned,
+        "stage_stuck": stage_stuck,
+        "stuck_reason": stuck_reason,
         "auto_drain": bool(auto_drain),
         "state": state,
         "drain_rate_per_min": drain_rate,
