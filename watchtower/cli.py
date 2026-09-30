@@ -309,6 +309,26 @@ def _mark_self(item: dict, worker: str, session: str) -> dict:
 
 
 # ----------------------------------------------------------------------- commands
+def cmd_deploy(args: argparse.Namespace) -> int:
+    """Show the installed tree vs origin; --sync fast-forwards it (WT-16)."""
+    from . import deploy
+    st = deploy.sync() if args.sync else deploy.status()
+    if args.json:
+        print(json.dumps(st, indent=2))
+        return 0
+    if not st.get("path"):
+        print("installed copy is not a git checkout; nothing to sync")
+        return 0
+    line = (f"{st['path']} @ {st['head'][:8]} ({st['branch']}); "
+            f"origin {st['origin_head'][:8]}, behind {st['behind']}, ahead {st['ahead']}")
+    if st["dirty"]:
+        line += f", dirty: {', '.join(st['dirty'][:5])}"
+    print(line)
+    if st.get("action"):
+        print(f"{st['action']}" + (f": {st['reason']}" if st.get("reason") else ""))
+    return 1 if st.get("action") == "refused" else 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     # fresh=True: a human asking for status gets current state, never a cached
     # snapshot. On a GitHub queue that is an ETag revalidation, so the usual
@@ -1218,6 +1238,17 @@ def cmd_close(args: argparse.Namespace) -> int:
     print(f"CLOSED: {item['ref']}" + (f" — {summary}" if summary else ""))
 
     _rename_claiming_session(item, summary)
+    if args.commit:
+        # WT-16: a landed fix reaches the installed tree right away instead of
+        # waiting for the daemon's next sync tick. Best-effort; a dirty tree
+        # or an unpushed commit just leaves it for the daemon.
+        try:
+            from . import deploy
+            res = deploy.sync()
+            if res["action"] == "moved":
+                print(f"DEPLOYED: installed copy {res['was'][:8]} -> {res['head'][:8]}")
+        except Exception:  # noqa: BLE001
+            pass
 
     # STRETCH (opt-in): file each follow-up / unresolved item as a new open
     # ticket in the same queue so nothing falls through the cracks.
@@ -3702,6 +3733,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+_DEPLOY_SYNC_INTERVAL_S = 30  # installed-tree fast-forward cadence (WT-16)
 _SELF_UPDATE_CHECK_INTERVAL_S = 3600  # how often the running daemon rechecks for new commits
 # How often the running daemon re-heals invalid queue worker settings
 # (config.sanitize_worker_settings). Cheap -- a single-file read that only
@@ -3800,6 +3832,7 @@ def _daemon_loop(args: argparse.Namespace) -> None:
 def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     _maybe_self_update()  # pick up reconciler fixes on every (re)start; re-execs if HEAD moved
     last_self_update_check = time.time()
+    last_deploy_sync = 0.0
     interval = max(5, args.interval)
     dry_run = getattr(args, "dry_run", False)
     # Always host the HTTP server alongside the watcher.
@@ -3973,6 +4006,20 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
         if time.time() - last_self_update_check >= _SELF_UPDATE_CHECK_INTERVAL_S:
             last_self_update_check = time.time()
             _maybe_self_update()
+        # Deploy-only installed tree (WT-16): pick up landed commits within
+        # ~30s; a clean fast-forward re-execs so the new code is what runs.
+        if time.time() - last_deploy_sync >= _DEPLOY_SYNC_INTERVAL_S:
+            last_deploy_sync = time.time()
+            try:
+                from . import deploy
+                res = deploy.sync()
+                if res["action"] == "moved":
+                    print(f"[watchtower] deploy sync {res['was'][:8]} -> {res['head'][:8]}; re-exec", flush=True)
+                    os.execvp(sys.executable, [sys.executable, "-m", "watchtower.cli"] + sys.argv[1:])
+                elif res["action"] == "refused":
+                    print(f"[watchtower] deploy sync refused: {res['reason']}", flush=True)
+            except Exception as e:  # noqa: BLE001 - never kill the loop
+                print(f"[watchtower] deploy sync failed: {e}", flush=True)
         time.sleep(interval)
 
 
@@ -4637,6 +4684,7 @@ COMMAND_HELP: Dict[str, str] = {
     "migrate-store": "one-time JSON -> SQLite store migration (idempotent)",
     "export-json": "dump the store as classic {counter, items} JSON",
     "status": "per-queue depth / age / stuck flag",
+    "deploy": "installed copy vs origin/main; --sync fast-forwards it when clean",
     "models": "list approved models per engine; `migrate`/`unpin` bulk-move queue models",
     "config": "recommended queue configuration: settings plus auto-drain policy",
     "set": "compatibility alias for basic queue settings; prefer `wt config`",
@@ -4846,6 +4894,12 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--json", action="store_true")
     a.set_defaults(func=cmd_queue_ls)
     s.set_defaults(func=lambda args: (s.print_help(), 2)[1])
+
+    s = sub.add_parser("deploy")
+    s.add_argument("--sync", action="store_true",
+                   help="fast-forward the installed copy to origin (refuses if dirty)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_deploy)
 
     s = sub.add_parser("models")
     s.add_argument("--engine", default=None,
