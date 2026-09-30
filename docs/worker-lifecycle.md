@@ -395,7 +395,9 @@ only the capped deficit. A same-pass release plus claimable work is labeled
 plan. Returns `spawned`, `released`, `spawn_plans`, `launch_failed`, `skipped`,
 and related maintenance results. In `dry_run` mode, no subprocesses or releases
 occur; staffing plans and synthetic spawn records are still returned and
-logged for tests.
+logged for tests. With `supervise_stages` (and not `dry_run`) the stage pass is
+followed by the liveness backstop (`result["backstop"]`, see "Liveness
+backstop").
 
 ### Launch-failure escalation (spawn-then-die)
 
@@ -601,3 +603,81 @@ claim keeps it as `prior_claim_proc`. `liveness.claim_owner(item)` answers
    scan (D2.6) rejects anything else. Only `RECEIPT_CONFIRMED_WRITERS` may move
    an answer to `delivered`. Add a golden in `tests/test_liveness_goldens.py`
    that drives the real function through the edge (`Golden.step(..., edge=)`).
+
+## Liveness backstop (WT-31 phase B)
+
+`liveness.sweep()` runs every reconciler tick after `reconcile_stages`
+(`reconcile_once` with `supervise_stages` and not `dry_run`) and in `wt stages
+tick [--ref REF]`. It walks every live ticket (closed ones only with a
+due/running/filing assessment), calls `assess()`, and acts on at most one step
+per ticket. `wt liveness [-q Q] [REF] [--json]` prints the same assessment
+read-only (row, owner, proof, verdict, evidence, idle, the action it would take).
+
+**Idle gate.** Stage, claim and staffing rows act only after `STALL_S` of no
+activity (`WATCHTOWER_STALL_S`, default 1800 s). Activity is the newest store
+stamp (`updated_at`, `claimed_at`, `stage_session.spawned_at`, answer
+`state_at`, `parked.at`, recent history) and then the claim transcript / stage
+worker file mtimes. System-op rows (`dep.stuck`, `answer.parked_bare`,
+`answer.plan_conflict`, `answer.affinity_expired`) act on the first sweep;
+`plan.blocked` waits one tick (120 s), because `plan_verdict` sets `blocked`
+before its caller blocks the ticket.
+
+| Row kind | Evidence | Action |
+|---|---|---|
+| stage (`plan.*`, `review.verify`, `assess.*`) | `stage_session` worker alive, or a launch cooldown | `stage`: `reconcile_stages(only_ref)` |
+| `assess.filing` | idle | `assessment_run_ops` (the idempotent op replay) |
+| claim (`work.claimed`, sent-back) | `claim_owner` | dead: `resume` if resume-first applies, else `reopen`; unproven or GitHub: `escalate`; alive: none |
+| `work.open` (staffing) | a live, unreleased queue worker | `spawn` one worker (auto_drain on, no launch-failure cooldown; one per queue per sweep) |
+| `dep.stuck` | stuck blocker not yet escalated | `escalate_stuck_blockers`; `BACKSTOP_NO_ESCALATION` if it still is not flagged |
+| `plan.blocked` | idle one tick | `BACKSTOP_UNBLOCKED_PLAN`, escalate to a human |
+| human / terminal / dependency rows | - | none |
+
+A live sent-back claim inside its WT-34 release window is never touched;
+`release_stalled_sent_back` owns it. A stage row with no `desired()` entry
+escalates (`no supervisor for state <id>`).
+
+**Answer floors.** Each floor is an edge through `pa_transition`, declared with
+its writer: `answer.routing` older than 2 x `ROUTE_LEASE_S` (the router gets its
+lease first) hands off by E5 (`_floor_routing`); `queued` older than
+`ANSWER_QUEUE_TTL_S` + lease, and `delivering` older than lease x
+(`MAX_DELIVERY_ATTEMPTS`+1) or with a dead owner after one lease, hand off by
+E10 (`_floor_bound`); `affinity_expired` (and an `affinity` whose prior worker
+is not alive after one lease) hands off by E11 (`_floor_affinity`);
+`plan_conflict` hands the answer to the plan stage (E5); `parked_bare` reopens.
+
+**`queue.recover_claim(ref, expect=, action=, reason=, ...)`** is the only
+backstop writer of claim state. It compares `expect` (status, `claimed_by`,
+`claimed_session_id`, `claim_proc`, and `liveness.fingerprint()`) inside the
+store lock; any race (reclaim, block, answer, comment/progress, re-bind) makes
+it a no-op with `BACKSTOP_SKIP <ref> race: ...`. Actions: `reopen` (the same
+field reset as `update_status(open)`, keeping `gate_feedback`, handing off a
+settled answer by E14, recording `orphan`/`displaced_*`), `resume` (stamps
+`claim_proc.resumed_at`), `escalate` (a system `needs_input` block, E17
+supersession) and `mark` (before a stage/spawn/assessment action). Every write
+appends a `backstop` history event and sets `backstop = {state, action, count,
+at, fingerprint}`. GitHub tickets are refused (the sweep escalates them with
+`q.block`).
+
+**Loop guard.** If a ticket is still in the same row with the fingerprint the
+backstop recorded (nothing moved since its last action), a prior `resume`
+becomes `reopen` and anything else becomes `escalate` (`second stall ...`), so
+the backstop never repeats one action forever.
+
+**Resume first (WT-30).** A dead builder holding a verifier rejection
+(`gate_feedback`, `resume.state == "pending"`, a resumable session) is resumed
+before it is reopened, both in the sweep and in `requeue_orphaned_tickets`. The
+orphan sweep stays the fast path: `claim_owner` alive vetoes a reopen, and a
+local reopen goes through `recover_claim` (GitHub still uses `update_status`).
+
+**Log lines.** `BACKSTOP <ref> state=<row> owner= proof= verdict= evidence=
+idle=Ns action=<a> [result]`, plus `BACKSTOP_SKIP`, `BACKSTOP_ANSWER_HANDOFF`,
+`BACKSTOP_ANSWER_PLAN_CONFLICT`, `BACKSTOP_NO_ESCALATION`,
+`BACKSTOP_UNBLOCKED_PLAN`.
+
+**Health (D5).** `claimable_depth` excludes plan-active tickets, `dep.stuck` and
+a reserved answer affinity. `queue_status` adds `stage_owned` (the `desired()`
+count), `stage_stuck` (no stage event for max(stuck minutes, stage idle limit +
+120 s)) and `stuck_reason` (`claimable` or `stage`). A stalled stage sets
+`state = "stuck"` even at depth 0, but the `stuck` bool keeps its old meaning
+(claimable work with no progress), since workers use it for nudges and spawns.
+There is no CCC alarm banner.
