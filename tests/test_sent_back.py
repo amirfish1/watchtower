@@ -361,3 +361,29 @@ def test_release_notifies_former_holder(wt, monkeypatch):
                         lambda queue, text, **kw: sent.append((text, kw)) or 1)
     assert [i["ref"] for i in wt.workers._release_stalled_sent_back()] == [ref]
     assert ref in sent[0][0] and f"wt claim {ref}" in sent[0][0] and sent[0][1]["only"] == {W}
+
+
+def test_release_clears_session_ownership_and_isolates_replacement(wt):
+    q = wt.q
+    ref = _sent_back(wt)
+    q.release_stalled_sent_back(now=_deadline(wt, ref) + 1)
+    it = q.get(ref)
+    assert it["status"] == "open" and not it.get("claimed_session_id")
+    assert it["sent_back_released"]["session_id"] == S
+    # replacement X claims without a session uuid: it must not inherit S
+    x = q.claim_by_ref(ref, "wt-x")
+    assert x["claimed_by"] == "wt-x" and not x.get("claimed_session_id")
+    # X's close is rejected: the send-back binds to X, never to the old holder
+    data = q._load_unlocked()
+    for i in data["items"]:
+        if i["ref"] == ref:
+            i["status"] = "in_review"
+    q._save_unlocked(data)
+    q.reject_with(ref, "second rejection", by_label="verifier")
+    again = q.get(ref)
+    assert again.get("claimed_session_id") != S
+    assert not (again.get("resume") or {}).get("sid") == S
+    assert again["claimed_by"] in (None, "wt-x")
+    # the former holder under an alias of S is not handed X's ticket
+    out = q.claim_next(W, project="Q", session_uuid=S)
+    assert not (out or {}).get("handed_back")

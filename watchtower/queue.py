@@ -4703,6 +4703,7 @@ def release_stalled_sent_back(now: Optional[float] = None) -> List[Dict[str, Any
             it["claimed_by"] = None
             it["claimed_machine"] = None
             it["claimed_at"] = None
+            it.pop("claimed_session_id", None)  # identity lives in sent_back_released
             it["updated_at"] = at
             it.pop("resume", None)
             it.pop("sent_back", None)
