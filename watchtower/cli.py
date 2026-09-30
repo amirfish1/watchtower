@@ -1254,6 +1254,35 @@ def cmd_plan(args: argparse.Namespace) -> int:
                                   f"{reviews[-1].get('reasons', '')}. Decide the approach."),
                         progress=f"Plan (round {item['plan'].get('round')}):\n"
                                  f"{item['plan'].get('text', '')}")
+        elif action == "decide":
+            text = args.text or ""
+            if args.file:
+                text = Path(args.file).expanduser().read_text()
+            decision = "accept" if args.accept else "retry"
+            item = q.plan_decide(ref, decision, text, retries=args.retries,
+                                 by=args.by or "human")
+            status = item["plan"]["status"]
+            print(f"PLAN DECISION {decision.upper()}: {ref} -> plan {status}; "
+                  f"human block cleared")
+            if status == "planning":
+                reviews = item["plan"].get("reviews") or []
+                last = reviews[-1].get("reasons", "") if reviews else ""
+                _spawn_plan_role(item, "planner",
+                                 _plan_goal(item, feedback=(text or last)),
+                                 f"plan-{ref}-r{item['plan']['round']}")
+            elif item.get("status") == "open":
+                try:
+                    workers.dispatch_after_enqueue(item.get("project", ""), ref)
+                except Exception:  # noqa: BLE001
+                    pass
+            if item.get("claimed_session_id"):
+                prompt = (f"A human decided the blocked plan on ticket {ref}: "
+                          f"{decision} (plan is now {status}). "
+                          + (f"Follow the accepted plan: `wt plan show {ref}`."
+                             if status == "accepted" else
+                             f"Wait for the revised plan: `wt plan wait {ref}`."))
+                return _deliver_to_blocked_session(item, text or decision, prompt,
+                                                   "", args.by or "")
         elif action == "show":
             plan = item.get("plan") or {}
             if args.json:
@@ -2366,6 +2395,10 @@ def cmd_answer(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
+    if (item.get("plan") or {}).get("status") == "blocked":
+        print(f"NOTE: {item['ref']} plan gate is STILL BLOCKED; a free-text answer "
+              f"does not accept it. Decide with `wt plan decide {item['ref']} "
+              f"--accept [--text/--file amended plan]` or `--retry [--retries N]`.")
     sid = item.get("claimed_session_id")
     if not sid:
         print(f"ANSWERED: {item['ref']} — needs_input cleared. "
@@ -5684,6 +5717,16 @@ def build_parser() -> argparse.ArgumentParser:
     p3 = ps.add_parser("show", help="print the ticket's plan state")
     p3.add_argument("ref")
     p3.add_argument("--json", action="store_true")
+    p5 = ps.add_parser("decide", help="human: settle a plan blocked by exhausted review")
+    p5.add_argument("ref")
+    g = p5.add_mutually_exclusive_group(required=True)
+    g.add_argument("--accept", action="store_true", help="accept the (amended) plan")
+    g.add_argument("--retry", action="store_true", help="resume planning/review")
+    p5.add_argument("--text", default="", help="amended plan text (with --accept)")
+    p5.add_argument("--file", default="")
+    p5.add_argument("--retries", type=int, default=1,
+                    help="review rounds granted by --retry (default 1)")
+    p5.add_argument("--by", default="")
     p4 = ps.add_parser("wait", help="builder: block until the plan is accepted, print it")
     p4.add_argument("ref")
     p4.add_argument("--timeout", type=int, default=1800)

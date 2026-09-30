@@ -2819,12 +2819,67 @@ def plan_verdict(ident: Any, accepted: bool, reasons: str = "",
              "by": str(by), "at": _now_iso()}]
         if accepted:
             plan["status"] = "accepted"
-        elif rnd > PLAN_MAX_REVISIONS:
+        elif rnd > int(plan.get("revision_limit", PLAN_MAX_REVISIONS)):
             plan["status"] = "blocked"
         else:
             plan.update(status="planning", round=rnd + 1)
         _append_history(it, "plan_review", by=_by("system"), at=_now_iso(),
                         passed=bool(accepted), text=_clip(reasons, 1000), round=rnd)
+    return _plan_update(ident, _do)
+
+
+def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
+                by: str = "human", session_id: str = "") -> Optional[Dict[str, Any]]:
+    """Human decision on a plan gate blocked by exhausted review (WT-25).
+
+    ``accept`` settles the plan as ``accepted`` (``text``, when given, replaces
+    the plan text); ``retry`` resumes planning with ``retries`` further review
+    rounds. Either clears the human block (reopening a ticket that has no
+    resumable session, like ``answer``) and is recorded in ``plan["decisions"]``
+    and history. A free-text ``answer`` never does this implicitly."""
+    decision = str(decision or "").strip().lower()
+    if decision not in ("accept", "retry"):
+        raise ValueError("plan decision must be 'accept' or 'retry'")
+    if decision == "retry" and int(retries) < 1:
+        raise ValueError("retries must be at least 1")
+    current = get(ident)
+    if current is None:
+        return None
+    cur_status = (current.get("plan") or {}).get("status")
+    if cur_status != "blocked":
+        raise ValueError(f"{current.get('ref', ident)} has no blocked plan "
+                         f"(plan status {cur_status or 'none'})")
+    text = str(text or "").strip()
+    now = _now_iso()
+    who = _by("human", str(by or ""), str(session_id or ""))
+
+    def _do(it, plan):
+        rnd = int(plan.get("round") or 1)
+        if decision == "accept":
+            if text:
+                plan["text"] = _clip(text, 24000)
+            plan["status"] = "accepted"
+        else:
+            plan.update(status="planning", round=rnd + 1,
+                        revision_limit=rnd + int(retries) - 1)
+        plan["decisions"] = list(plan.get("decisions") or []) + [
+            {"decision": decision, "round": rnd, "by": str(by or "human"), "at": now,
+             "text": _clip(text, 3000), **({"retries": int(retries)} if decision == "retry" else {})}]
+        _append_history(it, "plan_decision", by=who, at=now, decision=decision,
+                        text=_clip(text, 4000), round=rnd)
+        it["needs_input"] = False
+        it["answered_at"] = now
+        it["block_question"] = ""
+        it["block_kind"] = ""
+        it["blocked_at"] = None
+        if it.get("status") == "in_progress" and not it.get("claimed_session_id"):
+            it["status"] = "open"
+            it["claimed_by"] = None
+            it["claimed_machine"] = None
+            it["claimed_at"] = None
+            it["block_commit"] = ""
+            _append_history(it, "reopen", by=who, at=now,
+                            reason="plan_decision_without_resumable_session")
     return _plan_update(ident, _do)
 
 

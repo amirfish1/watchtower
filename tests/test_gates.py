@@ -371,3 +371,69 @@ def test_plan_gated_ticket_unclaimable_until_plan_accepted(plan_cli):
     got = q.claim_next("w1", project="GT")
     assert got and got["ref"] == a["ref"]
     assert "ACCEPTED PLAN" in cli._plan_note(q.get(a["ref"]))
+
+
+def _set_session(q, ref, sid):
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked()
+        for it in data["items"]:
+            if it["ref"] == ref:
+                it["claimed_session_id"] = sid
+        q._save_unlocked(data)
+
+
+def _block_plan(plan_cli, session=False):
+    q, cli = plan_cli.q, plan_cli.cli
+    a = _claimed(q, gates=["plan"])
+    if session:
+        _set_session(q, a["ref"], "sess-1")
+    cli._start_plan_stage(q.get(a["ref"]))
+    for n in range(q.PLAN_MAX_REVISIONS + 1):
+        cli.cmd_plan(_ns(plan_cmd="submit", ref=a["ref"], text=f"plan v{n}"))
+        cli.cmd_plan(_ns(plan_cmd="verdict", ref=a["ref"], reject=True, reasons=f"bad {n}"))
+    return a["ref"]
+
+
+def test_plan_decide_accept_clears_block_and_audits(plan_cli):
+    q, cli = plan_cli.q, plan_cli.cli
+    ref = _block_plan(plan_cli)
+    # a generic answer must not silently accept the plan
+    q.answer(ref, "looks fine, go")
+    assert q.get(ref)["plan"]["status"] == "blocked"
+    assert q.plan_pending(q.get(ref))
+    assert cli.cmd_plan(_ns(plan_cmd="decide", ref=ref, accept=True, text="amended plan",
+                            retries=1)) == 0
+    it = q.get(ref)
+    assert it["plan"]["status"] == "accepted" and it["plan"]["text"] == "amended plan"
+    assert it["needs_input"] is False and not q.plan_pending(it)
+    assert it["plan"]["decisions"][0]["decision"] == "accept"
+    assert it["status"] == "open"  # no retained session: reopened, now claimable
+    assert "plan_decision" in [h["event"] for h in it["history"]]
+
+
+def test_plan_decide_retry_grants_budget(plan_cli):
+    q, cli = plan_cli.q, plan_cli.cli
+    ref = _block_plan(plan_cli, session=True)
+    assert cli.cmd_plan(_ns(plan_cmd="decide", ref=ref, retry=True, accept=False,
+                            retries=1)) == 0
+    it = q.get(ref)
+    assert it["plan"]["status"] == "planning" and it["plan"]["round"] == q.PLAN_MAX_REVISIONS + 2
+    assert it["needs_input"] is False and it["status"] == "in_progress"  # session kept
+    cli.cmd_plan(_ns(plan_cmd="submit", ref=ref, text="v4"))
+    cli.cmd_plan(_ns(plan_cmd="verdict", ref=ref, reject=True, reasons="still bad"))
+    assert q.get(ref)["plan"]["status"] == "blocked"  # only one extra round
+
+
+def test_plan_decide_requires_blocked_plan(plan_cli):
+    q = plan_cli.q
+    a = _claimed(q, gates=["plan"])
+    with pytest.raises(ValueError):
+        q.plan_decide(a["ref"], "accept")
+
+
+def test_answer_on_blocked_plan_warns(plan_cli, capsys):
+    import argparse
+    q, cli = plan_cli.q, plan_cli.cli
+    ref = _block_plan(plan_cli)
+    cli.cmd_answer(argparse.Namespace(ref=ref, text="ok", worker="", engine="", tid=False))
+    assert "plan gate is STILL BLOCKED" in capsys.readouterr().out
