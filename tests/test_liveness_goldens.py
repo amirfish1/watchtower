@@ -345,3 +345,96 @@ def test_plan_reject_at_cap_blocks_for_a_human(wt):
     g.step(wt.q.plan_verdict, ref, False, "no", row="plan.blocked", desired=[])
     g.step(wt.q.block, ref, question="plan rejected", origin="plan_gate",
            row="human.block", owner="human", desired=[])
+
+
+# ------------------------------------------------------------- plan groups
+def _git(repo, *args):
+    import subprocess
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def _group_repo(tmp_path):
+    r = tmp_path / "grepo"
+    r.mkdir()
+    _git(r, "init", "-q", "-b", "main")
+    _git(r, "config", "user.email", "t@example.com")
+    _git(r, "config", "user.name", "t")
+    return r
+
+
+def _gcommit(repo, name):
+    (repo / f"{name}.txt").write_text(name + "\n")
+    _git(repo, "add", f"{name}.txt")
+    _git(repo, "commit", "-q", "-m", name)
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _gbuild(wt, ref, sha):
+    wt.q.claim_by_ref(ref, "w1", session_uuid=SID)
+    wt.q.close(ref, force=True, resolution={"summary": "done", "commit": sha})
+
+
+def _planned_group(wt, repo):
+    kids = [wt.q.enqueue(project=PQ, note=f"m{i}", source="test", repo_path=str(repo))["ref"]
+            for i in range(2)]
+    P = wt.q.enqueue(project=PQ, note="group", source="test", repo_path=str(repo),
+                     group_parent=True, children=kids)["ref"]
+    g = Golden(wt, P)
+    g.check(row="plan.start", desired=["planner"])
+    for k in kids:
+        Golden(wt, k).check(row="group.child.plan_wait", owner="dependency", desired=[])
+    wt.q.plan_start(P)
+    mv = wt.q.group_mv(wt.q.get(P))
+    text = "## Shared\ns\n\n" + "\n\n".join(f"## Section: {k}\nb {k}" for k in kids)
+    g.step(wt.q.plan_submit, P, text, expect_mv=mv, row="plan.reviewing",
+           desired=["plan_reviewer"])
+    g.step(wt.q.plan_verdict, P, True, "ok", expect_mv=mv, row="group.parent.wait",
+           owner="dependency", desired=[])
+    return g, kids
+
+
+def test_group_backstop_runs_the_integration_sweep(wt, tmp_path):
+    """group.parent.ready is a reconciler row: the backstop's recover is
+    ``group_sweep``, which takes the parent to the integration verifier."""
+    repo = _group_repo(tmp_path)
+    _gcommit(repo, "base")
+    g, kids = _planned_group(wt, repo)
+    for k in kids:
+        _gbuild(wt, k, _gcommit(repo, k))
+    g.check(row="group.parent.ready", owner="reconciler", desired=[])
+    assert wt.liveness.sweep(only_ref=g.ref) == []     # idle gate: the tick sweeps first
+    import time
+    acted = wt.liveness.sweep(now=time.time() + 2 * wt.liveness.STALL_S, only_ref=g.ref)
+    assert [a["action"] for a in acted] == ["group_sweep"]
+    g.check(row="review.verify", owner="verifier", desired=["verifier"])
+
+
+def test_done_parent_member_reopen_and_reclose_keeps_the_proof(wt, tmp_path):
+    """WT-33 amendment: done parent -> member reopen -> member reclose at a
+    different SHA. The parent stays closed with its original proof; the
+    classification stays ``closed`` (gint done, gproof stale) and the
+    backstop never re-evaluates it."""
+    repo = _group_repo(tmp_path)
+    _gcommit(repo, "base")
+    g, kids = _planned_group(wt, repo)
+    for k in kids:
+        _gbuild(wt, k, _gcommit(repo, k))
+    wt.q.group_sweep()
+    vc = g.item()["verify_cycle"]
+    g.step(wt.q.verdict, g.ref, True, "ok", expect_verify_cycle=vc, row="closed",
+           owner="terminal", desired=[])
+    proof = g.item()["group"]["integration"]["proven"]
+    resolution = g.item()["resolution"]
+    g.step(wt.q.reopen, kids[0], reason="follow-up", row="closed", desired=[])
+    Golden(wt, kids[0]).check(row="work.open")
+    _gbuild(wt, kids[0], _gcommit(repo, "later"))
+    it = g.check(row="closed", owner="terminal", desired=[]) and g.item()
+    st = wt.liveness.project(it)
+    assert (st.group, st.gint, st.gproof) == ("parent", "done", "stale")
+    assert it["status"] == "closed" and it["group"]["integration"]["proven"] == proof
+    assert it["resolution"] == resolution
+    assert [h for h in it["history"] if h.get("event") == "group_member_reopened_after_close"]
+    import time
+    later = time.time() + 2 * wt.liveness.STALL_S
+    assert wt.liveness.sweep(now=later, only_ref=g.ref) == [] and wt.q.group_sweep() == []
