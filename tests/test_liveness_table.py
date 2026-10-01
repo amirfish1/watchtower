@@ -86,6 +86,9 @@ def _agreement(sts, now, check_projection_every=7):
             assert got is None, (s, "desired() must stay empty while an answer is in flight")
 
 
+_NO_GROUP = {"group": ("none",), "gplan": ("n/a",), "gint": ("n/a",), "gproof": ("n/a",)}
+
+
 def _reachable(pools):
     pi = lv.DIMS.index("parked")
     for combo in itertools.product(*pools):
@@ -103,7 +106,7 @@ def test_desired_agrees_with_stage_rows(monkeypatch):
     monkeypatch.setattr(q, "_github_backend_for_project", github_by_name)
     vocab = lv.ALL()
     fixed = {"readiness": ("claimable",), "dep": ("ok",), "parked": (None,),
-             "block": ("none", "input")}
+             "block": ("none", "input"), **_NO_GROUP}
     pools = [fixed.get(d, vocab[d]) for d in lv.DIMS]
     sts = list(_reachable(pools))
     assert len(sts) > 100000
@@ -115,9 +118,57 @@ def test_desired_agrees_over_readiness_and_dependencies(monkeypatch):
     vocab = lv.ALL()
     fixed = {"plan": ("", "reviewing", "accepted"), "disc": ("none",),
              "awaiting": ("none",), "gate_pending": ("none", "verify"),
-             "assessment": ("none", "due"), "parked": (None,), "block": ("none", "input")}
+             "assessment": ("none", "due"), "parked": (None,), "block": ("none", "input"),
+             **_NO_GROUP}
     pools = [fixed.get(d, vocab[d]) for d in lv.DIMS]
     _agreement(list(_reachable(pools)), time.time())
+
+
+def test_desired_agrees_over_plan_groups(monkeypatch):
+    """WT-33: parents (every plan / integration / proof state) and members
+    (both group-plan states): desired() emits the stage the row proves -- a
+    parent's plan keys carry ``:m<mv>``, its integration verifier is the
+    ``verify:<cycle>`` stage -- and nothing else."""
+    monkeypatch.setattr(q, "_github_backend_for_project", github_by_name)
+    vocab = lv.ALL()
+    parent = {"group": ("parent",), "gplan": ("pending", "settled"), "backend": ("file",),
+              "status": ("open", "in_review", "closed"), "disc": ("none", "active"),
+              "assessment": ("none", "due"), "readiness": ("claimable",),
+              "dep": ("ok", "waiting"), "claimed": (False,), "parked": (None,),
+              "answer": ("none",), "block": ("none", "input"), "gproof": vocab["gproof"][1:],
+              "gint": vocab["gint"][1:]}
+    sts = list(_reachable([parent.get(d, vocab[d]) for d in lv.DIMS]))
+    rows = {lv.classify(s).id for s in sts}
+    assert {"group.parent.forming", "group.parent.wait", "group.parent.ready",
+            "group.parent.gating", "group.parent.gating_stale", "group.parent.capped",
+            "plan.start", "plan.planning", "plan.reviewing", "review.verify",
+            "review.gate", "closed", "human.block"} <= rows, rows
+    _agreement(sts, time.time())
+    child = {"group": ("child",), "gplan": ("pending", "settled"), "gint": ("n/a",),
+             "gproof": ("n/a",), "backend": ("file",), "gated": (False,),
+             "plan": ("", "accepted"), "disc": ("none",), "awaiting": ("none",),
+             "assessment": ("none", "due"), "readiness": ("claimable", "needs-spec"),
+             "dep": ("ok", "waiting"), "parked": (None,), "block": ("none", "input")}
+    sts = list(_reachable([child.get(d, vocab[d]) for d in lv.DIMS]))
+    rows = {lv.classify(s).id for s in sts}
+    assert {"group.child.plan_wait", "work.open", "work.claimed", "dep.waiting"} <= rows, rows
+    _agreement(sts, time.time(), check_projection_every=1)
+
+
+def test_done_parent_stays_classified_after_a_member_moves():
+    """D8 (amended): a done parent is never re-evaluated against the live
+    child map -- done x stale is the terminal row; only an unfinished
+    integration (verifying / reviewing) must match its proof."""
+    base = dict(status="closed", gated=True, backend="file", plan="accepted", disc="none",
+                awaiting="none", gate_pending="none", assessment="none", block="none",
+                readiness="claimable", dep="waiting", claimed=False, parked=False,
+                answer="none", group="parent", gplan="settled", gint="done")
+    for proof in ("match", "stale", "forced"):
+        assert lv.classify(lv.State(**dict(base, gproof=proof))).id == "closed"
+    live = dict(base, status="in_review", gate_pending="verify", gint="verifying", dep="ok")
+    assert lv.classify(lv.State(**dict(live, gproof="match"))).id == "review.verify"
+    for proof in ("none", "stale", "forced"):
+        assert lv.unreachable_reason(lv.State(**dict(live, gproof=proof))).id == "group_proof"
 
 
 # ------------------------------------------------------------------ D2.4
@@ -132,7 +183,8 @@ def test_frozen_vocabularies_equal_live_ones():
 # ------------------------------------------------------------------ D2.5
 _VOCABS = ("VALID_STATUSES", "BACKENDS", "PLAN_STATUSES", "DISC_STATUSES", "DISC_AWAITING",
            "GATE_KINDS", "ASSESSMENT_STATUSES", "BLOCK_KINDS", "UNCLAIMABLE_READINESS",
-           "DEP_VERDICTS", "ANSWER_STATES")
+           "DEP_VERDICTS", "ANSWER_STATES", "GROUP_ROLES", "GROUP_PLAN_STATES",
+           "INTEGRATION_STATES", "GROUP_PROOF_STATES")
 
 
 @pytest.mark.parametrize("name", _VOCABS)

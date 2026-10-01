@@ -40,8 +40,11 @@ class UnclassifiedState(ValueError):
 
 
 DIMS = ("status", "gated", "backend", "plan", "disc", "awaiting", "gate_pending",
-        "assessment", "block", "readiness", "dep", "claimed", "parked", "answer")
-State = collections.namedtuple("State", DIMS)
+        "assessment", "block", "readiness", "dep", "claimed", "parked", "answer",
+        "group", "gplan", "gint", "gproof")
+# The plan-group dims (WT-33) default to "not in a group", so a State built by
+# name for a non-group ticket need not spell them out.
+State = collections.namedtuple("State", DIMS, defaults=("none", "n/a", "n/a", "n/a"))
 
 _BOOLS = (False, True)
 
@@ -64,6 +67,15 @@ _FROZEN: Dict[str, tuple] = {
     "parked": _BOOLS,
     "answer": ("none", "routing", "delivering", "queued", "delivered", "affinity",
                "affinity_expired", "handed_off"),
+    # WT-33 plan groups: the ticket's role; its group plan (a child reads its
+    # parent's); a parent's integration state (gating past its lease TTL reads
+    # gating_stale) and integration proof (the live child commit map vs the
+    # proven one; forced = force-accepted with proof none).
+    "group": ("none", "parent", "child"),
+    "gplan": ("n/a", "pending", "settled"),
+    "gint": ("n/a", "idle", "gating", "gating_stale", "verifying", "reviewing", "fixing",
+             "capped", "done"),
+    "gproof": ("n/a", "none", "match", "stale", "forced"),
 }
 _FROZEN_SETTLED = ("none", "delivered", "handed_off")
 _FROZEN_INFLIGHT = ("routing", "delivering", "queued", "affinity", "affinity_expired")
@@ -87,7 +99,19 @@ def live_vocab() -> Dict[str, tuple]:
         "readiness": ("claimable",) + tuple(q.UNCLAIMABLE_READINESS),
         "dep": tuple(q.DEP_VERDICTS), "claimed": _BOOLS, "parked": _BOOLS,
         "answer": tuple(q.ANSWER_STATES),
+        "group": ("none",) + tuple(q.GROUP_ROLES),
+        "gplan": ("n/a",) + tuple(q.GROUP_PLAN_STATES),
+        "gint": ("n/a",) + _with_stale(tuple(q.INTEGRATION_STATES)),
+        "gproof": ("n/a",) + tuple(q.GROUP_PROOF_STATES),
     }
+
+
+def _with_stale(states: tuple) -> tuple:
+    """The stored integration states plus the projection-only gating_stale."""
+    if "gating" not in states:
+        return states
+    i = states.index("gating") + 1
+    return states[:i] + ("gating_stale",) + states[i:]
 
 
 # ------------------------------------------------------------------ boxes
@@ -123,6 +147,21 @@ NOT_PA = ({"gated": False}, {"gated": True, "plan": ("accepted", "failed")})
 SETTLED = _FROZEN_SETTLED
 INFLIGHT = _FROZEN_INFLIGHT
 _LIVE = ("open", "in_progress")
+# WT-33: a ticket the pool may claim as far as plan groups go: not in a group,
+# or a member whose group plan has settled.
+_POOL_GROUP = ({"group": "none"}, {"group": "child", "gplan": "settled"})
+
+
+def _and(alts1: Tuple[Dict[str, Any], ...], alts2: Tuple[Dict[str, Any], ...]
+         ) -> Tuple[Dict[str, Any], ...]:
+    """Every alt of ``alts1`` combined with every alt of ``alts2`` (their
+    dims are disjoint)."""
+    return tuple(dict(a, **b) for a in alts1 for b in alts2)
+
+
+_GROUP_SETTLED = {"group": "parent", "gated": True, "plan": ("accepted", "failed"),
+                  "gplan": "settled"}
+_GROUP_OPEN = dict(status="open", readiness="claimable", block="none", answer=SETTLED)
 
 Row = collections.namedtuple("Row", "id owner proof recover boxes")
 
@@ -201,7 +240,7 @@ ROWS: Tuple[Row, ...] = (
     _row("human.readiness", "human", "-", "-", NOT_PA,
          status="open", readiness=_not("readiness", "claimable"), block="none",
          answer=SETTLED),
-    _row("dep.waiting", "dependency", "-", "-", NOT_PA,
+    _row("dep.waiting", "dependency", "-", "-", _and(NOT_PA, _POOL_GROUP),
          status="open", readiness="claimable", dep="waiting", block="none", answer=SETTLED),
     _row("dep.stuck", "reconciler", "system_op", "_escalate_stuck_blockers", NOT_PA,
          status="open", readiness="claimable", dep="stuck", block="none", answer=SETTLED),
@@ -212,8 +251,28 @@ ROWS: Tuple[Row, ...] = (
     # pool unless a session bound to it is provably alive (GitHub: escalate).
     _row("work.unowned", "reconciler", "claim_owner", "reopen", NOT_PA,
          status="in_progress", claimed=False, block="none", answer=SETTLED),
-    _row("work.open", "pool", "staffing", "spawn", NOT_PA,
+    _row("work.open", "pool", "staffing", "spawn", _and(NOT_PA, _POOL_GROUP),
          status="open", readiness="claimable", dep="ok", block="none", answer=SETTLED),
+    # WT-33 plan groups. A member waits (unclaimable) until its parent's plan
+    # settles; the planner/reviewer rows above own that plan.
+    _row("group.child.plan_wait", "dependency", "-", "-", NOT_PA,
+         group="child", gplan="pending", dep=("ok", "waiting"), **_GROUP_OPEN),
+    # An unsealed parent has no plan gate yet: a human attaches and seals.
+    _row("group.parent.forming", "human", "-", "-",
+         group="parent", gated=False, dep=("ok", "waiting"), **_GROUP_OPEN),
+    # Sealed, plan settled: the members (and fixes) build; the parent waits.
+    _row("group.parent.wait", "dependency", "-", "-",
+         gint=("idle", "fixing"), dep="waiting", **_GROUP_SETTLED, **_GROUP_OPEN),
+    # Every child closed: the integration is due (the reconciler's group_sweep).
+    _row("group.parent.ready", "reconciler", "system_op", "group_sweep",
+         gint=("idle", "fixing"), dep="ok", **_GROUP_SETTLED, **_GROUP_OPEN),
+    _row("group.parent.gating", "reconciler", "lease", "group_sweep (lease TTL)",
+         gint="gating", dep=("ok", "waiting"), **_GROUP_SETTLED, **_GROUP_OPEN),
+    _row("group.parent.gating_stale", "reconciler", "system_op", "group_sweep",
+         gint="gating_stale", dep=("ok", "waiting"), **_GROUP_SETTLED, **_GROUP_OPEN),
+    # Out of fix allowance with the block answered away: a human decides.
+    _row("group.parent.capped", "human", "-", "-",
+         gint="capped", dep=("ok", "waiting"), **_GROUP_SETTLED, **_GROUP_OPEN),
 )
 ROWS_BY_ID = {r.id: r for r in ROWS}
 
@@ -256,6 +315,68 @@ UNREACHABLE: Tuple[Unreachable, ...] = (
              {"parked": True, "status": _not("status", "awaiting_answer")}),
     _unreach("parked_without_record", "_park_unlocked writes parked with the status",
              "queue._park_unlocked", {"parked": False, "status": "awaiting_answer"}),
+    # ---- WT-33 plan groups: dims follow the role
+    _unreach("group_dims_none", "a ticket outside a group projects n/a group dims",
+             "liveness.project",
+             {"group": "none", "gplan": _not("gplan", "n/a")},
+             {"group": "none", "gint": _not("gint", "n/a")},
+             {"group": "none", "gproof": _not("gproof", "n/a")}),
+    _unreach("group_dims_child", "a member reads its parent's plan; integration is the "
+             "parent's", "liveness.project",
+             {"group": "child", "gplan": "n/a"}, {"group": "child", "gint": _not("gint", "n/a")},
+             {"group": "child", "gproof": _not("gproof", "n/a")}),
+    _unreach("group_dims_parent", "a parent always has a plan state, an integration "
+             "record and a proof state", "liveness.project",
+             {"group": "parent", "gplan": "n/a"}, {"group": "parent", "gint": "n/a"},
+             {"group": "parent", "gproof": "n/a"}),
+    _unreach("group_github", "plan groups are local-store only",
+             "queue._validate_group_unlocked",
+             {"group": ("parent", "child"), "backend": "github"}),
+    _unreach("group_child_gated", "a member never has a plan gate of its own; its "
+             "parent plans for it", "queue.plan_gate", {"group": "child", "gated": True}),
+    _unreach("group_parent_claimed", "a parent is never claimed, parked or answered: "
+             "update_status / claim / block refuse it", "queue.update_status, "
+             "queue._group_claim_check_unlocked, queue.block",
+             {"group": "parent", "status": ("in_progress", "awaiting_answer")},
+             {"group": "parent", "claimed": True},
+             {"group": "parent", "answer": _not("answer", "none")},
+             {"group": "parent", "readiness": _not("readiness", "claimable")}),
+    _unreach("group_parent_plan_gate", "a parent's plan gate opens at seal; its group "
+             "plan is settled iff sealed and the plan accepted/failed",
+             "queue.plan_gate, queue.group_plan_settled",
+             {"group": "parent", "gated": False, "plan": _not("plan", "")},
+             {"group": "parent", "gated": False, "gplan": "settled"},
+             {"group": "parent", "gated": True, "gplan": "pending",
+              "plan": ("accepted", "failed")},
+             {"group": "parent", "gplan": "settled", "plan": _not("plan", "accepted", "failed")}),
+    _unreach("group_parent_unplanned_integration", "integration starts only after the "
+             "group plan settles; a plan restart needs a pending plan",
+             "queue._group_due_unlocked, queue.group_detach",
+             {"group": "parent", "gplan": "pending", "gint": _not("gint", "idle")},
+             {"group": "parent", "gplan": "pending", "gproof": _not("gproof", "none")}),
+    _unreach("group_parent_status_integration", "the parent's status follows its "
+             "integration: in_review iff verifying/reviewing, closed iff done",
+             "queue._group_integration_commit, queue._group_close_unlocked",
+             {"group": "parent", "status": "in_review",
+              "gint": _not("gint", "verifying", "reviewing")},
+             {"group": "parent", "gint": ("verifying", "reviewing"),
+              "status": _not("status", "in_review")},
+             {"group": "parent", "gint": "verifying", "gate_pending": _not("gate_pending", "verify")},
+             {"group": "parent", "gint": "reviewing", "gate_pending": _not("gate_pending", "review")},
+             {"group": "parent", "status": "closed", "gint": _not("gint", "done")},
+             {"group": "parent", "gint": "done", "status": _not("status", "closed")}),
+    # D8 (amended): the live child map must equal the proven one only while an
+    # integration is unfinished (verifying / reviewing): a child change there
+    # is refused or invalidates it in the same write. A done parent keeps its
+    # historical proof and is NOT re-evaluated: done x stale stays reachable
+    # (a member reopened and reclosed after the group closed; row "closed").
+    _unreach("group_proof", "an unfinished integration holds a matching proof; a "
+             "forced proof exists only on a closed parent; a done parent has a proof",
+             "queue._group_child_change_unlocked, queue._group_close_unlocked",
+             {"group": "parent", "gint": ("verifying", "reviewing"),
+              "gproof": _not("gproof", "match")},
+             {"group": "parent", "gproof": "forced", "gint": _not("gint", "done")},
+             {"group": "parent", "gint": "done", "gproof": "none"}),
 )
 
 
@@ -363,6 +484,18 @@ def project(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = 
         dep = q.blocker_verdict(item, by_ref)[0]
     else:
         dep = "ok"
+    role = q.group_role(item) or "none"
+    gplan, gint, gproof = "n/a", "n/a", "n/a"
+    if role == "parent":
+        readiness = "claimable"   # a parent is never claimed; readiness is moot
+        if by_ref is None and (item.get("group") or {}).get("members"):
+            by_ref = q._refs_index(q.list_items())
+        gplan = "settled" if q.group_plan_settled(item) else "pending"
+        gint = q.group_integration_state(item, now)
+        gproof = q.group_proof_state(item, by_ref)
+    elif role == "child":
+        parent = q.group_parent_of(item, by_ref)
+        gplan = "settled" if parent is not None and q.group_plan_settled(parent) else "pending"
     pa = item.get("pending_answer")
     if not pa:
         answer = "none"
@@ -387,6 +520,10 @@ def project(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = 
         claimed=bool(item.get("claimed_by")),
         parked=bool(item.get("parked")),
         answer=_check("answer", answer, vocab),
+        group=_check("group", role, vocab),
+        gplan=_check("gplan", gplan, vocab),
+        gint=_check("gint", gint, vocab),
+        gproof=_check("gproof", gproof, vocab),
     )
 
 
@@ -399,20 +536,21 @@ def prove(item: Dict[str, Any], row: Row) -> Dict[str, str]:
     plan = item.get("plan") or {}
     rnd = int(plan.get("round") or 1)
     disc = plan.get("discussion") or {}
+    mv = q.group_mv_suffix(item)
     if row.id == "assess.run.file":
         key = f"assess:{int((item.get('assessment') or {}).get('cycle') or 1)}"
     elif row.id == "review.verify":
         key = f"verify:{int(item.get('verify_cycle') or 0)}"
     elif row.id == "plan.start":
-        key = "plan:r1"
+        key = f"plan:r1{mv}"
     elif row.id == "plan.planning":
-        key = f"plan:r{rnd}"
+        key = f"plan:r{rnd}{mv}"
     elif row.id == "plan.reviewing":
-        key = f"review:r{rnd}"
+        key = f"review:r{rnd}{mv}"
     elif row.id == "plan.discuss.planner":
-        key = f"discuss:r{rnd}:d{int(disc.get('round') or 1)}:planner"
+        key = f"discuss:r{rnd}:d{int(disc.get('round') or 1)}:planner{mv}"
     elif row.id == "plan.discuss.reviewer":
-        key = f"discuss:r{rnd}:v{int(plan.get('version') or rnd)}:reviewer"
+        key = f"discuss:r{rnd}:v{int(plan.get('version') or rnd)}:reviewer{mv}"
     else:  # pragma: no cover - a new stage row needs its key here
         raise UnclassifiedState(f"no stage key rule for row {row.id}")
     return {"kind": "stage_session", "role": role, "key": key}
@@ -805,6 +943,11 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
     elif row.id == "plan.blocked":
         verdict, evidence = "unowned", "plan blocked with no open question"
         action, reason, min_idle = "unblocked_plan", "plan blocked but nobody is asked", ONE_TICK_S
+    elif row.id in ("group.parent.ready", "group.parent.gating_stale"):
+        verdict, evidence = "due", f"integration {row.id.rsplit('.', 1)[-1]}"
+        action, reason = "group_sweep", "group integration due but not run"
+    elif row.id == "group.parent.gating":
+        verdict, evidence = "lease", "integration gates running"
     elif row.id == "dep.stuck":
         verdict, evidence = "unescalated", f"blocker {q.blocker_verdict(item, by_ref)[1]} stuck"
         action, reason, min_idle = "escalate_blockers", "stuck blocker not escalated", None
@@ -947,6 +1090,9 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
                    else "BACKSTOP_ANSWER_HANDOFF", f"{ref} {a['row']}: {reason}",
                    queue=a["queue"])
         return "done" if ok else "race"
+    if action == "group_sweep":
+        out = q.group_sweep(only_ref=ref)
+        return "done" if out else "not due"
     if action == "escalate_blockers":
         q.escalate_stuck_blockers()
         now_it = q.get(ref) or {}

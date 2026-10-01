@@ -218,23 +218,25 @@ def desired(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 and not it.get("needs_input") and not _github_backed(it)):
             pst = str(plan.get("status") or "")
             rnd = int(plan.get("round") or 1)
+            mv = q.group_mv_suffix(it)   # WT-33: a membership change is a new key
             if pst == "":
                 if status == "open" or it.get("claimed_by"):
-                    entry = ("planner", "plan:r1")
+                    entry = ("planner", f"plan:r1{mv}")
             elif pst == "planning":
-                entry = ("planner", f"plan:r{rnd}")
+                entry = ("planner", f"plan:r{rnd}{mv}")
             elif pst == "reviewing" and (plan.get("discussion") or {}).get("status") != "active":
-                entry = ("plan_reviewer", f"review:r{rnd}")
+                entry = ("plan_reviewer", f"review:r{rnd}{mv}")
             else:
                 # WT-29: each planner<->reviewer discussion turn is its own
                 # supervised session (own key, own attempt budget).
                 disc = plan.get("discussion") or {}
                 if disc.get("status") == "active":
                     if pst == "discussing" and disc.get("awaiting") == "planner":
-                        entry = ("planner", f"discuss:r{rnd}:d{int(disc.get('round') or 1)}:planner")
+                        entry = ("planner",
+                                 f"discuss:r{rnd}:d{int(disc.get('round') or 1)}:planner{mv}")
                     elif pst == "reviewing" and disc.get("awaiting") == "reviewer":
                         entry = ("plan_reviewer",
-                                 f"discuss:r{rnd}:v{int(plan.get('version') or rnd)}:reviewer")
+                                 f"discuss:r{rnd}:v{int(plan.get('version') or rnd)}:reviewer{mv}")
         if entry:
             out.append({"ref": ref, "role": entry[0], "key": entry[1], "project": project})
     return out
@@ -423,6 +425,8 @@ def _goal(item: Dict[str, Any], role: str, *, token: str, respawn: bool,
         goal = cli._plan_goal(item, feedback=feedback)
     elif role == "plan_reviewer":
         goal = cli._plan_review_goal(item)
+    elif role == "verifier" and q.group_role(item) == "parent":
+        goal = cli._integration_verifier_goal(item)
     elif role == "verifier":
         goal = cli._verifier_goal(item)
     else:
@@ -515,7 +519,10 @@ def _escalate(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any]) -> 
     exits = {
         "planner": f"`wt answer {ref} \"retry\"` to retry, or `wt plan decide {ref} --accept` / `--retry`",
         "plan_reviewer": f"`wt answer {ref} \"retry\"` to retry, or `wt plan decide {ref} --accept` / `--retry`",
-        "verifier": f"`wt answer {ref} \"retry\"`, `wt verdict {ref} --pass|--fail`, or `wt accept {ref} --force`",
+        "verifier": f"`wt answer {ref} \"retry\"`, `wt verdict {ref} --pass|--fail"
+                    + (f" --verify-cycle {int(item.get('verify_cycle') or 0)}"
+                       if q.group_role(item) == "parent" else "")
+                    + f"`, or `wt accept {ref} --force`",
         "assessor": f"`wt answer {ref} \"retry\"` or `wt assess run {ref}`",
     }[role]
     question = (f"The {role.replace('_', ' ')} {'discussion turn' if key.startswith('discuss:') else 'stage'} ({key}) died twice: {reasons}."
@@ -698,7 +705,8 @@ def _supervise(d: Dict[str, Any], rows: List[Dict[str, Any]], budget: _Budget) -
         item = q.get(ref) or item
     if ss.get("key") != key:
         legacy = _legacy_meta(item, role)
-        if (not ss and legacy.get("worker_id")
+        retired = q.stage_retired_ids(item)   # WT-33 D10: never adopt a retired session
+        if (not ss and legacy.get("worker_id") and legacy["worker_id"] not in retired
                 and (not legacy.get("stage_key") or legacy.get("stage_key") == key)):
             adopted = True
             ss = {"key": key, "role": role, "attempt": 1, "worker_id": legacy["worker_id"],
@@ -715,7 +723,7 @@ def _supervise(d: Dict[str, Any], rows: List[Dict[str, Any]], budget: _Budget) -
                 # message, no budget); otherwise a fresh turn spawns this tick.
                 prior = _legacy_meta(item, role)
                 pwid = str(prior.get("worker_id") or "")
-                if pwid and session_alive(pwid):
+                if pwid and pwid not in retired and session_alive(pwid):
                     prec = _record_for(pwid, workers.list_workers(prune=False)) or {}
                     ss.update(worker_id=pwid, pid=prec.get("pid"),
                               pid_started=prec.get("pid_started", ""),
@@ -796,15 +804,67 @@ def _filing_maintenance(budget: _Budget, only_ref: str) -> None:
             pass
 
 
+def _retire_pass(items: List[Dict[str, Any]], only_ref: str = "") -> List[Tuple[str, str]]:
+    """WT-33 D10: stop every stage session a state change retired
+    (``item["stage_retired"]``). A pid is killed only when its start token
+    still matches (a recycled pid is never signalled); the outcome is recorded
+    and the entry dropped."""
+    acted: List[Tuple[str, str]] = []
+    rows: Optional[List[Dict[str, Any]]] = None
+    for it in items:
+        ref = str(it.get("ref") or "")
+        if only_ref and ref != only_ref:
+            continue
+        for e in list(it.get("stage_retired") or []):
+            if not isinstance(e, dict) or not e.get("worker_id"):
+                continue
+            wid = str(e["worker_id"])
+            pid, token = int(e.get("pid") or 0), str(e.get("pid_started") or "")
+            if not pid:
+                if rows is None:
+                    try:
+                        rows = workers.list_workers(prune=False)
+                    except Exception:  # noqa: BLE001
+                        rows = []
+                rec = _record_for(wid, rows) or {}
+                pid, token = int(rec.get("pid") or 0), str(rec.get("pid_started") or "")
+            if not pid or not workers._pid_alive(pid):
+                outcome = "already_gone"
+            elif not token or workers._pid_start_token(pid) != token:
+                outcome = "token_mismatch"
+            else:
+                _kill(pid)
+                outcome = "killed"
+            try:
+                q.stage_retired_done(ref, wid, outcome)
+            except Exception:  # noqa: BLE001 - retried next tick
+                continue
+            _log("STAGE_RETIRED", f"{ref} {e.get('role') or '-'} {wid} (pid {pid or '-'}) "
+                 f"{outcome}: {e.get('reason') or '-'}", queue=str(it.get("project") or ""))
+            acted.append((ref, f"retired:{outcome}"))
+    return acted
+
+
 def reconcile_stages(only_ref: str = "") -> List[Tuple[str, str]]:
     """One supervision pass (daemon tick, ``wt stages tick``). Returns
-    ``(ref, action)`` pairs: spawned / respawn-related / blocked / resumed / wait."""
+    ``(ref, action)`` pairs: spawned / respawn-related / blocked / resumed / wait.
+    Plan-group integrations (WT-33) run first, then retired stage sessions
+    are stopped, then the stage sessions the states call for are supervised."""
     budget = _Budget(spawns_per_tick())
     try:
         _filing_maintenance(budget, only_ref)
     except Exception:  # noqa: BLE001
         pass
+    try:
+        for ref, outcome in q.group_sweep(only_ref):
+            budget.acted.append((ref, f"integration:{outcome}"))
+    except Exception as exc:  # noqa: BLE001 - one group never stops the pass
+        _log("INTEGRATE", f"group sweep error: {exc}")
     items = q.list_items() or []
+    try:
+        budget.acted.extend(_retire_pass(items, only_ref))
+    except Exception as exc:  # noqa: BLE001
+        _log("STAGE_RETIRED", f"retire pass error: {exc}")
     try:
         from . import cli
         for project in sorted({str(i.get("project") or "") for i in items

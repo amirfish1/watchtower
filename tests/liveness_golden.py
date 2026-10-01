@@ -69,6 +69,15 @@ BY_REF = {
     "B-OK": {"ref": "B-OK", "status": "closed"},
     "B-WAIT": {"ref": "B-WAIT", "status": "open"},
     "B-STUCK": {"ref": "B-STUCK", "status": "closed", "product_nack": True},
+    # WT-33 plan groups: a member's gplan reads its parent; a parent's gproof
+    # compares its proven child map with the live one (C-A closed at "abc").
+    "P-PEND": {"ref": "P-PEND", "status": "open", "gates": ["plan"],
+               "group": {"role": "parent", "sealed": False, "members": ["C-A"]}},
+    "P-SET": {"ref": "P-SET", "status": "open", "gates": ["plan"],
+              "group": {"role": "parent", "sealed": True, "members": ["C-A"]},
+              "plan": {"status": "accepted"}},
+    "C-A": {"ref": "C-A", "status": "closed", "resolution": {"commit": "abc"},
+            "group": {"role": "child", "parent": "P-SET", "kind": "member"}},
 }
 _DEP = {"ok": ["B-OK"], "waiting": ["B-WAIT"], "stuck": ["B-STUCK"]}
 
@@ -105,6 +114,24 @@ def synth(s: Any, i: int, now: float) -> Dict[str, Any]:
         it["claimed_by"] = "w1"
     if s.parked:
         it["parked"] = {"worker_id": "w1", "session_id": SID}
+    if s.group == "child":
+        it["group"] = {"role": "child", "kind": "member",
+                       "parent": "P-SET" if s.gplan == "settled" else "P-PEND"}
+    elif s.group == "parent":
+        it["gates"] = ["plan", "verify"]   # the plan gate opens at seal
+        integ: Dict[str, Any] = {"state": "gating" if s.gint == "gating_stale" else s.gint,
+                                 "cycle": 1, "allowance": 2, "proven": None}
+        if s.gint in ("gating", "gating_stale"):
+            at = now - (86400 if s.gint == "gating_stale" else 0)
+            integ["lease"] = {"token": "t", "at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                                time.gmtime(at))}
+        if s.gproof == "forced":
+            integ["proof"] = "none"
+        elif s.gproof in ("match", "stale"):
+            integ["proven"] = {"sha": "abc", "commits": {"C-A": "abc" if s.gproof == "match"
+                                                         else "old"}}
+        it["group"] = {"role": "parent", "sealed": bool(s.gated), "members": ["C-A"],
+                       "membership_version": 3, "integration": integ}
     if s.answer != "none":
         stored = "affinity" if s.answer == "affinity_expired" else s.answer
         until = now + (-600 if s.answer == "affinity_expired" else 600)
