@@ -1586,7 +1586,11 @@ def deliver(
 
     Every success is recorded as a delivery receipt (WT-77) so "delivered"
     can later be verified against the target transcript — the result
-    carries ``receipt_id``."""
+    carries ``receipt_id``. A text carrying a WT-31 nonce on its last line
+    gets its receipt recorded *before* the send (the pre-send offset is what
+    makes only a later nonce count); a failed send drops it."""
+    sid = str(resolved.get("session_id") or "")
+    pre = _pre_send_receipt(resolved, text) if sid else None
     if live_only:
         result = _deliver_live_only(resolved, text)
     else:
@@ -1594,7 +1598,14 @@ def deliver(
             resolved, text, mode, force_queue=force_queue, prefer_uds=prefer_uds,
             notify=notify, delegate_timeout_s=delegate_timeout_s,
         )
-    sid = str(resolved.get("session_id") or "")
+    if pre is not None:
+        from . import receipts
+        if result.get("ok"):
+            receipts.set_transport(pre["id"], str(result.get("transport") or "?"))
+            result["receipt_id"] = pre["id"]
+        else:
+            receipts.discard(pre["id"])
+        return result
     if result.get("ok") and sid:
         try:
             from . import receipts
@@ -1615,6 +1626,22 @@ def deliver(
                              f"is unavailable for receipt verification: {exc}",
                 }
     return result
+
+
+def _pre_send_receipt(resolved: Dict[str, Any], text: str) -> Optional[Dict[str, Any]]:
+    """The WT-31 nonce receipt for ``text``, recorded before the send; None
+    for a text without a nonce (the WT-77 after-send receipt applies)."""
+    from . import receipts
+    nonce = receipts.nonce_of(text)
+    if not nonce:
+        return None
+    try:
+        return receipts.record(
+            str(resolved.get("session_id") or ""), text, "sending",
+            engine=str(resolved.get("engine") or "claude"), nonce=nonce,
+            delivery_id=nonce[len("\u27e8wt:"):-1])
+    except Exception:  # noqa: BLE001 - no receipt: the ledger reads it lost
+        return None
 
 
 def _deliver_uds(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
