@@ -36,12 +36,13 @@ assessors, resumes half-filed ones, and retries a dead assessor once.
 ## Commands
 
 - `wt assess show REF [--json]`: state, points, follow-ups.
+- `wt assess approve REF...`: approve follow-ups so workers can claim them (sets `readiness=ready`).
 - `wt assess run REF [--force] [--dry-run]`: (re)start the assessor; `--dry-run` prints repo, assessor, prompt and reserves nothing.
 - `wt assess submit REF --token T (--json OBJ | --file PATH|-)`: what the assessor runs. `--force` (human) reserves a fresh attempt.
 - `wt assess resume REF`: finish filing; no LLM needed.
 - `wt assess new -q QUEUE --title T [--text X] (--commit SHA | --no-code) [--json]`: for fixes that had no ticket (e.g. an auditor self-heal). Files a bug and closes it through the normal close path, so gates run and the assessment fires on real close.
 
-Submit payload: all six keys required, each `{"verdict": "adequate"|"gap", "note": "...", "followups": [{"title","note","queue"}], "existing": ["REF"]}`. A `gap` needs a follow-up or an existing open ref; max 3 follow-ups per point, 8 total. Follow-ups are filed `source=post-fix-assessment`, `blocked_by=[REF]`, deduplicated by title against active tickets (a hit gets a marker comment instead of a new ticket).
+Submit payload: all six keys required, each `{"verdict": "adequate"|"gap", "note": "...", "followups": [{"title","note","queue"}], "existing": ["REF"]}`. A `gap` needs a follow-up or an existing open ref; max 3 follow-ups per point, 8 total. Follow-ups are filed `source=post-fix-assessment`, `blocked_by=[REF]`, filed with `readiness=needs-rationale` (unclaimable: workers skip them, so follow-ups never feed a drain-until-empty loop until a human runs `wt assess approve REF`; `wt edit REF --readiness ready` is equivalent), deduplicated by title against active tickets (a hit gets a marker comment instead of a new ticket).
 
 ## Exit codes
 

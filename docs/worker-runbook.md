@@ -79,6 +79,10 @@ doesn't pay a full file rewrite every turn:
 - **Skip rule:** on a merely-drained queue, if `pending.md` is empty and
   `{queue}.md` was modified within the floor, do nothing — end your turn.
 
+A stop with `reason: context_budget` means a recycle limit tripped (Claude transcript
+bytes, Codex cumulative input tokens, or tickets closed/blocked this run); see
+`docs/worker-lifecycle.md` (Context recycle) for the knobs.
+
 The stop path is where the audit matters most: a recycled worker is torn
 down and its successor starts cold, so skipping the learnings hand-off on a
 stop throws away the whole session's wisdom. Either way, the audit is not
@@ -113,6 +117,7 @@ The audit (Tier 2):
      and resumes the conversation with full warm context. On a *stop/recycle*
      you have been released — end your turn after the audit; deficit staffing
      spawns a fresh worker to take over, so do not expect to be re-engaged.
-   - **Codex (`codex exec`):** complete this queue's active drain goal (or clear
-     it if the harness has no completion state), then exit immediately. There
+   - **Codex (`codex exec`):** end your turn and exit immediately after the idle audit.
+     Never set, complete, or clear a native Codex thread goal (a goal makes
+     Codex auto-continue after the process dies). There
      is no live stdin channel and no wake message to wait for.

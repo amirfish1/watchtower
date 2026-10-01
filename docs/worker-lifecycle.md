@@ -129,7 +129,7 @@ reconciler spawns Codex worker
   └─ one-shot worker loop:
        wt claim → ticket → do work → wt close --summary "..."
        wt claim → ticket → ...
-       wt claim → empty  → idle audit → complete drain goal → exit immediately
+       wt claim → empty  → idle audit → exit immediately
   └─ reconciler spawns a new process when later work needs staffing
 ```
 
@@ -209,6 +209,19 @@ in-progress or blocked work, the strict queue read fails, its PID identity is
 not attributable, or required activity evidence is unavailable. WatchTower
 never sends `SIGTERM` or `SIGKILL` as part of normal queue release.
 
+### Context recycle (claim-time)
+
+`wt claim` answers `{"stop": true, "reason": "context_budget"}` to a
+**registered** drain worker (never a human) that holds no active claim and has
+hit any limit below; the STOP log line names the limit and value. Each knob is
+read per call and `0` disables it.
+
+| Env var | Default | Applies to | Measures |
+| --- | --- | --- | --- |
+| `WATCHTOWER_CONTEXT_RECYCLE_BYTES` | `2500000` | claude | session transcript bytes (`claude_bytes`) |
+| `WATCHTOWER_CODEX_RECYCLE_INPUT_TOKENS` | `30000000` | codex | cumulative `input_tokens` from the rollout's last `token_count` event, cached tokens included (`codex_input_tokens`) |
+| `WATCHTOWER_RECYCLE_TICKETS` | `10` | every engine | tickets closed or blocked this run, counted as `tickets_done` on the worker record (`tickets`) |
+
 ### Engine-specific idle behavior
 
 When `wt claim` returns empty, neither engine polls or sleep-loops. A Claude
@@ -216,8 +229,9 @@ worker ends its turn and remains blocked on its live FIFO, so a later ticket can
 wake the same conversation. Its prompt cache is typically warm for about five
 minutes, but cache warmth does not control staffing; the reconciler may release
 the conversation after 30 minutes of verified inactivity. A Codex exec worker
-has no FIFO, so after its idle audit it completes the active queue-drain goal and
-exits immediately. A wind-down STOP makes either engine exit between tickets.
+has no FIFO, so after its idle audit it exits immediately. No native Codex
+thread goal is used, and spawns pass `-c model_auto_compact_token_limit=<worker_auto_compact_k*1000>`
+(CCC spawn-defaults.json, default 250000). A wind-down STOP makes either engine exit between tickets.
 
 ---
 

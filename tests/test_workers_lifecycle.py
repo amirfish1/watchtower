@@ -2522,6 +2522,17 @@ def test_build_claude_is_stream_json_no_goal(wt):
     assert not any("Drain the Q" in a for a in argv)  # goal not in argv
 
 
+def test_build_codex_passes_auto_compact_limit(wt, tmp_path, monkeypatch):
+    f = tmp_path / "sd.json"
+    f.write_text('{"worker_auto_compact_k": 200}')
+    monkeypatch.setattr(wt.config, "CCC_SPAWN_DEFAULTS_FILE", f)
+    argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")
+    assert argv[argv.index("-c") + 1] == "model_auto_compact_token_limit=200000"
+    f.write_text("{}")
+    argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")
+    assert "model_auto_compact_token_limit=250000" in argv
+
+
 def test_build_codex_has_goal_in_argv(wt):
     argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")
     assert argv[:2] == ["codex", "exec"]
@@ -2532,7 +2543,9 @@ def test_build_codex_has_goal_in_argv(wt):
     assert "full warm context" not in goal
     assert "whenever you wake" not in goal
     assert "released from queue staffing" not in goal
-    assert "complete this queue's drain goal" in goal.lower()
+    assert "native codex thread goal" in goal.lower()
+    assert "complete this queue's drain goal" not in goal.lower()
+    assert "native goal control" not in goal.lower()
     assert "after the idle audit" in goal.lower()
 
 

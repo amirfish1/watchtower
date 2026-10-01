@@ -2289,7 +2289,7 @@ def claim_next(
             session_id, str(session_uuid or "")
         )
     except Exception:
-        over = 0
+        over = ()
     if over:
         # A worker only reaches claim_next() again after closing or blocking
         # its previous ticket -- by protocol it should never still hold an
@@ -2312,8 +2312,8 @@ def claim_next(
             _workers._mark_worker_released(session_id)
             _log(
                 "STOP",
-                f"{session_id} — context budget exceeded "
-                f"({over} transcript bytes); recycling worker",
+                f"{session_id} — recycle limit {over[0]} reached "
+                f"({over[1]}); recycling worker",
                 queue=project or "",
             )
             return {"stop": True, "reason": "context_budget"}
@@ -3929,6 +3929,17 @@ def _reopen_with_feedback(ident: Any, reason: str, results: List[Dict[str, Any]]
     return item
 
 
+def _note_worker_ticket_done(session_id: Any) -> None:
+    """Bump the registered worker's tickets_done (WATCHTOWER_RECYCLE_TICKETS)."""
+    if not session_id:
+        return
+    try:
+        from . import workers as _workers
+        _workers.note_ticket_done(str(session_id))
+    except Exception:  # noqa: BLE001 - recycle accounting is best-effort
+        pass
+
+
 def close(
     ident: Any, session_id: str = "", resolution: Any = None, force: bool = False,
     declined: bool = False, session_uuid: str = "",
@@ -4012,6 +4023,7 @@ def close(
         _notify_review(item, hold_review, session_id)
         return item
     if item and item.get("status") == "closed":
+        _note_worker_ticket_done(session_id)
         try:
             from . import messages
             messages.ledger_clear_ref(str(item.get("ref") or ident))
@@ -5320,6 +5332,21 @@ ASSESSMENT_QUESTIONS = {
 _ASSESS_TYPE = {"logging": "bug", "ui_message": "bug", "automation": "feature",
                 "monitoring": "feature", "auditors": "feature", "other": "feature"}
 ASSESSMENT_SOURCE = "post-fix-assessment"
+# Follow-ups are filed unclaimable until a human approves them.
+ASSESSMENT_FOLLOWUP_READINESS = "needs-rationale"
+
+
+def assessment_approve(ident: Any, by: str = "human") -> Optional[Dict[str, Any]]:
+    """Approve one post-fix-assessment follow-up: make it claimable (readiness
+    ready). Raises ValueError for a ticket the assessment did not file."""
+    it = get(ident)
+    if not it:
+        return None
+    if it.get("source") != ASSESSMENT_SOURCE and not it.get("assessment_origin"):
+        raise ValueError(f"{it.get('ref')} is not a post-fix-assessment follow-up")
+    if it.get("readiness", "") == "ready":
+        return it
+    return update(ident, readiness="ready")
 _ASSESS_MAX_PER_POINT = 3
 _ASSESS_MAX_TOTAL = 8
 # Test hook: called as hook(stage, idx) at "before_lock" / "after_commit".
@@ -5687,7 +5714,11 @@ def _assessment_apply_op(ident: Any, token: str, idx: int) -> Dict[str, Any]:
                         source=ASSESSMENT_SOURCE, proj=op["queue"], annotation_id="", url="",
                         title=op["title"], selector="", screenshot_path="",
                         repo_path=str(bug.get("repo_path") or "") if op["queue"] == _norm_project(bug.get("project")) else "",
-                        lane="normal", item_type=_ASSESS_TYPE[op["point"]], readiness="",
+                        lane="normal", item_type=_ASSESS_TYPE[op["point"]],
+                        # Icebox until a human approves (`wt assess approve REF`):
+                        # workers skip UNCLAIMABLE_READINESS, so follow-ups cannot
+                        # fan out and keep a drain-until-empty worker alive.
+                        readiness=ASSESSMENT_FOLLOWUP_READINESS,
                         priority="", value="", confidence="", model_floor="", planner_model="",
                         verifier_model="", submitter="", submitter_explicit=False, pre_ack=False,
                         blocked_by=[ref], gates=None, accept_line="", assessment_origin=op["key"])
@@ -7122,6 +7153,8 @@ def block(
             ident, session_id=session_id, question=question, progress=progress,
         )
         if item:
+            if origin == "worker":
+                _note_worker_ticket_done(session_id)
             _notify_ticket_event(
                 item, "needs_input", detail=question, actor=session_id,
             )
@@ -7194,6 +7227,8 @@ def block(
                     "awaits_decision" if kind == "rationale" else "needs_input",
                     detail=question, actor=session_id,
                 )
+                if origin == "worker":
+                    _note_worker_ticket_done(session_id)
                 return it
     return None
 

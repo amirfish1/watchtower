@@ -671,6 +671,23 @@ def _ccc_worker_effort_default() -> str:
         return ""
 
 
+def worker_auto_compact_tokens() -> int:
+    """Auto-compact threshold in tokens for workers, from CCC's
+    spawn-defaults.json ``worker_auto_compact_k`` (thousands; the same
+    setting CCC passes Claude as CLAUDE_CODE_AUTO_COMPACT_WINDOW). Default
+    250000. Codex ignores that env var, so build_drain_command passes this
+    as ``-c model_auto_compact_token_limit=<N>``. 0 means "do not set"."""
+    k = 250
+    try:
+        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
+            data = json.load(f)
+        if "worker_auto_compact_k" in data:
+            k = float(data["worker_auto_compact_k"])
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return max(0, int(k * 1000))
+
+
 def engine(queue: str) -> str:
     """Return the worker engine for a queue (used by both DRAIN and
     RUN_ONCE spawns): an explicit `wt set --engine` override wins; else
