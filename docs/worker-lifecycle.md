@@ -777,7 +777,11 @@ The claim-time guard (`queue._verify_worker_live`, run by `claim_next` /
 `claim_by_ref`) asks the same resolver about the `claim_proc` the claim would
 write, and rejects (`... not currently alive ... claim rejected`) only on
 `dead`. A dead worker record whose session is alive in the Claude registry (a
-resumed session) is `alive` and claims normally; a claimer with no record
+resumed session) is `alive` and claims normally. The registry counts as alive
+only when the row's pid is live **and** its recorded start token (`procStart`,
+the UTC `lstart` Claude Code writes; or a WT-style `pid_started`) equals the
+pid's current start (`workers.claude_session_row_liveness`): a mismatch is a
+reused pid and never vetoes recovery; a live pid with no token is `unproven`. a claimer with no record
 (never spawned, or pruned) is `ambient`, and an unprovable death (registry
 unreadable, codex rollout missing, a process still naming the session) is
 `unproven` — both go through.
@@ -915,11 +919,19 @@ the offset to 0.
 | `queued` | the outbox holds it (`msg_id`) |
 | `deferred` | `fifo_busy="defer"` and the turn is open; there is no row |
 | `in_flight` / `duplicate` | the messages ledger already holds the key; there is no row |
-| `failed` | no transport took it |
+| `failed` | no transport took it; the row keeps `failed_at` and is settled through the purpose's handler (see the sweep) |
 
-A headless resume is refused for an engine with no receipt source unless the
-caller passes `unverified_ok`. Only the legacy `_deliver_to_blocked_session` does,
-to keep kimi resume working.
+A headless resume is refused for an engine with no receipt source (anything
+outside `RECEIPT_ENGINES` = claude, codex); there is no override. Callers hand
+such engines off **before** any resume, so no verified sender lacks a receipt
+source: `_deliver_to_blocked_session` (`wt answer`, `wt reject`, `wt ack`,
+`wt plan decide`, `wt reopen --resume`, the WT-30 resume-first backstop) records
+`resume = skipped`, writes the answer onto the ticket text (a rejection's
+`gate_feedback` already survives) and force-releases the claim for a fresh
+worker, with nothing sent or spawned; `answers._resumable` is false for
+kimi/devin, so a parked answer is handed off (E5) instead of resumed, and the
+backstop reopens a rejected kimi/devin claim instead of resuming it. Claude and
+codex keep steer -> outbox -> headless resume.
 
 **Ledger.** There is one live row per `dedupe_key`: a new send supersedes the
 older `sending`/`pending` rows. Every retry has a new nonce, so an old send's
@@ -936,18 +948,26 @@ are kept.
   - the row was unverified;
   - a queued row was still waiting after `expire + 2 x window`;
   - a `sending` row is older than 2 x the window.
+- **`failed`** (settled): a send no transport took. A caller that owns the
+  outcome settles it synchronously with `liveness.settle_failed(delivery_id)`
+  (the answer router: E10; `_deliver_to_blocked_session`: resume evidence
+  `failed`, then release; the plan reminder fallback: block). Otherwise the
+  sweep settles it once it is `FAILED_SETTLE_GRACE_S` (30 s) old (nudge,
+  release, review, plan discussion messages). The row is claimed under the
+  ledger lock either way, so its handler runs exactly once. Failed rows written
+  before this rule (no `failed_at`) are left alone.
 
 It then runs the purpose's handler and logs
 `DELIVERY <ref|worker> <purpose> <key> <id> <state> (<reason>) -> <result>`.
 
-| Purpose | Key | Confirmed | Lost |
+| Purpose | Key | Confirmed | Lost / failed |
 |---|---|---|---|
 | `answer` | `answer:<ref>:<sid>:<gen>` | E9 `_on_answer_confirmed` (`delivering`/`queued` -> `delivered`) | E10 `_fallback_reopen` (hand off) |
 | `stage_answer` | `stage_answer:<ref>:<gen>:<key>` | E13 `stages._confirm_stage_answer` | stays `handed_off` |
 | `nudge` | `nudge:<worker_id>` | clears `undeliverable_since` | resend once, then set `undeliverable_since` on the worker record |
 | `release` | `release:<worker_id>` | - | resend once, then `RELEASE_UNDELIVERED` |
 | `plan` | `plan:<ref>:<role>:<kind>` | a `reminder` bumps `nudges` (escalates past the max) | a `reminder` blocks the plan for a human; any other message to the live stage session marks it lost (killed, death recorded, respawned within the attempt budget) |
-| `review` | `review:<ref>:<n>` | - | renotify once, then `wt blocked` (system block) |
+| `review` | `review:<ref>:<n>` | - | renotify once (the second send's own row settles it), then `wt blocked` (system block); blocks at once if the target is gone. `_notify_review` returns the `deliver` result and logs `REVIEW_NOTIFY` on a failed send |
 | `resume` | `resume:<ref>:<sid>` | - | `set_resume_state(failed)` |
 
 E9, E10 and E13 are compare-and-swap moves on `gen` and the state. A confirm that

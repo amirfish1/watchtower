@@ -3656,17 +3656,21 @@ def _dependents_of(ref: str) -> List[str]:
         return []
 
 
-def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any, attempt: int = 1) -> None:
+def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any,
+                   attempt: int = 1) -> Optional[Dict[str, Any]]:
     """Ask the review stage's agent for a verdict, verified (WT-31 D4,
-    ``review:<ref>:<cycle>``): a request that never lands is renotified once,
-    then the ticket is blocked for a human. An unresolvable target (no
-    session/agent by that name) gets nothing, as before."""
+    ``review:<ref>:<cycle>``): a request that never lands -- or whose send
+    failed outright -- is renotified once, then the ticket is blocked for a
+    human (``liveness._h_review``, run by the delivery sweep). An
+    unresolvable target (no session/agent by that name) gets nothing, as
+    before. Returns the ``liveness.deliver`` result, or None when nothing
+    was sent."""
     if reviewer == "verify":
-        return  # the verifier is spawned by the CLI; nobody to notify yet
+        return None  # the verifier is spawned by the CLI; nobody to notify yet
     target = _reviewer_target(item, reviewer)
     ref = str(item.get("ref") or "?")
     if not target:
-        return
+        return None
     res = item.get("resolution") or {}
     deps = _dependents_of(ref)
     text = (f"[watchtower] {ref} awaits your review -- "
@@ -3676,20 +3680,29 @@ def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any, attempt: int
     try:
         from . import liveness, messages
         if target in _actor_identities(actor):
-            return
+            return None
         dest = messages.ccc_forward_target(target) or target
         try:
             messages.resolve_target(dest)
         except ValueError:
-            return  # nobody by that name: nothing can deliver it
-        liveness.deliver(dest, text, purpose="review",
-                         dedupe_key=f"review:{ref}:{len(item.get('gate_results') or [])}",
-                         ref=ref, queue=str(item.get("project") or ""),
-                         transports=("message",), message={"fn": "send", "notify": True},
-                         meta={"gate": str(item.get("gate_pending") or reviewer)},
-                         attempt=attempt)
-    except Exception:
-        pass
+            return None  # nobody by that name: nothing can deliver it
+        res = liveness.deliver(dest, text, purpose="review",
+                               dedupe_key=f"review:{ref}:{len(item.get('gate_results') or [])}",
+                               ref=ref, queue=str(item.get("project") or ""),
+                               transports=("message",), message={"fn": "send", "notify": True},
+                               meta={"gate": str(item.get("gate_pending") or reviewer)},
+                               attempt=attempt)
+    except Exception as exc:  # noqa: BLE001 - a notification never breaks the close
+        _log("REVIEW_NOTIFY", f"{ref} -> {target}: error {type(exc).__name__}: {exc}",
+             queue=str(item.get("project") or ""))
+        return None
+    if not res.get("ok") and res.get("state") == "failed":
+        # Honoured, not dropped: the failed ledger row is settled by the
+        # review handler (renotify once, then block for a human).
+        _log("REVIEW_NOTIFY", f"{ref} -> {target}: send failed (attempt {attempt}): "
+             f"{res.get('error')}; the delivery sweep renotifies once, then blocks",
+             queue=str(item.get("project") or ""))
+    return res
 
 
 def accept(ident: Any, by: str = "human", force: bool = False,

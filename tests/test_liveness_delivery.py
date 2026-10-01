@@ -173,10 +173,12 @@ def test_headless_refused_for_engine_without_receipts(dw, monkeypatch):
                                session_id="session_abc", engine="kimi",
                                transports=("headless",))
     assert not sent["ok"] and "no receipt source" in sent["error"] and calls == []
-    sent = dw.liveness.deliver("session_abc", "hi", purpose="resume", dedupe_key="k",
-                               session_id="session_abc", engine="kimi",
-                               transports=("headless",), unverified_ok=True)
-    assert sent["ok"] and sent["state"] == "unverified" and len(calls) == 1
+    # D2.8: there is no escape hatch any more (``unverified_ok`` is gone)
+    with pytest.raises(TypeError):
+        dw.liveness.deliver("session_abc", "hi", purpose="resume", dedupe_key="k",
+                            session_id="session_abc", engine="kimi",
+                            transports=("headless",), unverified_ok=True)
+    assert calls == []
 
 
 # ------------------------------------------------------------------ ledger
@@ -328,7 +330,8 @@ def test_review_renotifies_once_then_blocks(dw, monkeypatch):
     calls = []
     monkeypatch.setattr(dw.q, "get", lambda ref, *a, **k: dict(item))
     monkeypatch.setattr(dw.q, "_notify_review",
-                        lambda it, gate, actor, attempt=1: calls.append(("notify", attempt)))
+                        lambda it, gate, actor, attempt=1: calls.append(("notify", attempt))
+                        or {"ok": True, "state": "pending"})
     monkeypatch.setattr(dw.q, "block", lambda ref, *a, **k: calls.append(("block", k["origin"])))
     meta = {"gate": "review:alice"}
     assert _lost(dw, "review", "review:LQ-9:0", ref="LQ-9", meta=meta)[0]["result"] \
@@ -586,3 +589,283 @@ def test_transport_allowlist_catches_mutations():
     assert "zz_mut._wake: line 5" in got or "zz_mut._wake: line 6" in got
     assert "zz_mut._deliver is verified but calls a raw transport" in got
     assert "zz_mut.gone is listed but sends nothing" in got
+
+
+# ------------------------------------- outright failed sends (verifier F1)
+# A send every transport refused leaves a ``failed`` row with ``failed_at``.
+# It is settled through the purpose's handler exactly once: synchronously by
+# a caller that owns the outcome (``settle_failed``), else by the sweep once
+# FAILED_SETTLE_GRACE_S passed. Each test injects the real failure path.
+GRACE = 31.0
+
+
+def _fail_messages(monkeypatch, error="no live transport"):
+    import watchtower.messages as messages
+    sends = []
+
+    def fail(target, body, **kw):
+        sends.append(body)
+        return {"ok": False, "error": error}
+    monkeypatch.setattr(messages, "send", fail)
+    monkeypatch.setattr(messages, "deliver_message", fail)
+    return sends
+
+
+def _sweep(dw, dt):
+    return [(r["purpose"], r["state"], r["result"])
+            for r in dw.liveness.sweep_deliveries(now=time.time() + dt)]
+
+
+@pytest.mark.parametrize("purpose", ["nudge", "release", "plan", "review", "answer",
+                                     "stage_answer", "resume"])
+def test_every_purpose_settles_a_failed_send_exactly_once(dw, monkeypatch, purpose):
+    _fail_messages(monkeypatch)
+    lv = dw.liveness
+    seen = []
+    monkeypatch.setitem(lv.HANDLERS, purpose,
+                        lambda row, confirmed: seen.append((row["state"], confirmed)) or "handled")
+    sent = lv.deliver("someone", "hi", purpose=purpose, dedupe_key=f"{purpose}:k",
+                      transports=("message",))
+    assert sent["state"] == "failed" and not sent["ok"]
+    row = lv.deliveries(purpose=purpose)[-1]
+    assert row["state"] == "failed" and row["failed_at"] and "no live transport" in row["reason"]
+    assert _sweep(dw, 1) == []                       # grace: the caller may settle it
+    assert _sweep(dw, GRACE) == [(purpose, "failed", "handled")]
+    assert seen == [("failed", False)]
+    assert _sweep(dw, 7200) == [] and lv.settle_failed(sent["delivery_id"]) is None
+    assert seen == [("failed", False)]
+
+
+def test_settle_failed_runs_the_handler_once_and_the_sweep_skips_it(dw, monkeypatch):
+    _fail_messages(monkeypatch)
+    lv = dw.liveness
+    seen = []
+    monkeypatch.setitem(lv.HANDLERS, "resume", lambda row, c: seen.append(row["delivery_id"])
+                        or "handled")
+    sent = lv.deliver("x", "hi", purpose="resume", dedupe_key="resume:k", transports=("message",))
+    assert lv.settle_failed(sent["delivery_id"]) == "handled"
+    assert lv.settle_failed(sent["delivery_id"]) is None
+    assert _sweep(dw, 7200) == [] and seen == [sent["delivery_id"]]
+
+
+def test_legacy_failed_rows_without_failed_at_are_left_alone(dw):
+    lv = dw.liveness
+    lv._save_deliveries([{"delivery_id": "old", "purpose": "review", "dedupe_key": "k",
+                          "state": "failed", "sent_at": time.time()}], time.time())
+    assert _sweep(dw, 7200) == []
+
+
+def test_review_failed_send_renotifies_once_then_blocks(dw, monkeypatch):
+    """The verifier's probe: resolvable agent target, messages.send fails
+    outright. The real _notify_review records the failed row; the sweep
+    renotifies once (also failing), then blocks for a human; nothing after."""
+    import watchtower.messages as messages
+    sends = _fail_messages(monkeypatch)
+    monkeypatch.setattr(messages, "resolve_target", lambda t: {"kind": "agent", "name": t})
+    monkeypatch.setattr(messages, "ccc_forward_target", lambda t: None)
+    item = {"ref": "LQ-7", "project": PQ, "status": "in_review",
+            "gate_pending": "review:alice", "title": "t"}
+    monkeypatch.setattr(dw.q, "get", lambda ref, *a, **k: dict(item))
+    blocks = []
+    monkeypatch.setattr(dw.q, "block", lambda ref, *a, **k: blocks.append((ref, k)))
+    res = dw.q._notify_review(item, "review:alice", None)
+    assert res["state"] == "failed" and len(sends) == 1
+    assert "REVIEW_NOTIFY" in Path(os.environ["WATCHTOWER_ACTIVITY_LOG"]).read_text()
+    assert [(r["state"], r["attempts"]) for r in dw.liveness.deliveries(purpose="review")] \
+        == [("failed", 1)]
+    assert _sweep(dw, GRACE) == [("review", "failed", "renotify failed (its row settles it)")]
+    assert len(sends) == 2 and blocks == []
+    assert _sweep(dw, 2 * GRACE) == [("review", "failed", "blocked")]
+    assert len(blocks) == 1 and blocks[0][1]["origin"] == "system"
+    assert "no live transport" in blocks[0][1]["question"]
+    assert _sweep(dw, 7200) == [] and len(sends) == 2 and len(blocks) == 1
+
+
+def test_review_renotify_with_no_target_left_blocks_at_once(dw, monkeypatch):
+    item = {"ref": "LQ-8", "status": "in_review", "gate_pending": "review:alice"}
+    monkeypatch.setattr(dw.q, "get", lambda ref, *a, **k: dict(item))
+    monkeypatch.setattr(dw.q, "_notify_review", lambda *a, **k: None)
+    blocks = []
+    monkeypatch.setattr(dw.q, "block", lambda ref, *a, **k: blocks.append(ref))
+    assert _lost(dw, "review", "review:LQ-8:0", ref="LQ-8",
+                 meta={"gate": "review:alice"})[0]["result"] == "blocked"
+    assert blocks == ["LQ-8"]
+
+
+def test_answer_failed_send_hands_off_through_the_handler_once(dw, monkeypatch):
+    """Initial send fails outright (messages + headless): E3 then E10 via the
+    answer handler, synchronously; the sweep never acts on it again."""
+    _fail_messages(monkeypatch)
+    monkeypatch.setattr(dw.answers, "_resumable", lambda engine, sid: True)
+    monkeypatch.setattr(dw.cli, "_resume_session_headless", lambda *a, **k: False)
+    handled = []
+    real = dw.liveness.HANDLERS["answer"]
+    monkeypatch.setitem(dw.liveness.HANDLERS, "answer",
+                        lambda row, c: handled.append(row["state"]) or real(row, c))
+    g = Golden(dw, _claimed(dw))
+    g.step(dw.q.block, g.ref, session_id="w1", question="which way?", origin="worker",
+           row="answer.await_human", owner="human", desired=[])
+    g.step(dw.q.answer, g.ref, "left", edge="E1", row="answer.routing", desired=[])
+    out = dw.answers.route_answer(g.ref, _gen(dw, g.ref))
+    assert out["route"] == "reopen" and "delivery failed" in out["reason"]
+    assert pa_state(g.item()) == "handed_off" and g.item()["status"] == "open"
+    assert handled == ["failed"]
+    row = dw.liveness.deliveries(purpose="answer")[-1]
+    assert row["state"] == "failed" and row["settled_at"]
+    assert _sweep(dw, 7200) == [] and handled == ["failed"]
+
+
+def test_answer_failed_resend_hands_off_once(dw, monkeypatch):
+    """A failed resend (the retry after a pending row went away) is settled
+    the same way: E10, once."""
+    _fail_messages(monkeypatch)
+    monkeypatch.setattr(dw.answers, "_resumable", lambda engine, sid: True)
+    bodies = []
+    monkeypatch.setattr(dw.cli, "_resume_session_headless",
+                        lambda sid, repo, body, engine, **k: bodies.append(body) or True)
+    g = Golden(dw, _claimed(dw))
+    dw.q.block(g.ref, session_id="w1", question="q?", origin="worker")
+    dw.q.answer(g.ref, "left")
+    gen = _gen(dw, g.ref)
+    dw.answers.route_answer(g.ref, gen)                    # headless started: pending
+    assert pa_state(g.item()) == "delivering"
+    dw.liveness._save_deliveries([], time.time())          # its row vanished
+    monkeypatch.setattr(dw.cli, "_resume_session_headless", lambda *a, **k: False)
+    monkeypatch.setattr(dw.answers, "ROUTE_LEASE_S", 0)
+    dw.answers.route_pending_answers()
+    assert pa_state(g.item()) == "handed_off" and g.item()["status"] == "open"
+    rows = dw.liveness.deliveries(purpose="answer")
+    assert [(r["state"], bool(r.get("settled_at"))) for r in rows] == [("failed", True)]
+    assert _sweep(dw, 7200) == []
+
+
+def _live_worker(dw, wid):
+    return dw.workers.record_worker(os.getpid(), PQ, "claude", wid, str(dw.tmp),
+                                    str(dw.tmp / "w.log"), session_id=SID)
+
+
+def test_nudge_failed_send_resends_once_then_undeliverable(dw, monkeypatch):
+    sends = _fail_messages(monkeypatch)
+    monkeypatch.setattr(dw.workers, "worker_turn_open", lambda w: False)
+    _live_worker(dw, "lq-n1")
+    w = next(x for x in dw.workers.list_workers(prune=False) if x["worker_id"] == "lq-n1")
+    assert dw.workers._nudge_one(w, "claim something") == "failed"
+    assert _sweep(dw, GRACE) == [("nudge", "failed", "resent: failed")]
+    assert len(sends) == 2
+    assert _sweep(dw, 2 * GRACE) == [("nudge", "failed", "undeliverable_since")]
+    row = next(x for x in dw.workers.list_workers(prune=False) if x["worker_id"] == "lq-n1")
+    assert row.get("undeliverable_since")
+    assert _sweep(dw, 7200) == [] and len(sends) == 2
+
+
+def test_release_failed_send_resends_once_then_logs(dw, monkeypatch):
+    sends = _fail_messages(monkeypatch)
+    monkeypatch.setattr(dw.workers, "worker_turn_open", lambda w: False)
+    _live_worker(dw, "lq-r1")
+    w = next(x for x in dw.workers.list_workers(prune=False) if x["worker_id"] == "lq-r1")
+    assert dw.workers._deliver_release_instruction(w, "you are released")["delivered"] is False
+    out = _sweep(dw, GRACE)
+    assert len(out) == 1 and out[0][:2] == ("release", "failed") \
+        and out[0][2].startswith("resent")
+    assert _sweep(dw, 2 * GRACE) == [("release", "failed", "RELEASE_UNDELIVERED")]
+    assert _sweep(dw, 7200) == [] and len(sends) == 2
+
+
+def test_plan_reminder_failed_send_escalates_once(dw, monkeypatch):
+    ref, p, sent = _reminder_ticket(dw, monkeypatch)
+    _fail_messages(monkeypatch)
+    assert dw.cli.recover_plan_discussions(PQ, stale_s=0) == 1        # escalated now
+    it = dw.q.get(ref)
+    assert it["plan"]["status"] == "blocked" and it["plan"]["discussion"]["nudges"] == 0
+    assert "undelivered" in it["block_question"] and "no live transport" in it["block_question"]
+    assert _sweep(dw, 7200) == []
+
+
+def test_plan_discuss_failed_send_is_settled_by_the_sweep(dw, monkeypatch):
+    _fail_messages(monkeypatch)
+    asked = []
+    monkeypatch.setattr(dw.stages, "request", lambda ref, why: asked.append(ref))
+    item = {"ref": "LQ-4", "project": PQ, "plan": {"planner": {"worker_id": "w9"}}}
+    assert dw.cli._plan_send(item, "planner", "hello")["state"] == "failed"
+    assert _sweep(dw, GRACE) == [
+        ("plan", "failed", "recorded only (target is not the live stage session)")]
+    assert _sweep(dw, 7200) == []
+
+
+# ---------------------- D2.8: non-receiptable engines hand off (verifier F3)
+def _blocked_on(dw, engine, sid):
+    ref = dw.q.enqueue(project=PQ, note="ticket", source="test")["ref"]
+    dw.q.claim_by_ref(ref, "w-" + engine, session_uuid=sid)
+    dw.workers.record_worker(os.getpid(), PQ, engine, "w-" + engine, str(dw.tmp),
+                             str(dw.tmp / "w.log"), session_id=sid)
+    return ref
+
+
+@pytest.mark.parametrize("engine,sid", [("kimi", "session_11111111-2222-3333-4444-555555555555"),
+                                        ("devin", "22222222-3333-4444-5555-666666666666")])
+def test_non_receiptable_answer_hands_off_before_any_resume(dw, monkeypatch, engine, sid):
+    """The verifier's probe: a transport failure used to fall through to a
+    headless resume (unverified_ok) whose row the sweep then read lost while
+    the process ran. Now nothing is sent or spawned: the claim is released
+    with the answer on the ticket, and no ledger row exists."""
+    sends = _fail_messages(monkeypatch)
+    spawned = []
+    monkeypatch.setattr(dw.cli, "_resume_session_headless",
+                        lambda *a, **k: spawned.append(a) or True)
+    ref = _blocked_on(dw, engine, sid)
+    item = dw.q.get(ref)
+    assert dw.cli._deliver_to_blocked_session(item, "use B", "apply: use B", engine, "") == 0
+    assert spawned == [] and sends == [] and dw.liveness.deliveries() == []
+    it = dw.q.get(ref)
+    assert it["status"] == "open" and not it.get("claimed_by")
+    assert "A: use B" in it["text"]
+    assert _sweep(dw, 7200) == []
+
+
+def test_non_receiptable_reject_hands_off_with_feedback(dw, monkeypatch):
+    spawned = []
+    monkeypatch.setattr(dw.cli, "_resume_session_headless",
+                        lambda *a, **k: spawned.append(a) or True)
+    sends = _fail_messages(monkeypatch)
+    import argparse
+    sid = "session_33333333-4444-5555-6666-777777777777"
+    ref = dw.q.enqueue(project=PQ, note="ticket", source="test", gates=["review"])["ref"]
+    dw.q.claim_by_ref(ref, "w-kimi", session_uuid=sid)
+    dw.workers.record_worker(os.getpid(), PQ, "kimi", "w-kimi", str(dw.tmp),
+                             str(dw.tmp / "w.log"), session_id=sid)
+    dw.q.update_status(ref, "closed", "w-kimi", hold_review="review")
+    assert dw.q.get(ref)["status"] == "in_review"
+    assert dw.cli.cmd_reject(argparse.Namespace(ref=ref, reason="missing tests", by="boss",
+                                                json=False, engine=None)) == 0
+    assert spawned == [] and sends == [] and dw.liveness.deliveries() == []
+    it = dw.q.get(ref)
+    assert it["status"] == "open" and not it.get("claimed_by")
+    assert "missing tests" in str(it.get("gate_feedback"))       # rides the release
+
+
+def test_non_receiptable_engines_are_not_resumable_for_answers(dw):
+    import importlib
+    import watchtower.answers as answers
+    real = importlib.reload(answers)
+    try:
+        assert real._resumable("kimi", "session_x") is False
+        assert real._resumable("devin", "dv-x") is False
+    finally:
+        importlib.reload(answers)
+
+
+def test_receipt_engine_failure_still_resumes_then_releases(dw, monkeypatch):
+    """Claude keeps the steer -> headless path; an outright failure settles
+    its row through the resume handler once, then releases the claim."""
+    _fail_messages(monkeypatch)
+    monkeypatch.setattr(dw.cli, "_resume_session_headless", lambda *a, **k: False)
+    handled = []
+    real = dw.liveness.HANDLERS["resume"]
+    monkeypatch.setitem(dw.liveness.HANDLERS, "resume",
+                        lambda row, c: handled.append(row["state"]) or real(row, c))
+    ref = _blocked_on(dw, "claude", SID)
+    assert dw.cli._deliver_to_blocked_session(dw.q.get(ref), "B", "apply B", "claude", "") == 0
+    assert handled == ["failed"]
+    it = dw.q.get(ref)
+    assert it["status"] == "open" and "A: B" in it["text"]
+    assert _sweep(dw, 7200) == [] and handled == ["failed"]

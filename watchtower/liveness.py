@@ -1239,6 +1239,9 @@ DELIVERY_PURPOSES = ("nudge", "release", "plan", "review", "answer", "stage_answ
 # Engines whose transcript a receipt can read (receipts._transcript_stat).
 RECEIPT_ENGINES = ("claude", "codex")
 _LIVE_STATES = ("sending", "pending")
+# A failed send whose caller did not settle it itself (``settle_failed``) is
+# settled by the sweep once this old, so the two never race.
+FAILED_SETTLE_GRACE_S = 30.0
 
 # D2.8: every call of a low-level transport (deliver_via_uds,
 # write_to_worker_fifo, _write_fifo_frame, peer_uds.send_lines,
@@ -1395,7 +1398,7 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
             fifo: str = "", fifo_ready: Optional[Callable[[], bool]] = None,
             fifo_busy: str = "skip", uds_fn: Optional[Callable[[str], Any]] = None,
             from_name: str = "watchtower", message: Optional[Dict[str, Any]] = None,
-            headless: Optional[Dict[str, Any]] = None, unverified_ok: bool = False,
+            headless: Optional[Dict[str, Any]] = None,
             meta: Optional[Dict[str, Any]] = None, on_lost: str = "",
             attempt: int = 1) -> Dict[str, Any]:
     """Send ``text`` over the first transport that takes it (UDS -> FIFO ->
@@ -1408,11 +1411,14 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
     lost), ``queued`` (+``msg_id``; the outbox holds it), ``deferred``
     (``fifo_busy="defer"`` and the FIFO is not ready), ``in_flight`` /
     ``duplicate`` (the messages ledger already holds the key; no row),
-    ``failed``. ``ok`` = sent now (pending / unverified / duplicate).
+    ``failed`` (the row keeps ``failed_at``; it is settled through the
+    purpose's handler exactly once -- by the caller via ``settle_failed`` or
+    by the sweep after FAILED_SETTLE_GRACE_S). ``ok`` = sent now (pending /
+    unverified / duplicate).
 
     A headless resume needs a receipt source: an engine outside
-    RECEIPT_ENGINES is handed off instead (``failed``) unless
-    ``unverified_ok``. A slash command carries no nonce (it would become the
+    RECEIPT_ENGINES is never resumed (``failed``); its callers hand off
+    before reaching here (D2.8). A slash command carries no nonce (it would become the
     command's argument), so it is always ``unverified``."""
     from . import receipts
     from . import workers
@@ -1436,6 +1442,15 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
                            "nonce": nonce, "receipt_id": "", "error": ""}
     errors: List[str] = []
     msg_error = ""
+
+    def _failed(error: str, transport: str = "") -> Dict[str, Any]:
+        # An outright failed send is settled through its purpose's handler
+        # like a lost one: synchronously by a caller that owns the outcome
+        # (``settle_failed``), else by the sweep after FAILED_SETTLE_GRACE_S.
+        _finish(did, dedupe_key, {"state": "failed", "failed_at": now,
+                                  "reason": f"send failed: {error}"[:500]}, now)
+        out.update(transport=transport, error=error)
+        return out
 
     def _sent(transport: str, rec: Optional[Dict[str, Any]], **extra: Any) -> Dict[str, Any]:
         rid = (rec or {}).get("id", "") or str(extra.pop("receipt_id", "") or "")
@@ -1474,9 +1489,7 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
                 got = workers.write_to_worker_fifo(fifo, body, engine=engine)
             except Exception as exc:  # noqa: BLE001
                 _drop_receipt(rec)
-                _finish(did, dedupe_key, {"state": "failed"}, now)
-                out.update(transport="fifo", error=f"{type(exc).__name__}: {exc}")
-                return out
+                return _failed(f"{type(exc).__name__}: {exc}", "fifo")
             if got:
                 return _sent("fifo", rec)
             _drop_receipt(rec)
@@ -1524,7 +1537,7 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
             if not sid:
                 errors.append("headless: no session id")
                 continue
-            if engine not in RECEIPT_ENGINES and not unverified_ok:
+            if engine not in RECEIPT_ENGINES:
                 errors.append(f"headless: {engine} has no receipt source; handed off")
                 continue
             rec = _pre_receipt(sid, engine, body, nonce, did, "headless-resume")
@@ -1533,10 +1546,8 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
                 return _sent("headless-resume", rec)
             _drop_receipt(rec)
             errors.append("headless: resume did not start")
-    _finish(did, dedupe_key, {"state": "failed"}, now)
-    out["error"] = msg_error or "; ".join(errors) or "no transport"
     out["errors"] = errors
-    return out
+    return _failed(msg_error or "; ".join(errors) or "no transport")
 
 
 def _send_headless(sid: str, body: str, engine: str, h: Dict[str, Any]) -> bool:
@@ -1627,22 +1638,53 @@ def sweep_deliveries(now: Optional[float] = None, verify: bool = True) -> List[D
                 outcome, why = _outcome(r, receipt_rows, now)
                 if not outcome:
                     continue
+            elif _failed_unsettled(r):
+                if now - float(r.get("failed_at") or 0) < FAILED_SETTLE_GRACE_S:
+                    continue   # the sending caller may still settle it itself
+                outcome, why = "failed", str(r.get("reason") or "send failed")
             else:
                 continue
             r.update(state=outcome, reason=why, settled_at=now)
             settled.append(dict(r))
     _mutate_deliveries(_do, now)
-    out = []
-    for r in settled:
-        try:
-            result = _handle(r)
-        except Exception as exc:  # noqa: BLE001 - one row never stops the sweep
-            result = f"error: {exc}"
-        q._log("DELIVERY", f"{r.get('ref') or r.get('worker_id') or '-'} {r['purpose']} "
-               f"{r['dedupe_key']} {r['delivery_id']} {r['state']} ({r.get('reason')}) "
-               f"-> {result}", queue=str(r.get("queue") or ""))
-        out.append(dict(r, result=result))
-    return out
+    return [_run_handler(r) for r in settled]
+
+
+def _failed_unsettled(r: Dict[str, Any]) -> bool:
+    """A failed send nobody has settled yet (rows from before failed sends
+    were settled carry no ``failed_at`` and are left alone)."""
+    return r.get("state") == "failed" and bool(r.get("failed_at")) and not r.get("settled_at")
+
+
+def _run_handler(r: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        result = _handle(r)
+    except Exception as exc:  # noqa: BLE001 - one row never stops the sweep
+        result = f"error: {exc}"
+    q._log("DELIVERY", f"{r.get('ref') or r.get('worker_id') or '-'} {r['purpose']} "
+           f"{r['dedupe_key']} {r['delivery_id']} {r['state']} ({r.get('reason')}) "
+           f"-> {result}", queue=str(r.get("queue") or ""))
+    return dict(r, result=result)
+
+
+def settle_failed(delivery_id: str) -> Optional[str]:
+    """Run the handler of an outright failed send now, for a caller that owns
+    the outcome synchronously (answer fallback, resume hand-off, plan
+    reminder). The row is claimed under the ledger lock, so the handler runs
+    exactly once whether this or the sweep gets it first. Returns the
+    handler's result, or None when the row is not an unsettled failure."""
+    if not delivery_id:
+        return None
+    now = time.time()
+    claimed: List[Dict[str, Any]] = []
+
+    def _do(rows):
+        for r in rows:
+            if r.get("delivery_id") == delivery_id and _failed_unsettled(r):
+                r["settled_at"] = now
+                claimed.append(dict(r))
+    _mutate_deliveries(_do, now)
+    return _run_handler(claimed[0])["result"] if claimed else None
 
 
 def _handle(row: Dict[str, Any]) -> str:
@@ -1668,8 +1710,9 @@ def _h_answer(row: Dict[str, Any], confirmed: bool) -> str:
     if confirmed:
         return "E9" if _on_answer_confirmed(row) else "noop (state moved on)"
     from . import answers
+    verb = "failed" if row.get("state") == "failed" else "lost"
     done = answers._fallback_reopen(str(row["ref"]), _gen_of(row),
-                                    f"answer delivery lost ({row.get('reason')}); handed off")
+                                    f"answer delivery {verb} ({row.get('reason')}); handed off")
     return "E10" if done else "noop (state moved on)"
 
 
@@ -1727,8 +1770,9 @@ def _h_plan(row: Dict[str, Any], confirmed: bool) -> str:
         if confirmed:
             item = q.plan_discussion_record_nudge(ref, True, delivery_id=did)
         else:
+            how = "undelivered" if row.get("state") == "failed" else "never landed"
             item = q.plan_discussion_record_nudge(
-                ref, False, f"reminder to {meta.get('role')} never landed "
+                ref, False, f"reminder to {meta.get('role')} {how} "
                             f"({row.get('reason')})", delivery_id=did)
         if item is None:
             return "noop (discussion moved on)"
@@ -1755,12 +1799,17 @@ def _h_review(row: Dict[str, Any], confirmed: bool) -> str:
     if item.get("status") != "in_review" or str(item.get("gate_pending") or "") != meta.get("gate"):
         return "noop (review moved on)"
     if int(row.get("attempts") or 1) < 2:
-        q._notify_review(item, str(meta.get("gate") or ""), None, attempt=2)
-        return "renotified"
+        res = q._notify_review(item, str(meta.get("gate") or ""), None, attempt=2)
+        if res is not None:
+            # a second row now exists: its own outcome (landed / lost /
+            # failed) settles it, and blocks if it never lands
+            return "renotified" if res.get("ok") or res.get("state") in (
+                "queued", "in_flight", "duplicate") else "renotify failed (its row settles it)"
+        # nothing could be sent at all (target gone): straight to a human
     q.block(ref, "", origin="system", kind="input",
-            question=(f"The review request for {ref} never reached {row.get('target')} (no "
-                      f"receipt after two sends). Review it yourself: `wt accept {ref}` or "
-                      f"`wt reject {ref} --reason \"...\"`."))
+            question=(f"The review request for {ref} never reached {row.get('target')} "
+                      f"({row.get('reason') or 'no receipt'}; renotified once). Review it "
+                      f"yourself: `wt accept {ref}` or `wt reject {ref} --reason \"...\"`."))
     return "blocked"
 
 

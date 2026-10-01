@@ -1436,6 +1436,7 @@ def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
     one blocks the plan (``liveness._h_plan``). No second reminder goes out
     while one is pending. Never spawns. Returns how many discussions this
     call escalated to a human."""
+    from . import liveness
     n = 0
     try:
         for it in q.list_items(project=queue) or []:
@@ -1463,6 +1464,14 @@ def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
                         res.get("state") in ("pending", "unverified"):
                     # sent: the ledger's handler counts it or escalates it
                     q.plan_discussion_reminder_sent(ref, str(res["delivery_id"]), role)
+                elif res.get("state") == "failed" and res.get("delivery_id"):
+                    # failed outright: the same handler settles it now, once
+                    # (a failed reminder blocks the plan, like a lost one)
+                    did = str(res["delivery_id"])
+                    q.plan_discussion_reminder_sent(ref, did, role)
+                    if liveness.settle_failed(did) == "escalated":
+                        n += 1
+                    continue
                 elif not res.get("ok"):
                     nudged = q.plan_discussion_record_nudge(
                         ref, False,
@@ -2930,36 +2939,41 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
             )
             return 0
     repo = item.get("repo_path") or os.getcwd()
-    from . import messages
     target = item.get("claimed_session_id") or item.get("claimed_by")
     delivery_engine = _answer_engine(item, engine_arg)
-    # Kimi has no local messages adapter. Without a delegate, parking this in
-    # the outbox would retry the same unsupported adapter chain until dead.
-    # Let the existing headless Kimi resume fallback run immediately instead.
-    queue_on_fail = not (
-        delivery_engine == "kimi" and not messages._delegate_base()
-    )
     # Bind a held answer to this claim: the outbox cancels it once the ticket
     # closes or changes session instead of retrying it (WT-1).
     bound = item.get("status") == "in_progress"
+    from . import liveness
+    if delivery_engine not in liveness.RECEIPT_ENGINES:
+        # WT-31 D2.8: no receipt can ever confirm a message to this engine's
+        # session (no readable transcript), so a verified delivery could only
+        # end "lost" while the resumed process still runs. Hand off BEFORE any
+        # resume: the answer/feedback rides the ticket to a fresh worker.
+        why = (f"{delivery_engine} sessions have no receipt source; handed off "
+               f"instead of resumed")
+        _log_resume(item, f"skipped: {why}")
+        _hand_off_blocked_claim(item, answer_text, str(sid), worker, bound, "skipped", why,
+                                "could not be verified-resumed")
+        print(f"ANSWERED: {item['ref']} — {why}; "
+              + ("claim released for a fresh worker with your answer."
+                 if bound else "answer recorded on the ticket for the next worker."))
+        return 0
     # Verified (WT-31 D4, ``resume:<ref>:<sid>``): steer/outbox first; when
     # the target is unresolvable (nothing queued) the headless resume fork,
     # which registers the resume child under the worker id so the orphan sweep
     # cannot reopen the ticket while the answer is applied. A delivery whose
     # nonce never lands marks the resume evidence failed (WT-30 then acts).
-    from . import liveness
     sent = liveness.deliver(
         str(target), prompt, purpose="resume", dedupe_key=f"resume:{item.get('ref')}:{sid}",
         ref=str(item.get("ref") or "") if bound else "",
         queue=str(item.get("project") or ""), worker_id=str(item.get("claimed_by") or ""),
         session_id=str(sid), engine=delivery_engine, transports=("message", "headless"),
-        message={"verb": "steer", "engine": delivery_engine,
-                 "on_busy": "hold" if queue_on_fail else "reject",
+        message={"verb": "steer", "engine": delivery_engine, "on_busy": "hold",
                  "ticket_ref": str(item.get("ref") or "") if bound else "",
                  "ticket_session": str(sid) if bound else ""},
         headless={"repo": repo, "queue": item.get("project", ""),
-                  "worker_id": item.get("claimed_by", "")},
-        unverified_ok=True)
+                  "worker_id": item.get("claimed_by", "")})
     if sent.get("ok") and sent.get("transport") != "headless-resume":
         if bound:
             q.set_resume_state(item["ref"], str(sid), "running",
@@ -2987,23 +3001,17 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
         print(f"ANSWERED: {item['ref']} — resuming session {sid} in {repo} "
               f"to apply your answer and close.")
         return 0
-    # D7: every transport failed. Release the claim (the next tick / a fresh
-    # worker takes it) instead of leaving it held by a session that never woke.
+    # D7: every transport failed. The failed ledger row is settled by its
+    # handler (resume evidence -> failed) exactly once, now; then release the
+    # claim (the next tick / a fresh worker takes it) instead of leaving it
+    # held by a session that never woke.
     err = str(sent.get("error") or "unknown")
     _log_resume(item, f"failed: {err}")
+    settled = liveness.settle_failed(str(sent.get("delivery_id") or ""))
     if bound:
-        if answer_text and not item.get("gate_feedback"):
-            from datetime import datetime as _dt, timezone as _tz
-            stamp = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
-            q.update(item["ref"], text=(
-                f"{item.get('text') or item.get('note') or ''}\n\n"
-                f"[ANSWERED while blocked, {stamp}] Q: "
-                f"{item.get('block_question') or '(see history)'}\nA: {answer_text}\n"
-                f"(Original session {str(sid)[:8]} could not be resumed — apply this "
-                f"answer fresh.)"))
-        q.set_resume_state(item["ref"], str(sid), "failed", error=err)
-        q.release(item["ref"], session_id=str(item.get("claimed_by") or worker or ""),
-                  force=True)
+        _hand_off_blocked_claim(item, answer_text, str(sid), worker, bound,
+                                "failed" if settled is None else "", err,
+                                "could not be resumed")
         print(f"ANSWERED: {item['ref']} — delivery failed ({err}) and {delivery_engine} "
               "resume did not stay running; claim released for a fresh worker.")
         return 0
@@ -3012,6 +3020,29 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
           "resume also failed to stay running. Resume manually: "
           f"wt discuss {item['ref']} --engine {delivery_engine}")
     return 0
+
+
+def _hand_off_blocked_claim(item: dict, answer_text: str, sid: str, worker: str, bound: bool,
+                            resume_state: str, why: str, could_not: str) -> None:
+    """Give a blocked session's ticket to a fresh worker: the answer rides the
+    ticket text (gate feedback already survives a release), the resume
+    evidence is closed with ``resume_state`` ('' = already recorded), and a
+    bound claim is force-released."""
+    if answer_text and not item.get("gate_feedback"):
+        from datetime import datetime as _dt, timezone as _tz
+        stamp = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+        q.update(item["ref"], text=(
+            f"{item.get('text') or item.get('note') or ''}\n\n"
+            f"[ANSWERED while blocked, {stamp}] Q: "
+            f"{item.get('block_question') or '(see history)'}\nA: {answer_text}\n"
+            f"(Original session {sid[:8]} {could_not} — apply this "
+            f"answer fresh.)"))
+    if not bound:
+        return
+    if resume_state:
+        q.set_resume_state(item["ref"], sid, resume_state, error=why)
+    q.release(item["ref"], session_id=str(item.get("claimed_by") or worker or ""),
+              force=True)
 
 
 def cmd_migrate_blocks(args: argparse.Namespace) -> int:

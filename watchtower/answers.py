@@ -111,7 +111,9 @@ def _resumable(engine: str, sid: str) -> bool:
             return bool(codex_registry.entry(sid))
         except Exception:  # noqa: BLE001
             return False
-    return engine in ("kimi", "devin")
+    # kimi / devin: resumable in principle, but no receipt can confirm the
+    # resumed turn (WT-31 D2.8: no receipt source -> hand off before resume)
+    return False
 
 
 def worker_alive(worker_id: str) -> bool:
@@ -213,7 +215,8 @@ def _deliver(item: Dict[str, Any], pa: Dict[str, Any]) -> Dict[str, Any]:
                 "busy": bool(sent.get("busy"))}
     if sent.get("state") == "in_flight":
         return {"status": "in_flight"}
-    return {"status": "failed", "error": str(sent.get("error") or "delivery failed")}
+    return {"status": "failed", "error": str(sent.get("error") or "delivery failed"),
+            "delivery_id": str(sent.get("delivery_id") or "")}
 
 
 def _wake(item: Dict[str, Any], pa: Dict[str, Any]) -> None:
@@ -334,7 +337,13 @@ def _deliver_bound(item: Dict[str, Any], gen: int) -> Dict[str, Any]:
                 "queued": True, "msg_id": res.get("msg_id", "")}
     if st == "in_flight":
         return {"route": "resume", "reason": "delivery in flight; the reconciler retries"}
-    _fallback_reopen(ref, gen, f"delivery failed: {res.get('error', 'unknown')}")
+    # An outright failed send is settled by the ledger's answer handler, like
+    # a lost one (E10), exactly once: now, since the row is ours.
+    from . import liveness
+    if liveness.settle_failed(str(res.get("delivery_id") or "")) is None:
+        # no ledger row (deliver raised before registering) or the sweep
+        # already settled it: the CAS keeps this a no-op if E10 happened
+        _fallback_reopen(ref, gen, f"delivery failed: {res.get('error', 'unknown')}")
     return {"route": "reopen", "reason": f"delivery failed ({res.get('error', 'unknown')}); handed off"}
 
 

@@ -250,11 +250,16 @@ def test_answer_infers_kimi_engine_after_worker_exit(wt, tmp_path, monkeypatch):
     )
 
     assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
-    assert calls[0][0][3] == "kimi"
-    assert calls[0][1] == {
-        "queue": "THROUGHPUT",
-        "worker_id": worker_id,
-    }
+    # WT-31 D2.8: the engine is still inferred as kimi, but a kimi session has
+    # no receipt source, so it is handed off BEFORE any resume (this test used
+    # to require the headless kimi resume): no spawn, claim released, the
+    # answer rides the ticket to a fresh worker.
+    assert calls == []
+    it = q.get(item["ref"])
+    assert it["status"] == "open" and not it.get("claimed_by")
+    assert "A: A" in it["text"] and "could not be verified-resumed" in it["text"]
+    assert cli._answer_engine({"claimed_session_id": sid, "claimed_by": worker_id},
+                              None) == "kimi"
 
 
 def test_answer_resume_reports_immediate_process_exit(wt, tmp_path, monkeypatch):
