@@ -1552,15 +1552,37 @@ def _h_release(row: Dict[str, Any], confirmed: bool) -> str:
 
 
 def _h_plan(row: Dict[str, Any], confirmed: bool) -> str:
+    """Plan messages (``plan:<ref>:<role>:<kind>``). The ledger owns the
+    outcome: a fallback ``reminder`` (WT-29, tickets the supervisor does not
+    own) counts toward the nudge budget only here, on its confirmed nonce,
+    and a lost one blocks the plan for a human. A lost message to a live
+    stage session marks that session lost, so the supervisor kills and
+    respawns it within the stage's attempt budget (escalating past it)."""
+    ref = str(row.get("ref") or "")
+    meta = row.get("meta") or {}
+    from . import cli, stages
+    if meta.get("kind") == "reminder":
+        did = str(row.get("delivery_id") or "")
+        if confirmed:
+            item = q.plan_discussion_record_nudge(ref, True, delivery_id=did)
+        else:
+            item = q.plan_discussion_record_nudge(
+                ref, False, f"reminder to {meta.get('role')} never landed "
+                            f"({row.get('reason')})", delivery_id=did)
+        if item is None:
+            return "noop (discussion moved on)"
+        if cli._block_stalled_plan(ref, item):
+            return "escalated"
+        return "nudge counted"
     if confirmed:
         return "confirmed"
-    ref = str(row.get("ref") or "")
-    from . import stages
-    if (row.get("meta") or {}).get("kind") == "reminder":
-        q.plan_discussion_record_nudge(ref, False, f"reminder to {row['meta'].get('role')} never "
-                                       f"landed ({row.get('reason')})")
-    stages.request(ref, "plan message lost")
-    return "respawn requested"
+    wid = str(row.get("worker_id") or "")
+    if stages.mark_delivery_lost(ref, wid, f"plan {meta.get('kind') or 'message'} to "
+                                           f"{meta.get('role') or wid} never landed "
+                                           f"({row.get('reason')})"):
+        stages.request(ref, "plan message lost")
+        return "respawn: stage session marked lost"
+    return "recorded only (target is not the live stage session)"
 
 
 def _h_review(row: Dict[str, Any], confirmed: bool) -> str:

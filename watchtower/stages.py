@@ -298,6 +298,26 @@ def _log_facts(rec: Optional[Dict[str, Any]]) -> str:
     return f"{size}-byte log" + (f": {tail}" if tail else "")
 
 
+def mark_delivery_lost(ref: str, worker_id: str, reason: str) -> bool:
+    """A verified message to the ticket's live stage session never landed
+    (WT-31 D4): the session is not listening. Mark it lost so the next
+    ``_supervise`` pass kills it, records the death (attempt budget) and
+    respawns or escalates. False when ``worker_id`` is not the current,
+    unescalated stage session (nothing to respawn)."""
+    hit: List[bool] = []
+
+    def _do(it, ss):
+        if (not worker_id or str(ss.get("worker_id") or "") != str(worker_id)
+                or ss.get("escalated")):
+            return "skip"
+        ss["lost"] = {"worker_id": str(worker_id), "reason": str(reason)[:300], "at": _iso()}
+        hit.append(True)
+    q.stage_session_update(ref, _do)
+    if hit:
+        _log("STAGE_LOST", f"{ref} {worker_id}: {reason}", queue=ref.rsplit("-", 1)[0])
+    return bool(hit)
+
+
 def _check_session(item: Dict[str, Any], ss: Dict[str, Any],
                    rows: List[Dict[str, Any]], adopted: bool
                    ) -> Tuple[str, str, Dict[str, Any]]:
@@ -305,6 +325,14 @@ def _check_session(item: Dict[str, Any], ss: Dict[str, Any],
     wid = str(ss.get("worker_id") or "")
     rec = _record_for(wid, rows) if wid else None
     now = _now()
+    lost = ss.get("lost") if isinstance(ss.get("lost"), dict) else {}
+    if wid and str(lost.get("worker_id") or "") == wid:
+        # WT-31 D4: a message to this session never landed; it is not working
+        # the stage. Kill it so the respawn is the only session on the key.
+        if rec is not None and rec.get("alive"):
+            _kill(int(rec.get("pid") or 0))
+        return "dead", f"delivery lost: {lost.get('reason') or 'message never landed'}", \
+            {"killed": True}
     if rec is None:
         ref_ts = _parse_iso(ss.get("spawned_at")) or _parse_iso(item.get("updated_at"))
         if wid and (now - ref_ts) < _ADOPT_DEAD_AFTER_S:
@@ -466,6 +494,7 @@ def _record_death(ref: str, project: str, role: str, key: str, reason: str,
                 ss["attempt"] = max(0, attempt_no - 1)
         ss["deaths"] = (list(ss.get("deaths") or []) + [death])[-10:]
         ss["worker_id"] = ""
+        ss.pop("lost", None)
         ss["dead_reason"] = reason[:500]
         captured.update(death)
         q._append_history(it, "stage_death", by=q._by("system"), at=q._now_iso(),
@@ -593,6 +622,7 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
                  waiting_until=None)
         s.pop("retry_note", None)
         s.pop("retry_at", None)
+        s.pop("lost", None)
         q._append_history(it, "stage_spawn", by=q._by("system"), at=q._now_iso(),
                           role=role, key=key, attempt=attempt, cause=cause,
                           worker_id=rec.get("worker_id", ""))

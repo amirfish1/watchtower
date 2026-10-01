@@ -364,12 +364,73 @@ def test_stage_answer_confirm_and_lost(dw, monkeypatch):
     assert [r["result"] for r in out] == ["stays handed_off"] and len(confirmed) == 1
 
 
-def test_plan_lost_requests_a_respawn(dw, monkeypatch):
+def test_plan_lost_to_a_non_stage_target_is_only_recorded(dw, monkeypatch):
+    """No live stage session for the target: nothing to respawn (the real
+    respawn path is tests/test_stage_sessions.py::test_lost_plan_message_*)."""
     asked = []
     monkeypatch.setattr(dw.stages, "request", lambda ref, why: asked.append(ref))
-    assert _lost(dw, "plan", "plan:LQ-3:planner:discuss", ref="LQ-3")[0]["result"] \
-        == "respawn requested"
-    assert asked == ["LQ-3"]
+    assert _lost(dw, "plan", "plan:LQ-3:planner:discuss", ref="LQ-3", worker_id="w9",
+                 meta={"kind": "discuss", "role": "planner"})[0]["result"] \
+        == "recorded only (target is not the live stage session)"
+    assert asked == []
+
+
+def _reminder_ticket(dw, monkeypatch):
+    """An unsupervised (github-backed) plan discussion awaiting the planner,
+    whose session SID is running; the fallback reminder rides a fake live
+    transport that records a real pre-send receipt (nonce offset)."""
+    ref = dw.q.enqueue(project=PQ, note="plan me", source="test", gates=["plan"])["ref"]
+
+    def _do(it, plan):
+        plan.update(status="discussing", round=1, version=1, text="v1",
+                    planner={"worker_id": "lq-planner"},
+                    discussion={"status": "active", "awaiting": "planner", "round": 1,
+                                "nudges": 0, "objections": "no tests",
+                                "updated_at": "2000-01-01T00:00:00Z"})
+    dw.q._plan_update(ref, _do)
+    monkeypatch.setattr(dw.stages, "_github_backed", lambda it: True)
+    monkeypatch.setattr(dw.cli, "_plan_role_alive", lambda item, role: True)
+    p = _transcript()
+    import watchtower.messages as messages
+    sent = []
+
+    def send(target, body, **kw):
+        rec = dw.receipts.record(SID, body, "uds", nonce=dw.receipts.nonce_of(body))
+        sent.append(body)
+        return {"ok": True, "transport": "uds", "receipt_id": rec["id"]}
+    monkeypatch.setattr(messages, "send", send)
+    return ref, p, sent
+
+
+def test_plan_reminder_counts_only_when_its_nonce_lands(dw, monkeypatch):
+    """Verifier probe (WT-31 D4): delivery {ok, pending} must not bump
+    ``nudges`` nor count as success; the ledger's confirmed handler does."""
+    ref, p, sent = _reminder_ticket(dw, monkeypatch)
+    assert dw.cli.recover_plan_discussions(PQ, stale_s=0) == 0
+    disc = dw.q.get(ref)["plan"]["discussion"]
+    assert disc["nudges"] == 0 and disc["reminder"]["role"] == "planner"
+    row = dw.liveness.delivery_row(f"plan:{ref}:planner:reminder")
+    assert row["state"] == "pending" and not row.get("unverified")
+    assert dw.liveness.sweep_deliveries() == []          # nothing landed yet: still pending
+    assert dw.q.get(ref)["plan"]["discussion"]["nudges"] == 0
+    assert dw.cli.recover_plan_discussions(PQ, stale_s=0) == 0 and len(sent) == 1
+    _append(p, "unrelated output")
+    assert dw.liveness.sweep_deliveries() == []          # advanced is not landed
+    _append(p, sent[0])                                  # the planner read it
+    out = dw.liveness.sweep_deliveries()
+    assert [(r["state"], r["result"]) for r in out] == [("confirmed", "nudge counted")]
+    disc = dw.q.get(ref)["plan"]["discussion"]
+    assert disc["nudges"] == 1 and "reminder" not in disc
+
+
+def test_plan_reminder_lost_escalates_without_counting(dw, monkeypatch):
+    ref, p, sent = _reminder_ticket(dw, monkeypatch)
+    assert dw.cli.recover_plan_discussions(PQ, stale_s=0) == 0
+    out = dw.liveness.sweep_deliveries(now=_later(dw))
+    assert [(r["state"], r["result"]) for r in out] == [("lost", "escalated")]
+    it = dw.q.get(ref)
+    assert it["plan"]["status"] == "blocked" and it["plan"]["discussion"]["nudges"] == 0
+    assert it["needs_input"] and "never landed" in it["block_question"]
 
 
 # ------------------------------------------------- D2.8 transport allowlist

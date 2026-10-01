@@ -578,9 +578,9 @@ def test_plan_send_is_live_only(plan_cli, monkeypatch):
     monkeypatch.setattr(messages, "send", lambda t, x, **kw: seen.append(kw) or
                         {"ok": False, "queued": True})
     item = {"plan": {"planner": {"worker_id": "w1"}}}
-    assert cli._plan_send(item, "planner", "hi") is False
+    assert cli._plan_send(item, "planner", "hi")["ok"] is False
     assert seen == [{"live_only": True}]
-    assert cli._plan_send(item, "reviewer", "hi") is False      # no worker id
+    assert cli._plan_send(item, "reviewer", "hi")["ok"] is False      # no worker id
 
 
 def test_discuss_peer_exits_after_precheck_is_recorded_not_delivered(plan_cli, monkeypatch, capsys):
@@ -628,7 +628,7 @@ def test_fallback_nudge_to_dead_peer_blocks_immediately(plan_cli, monkeypatch):
     q, cli = plan_cli.q, plan_cli.cli
     ref = _github_plan(plan_cli, monkeypatch)
     monkeypatch.setattr(cli, "_plan_role_alive", lambda item, role: False)
-    assert cli.recover_plan_discussions("GT", stale_s=0) == 0
+    assert cli.recover_plan_discussions("GT", stale_s=0) == 1     # escalated
     it = q.get(ref)
     assert it["plan"]["status"] == "blocked" and it["plan"]["discussion"]["nudges"] == 0
     assert "not running" in it["block_question"] and "wt plan decide" in it["block_question"]
@@ -641,27 +641,61 @@ def test_fallback_nudge_undelivered_blocks_without_resume_or_outbox(plan_cli, mo
     ref = _github_plan(plan_cli, monkeypatch)
     monkeypatch.setattr(cli, "_plan_role_alive", lambda item, role: True)
     _live_only_spies(monkeypatch, lambda n: pytest.fail(f"{n} must not run"))
-    assert cli.recover_plan_discussions("GT", stale_s=0) == 0
+    assert cli.recover_plan_discussions("GT", stale_s=0) == 1     # escalated
     it = q.get(ref)
     assert it["plan"]["status"] == "blocked" and it["plan"]["discussion"]["nudges"] == 0
     assert "undelivered" in it["block_question"]
     assert messages.outbox_list() == []
 
 
-def test_fallback_nudge_delivered_counts_then_escalates(plan_cli, monkeypatch):
+def test_fallback_nudge_counts_only_on_the_ledger_confirm(plan_cli, monkeypatch):
+    """WT-31 D4: transport ok is not delivery. A sent reminder is pending (no
+    nudge, no success, no second send); only the delivery ledger's confirmed
+    handler counts it, and past the max it escalates."""
     q, cli = plan_cli.q, plan_cli.cli
-    from watchtower import messages
+    from watchtower import liveness, messages
     ref = _github_plan(plan_cli, monkeypatch)
     sent = []
     monkeypatch.setattr(cli, "_plan_role_alive", lambda item, role: True)
     monkeypatch.setattr(messages, "send",
                         lambda t, x, **kw: sent.append(kw) or {"ok": True, "transport": "uds"})
     assert cli.recover_plan_discussions("GT", stale_s=3600) == 0   # fresh: nothing due
+    assert sent == []
     for n in range(q.PLAN_DISCUSSION_MAX_NUDGES):
-        assert cli.recover_plan_discussions("GT", stale_s=0) == 1
-        assert q.get(ref)["plan"]["discussion"]["nudges"] == n + 1
+        assert cli.recover_plan_discussions("GT", stale_s=0) == 0
+        disc = q.get(ref)["plan"]["discussion"]
+        assert disc["nudges"] == n and disc["reminder"]["delivery_id"]   # pending, uncounted
+        assert cli.recover_plan_discussions("GT", stale_s=0) == 0       # no second send
+        assert len(sent) == n + 1
+        row = liveness.delivery_row(f"plan:{ref}:planner:reminder")
+        assert row["state"] == "pending"
+        # the ledger confirms it (its nonce landed): only now is it counted
+        assert liveness._h_plan(dict(row, state="confirmed"), True) == "nudge counted"
+        disc = q.get(ref)["plan"]["discussion"]
+        assert disc["nudges"] == n + 1 and "reminder" not in disc
+        assert liveness._h_plan(dict(row, state="confirmed"), True) == \
+            "noop (discussion moved on)"                                # stale confirm
     assert all(kw == {"live_only": True} for kw in sent)
     cli.recover_plan_discussions("GT", stale_s=0)
+    row = liveness.delivery_row(f"plan:{ref}:planner:reminder")
+    assert liveness._h_plan(dict(row, state="confirmed"), True) == "escalated"
     it = q.get(ref)
     assert it["plan"]["status"] == "blocked"
     assert "unresponsive after" in it["block_question"] and "delivered reminders" in it["block_question"]
+
+
+def test_fallback_nudge_unverified_send_is_lost_and_blocks(plan_cli, monkeypatch):
+    """Transport ok with no receipt source is unverified: the delivery sweep
+    reads it lost and the handler blocks the plan; nudges never move."""
+    q, cli = plan_cli.q, plan_cli.cli
+    from watchtower import liveness, messages
+    ref = _github_plan(plan_cli, monkeypatch)
+    monkeypatch.setattr(cli, "_plan_role_alive", lambda item, role: True)
+    monkeypatch.setattr(messages, "send", lambda t, x, **kw: {"ok": True, "transport": "uds"})
+    assert cli.recover_plan_discussions("GT", stale_s=0) == 0
+    assert q.get(ref)["plan"]["status"] == "discussing"
+    out = [r for r in liveness.sweep_deliveries() if r["purpose"] == "plan"]
+    assert [(r["state"], r["result"]) for r in out] == [("lost", "escalated")]
+    it = q.get(ref)
+    assert it["plan"]["status"] == "blocked" and it["plan"]["discussion"]["nudges"] == 0
+    assert "never landed" in it["block_question"] and it["needs_input"] is True

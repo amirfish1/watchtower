@@ -249,6 +249,7 @@ log until it exits), other engines by log mtime. Dead stage records are kept
 | `STAGE_QUEUED` | A CLI transition requested a stage; wake file touched. |
 | `STAGE_SPAWN` | A stage session started (`attempt n/2`, `cause=initial|respawn|retry|adopted`). |
 | `STAGE_DEAD` | A session died or could not start, with the reason and exit forensics. |
+| `STAGE_LOST` | A verified plan message to the live stage session never landed; the next pass kills it and respawns (one attempt). |
 | `STAGE_WAIT` | Spawn deferred by an engine launch cooldown (logged once). |
 | `STAGE_DEFER` | Per-tick spawn cap (`WATCHTOWER_STAGE_SPAWNS_PER_TICK`) reached. |
 | `STAGE_BLOCK` | Out of attempts; the ticket is waiting for a human. |
@@ -276,11 +277,25 @@ Plan messages (`wt plan discuss`, fallback reminders) use the live-only
 transport (`messages.send(..., live_only=True)`: UDS, then WT stdin FIFO; never
 the delegate, a resume, or the outbox). A send result is never taken as
 liveness: `wt plan discuss` to a peer that is not running is recorded in the
-transcript and reported as "recorded". The reminder/nudge fallback
-(`recover_plan_discussions`) only covers tickets outside the supervisor
-(github-backed queues): a dead peer blocks the plan for a human at once, an
-undelivered reminder blocks without counting, and only delivered reminders
-count toward `PLAN_DISCUSSION_MAX_NUDGES`.
+transcript and reported as "recorded"; a live send is reported as "sent live;
+awaiting its receipt". The reminder/nudge fallback (`recover_plan_discussions`)
+only covers tickets outside the supervisor (github-backed or otherwise
+unsupervised): a dead peer blocks the plan for a human at once, and a send no
+transport took blocks without counting. A reminder a live transport took is
+**not** counted yet (WT-31 D4): it is noted as `discussion.reminder =
+{delivery_id, role, at}` (no second reminder while it is pending), and the
+delivery ledger settles it. Only its confirmed nonce bumps `nudges` toward
+`PLAN_DISCUSSION_MAX_NUDGES` (escalating past it); a lost or unverified one
+blocks the plan for a human. Both are compare-and-swaps on the pending
+`delivery_id`, so a late outcome after the discussion moved on is a no-op.
+
+A lost plan message to the ticket's **live stage session** (`wt plan discuss`
+to the participant the supervisor adopted) means that session is not working
+the turn: `stages.mark_delivery_lost` sets `stage_session.lost`, and the next
+`_supervise` pass kills the session, records the death (`delivery lost: ...`,
+one attempt of the 2-attempt budget) and respawns it, or escalates once the
+budget is spent. A lost message to anyone else (not the current stage session)
+is only recorded; the next turn reads the transcript.
 
 ## Auditable idle decisions
 
@@ -756,7 +771,7 @@ It then runs the purpose's handler and logs
 | `stage_answer` | `stage_answer:<ref>:<gen>:<key>` | E13 `stages._confirm_stage_answer` | stays `handed_off` |
 | `nudge` | `nudge:<worker_id>` | clears `undeliverable_since` | resend once, then set `undeliverable_since` on the worker record |
 | `release` | `release:<worker_id>` | - | resend once, then `RELEASE_UNDELIVERED` |
-| `plan` | `plan:<ref>:<role>:<kind>` | - | `stages.request` (respawn); a reminder also records an undelivered nudge |
+| `plan` | `plan:<ref>:<role>:<kind>` | a `reminder` bumps `nudges` (escalates past the max) | a `reminder` blocks the plan for a human; any other message to the live stage session marks it lost (killed, death recorded, respawned within the attempt budget) |
 | `review` | `review:<ref>:<n>` | - | renotify once, then `wt blocked` (system block) |
 | `resume` | `resume:<ref>:<sid>` | - | `set_resume_state(failed)` |
 

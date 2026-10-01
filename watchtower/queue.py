@@ -2873,12 +2873,15 @@ def plan_pending(item: Dict[str, Any]) -> bool:
 
 
 def _plan_update(ident: Any, fn) -> Optional[Dict[str, Any]]:
+    """Run ``fn(item, plan)`` under the store lock; one save. ``fn`` returning
+    ``"skip"`` leaves the store untouched and returns None (a failed CAS)."""
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
                 plan = dict(it.get("plan") or {})
-                fn(it, plan)
+                if fn(it, plan) == "skip":
+                    return None
                 it["plan"] = plan
                 it["updated_at"] = _now_iso()
                 _save_unlocked(data)
@@ -3072,15 +3075,24 @@ def plan_discuss(ident: Any, role: str, text: str) -> Optional[Dict[str, Any]]:
     return _plan_update(ident, _do)
 
 
+# A fallback reminder whose delivery the ledger has not settled yet holds off
+# the next one; past this age (ledger row pruned / no sweep) it is ignored.
+PLAN_REMINDER_PENDING_S = 3600.0
+
+
 def plan_discussion_due(ident: Any, stale_s: float = 900.0) -> Optional[str]:
     """Read-only: the role a stalled active discussion is waiting on (silent
-    for ``stale_s``), else None."""
+    for ``stale_s``), else None. None while a reminder's delivery is still
+    awaiting its receipt (WT-31 D4: the ledger settles it)."""
     current = get(ident)
     if current is None:
         return None
     plan = current.get("plan") or {}
     disc = plan.get("discussion") or {}
     if disc.get("status") != "active" or not disc.get("awaiting"):
+        return None
+    pending = disc.get("reminder") if isinstance(disc.get("reminder"), dict) else {}
+    if pending and time.time() - _iso_ts(pending.get("at")) < PLAN_REMINDER_PENDING_S:
         return None
     try:
         age = time.time() - datetime.fromisoformat(
@@ -3093,16 +3105,41 @@ def plan_discussion_due(ident: Any, stale_s: float = 900.0) -> Optional[str]:
     return str(disc["awaiting"])
 
 
+def plan_discussion_reminder_sent(ident: Any, delivery_id: str,
+                                  role: str = "") -> Optional[Dict[str, Any]]:
+    """A fallback reminder went out and awaits its receipt (WT-31 D4): note
+    the delivery so no second reminder is sent meanwhile. ``nudges`` is left
+    alone -- only the ledger's confirmed handler counts a reminder."""
+    def _do(it, plan):
+        disc = dict(plan.get("discussion") or {})
+        if disc.get("status") != "active":
+            return "skip"
+        disc["reminder"] = {"delivery_id": str(delivery_id), "role": str(role or ""),
+                            "at": _now_iso()}
+        plan["discussion"] = disc
+    return _plan_update(ident, _do)
+
+
 def plan_discussion_record_nudge(ident: Any, delivered: bool,
-                                 reason: str = "") -> Optional[Dict[str, Any]]:
+                                 reason: str = "",
+                                 delivery_id: str = "") -> Optional[Dict[str, Any]]:
     """Record the outcome of a reminder to the awaited party (WT-29). A
     delivered reminder bumps ``nudges`` and blocks the plan once it exceeds
     PLAN_DISCUSSION_MAX_NUDGES; an undelivered one blocks right away with
-    ``reason`` (nobody is there to remind) and leaves ``nudges`` alone."""
+    ``reason`` (nobody is there to remind) and leaves ``nudges`` alone.
+
+    With ``delivery_id`` (the delivery ledger settling a sent reminder,
+    WT-31 D4) it is a compare-and-swap on the pending reminder: a stale
+    outcome (the discussion moved on, or another reminder is pending)
+    returns None and changes nothing."""
     def _do(it, plan):
         disc = plan.get("discussion") or {}
         if disc.get("status") != "active":
-            return
+            return "skip" if delivery_id else None
+        pending = disc.get("reminder") if isinstance(disc.get("reminder"), dict) else {}
+        if delivery_id and str(pending.get("delivery_id") or "") != str(delivery_id):
+            return "skip"
+        disc.pop("reminder", None)
         role = disc.get("awaiting")
         disc["updated_at"] = _now_iso()
         if delivered:

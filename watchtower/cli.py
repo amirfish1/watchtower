@@ -1233,27 +1233,43 @@ def _plan_role_alive(item: dict, role: str) -> bool:
     return bool(wid) and stages.session_alive(str(wid))
 
 
-def _plan_send(item: dict, role: str, text: str, kind: str = "discuss") -> bool:
+def _plan_send(item: dict, role: str, text: str, kind: str = "discuss") -> dict:
     """Message the planner/reviewer session of ``item`` over a live-only
     transport (UDS / WT stdin FIFO): never parks in the outbox, never spawns or
-    resumes a session. True only when a running peer took it. Verified (WT-31
-    D4, ``plan:<ref>:<role>:<kind>``): a message whose nonce never lands asks
-    the stage supervisor to respawn; a lost ``reminder`` blocks the plan."""
+    resumes a session. Returns the ``liveness.deliver`` result: ``ok`` means a
+    running peer took it (sent), NOT that it was read. Verified (WT-31 D4,
+    ``plan:<ref>:<role>:<kind>``): the delivery ledger settles it -- a lost
+    message marks the live stage session lost so the supervisor respawns it;
+    a reminder is counted only when its nonce lands, and a lost one blocks the
+    plan (``liveness._h_plan``)."""
     wid = ((item.get("plan") or {}).get(role) or {}).get("worker_id")
     if not wid:
-        return False
+        return {"ok": False, "state": "failed", "error": "no worker id"}
     try:
         from . import liveness
         ref = str(item.get("ref") or "")
-        res = liveness.deliver(str(wid), text, purpose="plan",
-                               dedupe_key=f"plan:{ref}:{role}:{kind}", ref=ref,
-                               queue=str(item.get("project") or ""), worker_id=str(wid),
-                               transports=("message",),
-                               message={"fn": "send", "live_only": True},
-                               meta={"kind": kind, "role": role})
-        return bool(res.get("ok"))
-    except Exception:  # noqa: BLE001
+        return liveness.deliver(str(wid), text, purpose="plan",
+                                dedupe_key=f"plan:{ref}:{role}:{kind}", ref=ref,
+                                queue=str(item.get("project") or ""), worker_id=str(wid),
+                                transports=("message",),
+                                message={"fn": "send", "live_only": True},
+                                meta={"kind": kind, "role": role})
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "state": "failed", "error": str(exc)}
+
+
+def _block_stalled_plan(ref: str, item: Optional[dict]) -> bool:
+    """A plan discussion just escalated (``plan.status == blocked``): put the
+    question to a human. True when it blocked."""
+    if not item or (item.get("plan") or {}).get("status") != "blocked":
         return False
+    q.block(ref, str(item.get("claimed_session_id") or ""), origin="plan_gate",
+            question=(f"Plan discussion stalled: "
+                      f"{item['plan'].get('discussion', {}).get('reason', '')}. "
+                      f"Decide with `wt plan decide {ref} --accept|--retry`."),
+            progress=f"Plan v{item['plan'].get('version')}:\n"
+                     f"{item['plan'].get('text', '')}")
+    return True
 
 
 def _plan_discussion_goal(item: dict, role: str) -> str:
@@ -1298,8 +1314,12 @@ def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
 
     A reminder goes out only to a peer that is running, over the live-only
     transport. A dead or unreachable peer blocks the plan for a human at once
-    (nobody to remind); a delivered reminder counts toward
-    q.PLAN_DISCUSSION_MAX_NUDGES. Never spawns. Returns delivered reminders."""
+    (nobody to remind). A sent reminder is NOT a delivered one (WT-31 D4): it
+    is noted as pending and the delivery ledger settles it -- the nonce
+    landing counts it toward q.PLAN_DISCUSSION_MAX_NUDGES, a lost/unverified
+    one blocks the plan (``liveness._h_plan``). No second reminder goes out
+    while one is pending. Never spawns. Returns how many discussions this
+    call escalated to a human."""
     n = 0
     try:
         for it in q.list_items(project=queue) or []:
@@ -1313,25 +1333,26 @@ def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
             ref = it["ref"]
             disc = (it.get("plan") or {}).get("discussion") or {}
             wid = ((it.get("plan") or {}).get(role) or {}).get("worker_id") or ""
+            nudged = None
             if not _plan_role_alive(it, role):
                 nudged = q.plan_discussion_record_nudge(
                     ref, False, f"{role} session is not running (worker {wid or '-'} "
                                 f"exited); no one to deliver to")
             else:
-                ok = _plan_send(it, role,
-                                f"Reminder: {ref} plan discussion is waiting on you ({role}). "
-                                f"Objections: {disc.get('objections', '')}. "
-                                f"See `wt plan show {ref}`.", "reminder")
-                nudged = q.plan_discussion_record_nudge(
-                    ref, ok, f"reminder to {role} undelivered (no live transport to worker {wid})")
-                n += 1 if ok else 0
-            if nudged and (nudged.get("plan") or {}).get("status") == "blocked":
-                q.block(ref, str(nudged.get("claimed_session_id") or ""), origin="plan_gate",
-                        question=(f"Plan discussion stalled: "
-                                  f"{nudged['plan']['discussion'].get('reason', '')}. "
-                                  f"Decide with `wt plan decide {ref} --accept|--retry`."),
-                        progress=f"Plan v{nudged['plan'].get('version')}:\n"
-                                 f"{nudged['plan'].get('text', '')}")
+                res = _plan_send(it, role,
+                                 f"Reminder: {ref} plan discussion is waiting on you ({role}). "
+                                 f"Objections: {disc.get('objections', '')}. "
+                                 f"See `wt plan show {ref}`.", "reminder")
+                if res.get("ok") and res.get("delivery_id") and \
+                        res.get("state") in ("pending", "unverified"):
+                    # sent: the ledger's handler counts it or escalates it
+                    q.plan_discussion_reminder_sent(ref, str(res["delivery_id"]), role)
+                elif not res.get("ok"):
+                    nudged = q.plan_discussion_record_nudge(
+                        ref, False,
+                        f"reminder to {role} undelivered (no live transport to worker {wid})")
+            if _block_stalled_plan(ref, nudged):
+                n += 1
     except Exception:  # noqa: BLE001
         pass
     return n
@@ -1413,9 +1434,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
             peer = "reviewer" if args.sender == "planner" else "planner"
             sent = (_plan_role_alive(item, peer)
                     and _plan_send(item, peer, f"[{ref} plan discussion, from the "
-                                               f"{args.sender}] {args.text}"))
+                                               f"{args.sender}] {args.text}").get("ok"))
             print(f"DISCUSSION: {ref} {args.sender} -> {peer} "
-                  + ("(delivered live)" if sent else
+                  + ("(sent live; awaiting its receipt)" if sent else
                      "(recorded; peer not running / not reachable live, its next turn sees it)"))
         elif action == "decide":
             text = args.text or ""

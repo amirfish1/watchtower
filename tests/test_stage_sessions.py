@@ -821,6 +821,54 @@ def test_discussion_turn_killed_twice_escalates_then_answer_retry_resumes(stg, m
     assert _ss(stg, ref)["key"] == "discuss:r1:d1:planner" and _ss(stg, ref)["attempt"] == 1
 
 
+def _lose_plan_message(ns, ref, monkeypatch, text="please answer"):
+    """``wt plan discuss`` to the live planner turn over a transport that
+    takes it but gives no receipt (unverified), then the daemon's delivery
+    sweep: the ledger reads it lost and runs ``liveness._h_plan``."""
+    from watchtower import liveness, messages
+    monkeypatch.setattr(messages, "send", lambda t, x, **kw: {"ok": True, "transport": "uds"})
+    res = ns.cli._plan_send(ns.q.get(ref), "planner", text)
+    assert res["ok"] and res["state"] == "unverified"
+    out = [r for r in liveness.sweep_deliveries() if r["purpose"] == "plan"]
+    assert [(r["state"], r["result"]) for r in out] == \
+        [("lost", "respawn: stage session marked lost")]
+
+
+def test_lost_plan_message_respawns_the_live_stage_session(stg, monkeypatch):
+    """WT-31 D4 (verifier finding): a lost discuss delivery to a LIVE stage
+    session must actually respawn it through the real supervisor -- kill the
+    deaf session, record the death against the attempt budget, spawn fresh --
+    and escalate once the budget is spent. No mocked ``stages.request``."""
+    ref = _to_discussion(stg)
+    _tick(stg)                                   # planner discussion turn (live)
+    ss = _ss(stg, ref)
+    old_wid, old_pid = ss["worker_id"], int(ss["pid"])
+    assert ss["key"] == "discuss:r1:d1:planner" and ss["attempt"] == 1
+    assert stg.stages.session_alive(old_wid)
+    n = len(stg.spawned)
+    _lose_plan_message(stg, ref, monkeypatch)
+    assert _ss(stg, ref)["lost"]["worker_id"] == old_wid
+    assert _activity(stg, "STAGE_LOST", ref)
+    acted = _tick(stg)
+    assert (ref, "spawned") in acted
+    ss = _ss(stg, ref)
+    assert len(stg.spawned) == n + 1 and ss["attempt"] == 2
+    assert ss["worker_id"] not in ("", old_wid) and "lost" not in ss
+    assert ss["deaths"][-1]["reason"].startswith("delivery lost")
+    assert _wait(lambda: not stg.workers._pid_alive(old_pid))      # the deaf one is gone
+    it = stg.q.get(ref)
+    assert it["plan"]["planner"]["worker_id"] == ss["worker_id"]
+    spawn = [h for h in it["history"] if h.get("event") == "stage_spawn"][-1]
+    assert spawn["cause"] == "respawn" and it["needs_input"] is False
+    # lost again on the last attempt: the budget is spent -> a human decides
+    _lose_plan_message(stg, ref, monkeypatch, "still there?")
+    _tick(stg)
+    it = stg.q.get(ref)
+    assert len(stg.spawned) == n + 1             # no third session
+    assert it["needs_input"] is True and it["plan"]["status"] == "blocked"
+    assert "died twice" in it["block_question"] and "delivery lost" in it["block_question"]
+
+
 def test_live_planner_is_adopted_not_duplicated_on_reject(stg):
     stg.script[:] = [SLEEP]
     ref = _plan_ticket(stg)
