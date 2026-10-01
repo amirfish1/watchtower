@@ -164,6 +164,15 @@ ANSWER_STATES = ("none", "routing", "delivering", "queued", "delivered", "affini
 ANSWER_SETTLED = ("none", "delivered", "handed_off")
 ANSWER_INFLIGHT = ("routing", "delivering", "queued", "affinity", "affinity_expired")
 _PA_STORED = ("routing", "delivering", "queued", "delivered", "affinity", "handed_off")
+# Plan groups (WT-33). ``group.role``; the projected group plan (``pending``
+# until the parent is sealed and its plan accepted/failed); the stored
+# ``group.integration.state`` (``gating_stale`` = a gating lease past its TTL
+# is projection-only); the parent's completion proof against the live child
+# commit map (``forced`` = force-accepted with ``proof: none``).
+GROUP_ROLES = ("parent", "child")
+GROUP_PLAN_STATES = ("pending", "settled")
+INTEGRATION_STATES = ("idle", "gating", "verifying", "reviewing", "fixing", "capped", "done")
+GROUP_PROOF_STATES = ("none", "match", "stale", "forced")
 VALID_VALUES = ("H", "M", "L", "")
 VALID_CONFIDENCES = ("H", "M", "L", "")
 # FEAT-NEXT-120 — a filer's best-guess minimum model this ticket needs. Not a
@@ -1422,8 +1431,16 @@ def enqueue(
     gates: Optional[List[str]] = None,
     accept_line: str = "",
     assessment_origin: str = "",
+    group_parent: bool = False,
+    group: str = "",
+    children: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
+
+    Plan groups (WT-33, local store only): ``group_parent`` files a group
+    parent (gates always include ``plan``; ``verify`` unless ``gates`` omits
+    it); ``children`` attaches those tickets and seals the group in the same
+    write. ``group`` files a new member of that unsealed parent.
 
     ``blocked_by``: refs of tickets that must close (completed) before this one
     is claimable (WT-4); validated -- unknown refs raise ValueError.
@@ -1454,6 +1471,20 @@ def enqueue(
     # entries behind). A queue that is never run or drain-enabled leaves no
     # trace in queue-config.json.
     backend = _github_backend_for_project(proj)
+    grouped = bool(group_parent or group or children)
+    if grouped:
+        if backend is not None:
+            raise ValueError("plan groups are not supported on GitHub-backed queues")
+        if group_parent and group:
+            raise ValueError("a ticket is either a group parent (--group-parent) or a member "
+                             "(--group), not both")
+        if children and not group_parent:
+            raise ValueError("--children needs --group-parent")
+        if group_parent and blocked_by:
+            raise ValueError("a group parent's dependencies are its members; use --children "
+                             "or `wt group attach`")
+        if group_parent:
+            gates = _parent_gates(gates)
     if backend is not None:
         if blocked_by:
             raise ValueError("ticket dependencies (--after) are not supported on GitHub-backed queues")
@@ -1488,9 +1519,37 @@ def enqueue(
             planner_model=planner_model, verifier_model=verifier_model, submitter=submitter,
             submitter_explicit=submitter_explicit, pre_ack=pre_ack, blocked_by=blocked_by,
             gates=gates, accept_line=accept_line, assessment_origin=assessment_origin)
+        if grouped:
+            # Raising here leaves the store untouched (nothing saved yet).
+            _group_enqueue_unlocked(data, saved, group_parent, group, list(children or []))
         _save_unlocked(data)
     _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
+    if group_parent and children:
+        _group_wake([str(saved.get("ref"))], "seal")
     return saved
+
+
+def _group_enqueue_unlocked(data: Dict[str, Any], saved: Dict[str, Any], group_parent: bool,
+                            group: str, children: List[str]) -> None:
+    now = _now_iso()
+    items = data["items"]
+    if group_parent:
+        saved["group"] = {"role": "parent", "members": [], "fixes": [], "sealed": False,
+                          "membership_version": 0, "integration": _new_integration()}
+        _append_history(saved, "group_parent", by=_by("system"), at=now)
+        for raw in children:
+            _group_add_member_unlocked(data, saved, _find_unlocked(items, raw), now)
+        if children:
+            _group_seal_unlocked(saved, now)
+        _validate_group_unlocked(items, saved)
+        return
+    parent = next((it for it in items if _matches(it, group)), None)
+    if parent is None or group_role(parent) != "parent":
+        raise ValueError(f"{group} is not a group parent")
+    if str(parent.get("ref")) in (saved.get("blocked_by") or []):
+        raise ValueError(f"a member cannot be blocked by its own group parent {parent.get('ref')}")
+    _group_add_member_unlocked(data, parent, saved, now)
+    _validate_group_unlocked(items, parent)
 
 
 def list_items(
@@ -1683,13 +1742,20 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                 now = _now_iso()
                 if "gates" in fields:
                     fields = dict(fields)
-                    fields["gates"] = validate_gates(fields["gates"])
+                    fields["gates"] = (_parent_gates(fields["gates"]) if group_role(it) == "parent"
+                                       else validate_gates(fields["gates"]))
                 if "blocked_by" in fields:
+                    if group_role(it) == "parent":
+                        raise ValueError(f"{it.get('ref')} is a group parent: its dependencies "
+                                         "are its members (wt group attach / detach)")
                     fields = dict(fields)
                     fields["blocked_by"] = _validate_blocked_by(
                         data["items"], str(it.get("ref") or ""),
                         list(fields["blocked_by"] or []),
                     )
+                    if group_parent_ref(it) and group_parent_ref(it) in fields["blocked_by"]:
+                        raise ValueError(f"{it.get('ref')} cannot be blocked by its own group "
+                                         f"parent {group_parent_ref(it)}")
                 edge_from = _pa_edge_start(it)
                 for k, v in fields.items():
                     if k in ALLOWED:
@@ -1743,6 +1809,9 @@ def move(ident: Any, new_project: str) -> Optional[Dict[str, Any]]:
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
+                if group_role(it):
+                    raise ValueError(f"{it.get('ref')} is in a plan group; a group lives in "
+                                     "one queue (detach it first)")
                 old_ref = it.get("ref", "")
                 old_project = it.get("project", "")
                 it["project"] = new_project
@@ -1942,6 +2011,12 @@ def _claim_candidates(
     # Plan gate (WT-22): a ticket is planned BEFORE a build worker claims it,
     # so one whose plan has not settled is not claimable yet.
     candidates = [it for it in candidates if not plan_pending(it)]
+    if any(group_role(it) for it in candidates):
+        # Plan groups (WT-33): a parent is never claimed; a member waits for
+        # its parent's plan (and its own dependencies).
+        gref = _refs_index(all_items if all_items is not None else items)
+        candidates = [it for it in candidates
+                      if not group_role(it) or not _group_claim_refusal_unlocked(it, gref)]
     if worker_model is not None:
         from . import config
         candidates = [
@@ -2299,7 +2374,9 @@ def claim_next(
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
-        _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
+        gfields = _stamp_claim_unlocked(item, data["items"], "claim_next", item["claimed_at"])
+        _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")),
+                        at=item["claimed_at"], **gfields)
         item["claim_proc"] = _claim_proc_for(session_id, real_sid or "")
         _bind_pending_unlocked(item, str(session_id), str(real_sid or ""), item["claimed_at"])
         _save_unlocked(data)
@@ -2368,6 +2445,7 @@ def claim_by_ref(
             _raise_sent_back_refused(sb_held[0], session_id)
         if status != "open":
             raise ValueError(f"{ref} is not open (status={status})")
+        _group_claim_check_unlocked(data["items"], item)   # WT-33
         reserved = _affinity_gate_unlocked(item, str(session_id), str(real_sid or ""), time.time())
         if reserved:
             raise ValueError(reserved)
@@ -2385,7 +2463,9 @@ def claim_by_ref(
             item["claimed_session_id"] = real_sid
         item["claimed_at"] = _now_iso()
         item["updated_at"] = item["claimed_at"]
-        _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=item["claimed_at"])
+        gfields = _stamp_claim_unlocked(item, data["items"], "claim_by_ref", item["claimed_at"])
+        _append_history(item, "claim", by=_by("worker", str(session_id), str(real_sid or "")),
+                        at=item["claimed_at"], **gfields)
         item["claim_proc"] = _claim_proc_for(session_id, real_sid or "")
         _bind_pending_unlocked(item, str(session_id), str(real_sid or ""), item["claimed_at"])
         _save_unlocked(data)
@@ -2553,8 +2633,15 @@ def update_status(
     answer_fate: str = "handoff",
     orphan: Optional[Dict[str, str]] = None,
     close_owner: str = "",
+    group_force: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """``close_owner`` (WT-34): run the close-ownership guard
+    """``group_force`` (WT-33 D9): taking a closed group child out of
+    ``closed`` while its parent integrates raises ``GroupChildLocked`` unless
+    set, which invalidates that integration in the same write. A group parent
+    never moves through here (its plan and integration own its status); a
+    group child claimed here passes the group claim check.
+
+    ``close_owner`` (WT-34): run the close-ownership guard
     (``_close_owner_guard_unlocked``) in the lock for ANY target status -- the
     failed-gate reopen of a worker-attributed close passes it. ``expect_owner``
     is the same guard, applied only when ``status == "closed"``.
@@ -2645,6 +2732,14 @@ def update_status(
                 _close_owner_guard_unlocked(
                     it, ident, close_owner or (expect_owner if status == "closed" else ""),
                     str(real_sid or ""))
+                if group_role(it) == "parent":
+                    raise ValueError(
+                        f"{it.get('ref')} is a group parent: its status moves only through its "
+                        f"plan and integration (`wt group show {it.get('ref')}`)")
+                if status == "in_progress":
+                    _group_claim_check_unlocked(data["items"], it)
+                _group_child_change_unlocked(data["items"], it, status, group_force)
+                gfields: Dict[str, Any] = {}
                 it["status"] = status
                 now = _now_iso()
                 it["updated_at"] = now
@@ -2661,7 +2756,9 @@ def update_status(
                     if real_sid:
                         it["claimed_session_id"] = real_sid
                     it["claim_proc"] = _claim_proc_for(session_id, real_sid or "")
-                    _append_history(it, "claim", by=_by("worker", str(session_id), str(real_sid or "")), at=now)
+                    gfields = _stamp_claim_unlocked(it, data["items"], "update_status", now)
+                    _append_history(it, "claim", by=_by("worker", str(session_id), str(real_sid or "")),
+                                    at=now, **gfields)
                 if status == "closed" and not hold_review:
                     _drop_claim_proc_unlocked(it)   # hold_review keeps it (WT-30)
                 if status == "closed":
@@ -2854,7 +2951,14 @@ PLAN_DISCUSSION_MAX_NUDGES = 3
 
 def plan_gate(item: Dict[str, Any]) -> Optional[str]:
     """None when the ticket has no plan gate; else the gate's planner model
-    ("" when the gate is a bare ``plan``)."""
+    ("" when the gate is a bare ``plan``). A group child never plans alone,
+    and a group parent plans only once sealed (WT-33)."""
+    grp = item.get("group") if isinstance(item.get("group"), dict) else None
+    if grp:
+        if grp.get("role") == "child":
+            return None
+        if grp.get("role") == "parent" and not grp.get("sealed"):
+            return None
     for g in effective_gates(item):
         if g == "plan":
             return ""
@@ -2900,6 +3004,8 @@ def plan_start(ident: Any) -> Optional[Dict[str, Any]]:
         if plan.get("status") in ("planning", "reviewing", "discussing", "accepted", "failed", "blocked"):
             return
         plan.update(status="planning", round=1, text="", reviews=[])
+        if group_role(it) == "parent":
+            plan["membership_version"] = group_mv(it)
         _append_history(it, "plan_start", by=_by("system"), at=_now_iso())
         fresh.append(True)
 
@@ -2935,38 +3041,55 @@ def plan_fail(ident: Any, reason: str) -> Optional[Dict[str, Any]]:
 PLAN_TEXT_MAX = 24000
 
 
-def plan_submit(ident: Any, text: str, by: str = "planner") -> Optional[Dict[str, Any]]:
+def plan_submit(ident: Any, text: str, by: str = "planner",
+                expect_mv: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """The planner files (or revises) the plan; moves to ``reviewing``. Each
     submission is a new ``version``; during a discussion (WT-26) the amended
-    plan goes back to the same reviewer for an explicit verdict on it."""
+    plan goes back to the same reviewer for an explicit verdict on it.
+
+    A group parent (WT-33 D3) takes ``## Shared`` + one ``## Section: <REF>``
+    per member (``_split_group_plan``) under ``expect_mv`` (fenced)."""
     text = str(text or "").strip()
     if not text:
         raise ValueError("plan text is empty")
-    if len(text) > PLAN_TEXT_MAX:
+    current = get(ident)
+    is_parent = current is not None and group_role(current) == "parent"
+    if not is_parent and len(text) > PLAN_TEXT_MAX:
         # Clipping silently stored a plan cut mid-sentence (OPS-1300) that the
         # reviewer then judged as if complete; make the planner condense it.
         raise ValueError(f"plan text is {len(text)} chars, over the {PLAN_TEXT_MAX} "
                          f"limit; condense it (keep test and rollout sections) and resubmit")
-    current = get(ident)
     if current is None:
         return None
+    if is_parent:
+        _group_fence_mv(current, expect_mv)
+        _split_group_plan(text, list(current["group"].get("members") or []),
+                          (current.get("plan") or {}).get("sections") or {})
     if (current.get("plan") or {}).get("status") not in ("planning", "discussing"):
         raise ValueError(f"{current.get('ref', ident)} is not waiting for a plan "
                          f"(plan status {(current.get('plan') or {}).get('status') or 'none'})")
 
     def _do(it, plan):
+        stored = _clip(text, 24000)
+        if is_parent:
+            _group_fence_mv(it, expect_mv)
+            stored, sections = _split_group_plan(
+                text, list(it["group"].get("members") or []), plan.get("sections") or {})
+            plan["sections"] = sections
+            plan["membership_version"] = group_mv(it)
         disc = plan.get("discussion")
         if not (disc and disc.get("status") == "active"):
             _plan_archive_role(plan, "reviewer")
-        plan.update(status="reviewing", text=_clip(text, 24000),
+        plan.update(status="reviewing", text=stored,
                     version=int(plan.get("version") or 0) + 1)
         disc = plan.get("discussion")
         if disc and disc.get("status") == "active":
             disc.update(awaiting="reviewer", nudges=0, updated_at=_now_iso())
             plan["discussion"] = disc
         _append_history(it, "plan", by=_by("system"), at=_now_iso(),
-                        text=_clip(text, PLAN_TEXT_MAX), round=plan.get("round", 1),
-                        version=plan["version"], planner=str(by))
+                        text=_clip(text, GROUP_PLAN_TEXT_MAX if is_parent else PLAN_TEXT_MAX),
+                        round=plan.get("round", 1), version=plan["version"], planner=str(by),
+                        **({"mv": group_mv(it)} if is_parent else {}))
     return _plan_update(ident, _do)
 
 
@@ -2986,30 +3109,57 @@ def _plan_reachable(plan: Dict[str, Any]) -> bool:
 
 def plan_verdict(ident: Any, accepted: bool, reasons: str = "",
                  by: str = "plan-reviewer",
-                 version_seen: Optional[int] = None) -> Optional[Dict[str, Any]]:
+                 version_seen: Optional[int] = None, expect_mv: Optional[int] = None,
+                 sections: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """The plan reviewer's verdict on plan ``version_seen`` (default: current).
     Accept -> ``accepted`` (records ``accepted_version``). The first reject
     with both roles reachable opens a planner<->reviewer discussion
     (``discussing``, WT-26); each further reject is another discussion round
     until PLAN_DISCUSSION_ROUNDS, then ``blocked`` with a recorded reason (the
     caller blocks the ticket for a human). Without reachable roles: back to
-    ``planning`` (round + 1) while revisions remain, else ``blocked``."""
+    ``planning`` (round + 1) while revisions remain, else ``blocked``.
+
+    A group parent (WT-33 D4) is fenced on ``expect_mv``; a reject may name
+    the rejected member ``sections`` (recorded in ``section_reviews``; any
+    rejected section rejects the whole group plan)."""
     current = get(ident)
     if current is None:
         return None
+    _group_fence_mv(current, expect_mv)
+    if sections and group_role(current) != "parent":
+        raise ValueError("--section applies only to a group parent's plan")
+    if sections and accepted:
+        raise ValueError("--section names rejected sections; use it with --reject")
     if (current.get("plan") or {}).get("status") != "reviewing":
         raise ValueError(f"{current.get('ref', ident)} has no plan under review "
                          f"(plan status {(current.get('plan') or {}).get('status') or 'none'})")
 
     def _do(it, plan):
+        _group_fence_mv(it, expect_mv)
         rnd = int(plan.get("round") or 1)
         version = int(plan.get("version") or rnd)
         if version_seen is not None and int(version_seen) != version:
             raise ValueError(f"verdict is for plan v{version_seen} but the ticket holds "
                              f"v{version}; review the current plan")
+        rejected: List[str] = []
+        if group_role(it) == "parent":
+            members = list(it["group"].get("members") or [])
+            canon = {m.upper(): m for m in members}
+            for s in sections or []:
+                if str(s).upper() not in canon:
+                    raise ValueError(f"--section {s} is not a member of {it.get('ref')} "
+                                     f"({', '.join(members)})")
+                rejected.append(canon[str(s).upper()])
+            now_r = _now_iso()
+            plan["section_reviews"] = {
+                m: {"version": version, "accepted": bool(accepted) or m not in rejected,
+                    **({"reasons": _clip(reasons, 3000)} if m in rejected else {}),
+                    "at": now_r}
+                for m in members}
         plan["reviews"] = list(plan.get("reviews") or []) + [
             {"round": rnd, "version": version, "accepted": bool(accepted),
-             "reasons": _clip(reasons, 3000), "by": str(by), "at": _now_iso()}]
+             "reasons": _clip(reasons, 3000), "by": str(by), "at": _now_iso(),
+             **({"sections": rejected} if rejected else {})}]
         disc = plan.get("discussion") or None
         now = _now_iso()
         if accepted:
@@ -3046,10 +3196,12 @@ def plan_verdict(ident: Any, accepted: bool, reasons: str = "",
     return _plan_update(ident, _do)
 
 
-def plan_discuss(ident: Any, role: str, text: str) -> Optional[Dict[str, Any]]:
+def plan_discuss(ident: Any, role: str, text: str,
+                 expect_mv: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """Record one peer message in the planner<->reviewer discussion (WT-26).
     The CLI forwards it to the counterpart; state only keeps the transcript
-    (last 30) so a restart can re-deliver it. No state transition."""
+    (last 30) so a restart can re-deliver it. No state transition. Fenced on
+    ``expect_mv`` for a group parent (WT-33)."""
     role = str(role or "").strip().lower()
     if role not in ("planner", "reviewer"):
         raise ValueError("role must be 'planner' or 'reviewer'")
@@ -3059,11 +3211,15 @@ def plan_discuss(ident: Any, role: str, text: str) -> Optional[Dict[str, Any]]:
     current = get(ident)
     if current is None:
         return None
+    _group_fence_mv(current, expect_mv)
     plan = current.get("plan") or {}
     if not plan.get("discussion") or plan["discussion"].get("status") != "active":
         raise ValueError(f"{current.get('ref', ident)} has no active plan discussion")
 
     def _do(it, plan):
+        _group_fence_mv(it, expect_mv)
+        if (plan.get("discussion") or {}).get("status") != "active":
+            raise ValueError(f"{it.get('ref', ident)} has no active plan discussion")
         disc = plan["discussion"]
         disc["messages"] = (list(disc.get("messages") or []) + [
             {"round": disc.get("round"), "from": role, "text": _clip(text, 3000),
@@ -3160,7 +3316,8 @@ def plan_discussion_record_nudge(ident: Any, delivered: bool,
 
 
 def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
-                by: str = "human", session_id: str = "") -> Optional[Dict[str, Any]]:
+                by: str = "human", session_id: str = "",
+                expect_mv: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """Human decision on a plan gate blocked by exhausted review (WT-25).
 
     ``accept`` settles the plan as ``accepted`` (``text``, when given, replaces
@@ -3176,6 +3333,7 @@ def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
     current = get(ident)
     if current is None:
         return None
+    _group_fence_mv(current, expect_mv)
     cur_status = (current.get("plan") or {}).get("status")
     if cur_status != "blocked":
         raise ValueError(f"{current.get('ref', ident)} has no blocked plan "
@@ -3185,9 +3343,13 @@ def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
     who = _by("human", str(by or ""), str(session_id or ""))
 
     def _do(it, plan):
+        _group_fence_mv(it, expect_mv)
         rnd = int(plan.get("round") or 1)
         if decision == "accept":
-            if text:
+            if text and group_role(it) == "parent":
+                plan["text"], plan["sections"] = _split_group_plan(
+                    text, list(it["group"].get("members") or []), plan.get("sections") or {})
+            elif text:
                 plan["text"] = _clip(text, 24000)
             plan["status"] = "accepted"
         else:
@@ -3218,17 +3380,49 @@ def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
     return _plan_update(ident, _do)
 
 
-def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str) -> Dict[str, Any]:
+def _pinned_setup_failed(command: str, commit: str, why: str, started: float) -> Dict[str, Any]:
+    return {"gate": "cmd:" + command, "passed": False, "exit_code": -1,
+            "output_tail": f"gate setup failed: {why}"[-GATE_OUTPUT_TAIL:],
+            "commit": commit or "", "at": _now_iso(),
+            "seconds": round(time.time() - started, 1), "setup_failed": True}
+
+
+def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str,
+                  pinned: bool = False) -> Dict[str, Any]:
     """Run one cmd gate; at the closing commit when it differs from the repo's
-    checked-out HEAD (via a throwaway detached worktree)."""
+    checked-out HEAD (via a throwaway detached worktree).
+
+    ``pinned`` (WT-33 D7.6, a group integration): ALWAYS in a fresh detached
+    worktree at ``commit`` (the checkout may be dirty even when it is at that
+    commit), verified by ``rev-parse HEAD``; any setup failure returns
+    ``setup_failed`` without ever running the command in the checkout."""
     import shutil
     import subprocess
     import tempfile
     cwd = os.path.expanduser(repo_path) if repo_path else os.getcwd()
     tmp = ""
     started = time.time()
+    if pinned:
+        if not (commit and repo_path and os.path.isdir(cwd)):
+            return _pinned_setup_failed(command, commit, f"no checkout at {repo_path or '(none)'} "
+                                        f"or no commit", started)
+        tmp = tempfile.mkdtemp(prefix="wt-gate-")
+        add = subprocess.run(["git", "-C", cwd, "worktree", "add", "--detach", tmp, commit],
+                             capture_output=True, text=True)
+        at = subprocess.run(["git", "-C", tmp, "rev-parse", "HEAD"], capture_output=True,
+                            text=True).stdout.strip() if add.returncode == 0 else ""
+        full = subprocess.run(["git", "-C", cwd, "rev-parse", commit], capture_output=True,
+                              text=True).stdout.strip()
+        if add.returncode != 0 or not at or at != full:
+            subprocess.run(["git", "-C", cwd, "worktree", "remove", "--force", tmp],
+                           capture_output=True)
+            shutil.rmtree(tmp, ignore_errors=True)
+            why = (add.stderr or "").strip()[-400:] if add.returncode != 0 else \
+                f"worktree HEAD {at or '?'} is not {full or commit}"
+            return _pinned_setup_failed(command, commit, why, started)
+        cwd = tmp
     try:
-        if commit and repo_path and os.path.isdir(cwd):
+        if commit and repo_path and os.path.isdir(cwd) and not pinned:
             head = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
                                   capture_output=True, text=True).stdout.strip()
             full = subprocess.run(["git", "-C", cwd, "rev-parse", commit],
@@ -3264,18 +3458,19 @@ def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str) -> Dict[s
             "at": _now_iso(), "seconds": round(time.time() - started, 1)}
 
 
-def evaluate_gates(item: Dict[str, Any], commit: str = "") -> Tuple[List[Dict[str, Any]], List[str]]:
+def evaluate_gates(item: Dict[str, Any], commit: str = "",
+                   pinned: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Run the cmd gates in order, stopping at the first failure. Returns
     ``(results, stages)``: ``stages`` is the ordered list still owed once all
     cmd gates passed (``"verify"`` then ``"review"`` / ``"review:<target>"``),
     empty when the ticket can close outright. A failed result has ``passed``
-    False (and ``stages`` is then empty)."""
+    False (and ``stages`` is then empty). ``pinned``: see ``_run_cmd_gate``."""
     results: List[Dict[str, Any]] = []
     gates = effective_gates(item)
     for g in gates:
         if g.startswith("cmd:"):
             r = _run_cmd_gate(g[4:], str(item.get("repo_path") or ""), commit,
-                              str(item.get("ref") or ""))
+                              str(item.get("ref") or ""), pinned=pinned)
             results.append(r)
             if not r["passed"]:
                 return results, []
@@ -3320,6 +3515,16 @@ def _role_target(item: Dict[str, Any], role: str) -> Dict[str, Any]:
     queue = str(item.get("project") or "")
     ticket = dict(item)
     wid = str(item.get("claimed_by") or "")
+    if not wid and group_role(item) == "parent":
+        # A parent is never claimed (WT-33): its builder is the claimant of
+        # the most recently closed member.
+        kids = set(group_children(item))
+        by_ref = {str(i.get("ref")): i for i in _load_unlocked().get("items", [])
+                  if i.get("ref") in kids}
+        last = sorted((m for m in (by_ref.get(r) for r in kids)
+                       if m and m.get("claimed_by")),
+                      key=lambda m: str(m.get("closed_at") or m.get("updated_at") or ""))
+        wid = str(last[-1].get("claimed_by") or "") if last else ""
     if wid and not ticket.get("model_floor"):
         try:
             from . import workers as _workers
@@ -3408,6 +3613,12 @@ def checks_block(item: Dict[str, Any]) -> str:
     for g in gates:
         if g.startswith("cmd:"):
             lines.append(f"- WatchTower runs: {g[4:]}")
+        elif (g == "plan" or g.startswith("plan:")) and group_role(item) == "child":
+            pref = group_parent_ref(item)
+            lines.append(f"- Group plan: {pref}'s accepted plan covers this ticket "
+                         f"(shared section + your own section, shown above); "
+                         f"`wt plan show {pref}` prints it. {pref} then runs one "
+                         f"integration check across the whole group.")
         elif g == "plan" or g.startswith("plan:"):
             lines.append(f"- Plan first: a planner writes and a reviewer accepts a plan "
                          f"before you build; `wt plan wait {item.get('ref', '<ref>')}` "
@@ -3479,13 +3690,25 @@ def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any, attempt: int
         pass
 
 
-def accept(ident: Any, by: str = "human", force: bool = False) -> Optional[Dict[str, Any]]:
+def accept(ident: Any, by: str = "human", force: bool = False,
+           no_proof: bool = False) -> Optional[Dict[str, Any]]:
     """Accept an ``in_review`` ticket: it becomes ``closed`` (its dependents
     unblock). Raises ValueError when it is not awaiting review, or while the
-    independent verifier's verdict is still pending (``force`` overrides)."""
+    independent verifier's verdict is still pending (``force`` overrides).
+
+    A group parent (WT-33 D7.5/D9) closes only through the proof-checking
+    ``_group_close_unlocked``; ``force`` also applies to an ``open`` parent
+    once every child is closed, and ``no_proof`` is required when no
+    integration commit contains every member."""
+    refused = ""
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
+            if _matches(it, ident) and group_role(it) == "parent":
+                refused = _group_accept_unlocked(data, it, str(by), force, no_proof)
+                _save_unlocked(data)
+                item = it
+                break
             if _matches(it, ident):
                 if it.get("status") != "in_review":
                     raise ValueError(f"{it.get('ref', ident)} is {it.get('status')}, "
@@ -3509,6 +3732,12 @@ def accept(ident: Any, by: str = "human", force: bool = False) -> Optional[Dict[
                 break
         else:
             return None
+    if refused:
+        raise GroupFenced(refused)
+    if group_role(item) == "parent":
+        _after_group_close(item, str(by))
+        return get(item.get("ref") or ident) or item
+    _group_wake([str(p.get("ref")) for p in _group_due_for(item)], "integration")
     _log("ACCEPT", f"{item.get('ref', '?')}", queue=item.get("project", ""))
     res = item.get("resolution") or {}
     _notify_ticket_event(item, "closed", detail=res.get("summary", "") if isinstance(res, dict) else "",
@@ -3517,14 +3746,18 @@ def accept(ident: Any, by: str = "human", force: bool = False) -> Optional[Dict[
     return get(item.get("ref") or ident) or item
 
 
-def verdict(ident: Any, passed: bool, findings: str = "", by: str = "verifier") -> Optional[Dict[str, Any]]:
+def verdict(ident: Any, passed: bool, findings: str = "", by: str = "verifier",
+            expect_verify_cycle: Optional[int] = None) -> Optional[Dict[str, Any]]:
     """File the independent verifier's verdict on an ``in_review`` ticket
     whose pending stage is ``verify``. Pass: advance to the next stage (a
     review) or close. Fail: back to open with the findings and the original
-    worker session re-bound (the CLI resumes it)."""
+    worker session re-bound (the CLI resumes it). On a group parent
+    (WT-33) ``expect_verify_cycle`` is required and fenced (``GroupFenced``)."""
     current = get(ident)
     if current is None:
         return None
+    if group_role(current) == "parent":   # WT-33: one locked write, fenced
+        return _group_verdict(ident, passed, findings, by, expect_verify_cycle)
     if current.get("status") != "in_review" or current.get("gate_pending") != "verify":
         raise ValueError(f"{current.get('ref', ident)} is not waiting on a verifier "
                          f"(status {current.get('status')})")
@@ -3569,26 +3802,46 @@ def reject_with(ident: Any, why: str, by_label: str = "human",
     if current is None:
         return None
     sid = str(current.get("claimed_session_id") or "")
-    if sid and _github_backend_for_project(_project_from_ident(ident)) is None:
+    deferred = ""
+    rebind = bool(sid) and _github_backend_for_project(_project_from_ident(ident)) is None
+    if rebind:
         # WT-30 D1: keep the ORIGINAL claimer (worker id) so the orphan sweep
         # can tell a spawned builder from an ambient session; the session id
         # rides in claimed_session_id.
         # WT-31: the re-bind inherits the builder's process (kept through
         # hold_review), so its death is provable even after its record is pruned.
-        item = reopen_and_claim(ident, str(current.get("claimed_by") or sid),
-                                session_uuid=sid, reason=why,
-                                sent_back_reason=why, sent_back_by=by_label,
-                                claim_proc=_inheritable_proc(current, sid))
+        try:
+            item = reopen_and_claim(ident, str(current.get("claimed_by") or sid),
+                                    session_uuid=sid, reason=why,
+                                    sent_back_reason=why, sent_back_by=by_label,
+                                    claim_proc=_inheritable_proc(current, sid))
+        except GroupClaimRefused as exc:
+            # WT-33: a group child that may not be re-claimed right now goes
+            # back to open (claimed_session_id stays as resume evidence).
+            item, deferred = None, str(exc)
+        if item is None and not deferred:
+            return None
+        if item is not None:
+            with _FileLock(_lock_path()):
+                data = _load_unlocked()
+                for it in data["items"]:
+                    if _matches(it, ident):
+                        it["resume"] = {"sid": sid, "state": "pending", "at": _now_iso()}
+                        _save_unlocked(data)
+                        break
+    if deferred:
+        item = update_status(ident, "open", reason=why, by_kind="human")
         if item is None:
             return None
         with _FileLock(_lock_path()):
             data = _load_unlocked()
             for it in data["items"]:
                 if _matches(it, ident):
-                    it["resume"] = {"sid": sid, "state": "pending", "at": _now_iso()}
+                    _append_history(it, "group_reclaim_deferred", by=_by("system"),
+                                    at=_now_iso(), reason=_clip(deferred, 1000))
                     _save_unlocked(data)
                     break
-    else:
+    elif not rebind:
         item = update_status(ident, "open", reason=why, by_kind="human")
         if item is None:
             return None
@@ -3657,6 +3910,8 @@ def reject(ident: Any, reason: str, by: str = "human") -> Optional[Dict[str, Any
     if current.get("status") != "in_review":
         raise ValueError(f"{current.get('ref', ident)} is {current.get('status')}, "
                          "not in_review -- nothing to reject")
+    if group_role(current) == "parent":   # WT-33 D7.4: never reject_with
+        return _group_reject(ident, f"rejected by {by}: {reason}")
     return reject_with(ident, f"rejected by {by}: {reason}", by_label=str(by))
 
 
@@ -3691,6 +3946,12 @@ def close(
     ``expect_owner``). Callers that close by ref without asserting ownership
     (e.g. dedup-close) pass no ``session_id`` and are unaffected. ``force=True``
     bypasses the guard for a human deliberately force-closing someone's ticket."""
+    if _github_backend_for_project(_project_from_ident(ident)) is None:
+        cur = get(ident)
+        if cur is not None and group_role(cur) == "parent":
+            raise ValueError(f"{cur.get('ref', ident)} is a group parent: it closes through its "
+                             f"integration once every member is closed (`wt group show "
+                             f"{cur.get('ref', ident)}`; `wt accept --force` overrides)")
     if not force and not declined:
         current = get(ident)
         if current is not None:
@@ -3761,6 +4022,7 @@ def close(
                     _save_unlocked(data)
         except Exception:  # noqa: BLE001 - claim_next re-runs this sweep anyway
             pass
+        _group_wake([str(p.get("ref")) for p in _group_due_for(item)], "integration")
         res = item.get("resolution") or {}
         summary = res.get("summary", "") if isinstance(res, dict) else (
             res if isinstance(res, str) else ""
@@ -3770,6 +4032,1267 @@ def close(
             assessment_mark_due(item.get("ref") or ident)
             item = get(item.get("ref") or ident) or item
     return item
+
+
+# ---------------------------------------------------------------------------
+# Plan groups (WT-33)
+#
+# A group is an ordinary ticket (the *parent*) that owns ONE plan: a shared
+# section plus one section per *member*. Members never plan alone; they read
+# their section from the parent at claim/verify time, build in ``blocked_by``
+# order and verify alone. The parent is never claimed: once every child is
+# closed it runs its own gates once, at one integration commit. Local store
+# only; opt-in (``wt add --group-parent`` / ``--group``). Data model:
+#   parent["group"] = {role: parent, members: [ref], fixes: [ref], sealed,
+#                      membership_version, integration: {...}}
+#   child["group"]  = {role: child, parent: ref, kind: member|integration_fix}
+# docs/worker-lifecycle.md "Plan groups" has the full lifecycle.
+# ---------------------------------------------------------------------------
+
+GROUP_MAX_MEMBERS = 6
+GROUP_PLAN_TEXT_MAX = 96000
+GROUP_INTEGRATION_ALLOWANCE = 2
+GROUP_MAX_FIXES = 8
+STAGE_RETIRED_MAX = 20
+
+
+class GroupClaimRefused(ValueError):
+    """A claim of a group parent, or of a member whose group plan has not
+    settled (or whose dependencies are not met)."""
+
+
+class GroupFenced(ValueError):
+    """A write from a superseded group stage: the membership version or the
+    integration verify cycle moved on. Stage runners treat it as a no-op."""
+
+
+class GroupChildLocked(ValueError):
+    """A closed group child is part of an integration in progress."""
+
+
+def group_role(item: Dict[str, Any]) -> str:
+    g = item.get("group") if isinstance(item, dict) else None
+    return str(g.get("role") or "") if isinstance(g, dict) else ""
+
+
+def group_parent_ref(item: Dict[str, Any]) -> str:
+    g = item.get("group")
+    return str(g.get("parent") or "") if isinstance(g, dict) and g.get("role") == "child" else ""
+
+
+def group_children(parent: Dict[str, Any]) -> List[str]:
+    """Members then integration fixes, in order."""
+    g = parent.get("group") or {}
+    return [str(r) for r in list(g.get("members") or []) + list(g.get("fixes") or [])]
+
+
+def group_mv(item: Dict[str, Any]) -> int:
+    return int((item.get("group") or {}).get("membership_version") or 0)
+
+
+def group_mv_suffix(item: Dict[str, Any]) -> str:
+    """``:m<mv>`` on a group parent's plan supervision keys (a membership
+    change restarts the plan under a fresh key), else ''."""
+    return f":m{group_mv(item)}" if group_role(item) == "parent" else ""
+
+
+def _new_integration() -> Dict[str, Any]:
+    return {"state": "idle", "cycle": 0, "allowance": GROUP_INTEGRATION_ALLOWANCE,
+            "sha": "", "commits": {}, "proven": None, "verify_cycle": 0,
+            "snapshot_mv": 0, "lease": None, "blocked": ""}
+
+
+def group_integration(parent: Dict[str, Any]) -> Dict[str, Any]:
+    """Read-only view of a parent's integration record."""
+    integ = (parent.get("group") or {}).get("integration")
+    return integ if isinstance(integ, dict) else {}
+
+
+def _integration(parent: Dict[str, Any]) -> Dict[str, Any]:
+    g = parent.setdefault("group", {})
+    if not isinstance(g.get("integration"), dict):
+        g["integration"] = _new_integration()
+    return g["integration"]
+
+
+def group_plan_settled(parent: Dict[str, Any]) -> bool:
+    """The parent is sealed and its plan accepted (or failed: build proceeds
+    without one, loudly) -- members may be claimed."""
+    return bool((parent.get("group") or {}).get("sealed")) and \
+        (parent.get("plan") or {}).get("status") in ("accepted", "failed")
+
+
+def _group_lookup(ref: str, by_ref: Optional[Dict[str, Dict[str, Any]]]) -> Optional[Dict[str, Any]]:
+    if not ref:
+        return None
+    if by_ref is not None and ref in by_ref:
+        return by_ref[ref]
+    for it in _load_unlocked().get("items", []):
+        if it.get("ref") == ref:
+            return it
+    return None
+
+
+def group_parent_of(item: Dict[str, Any],
+                    by_ref: Optional[Dict[str, Dict[str, Any]]] = None) -> Optional[Dict[str, Any]]:
+    return _group_lookup(group_parent_ref(item), by_ref)
+
+
+def group_current_map(parent: Dict[str, Any],
+                      by_ref: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
+    """``{child: commit}`` for every member and fix: the closing commit, ``""``
+    for a no-code close, None while the child is not closed."""
+    out: Dict[str, Any] = {}
+    for ref in group_children(parent):
+        ch = _group_lookup(ref, by_ref)
+        if ch is None or ch.get("status") != "closed":
+            out[ref] = None
+            continue
+        res = ch.get("resolution") if isinstance(ch.get("resolution"), dict) else {}
+        out[ref] = str(res.get("commit") or "")
+    return out
+
+
+def group_proof_state(parent: Dict[str, Any],
+                      by_ref: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
+    """``forced`` (force-accepted with ``proof: none``), ``none`` (no
+    integration proof yet), ``match`` / ``stale`` (the live child map equals /
+    differs from the proven one)."""
+    integ = group_integration(parent)
+    if integ.get("proof") == "none":
+        return "forced"
+    proven = integ.get("proven")
+    if not isinstance(proven, dict):
+        return "none"
+    return "match" if group_current_map(parent, by_ref) == dict(proven.get("commits") or {}) \
+        else "stale"
+
+
+def group_lease_ttl(parent: Dict[str, Any]) -> float:
+    n_cmd = sum(1 for g in effective_gates(parent) if g.startswith("cmd:"))
+    return float(GATE_CMD_TIMEOUT_S * (n_cmd + 1) + 300)
+
+
+def group_integration_state(parent: Dict[str, Any], now: Optional[float] = None) -> str:
+    """The stored state, except a ``gating`` lease past its TTL reads
+    ``gating_stale`` (the sweep retakes it)."""
+    integ = group_integration(parent)
+    st = str(integ.get("state") or "idle")
+    if st == "gating":
+        lease = integ.get("lease") if isinstance(integ.get("lease"), dict) else {}
+        if (time.time() if now is None else now) - _iso_ts(lease.get("at")) > group_lease_ttl(parent):
+            return "gating_stale"
+    return st
+
+
+def _group_claim_refusal_unlocked(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]) -> str:
+    """Why ``it`` may not be claimed as a group ticket ('' = it may)."""
+    role = group_role(it)
+    ref = str(it.get("ref") or "")
+    if role == "parent":
+        return (f"{ref} is a group parent: it is never claimed; its members are "
+                f"(`wt group show {ref}`)")
+    if role != "child":
+        return ""
+    pref = group_parent_ref(it)
+    parent = by_ref.get(pref)
+    if parent is None:
+        return f"{ref}'s group parent {pref} does not exist"
+    if not group_plan_settled(parent):
+        why = "not sealed" if not (parent.get("group") or {}).get("sealed") else \
+            f"plan {(parent.get('plan') or {}).get('status') or 'not started'}"
+        return f"{ref} waits for its group plan ({pref}: {why})"
+    state, bref = blocker_verdict(it, by_ref)
+    if state != "ok":
+        return f"{ref} waits on {bref} ({state})"
+    return ""
+
+
+def _group_claim_check_unlocked(items: List[Dict[str, Any]], it: Dict[str, Any]) -> None:
+    if group_role(it):
+        why = _group_claim_refusal_unlocked(it, _refs_index(items))
+        if why:
+            raise GroupClaimRefused(why)
+
+
+def claim_blocked_by_plan(it: Dict[str, Any],
+                          by_ref: Optional[Dict[str, Dict[str, Any]]] = None) -> bool:
+    """``plan_pending`` extended to plan groups (WT-33): a group parent is
+    never claimable and a member waits for its parent's plan."""
+    if plan_pending(it):
+        return True
+    role = group_role(it)
+    if role == "parent":
+        return True
+    if role != "child":
+        return False
+    parent = group_parent_of(it, by_ref)
+    return parent is None or not group_plan_settled(parent)
+
+
+def _stamp_claim_unlocked(it: Dict[str, Any], items: List[Dict[str, Any]], via: str,
+                          now: str) -> Dict[str, Any]:
+    """Record which group plan version a child was claimed under; returns the
+    extra fields for the claim history event ({} for a non-group ticket)."""
+    if group_role(it) != "child":
+        return {}
+    parent = _refs_index(items).get(group_parent_ref(it)) or {}
+    plan = parent.get("plan") or {}
+    stamp = {"parent": group_parent_ref(it),
+             "plan_version": int(plan.get("accepted_version") or plan.get("version") or 0),
+             "mv": group_mv(parent), "via": via, "at": now}
+    if (it.get("group") or {}).get("kind") == "integration_fix":
+        stamp["integration_cycle"] = int(group_integration(parent).get("cycle") or 0)
+    it["group_claim"] = stamp
+    it["claimed_plan_version"] = stamp["plan_version"]
+    return {"group_plan_version": stamp["plan_version"], "group_mv": stamp["mv"]}
+
+
+def _validate_group_unlocked(items: List[Dict[str, Any]], parent: Dict[str, Any]) -> None:
+    """Every group writer ends here: same queue, no nesting, caps, and the
+    parent's ``blocked_by`` is exactly members + fixes. Raises ValueError."""
+    by_ref = _refs_index(items)
+    ref = str(parent.get("ref") or "")
+    g = parent.get("group") or {}
+    if g.get("role") != "parent":
+        raise ValueError(f"{ref} is not a group parent")
+    if _github_backend_for_project(parent.get("project")) is not None:
+        raise ValueError("plan groups are not supported on GitHub-backed queues")
+    members, fixes = list(g.get("members") or []), list(g.get("fixes") or [])
+    if len(members) > GROUP_MAX_MEMBERS:
+        raise ValueError(f"{ref} has {len(members)} members; a group holds at most "
+                         f"{GROUP_MAX_MEMBERS}")
+    allowance = int(group_integration(parent).get("allowance") or GROUP_INTEGRATION_ALLOWANCE)
+    if not len(fixes) <= allowance <= GROUP_MAX_FIXES:
+        raise ValueError(f"{ref}: {len(fixes)} integration fixes, allowance {allowance} "
+                         f"(max {GROUP_MAX_FIXES})")
+    if len(set(members + fixes)) != len(members + fixes):
+        raise ValueError(f"{ref}: a child is listed twice")
+    for cref in members + fixes:
+        ch = by_ref.get(cref)
+        if ch is None:
+            raise ValueError(f"{ref}: child {cref} does not exist")
+        if ch.get("project") != parent.get("project"):
+            raise ValueError(f"{cref} is in {ch.get('project')}, not {parent.get('project')}: "
+                             "a group lives in one queue")
+        cg = ch.get("group") or {}
+        if cg.get("role") != "child" or cg.get("parent") != ref:
+            raise ValueError(f"{cref} is not a child of {ref}")
+        want = "member" if cref in members else "integration_fix"
+        if cg.get("kind", "member") != want:
+            raise ValueError(f"{cref} is listed as a {want} but is a {cg.get('kind')}")
+        if ref in (ch.get("blocked_by") or []):
+            raise ValueError(f"{cref} cannot be blocked by its own group parent {ref}")
+    if list(parent.get("blocked_by") or []) != members + fixes:
+        raise ValueError(f"{ref}: blocked_by must be its members + fixes")
+
+
+def _group_sync_blockers_unlocked(items: List[Dict[str, Any]], parent: Dict[str, Any]) -> None:
+    parent["blocked_by"] = _validate_blocked_by(items, str(parent.get("ref") or ""),
+                                                group_children(parent))
+
+
+def _retire_sessions_unlocked(item: Dict[str, Any], roles: Tuple[str, ...],
+                              reason: str) -> List[str]:
+    """Record the live handles of ``roles``' stage sessions in
+    ``item["stage_retired"]`` (D10) so the reconciler's kill pass stops them.
+    Runs BEFORE any archiving/clearing, in the same write as the state change
+    that makes them obsolete. Dedupe by worker_id. Returns the added ids."""
+    now = _now_iso()
+    entries = [e for e in (item.get("stage_retired") or []) if isinstance(e, dict)]
+    have = {str(e.get("worker_id") or "") for e in entries}
+    found: List[Dict[str, Any]] = []
+    ss = item.get("stage_session") or {}
+    if ss.get("role") in roles and ss.get("worker_id"):
+        found.append({"worker_id": str(ss["worker_id"]), "pid": ss.get("pid"),
+                      "pid_started": str(ss.get("pid_started") or ""), "role": ss["role"],
+                      "key": str(ss.get("key") or "")})
+    plan = item.get("plan") or {}
+    metas = {"planner": [plan.get("planner")], "plan_reviewer": [plan.get("reviewer")],
+             "verifier": [item.get("verifier")]}
+    for prole, wid in ((plan.get("discussion") or {}).get("participants") or {}).items():
+        metas["planner" if prole == "planner" else "plan_reviewer"].append({"worker_id": wid})
+    for role in roles:
+        for meta in metas.get(role, []):
+            if isinstance(meta, dict) and meta.get("worker_id"):
+                found.append({"worker_id": str(meta["worker_id"]), "pid": None,
+                              "pid_started": "", "role": role,
+                              "key": str(meta.get("stage_key") or "")})
+    added: List[str] = []
+    for e in found:
+        if e["worker_id"] in have:
+            continue
+        have.add(e["worker_id"])
+        entries.append(dict(e, reason=str(reason), at=now))
+        added.append(e["worker_id"])
+    if added:
+        item["stage_retired"] = entries[-STAGE_RETIRED_MAX:]
+    return added
+
+
+def stage_retired_ids(item: Dict[str, Any]) -> set:
+    """Worker ids retired from this ticket's stages (pending or done): never
+    adopted again."""
+    ids = {str(e.get("worker_id") or "") for e in (item.get("stage_retired") or [])
+           if isinstance(e, dict)}
+    ids |= {str(h.get("worker_id") or "") for h in (item.get("history") or [])
+            if isinstance(h, dict) and h.get("event") == "stage_retired"}
+    ids.discard("")
+    return ids
+
+
+def stage_retired_done(ident: Any, worker_id: str, outcome: str) -> Optional[Dict[str, Any]]:
+    """The kill pass handled one retired session: drop its entry and record
+    ``stage_retired`` (killed | already_gone | token_mismatch)."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            entries = [e for e in (it.get("stage_retired") or []) if isinstance(e, dict)]
+            hit = [e for e in entries if str(e.get("worker_id")) == str(worker_id)]
+            if not hit:
+                return None
+            it["stage_retired"] = [e for e in entries if str(e.get("worker_id")) != str(worker_id)]
+            if not it["stage_retired"]:
+                it.pop("stage_retired")
+            _append_history(it, "stage_retired", by=_by("system"), at=_now_iso(),
+                            worker_id=str(worker_id), outcome=str(outcome),
+                            role=hit[0].get("role"), key=hit[0].get("key"),
+                            reason=hit[0].get("reason"))
+            _save_unlocked(data)
+            return it
+    return None
+
+
+def _group_block_unlocked(parent: Dict[str, Any], question: str, now: str) -> None:
+    """A legacy block on a parent: never changes status, never binds a claimant."""
+    parent["needs_input"] = True
+    parent["block_question"] = _clip(question, 4000)
+    parent["block_kind"] = "input"
+    parent["blocked_at"] = now
+    parent["updated_at"] = now
+    _append_history(parent, "block", by=_by("system"), at=now,
+                    question=_clip(question, 4000), kind="input")
+
+
+def _group_clear_block(parent: Dict[str, Any]) -> None:
+    parent["needs_input"] = False
+    parent["block_question"] = ""
+    parent["block_kind"] = ""
+    parent["blocked_at"] = None
+
+
+def _archive_verifier(it: Dict[str, Any]) -> None:
+    if it.get("verifier"):
+        it["verifier_history"] = (list(it.get("verifier_history") or [])
+                                  + [it["verifier"]])[-10:]
+        it.pop("verifier", None)
+
+
+def _group_integration_invalidate_unlocked(parent: Dict[str, Any], reason: str,
+                                           retire: str = "child_reopened",
+                                           child: str = "") -> None:
+    """Drop the current integration (D9): no lease, no proof, back to ``idle``
+    and ``open``; ``verify_cycle`` moves on so a late verdict is fenced."""
+    now = _now_iso()
+    integ = _integration(parent)
+    old = str(integ.get("sha") or "")
+    _retire_sessions_unlocked(parent, ("verifier",), retire)
+    integ.update(lease=None, state="idle", proven=None, sha="")
+    if parent.get("status") == "in_review":
+        parent["status"] = "open"
+    parent.pop("gate_pending", None)
+    parent.pop("gate_stages", None)
+    parent.pop("resolution", None)
+    parent["verify_cycle"] = int(parent.get("verify_cycle") or 0) + 1
+    _archive_verifier(parent)
+    parent["updated_at"] = now
+    _append_history(parent, "group_integration_invalidated", by=_by("system"), at=now,
+                    child=child, sha=old, reason=_clip(reason, 1000),
+                    verify_cycle=parent["verify_cycle"])
+
+
+def _group_child_change_unlocked(items: List[Dict[str, Any]], child: Dict[str, Any],
+                                 action: str, force: bool) -> None:
+    """A writer is about to take a closed group child out of ``closed`` (or
+    rewrite its resolution). During an integration that is refused
+    (``GroupChildLocked``, nothing written) unless forced, which invalidates
+    the integration in the same write. A finished group only notes it."""
+    if group_role(child) != "child" or child.get("status") != "closed":
+        return
+    parent = _refs_index(items).get(group_parent_ref(child))
+    if parent is None:
+        return
+    ref, pref = str(child.get("ref") or ""), str(parent.get("ref") or "")
+    integ = group_integration(parent)
+    now = _now_iso()
+    if parent.get("status") == "closed":
+        _append_history(parent, "group_member_reopened_after_close", by=_by("system"), at=now,
+                        child=ref, action=action)
+        parent["updated_at"] = now
+        return
+    if not (integ.get("state") in ("gating", "verifying", "reviewing")
+            or parent.get("status") == "in_review"):
+        return
+    if not force:
+        sha = (integ.get("commits") or {}).get(ref) or \
+            ((child.get("resolution") or {}).get("commit") if isinstance(child.get("resolution"), dict) else "") \
+            or "no-code"
+        raise GroupChildLocked(f"{pref} is integrating {ref}@{sha}; wt reopen --force "
+                               f"invalidates that integration")
+    _group_integration_invalidate_unlocked(parent, f"{ref} {action} (forced)", child=ref)
+
+
+def _group_file_fix_unlocked(data: Dict[str, Any], parent: Dict[str, Any], findings: str,
+                             guidance: str = "") -> Dict[str, Any]:
+    """File one ``integration_fix`` child (system-owned: never planned, not
+    counted in the member cap, membership_version unchanged)."""
+    integ = _integration(parent)
+    pref = str(parent.get("ref") or "")
+    commits = integ.get("commits") or {}
+    cmap = "\n".join(f"- {r}: {s or '(no code)'}" for r, s in commits.items()) or "- (none)"
+    text = (f"Integration fix for group {pref} (integration cycle {integ.get('cycle', 0)}).\n\n"
+            f"Findings:\n{findings or '(none recorded)'}\n\n"
+            f"Integration commit: {integ.get('sha') or 'none'}\nPer-child commits:\n{cmap}"
+            + (f"\n\nHuman guidance:\n{guidance}" if guidance else "")
+            + f"\n\nFix the integration in one commit on top of all of them; `wt plan show "
+            f"{pref}` has the group plan.")
+    gates = [g for g in effective_gates(parent) if g != "plan" and not g.startswith("plan:")]
+    fix = _new_item_unlocked(
+        data, note=f"Integration fix for {pref}", text=text, source="wt",
+        proj=str(parent.get("project") or ""), annotation_id="", url="",
+        title=_clip(f"Integration fix {pref}: {parent.get('title') or parent.get('note') or ''}", 200),
+        selector="", screenshot_path="", repo_path=str(parent.get("repo_path") or ""),
+        lane=str(parent.get("lane") or "normal"), item_type=str(parent.get("type") or ""),
+        readiness="", priority=str(parent.get("priority") or ""), value="", confidence="",
+        model_floor="", planner_model="", verifier_model=str(parent.get("verifier_model") or ""),
+        submitter=str(parent.get("submitter") or ""), submitter_explicit=False,
+        pre_ack=bool(parent.get("pre_ack") or parent.get("product_ack")), blocked_by=None,
+        gates=None, accept_line=str(parent.get("accept") or ""))
+    fix["gates"] = gates
+    fix["group"] = {"role": "child", "parent": pref, "kind": "integration_fix"}
+    g = parent["group"]
+    g["fixes"] = list(g.get("fixes") or []) + [fix["ref"]]
+    _group_sync_blockers_unlocked(data["items"], parent)
+    return fix
+
+
+def _group_integration_failed_unlocked(data: Dict[str, Any], parent: Dict[str, Any],
+                                       findings: str) -> Optional[Dict[str, Any]]:
+    """D7.4 (verify fail, ``wt reject P``, cmd fail, divergence): never
+    reject_with. File a fix while the allowance lasts, else cap and block the
+    parent for a human. Closed children are never reopened."""
+    now = _now_iso()
+    pref = str(parent.get("ref") or "")
+    integ = _integration(parent)
+    _retire_sessions_unlocked(parent, ("verifier",), "integration_failed")
+    integ.update(lease=None, findings=_clip(findings, 4000))
+    if parent.get("status") == "in_review":
+        parent["status"] = "open"
+    _archive_verifier(parent)
+    parent.pop("gate_pending", None)
+    parent.pop("gate_stages", None)
+    parent.pop("resolution", None)
+    parent["gate_feedback"] = _clip(findings, 4000)
+    parent["updated_at"] = now
+    fixes = list((parent.get("group") or {}).get("fixes") or [])
+    allowance = int(integ.get("allowance") or GROUP_INTEGRATION_ALLOWANCE)
+    if len(fixes) < allowance:
+        fix = _group_file_fix_unlocked(data, parent, findings)
+        integ["state"] = "fixing"
+        _append_history(parent, "group_integration_failed", by=_by("system"), at=now,
+                        text=_clip(findings, 1000), cycle=integ.get("cycle"), fix=fix["ref"])
+        return fix
+    integ["state"] = "capped"
+    _append_history(parent, "group_integration_failed", by=_by("system"), at=now,
+                    text=_clip(findings, 1000), cycle=integ.get("cycle"), capped=True)
+    _group_block_unlocked(parent, (
+        f"Integration of {pref} failed after {len(fixes)} fix(es) (cycle "
+        f"{integ.get('cycle')}): {_clip(findings, 1500)} Decide: `wt answer {pref} "
+        f"\"<guidance>\"` or `wt group fix {pref} --text \"...\"` files one more fix; "
+        f"`wt accept {pref} --force` closes it (add --no-proof when no integration "
+        f"commit contains every member)."), now)
+    return None
+
+
+def _group_fix_unlocked(data: Dict[str, Any], parent: Dict[str, Any], guidance: str) -> Dict[str, Any]:
+    """Capped -> one more fix (``allowance + 1``) with the latest findings and
+    the human's guidance."""
+    pref = str(parent.get("ref") or "")
+    integ = _integration(parent)
+    if integ.get("state") != "capped":
+        raise ValueError(f"{pref}'s integration is {integ.get('state') or 'idle'}, not capped: "
+                         "nothing to override")
+    allowance = int(integ.get("allowance") or GROUP_INTEGRATION_ALLOWANCE)
+    if allowance >= GROUP_MAX_FIXES:
+        raise ValueError(f"{pref} already had {GROUP_MAX_FIXES} integration fixes; only "
+                         f"`wt accept {pref} --force [--no-proof]` closes it now")
+    integ["allowance"] = allowance + 1
+    fix = _group_file_fix_unlocked(data, parent, str(integ.get("findings") or ""), guidance)
+    integ["state"] = "fixing"
+    _group_clear_block(parent)
+    now = _now_iso()
+    parent["updated_at"] = now
+    _append_history(parent, "group_fix_override", by=_by("human"), at=now, fix=fix["ref"],
+                    allowance=integ["allowance"], text=_clip(guidance, 1000))
+    return fix
+
+
+def _group_refuse_completion_unlocked(parent: Dict[str, Any], problem: str) -> str:
+    _group_integration_invalidate_unlocked(parent, f"completion refused: {problem}",
+                                           retire="completion_refused")
+    _append_history(parent, "group_completion_refused", by=_by("system"), at=_now_iso(),
+                    reason=_clip(problem, 1000))
+    ref = str(parent.get("ref") or "")
+    return (f"{ref}: completion refused ({problem}); the integration was invalidated "
+            "and re-runs once every child is closed")
+
+
+def _group_close_unlocked(data: Dict[str, Any], parent: Dict[str, Any], *, forced: bool = False,
+                          no_proof: bool = False, by: str = "system") -> str:
+    """The ONLY way a parent reaches ``closed`` (D9). Requires, under the
+    lock, every member and fix closed and the live child map equal to the
+    proven one with ``resolution.commit == proven.sha`` (``no_proof`` skips
+    only the map/sha part). On failure it invalidates, writes
+    ``group_completion_refused`` and returns the refusal (the caller saves,
+    then raises GroupFenced); '' when closed."""
+    by_ref = _refs_index(data["items"])
+    integ = _integration(parent)
+    cur = group_current_map(parent, by_ref)
+    open_kids = [r for r, v in cur.items() if v is None]
+    proven = integ.get("proven") if isinstance(integ.get("proven"), dict) else None
+    proven_ok = bool(proven) and cur == dict(proven.get("commits") or {})
+    if open_kids:
+        return _group_refuse_completion_unlocked(parent, f"children not closed: {', '.join(open_kids)}")
+    if no_proof and not proven_ok:
+        parent["resolution"] = {
+            "summary": _clip("force-accepted WITHOUT an integration commit containing all "
+                             f"members: {integ.get('findings') or 'no integration proof'}", 4000),
+            "commit": ""}
+        integ["proof"] = "none"
+    else:
+        if not proven:
+            return _group_refuse_completion_unlocked(parent, "no integration proof")
+        if not proven_ok:
+            return _group_refuse_completion_unlocked(
+                parent, "the child commit map changed since the integration proof")
+        if forced:
+            parent["resolution"] = {"summary": "force-accepted after integration failures",
+                                    "commit": str(proven.get("sha") or "")}
+        res = parent.get("resolution") if isinstance(parent.get("resolution"), dict) else {}
+        if str(res.get("commit") or "") != str(proven.get("sha") or ""):
+            return _group_refuse_completion_unlocked(
+                parent, "resolution commit is not the proven integration commit")
+    now = _now_iso()
+    parent["status"] = "closed"
+    parent["closed_at"] = now
+    parent["updated_at"] = now
+    parent.pop("gate_pending", None)
+    parent.pop("gate_stages", None)
+    _group_clear_block(parent)
+    integ.update(state="done", lease=None)
+    _drop_claim_proc_unlocked(parent)
+    parent["gate_accepted_by"] = str(by)
+    _append_history(parent, "accept", by=_by("human" if forced else "system", str(by)), at=now,
+                    forced=True if forced else None,
+                    proof="none" if integ.get("proof") == "none" else "proven",
+                    commit=str((parent.get("resolution") or {}).get("commit") or ""))
+    _escalate_stuck_blockers(data["items"])
+    return ""
+
+
+def _after_group_close(item: Dict[str, Any], by: str) -> None:
+    ref = str(item.get("ref") or "")
+    _log("ACCEPT", f"{ref} (group integration)", queue=item.get("project", ""))
+    try:
+        from . import messages
+        messages.ledger_clear_ref(ref)
+    except Exception:  # noqa: BLE001 - ledger rows are best-effort hygiene
+        pass
+    res = item.get("resolution") or {}
+    _notify_ticket_event(item, "closed", detail=res.get("summary", "") if isinstance(res, dict) else "",
+                         actor=by)
+    assessment_mark_due(ref)
+
+
+def _group_wake(refs: List[str], why: str) -> None:
+    try:
+        from . import stages as _stages
+        for ref in refs:
+            _stages.request(ref, why)
+    except Exception:  # noqa: BLE001 - the daemon tick recovers from state
+        pass
+
+
+def _group_due_unlocked(items: List[Dict[str, Any]], now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Parents whose integration should run now (D7.1): open, sealed, plan
+    settled, no open question, every child done, and idle/fixing with no
+    open fix -- or gating with a lease past its TTL."""
+    by_ref = _refs_index(items)
+    out: List[Dict[str, Any]] = []
+    for it in items:
+        if group_role(it) != "parent" or it.get("status") != "open" or it.get("needs_input"):
+            continue
+        if not group_plan_settled(it) or blocker_verdict(it, by_ref)[0] != "ok":
+            continue
+        st = group_integration_state(it, now)
+        if st in ("idle", "fixing"):
+            if any((by_ref.get(f) or {}).get("status") != "closed"
+                   for f in (it.get("group") or {}).get("fixes") or []):
+                continue
+            out.append(it)
+        elif st == "gating_stale":
+            out.append(it)
+    return out
+
+
+def _group_due_for(item: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """The parent of a just-closed child when its integration is now due
+    (the close sites wake the daemon for it)."""
+    pref = group_parent_ref(item or {})
+    if not pref:
+        return []
+    try:
+        with _FileLock(_lock_path()):
+            return [p for p in _group_due_unlocked(_load_unlocked()["items"])
+                    if str(p.get("ref")) == pref]
+    except Exception:  # noqa: BLE001 - the daemon tick finds it anyway
+        return []
+
+
+def group_due_refs() -> List[str]:
+    with _FileLock(_lock_path()):
+        return [str(p.get("ref")) for p in _group_due_unlocked(_load_unlocked()["items"])]
+
+
+def group_sweep(only_ref: str = "") -> List[Tuple[str, str]]:
+    """Run every due integration (D7.1): take a lease (lock), find the one
+    commit containing every child and run the parent's gates there (no
+    lock), then commit the outcome (lock, CAS on the lease and the child map).
+    Returns ``(ref, outcome)`` pairs."""
+    import uuid
+    leases: List[Tuple[str, str, Dict[str, Any], Dict[str, str]]] = []
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        due = [p for p in _group_due_unlocked(data["items"])
+               if not only_ref or str(p.get("ref")) == only_ref]
+        if not due:
+            return []
+        by_ref = _refs_index(data["items"])
+        now = _now_iso()
+        for p in due:
+            integ = _integration(p)
+            if integ.get("state") == "gating":
+                _append_history(p, "group_lease_retaken", by=_by("system"), at=now,
+                                token=str((integ.get("lease") or {}).get("token") or ""))
+            token = uuid.uuid4().hex[:12]
+            commits = {r: str(v or "") for r, v in group_current_map(p, by_ref).items()}
+            integ.update(state="gating", lease={"token": token, "at": now},
+                         snapshot_mv=group_mv(p), commits=commits, blocked="")
+            p["updated_at"] = now
+            leases.append((str(p["ref"]), token, json.loads(json.dumps(p)), commits))
+        _save_unlocked(data)
+    acted: List[Tuple[str, str]] = []
+    for ref, token, snap, commits in leases:
+        sha, source, problem = "", "", ""
+        results: List[Dict[str, Any]] = []
+        stages: List[str] = []
+        try:
+            from . import integration_git
+            repo = str(snap.get("repo_path") or "")
+            if not repo:
+                from . import config as _config
+                repo = str(_config.repo_path(str(snap.get("project") or "")) or "")
+            sha, source, problem = integration_git.containing_sha(repo, commits)
+            if sha and not problem:
+                snap["repo_path"] = repo
+                results, stages = evaluate_gates(snap, sha, pinned=True)
+        except Exception as exc:  # noqa: BLE001 - recorded as a setup failure
+            problem = f"gate_setup: {exc}"
+        acted.append((ref, _group_integration_commit(ref, token, commits, sha, source,
+                                                     problem, results, stages)))
+    return acted
+
+
+def _group_integration_commit(ref: str, token: str, commits: Dict[str, str], sha: str,
+                              source: str, problem: str, results: List[Dict[str, Any]],
+                              stages: List[str]) -> str:
+    notify, closed, refused = "", None, ""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        by_ref = _refs_index(data["items"])
+        p = by_ref.get(ref)
+        if p is None:
+            return "gone"
+        integ = _integration(p)
+        now = _now_iso()
+        lease = integ.get("lease") if isinstance(integ.get("lease"), dict) else {}
+        why = ""
+        if lease.get("token") != token:
+            why = "lease lost"
+        elif integ.get("state") != "gating":
+            why = f"state {integ.get('state')}"
+        elif p.get("status") != "open":
+            why = f"status {p.get('status')}"
+        elif p.get("needs_input"):
+            why = "needs input"
+        elif int(integ.get("snapshot_mv") or 0) != group_mv(p):
+            why = "membership changed"
+        elif group_current_map(p, by_ref) != commits:
+            why = "child commits changed"
+        if why:
+            if lease.get("token") == token:
+                integ.update(state="idle", lease=None)
+            _append_history(p, "group_integration_discarded", by=_by("system"), at=now,
+                            reason=why, token=token)
+            _save_unlocked(data)
+            return "discarded"
+        integ["cycle"] = int(integ.get("cycle") or 0) + 1
+        integ["lease"] = None
+        setup = next((r for r in results if r.get("setup_failed")), None)
+        outcome = ""
+        if problem.startswith("commit_missing") or problem.startswith("no_repo") \
+                or problem.startswith("gate_setup") or setup is not None:
+            kind = "commit_missing" if problem.startswith("commit_missing") else "gate_setup"
+            integ.update(state="idle", blocked=kind)
+            detail = problem or str((setup or {}).get("output_tail") or "")
+            _append_history(p, "group_integration_blocked", by=_by("system"), at=now,
+                            kind=kind, text=_clip(detail, 1000), cycle=integ["cycle"])
+            if kind == "commit_missing":
+                _, cref, csha = (problem.split(" ", 2) + ["", ""])[:3]
+                question = (f"commit {csha} of {cref} not found in "
+                            f"{p.get('repo_path') or 'the queue repo'}; push/fetch it, then "
+                            f"`wt answer {ref} \"retry\"`.")
+            else:
+                question = (f"The integration gates for {ref} could not be set up at "
+                            f"{sha or 'the integration commit'}: {_clip(detail, 800)}. Fix it, "
+                            f"then `wt answer {ref} \"retry\"`.")
+            _group_block_unlocked(p, question, now)
+            outcome = kind
+        elif not sha:
+            findings = ("commits diverge: "
+                        + ", ".join(f"{r}@{s}" for r, s in commits.items() if s)
+                        + "; produce one commit containing all of them")
+            _group_integration_failed_unlocked(data, p, findings)
+            outcome = "diverged"
+        else:
+            integ.update(sha=sha, sha_source=source,
+                         proven={"sha": sha, "commits": dict(commits)})
+            p["resolution"] = {"summary": _clip(f"integration of {', '.join(commits)}", 4000),
+                               "commit": sha}
+            p["gate_results"] = list(p.get("gate_results") or []) + list(results)
+            _append_history(p, "group_integrate", by=_by("system"), at=now, sha=sha,
+                            source=source, cycle=integ["cycle"], commits=dict(commits))
+            failed = [r for r in results if not r.get("passed")]
+            if failed:
+                f = failed[0]
+                _group_integration_failed_unlocked(
+                    data, p, f"gate {f['gate']} failed at {sha[:12]} (exit {f['exit_code']}): "
+                             f"{str(f.get('output_tail') or '')[-600:].strip()}")
+                outcome = "gate_failed"
+            elif stages:
+                p["status"] = "in_review"
+                p["gate_stages"] = list(stages)
+                p["gate_pending"] = stages[0]
+                p["closed_at"] = None
+                extra: Dict[str, Any] = {}
+                if stages[0] == "verify":
+                    _archive_verifier(p)
+                    p["verify_cycle"] = int(p.get("verify_cycle") or 0) + 1
+                    integ.update(state="verifying", verify_cycle=p["verify_cycle"])
+                    extra["verify_cycle"] = p["verify_cycle"]
+                else:
+                    integ["state"] = "reviewing"
+                _append_history(p, "in_review", by=_by("system"), at=now, reviewer=stages[0],
+                                **extra)
+                notify = stages[0]
+                outcome = integ["state"]
+            else:
+                refused = _group_close_unlocked(data, p)
+                closed = None if refused else p
+                outcome = "refused" if refused else "closed"
+        p["updated_at"] = now
+        _save_unlocked(data)
+    if notify:
+        _notify_review(p, notify, "system")
+        _group_wake([ref], "integration")
+    if closed is not None:
+        _after_group_close(closed, "system")
+    _log("INTEGRATE", f"{ref} cycle {integ.get('cycle')}: {outcome}"
+         + (f" at {sha[:12]}" if sha else ""), queue=str(p.get("project") or ""))
+    return outcome
+
+
+def _group_add_member_unlocked(data: Dict[str, Any], parent: Dict[str, Any],
+                               child: Dict[str, Any], now: str) -> None:
+    pref, cref = str(parent.get("ref") or ""), str(child.get("ref") or "")
+    g = parent.get("group") or {}
+    if g.get("role") != "parent":
+        raise ValueError(f"{pref} is not a group parent")
+    if g.get("sealed"):
+        raise ValueError(f"{pref} is sealed: members change only by `wt group detach`")
+    if len(g.get("members") or []) >= GROUP_MAX_MEMBERS:
+        raise ValueError(f"{pref} already has {GROUP_MAX_MEMBERS} members (the cap)")
+    if child.get("project") != parent.get("project"):
+        raise ValueError(f"{cref} is in {child.get('project')}, not {parent.get('project')}: "
+                         "a group lives in one queue")
+    if group_role(child):
+        raise ValueError(f"{cref} is already in a group ({group_role(child)})")
+    if child.get("status") != "open" or child.get("claimed_by") or child.get("parked"):
+        raise ValueError(f"{cref} must be open, unclaimed and not parked to join a group "
+                         f"(status {child.get('status')})")
+    if pref in (child.get("blocked_by") or []):
+        raise ValueError(f"{cref} cannot be blocked by its own group parent {pref}")
+    g["members"] = list(g.get("members") or []) + [cref]
+    g["membership_version"] = int(g.get("membership_version") or 0) + 1
+    child["group"] = {"role": "child", "parent": pref, "kind": "member"}
+    child["updated_at"] = now
+    _group_sync_blockers_unlocked(data["items"], parent)
+    _append_history(child, "group_attach", by=_by("human"), at=now, parent=pref)
+    _append_history(parent, "group_attach", by=_by("human"), at=now, child=cref,
+                    mv=g["membership_version"])
+
+
+def _group_seal_unlocked(parent: Dict[str, Any], now: str) -> None:
+    g = parent.get("group") or {}
+    pref = str(parent.get("ref") or "")
+    if g.get("sealed"):
+        raise ValueError(f"{pref} is already sealed")
+    if len(g.get("members") or []) < 2:
+        raise ValueError(f"{pref} has {len(g.get('members') or [])} member(s); a group "
+                         "needs at least 2 to seal")
+    g["sealed"] = True
+    g["membership_version"] = int(g.get("membership_version") or 0) + 1
+    parent["updated_at"] = now
+    _append_history(parent, "group_seal", by=_by("human"), at=now,
+                    members=list(g.get("members") or []), mv=g["membership_version"])
+
+
+def _parent_gates(gates: Optional[List[str]]) -> List[str]:
+    """A parent's gates always include ``plan``; ``verify`` unless an explicit
+    gate list omits it."""
+    out = validate_gates(gates) if gates else ["verify"]
+    if not any(g == "plan" or g.startswith("plan:") for g in out):
+        out = ["plan"] + out
+    return out
+
+
+def _find_unlocked(items: List[Dict[str, Any]], ident: Any) -> Dict[str, Any]:
+    found = next((it for it in items if _matches(it, ident)), None)
+    if found is None:
+        raise ValueError(f"{ident} does not exist")
+    return found
+
+
+def _group_write(fn) -> Any:
+    """Run ``fn(data)`` under the store lock; one save."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        out = fn(data)
+        _save_unlocked(data)
+        return out
+
+
+def group_attach(parent_ref: Any, refs: List[str], replan: bool = False,
+                 seal: bool = False) -> Dict[str, Any]:
+    """Adopt open, unclaimed, unparked same-queue tickets as members of an
+    unsealed group (one write). A ticket with its own plan needs ``replan``
+    (the plan moves to history ``plan_superseded``)."""
+    def _do(data):
+        items = data["items"]
+        parent = _find_unlocked(items, parent_ref)
+        if group_role(parent) != "parent":
+            raise ValueError(f"{parent.get('ref')} is not a group parent")
+        now = _now_iso()
+        for raw in refs:
+            child = _find_unlocked(items, raw)
+            if (child.get("plan") or {}).get("status"):
+                if not replan:
+                    raise ValueError(f"{child.get('ref')} has a plan of its own (status "
+                                     f"{child['plan'].get('status')}); --replan moves it to "
+                                     "history and plans it with the group")
+                _retire_sessions_unlocked(child, ("planner", "plan_reviewer"), "replan")
+                _append_history(child, "plan_superseded", by=_by("human"), at=now,
+                                text=_clip(child["plan"].get("text") or "", 24000),
+                                status=child["plan"].get("status"),
+                                parent=str(parent.get("ref")))
+                child.pop("plan", None)
+                child.pop("stage_session", None)
+            _group_add_member_unlocked(data, parent, child, now)
+        if seal:
+            _group_seal_unlocked(parent, now)
+        _validate_group_unlocked(items, parent)
+        return parent
+    parent = _group_write(_do)
+    if seal:
+        _group_wake([str(parent["ref"])], "seal")
+    return parent
+
+
+def group_seal(parent_ref: Any) -> Dict[str, Any]:
+    """Seal the membership (>= 2 members) and start the group plan."""
+    def _do(data):
+        parent = _find_unlocked(data["items"], parent_ref)
+        if group_role(parent) != "parent":
+            raise ValueError(f"{parent.get('ref')} is not a group parent")
+        _group_seal_unlocked(parent, _now_iso())
+        _validate_group_unlocked(data["items"], parent)
+        return parent
+    parent = _group_write(_do)
+    _group_wake([str(parent["ref"])], "seal")
+    return parent
+
+
+def _group_plan_restart_unlocked(parent: Dict[str, Any], reason: str) -> None:
+    """Membership changed while the plan was in flight: retire the live plan
+    sessions (first), archive the roles, end any discussion and plan afresh
+    under the new ``:m<mv>`` keys."""
+    now = _now_iso()
+    _retire_sessions_unlocked(parent, ("planner", "plan_reviewer"), "mv")
+    plan = dict(parent.get("plan") or {})
+    _plan_archive_role(plan, "planner")
+    _plan_archive_role(plan, "reviewer")
+    disc = plan.pop("discussion", None)
+    if disc:
+        plan["discussion_history"] = (list(plan.get("discussion_history") or [])
+                                      + [dict(disc, ended="superseded", ended_at=now)])[-5:]
+    plan.update(status="planning", membership_version=group_mv(parent))
+    plan.pop("escalated", None)
+    parent["plan"] = plan
+    parent.pop("stage_session", None)
+    _append_history(parent, "group_plan_restart", by=_by("system"), at=now,
+                    mv=group_mv(parent), reason=_clip(reason, 500))
+
+
+def group_detach(ident: Any) -> Dict[str, Any]:
+    """Take a member out of its group (members only; closed members and
+    integration fixes never). See the D2 detach table in
+    docs/worker-lifecycle.md."""
+    def _do(data):
+        items = data["items"]
+        child = _find_unlocked(items, ident)
+        cref = str(child.get("ref") or "")
+        cg = child.get("group") or {}
+        if cg.get("role") != "child":
+            raise ValueError(f"{cref} is not a group member")
+        if cg.get("kind") == "integration_fix":
+            raise ValueError(f"{cref} is an integration fix: fixes are not detachable "
+                             "(close it no-code to drop it; integration re-runs)")
+        if child.get("status") == "closed":
+            raise ValueError(f"{cref} is closed: closed members never detach")
+        parent = _find_unlocked(items, cg.get("parent"))
+        pref = str(parent.get("ref") or "")
+        g = parent["group"]
+        integ = _integration(parent)
+        pst = str((parent.get("plan") or {}).get("status") or "")
+        if parent.get("status") == "closed":
+            raise ValueError(f"{pref} is closed; the group is finished")
+        if integ.get("state") in ("gating", "verifying", "reviewing") \
+                or parent.get("status") == "in_review":
+            raise ValueError(f"{pref} is integrating; detach is refused until it finishes")
+        sealed = bool(g.get("sealed"))
+        if sealed and len(g.get("members") or []) <= 1:
+            raise ValueError(f"{cref} is the last member of sealed {pref}")
+        if sealed and pst in ("accepted", "failed") and child.get("status") != "open":
+            raise ValueError(f"{cref} is {child.get('status')}: after the plan is accepted "
+                             "only an open member detaches")
+        now = _now_iso()
+        g["members"] = [r for r in g.get("members") or [] if r != cref]
+        child.pop("group", None)
+        child["updated_at"] = now
+        _group_sync_blockers_unlocked(items, parent)
+        _append_history(child, "group_detach", by=_by("human"), at=now, parent=pref)
+        if sealed:
+            g["membership_version"] = int(g.get("membership_version") or 0) + 1
+            plan = dict(parent.get("plan") or {})
+            sections = dict(plan.get("sections") or {})
+            if cref in sections:
+                _append_history(parent, "group_section_removed", by=_by("system"), at=now,
+                                child=cref, text=_clip(sections.pop(cref), 24000))
+            plan["sections"] = sections
+            reviews = dict(plan.get("section_reviews") or {})
+            reviews.pop(cref, None)
+            plan["section_reviews"] = reviews
+            parent["plan"] = plan
+            if pst == "blocked":
+                # Exhausted: the latest text minus REF goes back to review
+                # (budget kept); the human block is answered by the detach.
+                _retire_sessions_unlocked(parent, ("planner", "plan_reviewer"), "mv")
+                _plan_archive_role(plan, "reviewer")
+                plan.update(status="reviewing", version=int(plan.get("version") or 0) + 1,
+                            membership_version=group_mv(parent))
+                plan.pop("escalated", None)
+                parent.pop("stage_session", None)
+                _group_clear_block(parent)
+                _append_history(parent, "group_detach_unblock", by=_by("human"), at=now,
+                                child=cref, version=plan["version"], mv=group_mv(parent))
+            elif pst in ("planning", "reviewing", "discussing"):
+                _group_plan_restart_unlocked(parent, f"{cref} detached")
+        parent["updated_at"] = now
+        _append_history(parent, "group_detach", by=_by("human"), at=now, child=cref,
+                        mv=group_mv(parent))
+        _validate_group_unlocked(items, parent)
+        return child, pref, sealed
+    child, pref, sealed = _group_write(_do)
+    if sealed:
+        _group_wake([pref], "detach")
+    return child
+
+
+def group_fix(parent_ref: Any, text: str = "") -> Dict[str, Any]:
+    """Capped integration -> one more fix with the human's guidance."""
+    def _do(data):
+        parent = _find_unlocked(data["items"], parent_ref)
+        if group_role(parent) != "parent":
+            raise ValueError(f"{parent.get('ref')} is not a group parent")
+        fix = _group_fix_unlocked(data, parent, str(text or ""))
+        _validate_group_unlocked(data["items"], parent)
+        return fix
+    return _group_write(_do)
+
+
+def group_show(parent_ref: Any) -> Dict[str, Any]:
+    """Read-only summary of a group (``wt group show``)."""
+    items = _load_unlocked()["items"]
+    by_ref = _refs_index(items)
+    it = _find_unlocked(items, parent_ref)
+    if group_role(it) == "child":
+        it = by_ref.get(group_parent_ref(it)) or it
+    if group_role(it) != "parent":
+        raise ValueError(f"{it.get('ref')} is not in a group")
+    g = it.get("group") or {}
+    integ = group_integration(it)
+
+    def _kid(r):
+        ch = by_ref.get(r) or {}
+        res = ch.get("resolution") if isinstance(ch.get("resolution"), dict) else {}
+        return {"ref": r, "title": ch.get("title") or ch.get("note", "")[:80],
+                "status": ch.get("status"), "commit": str(res.get("commit") or ""),
+                "blocked_by": list(ch.get("blocked_by") or []),
+                "kind": (ch.get("group") or {}).get("kind", "member")}
+    return {"ref": it.get("ref"), "title": it.get("title") or "", "status": it.get("status"),
+            "sealed": bool(g.get("sealed")), "membership_version": group_mv(it),
+            "plan_status": (it.get("plan") or {}).get("status") or "",
+            "plan_version": (it.get("plan") or {}).get("version") or 0,
+            "members": [_kid(r) for r in g.get("members") or []],
+            "fixes": [_kid(r) for r in g.get("fixes") or []],
+            "integration": dict(integ, state=group_integration_state(it)),
+            "proof": group_proof_state(it, by_ref),
+            "needs_input": bool(it.get("needs_input")),
+            "block_question": it.get("block_question") or ""}
+
+
+# --- group plan text --------------------------------------------------------
+_GROUP_HEADING_RE = _re.compile(r"^##[ \t]+(Shared|Section:[ \t]*(\S+))[ \t]*$", _re.M | _re.I)
+GROUP_PLAN_UNCHANGED = "(unchanged)"
+
+
+def _split_group_plan(text: str, members: List[str],
+                      prior: Optional[Dict[str, str]] = None) -> Tuple[str, Dict[str, str]]:
+    """``## Shared`` then one ``## Section: <REF>`` per member, in any order.
+    Raises on a missing/unknown/duplicate section; a body of ``(unchanged)``
+    copies the prior section. No silent clip (OPS-1300): each section is at
+    most PLAN_TEXT_MAX and the whole plan GROUP_PLAN_TEXT_MAX."""
+    text = str(text or "").strip()
+    if len(text) > GROUP_PLAN_TEXT_MAX:
+        raise ValueError(f"group plan is {len(text)} chars, over the {GROUP_PLAN_TEXT_MAX} "
+                         "limit; condense it and resubmit")
+    heads = list(_GROUP_HEADING_RE.finditer(text))
+    fmt = ("a group plan is `## Shared` followed by one `## Section: <REF>` per member ("
+           + ", ".join(members) + ")")
+    if not heads or heads[0].group(1).lower() != "shared":
+        raise ValueError(f"missing `## Shared`: {fmt}")
+    canon = {m.upper(): m for m in members}
+    shared: Optional[str] = None
+    sections: Dict[str, str] = {}
+    pre = text[:heads[0].start()].strip()
+    for i, m in enumerate(heads):
+        body = text[m.end():heads[i + 1].start() if i + 1 < len(heads) else len(text)].strip()
+        if m.group(1).lower() == "shared":
+            if shared is not None:
+                raise ValueError(f"duplicate `## Shared`: {fmt}")
+            shared = (pre + "\n\n" + body).strip() if pre else body
+            continue
+        ref = canon.get(str(m.group(2)).upper())
+        if ref is None:
+            raise ValueError(f"section for unknown member {m.group(2)}: {fmt}")
+        if ref in sections:
+            raise ValueError(f"duplicate section for {ref}: {fmt}")
+        if body == GROUP_PLAN_UNCHANGED:
+            if not (prior or {}).get(ref):
+                raise ValueError(f"section {ref} says {GROUP_PLAN_UNCHANGED} but has no prior text")
+            body = str(prior[ref])
+        sections[ref] = body
+    missing = [m for m in members if m not in sections]
+    if missing:
+        raise ValueError(f"missing section(s) for {', '.join(missing)}: {fmt}")
+    for name, body in [("Shared", shared or "")] + list(sections.items()):
+        if len(body) > PLAN_TEXT_MAX:
+            raise ValueError(f"section {name} is {len(body)} chars, over the {PLAN_TEXT_MAX} "
+                             "limit; condense it and resubmit")
+    if len(shared or "") + sum(len(v) for v in sections.values()) > GROUP_PLAN_TEXT_MAX:
+        raise ValueError(f"group plan sections total over {GROUP_PLAN_TEXT_MAX} chars; condense")
+    return shared or "", {m: sections[m] for m in members}
+
+
+def render_plan(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = None,
+                sections: Any = "all") -> str:
+    """One renderer for goals, ``wt plan show``, the claim note and the
+    verifier: a non-group ticket's plan text unchanged; a parent's shared
+    section plus ``sections`` (``"all"``, one member ref, or None for shared
+    only); a child's shared + own section."""
+    role = group_role(item)
+    if role == "child":
+        parent = group_parent_of(item, by_ref) or {}
+        if not parent:
+            return ""
+        return render_plan(parent, by_ref, sections=str(item.get("ref") or "")
+                           if sections == "all" else sections)
+    plan = item.get("plan") or {}
+    if role != "parent":
+        return str(plan.get("text") or "")
+    out = [f"## Shared\n{str(plan.get('text') or '').strip()}"]
+    secs = dict(plan.get("sections") or {})
+    members = list((item.get("group") or {}).get("members") or [])
+    if sections == "all":
+        want = members
+    elif sections:
+        want = [str(sections)]
+    else:
+        want = []
+    for ref in want:
+        out.append(f"## Section: {ref}\n{str(secs.get(ref) or '(no section)').strip()}")
+    return "\n\n".join(out)
+
+
+def _group_fence_mv(it: Dict[str, Any], expect_mv: Optional[int]) -> None:
+    """Group-parent plan writes carry the membership version they were
+    written for; a stale one is fenced (D2)."""
+    if group_role(it) != "parent":
+        return
+    cur = group_mv(it)
+    if expect_mv is None:
+        raise ValueError(f"{it.get('ref')} is a group parent: pass --mv {cur} "
+                         "(its membership version)")
+    if int(expect_mv) != cur:
+        raise GroupFenced(f"stale: group membership changed (v{int(expect_mv)}→v{cur})")
+
+
+def _group_accept_unlocked(data: Dict[str, Any], it: Dict[str, Any], by: str, force: bool,
+                           no_proof: bool) -> str:
+    ref = str(it.get("ref") or "")
+    st = it.get("status")
+    if not force:
+        if st != "in_review":
+            raise ValueError(f"{ref} is {st}, not in_review -- nothing to accept")
+        if it.get("gate_pending") == "verify":
+            raise ValueError(f"{ref} is waiting on its integration verifier's verdict "
+                             "(wt verdict); --force overrides")
+        return _group_close_unlocked(data, it, by=by)
+    if st not in ("open", "in_review"):
+        raise ValueError(f"{ref} is {st}; nothing to force-accept")
+    if not group_plan_settled(it):
+        raise ValueError(f"{ref}'s group plan has not settled; nothing to accept")
+    by_ref = _refs_index(data["items"])
+    cur = group_current_map(it, by_ref)
+    open_kids = [r for r, v in cur.items() if v is None]
+    if open_kids:
+        raise ValueError(f"{ref} still has open children: {', '.join(open_kids)}")
+    integ = _integration(it)
+    proven = integ.get("proven") if isinstance(integ.get("proven"), dict) else None
+    proven_ok = bool(proven) and cur == dict(proven.get("commits") or {})
+    if not proven_ok and not no_proof:
+        why = "no integration commit was found" if not proven else \
+            "its integration proof predates a later child commit"
+        raise ValueError(f"{ref} is not proven ({why}); `wt accept {ref} --force --no-proof` "
+                         "closes it without an integration commit containing every member")
+    integ["lease"] = None
+    if st == "in_review":
+        it["verify_cycle"] = int(it.get("verify_cycle") or 0) + 1
+    _retire_sessions_unlocked(it, ("verifier",), "force_accept")
+    _archive_verifier(it)
+    it.pop("gate_pending", None)
+    it.pop("gate_stages", None)
+    return _group_close_unlocked(data, it, forced=True, no_proof=not proven_ok, by=by)
+
+
+def _group_verdict(ident: Any, passed: bool, findings: str, by: str,
+                   expect_verify_cycle: Optional[int]) -> Optional[Dict[str, Any]]:
+    """The integration verifier's verdict: one locked write (fence, then
+    advance to review / close / D7.4)."""
+    refused, nxt, closed = "", "", None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        it = next((x for x in data["items"] if _matches(x, ident)), None)
+        if it is None:
+            return None
+        ref = str(it.get("ref") or "")
+        integ = _integration(it)
+        vc = int(it.get("verify_cycle") or 0)
+        if expect_verify_cycle is None:
+            raise ValueError(f"{ref} is a group parent: pass --verify-cycle {vc} "
+                             "(the integration verify cycle)")
+        n = int(expect_verify_cycle)
+        if not (n == vc == int(integ.get("verify_cycle") or 0) and integ.get("state") == "verifying"
+                and it.get("status") == "in_review" and it.get("gate_pending") == "verify"):
+            raise GroupFenced(f"stale: {ref} is at integration verify cycle {vc} (state "
+                              f"{integ.get('state')}, status {it.get('status')}); this verdict "
+                              f"is for cycle {n}")
+        now = _now_iso()
+        entry = {"gate": "verify", "passed": bool(passed),
+                 "output_tail": _clip(findings, GATE_OUTPUT_TAIL), "by": str(by), "at": now,
+                 "commit": str(integ.get("sha") or "")}
+        v = it.get("verifier") or {}
+        if v.get("engine"):
+            entry["engine"], entry["model"] = v.get("engine"), v.get("model", "")
+        it["gate_results"] = list(it.get("gate_results") or []) + [entry]
+        _append_history(it, "verify", by=_by("system"), at=now, passed=bool(passed),
+                        findings=_clip(findings, 500), verify_cycle=vc)
+        if not passed:
+            _group_integration_failed_unlocked(
+                data, it, f"independent verification failed at {str(integ.get('sha'))[:12]}: "
+                          f"{_clip(findings, 3000) or '(no findings given)'}")
+        else:
+            stages = [x for x in (it.get("gate_stages") or []) if x != "verify"]
+            it["gate_stages"] = stages
+            if stages:
+                cur = group_current_map(it, _refs_index(data["items"]))
+                proven = integ.get("proven") if isinstance(integ.get("proven"), dict) else {}
+                if cur != dict(proven.get("commits") or {}):
+                    refused = _group_refuse_completion_unlocked(
+                        it, "the child commit map changed since the integration proof")
+                else:
+                    it["gate_pending"] = nxt = stages[0]
+                    integ["state"] = "reviewing"
+            else:
+                refused = _group_close_unlocked(data, it, by=f"verifier:{by}")
+                closed = None if refused else it
+        it["updated_at"] = now
+        _save_unlocked(data)
+        item = it
+    if refused:
+        raise GroupFenced(refused)
+    if nxt:
+        _notify_review(item, nxt, by)
+    if closed is not None:
+        _after_group_close(closed, f"verifier:{by}")
+    return get(item.get("ref") or ident) or item
+
+
+def _group_reject(ident: Any, why: str) -> Optional[Dict[str, Any]]:
+    """``wt reject P``: an integration failure (D7.4), never reject_with."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        it = next((x for x in data["items"] if _matches(x, ident)), None)
+        if it is None:
+            return None
+        if it.get("status") != "in_review":
+            raise ValueError(f"{it.get('ref')} is {it.get('status')}, not in_review -- "
+                             "nothing to reject (its integration is not under review)")
+        _group_integration_failed_unlocked(data, it, why)
+        _save_unlocked(data)
+        return it
 
 
 # ---------------------------------------------------------------------------
@@ -4316,6 +5839,9 @@ def reopen(ident: Any, reason: str = "", session_id: str = "",
     current = get(ident)
     if current is None:
         return None
+    if group_role(current) == "parent":
+        raise ValueError(f"{current.get('ref', ident)} is a group parent: it is never "
+                         "reopened; reopen a member (`wt group show`) instead")
     if current.get("status") == "open":
         raise ValueError(
             f"{current.get('ref', ident)} is already open — nothing to reopen"
@@ -4340,8 +5866,10 @@ def reopen(ident: Any, reason: str = "", session_id: str = "",
             f"--force if the block is stale."
         )
     by_kind = "worker" if session_id else "human"
+    # WT-33 D9: --force also invalidates a group integration that holds this
+    # closed child (without it the reopen is refused, nothing written).
     return update_status(ident, "open", session_id, reason=reason or "reopened",
-                         by_kind=by_kind)
+                         by_kind=by_kind, group_force=force)
 
 
 def reopen_and_claim(
@@ -4410,6 +5938,10 @@ def reopen_and_claim(
                     f"{it.get('ref', ident)} \"...\"` to resolve it, or pass "
                     f"--force if the block is stale."
                 )
+            # WT-33: the D9 child hook and the group claim check run before any
+            # reset, so a refusal leaves the ticket untouched.
+            _group_child_change_unlocked(data["items"], it, "reopen", force)
+            _group_claim_check_unlocked(data["items"], it)
             now = _now_iso()
             # Reopen half: same field resets as update_status's "open" branch
             # (parity with reopen()/GitHub's reopen), except status lands on
@@ -4441,10 +5973,11 @@ def reopen_and_claim(
             it["updated_at"] = now
             it["claim_proc"] = (dict(claim_proc, bound="inherited") if claim_proc
                                 else _claim_proc_for(session_id, real_sid or ""))
+            gfields = _stamp_claim_unlocked(it, data["items"], "reopen", now)
             _append_history(
                 it, "claim",
                 by=_by("worker", str(session_id), str(real_sid or "")),
-                at=now,
+                at=now, **gfields,
             )
             if sent_back_reason:
                 it["sent_back"] = {
@@ -5003,7 +6536,7 @@ def _recover_escalate_unlocked(it: Dict[str, Any], now: str, question: str) -> N
     it["blocked_at"] = now
     it.pop("resume", None)
     _clear_sent_back_unlocked(it)
-    if it.get("status") == "open":
+    if it.get("status") == "open" and group_role(it) != "parent":   # WT-33: never in_progress
         it["status"] = "in_progress"
     _append_history(it, "block", by=_by("system"), at=now, question=_clip(question, 4000),
                     kind="input")
@@ -5600,9 +7133,12 @@ def block(
                 edge_from = _pa_edge_start(it)
                 _supersede_pending_unlocked(it, now)
                 park_worker = str(it.get("claimed_by") or session_id or "")
+                # WT-33 D7.5: a group parent's block never changes its status
+                # nor binds a claimant (it is never parked or in_progress).
+                is_parent = group_role(it) == "parent"
                 # WT-31 D1a: under an active plan gate the plan stage owns the
                 # ticket, so a worker block stays legacy (needs_input).
-                park = (origin == "worker" and not was_parked
+                park = (origin == "worker" and not was_parked and not is_parent
                         and it.get("status") in ("open", "in_progress") and bool(park_worker)
                         and not _plan_active_unlocked(it))
                 park_sid = str(it.get("claimed_session_id")
@@ -5617,9 +7153,9 @@ def block(
                     it["block_commit"] = commit
                 it.pop("resume", None)
                 _clear_sent_back_unlocked(it)
-                if it.get("status") == "open" and not park:
+                if it.get("status") == "open" and not park and not is_parent:
                     it["status"] = "in_progress"
-                if session_id and not park and not was_parked:
+                if session_id and not park and not was_parked and not is_parent:
                     real = _coerce_session_uuid(session_id)
                     if not it.get("claimed_by"):
                         it["claimed_by"] = str(session_id)
@@ -5681,6 +7217,19 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
         for it in data["items"]:
             if _matches(it, ident):
                 now = _now_iso()
+                integ = group_integration(it) if group_role(it) == "parent" else {}
+                if integ.get("state") == "capped" and not integ.get("blocked"):
+                    # WT-33 D7.5: the answer is the guidance for one more fix
+                    # (raises at GROUP_MAX_FIXES before anything is written).
+                    _append_history(it, "answer", by=_by("human", str(session_id or "")),
+                                    at=now, text=_clip(text, 24000))
+                    it["answered_at"] = now
+                    _group_fix_unlocked(data, it, text)
+                    _validate_group_unlocked(data["items"], it)
+                    _save_unlocked(data)
+                    _log("ANSWER", f"{it.get('ref', '?')} — {_clip(text, 240)}",
+                         queue=it.get("project", ""))
+                    return it
                 it["needs_input"] = False
                 it["answered_at"] = now
                 it["updated_at"] = now
@@ -5691,6 +7240,17 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     at=now,
                     text=_clip(text, 24000),
                 )
+                if integ.get("blocked"):
+                    # WT-33 D7.1: one answer = one integration retry.
+                    _append_history(it, "group_integration_retry", by=_by("human"), at=now,
+                                    kind=integ.get("blocked"))
+                    _integration(it)["blocked"] = ""
+                    _group_clear_block(it)
+                    _save_unlocked(data)
+                    _log("ANSWER", f"{it.get('ref', '?')} — {_clip(text, 240)}",
+                         queue=it.get("project", ""))
+                    _group_wake([str(it.get("ref"))], "integration")
+                    return it
                 stage_retry = _stage_retry_reset(it, text, now)
                 if (it.get("status") == PARKED_STATUS and it.get("parked")
                         and not stage_retry):
