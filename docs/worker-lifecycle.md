@@ -583,6 +583,15 @@ after the parked worker exited). Parking moves it to `parked.proc`; ending a
 claim keeps it as `prior_claim_proc`. `liveness.claim_owner(item)` answers
 `alive | dead | unproven` from it.
 
+The claim-time guard (`queue._verify_worker_live`, run by `claim_next` /
+`claim_by_ref`) asks the same resolver about the `claim_proc` the claim would
+write, and rejects (`... not currently alive ... claim rejected`) only on
+`dead`. A dead worker record whose session is alive in the Claude registry (a
+resumed session) is `alive` and claims normally; a claimer with no record
+(never spawned, or pruned) is `ambient`, and an unprovable death (registry
+unreadable, codex rollout missing, a process still naming the session) is
+`unproven` — both go through.
+
 ### Adding a state value, a dim or an edge
 
 1. Add the value to its vocabulary tuple in `queue.py` (`VALID_STATUSES`,

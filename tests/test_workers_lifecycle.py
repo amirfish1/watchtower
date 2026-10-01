@@ -175,6 +175,12 @@ def _live_worker(wt, queue, *, with_fifo=True):
     return rec
 
 
+def _claude_registry_readable(wt):
+    """WT-31: the claim_owner resolver judges a claude worker ``dead`` only
+    when the Claude session registry is readable (else ``unproven``)."""
+    (wt.tmp / "claude-home" / "sessions").mkdir(parents=True, exist_ok=True)
+
+
 def _dead_worker(wt, queue):
     """Record a worker whose process is gone and whose FIFO has no reader."""
     workers = wt.workers
@@ -1221,6 +1227,7 @@ def test_claim_next_rejects_dead_spawned_worker(wt):
     """WT-92: claim_next must fail loudly when the session_id is a registered
     spawned worker that is no longer alive, so the caller gets an immediate
     error instead of a silent requeue 2 minutes later."""
+    _claude_registry_readable(wt)
     rec = _dead_worker(wt, "Q")
     dead_id = rec["worker_id"]  # "q-dead" — _dead_worker lowercases the queue name
     wt.q.enqueue(project="Q", note="work")
@@ -1234,6 +1241,7 @@ def test_claim_next_rejects_dead_spawned_worker(wt):
 
 def test_claim_by_ref_rejects_dead_spawned_worker(wt):
     """WT-92: claim_by_ref must also fail loudly for a dead registered worker."""
+    _claude_registry_readable(wt)
     rec = _dead_worker(wt, "Q")
     dead_id = rec["worker_id"]  # "q-dead"
     item = wt.q.enqueue(project="Q", note="work")
@@ -1248,6 +1256,7 @@ def test_dead_worker_rejection_message_guides_resumed_sessions(wt):
     bug because the message read as transient. The message must name the
     recorded pid and tell the caller not to retry or file."""
     import pytest
+    _claude_registry_readable(wt)
     rec = _dead_worker(wt, "Q")
     dead_id = rec["worker_id"]
     wt.q.enqueue(project="Q", note="work")
@@ -1454,9 +1463,14 @@ def test_claim_rejects_concurrent_codex_process_for_same_thread(
     assert recorded["pid"] == os.getpid()
 
 
-def test_claim_rejects_pruned_codex_alias_from_unrelated_session(
+def test_pruned_codex_alias_from_unrelated_session_claims_ambient(
     wt, monkeypatch, capsys
 ):
+    """WT-31 (plan v6: ``_verify_worker_live`` -> resolver ``dead`` only).
+    The alias's record is pruned, so nothing proves its process dead: the
+    claim is not rejected, it is bound ``ambient`` (never dead, so the orphan
+    sweep never requeues it). The unrelated session is still not rebound onto
+    the old worker record (that stays the FEAT-NEXT-102 rebind guard)."""
     cli = _reloaded_cli(wt)
     worker_id = "q-codex-dead"
     wt.workers.record_worker(
@@ -1478,9 +1492,13 @@ def test_claim_rejects_pruned_codex_alias_from_unrelated_session(
 
     rc = cli.cmd_claim(_claim_ns("Q", worker_id, json_out=True))
 
-    assert rc == 1
-    assert "not currently alive" in capsys.readouterr().err
-    assert wt.q.get(ticket["ref"])["status"] == "open"
+    assert rc == 0
+    assert "not currently alive" not in capsys.readouterr().err
+    it = wt.q.get(ticket["ref"])
+    assert it["status"] == "in_progress"
+    assert it["claim_proc"]["bound"] == "ambient"
+    assert all(w["worker_id"] != worker_id or w.get("session_id") != it["claimed_session_id"]
+               for w in wt.workers._load()["workers"])
 
 
 def test_rebind_continued_worker_refuses_a_second_continuation(wt):

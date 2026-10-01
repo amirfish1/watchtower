@@ -219,3 +219,83 @@ def test_exit_file_names_the_death(wt, procs, tmp_path):
     v = _owner(wt, ref)
     assert v.verdict == "dead" and v.evidence == "killed by signal 15"
     w.kill()
+
+
+# ------------------------------------- claim-time guard (_verify_worker_live)
+# Plan v6 "What it replaces": ``_verify_worker_live`` -> resolver ``dead``.
+# Only a claim the resolver would judge dead is rejected; alive, unproven and
+# ambient claimers go through.
+def _registry_row(tmp_path, sid: str, pid: int) -> None:
+    (tmp_path / "claude-home" / "sessions" / f"{pid}.json").write_text(
+        json.dumps({"sessionId": sid, "pid": pid}))
+
+
+def test_claim_guard_lets_a_resumed_session_of_a_dead_worker_through(wt, procs, tmp_path):
+    """The verifier's probe: the original WT worker record is dead, its
+    session is alive in the Claude registry (resumed) -> claim_owner alive,
+    so the claim is legitimate and must not be rejected."""
+    w = procs("w1", SID)
+    w.kill()
+    alive = subprocess.Popen(["sleep", "60"])
+    try:
+        _registry_row(tmp_path, SID, alive.pid)
+        a, b = _file(wt, "a"), _file(wt, "b")
+        wt.q.claim_by_ref(a, "w1", session_uuid=SID)
+        assert _owner(wt, a).verdict == "alive"
+        wt.q.update_status(a, "closed", "w1")
+        got = wt.q.claim_next("w1", project=PQ, session_uuid=SID)
+        assert got["ref"] == b and wt.q.get(b)["status"] == "in_progress"
+        # no session uuid passed: the worker's own (registry-live) session counts
+        wt.q.update_status(b, "open", "w1")
+        assert wt.q.claim_by_ref(b, "w1")["status"] == "in_progress"
+    finally:
+        alive.kill()
+        alive.wait()
+
+
+def test_claim_guard_rejects_only_a_dead_verdict(wt, procs):
+    w = procs("w1", SID)
+    w.kill()
+    ref = _file(wt)
+    with pytest.raises(ValueError, match="not currently alive.*process gone"):
+        wt.q.claim_by_ref(ref, "w1", session_uuid=SID)
+    with pytest.raises(ValueError, match="not currently alive"):
+        wt.q.claim_next("w1", project=PQ)
+    assert wt.q.get(ref)["status"] == "open"
+
+
+def test_claim_guard_lets_unproven_through(wt, procs, tmp_path):
+    """Registry unreadable: the dead record's death cannot be proven."""
+    w = procs("w1", SID)
+    w.kill()
+    os.rmdir(tmp_path / "claude-home" / "sessions")
+    ref = _file(wt)
+    assert wt.q.claim_by_ref(ref, "w1", session_uuid=SID)["status"] == "in_progress"
+
+
+def test_claim_guard_lets_unproven_codex_through(wt, procs, monkeypatch):
+    w = procs("w1", SID, engine="codex")
+    w.kill()
+    monkeypatch.setattr(wt.liveness, "ps_argv", lambda: ["bash"])
+    monkeypatch.setattr(wt.liveness, "_transcript_mtime", lambda e, s: 0.0)
+    ref = _file(wt)
+    assert wt.q.claim_by_ref(ref, "w1", session_uuid=SID)["status"] == "in_progress"
+    monkeypatch.setattr(wt.liveness, "_transcript_mtime", lambda e, s: time.time() - 600)
+    ref2 = _file(wt)
+    with pytest.raises(ValueError, match="not currently alive"):
+        wt.q.claim_by_ref(ref2, "w1", session_uuid=SID)
+
+
+def test_claim_guard_lets_ambient_and_pruned_through(wt, procs):
+    """No record (never spawned, or pruned): ambient, never dead."""
+    w = procs("w1", SID)
+    w.kill()
+    w.prune()
+    wt.workers._add_worker_id("w1")            # the id ledger still knows it
+    ref = _file(wt)
+    it = wt.q.claim_by_ref(ref, "w1", session_uuid=SID2)
+    assert it["status"] == "in_progress" and it["claim_proc"]["bound"] == "ambient"
+    ref2 = _file(wt)
+    assert wt.q.claim_by_ref(ref2, "stranger",
+                             session_uuid="33333333-3333-3333-3333-333333333333"
+                             )["status"] == "in_progress"

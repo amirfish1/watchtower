@@ -2060,45 +2060,58 @@ def _hosted_codex_thread_owns_worker(worker_id: str, session_uuid: str) -> bool:
 
 
 def _verify_worker_live(session_id: str, session_uuid: str = "") -> None:
-    """Raise ValueError if session_id is a known-spawned worker that is dead.
+    """Raise ValueError if the claim ``session_id`` is about to make would be
+    bound to a process the claim_owner resolver judges ``dead`` (WT-31).
 
-    Ambient sessions (wt claim --worker <alias> from a bare Claude session,
-    never launched via spawn_workers) are not in the spawn registry, so their
-    liveness cannot be checked — they are left alone to match the OPS-104 fix
-    in requeue_orphaned_tickets().  Only registered-but-dead workers are
-    rejected: those are exactly the ones the reconciler will silently requeue
-    2 minutes later, so failing loudly at claim time is strictly better UX.
+    The probe is exactly the ``claim_proc`` the claim would write
+    (``_claim_proc_for``): a live worker record, a live Claude registry
+    session or another live WT record for the session all read ``alive``;
+    ambient claimers (no record: never spawned, or pruned) and anything the
+    engine checks cannot prove dead read ``unproven``. Only ``dead`` is
+    rejected -- those are the claims the orphan sweep would requeue, so
+    failing loudly at claim time is strictly better UX. A resumed session of a
+    dead worker whose session is alive in the registry is let through.
     """
     try:
         from . import workers as _workers
+        from . import liveness as _lv
         known = _workers.list_workers(prune=False)
-        known_ids = {str(w.get("worker_id", "")) for w in known} | set(
-            _workers._load_worker_id_ledger()
-        )
-        if session_id not in known_ids:
-            return  # not a tracked spawned worker — can't verify, allow through
-        live_ids = {str(w.get("worker_id", "")) for w in known if w.get("alive")}
-        if session_id not in live_ids:
-            if _hosted_codex_thread_owns_worker(session_id, session_uuid):
+        if any(str(w.get("worker_id", "")) == session_id and w.get("alive") for w in known):
+            return  # fast path: its record is running
+        if _hosted_codex_thread_owns_worker(session_id, session_uuid):
+            return
+        real_sid = _coerce_session_uuid(session_uuid)
+        cp = _claim_proc_for(session_id, real_sid)
+        if cp.get("bound") == "ambient":
+            return  # no record: an ambient claimer is never dead (OPS-104)
+        ctx = _lv.ResolverContext()
+        sids = [str(cp.get("session_id") or "")]
+        rec_sid = next((str(w.get("session_id") or "") for w in reversed(known)
+                        if str(w.get("worker_id", "")) == str(cp.get("worker_id") or "")), "")
+        if rec_sid and rec_sid not in sids:
+            sids.append(rec_sid)   # the worker's own session may be the resumed one
+        verdict = None
+        for sid in sids:
+            probe = {"status": "in_progress", "claimed_by": session_id,
+                     "claimed_session_id": sid, "claim_proc": dict(cp, session_id=sid)}
+            verdict = _lv.claim_owner(probe, ctx)
+            if verdict.verdict != "dead":
                 return
-            dead = next(
-                (w for w in known if str(w.get("worker_id", "")) == session_id),
-                {},
-            )
-            pid_hint = (
-                f" (recorded pid {dead['pid']} — verify with `ps -p {dead['pid']}`)"
-                if dead.get("pid")
-                else ""
-            )
-            raise ValueError(
-                f"worker {session_id!r} is registered as a spawned worker but is "
-                f"not currently alive{pid_hint} — claim rejected to prevent a "
-                "silent requeue. This almost always means the worker was "
-                "released/reaped and its process exited; the reconciler spawns "
-                "a fresh worker with a new id when staffing is needed. If you "
-                "are a resumed session from that dead worker: do not retry the "
-                "claim and do not file a bug about this message — end your turn."
-            )
+        pid_hint = (
+            f" (recorded pid {cp['pid']} — verify with `ps -p {cp['pid']}`)"
+            if cp.get("pid")
+            else ""
+        )
+        raise ValueError(
+            f"worker {session_id!r} is registered as a spawned worker but is "
+            f"not currently alive{pid_hint}: {verdict.evidence if verdict else 'dead'} — "
+            "claim rejected to prevent a "
+            "silent requeue. This almost always means the worker was "
+            "released/reaped and its process exited; the reconciler spawns "
+            "a fresh worker with a new id when staffing is needed. If you "
+            "are a resumed session from that dead worker: do not retry the "
+            "claim and do not file a bug about this message — end your turn."
+        )
     except ValueError:
         raise
     except Exception:
