@@ -2815,6 +2815,7 @@ def _resume_session_headless(
         argv = [
             "codex", "exec", "resume",
             "--dangerously-bypass-approvals-and-sandbox",
+            *workers.codex_compact_args(),
             sid, prompt,
         ]
     elif engine == "kimi":
@@ -2838,7 +2839,7 @@ def _resume_session_headless(
             proc = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=logf,
                 stderr=subprocess.STDOUT, start_new_session=True,
-                cwd=repo or os.getcwd(),
+                cwd=repo or os.getcwd(), env=workers.compact_env(),
             )
         finally:
             logf.close()

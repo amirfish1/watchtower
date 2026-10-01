@@ -4884,3 +4884,50 @@ def test_retained_parked_worker_does_not_consume_spawn_budget(wt, monkeypatch):
     # The retained worker is excluded from the live count the claim-time STOP uses.
     assert wt.workers.live_worker_count(
         "Q", exclude=wt.workers.retained_parked_ids("Q")) <= 1
+
+
+def test_every_codex_spawn_carries_the_compact_limit(wt, tmp_path, monkeypatch):
+    f = tmp_path / "sd.json"
+    f.write_text('{"worker_auto_compact_k": 200}')
+    monkeypatch.setattr(wt.config, "CCC_SPAWN_DEFAULTS_FILE", f)
+    monkeypatch.setattr(wt.workers.shutil, "which", lambda b: "/usr/bin/" + b)
+    argv = wt.workers.build_adhoc_command("codex", "do it", model="m")
+    assert argv[argv.index("-c") + 1] == "model_auto_compact_token_limit=200000"
+    assert argv[-1] == "do it"
+    f.write_text('{"worker_auto_compact_k": 0}')
+    assert "-c" not in wt.workers.build_adhoc_command("codex", "do it")
+
+
+def test_claude_spawns_get_the_compact_window_env(wt, tmp_path, monkeypatch):
+    f = tmp_path / "sd.json"
+    f.write_text('{"worker_auto_compact_k": 200}')
+    monkeypatch.setattr(wt.config, "CCC_SPAWN_DEFAULTS_FILE", f)
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    assert wt.workers._spawn_env("w")["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+    assert wt.workers.compact_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "123")  # operator wins
+    assert wt.workers._spawn_env("w")["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "123"
+
+
+def test_headless_resume_carries_the_compact_settings(wt, tmp_path, monkeypatch):
+    f = tmp_path / "sd.json"
+    f.write_text('{"worker_auto_compact_k": 200}')
+    monkeypatch.setattr(wt.config, "CCC_SPAWN_DEFAULTS_FILE", f)
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import watchtower.cli as cli
+    wt.cli = cli
+    seen = []
+
+    class P:
+        pid = 1
+
+    monkeypatch.setattr(wt.cli.subprocess, "Popen",
+                        lambda argv, **kw: seen.append((argv, kw.get("env"))) or P())
+    monkeypatch.setattr(wt.cli.resume_verify, "verify_resume_child", lambda p: (False, ""))
+    assert wt.cli._resume_session_headless("sid1", "", "go", "codex")
+    assert wt.cli._resume_session_headless("sid2", "", "go", "claude")
+    codex, claude = seen
+    assert "model_auto_compact_token_limit=200000" in codex[0]
+    assert codex[0].index("-c") < codex[0].index("sid1")
+    assert claude[1]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"

@@ -213,6 +213,13 @@ def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "
     env["GIT_AUTHOR_NAME"] = "Amir Fish (watchtower)"
     env["GIT_COMMITTER_NAME"] = "Amir Fish (watchtower)"
     env["AGENT_MACHINE"] = "watchtower"
+    # Claude honors CLAUDE_CODE_AUTO_COMPACT_WINDOW; a daemon not started by
+    # CCC would not carry it, so every spawn gets CCC's worker threshold
+    # unless the operator already set one.
+    from . import config as _config
+    compact = _config.worker_auto_compact_tokens()
+    if compact > 0:
+        env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(compact))
     return env
 
 
@@ -4784,10 +4791,7 @@ def build_drain_command(
             argv += ["--config", f'model_reasoning_effort="{effort}"']
         # Codex ignores CCC's CLAUDE_CODE_AUTO_COMPACT_WINDOW; without this
         # workers ran to ~780K context (model_context_window=1M) before compact.
-        from . import config as _config
-        compact = _config.worker_auto_compact_tokens()
-        if compact > 0:
-            argv += ["-c", f"model_auto_compact_token_limit={compact}"]
+        argv += codex_compact_args()
         argv.append(goal or drain_goal(queue, worker_id, repo_path, engine=engine))
         return argv
     if engine == "kimi":
@@ -7475,6 +7479,25 @@ ADHOC_REPORT_FOOTER = (
 )
 
 
+def compact_env() -> Dict[str, str]:
+    """Copy of the environment with the worker auto-compact window set for
+    Claude (an operator-set value wins)."""
+    env = os.environ.copy()
+    from . import config as _config
+    compact = _config.worker_auto_compact_tokens()
+    if compact > 0:
+        env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(compact))
+    return env
+
+
+def codex_compact_args() -> List[str]:
+    """``-c model_auto_compact_token_limit=N`` for every codex spawn: Codex
+    ignores CLAUDE_CODE_AUTO_COMPACT_WINDOW and otherwise runs to ~780K."""
+    from . import config as _config
+    compact = _config.worker_auto_compact_tokens()
+    return ["-c", f"model_auto_compact_token_limit={compact}"] if compact > 0 else []
+
+
 def build_adhoc_command(
     engine: str, prompt: str, *, model: str = "", repo_path: str = "",
     log_path: str = "", session_id: str = "",
@@ -7490,6 +7513,7 @@ def build_adhoc_command(
         argv = [_ENGINE_BIN["codex"], "exec"]
         if model:
             argv += ["--model", model]
+        argv += codex_compact_args()
         argv.append(prompt)
         return argv
     if engine == "antigravity":
