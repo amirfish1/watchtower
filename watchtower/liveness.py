@@ -1072,9 +1072,8 @@ _LIVE_STATES = ("sending", "pending")
 # (nonce + ledger); an advisory sender's result never feeds a ticket-state
 # write; the transport layer is the plumbing itself.
 VERIFIED_SENDERS = frozenset({
-    "answers._deliver", "cli._deliver_to_blocked_session", "workers.notify_workers",
-    "workers._nudge_one", "workers._deliver_release_instruction", "cli._plan_send",
-    "queue._notify_review", "cli.cmd_plan", "cli._resume_rejected", "cli.cmd_reopen",
+    "answers._deliver", "cli._deliver_to_blocked_session", "workers._nudge_one",
+    "workers._deliver_release_instruction", "cli._plan_send", "queue._notify_review", "cli.cmd_plan", "cli._resume_rejected", "cli.cmd_reopen",
     "cli.cmd_answer", "cli.cmd_gate_ack",
 })
 ADVISORY_SENDERS = frozenset({
