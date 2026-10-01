@@ -36,7 +36,7 @@ import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 VALID_BACKENDS = ("file", "github")
 from . import models as _models
@@ -794,6 +794,89 @@ def default_model(eng: str) -> str:
     return _ccc_default_model(eng)
 
 
+MODEL_PROFILES = ("fast", "standard", "deep")
+FALLBACK_ENGINES = ("claude", "codex", "kimi", "grok")
+
+
+def _ccc_model_settings() -> Dict[str, Any]:
+    try:
+        data = json.loads(CCC_SPAWN_DEFAULTS_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _configured_model_routes(raw: Any) -> List[Dict[str, str]]:
+    """Validate ordered routes without inventing a model or raising budgets.
+
+    One entry per engine: an exhausted account cannot recover by selecting a
+    second model on the same provider. Reject malformed config rather than
+    accidentally reverting to ambient CLI defaults.
+    """
+    if not isinstance(raw, list) or len(raw) > len(FALLBACK_ENGINES):
+        raise ValueError("model routes must be a list of at most four engines")
+    seen = set()
+    routes = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            raise ValueError("model route must be an object")
+        eng = str(entry.get("engine") or "").strip().lower()
+        model_value = canonical_model(eng, str(entry.get("model") or "").strip())
+        effort_value = str(entry.get("effort") or "").strip().lower()
+        if eng not in FALLBACK_ENGINES or eng in seen:
+            raise ValueError("model routes must use distinct supported engines")
+        if (not model_value or is_blocked_model(model_value)
+                or not is_approved_model(eng, model_value)):
+            raise ValueError("model route is missing, unsupported, or blocked")
+        if effort_value and (effort_value not in VALID_EFFORTS
+                             or _effort_rejected(eng, model_value, effort_value)):
+            raise ValueError("model route effort is not supported")
+        routes.append({"engine": eng, "model": model_value, "effort": effort_value})
+        seen.add(eng)
+    return routes
+
+
+def worker_fallback_policy() -> Optional[Dict[str, Any]]:
+    """Machine policy owned by CCC; absence preserves legacy queue behavior."""
+    data = _ccc_model_settings()
+    if "worker_fallback" not in data:
+        return None
+    policy = data["worker_fallback"]
+    if not isinstance(policy, dict) or not isinstance(policy.get("enabled"), bool):
+        return {"enabled": False, "models": []}
+    try:
+        routes = _configured_model_routes(policy.get("models"))
+    except ValueError:
+        return {"enabled": False, "models": []}
+    return {"enabled": policy["enabled"], "models": routes}
+
+
+def model_profile(name: str) -> Dict[str, Any]:
+    """Resolve an application capability profile without provider assumptions."""
+    if name not in MODEL_PROFILES:
+        raise ValueError("unknown model profile; use fast, standard, or deep")
+    profiles = _ccc_model_settings().get("model_profiles")
+    profile = profiles.get(name) if isinstance(profiles, dict) else None
+    if not isinstance(profile, dict):
+        raise ValueError(f"model profile {name!r} has not been configured in CCC Settings")
+    routes = _configured_model_routes(profile.get("models"))
+    if not routes:
+        raise ValueError(f"model profile {name!r} has no configured models")
+    return {"models": routes}
+
+
+def fallback_effort(queue: str, eng: str) -> str:
+    """Explicit queue effort wins; otherwise use the selected fallback route."""
+    pin = str(_queue_entry(queue).get("effort") or "").strip().lower()
+    if pin in VALID_EFFORTS:
+        return pin
+    policy = worker_fallback_policy()
+    for row in (policy or {}).get("models", []):
+        if row["engine"] == eng:
+            return row["effort"]
+    return effort(queue)
+
+
 def fallback_engine(failed_engine: str, *, excluded=()) -> str:
     """Choose an available replacement engine after a provider-level failure.
 
@@ -802,7 +885,9 @@ def fallback_engine(failed_engine: str, *, excluded=()) -> str:
     engine is never retried as its own fallback.
     """
     failed = str(failed_engine or "").strip().lower()
-    candidates = [_ccc_worker_engine_default(), "codex", "claude", "kimi"]
+    policy = worker_fallback_policy()
+    candidates = ([row["engine"] for row in policy["models"]] if policy is not None
+                  else [_ccc_worker_engine_default(), "codex", "claude", "kimi"])
     excluded = {str(item).strip().lower() for item in excluded}
     from . import workers as _workers
     seen = set()
@@ -816,10 +901,13 @@ def fallback_engine(failed_engine: str, *, excluded=()) -> str:
     return ""
 
 
-def set_fallback_to_default_worker(queue: str, enabled: bool) -> Dict[str, Any]:
+def set_fallback_to_default_worker(queue: str, enabled: Optional[bool]) -> Dict[str, Any]:
     data = _load()
     q = data.setdefault(queue, {})
-    q["fallback_to_default_worker"] = bool(enabled)
+    if enabled is None:
+        q.pop("fallback_to_default_worker", None)
+    else:
+        q["fallback_to_default_worker"] = bool(enabled)
     _save(data)
     return q
 
@@ -827,17 +915,27 @@ def set_fallback_to_default_worker(queue: str, enabled: bool) -> Dict[str, Any]:
 def fallback_to_default_worker(queue: str) -> bool:
     """"Revert to CCC default worker if current model is exhausted."
 
-    False unless explicitly opted in (WATCHTOWER-30). When on, a queue whose
-    engine keeps failing at launch gets workers on ``fallback_engine`` for
+    An explicit queue On/Off overrides CCC's machine policy; a queue without
+    an override inherits it. With no machine policy the legacy default is Off.
+    When on, a queue whose engine keeps failing gets ``fallback_engine`` for
     that launch only -- the queue's stored engine/model are never rewritten.
     When off, such a queue is parked instead of switched."""
-    return bool(_queue_entry(queue).get("fallback_to_default_worker", False))
+    entry = _queue_entry(queue)
+    if "fallback_to_default_worker" in entry:
+        return bool(entry["fallback_to_default_worker"])
+    return bool((worker_fallback_policy() or {}).get("enabled", False))
 
 
 def fallback_model(eng: str) -> str:
     """The model a substituted worker on ``eng`` runs with: the same shared
     defaults ``model()`` resolves for an unpinned queue on that engine. The
     failed queue's own pin belongs to its engine, so it is never carried over."""
+    policy = worker_fallback_policy()
+    if policy is not None:
+        for row in policy["models"]:
+            if row["engine"] == eng:
+                return row["model"]
+        return ""
     resolved = canonical_model(eng, _ccc_worker_model_default(eng) or default_model(eng))
     if resolved and is_blocked_model(resolved):
         return policy_fallback_model(eng)

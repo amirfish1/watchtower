@@ -6962,6 +6962,8 @@ def _reconcile_once_locked(dry_run: bool = False,
             spawned = spawn_workers(
                 q_name, n=to_spawn, engine=launch_engine, model=launch_model,
                 inherit_queue_model=launch_engine == engine,
+                **({"effort": config.fallback_effort(q_name, launch_engine)}
+                   if launch_engine != engine else {}),
                 repo_path=repo_path, dry_run=dry_run,
                 launch_failures=launch_failed,
                 # On a drain-off queue the worker exists only for the tickets
@@ -7009,6 +7011,7 @@ def _reconcile_once_locked(dry_run: bool = False,
                 fallback_spawned = spawn_workers(
                     q_name, n=len(failed_indices), engine=fallback,
                     model=fallback_model, inherit_queue_model=False,
+                    effort=config.fallback_effort(q_name, fallback),
                     repo_path=repo_path, dry_run=False,
                     launch_failures=fallback_failures,
                     extra_instructions=(
@@ -7216,6 +7219,7 @@ def spawn_workers(
     dry_run: bool = False,
     launch_failures: Optional[List[Dict[str, Any]]] = None,
     inherit_queue_model: bool = True,
+    effort: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Launch ``n`` worker subprocesses draining ``queue``.
 
@@ -7240,7 +7244,7 @@ def spawn_workers(
         from . import config
         model = config.model(queue)
     from . import config
-    effort = config.effort(queue)
+    effort = config.effort(queue) if effort is None else effort
     if _is_fable_model(model):
         import sys
         print(
