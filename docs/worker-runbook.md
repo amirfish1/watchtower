@@ -113,6 +113,7 @@ The audit (Tier 2):
      and resumes the conversation with full warm context. On a *stop/recycle*
      you have been released — end your turn after the audit; deficit staffing
      spawns a fresh worker to take over, so do not expect to be re-engaged.
-   - **Codex (`codex exec`):** complete this queue's active drain goal (or clear
-     it if the harness has no completion state), then exit immediately. There
+   - **Codex (`codex exec`):** end your turn and exit immediately after the idle audit.
+     Never set, complete, or clear a native Codex thread goal (a goal makes
+     Codex auto-continue after the process dies). There
      is no live stdin channel and no wake message to wait for.

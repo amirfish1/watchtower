@@ -218,7 +218,7 @@ def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "
 
 # Codex approval/sandbox policy is per-turn, not per-thread: the spawn's
 # --dangerously-bypass-approvals-and-sandbox does NOT carry over to turns
-# other clients start on the same thread (native goal continuations, desktop
+# other clients start on the same thread (desktop
 # takeovers). Such a turn runs workspace-write with on-request approvals, and
 # its first `wt` command -- which writes ~/.watchtower, outside any repo
 # workspace -- hangs on an approval prompt no headless worker can answer
@@ -248,7 +248,7 @@ def ensure_codex_wt_execpolicy() -> bool:
         rules_dir.mkdir(mode=0o700, exist_ok=True)
         rules_path.write_text(
             "# Managed by WatchTower (workers.ensure_codex_wt_execpolicy).\n"
-            "# Default-policy Codex turns (e.g. native goal continuations,\n"
+            "# Default-policy Codex turns (e.g. desktop takeovers,\n"
             "# which do not inherit a spawn's full-auto policy) would\n"
             "# otherwise hang on an approval prompt for WatchTower queue\n"
             "# commands.\n"
@@ -273,10 +273,10 @@ CLAUDE_IDLE_CONTRACT = (
 )
 
 CODEX_IDLE_CONTRACT = (
-    "Do NOT poll or sleep-loop. After the idle audit, complete this queue's "
-    "drain goal using the native goal control (or clear it if completion is "
-    "unavailable), then exit immediately. This is a one-shot run; do not wait "
-    "for a wake message. "
+    "Do NOT poll or sleep-loop. After the idle audit, end your turn and exit "
+    "immediately. This is a one-shot run; do not wait for a wake message. "
+    "Do NOT create, update, complete, or clear a native Codex thread goal: "
+    "a goal makes Codex auto-continue after you stop. "
 )
 
 CLAUDE_RESUME_CONTRACT = (
@@ -4644,6 +4644,12 @@ def build_drain_command(
             argv += ["--model", model]
         if effort:
             argv += ["--config", f'model_reasoning_effort="{effort}"']
+        # Codex ignores CCC's CLAUDE_CODE_AUTO_COMPACT_WINDOW; without this
+        # workers ran to ~780K context (model_context_window=1M) before compact.
+        from . import config as _config
+        compact = _config.worker_auto_compact_tokens()
+        if compact > 0:
+            argv += ["-c", f"model_auto_compact_token_limit={compact}"]
         argv.append(goal or drain_goal(queue, worker_id, repo_path, engine=engine))
         return argv
     if engine == "kimi":
