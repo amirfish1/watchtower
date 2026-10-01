@@ -158,6 +158,8 @@ def queue_status(
     closed = [it for it in items if it.get("status") == "closed"]
 
     depth = len(open_items)
+    group_idx = (q._refs_index(q.list_items())
+                 if any(q.group_role(it) for it in open_items) else {})
     claimable_open = [
         it for it in open_items
         if it.get("claimable", True)
@@ -167,6 +169,8 @@ def queue_status(
         # an unsettled plan or a model_floor above the queue's worker model
         # means the drainer's `wt claim` returns nothing, so it isn't "stuck".
         and not q.plan_pending(it)
+        # WT-33: a group parent is never claimed; a member waits for its group plan.
+        and not (q.group_role(it) and q.claim_blocked_by_plan(it, group_idx))
         # WT-28/31: an answer reserved for its parked worker is claimable by
         # that worker only, so it is not open work for the pool.
         and not q._affinity_reserved(it, now_ts)

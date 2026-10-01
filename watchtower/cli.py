@@ -540,6 +540,12 @@ def cmd_ls(args: argparse.Namespace) -> int:
         waiting = _waiting_note(it, by_ref)
         if waiting:
             line += f"  [{waiting}]"
+        role = q.group_role(it)
+        if role == "parent":
+            line += (f"  [group: {len((it.get('group') or {}).get('members') or [])} members, "
+                     f"integration {q.group_integration_state(it)}]")
+        elif role == "child":
+            line += f"  [group {q.group_parent_ref(it)}]"
         if it.get("status") == "in_review":
             line += f"  [gate pending: {q.gate_stage_label(str(it.get('gate_pending') or 'review'))}]"
         elif it.get("status") == "open" and it.get("gate_feedback"):
@@ -644,6 +650,14 @@ def cmd_find(args: argparse.Namespace) -> int:
         except Exception:
             forwarded = None
         print(f"  filed_by: {filer}" + (f" -> {forwarded}" if forwarded else ""))
+    if q.group_role(item) == "parent":
+        g = item.get("group") or {}
+        print(f"  group: parent of {', '.join(q.group_children(item)) or '(none)'} "
+              f"({'sealed' if g.get('sealed') else 'unsealed'}, membership v{q.group_mv(item)}, "
+              f"integration {q.group_integration_state(item)}); `wt group show {item.get('ref')}`")
+    elif q.group_role(item) == "child":
+        print(f"  group: {(item.get('group') or {}).get('kind', 'member')} of "
+              f"{q.group_parent_ref(item)}")
     if item.get("blocked_by"):
         print(f"  blocked_by: {', '.join(item['blocked_by'])}")
         try:
@@ -809,11 +823,26 @@ def cmd_add(args: argparse.Namespace) -> int:
             blocked_by=list(getattr(args, "after", None) or []),
             gates=list(getattr(args, "gate", None) or []) or None,
             accept_line=getattr(args, "accept", "") or "",
+            group_parent=bool(getattr(args, "group_parent", False)),
+            group=getattr(args, "group", "") or "",
+            children=[c.strip() for c in str(getattr(args, "children", "") or "").split(",")
+                      if c.strip()] or None,
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
+    if q.group_role(item) == "parent":
+        g = item.get("group") or {}
+        members = ", ".join(g.get("members") or []) or "none yet"
+        print(f"GROUP: {item['ref']} members [{members}] "
+              + ("sealed; the group plan starts now" if g.get("sealed") else
+                 f"unsealed; `wt group attach {item['ref']} REF...` then "
+                 f"`wt group seal {item['ref']}`"))
+        return 0   # a parent is never claimed or dispatched
+    if q.group_role(item) == "child":
+        print(f"GROUP: {item['ref']} is a member of {q.group_parent_ref(item)}; claimable "
+              f"once the group plan is accepted")
     # Enqueue-and-claim: file the ticket, then immediately mark it in_progress so
     # the reconciler (which only spawns for OPEN tickets) leaves it alone. For the
     # user who's already working the bug they're documenting. Skip the dispatch
@@ -1140,7 +1169,66 @@ def _sent_back_view(item: dict) -> dict:
     return {}
 
 
+def _group_plan_brief(item: dict) -> Tuple[str, str]:
+    """(tickets block, format rules) for a group parent's plan sessions."""
+    ref = item["ref"]
+    members = list((item.get("group") or {}).get("members") or [])
+    by_ref = q._refs_index(q.list_items())
+    blocks = []
+    for r in members:
+        ch = by_ref.get(r) or {}
+        blocks.append(f"### {r}: {ch.get('title') or ch.get('note') or ''}\n"
+                      f"{ch.get('text') or ch.get('note') or ''}"
+                      + (f"\nACCEPT LINE: {ch['accept']}" if ch.get("accept") else ""))
+    tickets = (f"GROUP {ref}: {item.get('text') or item.get('note') or item.get('title') or ''}\n"
+               + (f"GROUP ACCEPT LINE: {item['accept']}\n" if item.get("accept") else "")
+               + "\nMEMBER TICKETS:\n" + "\n\n".join(blocks))
+    rules = (f"This is ONE plan for the whole group: start with `## Shared` (the "
+             f"contracts, interfaces, ordering and conventions every member must "
+             f"follow), then exactly one `## Section: <REF>` per member ("
+             f"{', '.join(members)}) with that member's own work. A section whose "
+             f"text is exactly `{q.GROUP_PLAN_UNCHANGED}` keeps its previous text. "
+             f"Each member's builder sees the shared section and its own section only.")
+    return tickets, rules
+
+
+def _mv_flag(item: dict) -> str:
+    return f" --mv {q.group_mv(item)}" if q.group_role(item) == "parent" else ""
+
+
+def _rejected_sections(item: dict) -> List[str]:
+    plan = item.get("plan") or {}
+    return [r for r, v in (plan.get("section_reviews") or {}).items()
+            if isinstance(v, dict) and not v.get("accepted")]
+
+
+def _group_plan_goal(item: dict, feedback: str = "") -> str:
+    ref = item["ref"]
+    plan = item.get("plan") or {}
+    tickets, rules = _group_plan_brief(item)
+    rejected = _rejected_sections(item)
+    revise = ""
+    if feedback:
+        revise = (f"\nYour previous plan (round {int(plan.get('round') or 2) - 1}):\n"
+                  f"{q.render_plan(item)}\n\nThe reviewer REJECTED it: {feedback}\n"
+                  + (f"Rejected sections (fix these first): {', '.join(rejected)}. "
+                     f"Other sections may stay `{q.GROUP_PLAN_UNCHANGED}`.\n" if rejected else "")
+                  + "Revise the plan to address that.\n")
+    return (
+        f"You are the PLANNER for WatchTower plan group {ref} (membership v{q.group_mv(item)}). "
+        f"Do not write code or edit files. Read the tickets and the relevant code, then "
+        f"write an implementation plan for the group: approach, files to change, risks, "
+        f"the test list, and any open decisions you resolved (decide them yourself; "
+        f"nobody will answer questions).\n\n{rules}\n\n{tickets}\n{revise}"
+        f"\nWhen done, file the plan (not to anyone else): `wt plan submit {ref}"
+        f"{_mv_flag(item)} --file <path-to-plan.md>`. A refused submit names what is "
+        f"missing; a SUPERSEDED one means the membership changed: stop."
+    )
+
+
 def _plan_goal(item: dict, feedback: str = "") -> str:
+    if q.group_role(item) == "parent":
+        return _group_plan_goal(item, feedback)
     ref = item["ref"]
     plan = item.get("plan") or {}
     return (
@@ -1161,6 +1249,25 @@ def _plan_goal(item: dict, feedback: str = "") -> str:
 
 
 def _plan_review_goal(item: dict) -> str:
+    if q.group_role(item) == "parent":
+        ref = item["ref"]
+        plan = item.get("plan") or {}
+        tickets, rules = _group_plan_brief(item)
+        mv = _mv_flag(item)
+        return (
+            f"You are an independent PLAN REVIEWER for WatchTower plan group {ref} "
+            f"(membership v{q.group_mv(item)}). You did not write the plan. Do not edit "
+            f"files. Check the plan against every member ticket and the real code: is "
+            f"the shared section a sound contract for all members, is each member's "
+            f"section right and adequate (files, risks, tests, its accept line)?\n\n"
+            f"{rules}\n\n{tickets}\n\nPLAN (round {plan.get('round', 1)}, "
+            f"v{plan.get('version') or plan.get('round', 1)}):\n{q.render_plan(item)}\n\n"
+            f"File your verdict: `wt plan verdict {ref}{mv} --accept --reasons \"why it is "
+            f"sound\"` or `wt plan verdict {ref}{mv} --reject --section <REF> [--section "
+            f"<REF>...] --reasons \"what must change\"` naming every member section that "
+            f"must change (omit --section when the shared section is the problem). Reject "
+            f"only for real defects; a different-but-workable approach is an accept."
+        )
     ref = item["ref"]
     plan = item.get("plan") or {}
     return (
@@ -1281,6 +1388,14 @@ def _plan_discussion_goal(item: dict, role: str) -> str:
     version = plan.get("version") or plan.get("round", 1)
     base = (f"\nTICKET:\n{item.get('text') or item.get('note') or item.get('title') or ''}\n"
             + (f"\nACCEPT LINE: {item['accept']}\n" if item.get("accept") else ""))
+    mv = _mv_flag(item)
+    if mv:
+        tickets, rules = _group_plan_brief(item)
+        base = f"\n{rules}\n\n{tickets}\n"
+        rejected = _rejected_sections(item)
+        if rejected:
+            base += f"\nREJECTED SECTIONS: {', '.join(rejected)}\n"
+        plan = dict(plan, text=q.render_plan(item))
     msgs = (disc.get("messages") or [])[-10:]
     transcript = "\n".join(f"- [{m.get('from')}] {str(m.get('text') or '')[:600]}" for m in msgs)
     transcript = f"\nDISCUSSION SO FAR:\n{transcript}\n" if transcript else ""
@@ -1292,8 +1407,8 @@ def _plan_discussion_goal(item: dict, role: str) -> str:
             f"Do not write code or edit files.\n{base}"
             f"\nPLAN v{version} (as reviewed):\n{plan.get('text', '')}\n{objections}{transcript}"
             f"\nFix the objections rather than rewriting the plan wholesale. If you "
-            f"disagree with one, say so: `wt plan discuss {ref} --from planner --text \"...\"`. "
-            f"Then file the amended plan: `wt plan submit {ref} --file <path-to-plan.md>`."
+            f"disagree with one, say so: `wt plan discuss {ref}{mv} --from planner --text \"...\"`. "
+            f"Then file the amended plan: `wt plan submit {ref}{mv} --file <path-to-plan.md>`."
         )
     return (
         f"You are the independent PLAN REVIEWER for WatchTower ticket {ref}. You reviewed "
@@ -1301,9 +1416,10 @@ def _plan_discussion_goal(item: dict, role: str) -> str:
         f"previous session has ended; this is a fresh turn. Do not edit files.\n{base}"
         f"{objections}{transcript}\nAMENDED PLAN v{version}:\n{plan.get('text', '')}\n\n"
         f"Check it against the ticket and the real code, then file your verdict on this "
-        f"exact version: `wt plan verdict {ref} --accept --version {version} --reasons "
-        f"\"why it is sound\"` or `wt plan verdict {ref} --reject --version {version} "
-        f"--reasons \"what still must change\"`. Reject only for real remaining defects."
+        f"exact version: `wt plan verdict {ref}{mv} --accept --version {version} --reasons "
+        f"\"why it is sound\"` or `wt plan verdict {ref}{mv} --reject --version {version} "
+        + (f"--section <REF> " if mv else "")
+        + f"--reasons \"what still must change\"`. Reject only for real remaining defects."
     )
 
 
@@ -1358,15 +1474,54 @@ def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
     return n
 
 
+def _group_plan_note(item: dict) -> str:
+    """Claim-time instruction for a plan-group member (WT-33): the parent's
+    accepted plan -- shared section + this member's own -- and its siblings."""
+    by_ref = q._refs_index(q.list_items())
+    parent = q.group_parent_of(item, by_ref) or {}
+    pref = q.group_parent_ref(item)
+    plan = parent.get("plan") or {}
+    status = plan.get("status", "")
+    ref = item["ref"]
+    if not q.group_plan_settled(parent):
+        return (f"GROUP PLAN PENDING: {ref} is a member of plan group {pref}; its plan is "
+                f"not accepted yet. Do NOT start building. Run `wt plan wait {pref}`.")
+    if status == "failed":
+        return (f"Group plan for {pref} did not run ({plan.get('reason', '')}); plan your "
+                f"part yourself and keep it compatible with the siblings below.")
+    version = plan.get("accepted_version") or plan.get("version") or plan.get("round", 1)
+    kind = (item.get("group") or {}).get("kind", "member")
+    sibs = [r for r in q.group_children(parent) if r != ref]
+    sib_lines = "\n".join(f"- {r}: {(by_ref.get(r) or {}).get('status', '?')} "
+                          f"{(by_ref.get(r) or {}).get('title') or ''}".rstrip() for r in sibs)
+    if kind == "integration_fix":
+        integ = q.group_integration(parent)
+        cmap = "\n".join(f"- {r}: {c or '(no code)'}"
+                         for r, c in (integ.get("commits") or {}).items())
+        return (f"INTEGRATION FIX for plan group {pref} (plan v{version}). The members "
+                f"are closed; their integration failed:\n{integ.get('findings') or ''}\n"
+                f"Integration commit: {integ.get('sha') or 'none'}\nPer-child commits:\n"
+                f"{cmap}\nFix it in one commit on top of all of them, following the shared "
+                f"plan:\n{q.render_plan(parent, by_ref, sections=None)}")
+    return (f"GROUP PLAN {pref} v{version} (follow it; the shared section binds every "
+            f"member, the section for {ref} is yours):\n{q.render_plan(item, by_ref)}"
+            + (f"\n\nSIBLINGS (built by others; do not do their work):\n{sib_lines}"
+               if sib_lines else "")
+            + f"\n\nAfter every member closes, {pref} runs ONE integration check at a "
+              f"commit containing all of them.")
+
+
 def _plan_note(item: dict) -> str:
     """Claim-time instruction for the build worker about the plan stage."""
+    if q.group_role(item) == "child":
+        return _group_plan_note(item)
     if q.plan_gate(item) is None:
         return ""
     plan = item.get("plan") or {}
     status = plan.get("status", "")
     ref = item["ref"]
     if status == "accepted":
-        return f"ACCEPTED PLAN (follow it):\n{plan.get('text', '')}"
+        return f"ACCEPTED PLAN (follow it):\n{q.render_plan(item)}"
     if status == "failed":
         return f"Plan stage did not run ({plan.get('reason', '')}); plan the work yourself."
     if status == "blocked":
@@ -1391,7 +1546,8 @@ def cmd_plan(args: argparse.Namespace) -> int:
             text = args.text or ""
             if args.file:
                 text = Path(args.file).expanduser().read_text()
-            item = q.plan_submit(ref, text, by=args.by or _default_worker_id())
+            item = q.plan_submit(ref, text, by=args.by or _default_worker_id(),
+                                 expect_mv=getattr(args, "mv", None))
             plan = item["plan"]
             print(f"PLAN FILED: {ref} round {plan['round']} v{plan.get('version')} -> reviewing")
             if (plan.get("discussion") or {}).get("status") == "active":
@@ -1403,15 +1559,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
         elif action == "verdict":
             item = q.plan_verdict(ref, bool(args.accept), args.reasons or "",
                                   by=args.by or _default_worker_id(),
-                                  version_seen=getattr(args, "version", None))
+                                  version_seen=getattr(args, "version", None),
+                                  expect_mv=getattr(args, "mv", None),
+                                  sections=getattr(args, "section", None))
             status = item["plan"]["status"]
             print(f"PLAN {'ACCEPTED' if args.accept else 'REJECTED'}: {ref} -> {status}")
-            if status == "accepted" and item.get("status") == "open":
-                # The ticket just became claimable: wake/staff a build worker.
-                try:
-                    workers.dispatch_after_enqueue(item.get("project", ""), ref)
-                except Exception:  # noqa: BLE001
-                    pass
+            if status == "accepted":
+                _dispatch_planned(item)
             if status == "discussing":
                 stages.request(ref, "plan discussion: planner")
             elif status == "planning":
@@ -1423,14 +1577,22 @@ def cmd_plan(args: argparse.Namespace) -> int:
                        if disc.get("reason") else
                        f"The planner and plan reviewer still disagree after "
                        f"{len(reviews)} rounds.")
+                rejected = _rejected_sections(item)
+                group_exit = ""
+                if q.group_role(item) == "parent":
+                    group_exit = (f" Or drop a member whose section cannot be agreed: "
+                                  f"`wt group detach <REF>`"
+                                  + (f" (rejected: {', '.join(rejected)})" if rejected else "")
+                                  + "; the rest goes back to review.")
                 q.block(ref, str(item.get("claimed_session_id") or ""), origin="plan_gate",
                         question=(f"{why} Last reviewer reasons: "
                                   f"{reviews[-1].get('reasons', '')}. Decide with "
-                                  f"`wt plan decide {ref} --accept|--retry`."),
+                                  f"`wt plan decide {ref}{_mv_flag(item)} --accept|--retry`."
+                                  + group_exit),
                         progress=f"Plan (round {item['plan'].get('round')}):\n"
-                                 f"{item['plan'].get('text', '')}")
+                                 f"{q.render_plan(item)}")
         elif action == "discuss":
-            item = q.plan_discuss(ref, args.sender, args.text)
+            item = q.plan_discuss(ref, args.sender, args.text, expect_mv=getattr(args, "mv", None))
             peer = "reviewer" if args.sender == "planner" else "planner"
             sent = (_plan_role_alive(item, peer)
                     and _plan_send(item, peer, f"[{ref} plan discussion, from the "
@@ -1444,17 +1606,16 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 text = Path(args.file).expanduser().read_text()
             decision = "accept" if args.accept else "retry"
             item = q.plan_decide(ref, decision, text, retries=args.retries,
-                                 by=args.by or "human")
+                                 by=args.by or "human", expect_mv=getattr(args, "mv", None))
             status = item["plan"]["status"]
             print(f"PLAN DECISION {decision.upper()}: {ref} -> plan {status}; "
                   f"human block cleared")
             if status == "planning":
                 stages.request(ref, "plan retry")
-            elif item.get("status") == "open":
-                try:
-                    workers.dispatch_after_enqueue(item.get("project", ""), ref)
-                except Exception:  # noqa: BLE001
-                    pass
+            elif status == "reviewing":
+                stages.request(ref, "plan review retry")
+            else:
+                _dispatch_planned(item)
             routed = _route_parked_answer(item)
             if routed is not None:
                 return routed
@@ -1468,11 +1629,31 @@ def cmd_plan(args: argparse.Namespace) -> int:
                                                    "", args.by or "")
         elif action == "show":
             plan = item.get("plan") or {}
+            if q.group_role(item) == "child":
+                pref = q.group_parent_ref(item)
+                parent = q.get(pref) or {}
+                pplan = parent.get("plan") or {}
+                if args.json:
+                    print(json.dumps({"group_parent": pref, "plan_status": pplan.get("status", ""),
+                                      "plan_version": pplan.get("version", 0),
+                                      "text": q.render_plan(item)}, indent=2))
+                else:
+                    print(f"{ref} is a member of plan group {pref}: plan "
+                          f"{pplan.get('status') or 'none'} (v{pplan.get('version', 0)})")
+                    print(q.render_plan(item))
+                return 0
             if args.json:
                 print(json.dumps(plan, indent=2))
             else:
-                print(f"{ref} plan: {plan.get('status', 'none')} (round {plan.get('round', 0)})")
-                if plan.get("text"):
+                print(f"{ref} plan: {plan.get('status', 'none')} (round {plan.get('round', 0)})"
+                      + (f" membership v{q.group_mv(item)}" if q.group_role(item) == "parent"
+                         else ""))
+                if q.group_role(item) == "parent" and (plan.get("text") or plan.get("sections")):
+                    print(q.render_plan(item))
+                    for r, v in (plan.get("section_reviews") or {}).items():
+                        if isinstance(v, dict) and not v.get("accepted"):
+                            print(f"  section {r}: REJECTED v{v.get('version')}")
+                elif plan.get("text"):
                     print(plan["text"])
                 for r in plan.get("reviews") or []:
                     print(f"  review r{r['round']}: {'accept' if r['accepted'] else 'reject'}"
@@ -1486,6 +1667,9 @@ def cmd_plan(args: argparse.Namespace) -> int:
                         print(f"    {m['from']}: {m['text']}")
         elif action == "wait":
             deadline = time.time() + args.timeout
+            member = item if q.group_role(item) == "child" else None
+            if member is not None:
+                ref = q.group_parent_ref(member)   # a member waits on its group plan
             while True:
                 item = q.get(ref) or item
                 plan = item.get("plan") or {}
@@ -1495,8 +1679,79 @@ def cmd_plan(args: argparse.Namespace) -> int:
                     print(f"TIMEOUT: plan for {ref} still {plan.get('status')}", file=sys.stderr)
                     return 2
                 time.sleep(5)
-            print(_plan_note(item) or f"{ref} has no plan stage")
+            if member is not None:
+                print(_plan_note(q.get(member["ref"]) or member))
+            else:
+                print(_plan_note(item) or f"{ref} has no plan stage")
             return 0 if plan.get("status") in ("accepted", "failed") else 1
+    except q.GroupFenced as exc:
+        print(f"SUPERSEDED: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _dispatch_planned(item: dict) -> None:
+    """A plan just settled: wake/staff build workers for the ticket, or for a
+    group parent's open members (WT-33)."""
+    refs = ([r for r in (item.get("group") or {}).get("members") or []]
+            if q.group_role(item) == "parent" else
+            ([item["ref"]] if item.get("status") == "open" else []))
+    for r in refs:
+        try:
+            workers.dispatch_after_enqueue(item.get("project", ""), r)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def cmd_group(args: argparse.Namespace) -> int:
+    """`wt group attach|seal|detach|fix|show` -- plan groups (WT-33)."""
+    action = args.group_cmd
+    try:
+        if action == "attach":
+            parent = q.group_attach(args.parent, list(args.refs), replan=bool(args.replan),
+                                    seal=bool(args.seal))
+            g = parent.get("group") or {}
+            print(f"ATTACHED: {', '.join(args.refs)} -> {parent['ref']} (members "
+                  f"{', '.join(g.get('members') or [])}; membership v{q.group_mv(parent)}"
+                  + ("; sealed" if g.get("sealed") else "") + ")")
+        elif action == "seal":
+            parent = q.group_seal(args.parent)
+            print(f"SEALED: {parent['ref']} membership v{q.group_mv(parent)}; the group plan starts")
+        elif action == "detach":
+            child = q.group_detach(args.ref)
+            print(f"DETACHED: {child['ref']} is a standalone ticket again")
+        elif action == "fix":
+            fix = q.group_fix(args.parent, args.text or "")
+            print(f"FIX FILED: {fix['ref']} for {args.parent} (integration resumes once it closes)")
+            try:
+                workers.dispatch_after_enqueue(fix.get("project", ""), fix["ref"])
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            info = q.group_show(args.ref)
+            if args.json:
+                print(json.dumps(info, indent=2))
+                return 0
+            integ = info["integration"]
+            print(f"{info['ref']} [{info['status']}] {info['title']}")
+            print(f"  membership v{info['membership_version']} "
+                  f"{'sealed' if info['sealed'] else 'UNSEALED'}; plan {info['plan_status'] or 'none'}"
+                  f" v{info['plan_version']}")
+            for k in info["members"] + info["fixes"]:
+                tag = " (fix)" if k["kind"] == "integration_fix" else ""
+                print(f"  - {k['ref']}{tag} [{k['status']}] {k['commit'] or ''} {k['title']}".rstrip())
+            print(f"  integration: {integ.get('state')} cycle {integ.get('cycle', 0)} "
+                  f"fixes {len(info['fixes'])}/{integ.get('allowance')} proof {info['proof']}"
+                  + (f" at {integ.get('sha')[:12]}" if integ.get("sha") else "")
+                  + (f" BLOCKED ({integ.get('blocked')})" if integ.get("blocked") else ""))
+            if info["needs_input"]:
+                print(f"  NEEDS INPUT: {info['block_question']}")
+    except q.GroupFenced as exc:
+        print(f"SUPERSEDED: {exc}", file=sys.stderr)
+        return 1
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -2175,8 +2430,9 @@ def _verifier_goal(item: dict) -> str:
         + (f" at commit {commit}" if commit else "")
         + f", that this acceptance criterion holds:\n\n{target}\n\n"
         + (f"The build was also required to follow this accepted plan; flag "
-           f"material deviations:\n{(item.get('plan') or {}).get('text', '')}\n\n"
-           if (item.get("plan") or {}).get("status") == "accepted" else "")
+           f"material deviations:\n{q.render_plan(item)}\n\n"
+           if (item.get("plan") or {}).get("status") == "accepted"
+           or q.group_role(item) == "child" and q.render_plan(item) else "")
         + "Drive a real browser/app where the criterion is user-visible; read the "
         "code and run it otherwise. Do NOT edit files or fix anything. Do NOT "
         "execute scripts that call paid APIs, send customer messages, or touch "
@@ -2190,6 +2446,44 @@ def _verifier_goal(item: dict) -> str:
     )
 
 
+def _integration_verifier_goal(item: dict) -> str:
+    """The ONE integration verifier of a plan group (WT-33 D7.3): the whole
+    group at the integration commit, against the shared plan and every
+    member's acceptance line. Per-member criteria were verified per member."""
+    ref = item["ref"]
+    integ = q.group_integration(item)
+    sha = str(integ.get("sha") or "")
+    vc = int(item.get("verify_cycle") or 0)
+    by_ref = q._refs_index(q.list_items())
+    kids = []
+    for r in q.group_children(item):
+        ch = by_ref.get(r) or {}
+        crit = str(ch.get("accept") or "").strip() or str(ch.get("title") or ch.get("note") or "")
+        kids.append(f"- {r} @ {(integ.get('commits') or {}).get(r) or '(no code)'}: {crit[:400]}")
+    accept = str(item.get("accept") or "").strip()
+    return (
+        f"You are the INDEPENDENT INTEGRATION verifier for WatchTower plan group {ref}. "
+        f"Each member was built and verified on its own; your job is the group as a "
+        f"whole at ONE commit, {sha or '(see `wt group show ' + ref + '`)'}, which contains "
+        f"every member's work. Check out that commit (a detached worktree; never "
+        f"move a branch) and check that the members work TOGETHER: the shared plan's "
+        f"contracts hold across them, nothing one member did breaks another, and "
+        + (f"the group's acceptance line holds:\n\n{accept}\n\n" if accept else
+           "the group delivers what its ticket asks:\n\n"
+           f"{item.get('text') or item.get('note') or item.get('title') or ''}\n\n")
+        + "MEMBERS (commit: own acceptance line, already verified per member):\n"
+        + "\n".join(kids)
+        + f"\n\nGROUP PLAN (shared section binds every member):\n{q.render_plan(item, by_ref)}\n\n"
+        "Do NOT edit files or fix anything; run the tests and drive the app where the "
+        "integration is user-visible. Do NOT execute scripts that call paid APIs, send "
+        "customer messages, or touch production data. WT_VERIFY=1 is set in your "
+        "environment. When done, file your verdict on the group (this exact cycle; a "
+        f"stale cycle is refused): `wt verdict {ref} --verify-cycle {vc} --pass --findings "
+        f"\"what you checked\"` or `wt verdict {ref} --verify-cycle {vc} --fail --findings "
+        f"\"what is wrong, with evidence\"`. A fail files an integration-fix ticket."
+    )
+
+
 def _spawn_verifier(item: dict) -> None:
     """Shim (WT-24): the daemon spawns the verifier for an in_review/verify
     ticket; this only wakes it."""
@@ -2200,7 +2494,11 @@ def cmd_verdict(args: argparse.Namespace) -> int:
     """File the independent verifier's verdict straight onto the ticket."""
     try:
         item = q.verdict(args.ref, bool(args.passed), args.findings or "",
-                         by=args.by or _default_worker_id())
+                         by=args.by or _default_worker_id(),
+                         expect_verify_cycle=getattr(args, "verify_cycle", None))
+    except q.GroupFenced as exc:
+        print(f"SUPERSEDED: {exc}", file=sys.stderr)
+        return 1
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -2282,7 +2580,11 @@ def _resume_rejected(item: dict, reason: str, engine: str = "") -> int:
 def cmd_accept(args: argparse.Namespace) -> int:
     """Accept an in_review ticket (WT-5): it closes and its dependents unblock."""
     try:
-        item = q.accept(args.ref, by=args.by or "human", force=getattr(args, "force", False))
+        item = q.accept(args.ref, by=args.by or "human", force=getattr(args, "force", False),
+                        no_proof=bool(getattr(args, "no_proof", False)))
+    except q.GroupFenced as exc:
+        print(f"SUPERSEDED: {exc}", file=sys.stderr)
+        return 1
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -5566,6 +5868,7 @@ COMMAND_HELP: Dict[str, str] = {
     "verdict": "file an independent verifier's pass/fail on an in_review ticket",
     "assess": "post-fix assessment (WT-21): `submit`/`show`/`run`/`resume`, or `new` for a fix with no ticket",
     "plan": "plan stage (plan gate): `submit` a plan, `verdict` it, `show`/`wait` for it",
+    "group": "plan groups (WT-33): `attach`/`seal`/`detach` members, `fix` a capped integration, `show` it",
     "stages": "stage-session supervision (planner/verifier/assessor): `tick` one pass, `show` a ticket",
     "liveness": "who owns each live ticket, is it proven at work, and what the backstop would do (read-only)",
     "reject": "reject an in_review ticket back to open and resume its worker",
@@ -5933,6 +6236,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--claim", action="store_true",
                    help="immediately claim the new ticket (mark in_progress) so no "
                         "auto-drain worker picks it up; use when you're already working it")
+    s.add_argument("--group-parent", action="store_true", dest="group_parent",
+                   help="file a plan-group parent (WT-33): one plan for its members, "
+                        "one integration check after they all close; never claimed")
+    s.add_argument("--children", default="", metavar="REF,REF",
+                   help="with --group-parent: attach these open tickets and seal the "
+                        "group (>= 2) in the same write")
+    s.add_argument("--group", default="", metavar="PARENT",
+                   help="file this ticket as a member of the (unsealed) group PARENT")
     s.set_defaults(func=cmd_add)
 
     s = sub.add_parser(
@@ -6111,6 +6422,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--by", default="", help="who accepted (default: human)")
     s.add_argument("--force", action="store_true",
                    help="accept even while the independent verifier's verdict is pending")
+    s.add_argument("--no-proof", action="store_true", dest="no_proof",
+                   help="group parent with --force: close it although no integration "
+                        "commit contains every member (recorded as proof: none)")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_accept)
@@ -6122,6 +6436,8 @@ def build_parser() -> argparse.ArgumentParser:
     p1.add_argument("--text", default="")
     p1.add_argument("--file", default="")
     p1.add_argument("--by", default="")
+    p1.add_argument("--mv", type=int, default=None,
+                    help="group parent: the membership version the plan was written for")
     p2 = ps.add_parser("verdict", help="plan reviewer: accept or reject the plan")
     p2.add_argument("ref")
     g = p2.add_mutually_exclusive_group(required=True)
@@ -6129,6 +6445,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--reject", action="store_true")
     p2.add_argument("--reasons", default="")
     p2.add_argument("--by", default="")
+    p2.add_argument("--mv", type=int, default=None,
+                    help="group parent: the membership version the verdict is for")
+    p2.add_argument("--section", action="append", default=None, metavar="REF",
+                    help="group parent, with --reject: a member section that must "
+                         "change (repeatable)")
     p3 = ps.add_parser("show", help="print the ticket's plan state")
     p3.add_argument("ref")
     p3.add_argument("--json", action="store_true")
@@ -6136,6 +6457,8 @@ def build_parser() -> argparse.ArgumentParser:
     p6.add_argument("ref")
     p6.add_argument("--from", dest="sender", choices=["planner", "reviewer"], required=True)
     p6.add_argument("--text", required=True)
+    p6.add_argument("--mv", type=int, default=None,
+                    help="group parent: the membership version")
     p2.add_argument("--version", type=int, default=None,
                     help="plan version this verdict is for (rejects a stale verdict)")
     p5 = ps.add_parser("decide", help="human: settle a plan blocked by exhausted review")
@@ -6148,10 +6471,32 @@ def build_parser() -> argparse.ArgumentParser:
     p5.add_argument("--retries", type=int, default=1,
                     help="review rounds granted by --retry (default 1)")
     p5.add_argument("--by", default="")
+    p5.add_argument("--mv", type=int, default=None,
+                    help="group parent: the membership version")
     p4 = ps.add_parser("wait", help="builder: block until the plan is accepted, print it")
     p4.add_argument("ref")
     p4.add_argument("--timeout", type=int, default=1800)
     s.set_defaults(func=cmd_plan)
+
+    s = sub.add_parser("group", help=COMMAND_HELP.get("group", ""))
+    gs = s.add_subparsers(dest="group_cmd", required=True)
+    g1 = gs.add_parser("attach", help="adopt open, unclaimed tickets into an unsealed group")
+    g1.add_argument("parent")
+    g1.add_argument("refs", nargs="+")
+    g1.add_argument("--replan", action="store_true",
+                    help="a ticket with its own plan: move that plan to history")
+    g1.add_argument("--seal", action="store_true", help="seal the group in the same write")
+    g2 = gs.add_parser("seal", help="seal the membership (>= 2) and start the group plan")
+    g2.add_argument("parent")
+    g3 = gs.add_parser("detach", help="take an unclosed member out of its group")
+    g3.add_argument("ref")
+    g4 = gs.add_parser("fix", help="capped integration: file one more integration fix")
+    g4.add_argument("parent")
+    g4.add_argument("--text", default="", help="guidance for the fix")
+    g5 = gs.add_parser("show", help="members, fixes, plan and integration state")
+    g5.add_argument("ref", help="the parent or any member")
+    g5.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_group)
 
     s = sub.add_parser("stages", help=COMMAND_HELP.get("stages", ""))
     sg = s.add_subparsers(dest="stages_cmd", required=True)
@@ -6209,6 +6554,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--fail", dest="passed", action="store_false")
     s.add_argument("--findings", default="", help="what was checked / what is wrong")
     s.add_argument("--by", default="", help="verifier id (default: your worker id)")
+    s.add_argument("--verify-cycle", type=int, default=None, dest="verify_cycle",
+                   help="group parent: the integration verify cycle this verdict is for")
     s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
                    help="override the resumed worker's engine (--fail only)")
     s.add_argument("--json", action="store_true")
@@ -6233,7 +6580,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true",
                    help="reopen even if the ticket is blocked (needs_input) -- "
                         "normally refused because it erases the open question; "
-                        "prefer `wt answer` to resolve a block")
+                        "prefer `wt answer` to resolve a block. A closed plan-group "
+                        "member under its group's integration is refused too; "
+                        "--force invalidates that integration (WT-33)")
     s.add_argument("--resume", default=None, metavar="TEXT",
                    help="re-entry re-bind (CLIENT-CHAT-19): atomically reopen "
                         "AND claim under the ticket's own preserved session, "

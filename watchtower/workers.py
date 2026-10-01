@@ -5253,6 +5253,14 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             reason = "planning first — no worker until the plan is accepted"
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
+        if item and _q.group_role(item) and _q.claim_blocked_by_plan(item):
+            # WT-33: a group parent is never claimed (its members are); a
+            # member waits for its group plan (the plan accept dispatches it).
+            reason = ("group parent — never claimed; its members are"
+                      if _q.group_role(item) == "parent" else
+                      f"group plan first — waits for {_q.group_parent_ref(item)}'s plan")
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
         if not config.auto_drain(queue):
             # Drain off parks the backlog, but not a run somebody just asked
             # for -- bailing here is what made ▶ report "Running" and do
