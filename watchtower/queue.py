@@ -1019,6 +1019,10 @@ def _append_history(
             entry[key] = value
     hist.append(entry)
     it["history"] = hist
+    from . import usage
+    usage.capture(it, usage.on_event, entry)
+    if event in ("plan", "plan_review", "verify", "assessment", "stage_death") and it.get("token_usage"):
+        _log("USAGE", f"{it.get('ref', '?')} {event} — {usage.summary(it)}", queue=it.get("project", ""))
 
 
 def _timeline_event(raw: Dict[str, Any], default_at: str = "") -> Optional[Dict[str, Any]]:
@@ -1705,7 +1709,8 @@ def get(ident: Any) -> Optional[Dict[str, Any]]:
         return backend.get(ident)
     for it in _load_unlocked().get("items", []):
         if _matches(it, ident):
-            return it
+            from . import usage
+            return usage.attach(it)
     return None
 
 
@@ -2714,6 +2719,9 @@ def update_status(
                 elif isinstance(res, str):
                     summary = res
             detail = f"{item.get('ref', '?')} — {summary or item.get('title') or item.get('note', '')[:60]}"
+            if status == "closed" and item.get("token_usage"):
+                from . import usage
+                detail += " — " + usage.summary(item)
             if not quiet:
                 _log(verb, detail, queue=item.get('project', ''))
         return item
@@ -2869,6 +2877,9 @@ def update_status(
                     elif isinstance(res, str):
                         summary = res
                 detail = f"{it.get('ref', '?')} — {summary or it.get('title') or it.get('note', '')[:60]}"
+                if status == "closed" and it.get("token_usage"):
+                    from . import usage
+                    detail += " — " + usage.summary(it)
                 # ``quiet`` suppresses this primitive transition line when the
                 # caller emits its own higher-level log for the same event (e.g.
                 # the orphan sweep logs REQUEUE and owns the single line — see
@@ -3554,8 +3565,11 @@ def stage_session_update(ident: Any, fn) -> Optional[Dict[str, Any]]:
                 ss = dict(it.get("stage_session") or {})
                 if fn(it, ss) == "skip":
                     return it
+                previous = it.get("stage_session") or {}
                 it["stage_session"] = ss
                 it["updated_at"] = _now_iso()
+                from . import usage
+                usage.capture(it, usage.track_stage, previous, ss, it["updated_at"])
                 _save_unlocked(data)
                 return it
     return None

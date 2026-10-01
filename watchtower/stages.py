@@ -850,6 +850,11 @@ def reconcile_stages(only_ref: str = "") -> List[Tuple[str, str]]:
     ``(ref, action)`` pairs: spawned / respawn-related / blocked / resumed / wait.
     Plan-group integrations (WT-33) run first, then retired stage sessions
     are stopped, then the stage sessions the states call for are supervised."""
+    from . import usage
+    try:
+        usage.reconcile()
+    except Exception as exc:  # One corrupt telemetry record cannot stop stages.
+        _log("USAGE", type(exc).__name__)
     budget = _Budget(spawns_per_tick())
     try:
         _filing_maintenance(budget, only_ref)

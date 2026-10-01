@@ -1519,6 +1519,17 @@ class GitHubIssuesBackend:
             else self._config_partitions_by_label()
         )
 
+    def _usage_history(self, meta, number, event, **fields):
+        _append_history(meta, event, **fields)
+        from . import usage
+        tracking = dict(meta, ref=f"{self.queue}-{number}",
+                        _usage_namespace=f"github:{self.repo}:{self.queue}")
+        entry = dict(meta["history"][-1], by={"worker": fields.get("worker", ""),
+                                              "session_id": fields.get("session_id", "")})
+        usage.capture(tracking, usage.on_event, entry)
+        if tracking.get("token_usage"):
+            meta["token_usage"] = tracking["token_usage"]
+
     def _config_sibling_labels(self) -> List[str]:
         try:
             from . import config
@@ -1798,6 +1809,12 @@ class GitHubIssuesBackend:
         history = meta.get("history")
         if isinstance(history, list):
             item["history"] = history
+        from . import usage
+        item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
+        if meta.get("token_usage"):
+            item["token_usage"] = meta["token_usage"]
+        usage.attach(item)
+        item.pop("_usage_namespace", None)
         return item
 
     def _list_probe_path(self, state: str) -> str:
@@ -2532,7 +2549,7 @@ class GitHubIssuesBackend:
             })
             if session_uuid:
                 meta["claimed_session_id"] = str(session_uuid)
-            _append_history(meta, "claim", session_id=str(session_uuid or ""), worker=str(session_id))
+            self._usage_history(meta, number, "claim", session_id=str(session_uuid or ""), worker=str(session_id))
             self._ensure_labels()
             self._run([
                 "issue", "edit", number,
@@ -2607,7 +2624,7 @@ class GitHubIssuesBackend:
                 "needs_input", "block_question",
             ):
                 meta.pop(key, None)
-            _append_history(meta, "reopen", reason=reason)
+            self._usage_history(meta, number, "reopen", reason=reason)
             self._run([
                 "issue", "edit", number,
                 *self._repo_args(),
@@ -2665,7 +2682,7 @@ class GitHubIssuesBackend:
                     meta[f"resolution_{field}_ack"] = acks
                 else:
                     meta.pop(f"resolution_{field}_ack", None)
-        _append_history(meta, "close", session_id=str(session_uuid or ""),
+        self._usage_history(meta, number, "close", session_id=str(session_uuid or ""),
                          worker=str(session_id or meta.get("closed_by") or ""),
                          resolution=norm)
         self._run([
@@ -2809,7 +2826,7 @@ class GitHubIssuesBackend:
                 meta["claimed_machine"] = machine_tag()
         if progress:
             _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
-        _append_history(meta, "block", worker=str(session_id), question=_clip(question, 4000))
+        self._usage_history(meta, number, "block", worker=str(session_id), question=_clip(question, 4000))
         self._run([
             "issue", "edit", number,
             *self._repo_args(),
