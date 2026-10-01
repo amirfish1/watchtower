@@ -565,11 +565,172 @@ holder whose claim was released) is enforced in the store lock on every mutating
 outcome of a worker-attributed `wt close`, including the failed-gate reopen,
 which also compare-and-swaps on the pre-gate status.
 
+## Plan groups (WT-33)
+
+Opt-in only: no ticket joins a group unless a human files or attaches it. A
+group is a **parent** ticket (`group.role = "parent"`) and up to
+`GROUP_MAX_MEMBERS` (6) **members** (`group = {role: child, parent, kind:
+member}`). Plans run once for the whole group, each member is built and
+verified on its own, and one integration check runs over all of them together.
+Groups work on the local store only, not on GitHub-backed queues.
+
+**Filing.**
+- `wt add -q Q --group-parent --children A,B` files a parent and seals it.
+- Without `--children` the parent is unsealed and stays in `group.parent.forming`
+  (owner: human). Grow it with `wt group attach P REFS... [--replan] [--seal]`,
+  then run `wt group seal P`.
+- `wt add -q Q --group P` files a new member of an unsealed parent.
+- A parent's gates are always `plan` first, then the rest (default
+  `["plan","verify"]`).
+- Refused:
+  - a parent with `--group`
+  - `--children` without `--group-parent`
+  - manual `blocked_by` on a parent, or on a member pointing at its parent
+  - sealing with fewer than 2 members
+  - adding to a sealed group
+  - attaching a ticket that has its own plan without `--replan` (`--replan`
+    supersedes that plan)
+
+The parent's `blocked_by` mirrors its members plus its open integration fixes.
+
+**Membership version.** `group.membership_version` (mv) starts at 0 and is
+bumped by attach, seal and detach. The parent's plan stage keys carry it
+(`plan:r1:m3`), so a membership change starts a fresh session. Every parent
+`wt plan submit|verdict|discuss|decide` must pass `--mv N`, and a stale mv is
+refused with `SUPERSEDED` (`GroupFenced`). `plan_start` is a no-op until the
+group is sealed.
+
+**The group plan.** The planner writes:
+- one `## Shared` section
+- one `## Section: REF` per member, with no unknown, missing or duplicate
+  sections
+
+Each section is clipped at `PLAN_TEXT_MAX`, and the whole plan at
+`GROUP_PLAN_TEXT_MAX` (96000). A resubmission may write
+`(unchanged)` (`GROUP_PLAN_UNCHANGED`) as a section body to keep the previous text. The
+reviewer may reject individual sections with `wt plan verdict P --reject --mv N
+--section REF` (repeatable). Results go to `plan.section_reviews`, and the
+sections not named count as accepted. When the revision budget runs out, the
+block question names `wt group detach <REF>` for each rejected section.
+Detaching that member sends the remaining text back to review. Members are
+unclaimable until the plan settles (`accepted`, or `failed`):
+- row `group.child.plan_wait`
+- `claim_next` skips them
+- `claim_by_ref` raises `GroupClaimRefused`
+
+**Claims.**
+- Every member claim is stamped `group_claim = {parent, mv, via}`.
+- At claim time the member sees the shared section, its own section and a list
+  of its siblings, never the siblings' sections (`render_plan(...,
+  sections=REF)`).
+- `reject_with` re-binds the member only while the plan is still settled.
+  Otherwise the ticket goes back to `open` (`group_reclaim_deferred`).
+- The parent itself is never claimed, parked, in_progress or answered by
+  resume. A worker `wt block` on it stays a plain `needs_input`.
+
+**Detach table** (`wt group detach REF`):
+
+| Member / group state | Result |
+|---|---|
+| closed member, or an integration fix | refused |
+| parent closed or integrating (gating, verifying, reviewing) | refused |
+| last member of a sealed group | refused |
+| plan accepted/failed and the member is not `open` | refused |
+| unsealed group | removed; mv unchanged |
+| sealed, plan planning/reviewing | removed; mv+1; plan restarts at the new key; live planner/reviewer retired |
+| sealed, plan blocked (exhausted) | removed; mv+1; the text minus the section goes back to review; the block is cleared |
+| sealed, plan accepted | removed; mv+1; the section is archived (`group_section_removed`) |
+
+**Integration (D7).** When every member and fix is closed, `group_sweep` runs
+on each `reconcile_stages` tick, and in the liveness backstop as the recover
+for `group.parent.ready` / `gating_stale`. It:
+1. Takes a lease (`gating`). The lease TTL is `GATE_CMD_TIMEOUT_S × (cmd gates +
+   1) + 300`, and a lapsed lease reads `gating_stale` and is retaken.
+2. Picks commit X with `integration_git.containing_sha`. X is the first
+   candidate that contains every member commit, in this order:
+   - member commits, newest first
+   - `HEAD`
+   - `@{u}`
+
+   No-code members are ignored, and when every member is no-code X is `HEAD`.
+3. Runs the `cmd:` gates pinned at X in a clean detached checkout.
+4. Compare-and-swaps the outcome back, with the child commit map recorded as
+   `integration.proven`.
+
+Outcomes:
+- **pass:** goes to `verifying` (one integration verifier, `review.verify` with
+  key `verify:<verify_cycle>`), then `reviewing`, then `done`. A run with only
+  `cmd:` gates closes directly.
+- **diverged** or **gate failed:** files an integration-fix member (`kind:
+  integration_fix`) and goes to `fixing`.
+- **setup failure** or **missing commit:** a human block (`integration.blocked`).
+  Answering it retries.
+- **fix allowance used up** (`GROUP_INTEGRATION_ALLOWANCE`, 2): goes to
+  `capped`, which is a human block. Answering it, or `wt group fix P --text`,
+  files one more fix and raises the allowance by one, up to `GROUP_MAX_FIXES`
+  (8).
+
+Integration verifier:
+- **Scope:** the integration verifier checks the group as a whole at X. It
+  checks the shared plan's contracts and every member's acceptance line, but
+  does not re-verify each member's own criteria.
+- **Model:** it uses the queue's normal verifier model and engine.
+- **Verdict:** it must file `wt verdict P --verify-cycle N`. A stale cycle is
+  fenced, and a fail files a fix.
+
+`wt reject P` is accepted only in `in_review`. `wt accept P --force` closes from
+any state if X is proven against the live map (`proof: proven`). Otherwise it
+requires `--no-proof`, which records `proof: forced` and says so in the
+resolution. A late gate commit or verdict after a force accept is discarded.
+
+**R7, members during integration.** While a parent is `gating`, `verifying`
+or `reviewing`, a closed member is locked: `wt reopen` raises
+`GroupChildLocked` and nothing is written. `wt reopen --force` reopens the
+member and invalidates the integration in the same write: the parent goes back
+to `idle`/`open`, `proven` is cleared and `verify_cycle` is bumped, so the old
+verdict is fenced. Completion re-checks the live map against `proven` and
+refuses (`group_completion_refused`) if they differ.
+
+**D8 (amended): a done parent keeps its proof.** The live-map invariant covers
+only an **unfinished** integration (`verifying`/`reviewing` ⇒ `gproof =
+match`). A done parent is never re-evaluated:
+- reopening a member after the group closed only records
+  `group_member_reopened_after_close` on the parent
+- the parent stays `closed`, with its original `integration.proven` and
+  resolution commit
+- the parent projects `gint=done, gproof=stale` and classifies as `closed`
+
+`gproof=forced` exists only when the parent is done, and `done ∧ none` is
+unreachable.
+
+**R8, retiring stage sessions.** Detach, a plan restart, force accept and an
+integration failure append the live stage session's `{worker_id, pid,
+pid_started}` to `stage_retired`. `stages._retire_pass` runs on every
+`reconcile_stages` tick, before the desired targets:
+- it kills the session's process group only when the pid's start token
+  matches (`killed`)
+- `already_gone` and `token_mismatch` are never signalled
+- it logs `STAGE_RETIRED`
+
+Retired worker ids are never adopted again.
+
 ## Liveness state table (WT-31)
 
 `watchtower/liveness.py` is the single state table: `project(item)` maps a
 ticket to a `State` over the dims `status, gated, backend, plan, disc, awaiting,
-gate_pending, assessment, block, readiness, dep, claimed, parked, answer`, and
+gate_pending, assessment, block, readiness, dep, claimed, parked, answer`, plus
+the WT-33 group dims:
+- `group`: `none|parent|child`
+- `gplan`: the parent's plan, `pending|settled`
+- `gint`: the integration state, with `gating_stale` for a lapsed lease
+- `gproof`: `none|match|stale|forced`
+
+Ungrouped tickets project `none/n/a/n/a/n/a`. The group rows are
+`group.child.plan_wait`, `group.parent.forming|wait|ready|gating|gating_stale|capped`.
+Parent plan and verify stages reuse the `plan.*` and `review.*` rows, and a
+parent's human blocks use `human.block`. The `group_*` `UNREACHABLE` entries
+cite the queue code behind each one.
+
 `classify(state)` returns the one `Row` it is in (`id`, `owner`, `proof`,
 `recover`), or raises when the state is in `UNREACHABLE` or in no row.
 `prove(item, row)` names what proves the owner is at work (for stage rows, the
