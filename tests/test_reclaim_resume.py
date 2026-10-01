@@ -234,6 +234,21 @@ def test_over_budget_builder_is_released_with_feedback(wt, monkeypatch, capsys):
     assert "RESUME" in open(os.environ["WATCHTOWER_ACTIVITY_LOG"]).read()
 
 
+def test_incident_sized_transcript_is_not_resumed_at_default_budget(wt, monkeypatch):
+    """WT-30 D6: the cutoff is the 2.5 MB recycle budget, not 2x it."""
+    monkeypatch.delenv("WATCHTOWER_CONTEXT_RECYCLE_BYTES", raising=False)
+    monkeypatch.delenv("WATCHTOWER_ANSWER_REQUEUE_BYTES", raising=False)
+    _builder(wt)
+    ref = _rejected(wt)
+    monkeypatch.setattr(wt.workers, "_claude_transcript_bytes", lambda sid: 2_703_575)
+    sent = []
+    monkeypatch.setattr(wt.messages, "deliver_message", lambda *a, **k: sent.append(a) or {"ok": True})
+    wt.cli._resume_rejected(wt.q.get(ref), "verifier failed")
+    it = wt.q.get(ref)
+    assert sent == [] and it["status"] == "open" and it["gate_feedback"]
+    assert "skipped" in open(os.environ["WATCHTOWER_ACTIVITY_LOG"]).read() or "RESUME" in open(os.environ["WATCHTOWER_ACTIVITY_LOG"]).read()
+
+
 def test_resume_success_records_running_and_total_failure_releases(wt, monkeypatch):
     _builder(wt)
     ref = _rejected(wt)
@@ -369,3 +384,15 @@ def test_claim_output_prints_gate_feedback(wt, capsys):
     wt.q._save_unlocked(data)
     assert wt.cli.main(["claim", "-q", "Q", "--worker", "wt-z"]) == 0
     assert "verifier failed: missing test" in capsys.readouterr().out
+
+
+def test_expired_outbox_row_writes_failed_back_to_ticket(wt, monkeypatch):
+    _builder(wt)
+    ref = _rejected(wt)
+    row = wt.messages.outbox_add(S, "x", ticket_ref=ref, ticket_session=S,
+                                 delay_s=0, ttl_s=1, now=wt.base)
+    wt.q.set_resume_state(ref, S, "queued", outbox_id=row["id"])
+    wt.messages.drain_outbox(now=wt.base + 5)
+    assert wt.messages.outbox_entry(row["id"])["status"] == "dead"
+    assert wt.q.get(ref)["resume"]["state"] == "failed"
+    assert "failed (outbox dead)" in open(os.environ["WATCHTOWER_ACTIVITY_LOG"]).read()

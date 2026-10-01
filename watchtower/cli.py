@@ -2209,6 +2209,15 @@ def _context_requeue_bytes() -> int:
         return 5_000_000
 
 
+def _context_recycle_bytes() -> int:
+    """The claim-time recycle budget (workers.context_budget_exceeded): a session
+    past it is already retired, so a rejection must not resume it (WT-30 D6)."""
+    try:
+        return int(os.environ.get("WATCHTOWER_CONTEXT_RECYCLE_BYTES", "2500000") or 0)
+    except (TypeError, ValueError):
+        return 2_500_000
+
+
 def _log_resume(item: dict, what: str) -> None:
     """One RESUME line per attempt (WT-30 D7)."""
     q._log("RESUME", f"{item.get('ref', '?')} — {what}", queue=item.get("project", ""))
@@ -2222,7 +2231,7 @@ def _sent_back_minutes_label(item: dict) -> str:
 
 def _resume_rejected(item: dict, reason: str, engine: str = "") -> int:
     sid = str(item.get("claimed_session_id") or "")
-    limit = _context_requeue_bytes()
+    limit = _context_recycle_bytes()
     if sid and limit > 0:
         size = workers._claude_transcript_bytes(sid)
         if size >= limit:

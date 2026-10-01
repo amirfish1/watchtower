@@ -2227,6 +2227,9 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
                 m["status"] = "dead"
                 m["last_error"] = "expired"
                 result["dead"].append(msg_id)
+                if m.get("ticket"):
+                    writebacks.append((str(m["ticket"]), str(m.get("ticket_session") or ""),
+                                       msg_id, "failed", "", "expired", ""))
                 queue_mod._log(
                     "DEADMSG",
                     f"{m.get('id','?')} to {m.get('to','?')}: expired",
