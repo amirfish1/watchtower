@@ -88,3 +88,11 @@ def test_reconcile_uses_configured_fallback_model_and_effort(wt_env, monkeypatch
     monkeypatch.setattr(wt_env.workers, "spawn_workers", spawn)
     wt_env.workers.reconcile_once()
     assert calls == [("claude", "", None), ("codex", "gpt-6.1-sol", "medium")]
+
+
+def test_profiles_reject_engines_without_required_output_and_tool_contract(wt_env):
+    save_policy(wt_env, model_profiles={"deep": {"models": [
+        {"engine": "kimi", "model": "kimi-code/k3", "effort": ""}
+    ]}})
+    with pytest.raises(ValueError, match="tool-free structured"):
+        wt_env.config.model_profile("deep")

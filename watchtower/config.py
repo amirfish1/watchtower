@@ -862,6 +862,8 @@ def model_profile(name: str) -> Dict[str, Any]:
     routes = _configured_model_routes(profile.get("models"))
     if not routes:
         raise ValueError(f"model profile {name!r} has no configured models")
+    if any(route["engine"] not in ("claude", "codex") for route in routes):
+        raise ValueError("model profiles require engines supporting tool-free structured output")
     return {"models": routes}
 
 
