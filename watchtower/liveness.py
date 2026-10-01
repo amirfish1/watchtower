@@ -649,10 +649,20 @@ def _legacy_proc(item: Dict[str, Any], ctx: ResolverContext) -> Optional[Dict[st
     return q._claim_proc_from_record(rec, str(item.get("claimed_session_id") or ""), "legacy")
 
 
-def _registry_alive(sid: str) -> bool:
+def _registry_state(sid: str) -> Tuple[str, str]:
+    """('alive'|'dead'|'unproven'|'', why) for the Claude registry row of
+    ``sid`` ('' = no row). Alive needs a live pid AND a matching start token
+    (``workers.claude_session_row_liveness``): a stale row whose pid was
+    reused by an unrelated process is not alive proof."""
     from . import workers
     row = workers._find_claude_session_row(sid) if sid else None
-    return bool(row and row.get("pid") and workers._pid_alive(int(row.get("pid") or 0)))
+    if not row:
+        return "", ""
+    return workers.claude_session_row_liveness(row)
+
+
+def _registry_alive(sid: str) -> bool:
+    return _registry_state(sid)[0] == "alive"
 
 
 def _registry_readable() -> bool:
@@ -725,6 +735,11 @@ def claim_owner(item: Dict[str, Any], ctx: Optional[ResolverContext] = None) -> 
     blocked = _engine_checks(cp, sid, died_at, ctx)
     if blocked:
         return Verdict("unproven", "", f"{why}; {blocked}", cp)
+    reg, reg_why = _registry_state(sid) if sid else ("", "")
+    if reg == "unproven":
+        # a live registry pid with no start token: neither proof of life nor
+        # of death (a reused pid with a mismatched token does not veto)
+        return Verdict("unproven", "", f"{why}; {reg_why}", cp)
     return Verdict("dead", "", why, cp)
 
 

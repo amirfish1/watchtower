@@ -225,9 +225,84 @@ def test_exit_file_names_the_death(wt, procs, tmp_path):
 # Plan v6 "What it replaces": ``_verify_worker_live`` -> resolver ``dead``.
 # Only a claim the resolver would judge dead is rejected; alive, unproven and
 # ambient claimers go through.
-def _registry_row(tmp_path, sid: str, pid: int) -> None:
-    (tmp_path / "claude-home" / "sessions" / f"{pid}.json").write_text(
-        json.dumps({"sessionId": sid, "pid": pid}))
+_REAL_TOKEN = object()
+
+
+def _registry_row(tmp_path, sid: str, pid: int, proc_start=_REAL_TOKEN) -> None:
+    """A Claude session registry row as Claude Code writes it: ``procStart``
+    is the pid's UTC ``lstart`` (pass a string to fake one, None to omit)."""
+    row = {"sessionId": sid, "pid": pid}
+    if proc_start is _REAL_TOKEN:
+        from watchtower import workers
+        proc_start = workers._pid_start_token(pid, utc=True)
+    if proc_start is not None:
+        row["procStart"] = proc_start
+    (tmp_path / "claude-home" / "sessions" / f"{pid}.json").write_text(json.dumps(row))
+
+
+# ----------------------------- registry start-token proof (D1 alive source)
+# Finding 2 (verifier, 954a856): a stale registry row whose pid now belongs
+# to an unrelated live process must not prove the claim alive.
+def _dead_bound_claim(wt, procs, tmp_path):
+    w = procs("w1", SID)
+    ref = _file(wt)
+    wt.q.claim_by_ref(ref, "w1", session_uuid=SID)
+    w.kill()
+    w.prune()
+    return ref
+
+
+def test_registry_row_with_matching_token_is_alive(wt, procs, tmp_path):
+    ref = _dead_bound_claim(wt, procs, tmp_path)
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        _registry_row(tmp_path, SID, other.pid)
+        v = _owner(wt, ref)
+        assert (v.verdict, v.source) == ("alive", "claude_registry")
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_registry_row_with_wrong_token_is_not_alive_and_does_not_veto(wt, procs, tmp_path):
+    """The probe: dead bound pid, stale row naming an unrelated LIVE pid with
+    an old start token -> PID reuse: the claim is dead (recoverable)."""
+    ref = _dead_bound_claim(wt, procs, tmp_path)
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        _registry_row(tmp_path, SID, other.pid, proc_start="Mon Jan  1 00:00:00 2024")
+        assert wt.liveness._registry_state(SID)[0] == "dead"
+        v = _owner(wt, ref)
+        assert v.verdict == "dead" and v.source != "claude_registry"
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_registry_row_without_token_is_unproven_not_alive(wt, procs, tmp_path):
+    ref = _dead_bound_claim(wt, procs, tmp_path)
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        _registry_row(tmp_path, SID, other.pid, proc_start=None)
+        assert wt.liveness._registry_alive(SID) is False
+        v = _owner(wt, ref)
+        assert v.verdict == "unproven" and "no start token" in v.evidence
+    finally:
+        other.kill()
+        other.wait()
+
+
+def test_registry_row_with_wt_style_pid_started_token(wt, procs, tmp_path):
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        row = {"pid": other.pid, "pid_started": wt.workers._pid_start_token(other.pid)}
+        assert wt.workers.claude_session_row_liveness(row)[0] == "alive"
+        row["pid_started"] = "Mon Jan  1 00:00:00 2024"
+        assert wt.workers.claude_session_row_liveness(row)[0] == "dead"
+    finally:
+        other.kill()
+        other.wait()
+    assert wt.workers.claude_session_row_liveness(row) == ("dead", "registry pid gone")
 
 
 def test_claim_guard_lets_a_resumed_session_of_a_dead_worker_through(wt, procs, tmp_path):

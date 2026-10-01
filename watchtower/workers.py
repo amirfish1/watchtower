@@ -3880,20 +3880,50 @@ def _upsert_codex_worker_registry(
         pass
 
 
-def _pid_start_token(pid: int) -> str:
-    """Return the OS-reported process start time used to detect PID reuse."""
+def _pid_start_token(pid: int, utc: bool = False) -> str:
+    """Return the OS-reported process start time used to detect PID reuse.
+
+    ``utc=True`` renders it in UTC, the form Claude Code records as a session
+    registry row's ``procStart``."""
     if not pid:
         return ""
     try:
+        env = dict(os.environ, TZ="UTC") if utc else None
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="],
             capture_output=True,
             text=True,
             timeout=2,
+            env=env,
         )
         return result.stdout.strip() if result.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def claude_session_row_liveness(row: Dict[str, Any]) -> Tuple[str, str]:
+    """``('alive'|'dead'|'unproven', why)`` for one Claude session registry
+    row (WT-31 D1): alive only when its pid is live AND the start token the
+    row recorded (``procStart``, UTC ``lstart``; or a WT-style
+    ``pid_started``) equals that pid's current start. A token mismatch is a
+    reused pid (dead: it must never veto orphan/backstop recovery); a live
+    pid without a recorded token proves nothing (unproven)."""
+    pid = int((row or {}).get("pid") or 0)
+    if not pid or not _pid_alive(pid):
+        return "dead", "registry pid gone"
+    proc_start = " ".join(str(row.get("procStart") or "").split())
+    if proc_start:
+        cur = " ".join(_pid_start_token(pid, utc=True).split())
+    else:
+        proc_start = " ".join(str(row.get("pid_started") or "").split())
+        cur = " ".join(_pid_start_token(pid).split()) if proc_start else ""
+    if not proc_start:
+        return "unproven", f"registry pid {pid} live but its row has no start token"
+    if not cur:
+        return "unproven", f"registry pid {pid}: start token unreadable"
+    if cur != proc_start:
+        return "dead", f"registry pid {pid} reused (start token mismatch)"
+    return "alive", ""
 
 
 def _pid_alive(pid: int) -> bool:
