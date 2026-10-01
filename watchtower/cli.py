@@ -6182,6 +6182,13 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     u.set_defaults(func=cmd_models_unpin)
 
+    s = sub.add_parser("model", help="managed capability-profile model execution")
+    msub = s.add_subparsers(dest="model_command", required=True)
+    m = msub.add_parser("run", help="read a structured tools:none request from stdin")
+    m.add_argument("--json", action="store_true", required=True)
+    from .model_runner import command as model_run_command
+    m.set_defaults(func=model_run_command)
+
     s = sub.add_parser("ls")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument(
