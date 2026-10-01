@@ -58,6 +58,18 @@ def test_park_answer_handoff_claim(wt):
     assert got["ref"] == g.ref and got["pending_answer"]["state"] == "delivered"
 
 
+def test_unowned_in_progress_is_a_reconciler_row(wt):
+    """D3: ``update_status(in_progress, worker='')`` -> ``work.unowned``, owned by
+    the reconciler (the backstop reopens it); a claim moves it to work.claimed."""
+    g = Golden(wt, wt.q.enqueue(project=PQ, note="ticket", source="test")["ref"])
+    g.check(row="work.open")
+    g.step(wt.q.update_status, g.ref, "in_progress", "", row="work.unowned",
+           owner="reconciler", desired=[])
+    assert wt.liveness.ROWS_BY_ID["work.unowned"].recover == "reopen"
+    g.step(wt.q.update_status, g.ref, "open", "", row="work.open", desired=[])
+    g.step(wt.q.claim_next, "w2", project=PQ, row="work.claimed", owner="worker")
+
+
 def test_affinity_then_claim_by_prior_worker(wt, monkeypatch):
     g = Golden(wt, _claimed(wt))
     _parked_routing(wt, g)

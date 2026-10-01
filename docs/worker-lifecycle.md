@@ -636,6 +636,7 @@ before its caller blocks the ticket.
 | stage (`plan.*`, `review.verify`, `assess.*`) | `stage_session` worker alive, or a launch cooldown | `stage`: `reconcile_stages(only_ref)` |
 | `assess.filing` | idle | `assessment_run_ops` (the idempotent op replay) |
 | claim (`work.claimed`, sent-back) | `claim_owner` | dead: `resume` if resume-first applies, else `reopen`; unproven or GitHub: `escalate`; alive: none |
+| `work.unowned` (in_progress, no claimer, e.g. `update_status(in_progress, worker='')`) | owner `reconciler`; only a bound session `claim_owner` proves alive vetoes | `reopen` to the pool (no claimer to protect); GitHub: `escalate` |
 | `work.open` (staffing) | a live, unreleased queue worker | `spawn` one worker (auto_drain on, no launch-failure cooldown; one per queue per sweep) |
 | `dep.stuck` | stuck blocker not yet escalated | `escalate_stuck_blockers`; `BACKSTOP_NO_ESCALATION` if it still is not flagged |
 | `plan.blocked` | idle one tick | `BACKSTOP_UNBLOCKED_PLAN`, escalate to a human |

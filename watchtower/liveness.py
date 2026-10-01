@@ -207,7 +207,10 @@ ROWS: Tuple[Row, ...] = (
          status="open", readiness="claimable", dep="stuck", block="none", answer=SETTLED),
     _row("work.claimed", "worker", "claim_owner", "reopen", NOT_PA,
          status="in_progress", claimed=True, block="none", answer=SETTLED),
-    _row("work.unowned", "human", "-", "-", NOT_PA,
+    # in_progress with no claimer (``update_status(in_progress, worker='')``):
+    # nobody owns it, so after STALL_S idle the backstop reopens it to the
+    # pool unless a session bound to it is provably alive (GitHub: escalate).
+    _row("work.unowned", "reconciler", "claim_owner", "reopen", NOT_PA,
          status="in_progress", claimed=False, block="none", answer=SETTLED),
     _row("work.open", "pool", "staffing", "spawn", NOT_PA,
          status="open", readiness="claimable", dep="ok", block="none", answer=SETTLED),
@@ -814,6 +817,18 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
     elif row.id == "assess.filing":
         verdict, evidence = "due", "assessment ops pending"
         action, reason = "assessment_run_ops", "assessment filing stalled"
+    elif row.id == "work.unowned":
+        # No claimer to protect; only a provably live bound session vetoes.
+        v = claim_owner(item, ctx) if claim_proc_of(item) else None
+        if v is not None and v.verdict == "alive":
+            verdict, evidence = "alive", v.evidence or v.source
+        else:
+            verdict = "unowned"
+            evidence = "in_progress with no claimer" + (f" ({v.evidence})" if v else "")
+            if github:
+                action, reason = "escalate", "in_progress with no claimer (GitHub)"
+            else:
+                action, reason = "reopen", "in_progress with no claimer and no live owner"
     elif proof["kind"] == "claim_owner":
         v = claim_owner(item, ctx)
         verdict, evidence = v.verdict, v.evidence or v.source

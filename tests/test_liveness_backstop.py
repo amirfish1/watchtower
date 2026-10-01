@@ -215,6 +215,56 @@ def test_github_claim_escalates_through_block(lv, monkeypatch):
     assert [a["action"] for a in acted] == ["escalate"] and blocked == ["GH-1"]
 
 
+def test_unowned_in_progress_is_reopened_after_stall(lv):
+    """``update_status(in_progress, worker='')`` leaves a non-terminal ticket
+    with no claimer, no live owner and no human block (``work.unowned``). The
+    backstop reopens it after STALL_S idle instead of skipping it forever."""
+    ref = _file(lv)
+    lv.q.update_status(ref, "in_progress", "")
+    it = lv.q.get(ref)
+    assert it["claimed_by"] is None and not it.get("needs_input")
+    assert lv.liveness.row_of(it).id == "work.unowned"
+    a = _assess(lv, ref, off=60)
+    assert a["row"] == "work.unowned" and a["action"] == ""     # idle < STALL_S
+    a = _assess(lv, ref)
+    assert (a["owner"], a["verdict"], a["action"]) == ("reconciler", "unowned", "reopen")
+    assert _sweep(lv, off=60) == []
+    acted = _sweep(lv)
+    assert [(a["ref"], a["row"], a["action"], a["result"]) for a in acted] == \
+        [(ref, "work.unowned", "reopen", "done")]
+    it = lv.q.get(ref)
+    assert it["status"] == "open" and it["backstop"]["state"] == "work.unowned"
+    assert lv.liveness.row_of(it).id == "work.open"
+    line = [l for l in _log(lv).splitlines() if "BACKSTOP " in l][-1]
+    for part in (f"{ref} state=work.unowned", "owner=reconciler", "verdict=unowned",
+                 "action=reopen"):
+        assert part in line
+
+
+def test_unowned_with_a_live_bound_session_is_left_alone(lv, monkeypatch):
+    ref = _file(lv)
+    lv.q.update_status(ref, "in_progress", "")
+    _patch(lv, ref, claim_proc={"worker_id": "", "session_id": SID, "engine": "claude",
+                                "pid": 0, "bound": "ambient"})
+    monkeypatch.setattr(lv.liveness, "_registry_alive", lambda sid: sid == SID)
+    a = _assess(lv, ref)
+    assert a["row"] == "work.unowned" and a["verdict"] == "alive" and a["action"] == ""
+    assert _sweep(lv) == []
+    assert lv.q.get(ref)["status"] == "in_progress"
+
+
+def test_github_unowned_escalates_through_block(lv, monkeypatch):
+    blocked = []
+    item = {"ref": "GH-2", "project": "GH", "status": "in_progress", "claimed_by": None,
+            "updated_at": "2000-01-01T00:00:00Z", "history": []}
+    monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
+    acted = _sweep(lv)
+    assert [(a["row"], a["action"]) for a in acted] == [("work.unowned", "escalate")]
+    assert blocked == ["GH-2"]
+
+
 def test_live_sent_back_claim_is_left_to_its_release_window(lv):
     lv.worker()
     ref = _claimed(lv)
