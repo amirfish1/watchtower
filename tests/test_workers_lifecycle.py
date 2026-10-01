@@ -658,6 +658,7 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
 def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
     """A Codex quota failure exits after creating a session. Reconcile must not
     create a fresh cloud session every tick while the reset/cooldown is active."""
+    monkeypatch.setattr(wt.workers, "engine_available", lambda e: e in {"claude", "codex"})
     wt.config.set_auto_drain("Q", True)
     wt.config.set_engine("Q", "codex")
     wt.config.set_fallback_to_default_worker("Q", True)
@@ -759,7 +760,7 @@ def test_reconcile_usage_limit_falls_back_to_default_engine(wt, monkeypatch):
         return [{"worker_id": "fallback-worker", "queue": queue, "engine": engine}]
 
     monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
-    monkeypatch.setattr(wt.config, "fallback_engine", lambda failed: "codex")
+    monkeypatch.setattr(wt.config, "fallback_engine", lambda failed, **kw: "codex")
     monkeypatch.setattr(wt.config, "fallback_model", lambda engine: "gpt-5.6-terra")
 
     result = wt.workers.reconcile_once(dry_run=False)
@@ -787,7 +788,7 @@ def test_reconcile_usage_limit_without_opt_in_does_not_substitute(
         return []
 
     monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
-    monkeypatch.setattr(wt.config, "fallback_engine", lambda failed: "codex")
+    monkeypatch.setattr(wt.config, "fallback_engine", lambda failed, **kw: "codex")
 
     result = wt.workers.reconcile_once(dry_run=False)
 
@@ -4931,3 +4932,82 @@ def test_headless_resume_carries_the_compact_settings(wt, tmp_path, monkeypatch)
     assert "model_auto_compact_token_limit=200000" in codex[0]
     assert codex[0].index("-c") < codex[0].index("sid1")
     assert claude[1]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "result", "is_error": True, "api_error_status": 429,
+     "result": "You've hit your monthly spend limit"},
+    {"type": "assistant", "is_api_error_message": True, "error": "rate_limit"},
+    {"type": "error", "error": {"code": "insufficient_quota"}},
+])
+def test_quota_errors_detected_at_launch_and_in_live_tail(wt, event):
+    log = wt.tmp / "quota.log"
+    log.write_text(json.dumps(event) + "\n")
+    assert wt.workers._classify_launch_failure_log(log)["reason"] == "engine usage limit"
+    assert wt.workers._classify_zombie_log(str(log)) == "engine usage limit"
+
+
+def test_quoted_quota_error_is_not_provider_failure(wt):
+    log = wt.tmp / "quote.log"
+    log.write_text(json.dumps({"type": "assistant", "message": {
+        "content": [{"type": "text", "text": "monthly spend limit / insufficient_quota"}]
+    }}) + "\n")
+    assert wt.workers._classify_launch_failure_log(log) is None
+    assert wt.workers._classify_zombie_log(str(log)) is None
+
+
+def test_fallback_skips_exhausted_candidates_in_existing_order(wt, monkeypatch):
+    wt.config.set_fallback_to_default_worker("Q", True)
+    monkeypatch.setattr(wt.workers, "engine_available", lambda e: True)
+    monkeypatch.setattr(wt.workers, "active_launch_failure_cooldown",
+                        lambda q, e: {"reason": "engine usage limit"} if e == "codex" else None)
+    assert wt.workers._launch_substitute("Q", "claude") == "kimi"
+    assert wt.workers._launch_substitute("Q", "claude", attempted={"kimi"}) == ""
+
+
+@pytest.mark.parametrize("all_exhausted", [False, True])
+def test_fallback_chain_is_bounded_and_replaces_only_failed_slots(wt, monkeypatch, all_exhausted):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_engine("Q", "claude")
+    wt.config.set_fallback_to_default_worker("Q", True)
+    wt.config.set_desired_workers("Q", 2)
+    for i in range(2):
+        wt.q.enqueue(project="Q", note=f"work {i}")
+    monkeypatch.setattr(wt.workers, "engine_available", lambda e: e in {"claude", "codex", "kimi"})
+    calls = []
+    def spawn(queue, n=1, engine="claude", launch_failures=None, **kw):
+        calls.append((engine, n))
+        if engine == "claude":
+            launch_failures.append({"reason": "engine usage limit", "_spawn_index": 1})
+            return [{"worker_id": "successful-primary", "queue": queue, "engine": engine, "_spawn_index": 0}]
+        if engine == "codex" or all_exhausted:
+            launch_failures.append({"reason": "engine usage limit", "_spawn_index": 0})
+            return []
+        return [{"worker_id": "successful-fallback", "queue": queue, "engine": engine, "_spawn_index": 0}]
+    monkeypatch.setattr(wt.workers, "spawn_workers", spawn)
+    result = wt.workers.reconcile_once(dry_run=False)
+    assert calls == [("claude", 2), ("codex", 1), ("kimi", 1)]
+    assert len(result["spawned"]) == (1 if all_exhausted else 2)
+    if not all_exhausted:
+        assert result["spawned"][-1]["_spawn_index"] == 1
+    assert wt.config.engine("Q") == "claude"
+
+
+@pytest.mark.parametrize("holds_claim", [False, True])
+def test_live_quota_worker_retires_promptly_without_replaying_claim(wt, holds_claim):
+    wt.config.set_auto_drain("Q", True)
+    item = wt.q.enqueue(project="Q", note="fresh work")
+    rec = _live_worker(wt, "Q")
+    Path(rec["log"]).write_text(json.dumps({
+        "type": "result", "is_error": True, "api_error_status": 429,
+        "result": "You've hit your monthly spend limit",
+    }) + "\n")
+    if holds_claim:
+        wt.q.claim_by_ref(item["ref"], rec["worker_id"])
+    released = wt.workers.release_zombie_workers(queue="Q")
+    assert len(released) == (0 if holds_claim else 1)
+    if not holds_claim:
+        cooldown = wt.workers.active_launch_failure_cooldown("Q", "claude")
+        assert cooldown["reason"] == "engine usage limit"
+    else:
+        assert wt.q.list_items(project="Q")[0]["status"] == "in_progress"

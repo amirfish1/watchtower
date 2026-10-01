@@ -2538,7 +2538,9 @@ def release_zombie_workers(queue: Optional[str] = None,
             continue
         if _worker_released(w):
             continue
-        if q_name not in stuck_queues:
+        failure_reason = _classify_zombie_log(str(w.get("log") or ""))
+        quota_blocked = failure_reason == "engine usage limit"
+        if q_name not in stuck_queues and not quota_blocked:
             continue
 
         started = w.get("started_at")
@@ -2551,7 +2553,7 @@ def release_zombie_workers(queue: Optional[str] = None,
                 age_s = max(0.0, now - dt.timestamp())
             except (ValueError, TypeError):
                 pass
-        if age_s < threshold:
+        if age_s < threshold and not quota_blocked:
             continue
 
         worker_id = str(w.get("worker_id") or "")
@@ -2574,7 +2576,7 @@ def release_zombie_workers(queue: Optional[str] = None,
                 if closed_at and closed_at >= started:
                     closed_since_start = True
                     break
-        if closed_since_start:
+        if closed_since_start and not quota_blocked:
             continue
 
         try:
@@ -2593,7 +2595,6 @@ def release_zombie_workers(queue: Optional[str] = None,
             )])
             continue
 
-        failure_reason = _classify_zombie_log(str(w.get("log") or ""))
         if failure_reason:
             log_path = Path(str(w.get("log") or ""))
             _record_launch_failure(
@@ -2602,7 +2603,8 @@ def release_zombie_workers(queue: Optional[str] = None,
                 worker_id=worker_id,
                 pid=int(w.get("pid") or 0),
                 log_path=log_path,
-                reason=f"zombie worker: {failure_reason}",
+                reason=(failure_reason if failure_reason == "engine usage limit"
+                        else f"zombie worker: {failure_reason}"),
                 model=str(w.get("model") or ""),
             )
 
@@ -3179,6 +3181,37 @@ _AUTH_FAILED_RE = re.compile(
 )
 
 
+def _quota_exhausted(text: str) -> bool:
+    """Provider exhaustion, including Claude's spend wall and structured errors.
+
+    Structured output must be an actual error, not a tool result quoting an
+    error string. Plain CLI diagnostics remain supported.
+    """
+    phrases = ("usage limit", "monthly spend limit", "weekly limit reached",
+               "insufficient_quota", "quota exceeded", "quota exhausted",
+               "credit balance is too low", "resource_exhausted")
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            if any(phrase in line.lower() for phrase in phrases):
+                return True
+            continue
+        if not isinstance(event, dict):
+            continue
+        is_error = (event.get("is_error") is True
+                    or event.get("is_api_error_message") is True
+                    or event.get("type") in {"error", "turn.failed"})
+        if not is_error:
+            continue
+        lower = json.dumps(event).lower()
+        if any(phrase in lower for phrase in phrases):
+            return True
+        if event.get("error") == "rate_limit" or event.get("api_error_status") == 429:
+            return True
+    return False
+
+
 def _classify_launch_failure_log(
     log_path: Path, now: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
@@ -3189,7 +3222,7 @@ def _classify_launch_failure_log(
     lower = text.lower()
     reason = ""
     retry_at = None
-    if "usage limit" in lower:
+    if _quota_exhausted(text):
         reason = "engine usage limit"
         retry_at = _parse_usage_retry_at(text, now=now)
     elif "http 503" in lower or "upstream connect error" in lower:
@@ -3250,7 +3283,7 @@ def _classify_zombie_log(log_path: str, lines: int = ZOMBIE_LOG_SCAN_LINES) -> O
                 or recent.count("not exist or you may not have access") >= 2):
             return "repeated model_not_found"
         # Usage / auth / connectivity failures that would also stall a worker.
-        if "usage limit" in recent:
+        if _quota_exhausted("".join(all_lines[-lines:])):
             return "engine usage limit"
         if ("authentication" in recent
                 and ("failed" in recent or "required" in recent)):
@@ -3560,7 +3593,7 @@ def _warrants_engine_swap(rec: Optional[Dict[str, Any]]) -> bool:
     return consecutive >= _LAUNCH_FAILURE_ALERT_STREAK
 
 
-def _launch_substitute(queue: str, engine: str) -> str:
+def _launch_substitute(queue: str, engine: str, *, attempted=()) -> str:
     """Engine to launch this queue's workers on instead of its failing
     ``engine``, or "" to not substitute. Only a queue that opted in to
     "Revert to CCC default worker" gets one (WATCHTOWER-30), and never an
@@ -3568,10 +3601,16 @@ def _launch_substitute(queue: str, engine: str) -> str:
     from . import config
     if not config.fallback_to_default_worker(queue):
         return ""
-    substitute = config.fallback_engine(engine)
-    if substitute and active_launch_failure_cooldown(queue, substitute):
-        return ""
-    return substitute
+    excluded = set(attempted)
+    # Preserve the configured/default order, skipping every exhausted engine.
+    # Each candidate can be visited only once, even if a provider keeps failing.
+    while True:
+        substitute = config.fallback_engine(engine, excluded=excluded)
+        if not substitute or substitute in excluded:
+            return ""
+        if not active_launch_failure_cooldown(queue, substitute):
+            return substitute
+        excluded.add(substitute)
 
 
 def active_launch_failure_cooldown(
@@ -6952,12 +6991,14 @@ def _reconcile_once_locked(dry_run: bool = False,
                 if swap_failures
                 else ""
             )
+            attempted_engines = {engine, launch_engine}
             fallback = (
-                _launch_substitute(q_name, engine)
-                if swap_failures and not dry_run and launch_engine == engine
+                _launch_substitute(q_name, engine, attempted=attempted_engines)
+                if swap_failures and not dry_run
                 else ""
             )
-            if fallback:
+            while fallback:
+                attempted_engines.add(fallback)
                 fallback_model = config.fallback_model(fallback)
                 fallback_reason = f"fallback from {engine} ({swap_cause})"
                 fallback_failures: List[Dict[str, Any]] = []
@@ -6991,13 +7032,20 @@ def _reconcile_once_locked(dry_run: bool = False,
                 )
                 result["fallbacks"].append({
                     "queue": q_name,
-                    "from_engine": engine,
+                    "from_engine": launch_engine,
                     "to_engine": fallback,
                     "reason": swap_cause,
                 })
                 spawned.extend(fallback_spawned)
                 launch_failed.extend(fallback_failures)
-            elif swap_failures and not dry_run:
+                launch_engine = fallback
+                swap_failures = [rec for rec in fallback_failures
+                                 if _warrants_engine_swap(rec)]
+                swap_cause = (str(swap_failures[0].get("reason") or "launch failure")
+                              if swap_failures else "")
+                fallback = (_launch_substitute(q_name, engine, attempted=attempted_engines)
+                            if swap_failures else "")
+            if swap_failures and not dry_run:
                 # No engine left to fall back to. A cooldown alone would keep
                 # this queue in a spawn-then-die loop for as long as the
                 # breakage lasts (5 days on hermes INTAKE), so park it: the

@@ -794,7 +794,7 @@ def default_model(eng: str) -> str:
     return _ccc_default_model(eng)
 
 
-def fallback_engine(failed_engine: str) -> str:
+def fallback_engine(failed_engine: str, *, excluded=()) -> str:
     """Choose an available replacement engine after a provider-level failure.
 
     Prefer CCC's worker default so queue workers follow the fleet policy, then
@@ -803,11 +803,12 @@ def fallback_engine(failed_engine: str) -> str:
     """
     failed = str(failed_engine or "").strip().lower()
     candidates = [_ccc_worker_engine_default(), "codex", "claude", "kimi"]
+    excluded = {str(item).strip().lower() for item in excluded}
     from . import workers as _workers
     seen = set()
     for candidate in candidates:
         candidate = str(candidate or "").strip().lower()
-        if not candidate or candidate == failed or candidate in seen:
+        if not candidate or candidate == failed or candidate in seen or candidate in excluded:
             continue
         seen.add(candidate)
         if candidate in _models.ENGINES and _workers.engine_available(candidate):
