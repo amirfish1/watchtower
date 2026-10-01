@@ -306,3 +306,25 @@ def test_recorded_exit_settles_pruned_worker_without_terminal_event(measured, tm
     usage.attach(item)
     assert item["token_usage"]["completeness"] == "complete"
     assert item["token_usage"]["totals"]["input"] == 27
+
+
+def test_historical_partial_backfill_does_not_expand_on_settlement(measured, tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_USAGE_DIR", str(tmp_path / "usage"))
+    item = {"ref": "TOK-1", "history": []}
+    usage.capture(item, usage.on_event, {"event": "claim", "at": "t0", "by": {"worker": "w"}})
+    write(measured, [claude("preexisting"), claude("work", inp=20)])
+    usage.capture(item, usage.on_event, {"event": "close", "at": "t1", "by": {"worker": "w"}})
+    target = usage._location(item)
+    record = usage._read(target, strict=True)
+    attempt = record["token_usage"]["attempts"][0]
+    attempt["backfill"] = {"finalization": "frozen_historical_interval"}
+    attempt["completeness"] = "historical_partial"
+    record["token_usage"]["totals"] = usage.totals(record["token_usage"]["attempts"])
+    usage._write(target, record)
+    write(measured, [claude("preexisting"), claude("work", inp=20), claude("later-unrelated", inp=100), {"type": "result"}])
+    usage.reconcile()
+    usage.attach(item)
+    assert item["token_usage"]["totals"]["input"] is None
+    assert item["token_usage"]["measured_totals"]["input"] == 20
+    assert item["token_usage"]["attempts"][0]["completeness"] == "historical_partial"
+    assert usage._read(target)["token_usage"]["attempts"][0]["observed"]["units"].get("later-unrelated") is None

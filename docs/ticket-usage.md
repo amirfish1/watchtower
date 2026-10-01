@@ -69,6 +69,12 @@ actual models are never treated as measured zeroes.
 `measured_totals` is the subtotal of counters that were actually observed; it is
 always displayed with completeness, so it cannot be mistaken for a final bill.
 
+Historical imports are frozen to their original provider timestamp interval.
+Incomplete historical attempts preserve measured subtotals, while conservative
+full totals remain unknown. Settlement never expands an imported interval to
+include later session activity. Imports retain private source provenance and
+reasons for unavailable observations; they do not estimate a split.
+
 ## Storage and privacy
 
 Raw transcripts are not copied. Provider observations, baseline samples, session

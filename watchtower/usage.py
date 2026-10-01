@@ -222,7 +222,7 @@ def totals(attempts: list) -> dict:
     for attempt in attempts:
         models = attempt.get("models") or []
         rows.extend(m["counters"] for m in models)
-        if not models:
+        if not models or (attempt.get("backfill") and attempt.get("completeness") != "complete"):
             rows.append(dict.fromkeys(COUNTERS))
     return _sum(rows)
 
@@ -384,6 +384,8 @@ def reconcile() -> None:
             ledger = record.get("token_usage") or {}
             changed = False
             for a in ledger.get("attempts", []):
+                if (a.get("backfill") or {}).get("finalization") == "frozen_historical_interval":
+                    continue  # Historical bounds must never expand to later session usage.
                 if a.get("outcome") == "running" or a.get("completeness") == "complete" or a.get("attribution") == "retention_limit":
                     continue
                 key = a.get("session_id") or a["worker_id"]
