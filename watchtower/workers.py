@@ -944,32 +944,123 @@ def _claude_transcript_bytes(session_id: str) -> int:
     return biggest
 
 
-def context_budget_exceeded(worker_id: str, session_uuid: str = "") -> int:
-    """Transcript bytes when a DRAIN WORKER is over its context budget, else 0.
+_CODEX_ROLLOUT_CACHE: Dict[tuple, str] = {}
 
-    Applies ONLY to workers registered in workers.json — a human (or any
-    non-worker session) running ``wt claim`` by hand must never be "recycled"
-    just because their own conversation is large. The registered record's
-    claude session id is authoritative for locating the transcript;
-    ``session_uuid`` is a fallback when the record predates uuid capture.
 
-    The budget is ``WATCHTOWER_CONTEXT_RECYCLE_BYTES`` (default 2.5MB ≈ a
-    third of the transcript size observed at 800K tokens — recycle early;
-    a fresh worker costs seconds and regains full-quality context). Set the
-    env var to 0 to disable recycling. Read per call so tests and operators
-    can tune it without a daemon restart.
-    """
+def _codex_rollout_path(session_id: str) -> Optional[Path]:
+    """Resolve (and cache) the rollout file for a Codex session id."""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return None
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    key = (str(codex_home), session_id)
+    cached = _CODEX_ROLLOUT_CACHE.get(key)
+    if cached and os.path.exists(cached):
+        return Path(cached)
     try:
-        budget = int(
-            os.environ.get("WATCHTOWER_CONTEXT_RECYCLE_BYTES", "2500000") or 0
+        found = sorted(
+            (codex_home / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")
         )
-    except (TypeError, ValueError):
-        budget = 2_500_000
-    if budget <= 0:
+    except OSError:
+        return None
+    if not found:
+        return None
+    _CODEX_ROLLOUT_CACHE[key] = str(found[-1])
+    return found[-1]
+
+
+def _codex_input_tokens(session_id: str) -> int:
+    """Cumulative input tokens of a Codex session, or 0 if unknown.
+
+    Reads the LAST ``event_msg`` / ``token_count`` line's
+    ``info.total_token_usage.input_tokens`` from the tail of the rollout
+    (256KB, widened x4 up to the whole file when none is found). Cumulative
+    input counts cached tokens on purpose: it measures per-call resend volume.
+    """
+    path = _codex_rollout_path(session_id)
+    if path is None:
         return 0
+    try:
+        size = path.stat().st_size
+        window = 256 * 1024
+        with open(path, "rb") as f:
+            while True:
+                start = max(0, size - window)
+                f.seek(start)
+                chunk = f.read(size - start)
+                lines = chunk.split(b"\n")
+                if start > 0:
+                    lines = lines[1:]  # first line may be cut mid-record
+                for raw in reversed(lines):
+                    if b"token_count" not in raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except ValueError:
+                        continue
+                    pl = obj.get("payload") if isinstance(obj, dict) else None
+                    if (
+                        obj.get("type") != "event_msg"
+                        or not isinstance(pl, dict)
+                        or pl.get("type") != "token_count"
+                    ):
+                        continue
+                    usage = ((pl.get("info") or {}).get("total_token_usage") or {})
+                    try:
+                        return int(usage.get("input_tokens") or 0)
+                    except (TypeError, ValueError):
+                        return 0
+                if start == 0:
+                    return 0
+                window *= 4
+    except OSError:
+        return 0
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def note_ticket_done(worker_id: str) -> None:
+    """Count one closed/blocked ticket on a registered worker's record.
+
+    Feeds the engine-independent WATCHTOWER_RECYCLE_TICKETS cap. Unregistered
+    callers (humans) are ignored. Best-effort: never raises."""
     worker_id = str(worker_id or "").strip()
     if not worker_id:
-        return 0
+        return
+    try:
+        with _WorkersFileLock():
+            data = _load()
+            for row in data["workers"]:
+                if row.get("worker_id") == worker_id and not row.get("released_at"):
+                    row["tickets_done"] = int(row.get("tickets_done") or 0) + 1
+                    _save(data)
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def context_budget_exceeded(worker_id: str, session_uuid: str = "") -> tuple:
+    """``(limit, value)`` when a DRAIN WORKER is over a recycle limit, else ``()``.
+
+    ``limit`` is ``claude_bytes`` / ``codex_input_tokens`` / ``tickets``
+    (truthy tuple, falsy when fine). Applies ONLY to workers registered in
+    workers.json -- a human running ``wt claim`` by hand is never recycled.
+    Env knobs, read per call (0 disables each):
+
+    * ``WATCHTOWER_CONTEXT_RECYCLE_BYTES`` (default 2.5MB): claude transcript.
+    * ``WATCHTOWER_CODEX_RECYCLE_INPUT_TOKENS`` (default 30M): codex cumulative
+      input tokens from the rollout's last token_count event.
+    * ``WATCHTOWER_RECYCLE_TICKETS`` (default 10): any engine, tickets closed
+      or blocked this run (``tickets_done`` on the worker record).
+    """
+    worker_id = str(worker_id or "").strip()
+    if not worker_id:
+        return ()
     record = next(
         (
             w
@@ -978,11 +1069,28 @@ def context_budget_exceeded(worker_id: str, session_uuid: str = "") -> int:
         ),
         None,
     )
-    if record is None or str(record.get("engine") or "") != "claude":
-        return 0
+    if record is None:
+        return ()
+    engine = str(record.get("engine") or "")
     sid = str(record.get("session_id") or "").strip() or str(session_uuid or "")
-    size = _claude_transcript_bytes(sid)
-    return size if size >= budget else 0
+    if engine == "claude":
+        budget = _env_int("WATCHTOWER_CONTEXT_RECYCLE_BYTES", 2_500_000)
+        if budget > 0:
+            size = _claude_transcript_bytes(sid)
+            if size >= budget:
+                return ("claude_bytes", size)
+    elif engine == "codex":
+        budget = _env_int("WATCHTOWER_CODEX_RECYCLE_INPUT_TOKENS", 30_000_000)
+        if budget > 0:
+            used = _codex_input_tokens(sid)
+            if used >= budget:
+                return ("codex_input_tokens", used)
+    cap = _env_int("WATCHTOWER_RECYCLE_TICKETS", 10)
+    if cap > 0:
+        done = int(record.get("tickets_done") or 0)
+        if done >= cap:
+            return ("tickets", done)
+    return ()
 
 
 def _kimi_wire_mtime(w: Dict[str, Any]) -> float:

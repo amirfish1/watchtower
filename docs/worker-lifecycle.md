@@ -209,6 +209,19 @@ in-progress or blocked work, the strict queue read fails, its PID identity is
 not attributable, or required activity evidence is unavailable. WatchTower
 never sends `SIGTERM` or `SIGKILL` as part of normal queue release.
 
+### Context recycle (claim-time)
+
+`wt claim` answers `{"stop": true, "reason": "context_budget"}` to a
+**registered** drain worker (never a human) that holds no active claim and has
+hit any limit below; the STOP log line names the limit and value. Each knob is
+read per call and `0` disables it.
+
+| Env var | Default | Applies to | Measures |
+| --- | --- | --- | --- |
+| `WATCHTOWER_CONTEXT_RECYCLE_BYTES` | `2500000` | claude | session transcript bytes (`claude_bytes`) |
+| `WATCHTOWER_CODEX_RECYCLE_INPUT_TOKENS` | `30000000` | codex | cumulative `input_tokens` from the rollout's last `token_count` event, cached tokens included (`codex_input_tokens`) |
+| `WATCHTOWER_RECYCLE_TICKETS` | `10` | every engine | tickets closed or blocked this run, counted as `tickets_done` on the worker record (`tickets`) |
+
 ### Engine-specific idle behavior
 
 When `wt claim` returns empty, neither engine polls or sleep-loops. A Claude

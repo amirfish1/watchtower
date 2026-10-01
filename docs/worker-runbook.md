@@ -79,6 +79,10 @@ doesn't pay a full file rewrite every turn:
 - **Skip rule:** on a merely-drained queue, if `pending.md` is empty and
   `{queue}.md` was modified within the floor, do nothing — end your turn.
 
+A stop with `reason: context_budget` means a recycle limit tripped (Claude transcript
+bytes, Codex cumulative input tokens, or tickets closed/blocked this run); see
+`docs/worker-lifecycle.md` (Context recycle) for the knobs.
+
 The stop path is where the audit matters most: a recycled worker is torn
 down and its successor starts cold, so skipping the learnings hand-off on a
 stop throws away the whole session's wisdom. Either way, the audit is not

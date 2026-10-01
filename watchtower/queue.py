@@ -2214,7 +2214,7 @@ def claim_next(
             session_id, str(session_uuid or "")
         )
     except Exception:
-        over = 0
+        over = ()
     if over:
         # A worker only reaches claim_next() again after closing or blocking
         # its previous ticket -- by protocol it should never still hold an
@@ -2237,8 +2237,8 @@ def claim_next(
             _workers._mark_worker_released(session_id)
             _log(
                 "STOP",
-                f"{session_id} — context budget exceeded "
-                f"({over} transcript bytes); recycling worker",
+                f"{session_id} — recycle limit {over[0]} reached "
+                f"({over[1]}); recycling worker",
                 queue=project or "",
             )
             return {"stop": True, "reason": "context_budget"}
@@ -3672,6 +3672,17 @@ def _reopen_with_feedback(ident: Any, reason: str, results: List[Dict[str, Any]]
     return item
 
 
+def _note_worker_ticket_done(session_id: Any) -> None:
+    """Bump the registered worker's tickets_done (WATCHTOWER_RECYCLE_TICKETS)."""
+    if not session_id:
+        return
+    try:
+        from . import workers as _workers
+        _workers.note_ticket_done(str(session_id))
+    except Exception:  # noqa: BLE001 - recycle accounting is best-effort
+        pass
+
+
 def close(
     ident: Any, session_id: str = "", resolution: Any = None, force: bool = False,
     declined: bool = False, session_uuid: str = "",
@@ -3749,6 +3760,7 @@ def close(
         _notify_review(item, hold_review, session_id)
         return item
     if item and item.get("status") == "closed":
+        _note_worker_ticket_done(session_id)
         try:
             from . import messages
             messages.ledger_clear_ref(str(item.get("ref") or ident))
@@ -5606,6 +5618,8 @@ def block(
             ident, session_id=session_id, question=question, progress=progress,
         )
         if item:
+            if origin == "worker":
+                _note_worker_ticket_done(session_id)
             _notify_ticket_event(
                 item, "needs_input", detail=question, actor=session_id,
             )
@@ -5675,6 +5689,8 @@ def block(
                     "awaits_decision" if kind == "rationale" else "needs_input",
                     detail=question, actor=session_id,
                 )
+                if origin == "worker":
+                    _note_worker_ticket_done(session_id)
                 return it
     return None
 
