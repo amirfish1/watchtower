@@ -3003,6 +3003,8 @@ def plan_start(ident: Any) -> Optional[Dict[str, Any]]:
     def _do(it, plan):
         if plan.get("status") in ("planning", "reviewing", "discussing", "accepted", "failed", "blocked"):
             return
+        if group_role(it) == "parent" and not (it.get("group") or {}).get("sealed"):
+            return   # WT-33: a group is planned only once its membership is sealed
         plan.update(status="planning", round=1, text="", reviews=[])
         if group_role(it) == "parent":
             plan["membership_version"] = group_mv(it)
