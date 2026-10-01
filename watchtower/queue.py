@@ -5256,9 +5256,15 @@ def _supersede_pending_unlocked(it: Dict[str, Any], now: str) -> Optional[int]:
 
 def answer_session(it: Dict[str, Any]) -> str:
     """The session an answer for ``it`` belongs to: the parked one when the
-    ticket is parked/routing, else the claimant's."""
+    ticket is parked/routing, the live claimant when in progress, else the
+    answer's prior session."""
     parked = it.get("parked") or {}
     pa = it.get("pending_answer") or {}
+    if not parked.get("session_id") and it.get("status") == "in_progress" \
+            and it.get("claimed_session_id"):
+        # a replacement claimant owns the ticket now, whatever the answer's
+        # prior session was
+        return str(it["claimed_session_id"])
     return str(parked.get("session_id") or pa.get("prior_session_id")
                or it.get("claimed_session_id") or "")
 

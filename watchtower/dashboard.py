@@ -169,9 +169,11 @@ CLOSED_LIMIT = 50  # cap the drill-down's closed section to the most-recent N.
 
 
 def queue_tickets(name: str) -> List[Dict[str, Any]]:
-    """Active (open + in_progress) tickets for one queue, mirroring ``wt ls``."""
+    """Active (open + in_progress + parked awaiting_answer) tickets for one
+    queue, mirroring ``wt ls``."""
     items = q.list_items(project=name)
-    return [it for it in items if it.get("status") in ("open", "in_progress")]
+    return [it for it in items
+            if it.get("status") in ("open", "in_progress", q.PARKED_STATUS)]
 
 
 def closed_tickets(name: str, limit: int = CLOSED_LIMIT) -> List[Dict[str, Any]]:

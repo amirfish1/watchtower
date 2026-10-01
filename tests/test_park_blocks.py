@@ -377,3 +377,31 @@ def test_retained_ids_exclude_busy_and_dead_owners(wt, monkeypatch):
     monkeypatch.setattr(workers, "list_workers", lambda *a, **k: [
         {"worker_id": "w1", "queue": "PK", "alive": False}])
     assert workers.retained_parked_ids("PK") == set()  # known dead
+
+
+def test_answer_session_follows_replacement_claimant_after_handoff(wt):
+    """After a handed-off answer is claimed by another session, discussion
+    resumes the new claimant, not the former parked session."""
+    T = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    it = _parked(wt)
+    ans = wt.q.answer(it["ref"], "go left", session_id="human")
+    gen = ans["pending_answer"]["gen"]
+    assert wt.q.answer_session(wt.q.get(it["ref"])) == SID  # parked: prior session
+    assert wt.q.pa_transition(it["ref"], gen, "routing", "handed_off",
+                              from_status="awaiting_answer", reopen=True)
+    assert wt.q.answer_session(wt.q.get(it["ref"])) == SID  # open, handed off
+    wt.q.claim_by_ref(it["ref"], "w2", session_uuid=T)
+    cur = wt.q.get(it["ref"])
+    assert cur["status"] == "in_progress" and cur["claimed_session_id"] == T
+    assert wt.q.answer_session(cur) == T
+
+
+def test_dashboard_queue_tickets_include_parked(wt):
+    import watchtower.dashboard as dashboard
+    importlib.reload(dashboard)
+    it = _parked(wt)
+    other = wt.q.enqueue(project="PK", note="plain", source="test")
+    refs = {t["ref"] for t in dashboard.queue_tickets("PK")}
+    assert {it["ref"], other["ref"]} <= refs
+    page = dashboard.render_queue("PK", dashboard.status_payload(), dashboard.queue_tickets("PK"))
+    assert it["ref"] in page
