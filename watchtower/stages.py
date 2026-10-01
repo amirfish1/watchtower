@@ -382,7 +382,7 @@ def _role_target(item: Dict[str, Any], role: str) -> Dict[str, Any]:
 
 
 def _goal(item: Dict[str, Any], role: str, *, token: str, respawn: bool,
-          note: str, key: str = "") -> str:
+          note: str, key: str = "", nonce: str = "") -> str:
     from . import cli
     if key.startswith("discuss:") and role in ("planner", "plan_reviewer"):
         goal = cli._plan_discussion_goal(item, "planner" if role == "planner" else "reviewer")
@@ -411,7 +411,20 @@ def _goal(item: Dict[str, Any], role: str, *, token: str, respawn: bool,
         q_ = str(pa.get("question") or "").strip()
         goal += ("\n\nA human answered the ticket's open question"
                  + (f" ({q_[:500]})" if q_ else "") + f":\n{pa['answer']}")
+        if nonce:
+            goal += f"\n{nonce}"   # D4: the receipt for this hand-off (last line)
     return goal
+
+
+def _stage_answer_nonce(item: Dict[str, Any]) -> Tuple[str, str]:
+    """(delivery_id, nonce) when the stage prompt carries a handed-off
+    answer, else ('', '')."""
+    pa = item.get("pending_answer") or {}
+    if pa.get("state") != "handed_off" or not pa.get("answer"):
+        return "", ""
+    from . import liveness, receipts
+    did = liveness.new_delivery_id()
+    return did, receipts.make_nonce(did)
 
 
 def _confirm_stage_answer(ref: str, gen: int) -> Optional[Dict[str, Any]]:
@@ -530,8 +543,9 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
             if not token:
                 return "skip"
             item = q.get(ref) or item
+        did, nonce = _stage_answer_nonce(item)
         goal = _goal(item, role, token=token, respawn=cause in ("respawn", "adopted"),
-                     note=str(ss.get("retry_note") or ""), key=key)
+                     note=str(ss.get("retry_note") or ""), key=key, nonce=nonce)
         plan_now = item.get("plan") or {}
         name = {"planner": f"plan-{ref}-r{plan_now.get('round', 1)}",
                 "plan_reviewer": f"plan-review-{ref}",
@@ -546,6 +560,20 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
                                   stage=role, ticket_ref=ref, ticket_queue=project)
     except Exception as exc:  # noqa: BLE001
         return _spawn_error(item, role, key, ss, exc, engine=engine)
+    if nonce and not rec.get("launch_failure"):
+        # WT-31 D4: the hand-off is confirmed (E13) only when this nonce lands
+        # in the stage session's transcript; a stage that dies first leaves
+        # the answer handed_off for its next attempt.
+        try:
+            from . import liveness
+            gen = int((item.get("pending_answer") or {}).get("gen") or 0)
+            liveness.register_spawn_delivery(
+                purpose="stage_answer", dedupe_key=f"stage_answer:{ref}:{gen}:{key}",
+                nonce=nonce, delivery_id=did, session_id=str(rec.get("session_id") or ""),
+                engine=engine, ref=ref, queue=project,
+                worker_id=str(rec.get("worker_id") or ""), meta={"gen": gen})
+        except Exception:  # noqa: BLE001 - unconfirmed stays handed_off
+            pass
     info = {"engine": engine, "model": target["model"], "source": target["source"],
             "worker_id": rec.get("worker_id", ""), "stage_key": key}
     if role == "planner":

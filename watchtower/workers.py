@@ -1135,42 +1135,11 @@ def notify_workers(
             or str(w.get("session_id") or "") in exclude
         ):
             continue  # never push a nudge back at whoever caused it
-        # UDS first. It is steer by construction -- the frame goes at peer
-        # priority `next`, which Claude injects into a running turn without
-        # aborting it -- so unlike a FIFO write it is safe even mid-turn, and
-        # it arrives as a proper cross-session message rather than as text
-        # indistinguishable from the user's own typing.
-        if str(w.get("engine") or "") == "claude" and deliver_via_uds(
-            str(w.get("session_id") or ""), text,
-            from_name="watchtower-reconciler",
-        ):
+        got = _nudge_one(w, text)
+        if got == "sent":
             n += 1
-            continue
-        if worker_turn_open(w):
+        elif got == "deferred":
             deferred += 1
-            continue  # mid-turn: defer to the next tick rather than interrupt
-        fifo = w.get("fifo")
-        if fifo and write_to_worker_fifo(fifo, text, engine=str(w.get("engine") or "claude")):
-            n += 1
-            continue
-        # WATCHTOWER-14: a worker with no fifo (or a failed write) used to get
-        # nothing at all -- this loop was the one delivery path in WT that had
-        # no fallback whatsoever. Route it through the shared adapter chain
-        # instead. verb=steer because a nudge is only useful before the turn
-        # it is nudging about ends, and expire=30 because a stale nudge is
-        # noise: the reconcile tick will produce a fresh one.
-        target = str(w.get("session_id") or "").strip()
-        if not target:
-            continue
-        try:
-            from . import messages
-            if messages.deliver_message(
-                target, text, verb="steer", expire=30,
-                delegate_timeout_s=_NUDGE_DELEGATE_TIMEOUT_S,
-            ).get("ok"):
-                n += 1
-        except Exception:  # noqa: BLE001 - a nudge must never break reconcile
-            pass
     if deferred:
         try:
             from .queue import _log
@@ -1182,6 +1151,69 @@ def notify_workers(
         except Exception:
             pass
     return n
+
+
+def _nudge_one(w: Dict[str, Any], text: str, attempt: int = 1) -> str:
+    """One worker's nudge, verified (WT-31 D4): ``sent`` / ``deferred`` /
+    ``failed``. The ledger row (``nudge:<worker_id>``) is confirmed only when
+    the nonce lands; a lost nudge is resent once, then the worker is marked
+    ``undeliverable_since``.
+
+    UDS first. It is steer by construction -- the frame goes at peer priority
+    ``next``, which Claude injects into a running turn without aborting it --
+    so unlike a FIFO write it is safe even mid-turn, and it arrives as a
+    proper cross-session message rather than as text indistinguishable from
+    the user's own typing. A mid-turn worker without UDS is deferred to the
+    next tick rather than interrupted.
+
+    WATCHTOWER-14: a worker with no fifo (or a failed write) used to get
+    nothing at all. It goes through the shared adapter chain instead:
+    verb=steer because a nudge is only useful before the turn it is nudging
+    about ends, and expire=30 because a stale nudge is noise: the reconcile
+    tick will produce a fresh one."""
+    from . import liveness
+    wid = str(w.get("worker_id") or "")
+    sid = str(w.get("session_id") or "").strip()
+    try:
+        res = liveness.deliver(
+            sid, text, purpose="nudge", dedupe_key=f"nudge:{wid}",
+            queue=str(w.get("queue") or ""), worker_id=wid, session_id=sid,
+            engine=str(w.get("engine") or "claude"),
+            transports=("uds", "fifo", "message"), fifo=str(w.get("fifo") or ""),
+            fifo_ready=lambda: not worker_turn_open(w), fifo_busy="defer",
+            from_name="watchtower-reconciler",
+            message={"verb": "steer", "expire": 30,
+                     "delegate_timeout_s": _NUDGE_DELEGATE_TIMEOUT_S},
+            attempt=attempt)
+    except Exception:  # noqa: BLE001 - a nudge must never break reconcile
+        return "failed"
+    if res.get("state") == "deferred":
+        return "deferred"
+    return "sent" if res.get("ok") else "failed"
+
+
+def _set_undeliverable(worker_id: str, since: Optional[float]) -> bool:
+    """Mark (or clear, ``since=None``) a worker whose nudges never land."""
+    if not worker_id:
+        return False
+    try:
+        with _WorkersFileLock():
+            data = _load()
+            for row in data["workers"]:
+                if row.get("worker_id") != worker_id:
+                    continue
+                if since is None:
+                    if "undeliverable_since" not in row:
+                        return False
+                    row.pop("undeliverable_since", None)
+                else:
+                    row.setdefault("undeliverable_since",
+                                   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since)))
+                _save(data)
+                return True
+    except Exception:
+        return False
+    return False
 
 
 # Hard ceiling on how long the fifo-less fallback in notify_workers may wait
@@ -1522,52 +1554,40 @@ def _deliver_release_instruction_via_uds(
 
 
 def _deliver_release_instruction(
-    w: Dict[str, Any], text: str
+    w: Dict[str, Any], text: str, attempt: int = 1
 ) -> Dict[str, Any]:
-    if str(w.get("engine") or "") == "claude":
-        uds_result = _deliver_release_instruction_via_uds(w, text)
-        if uds_result is not None:
-            return uds_result
-    fifo = str(w.get("fifo") or "")
-    # A mid-turn FIFO write can steer (and truncate) the response in flight.
-    # messages.send below is the safe alternative: it holds/queues on a busy
-    # target and retries, instead of interrupting.
-    if fifo and not worker_turn_open(w):
-        try:
-            if write_to_worker_fifo(fifo, text, engine=str(w.get("engine") or "claude")):
-                return {"transport": "fifo", "delivered": True, "error": ""}
-        except Exception as exc:
-            return {
-                "transport": "fifo",
-                "delivered": False,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+    """Verified (WT-31 D4, ``release:<worker_id>``): UDS, then the FIFO when
+    the turn is closed, then ``messages.deliver_message``. A mid-turn FIFO
+    write can steer (and truncate) the response in flight; deliver_message is
+    the safe alternative: it holds/queues on a busy target and retries,
+    instead of interrupting. verb=engine_default maps to today's mode="send"
+    exactly. A lost instruction is resent once, then logged
+    RELEASE_UNDELIVERED."""
+    from . import liveness
+    engine = str(w.get("engine") or "claude")
     target = str(w.get("session_id") or "").strip()
-    if not target:
-        return {
-            "transport": "unavailable",
-            "delivered": False,
-            "error": "missing session id",
-        }
     try:
-        from . import messages
-        # verb=engine_default maps to today's mode="send" exactly. This path
-        # was hardened by the UDS release-delivery hotfix and works; the point
-        # of routing it through deliver_message is the single entry point and
-        # the shared adapter chain, not new timing semantics.
-        result = messages.deliver_message(target, text, verb="engine_default")
-        delivered = bool(result.get("ok"))
-        return {
-            "transport": "native_session",
-            "delivered": delivered,
-            "error": "" if delivered else str(result.get("error") or "delivery failed"),
-        }
+        res = liveness.deliver(
+            target, text, purpose="release",
+            dedupe_key=f"release:{w.get('worker_id') or target}",
+            queue=str(w.get("queue") or ""), worker_id=str(w.get("worker_id") or ""),
+            session_id=target, engine=engine, transports=("uds", "fifo", "message"),
+            uds_fn=lambda body: _deliver_release_instruction_via_uds(w, body),
+            fifo=str(w.get("fifo") or ""), fifo_ready=lambda: not worker_turn_open(w),
+            message={"verb": "engine_default"}, attempt=attempt)
     except Exception as exc:
-        return {
-            "transport": "native_session",
-            "delivered": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        return {"transport": "native_session", "delivered": False,
+                "error": f"{type(exc).__name__}: {exc}"}
+    transport = str(res.get("transport") or "")
+    if transport in ("uds", "fifo"):
+        return {"transport": transport, "delivered": bool(res.get("ok")),
+                "error": str(res.get("error") or "")}
+    if not target:
+        return {"transport": "unavailable", "delivered": False,
+                "error": "missing session id"}
+    delivered = bool(res.get("ok"))
+    return {"transport": "native_session", "delivered": delivered,
+            "error": "" if delivered else str(res.get("error") or "delivery failed")}
 
 
 def _audit_value(value: Any) -> str:

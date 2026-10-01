@@ -13,7 +13,10 @@ worker alive: ticket opens reserved for it, it is woken, nothing is bound),
 session and the answer is delivered to it).
 
 Delivery is at-least-once between a started transport and the ledger write; the
-``[answer REF#gen]`` tag in the prompt lets a session ignore a repeat.
+``[answer REF#gen]`` tag in the prompt lets a session ignore a repeat. A sent
+answer stays ``delivering``/``queued`` until the verified-delivery sweep
+(``liveness.sweep_deliveries``) sees its nonce land (E9, ``_on_answer_confirmed``)
+or reads it lost (E10, ``_fallback_reopen``).
 """
 
 from __future__ import annotations
@@ -177,41 +180,39 @@ def claim_brief(item: Dict[str, Any], worker_id: str = "", session_id: str = "")
 
 # --------------------------------------------------------------- delivery
 def _deliver(item: Dict[str, Any], pa: Dict[str, Any]) -> Dict[str, Any]:
-    """Deliver the answer to the parked session. ``status``: ``ok`` (taken or a
-    headless resume started), ``queued`` (+msg_id), ``in_flight`` (try later)
-    or ``failed``."""
-    from . import messages
+    """Deliver the answer to the parked session, verified (WT-31 D4): a nonce
+    and a ledger row (``answer:<ref>:<sid>:<gen>``) before the send.
+    ``status``: ``ok`` (sent or a headless resume started; the answer stays
+    ``delivering`` until the receipt confirms it, E9), ``queued`` (+msg_id),
+    ``in_flight`` (try later) or ``failed``. An engine whose transcript no
+    receipt can read is handed off rather than resumed headless."""
+    from . import liveness, messages
     ref, gen = item["ref"], pa["gen"]
     sid = str(pa.get("prior_session_id") or "")
     target = sid or str(pa.get("prior_worker_id") or "")
     engine = str(pa.get("prior_engine") or "") or engine_for(
         str(pa.get("prior_worker_id") or ""), sid)
     hold = not (engine == "kimi" and not messages._delegate_base())
-    try:
-        sent = messages.deliver_message(
-            target, answer_prompt(item, pa), verb="steer", engine=engine,
-            on_busy="hold" if hold else "reject", expire=ANSWER_QUEUE_TTL_S,
-            ticket_ref=ref, ticket_session=sid,
-            dedupe_key=answer_key(ref, sid, gen), ticket_gen=int(gen))
-    except Exception as exc:  # noqa: BLE001 - never lose the answer to a delivery crash
-        sent = {"ok": False, "error": str(exc)}
+    key = answer_key(ref, sid, gen)
+    sent = liveness.deliver(
+        target, answer_prompt(item, pa), purpose="answer", dedupe_key=key, ref=ref,
+        queue=str(item.get("project") or ""), worker_id=str(pa.get("prior_worker_id") or ""),
+        session_id=sid, engine=engine, transports=("message", "headless"),
+        message={"verb": "steer", "engine": engine, "on_busy": "hold" if hold else "reject",
+                 "expire": ANSWER_QUEUE_TTL_S, "ticket_ref": ref, "ticket_session": sid,
+                 "dedupe_key": key, "ticket_gen": int(gen)},
+        headless={"repo": str(pa.get("repo_path") or item.get("repo_path") or os.getcwd()),
+                  "queue": str(item.get("project") or ""),
+                  "worker_id": str(pa.get("prior_worker_id") or "")},
+        meta={"gen": int(gen)})
     if sent.get("ok"):
-        return {"status": "ok", "transport": sent.get("transport", "?")}
-    if sent.get("queued"):
-        return {"status": "queued", "msg_id": sent.get("id", ""),
+        return {"status": "ok", "transport": sent.get("transport", "?"),
+                "delivery": sent.get("state")}
+    if sent.get("state") == "queued":
+        return {"status": "queued", "msg_id": sent.get("msg_id", ""),
                 "busy": bool(sent.get("busy"))}
-    if sent.get("in_flight"):
+    if sent.get("state") == "in_flight":
         return {"status": "in_flight"}
-    try:  # unresolvable target: headless resume fork under the worker id
-        from . import cli
-        started = cli._resume_session_headless(
-            sid, str(pa.get("repo_path") or item.get("repo_path") or os.getcwd()),
-            answer_prompt(item, pa), engine, queue=str(item.get("project") or ""),
-            worker_id=str(pa.get("prior_worker_id") or ""))
-    except Exception:  # noqa: BLE001
-        started = False
-    if started:
-        return {"status": "ok", "transport": "headless-resume"}
     return {"status": "failed", "error": str(sent.get("error") or "delivery failed")}
 
 
@@ -320,9 +321,11 @@ def _deliver_bound(item: Dict[str, Any], gen: int) -> Dict[str, Any]:
     res = _deliver(item, pa)
     st = res["status"]
     if st == "ok":
-        q.pa_transition(ref, gen, ("delivering", "queued"), "delivered",
-                        from_status="in_progress", route="resume")
-        return {"route": "resume", "reason": f"delivered via {res.get('transport')}",
+        # Sent is not delivered (WT-31 D4): the answer stays ``delivering``
+        # until the ledger sweep sees its nonce in the transcript (E9) or
+        # reads it lost (E10).
+        return {"route": "resume", "reason": f"sent via {res.get('transport')}; "
+                                             "delivered once its receipt lands",
                 "transport": res.get("transport")}
     if st == "queued":
         q.pa_transition(ref, gen, "delivering", "queued", from_status="in_progress",
@@ -378,7 +381,9 @@ def route_pending_answers(now: Optional[float] = None) -> List[str]:
                 route_answer(ref, gen)
                 acted.append(f"{ref}:routed")
             elif state == "delivering" and _age(pa, now) >= ROUTE_LEASE_S:
-                acted.append(f"{ref}:{_retry(it, gen, now)}")
+                tag = _retry(it, gen, now)
+                if tag:
+                    acted.append(f"{ref}:{tag}")
             elif state == "queued":
                 tag = _check_queued(it, gen, now)
                 if tag:
@@ -401,8 +406,20 @@ def _still_bound(it: Dict[str, Any], pa: Dict[str, Any]) -> bool:
             and str(it.get("claimed_session_id") or "") == str(pa.get("prior_session_id") or ""))
 
 
+def _awaiting_receipt(it: Dict[str, Any], gen: int) -> bool:
+    """A sent answer whose ledger row the delivery sweep owns (pending, or
+    already settled and handled there): no resend."""
+    from . import liveness
+    pa = it.get("pending_answer") or {}
+    row = liveness.delivery_row(answer_key(str(it["ref"]),
+                                           str(pa.get("prior_session_id") or ""), gen))
+    return bool(row) and row.get("state") in ("sending", "pending", "confirmed", "lost")
+
+
 def _retry(it: Dict[str, Any], gen: int, now: float) -> str:
     ref, pa = str(it["ref"]), it["pending_answer"]
+    if _awaiting_receipt(it, gen):
+        return ""
     if not _still_bound(it, pa):
         return "stale"
     if int(pa.get("attempts") or 0) + 1 >= MAX_DELIVERY_ATTEMPTS:
@@ -420,10 +437,9 @@ def _check_queued(it: Dict[str, Any], gen: int, now: float) -> str:
     ref, pa = str(it["ref"]), it["pending_answer"]
     row = messages.outbox_row(str(pa.get("msg_id") or "")) if pa.get("msg_id") else None
     status = (row or {}).get("status")
-    if status == "delivered":
-        q.pa_transition(ref, gen, "queued", "delivered", from_status="in_progress")
-        return "delivered"
-    if status in ("pending", "held"):
+    if status in ("delivered", "pending", "held"):
+        # delivered by the outbox is still only sent: the delivery sweep
+        # confirms it on the nonce (E9) or reads it lost (E10).
         return ""
     if not _still_bound(it, pa):
         return ""

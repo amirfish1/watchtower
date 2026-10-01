@@ -746,6 +746,15 @@ def _answer_floor(item: Dict[str, Any], row: Row, ctx: "ResolverContext",
             return "lease", f"routing {int(age)}s", "", ""
         return "stale", f"routing {int(age)}s > 2x lease", "answer_handoff", \
             f"answer stuck routing {int(age)}s (backstop)"
+    if row.id in ("answer.queued", "answer.delivering"):
+        led = delivery_row(answers.answer_key(str(item.get("ref") or ""),
+                                              str(pa.get("prior_session_id") or ""),
+                                              pa.get("gen")))
+        if led and led.get("state") in ("sending", "pending"):
+            # D4: the delivery sweep owns a sent answer until its window closes
+            sent_age = now - float(led.get("sent_at") or 0)
+            if sent_age < float(led.get("expire_s") or 0) + 2 * _receipt_window_s() + lease:
+                return "pending", f"receipt pending {int(sent_age)}s", "", ""
     if row.id == "answer.queued":
         floor = float(answers.ANSWER_QUEUE_TTL_S) + lease
         if age < floor:
@@ -1035,3 +1044,539 @@ def sweep(now: Optional[float] = None, only_ref: str = "") -> List[Dict[str, Any
             q._log("BACKSTOP", f"{it.get('ref', '?')} error: {exc}",
                    queue=str(it.get("project") or ""))
     return acted
+
+
+# ------------------------------------------------------- verified delivery (D4)
+# "The transport said ok" is not delivery. ``deliver`` puts a nonce
+# ``⟨wt:<delivery_id>⟩`` on the message's last line, records a receipt before
+# the send (receipts.record(nonce=), offset = the pre-send transcript size)
+# and registers a ledger row under a dedupe key. ``sweep_deliveries`` (daemon
+# tick) moves a row to ``confirmed`` only when that nonce landed at/after the
+# offset, and to ``lost`` when the receipt is lost / missing / pending past
+# twice the window, or the delivery had no receipt source (``unverified``);
+# then it runs the purpose's handler (HANDLERS below).
+
+DELIVERIES_FILE: Optional[str] = None   # module override (tests); env wins
+DELIVERY_PRUNE_S = 24 * 3600.0
+DELIVERY_MAX_ROWS = 2000
+DELIVERY_PURPOSES = ("nudge", "release", "plan", "review", "answer", "stage_answer", "resume")
+# Engines whose transcript a receipt can read (receipts._transcript_stat).
+RECEIPT_ENGINES = ("claude", "codex")
+_LIVE_STATES = ("sending", "pending")
+
+# D2.8: every call of a low-level transport (deliver_via_uds,
+# write_to_worker_fifo, _write_fifo_frame, peer_uds.send_lines,
+# messages.send / deliver_message, cli._resume_session_headless,
+# cli._deliver_to_blocked_session) and of ``liveness.deliver`` sits in exactly
+# one list. A verified sender reaches a session only through ``deliver``
+# (nonce + ledger); an advisory sender's result never feeds a ticket-state
+# write; the transport layer is the plumbing itself.
+VERIFIED_SENDERS = frozenset({
+    "answers._deliver", "cli._deliver_to_blocked_session", "workers.notify_workers",
+    "workers._nudge_one", "workers._deliver_release_instruction", "cli._plan_send",
+    "queue._notify_review", "cli.cmd_plan", "cli._resume_rejected", "cli.cmd_reopen",
+    "cli.cmd_answer", "cli.cmd_gate_ack",
+})
+ADVISORY_SENDERS = frozenset({
+    "answers._wake", "queue._notify_ticket_event", "cli.cmd_comment", "cli.cmd_send",
+    "cli.cmd_chat_new", "cli.cmd_chat_nudge", "cli._daemon_loop_ticks", "dashboard.do_POST",
+    "messages.ask",
+})
+TRANSPORT_LAYER = frozenset({
+    "liveness.deliver", "liveness._send_headless", "messages._deliver_fifo",
+    "messages._deliver_uds", "workers.write_to_worker_fifo", "workers.interrupt_worker_turn",
+    "workers.deliver_via_uds", "workers._deliver_release_instruction_via_uds",
+    "workers.spawn_workers", "workers.spawn_run_once_worker",
+})
+
+
+def deliveries_file():
+    """``~/.watchtower/deliveries.json`` (next to the outbox, so tests are
+    sandboxed by $WATCHTOWER_OUTBOX_FILE); $WATCHTOWER_DELIVERIES_FILE or
+    ``DELIVERIES_FILE`` override it."""
+    from pathlib import Path
+    from . import messages
+    env = os.environ.get("WATCHTOWER_DELIVERIES_FILE")
+    if env:
+        return Path(env).expanduser()
+    if DELIVERIES_FILE:
+        return Path(DELIVERIES_FILE).expanduser()
+    return messages._outbox_file().parent / "deliveries.json"
+
+
+def _deliveries_lock():
+    return deliveries_file().with_suffix(".lock")
+
+
+def _load_deliveries() -> List[Dict[str, Any]]:
+    import json
+    try:
+        with open(deliveries_file(), "r") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return []
+    rows = data.get("deliveries") if isinstance(data, dict) else None
+    return [r for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def _save_deliveries(rows: List[Dict[str, Any]], now: float) -> None:
+    import json
+    cutoff = now - DELIVERY_PRUNE_S
+    rows = [r for r in rows if float(r.get("sent_at") or 0) >= cutoff][-DELIVERY_MAX_ROWS:]
+    path = deliveries_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"deliveries": rows}, f, indent=1)
+    os.replace(tmp, path)
+
+
+def _mutate_deliveries(fn: Callable[[List[Dict[str, Any]]], Any],
+                       now: Optional[float] = None) -> Any:
+    now = time.time() if now is None else now
+    with q._FileLock(_deliveries_lock()):
+        rows = _load_deliveries()
+        out = fn(rows)
+        _save_deliveries(rows, now)
+    return out
+
+
+def deliveries(state: str = "", purpose: str = "") -> List[Dict[str, Any]]:
+    return [r for r in _load_deliveries()
+            if (not state or r.get("state") == state)
+            and (not purpose or r.get("purpose") == purpose)]
+
+
+def delivery_row(dedupe_key: str) -> Optional[Dict[str, Any]]:
+    """The current row for ``dedupe_key`` (newest not superseded/failed)."""
+    for r in reversed(_load_deliveries()):
+        if r.get("dedupe_key") == dedupe_key and r.get("state") not in ("superseded", "failed"):
+            return r
+    return None
+
+
+def new_delivery_id() -> str:
+    import uuid
+    return f"dlv-{uuid.uuid4().hex[:12]}"
+
+
+def _receipt_window_s() -> float:
+    from . import receipts
+    return receipts._wait_window_s()
+
+
+def _pre_receipt(sid: str, engine: str, body: str, nonce: str, did: str,
+                 transport: str) -> Optional[Dict[str, Any]]:
+    """The nonce receipt, recorded before the send; None without a receipt
+    source (no session id, or an engine whose transcript is unreadable)."""
+    if not nonce or not sid or engine not in RECEIPT_ENGINES:
+        return None
+    from . import receipts
+    try:
+        return receipts.record(sid, body, transport, engine=engine, nonce=nonce,
+                               delivery_id=did)
+    except Exception:  # noqa: BLE001 - no receipt: the row reads unverified
+        return None
+
+
+def _drop_receipt(rec: Optional[Dict[str, Any]]) -> None:
+    if rec:
+        from . import receipts
+        try:
+            receipts.discard(rec["id"])
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _register(row: Dict[str, Any], now: float) -> None:
+    def _do(rows):
+        rows.append(row)
+    _mutate_deliveries(_do, now)
+
+
+def _finish(did: str, key: str, fields: Dict[str, Any], now: float) -> None:
+    """Settle the row after the send; a live outcome supersedes the key's
+    older live rows (one pending delivery per dedupe key)."""
+    def _do(rows):
+        for r in rows:
+            if r.get("delivery_id") == did:
+                r.update(fields)
+            elif (fields.get("state") == "pending" and r.get("dedupe_key") == key
+                  and r.get("state") in _LIVE_STATES):
+                r["state"] = "superseded"
+                r["settled_at"] = now
+    _mutate_deliveries(_do, now)
+
+
+def _unregister(did: str, now: float) -> None:
+    def _do(rows):
+        rows[:] = [r for r in rows if r.get("delivery_id") != did]
+    _mutate_deliveries(_do, now)
+
+
+def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str = "",
+            queue: str = "", worker_id: str = "", session_id: str = "", engine: str = "",
+            transports: Tuple[str, ...] = ("uds", "fifo", "message", "headless"),
+            fifo: str = "", fifo_ready: Optional[Callable[[], bool]] = None,
+            fifo_busy: str = "skip", uds_fn: Optional[Callable[[str], Any]] = None,
+            from_name: str = "watchtower", message: Optional[Dict[str, Any]] = None,
+            headless: Optional[Dict[str, Any]] = None, unverified_ok: bool = False,
+            meta: Optional[Dict[str, Any]] = None, on_lost: str = "",
+            attempt: int = 1) -> Dict[str, Any]:
+    """Send ``text`` over the first transport that takes it (UDS -> FIFO ->
+    ``messages.deliver_message``/``send`` -> headless resume, as listed) with
+    a nonce, a pre-send receipt and a ledger row.
+
+    Returns ``{"ok", "state", "transport", "delivery_id", "nonce",
+    "receipt_id", "error"}``; ``state``: ``pending`` (sent, awaiting the
+    receipt), ``unverified`` (sent, no receipt source: the sweep reads it
+    lost), ``queued`` (+``msg_id``; the outbox holds it), ``deferred``
+    (``fifo_busy="defer"`` and the FIFO is not ready), ``in_flight`` /
+    ``duplicate`` (the messages ledger already holds the key; no row),
+    ``failed``. ``ok`` = sent now (pending / unverified / duplicate).
+
+    A headless resume needs a receipt source: an engine outside
+    RECEIPT_ENGINES is handed off instead (``failed``) unless
+    ``unverified_ok``. A slash command carries no nonce (it would become the
+    command's argument), so it is always ``unverified``."""
+    from . import receipts
+    from . import workers
+    now = time.time()
+    purpose = str(purpose)
+    if purpose not in DELIVERY_PURPOSES:
+        raise ValueError(f"undeclared delivery purpose {purpose!r}")
+    engine = str(engine or "claude")
+    did = new_delivery_id()
+    slash = bool(workers._SLASH_COMMAND_RE.match(str(text or "")))
+    nonce = "" if slash else receipts.make_nonce(did)
+    body = str(text) if slash else receipts.with_nonce(text, nonce)
+    row = {"delivery_id": did, "purpose": purpose, "dedupe_key": str(dedupe_key),
+           "target": str(target or ""), "sid": str(session_id or ""), "engine": engine,
+           "ref": str(ref or ""), "queue": str(queue or ""), "worker_id": str(worker_id or ""),
+           "nonce": nonce, "receipt_id": "", "sent_at": now, "attempts": int(attempt),
+           "state": "sending", "transport": "", "text": str(text)[:4000],
+           "meta": dict(meta or {}), "on_lost": str(on_lost or "")}
+    _register(row, now)
+    out: Dict[str, Any] = {"ok": False, "state": "failed", "transport": "", "delivery_id": did,
+                           "nonce": nonce, "receipt_id": "", "error": ""}
+    errors: List[str] = []
+    msg_error = ""
+
+    def _sent(transport: str, rec: Optional[Dict[str, Any]], **extra: Any) -> Dict[str, Any]:
+        rid = (rec or {}).get("id", "") or str(extra.pop("receipt_id", "") or "")
+        state = "pending" if rid and nonce else "unverified"
+        _finish(did, dedupe_key, dict(state="pending", unverified=state == "unverified",
+                                      transport=transport, receipt_id=rid, **extra), now)
+        out.update(ok=True, state=state, transport=transport, receipt_id=rid, error="")
+        return out
+
+    sid = str(session_id or "")
+    for step in transports:
+        if step == "uds":
+            if engine != "claude" or not sid:
+                continue
+            rec = _pre_receipt(sid, engine, body, nonce, did, "uds")
+            try:
+                got = (uds_fn(body) if uds_fn is not None
+                       else workers.deliver_via_uds(sid, body, from_name=from_name))
+            except Exception as exc:  # noqa: BLE001 - fall through
+                got, errors = None, errors + [f"uds: {exc}"]
+            if got:
+                return _sent("uds", rec)
+            _drop_receipt(rec)
+            errors.append("uds: declined")
+        elif step == "fifo":
+            if fifo_ready is not None and not fifo_ready():
+                if fifo_busy == "defer":
+                    _unregister(did, now)
+                    out.update(state="deferred", error="turn open")
+                    return out
+                continue
+            if not fifo:
+                continue
+            rec = _pre_receipt(sid, engine, body, nonce, did, "fifo")
+            try:
+                got = workers.write_to_worker_fifo(fifo, body, engine=engine)
+            except Exception as exc:  # noqa: BLE001
+                _drop_receipt(rec)
+                _finish(did, dedupe_key, {"state": "failed"}, now)
+                out.update(transport="fifo", error=f"{type(exc).__name__}: {exc}")
+                return out
+            if got:
+                return _sent("fifo", rec)
+            _drop_receipt(rec)
+            errors.append("fifo: write failed")
+        elif step == "message":
+            if not target:
+                continue
+            from . import messages
+            kw = dict(message or {})
+            fn = kw.pop("fn", "deliver_message")
+            try:
+                res = (messages.send(target, body, **kw) if fn == "send"
+                       else messages.deliver_message(target, body, **kw)) or {}
+            except Exception as exc:  # noqa: BLE001 - never lose a message to a crash
+                res = {"ok": False, "error": str(exc)}
+            if res.get("deduped") and (res.get("ok") or res.get("queued") or res.get("in_flight")):
+                # the messages ledger already holds this key: no second row
+                _unregister(did, now)
+                out.update(ok=bool(res.get("ok")), transport=str(res.get("transport") or "ledger"),
+                           msg_id=str(res.get("id") or ""), busy=bool(res.get("busy")),
+                           state="duplicate" if res.get("ok") else
+                           ("queued" if res.get("queued") else "in_flight"),
+                           error=str(res.get("error") or ""))
+                return out
+            if res.get("ok"):
+                return _sent(str(res.get("transport") or "?"), None,
+                             receipt_id=str(res.get("receipt_id") or ""))
+            if res.get("queued"):
+                expire = kw.get("expire", kw.get("ttl_s"))
+                _finish(did, dedupe_key, {"state": "pending", "queued": True,
+                                          "msg_id": str(res.get("id") or ""),
+                                          "expire_s": float(expire or 0)}, now)
+                out.update(state="queued", msg_id=str(res.get("id") or ""),
+                           busy=bool(res.get("busy")), error=str(res.get("error") or ""))
+                return out
+            if res.get("in_flight"):
+                _unregister(did, now)
+                out.update(state="in_flight", error=str(res.get("error") or ""))
+                return out
+            msg_error = str(res.get("error") or "delivery failed")
+            out["message_result"] = res
+            errors.append(f"message: {msg_error}")
+        elif step == "headless":
+            h = dict(headless or {})
+            if not sid:
+                errors.append("headless: no session id")
+                continue
+            if engine not in RECEIPT_ENGINES and not unverified_ok:
+                errors.append(f"headless: {engine} has no receipt source; handed off")
+                continue
+            rec = _pre_receipt(sid, engine, body, nonce, did, "headless-resume")
+            started = _send_headless(sid, body, engine, h)
+            if started:
+                return _sent("headless-resume", rec)
+            _drop_receipt(rec)
+            errors.append("headless: resume did not start")
+    _finish(did, dedupe_key, {"state": "failed"}, now)
+    out["error"] = msg_error or "; ".join(errors) or "no transport"
+    out["errors"] = errors
+    return out
+
+
+def _send_headless(sid: str, body: str, engine: str, h: Dict[str, Any]) -> bool:
+    try:
+        from . import cli
+        return bool(cli._resume_session_headless(
+            sid, str(h.get("repo") or os.getcwd()), body, engine,
+            queue=str(h.get("queue") or ""), worker_id=str(h.get("worker_id") or "")))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def register_spawn_delivery(*, purpose: str, dedupe_key: str, nonce: str, delivery_id: str,
+                            session_id: str, engine: str, ref: str = "", queue: str = "",
+                            worker_id: str = "", meta: Optional[Dict[str, Any]] = None,
+                            text: str = "") -> Dict[str, Any]:
+    """Ledger row for a message that rode a fresh session's spawn (a stage
+    prompt): the session did not exist before, so the receipt baseline is
+    offset 0. No session id / receipt source -> unverified."""
+    now = time.time()
+    rid = ""
+    if session_id and engine in RECEIPT_ENGINES and nonce:
+        from . import receipts
+        try:
+            rid = receipts.record(session_id, text, "stage-spawn", engine=engine, nonce=nonce,
+                                  delivery_id=delivery_id,
+                                  at_send={"path": "", "size": 0, "mtime": 0.0})["id"]
+        except Exception:  # noqa: BLE001
+            rid = ""
+    row = {"delivery_id": delivery_id, "purpose": purpose, "dedupe_key": dedupe_key,
+           "target": session_id, "sid": session_id, "engine": engine, "ref": ref,
+           "queue": queue, "worker_id": worker_id, "nonce": nonce, "receipt_id": rid,
+           "sent_at": now, "attempts": 1, "state": "sending", "transport": "stage-spawn",
+           "text": "", "meta": dict(meta or {}), "on_lost": ""}
+    _register(row, now)
+    _finish(delivery_id, dedupe_key, {"state": "pending", "unverified": not rid}, now)
+    return dict(row, state="pending", unverified=not rid)
+
+
+# ------------------------------------------------------------- the sweep
+def _outcome(row: Dict[str, Any], receipt_rows: List[Dict[str, Any]],
+             now: float) -> Tuple[str, str]:
+    """('confirmed' | 'lost' | '', reason) for one pending row."""
+    from . import receipts
+    if row.get("unverified"):
+        return "lost", "unverified: no receipt source"
+    window = _receipt_window_s()
+    age = now - float(row.get("sent_at") or 0)
+    st = receipts.by_nonce(str(row.get("nonce") or ""), receipt_rows)
+    if st == "landed":
+        return "confirmed", "nonce landed"
+    if st == "lost":
+        return "lost", "receipt lost (nonce never landed)"
+    if row.get("queued"):
+        if age > float(row.get("expire_s") or 0) + 2 * window:
+            return "lost", "queued message never landed"
+        return "", ""
+    if not st:
+        return "lost", "receipt missing"
+    if age > 2 * window:
+        return "lost", f"receipt pending {int(age)}s > 2x window"
+    return "", ""
+
+
+def sweep_deliveries(now: Optional[float] = None, verify: bool = True) -> List[Dict[str, Any]]:
+    """Settle every pending ledger row and run its handler (daemon tick).
+    A row is settled under the ledger lock before its handler runs, so two
+    sweeps never both act on it. ``sending`` rows older than the dedupe
+    lease were cut off mid-send and read lost too."""
+    from . import receipts
+    now = time.time() if now is None else now
+    if verify:
+        try:
+            receipts.sweep(now)
+        except Exception:  # noqa: BLE001
+            pass
+    receipt_rows = receipts._load()
+    settled: List[Dict[str, Any]] = []
+
+    def _do(rows):
+        for r in rows:
+            if r.get("state") == "sending":
+                if now - float(r.get("sent_at") or 0) > 2 * _receipt_window_s():
+                    outcome, why = "lost", "send never finished"
+                else:
+                    continue
+            elif r.get("state") == "pending":
+                outcome, why = _outcome(r, receipt_rows, now)
+                if not outcome:
+                    continue
+            else:
+                continue
+            r.update(state=outcome, reason=why, settled_at=now)
+            settled.append(dict(r))
+    _mutate_deliveries(_do, now)
+    out = []
+    for r in settled:
+        try:
+            result = _handle(r)
+        except Exception as exc:  # noqa: BLE001 - one row never stops the sweep
+            result = f"error: {exc}"
+        q._log("DELIVERY", f"{r.get('ref') or r.get('worker_id') or '-'} {r['purpose']} "
+               f"{r['dedupe_key']} {r['delivery_id']} {r['state']} ({r.get('reason')}) "
+               f"-> {result}", queue=str(r.get("queue") or ""))
+        out.append(dict(r, result=result))
+    return out
+
+
+def _handle(row: Dict[str, Any]) -> str:
+    kind = str(row.get("on_lost") or row["purpose"])
+    fn = HANDLERS.get(kind)
+    if fn is None:
+        return "no handler"
+    return fn(row, row["state"] == "confirmed") or "done"
+
+
+def _gen_of(row: Dict[str, Any]) -> int:
+    return int((row.get("meta") or {}).get("gen") or 0)
+
+
+def _on_answer_confirmed(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """E9: the parked session's answer landed (its nonce is in the
+    transcript). A CAS on gen + state: after E14/E17 it is a no-op."""
+    return q.pa_transition(str(row["ref"]), _gen_of(row), ("delivering", "queued"), "delivered",
+                           from_status="in_progress", route="resume")
+
+
+def _h_answer(row: Dict[str, Any], confirmed: bool) -> str:
+    if confirmed:
+        return "E9" if _on_answer_confirmed(row) else "noop (state moved on)"
+    from . import answers
+    done = answers._fallback_reopen(str(row["ref"]), _gen_of(row),
+                                    f"answer delivery lost ({row.get('reason')}); handed off")
+    return "E10" if done else "noop (state moved on)"
+
+
+def _h_stage_answer(row: Dict[str, Any], confirmed: bool) -> str:
+    if not confirmed:
+        return "stays handed_off"   # carried into the next stage attempt
+    from . import stages
+    return "E13" if stages._confirm_stage_answer(str(row["ref"]), _gen_of(row)) \
+        else "noop (state moved on)"
+
+
+def _h_nudge(row: Dict[str, Any], confirmed: bool) -> str:
+    from . import workers
+    wid = str(row.get("worker_id") or "")
+    if confirmed:
+        workers._set_undeliverable(wid, None)
+        return "confirmed"
+    if int(row.get("attempts") or 1) < 2:
+        w = next((x for x in workers.list_workers() if str(x.get("worker_id") or "") == wid
+                  and x.get("alive")), None)
+        if w is not None:
+            return "resent: " + workers._nudge_one(w, str(row.get("text") or ""), attempt=2)
+    workers._set_undeliverable(wid, time.time())
+    return "undeliverable_since"
+
+
+def _h_release(row: Dict[str, Any], confirmed: bool) -> str:
+    if confirmed:
+        return "confirmed"
+    from . import workers
+    wid = str(row.get("worker_id") or "")
+    if int(row.get("attempts") or 1) < 2:
+        w = next((x for x in workers.list_workers(prune=False)
+                  if str(x.get("worker_id") or "") == wid), None)
+        if w is not None:
+            res = workers._deliver_release_instruction(w, str(row.get("text") or ""), attempt=2)
+            return f"resent: {res.get('transport')}"
+    q._log("RELEASE_UNDELIVERED", f"{wid or '-'}: release instruction never landed "
+           f"({row.get('reason')})", queue=str(row.get("queue") or ""))
+    return "RELEASE_UNDELIVERED"
+
+
+def _h_plan(row: Dict[str, Any], confirmed: bool) -> str:
+    if confirmed:
+        return "confirmed"
+    ref = str(row.get("ref") or "")
+    from . import stages
+    if (row.get("meta") or {}).get("kind") == "reminder":
+        q.plan_discussion_record_nudge(ref, False, f"reminder to {row['meta'].get('role')} never "
+                                       f"landed ({row.get('reason')})")
+    stages.request(ref, "plan message lost")
+    return "respawn requested"
+
+
+def _h_review(row: Dict[str, Any], confirmed: bool) -> str:
+    if confirmed:
+        return "confirmed"
+    ref = str(row.get("ref") or "")
+    item = q.get(ref) or {}
+    meta = row.get("meta") or {}
+    if item.get("status") != "in_review" or str(item.get("gate_pending") or "") != meta.get("gate"):
+        return "noop (review moved on)"
+    if int(row.get("attempts") or 1) < 2:
+        q._notify_review(item, str(meta.get("gate") or ""), None, attempt=2)
+        return "renotified"
+    q.block(ref, "", origin="system", kind="input",
+            question=(f"The review request for {ref} never reached {row.get('target')} (no "
+                      f"receipt after two sends). Review it yourself: `wt accept {ref}` or "
+                      f"`wt reject {ref} --reason \"...\"`."))
+    return "blocked"
+
+
+def _h_resume(row: Dict[str, Any], confirmed: bool) -> str:
+    if confirmed:
+        return "confirmed"
+    ref, sid = str(row.get("ref") or ""), str(row.get("sid") or "")
+    if ref and sid:
+        q.set_resume_state(ref, sid, "failed", error=f"delivery lost: {row.get('reason')}")
+    return "resume failed"
+
+
+HANDLERS: Dict[str, Callable[[Dict[str, Any], bool], str]] = {
+    "answer": _h_answer, "stage_answer": _h_stage_answer, "nudge": _h_nudge,
+    "release": _h_release, "plan": _h_plan, "review": _h_review, "resume": _h_resume,
+}

@@ -1233,16 +1233,24 @@ def _plan_role_alive(item: dict, role: str) -> bool:
     return bool(wid) and stages.session_alive(str(wid))
 
 
-def _plan_send(item: dict, role: str, text: str) -> bool:
+def _plan_send(item: dict, role: str, text: str, kind: str = "discuss") -> bool:
     """Message the planner/reviewer session of ``item`` over a live-only
     transport (UDS / WT stdin FIFO): never parks in the outbox, never spawns or
-    resumes a session. True only when a running peer took it."""
+    resumes a session. True only when a running peer took it. Verified (WT-31
+    D4, ``plan:<ref>:<role>:<kind>``): a message whose nonce never lands asks
+    the stage supervisor to respawn; a lost ``reminder`` blocks the plan."""
     wid = ((item.get("plan") or {}).get(role) or {}).get("worker_id")
     if not wid:
         return False
     try:
-        from . import messages
-        res = messages.send(str(wid), text, live_only=True)
+        from . import liveness
+        ref = str(item.get("ref") or "")
+        res = liveness.deliver(str(wid), text, purpose="plan",
+                               dedupe_key=f"plan:{ref}:{role}:{kind}", ref=ref,
+                               queue=str(item.get("project") or ""), worker_id=str(wid),
+                               transports=("message",),
+                               message={"fn": "send", "live_only": True},
+                               meta={"kind": kind, "role": role})
         return bool(res.get("ok"))
     except Exception:  # noqa: BLE001
         return False
@@ -1313,7 +1321,7 @@ def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
                 ok = _plan_send(it, role,
                                 f"Reminder: {ref} plan discussion is waiting on you ({role}). "
                                 f"Objections: {disc.get('objections', '')}. "
-                                f"See `wt plan show {ref}`.")
+                                f"See `wt plan show {ref}`.", "reminder")
                 nudged = q.plan_discussion_record_nudge(
                     ref, ok, f"reminder to {role} undelivered (no live transport to worker {wid})")
                 n += 1 if ok else 0
@@ -2587,19 +2595,25 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
     # Bind a held answer to this claim: the outbox cancels it once the ticket
     # closes or changes session instead of retrying it (WT-1).
     bound = item.get("status") == "in_progress"
-    try:
-        sent = messages.deliver_message(
-            str(target),
-            prompt,
-            verb="steer",
-            engine=delivery_engine,
-            on_busy="hold" if queue_on_fail else "reject",
-            ticket_ref=str(item.get("ref") or "") if bound else "",
-            ticket_session=str(sid) if bound else "",
-        )
-    except Exception as e:  # never lose the answer to a delivery-layer crash
-        sent = {"ok": False, "error": str(e)}
-    if sent.get("ok"):
+    # Verified (WT-31 D4, ``resume:<ref>:<sid>``): steer/outbox first; when
+    # the target is unresolvable (nothing queued) the headless resume fork,
+    # which registers the resume child under the worker id so the orphan sweep
+    # cannot reopen the ticket while the answer is applied. A delivery whose
+    # nonce never lands marks the resume evidence failed (WT-30 then acts).
+    from . import liveness
+    sent = liveness.deliver(
+        str(target), prompt, purpose="resume", dedupe_key=f"resume:{item.get('ref')}:{sid}",
+        ref=str(item.get("ref") or "") if bound else "",
+        queue=str(item.get("project") or ""), worker_id=str(item.get("claimed_by") or ""),
+        session_id=str(sid), engine=delivery_engine, transports=("message", "headless"),
+        message={"verb": "steer", "engine": delivery_engine,
+                 "on_busy": "hold" if queue_on_fail else "reject",
+                 "ticket_ref": str(item.get("ref") or "") if bound else "",
+                 "ticket_session": str(sid) if bound else ""},
+        headless={"repo": repo, "queue": item.get("project", ""),
+                  "worker_id": item.get("claimed_by", "")},
+        unverified_ok=True)
+    if sent.get("ok") and sent.get("transport") != "headless-resume":
         if bound:
             q.set_resume_state(item["ref"], str(sid), "running",
                                transport=str(sent.get("transport") or ""))
@@ -2607,30 +2621,19 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
         print(f"ANSWERED: {item['ref']} — delivered to session {sid} via "
               f"{sent.get('transport', '?')} to apply your answer and close.")
         return 0
-    if sent.get("queued"):
+    if sent.get("state") in ("queued", "in_flight"):
         if bound:
             q.set_resume_state(item["ref"], str(sid), "queued",
-                               outbox_id=str(sent.get("id") or ""))
+                               outbox_id=str(sent.get("msg_id") or ""))
         _log_resume(item, "queued")
         # Busy or momentarily unreachable: the durable outbox will deliver once
         # the session goes idle. The answer_grace in requeue_orphaned_tickets
         # keeps the sweep from reopening the ticket in the meantime.
         held = "session is mid-turn" if sent.get("busy") else "delivery deferred"
         print(f"ANSWERED: {item['ref']} — {held}; answer queued for delivery "
-              f"({sent.get('id', '?')}).")
+              f"({sent.get('msg_id') or '?'}).")
         return 0
-    # Unresolvable target (nothing queued): fall back to the headless resume
-    # fork, which registers the resume child under the worker id so the orphan
-    # sweep cannot reopen the ticket while the answer is applied.
-    started = _resume_session_headless(
-        sid,
-        repo,
-        prompt,
-        delivery_engine,
-        queue=item.get("project", ""),
-        worker_id=item.get("claimed_by", ""),
-    )
-    if started:
+    if sent.get("ok"):
         if bound:
             q.set_resume_state(item["ref"], str(sid), "headless")
         _log_resume(item, "headless")
@@ -4713,6 +4716,15 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
             receipts.sweep()
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] receipts sweep failed: {e}", flush=True)
+        # Verified delivery (WT-31 D4): settle ledger rows on those receipts
+        # (nonce landed -> confirmed; lost/missing/late -> lost) and run each
+        # purpose's handler (E9/E10/E13, resend, renotify, ...).
+        if not dry_run:
+            try:
+                from . import liveness
+                liveness.sweep_deliveries(verify=False)
+            except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+                print(f"[watchtower] delivery sweep failed: {e}", flush=True)
         # Resume-child reaper (WT-82): SIGTERM wt-spawned resume children that
         # outlived a completed turn. Ledger-scoped — never touches pids wt did
         # not spawn (CCC keeps its own resume children alive on purpose).

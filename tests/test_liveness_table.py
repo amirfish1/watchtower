@@ -144,23 +144,18 @@ def test_new_vocabulary_value_fails_the_table(monkeypatch, name):
 
 
 # ------------------------------------------------------------------ D2.6
-# Phase C (verified delivery) moves these two onto receipt-confirmed writes.
-_UNRECEIPTED = ("_deliver_bound", "_check_queued")
-
-
-def test_scan_violations_are_only_the_known_unreceipted_writers():
+def test_scan_has_no_violations():
+    """D2.6f: since phase C (verified delivery) every edge into delivered
+    comes from a RECEIPT_CONFIRMED_WRITER; the former unreceipted writers
+    (answers._deliver_bound, answers._check_queued) no longer write it."""
     scan = Scan(lv, q)
-    assert {fn for fn, _ in scan.violations} <= set(_UNRECEIPTED), scan.violations
-    assert all("delivered" in msg for _, msg in scan.violations), scan.violations
+    assert scan.violations == [], scan.violations
     # the scan sees every wrapper call site it should
     assert {"route_answer", "_fallback_reopen", "_retry", "route_pending_answers",
-            "_confirm_stage_answer"} <= set(scan.edges)
-
-
-@pytest.mark.parametrize("fn", _UNRECEIPTED)
-@pytest.mark.xfail(strict=True, reason="WT-31 phase C: delivered only on a receipt")
-def test_delivered_only_from_receipt_writers(fn):
-    assert [m for f, m in Scan(lv, q).violations if f == fn] == []
+            "_confirm_stage_answer", "_on_answer_confirmed"} <= set(scan.edges)
+    into_delivered = {fn for fn, edges in scan.edges.items()
+                      if any(new == "delivered" and old != "delivered" for old, new, _, _ in edges)}
+    assert into_delivered <= set(lv.RECEIPT_CONFIRMED_WRITERS), into_delivered
 
 
 def test_inlock_writer_edges_are_declared():

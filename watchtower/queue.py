@@ -3393,7 +3393,11 @@ def _dependents_of(ref: str) -> List[str]:
         return []
 
 
-def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any) -> None:
+def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any, attempt: int = 1) -> None:
+    """Ask the review stage's agent for a verdict, verified (WT-31 D4,
+    ``review:<ref>:<cycle>``): a request that never lands is renotified once,
+    then the ticket is blocked for a human. An unresolvable target (no
+    session/agent by that name) gets nothing, as before."""
     if reviewer == "verify":
         return  # the verifier is spawned by the CLI; nobody to notify yet
     target = _reviewer_target(item, reviewer)
@@ -3407,9 +3411,20 @@ def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any) -> None:
             f"Run `wt accept {ref}` or `wt reject {ref} --reason \"...\"`."
             + (f" Accepting unblocks: {', '.join(deps)}." if deps else ""))
     try:
-        from . import messages
-        if target not in _actor_identities(actor):
-            messages.send(messages.ccc_forward_target(target) or target, text, notify=True)
+        from . import liveness, messages
+        if target in _actor_identities(actor):
+            return
+        dest = messages.ccc_forward_target(target) or target
+        try:
+            messages.resolve_target(dest)
+        except ValueError:
+            return  # nobody by that name: nothing can deliver it
+        liveness.deliver(dest, text, purpose="review",
+                         dedupe_key=f"review:{ref}:{len(item.get('gate_results') or [])}",
+                         ref=ref, queue=str(item.get("project") or ""),
+                         transports=("message",), message={"fn": "send", "notify": True},
+                         meta={"gate": str(item.get("gate_pending") or reviewer)},
+                         attempt=attempt)
     except Exception:
         pass
 

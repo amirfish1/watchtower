@@ -1777,6 +1777,15 @@ def test_claim_drain_off_stop_log_names_manual_run(wt, capsys):
 
 
 # ====================================================================== FIFO push
+def _unnonced(text):
+    """A nudge is a verified delivery (WT-31 D4): its last line is the
+    ``⟨wt:<delivery_id>⟩`` nonce. Return the text without it."""
+    from watchtower import receipts
+    nonce = receipts.nonce_of(text)
+    assert nonce, f"no delivery nonce on the last line of {text!r}"
+    return text.rstrip()[: -len(nonce)].rstrip("\n")
+
+
 def test_notify_live_worker_delivers(wt):
     rec = _live_worker(wt, "Q")
     n = wt.workers.notify_workers("Q", "hello worker")
@@ -1786,7 +1795,7 @@ def test_notify_live_worker_delivers(wt):
     data = os.read(fd, 65536).decode()
     msg = json.loads(data.strip())
     assert msg["type"] == "user"
-    assert msg["message"]["content"][0]["text"] == "hello worker"
+    assert _unnonced(msg["message"]["content"][0]["text"]) == "hello worker"
 
 
 def test_notify_prefers_uds_over_raw_fifo(wt, monkeypatch):
@@ -1811,7 +1820,7 @@ def test_notify_prefers_uds_over_raw_fifo(wt, monkeypatch):
     assert wt.workers.notify_workers("Q", "nudge") == 1
 
     assert [c[0] for c in calls] == [rec["session_id"]]
-    assert calls[0][1] == "nudge"
+    assert _unnonced(calls[0][1]) == "nudge"
     assert calls[0][2]["from_name"] == "watchtower-reconciler"
     assert written == [], "FIFO must not be used when UDS delivered"
 
@@ -1849,7 +1858,7 @@ def test_notify_falls_back_to_fifo_when_uds_declines(wt, monkeypatch):
         lambda fifo, text, engine="claude": written.append(text) or True,
     )
     assert wt.workers.notify_workers("Q", "nudge") == 1
-    assert written == ["nudge"]
+    assert [_unnonced(t) for t in written] == ["nudge"]
 
 
 def test_notify_fifoless_worker_falls_back_to_adapter_chain(wt, monkeypatch):
@@ -1872,7 +1881,7 @@ def test_notify_fifoless_worker_falls_back_to_adapter_chain(wt, monkeypatch):
     assert len(calls) == 1
     target, text, kw = calls[0]
     assert target == rec["session_id"]
-    assert text == "wake up"
+    assert _unnonced(text) == "wake up"
     # A nudge is only useful before the turn it nudges about ends, and a
     # stale one is noise -- the next reconcile tick makes a fresh one.
     assert kw["verb"] == "steer"
@@ -4758,7 +4767,7 @@ def test_notify_workers_exclude_skips_by_worker_id_and_session_id(wt):
 
     assert delivered == 1
     msg = json.loads(os.read(wt._readers[-1], 65536).decode().strip())
-    assert msg["message"]["content"][0]["text"] == "nudge"
+    assert _unnonced(msg["message"]["content"][0]["text"]) == "nudge"
     assert other["worker_id"] not in {by_worker["worker_id"],
                                       by_session["worker_id"]}
 
