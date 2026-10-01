@@ -617,6 +617,12 @@ def cmd_unresolved(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_ticket_usage(item: dict) -> None:
+    if item.get("token_usage"):
+        from . import usage
+        print("  " + usage.render(item).replace("\n", "\n  "))
+
+
 def cmd_find(args: argparse.Namespace) -> int:
     """Look up one ticket by ref or number, searching every queue -- the CLI
     surface for queue.get(), which already matches globally. No -q needed,
@@ -685,6 +691,7 @@ def cmd_find(args: argparse.Namespace) -> int:
         print(f"  assessment: {asmt.get('status')} (attempt {asmt.get('attempt', 0)})"
               + (f" -- {asmt['reason']}" if asmt.get("reason") else "")
               + (f" -- follow-ups: {', '.join(asmt['followups'])}" if asmt.get("followups") else ""))
+    _print_ticket_usage(item)
     timeline = item_with_timeline.get("timeline") or []
     if timeline:
         print("  activity:")
@@ -2220,6 +2227,7 @@ def cmd_close(args: argparse.Namespace) -> int:
             stages.request(item["ref"], "verify")
         return 0
     print(f"CLOSED: {item['ref']}" + (f" — {summary}" if summary else ""))
+    _print_ticket_usage(item)
 
     _rename_claiming_session(item, summary)
     _maybe_assess(item)

@@ -11,7 +11,8 @@ The same collector handles local and GitHub-backed worker claims and closes.
 Stage recording follows WatchTower's existing stage supervisor; it does not add
 new planning or verification support to backend workflows that lack those stages.
 
-View a readable report with:
+Plain `wt close` and `wt find` print per-role usage when telemetry is present.
+View a standalone readable report with:
 
 ```sh
 python3 -m watchtower.usage QUEUE-123

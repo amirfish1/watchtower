@@ -149,3 +149,19 @@ def test_find_human_output_appends_you_markers(wt, capsys, monkeypatch):
     tag = wt.q.machine_tag()
     expected = f"{tag}-ccc-worker-a" if tag else "ccc-worker-a"
     assert f"closed_by: {expected} (you)" in text
+
+
+def test_plain_find_reports_actual_tokens_and_unknowns(wt, capsys, monkeypatch):
+    item = wt.q.enqueue(project="TOK", title="x", note="x", text="")
+    item["token_usage"] = {"completeness": "partial", "measured_totals": {
+        "input": 0, "cache_read": None, "output": 12}, "attempts": [{
+        "role": "verifier", "run": "verify:1", "attempt": 2,
+        "outcome": "failed", "completeness": "snapshot_at_transition",
+        "models": [{"model": "observed-model", "counters": {
+            "input": 0, "cache_read": None, "output": 12}}]}]}
+    monkeypatch.setattr(wt.q, "get", lambda ref: item)
+    assert wt.cli.cmd_find(argparse.Namespace(ref=item["ref"], json=False)) == 0
+    out = capsys.readouterr().out
+    assert "verifier run=verify:1 attempt=2" in out
+    assert "actual model=observed-model  0 / ? / 12" in out
+    assert "status: partial" in out
