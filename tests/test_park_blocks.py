@@ -355,8 +355,9 @@ def test_one_window_governs_retention_expiry_and_reap(wt, monkeypatch):
     import time
     import watchtower.workers as workers
     _parked(wt)
-    monkeypatch.setenv("WATCHTOWER_PARK_GRACE_S", "1")
-    assert workers.park_retention_s() == workers.park_grace_s() == 1.0
+    # 10 s, not 1: parked.at is second-granular, so a 1 s window raced it.
+    monkeypatch.setenv("WATCHTOWER_PARK_GRACE_S", "10")
+    assert workers.park_retention_s() == workers.park_grace_s() == 10.0
     assert workers.retained_parked_ids("PK") == {"w1"}
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 60)

@@ -304,6 +304,9 @@ def plan_cli(vcfg, monkeypatch, instant_daemon):
         return {"worker_id": f"sp{len(calls)}"}
 
     monkeypatch.setattr(cli.workers, "spawn_adhoc", fake_spawn)
+    # Never fork a real `claude --resume` (it raced the 2 s verify window and
+    # logged to the real ~/.watchtower/logs): the resume "starts".
+    monkeypatch.setattr(cli, "_resume_session_headless", lambda *a, **k: True)
     vcfg.cli, vcfg.calls = cli, calls
     return vcfg
 
