@@ -3795,6 +3795,21 @@ ASSESSMENT_QUESTIONS = {
 _ASSESS_TYPE = {"logging": "bug", "ui_message": "bug", "automation": "feature",
                 "monitoring": "feature", "auditors": "feature", "other": "feature"}
 ASSESSMENT_SOURCE = "post-fix-assessment"
+# Follow-ups are filed unclaimable until a human approves them.
+ASSESSMENT_FOLLOWUP_READINESS = "needs-rationale"
+
+
+def assessment_approve(ident: Any, by: str = "human") -> Optional[Dict[str, Any]]:
+    """Approve one post-fix-assessment follow-up: make it claimable (readiness
+    ready). Raises ValueError for a ticket the assessment did not file."""
+    it = get(ident)
+    if not it:
+        return None
+    if it.get("source") != ASSESSMENT_SOURCE and not it.get("assessment_origin"):
+        raise ValueError(f"{it.get('ref')} is not a post-fix-assessment follow-up")
+    if it.get("readiness", "") == "ready":
+        return it
+    return update(ident, readiness="ready")
 _ASSESS_MAX_PER_POINT = 3
 _ASSESS_MAX_TOTAL = 8
 # Test hook: called as hook(stage, idx) at "before_lock" / "after_commit".
@@ -4162,7 +4177,11 @@ def _assessment_apply_op(ident: Any, token: str, idx: int) -> Dict[str, Any]:
                         source=ASSESSMENT_SOURCE, proj=op["queue"], annotation_id="", url="",
                         title=op["title"], selector="", screenshot_path="",
                         repo_path=str(bug.get("repo_path") or "") if op["queue"] == _norm_project(bug.get("project")) else "",
-                        lane="normal", item_type=_ASSESS_TYPE[op["point"]], readiness="",
+                        lane="normal", item_type=_ASSESS_TYPE[op["point"]],
+                        # Icebox until a human approves (`wt assess approve REF`):
+                        # workers skip UNCLAIMABLE_READINESS, so follow-ups cannot
+                        # fan out and keep a drain-until-empty worker alive.
+                        readiness=ASSESSMENT_FOLLOWUP_READINESS,
                         priority="", value="", confidence="", model_floor="", planner_model="",
                         verifier_model="", submitter="", submitter_explicit=False, pre_ack=False,
                         blocked_by=[ref], gates=None, accept_line="", assessment_origin=op["key"])

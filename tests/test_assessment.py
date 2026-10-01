@@ -179,6 +179,16 @@ def test_submission_files_followups_and_summary(wt):
     kids = [i for i in q.list_items() if i.get("source") == "post-fix-assessment"]
     assert len(kids) == 2 and all(k["blocked_by"] == [ref] for k in kids)
     assert {k["type"] for k in kids} == {"bug", "feature"}
+    # Filed unclaimable: workers cannot claim until a human approves.
+    assert all(k["readiness"] == "needs-rationale" for k in kids)
+    assert all(k["status"] == "open" for k in kids)
+    assert q.peek_next(project="AS") is None
+    assert q.assessment_approve(kids[0]["ref"])["readiness"] == "ready"
+    assert q.get(kids[0]["ref"])["readiness"] == "ready"
+    plain = q.enqueue(project="AS", title="plain", note="n")
+    import pytest
+    with pytest.raises(ValueError):
+        q.assessment_approve(plain["ref"])
     bug = q.get(ref)
     summaries = [h for h in bug["history"] if h["event"] == "comment"]
     assert len(summaries) == 1 and "logging [gap]" in summaries[0]["text"]

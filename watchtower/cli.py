@@ -1755,6 +1755,21 @@ def cmd_assess(args: argparse.Namespace) -> int:
     action = args.assess_cmd
     if action == "new":
         return _assess_new(args)
+    if action == "approve":
+        rc = 0
+        for r in args.refs:
+            try:
+                it = q.assessment_approve(r)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                rc = 1
+                continue
+            if not it:
+                print(f"not found: {r}", file=sys.stderr)
+                rc = 1
+                continue
+            print(f"APPROVED: {it['ref']} is now claimable")
+        return rc
     item = q.get(args.ref)
     if not item:
         print(f"not found: {args.ref}", file=sys.stderr)
@@ -6189,6 +6204,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="print the resolved repo, assessor and prompt; spawn nothing")
     p4 = ass.add_parser("resume", help="finish filing a half-filed assessment (no LLM)")
     p4.add_argument("ref")
+    p6 = ass.add_parser("approve", help="approve assessment follow-up(s) so workers can claim them")
+    p6.add_argument("refs", nargs="+", metavar="REF")
     p5 = ass.add_parser("new", help="file + close a bug fixed without a ticket, then assess it")
     p5.add_argument("-q", "--queue", required=True)
     p5.add_argument("--title", required=True)
