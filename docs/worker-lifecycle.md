@@ -681,3 +681,107 @@ count), `stage_stuck` (no stage event for max(stuck minutes, stage idle limit +
 `state = "stuck"` even at depth 0, but the `stuck` bool keeps its old meaning
 (claimable work with no progress), since workers use it for nudges and spawns.
 There is no CCC alarm banner.
+
+## Verified delivery (WT-31 phase C)
+
+A send is not a delivery. `liveness.deliver(target, text, purpose=,
+dedupe_key=, ...)` is the one way a verified sender reaches a session. It tries
+UDS, then the FIFO, then `messages.deliver_message` / `send`, then a headless
+resume, in the order the caller lists. Every send:
+
+1. gets a delivery id and a nonce `⟨wt:<delivery_id>⟩` alone on the last line
+   of the text (a slash command gets none: it would become the command's
+   argument, so it is sent `unverified`);
+2. writes a `sending` row to the ledger, `~/.watchtower/deliveries.json`
+   (next to the outbox; `$WATCHTOWER_DELIVERIES_FILE` or
+   `liveness.DELIVERIES_FILE` override it);
+3. records a receipt (`receipts.record(nonce=)`) **before** the send, with the
+   transcript size as its offset. `messages.deliver` does the same for nonce'd
+   text it sends, and drops the receipt if every adapter fails.
+
+A receipt is `landed` only when its nonce appears in the transcript at or
+after the offset (raw or JSON-escaped). Earlier bytes, the same text sent
+before, and a nonce pasted mid-message never count. `advanced` (the transcript
+grew) stays pending. After `WATCHTOWER_RECEIPT_WAIT_S` (600 s) the receipt is
+`lost`. A transcript smaller than the offset (compacted or rewritten) resets
+the offset to 0.
+
+`deliver()` returns `state`:
+
+| State | Meaning |
+|---|---|
+| `pending` | sent; the row waits for the receipt |
+| `unverified` | sent; there is no receipt source (no session id, kimi/devin, slash command), and the sweep reads it lost |
+| `queued` | the outbox holds it (`msg_id`) |
+| `deferred` | `fifo_busy="defer"` and the turn is open; there is no row |
+| `in_flight` / `duplicate` | the messages ledger already holds the key; there is no row |
+| `failed` | no transport took it |
+
+A headless resume is refused for an engine with no receipt source unless the
+caller passes `unverified_ok`. Only the legacy `_deliver_to_blocked_session` does,
+to keep kimi resume working.
+
+**Ledger.** There is one live row per `dedupe_key`: a new send supersedes the
+older `sending`/`pending` rows. Every retry has a new nonce, so an old send's
+nonce never confirms the new one. Rows are pruned after 24 h, and at most 2000
+are kept.
+
+**Sweep.** `liveness.sweep_deliveries()` runs on every daemon tick, after
+`receipts.sweep()`, and settles each pending row under the ledger lock:
+
+- **`confirmed`**: the nonce landed.
+- **`lost`**: any one of these:
+  - the receipt was lost or is missing;
+  - the row was pending for more than 2 x the window;
+  - the row was unverified;
+  - a queued row was still waiting after `expire + 2 x window`;
+  - a `sending` row is older than 2 x the window.
+
+It then runs the purpose's handler and logs
+`DELIVERY <ref|worker> <purpose> <key> <id> <state> (<reason>) -> <result>`.
+
+| Purpose | Key | Confirmed | Lost |
+|---|---|---|---|
+| `answer` | `answer:<ref>:<sid>:<gen>` | E9 `_on_answer_confirmed` (`delivering`/`queued` -> `delivered`) | E10 `_fallback_reopen` (hand off) |
+| `stage_answer` | `stage_answer:<ref>:<gen>:<key>` | E13 `stages._confirm_stage_answer` | stays `handed_off` |
+| `nudge` | `nudge:<worker_id>` | clears `undeliverable_since` | resend once, then set `undeliverable_since` on the worker record |
+| `release` | `release:<worker_id>` | - | resend once, then `RELEASE_UNDELIVERED` |
+| `plan` | `plan:<ref>:<role>:<kind>` | - | `stages.request` (respawn); a reminder also records an undelivered nudge |
+| `review` | `review:<ref>:<n>` | - | renotify once, then `wt blocked` (system block) |
+| `resume` | `resume:<ref>:<sid>` | - | `set_resume_state(failed)` |
+
+E9, E10 and E13 are compare-and-swap moves on `gen` and the state. A confirm that
+arrives after E14 or E17 (release, reopen, re-block) is therefore a no-op.
+`delivered` is written only by `RECEIPT_CONFIRMED_WRITERS`. The answer router
+treats a ledger row that is still pending as in flight, so it does not resend,
+and the E10 floors wait for it.
+
+A stage prompt that carries a handed-off answer ends with the nonce. The
+session did not exist before the spawn, so its receipt offset is 0
+(`register_spawn_delivery`). A codex stage has no session id at spawn, so its row
+is unverified and the answer stays `handed_off` until the next claim (E12).
+
+**Sender lists (D2.8).** Every function that calls a raw transport
+(`deliver_via_uds`, `write_to_worker_fifo`, `_write_fifo_frame`, `send_lines`,
+`messages.send`, `deliver_message`, `_resume_session_headless`), or calls
+`_deliver_to_blocked_session` or `liveness.deliver`, is in exactly one list:
+
+- **`liveness.VERIFIED_SENDERS`**: reaches a session only through `deliver`.
+- **`ADVISORY_SENDERS`**: best effort. The result of the send never feeds a
+  ticket-state write, either as an argument or as the test of an `if`.
+- **`TRANSPORT_LAYER`**: the plumbing itself.
+
+`tests/test_liveness_delivery.py` checks this with an AST scan, and also fails
+on stale list entries.
+
+### Adding a verified sender
+
+1. Call `liveness.deliver(...)` with one of the `DELIVERY_PURPOSES`, a stable
+   `dedupe_key`, and `ref` / `worker_id` / `meta` for the handler. Do not call a
+   raw transport.
+2. Treat `ok` as "sent", not as "delivered". Any state change that depends on
+   the session reading the message belongs in the purpose's handler
+   (`liveness.HANDLERS`).
+3. Add `module.function` to `VERIFIED_SENDERS`. A new purpose needs a handler,
+   and if it moves an answer, a declared edge with `sweep_deliveries` as its
+   caller.
