@@ -96,3 +96,23 @@ def test_profiles_reject_engines_without_required_output_and_tool_contract(wt_en
     ]}})
     with pytest.raises(ValueError, match="tool-free structured"):
         wt_env.config.model_profile("deep")
+
+
+def test_inherited_effort_omitted_for_model_without_reasoning_controls(wt_env, monkeypatch):
+    c = wt_env.config
+    c.set_engine("Q", "antigravity")
+    c.set_model("Q", "gemini-test-high")
+    save_policy(wt_env, worker_reasoning_effort="medium")
+    monkeypatch.setattr(c._models, "catalog", lambda eng: {"gemini-test-high": []})
+    assert c.effort("Q") == ""
+    assert c.model("Q") == "gemini-test-high"
+    assert "effort" not in c._queue_entry("Q")
+    c.set_effort("Q", "high")
+    assert c.effort("Q") == "high"  # explicit pins are preserved
+
+
+def test_missing_catalog_preserves_inherited_effort(wt_env, monkeypatch):
+    c = wt_env.config
+    save_policy(wt_env, worker_reasoning_effort="medium")
+    monkeypatch.setattr(c._models, "catalog", lambda eng: None)
+    assert c.effort("Q") == "medium"

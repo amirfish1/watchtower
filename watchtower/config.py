@@ -1082,7 +1082,12 @@ def effort(queue: str) -> str:
     value = str(_queue_entry(queue).get("effort") or "").strip().lower()
     if value in VALID_EFFORTS:
         return value
-    return _ccc_worker_effort_default()
+    inherited = _ccc_worker_effort_default()
+    # A shared default cannot add reasoning controls to models that have none.
+    # Keep explicit queue pins above intact; only omit an unsupported default.
+    if inherited and _effort_rejected(engine(queue), model(queue), inherited):
+        return ""
+    return inherited
 
 
 def canonical_model(eng: str, model_value: str) -> str:
