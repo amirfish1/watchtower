@@ -4495,7 +4495,15 @@ def retained_parked_refs(queue: Optional[str], worker_id: str) -> List[str]:
 def retained_parked_ids(queue: Optional[str] = None,
                         items: Optional[List[Dict[str, Any]]] = None) -> set:
     """Worker ids kept alive (never STOPped, not counted against the spawn
-    budget) because they own a parked ticket within the retention window."""
+    budget) because they own a parked ticket within the retention window.
+
+    DESIGN (INTAKE-CONSOL-8, decided by Amir): excluding these from the spawn
+    budget is intentional elasticity, not a leak. Under ``desired_workers=1`` a
+    queue may run one parked worker plus one live worker, so a long-parked
+    awaiting-client topic never leaves the queue unstaffed for new tickets and
+    the parked worker's warm session survives for ``wt answer`` / resume. There
+    is deliberately no ceiling or ``max_total_workers`` knob; the total worker
+    count is bounded only by ``PARK_RETENTION_S`` expiry."""
     if items is None:
         try:
             from . import queue as _q
