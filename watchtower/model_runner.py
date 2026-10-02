@@ -130,11 +130,42 @@ def _attempt(candidate, request, directory, timeout, limit):
                 '--system-prompt', request['system'],
                 '--json-schema', json.dumps(request['json_schema'])]
         prompt = request['prompt']
+    elif engine == 'devin':
+        # Devin print mode returns plain text, so the schema is carried in the
+        # prompt and the reply is parsed as JSON. A deny-all config keeps the
+        # tools:none contract: the run must answer from the prompt alone.
+        deny_config = os.path.join(directory, 'devin-deny-all.json')
+        with open(deny_config, 'w') as fh:
+            json.dump({'permissions': {'deny': [
+                'read', 'edit', 'write', 'grep', 'glob', 'exec',
+                'webfetch', 'websearch', 'mcp__*']}}, fh)
+        schema_hint = json.dumps(request['json_schema'])
+        combined = (request['system'] + '\n\n' + request['prompt'] +
+                    '\n\nRespond with a single JSON object matching this JSON '
+                    'Schema. Output only the JSON, no prose, no code fences:\n' +
+                    schema_hint)
+        argv = [workers._resolve_engine_bin('devin') or 'devin', '-p',
+                '--config', deny_config, '--model', model,
+                '--respect-workspace-trust', 'false', '--', combined]
+        prompt = ''
     elif engine == 'codex':
         raise ModelRunError('Codex tools:none execution is unavailable in the installed runtime; profile cannot safely fall back')
     else:
         raise ModelRunError('profile engine does not support tool-free structured execution')
     rc, out, err = _capture(argv, prompt, directory, timeout, limit, env)
+    if engine == 'devin':
+        if rc != 0:
+            return None, workers._quota_exhausted(out + '\n' + err)
+        # The CLI prepends a login banner (with ANSI styling) to the reply;
+        # the answer is the JSON object span within it.
+        text = re.sub(r'\x1b\[[0-9;]*m', '', out)
+        start, end = text.find('{'), text.rfind('}')
+        try:
+            structured = json.loads(text[start:end + 1] if 0 <= start < end else text.strip())
+        except ValueError:
+            return None, False
+        return {'subtype': 'success', 'is_error': False, 'result': text.strip(),
+                'structured_output': structured, 'modelUsage': {}}, False
     if engine == 'claude':
         try:
             result = json.loads(out)
@@ -181,7 +212,7 @@ def run(request):
     if not (config.worker_fallback_policy() or {}).get('enabled'):
         candidates = candidates[:1]
     for candidate in candidates:
-        if candidate['engine'] != 'claude':
+        if candidate['engine'] not in ('claude', 'devin'):
             raise ModelRunError('profile_capability_unavailable: ' + candidate['engine'] + ' has no enforceable tools:none structured runner')
     trace = []
     deadline = time.monotonic() + timeout

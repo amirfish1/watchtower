@@ -795,7 +795,7 @@ def default_model(eng: str) -> str:
 
 
 MODEL_PROFILES = ("fast", "standard", "deep")
-FALLBACK_ENGINES = ("claude", "codex", "kimi", "grok")
+FALLBACK_ENGINES = ("claude", "codex", "kimi", "grok", "devin")
 
 
 def _ccc_model_settings() -> Dict[str, Any]:
@@ -814,7 +814,7 @@ def _configured_model_routes(raw: Any) -> List[Dict[str, str]]:
     accidentally reverting to ambient CLI defaults.
     """
     if not isinstance(raw, list) or len(raw) > len(FALLBACK_ENGINES):
-        raise ValueError("model routes must be a list of at most four engines")
+        raise ValueError(f"model routes must be a list of at most {len(FALLBACK_ENGINES)} engines")
     seen = set()
     routes = []
     for entry in raw:
@@ -862,7 +862,7 @@ def model_profile(name: str) -> Dict[str, Any]:
     routes = _configured_model_routes(profile.get("models"))
     if not routes:
         raise ValueError(f"model profile {name!r} has no configured models")
-    if any(route["engine"] not in ("claude", "codex") for route in routes):
+    if any(route["engine"] not in ("claude", "codex", "devin") for route in routes):
         raise ValueError("model profiles require engines supporting tool-free structured output")
     return {"models": routes}
 
