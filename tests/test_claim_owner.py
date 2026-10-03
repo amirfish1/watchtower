@@ -192,6 +192,9 @@ def test_non_claude_engines_need_ps_and_transcript(wt, procs, monkeypatch, engin
     assert "transcript not found" in _owner(wt, ref).evidence
     monkeypatch.setattr(lv, "_transcript_mtime", lambda e, s: time.time() + 60)
     assert "written after" in _owner(wt, ref).evidence
+    monkeypatch.setattr(lv, "_transcript_mtime", lambda e, s: time.time() - 10)
+    v = _owner(wt, ref)
+    assert v.verdict == "unproven" and "transcript written" in v.evidence  # OPS-1331
     monkeypatch.setattr(lv, "_transcript_mtime", lambda e, s: time.time() - 600)
     assert _owner(wt, ref).verdict == "dead"
 

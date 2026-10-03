@@ -686,6 +686,9 @@ def _transcript_mtime(engine: str, sid: str) -> float:
     return 0.0
 
 
+RECENT_TRANSCRIPT_S = 120.0
+
+
 def _engine_checks(cp: Dict[str, Any], sid: str, died_at: float,
                    ctx: ResolverContext) -> str:
     """'' when the engine's death checks pass, else why death is unproven."""
@@ -705,6 +708,12 @@ def _engine_checks(cp: Dict[str, Any], sid: str, died_at: float,
         return f"{engine} transcript not found"
     if mt > died_at:
         return f"{engine} transcript written after the process died"
+    # A goal continuation can outlive the pid the claim was bound to, and a
+    # claim with no recorded death time falls back to died_at == now, which
+    # makes the check above vacuous (OPS-1331): a transcript touched within
+    # the last RECENT_TRANSCRIPT_S is a session still working.
+    if ctx.now - mt < RECENT_TRANSCRIPT_S:
+        return f"{engine} transcript written {int(ctx.now - mt)}s ago"
     return ""
 
 
