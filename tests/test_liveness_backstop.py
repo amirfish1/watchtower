@@ -595,5 +595,9 @@ def test_requeue_leaves_ambient_rebound_claim_of_a_known_worker(lv, monkeypatch)
     lv.kill()
     base = time.time()
     monkeypatch.setattr(time, "time", lambda: base + 600)
+    monkeypatch.setattr(lv.liveness, "_file_activity", lambda it, ctx: base + 590)
     assert lv.workers.requeue_orphaned_tickets() == []
     assert lv.q.get(ref)["status"] == "in_progress"
+    # the session went quiet: the sweep reopens it again
+    monkeypatch.setattr(lv.liveness, "_file_activity", lambda it, ctx: base - 3600)
+    assert [i["ref"] for i in lv.workers.requeue_orphaned_tickets()] == [ref]

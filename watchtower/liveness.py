@@ -687,6 +687,7 @@ def _transcript_mtime(engine: str, sid: str) -> float:
 
 
 RECENT_TRANSCRIPT_S = 120.0
+RECENT_SESSION_S = 600.0  # ambient claim: session files written this recently = working
 
 
 def _engine_checks(cp: Dict[str, Any], sid: str, died_at: float,
