@@ -2429,8 +2429,10 @@ def cmd_release(args: argparse.Namespace) -> int:
     grabbing it mid-investigation, and turns out better left for the normal
     pool to pick up."""
     worker = args.worker or _default_worker_id()
+    reserve_for = str(getattr(args, "reserve_for", "") or "")
     try:
-        item = q.release(args.ref, session_id=worker, force=args.force)
+        item = q.release(args.ref, session_id=worker, force=args.force,
+                         reserve_for=reserve_for, ttl=args.ttl)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -2445,7 +2447,10 @@ def cmd_release(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         return 1
-    print(f"RELEASED: {item['ref']} -> open")
+    if reserve_for:
+        print(f"RELEASED: {item['ref']} -> open (reserved for {reserve_for}, {args.ttl:.0f}s)")
+    else:
+        print(f"RELEASED: {item['ref']} -> open")
     return 0
 
 
@@ -6476,6 +6481,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="release even if the ticket is blocked (needs_input) -- "
                         "normally refused because it erases the open question; "
                         "prefer `wt answer` to resolve a block")
+    s.add_argument("--reserve-for", default="", metavar="WORKER",
+                   help="release to open but reserve the ticket for this worker/session "
+                        "(WT-28 affinity gate) until --ttl elapses, then it opens up to anyone")
+    s.add_argument("--ttl", type=float, default=300,
+                   help="seconds the --reserve-for reservation holds (default 300)")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_release)
 

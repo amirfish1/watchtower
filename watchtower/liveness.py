@@ -574,7 +574,7 @@ PA_WRAPPERS: Dict[str, Dict[str, Any]] = {
 }
 # In-lock writers that change pending_answer directly, and the edges each may make.
 PA_INLOCK_WRITERS: Dict[str, Tuple[str, ...]] = {
-    "_write_pending_answer_unlocked": ("E1",),
+    "_write_pending_answer_unlocked": ("E1", "E18"),
     "resume_claim": ("E3",),
     "_bind_pending_unlocked": ("E12",),
     "_reopen_pending_unlocked": ("E14", "E15"),

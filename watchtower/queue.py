@@ -5833,7 +5833,9 @@ def assessment_targets_for_sweep(now_ts: Optional[float] = None) -> Dict[str, Li
     return res
 
 
-def release(ident: Any, session_id: str = "", force: bool = False) -> Optional[Dict[str, Any]]:
+def release(ident: Any, session_id: str = "", force: bool = False, *,
+            reserve_for: str = "", reserve_session: str = "",
+            ttl: float = 300) -> Optional[Dict[str, Any]]:
     """Give up a claim without closing it, e.g. a ticket claimed defensively
     (to stop other workers grabbing it mid-investigation) that turns out
     better left for the normal worker pool to pick up and fix.
@@ -5854,7 +5856,18 @@ def release(ident: Any, session_id: str = "", force: bool = False) -> Optional[D
     ``require_status="in_progress"`` is a compare-and-swap guard so a stale
     ref that's already closed or reopened by someone else is left alone
     rather than clobbered (WT-86, same pattern as the OPS-72 orphan-reopen
-    guard)."""
+    guard).
+
+    ``reserve_for`` (OPS-1332): release to ``open`` while reserving the
+    ticket for ``reserve_for``/``reserve_session`` for ``ttl`` seconds,
+    reusing the WT-28 affinity gate (``_affinity_gate_unlocked``) so only
+    that worker/session may claim it until expiry -- then the reconciler's
+    existing generic affinity-expiry sweep (``route_pending_answers``) hands
+    it back to the open pool for anyone (E11). The release and the
+    reservation are written in the same store lock (``_release_with_reservation``)
+    so no other claimer can land in the gap between them."""
+    if reserve_for and _github_backend_for_project(_project_from_ident(ident)) is not None:
+        raise ValueError("--reserve-for is not supported for GitHub-backed queues")
     current = get(ident)
     if current is not None and current.get("status") == PARKED_STATUS:
         if not force:
@@ -5875,8 +5888,33 @@ def release(ident: Any, session_id: str = "", force: bool = False) -> Optional[D
                 f"{current.get('ref', ident)} \"...\"` to resolve it, or pass "
                 f"force=True (--force on the CLI) if the block is stale."
             )
+    if reserve_for:
+        return _release_with_reservation(ident, reserve_for, reserve_session, ttl)
     return update_status(ident, "open", session_id, require_status="in_progress",
                           reason="released")
+
+
+def _release_with_reservation(ident: Any, reserve_for: str, reserve_session: str,
+                              ttl: float) -> Optional[Dict[str, Any]]:
+    """One locked step (E18): drop the claim to ``open``
+    (``_release_claim_to_open_unlocked``), then write a fresh ``affinity``
+    reservation (``_write_pending_answer_unlocked``) so the two never race."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            if it.get("status") != "in_progress":
+                return None
+            now = _now_iso()
+            _release_claim_to_open_unlocked(it, now, "released (reserved for a worker)")
+            until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + max(float(ttl), 0.0)))
+            _write_pending_answer_unlocked(it, "", now, reserve_for=reserve_for,
+                                           reserve_session=reserve_session, affinity_until=until)
+            it["updated_at"] = now
+            _save_unlocked(data)
+            return it
+    return None
 
 
 def reopen(ident: Any, reason: str = "", session_id: str = "",
@@ -6771,6 +6809,11 @@ ANSWER_TRANSITIONS: Tuple[Dict[str, Any], ...] = (
                 ("awaiting_answer", "awaiting_answer")),
      "writers": ("_supersede_pending_unlocked",),
      "callers": ("block", "update", "recover_claim", "sweep")},
+    # wt release --reserve-for (OPS-1332): no parked session, so the record is
+    # built straight into affinity rather than routed there via E1 -> E4.
+    {"id": "E18", "from": ("none",), "to": "affinity",
+     "status": (("in_progress", "open"),),
+     "writers": ("_write_pending_answer_unlocked",), "callers": ("release",)},
 )
 
 
@@ -6947,11 +6990,28 @@ def _park_unlocked(it: Dict[str, Any], worker_id: str, session_id: str, machine:
                     reason=reason)
 
 
-def _write_pending_answer_unlocked(it: Dict[str, Any], text: str, now: str) -> Dict[str, Any]:
-    """Answer on a parked ticket: persist ``pending_answer`` (state routing)."""
-    parked = it.get("parked") or {}
+def _write_pending_answer_unlocked(it: Dict[str, Any], text: str, now: str, *,
+                                   reserve_for: str = "", reserve_session: str = "",
+                                   affinity_until: str = "") -> Dict[str, Any]:
+    """Answer on a parked ticket: persist ``pending_answer`` (state routing).
+
+    ``reserve_for`` (OPS-1332/E18): instead write a fresh reservation
+    straight into state ``affinity`` -- a released ``in_progress`` ticket
+    has no parked session to answer, so this is a separate record shape
+    (no question/answer text) built by the same sole function the D2.6 scan
+    allows to construct a ``pending_answer`` dict literal."""
     gen = int(it.get("last_answer_gen") or 0) + 1
     it["last_answer_gen"] = gen
+    if reserve_for:
+        it["pending_answer"] = {
+            "gen": gen, "state": "affinity", "question": "", "answer": "",
+            "prior_worker_id": reserve_for, "prior_session_id": reserve_session,
+            "prior_engine": "", "transcript_path": "", "repo_path": it.get("repo_path") or "",
+            "route": "release_reserve", "reason": "released with a reservation",
+            "attempts": 0, "state_at": now, "affinity_until": affinity_until,
+        }
+        return it["pending_answer"]
+    parked = it.get("parked") or {}
     it["pending_answer"] = {
         "gen": gen, "state": "routing", "question": it.get("block_question", ""),
         "answer": _clip(text, 24000), "prior_worker_id": parked.get("worker_id", ""),

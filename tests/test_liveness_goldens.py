@@ -89,6 +89,26 @@ def test_affinity_expires(wt, monkeypatch):
     g.step(wt.answers.route_pending_answers, edge="E11", row="work.open")
 
 
+def test_release_reserve_for_blocks_other_claimants(wt):
+    """OPS-1332: a release with --reserve-for writes the ticket straight to
+    ``affinity`` (E18, no parked session to route through), so another
+    worker's claim is refused while the reserved one still gets it."""
+    g = Golden(wt, _claimed(wt))
+    g.step(wt.q.release, g.ref, reserve_for="w2", ttl=300, edge="E18",
+           row="answer.affinity", desired=[])
+    assert wt.q.claim_next("w3", project=PQ) is None
+    got = g.step(wt.q.claim_next, "w2", project=PQ, edge="E12", row="work.claimed")
+    assert got["ref"] == g.ref and got["claimed_by"] == "w2"
+
+
+def test_release_reservation_expires_back_to_open(wt):
+    g = Golden(wt, _claimed(wt))
+    g.step(wt.q.release, g.ref, reserve_for="w2", ttl=-1, edge="E18",
+           row="answer.affinity_expired", desired=[])
+    g.step(wt.answers.route_pending_answers, edge="E11", row="work.open")
+    assert wt.q.claim_next("w3", project=PQ)["ref"] == g.ref
+
+
 def _resuming(wt, g, monkeypatch, status):
     """Parked + answered + resumable: resume_claim (E3), then ``_deliver``
     reports ``status``."""
