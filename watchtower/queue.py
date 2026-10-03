@@ -6444,7 +6444,12 @@ def _close_owner_guard_unlocked(it: Dict[str, Any], ident: Any, owner: str,
             f"duplicate theirs: do NOT re-commit; run `wt find {ref_label} "
             f"--json` to compare. Pass --force to close anyway."
         )
-    if status == "in_progress" and it.get("claimed_by") and str(it.get("claimed_by")) != owner:
+    # `wt find` marks a claim as yours by worker id OR session id; honour the
+    # same session match here so a legacy claim made under another worker label
+    # in the caller's own session is closable without --force (OPS-1329).
+    same_session = bool(real_sid and str(it.get("claimed_session_id") or "") == real_sid)
+    if (status == "in_progress" and it.get("claimed_by")
+            and str(it.get("claimed_by")) != owner and not same_session):
         raise ValueError(
             f"{it.get('ref', ident)} is claimed by {it.get('claimed_by')}; "
             f"you are {owner}. Only the claiming worker may close "

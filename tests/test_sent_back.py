@@ -387,3 +387,13 @@ def test_release_clears_session_ownership_and_isolates_replacement(wt):
     # the former holder under an alias of S is not handed X's ticket
     out = q.claim_next(W, project="Q", session_uuid=S)
     assert not (out or {}).get("handed_back")
+
+
+def test_close_accepts_same_session_claim_under_other_worker_label(wt):
+    """OPS-1329: find marks claimed_by_you via session id; close must agree."""
+    q = wt.q
+    ref, late = _gated_sent_back(wt)
+    q.release_stalled_sent_back(now=late)
+    assert q.claim_by_ref(ref, "legacy-label", session_uuid=S)["status"] == "in_progress"
+    out = q.close(ref, session_id="explicit-worker", session_uuid=S, resolution={"summary": "x"})
+    assert out["status"] == "open" and "gate cmd:exit 1 failed" in out["gate_feedback"]
