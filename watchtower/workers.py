@@ -5355,6 +5355,13 @@ def requeue_orphaned_tickets(
                 verdict = None
             if verdict is not None and verdict.verdict == "alive":
                 continue
+            # An ambient claim (a session resumed or rebound without a spawned
+            # pid) has no process to prove dead; the backstop escalates it
+            # after STALL_S idle instead of reopening it here and handing it
+            # to a second worker while the session still works (OPS-1333).
+            if (verdict is not None and verdict.verdict == "unproven"
+                    and (verdict.proc or {}).get("bound") == "ambient"):
+                continue
             if (verdict is not None and verdict.verdict == "dead"
                     and _liveness._resume_first(it)):
                 done = _q.recover_claim(

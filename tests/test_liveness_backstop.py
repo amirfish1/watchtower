@@ -583,3 +583,17 @@ def test_stage_events_count_as_progress():
               "history": [{"event": "plan_submit", "at": _ago(1)}]}]
     row = health.queue_status("Q", items)
     assert row["since_progress_s"] < 120 and row["stuck"] is False
+
+
+def test_requeue_leaves_ambient_rebound_claim_of_a_known_worker(lv, monkeypatch):
+    """OPS-1333: a spawned worker whose claim was rebound ambient (pid 0) while
+    its session keeps working is not reopened by the orphan sweep."""
+    lv.worker()
+    ref = _claimed(lv)
+    _patch(lv, ref, claim_proc={"worker_id": "w1", "session_id": SID, "engine": "codex",
+                                "pid": 0, "bound": "ambient"})
+    lv.kill()
+    base = time.time()
+    monkeypatch.setattr(time, "time", lambda: base + 600)
+    assert lv.workers.requeue_orphaned_tickets() == []
+    assert lv.q.get(ref)["status"] == "in_progress"
