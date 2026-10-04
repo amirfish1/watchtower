@@ -4593,6 +4593,9 @@ def cmd_config(args: argparse.Namespace) -> int:
     ``wt set`` and ``wt drain`` are kept as-is; this command is the single-stop
     alternative for the common case of configuring a queue from scratch."""
     from . import config
+    if not args.queue:
+        print(config.config_path())
+        return 0
     if not _validate_queue_worker_settings(args, config):
         return 1
     changed = []
@@ -5165,6 +5168,11 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
                     _q._log("WARN", note, queue=change["queue"])
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] config sanitize failed: {e}", flush=True)
+        try:
+            from . import config as _config
+            _config.check_outside_changes()
+        except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+            print(f"[watchtower] config audit failed: {e}", flush=True)
         # Group-chat nudge scheduler: same never-kill-the-loop contract as the
         # outbox drain above. deliver() wraps messages.send so chats.py never
         # touches transports directly; a chats.py bug must not take down
@@ -7064,7 +7072,8 @@ def build_parser() -> argparse.ArgumentParser:
             "from `wt drain`."
         ),
     )
-    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("-q", "--queue",
+                   help="queue to configure; omit to print the live config path")
     s.add_argument("--json", action="store_true",
                    help="with no setting flags: print the queue config and "
                         "role table as JSON")
