@@ -7579,7 +7579,13 @@ def build_adhoc_command(
     if engine == "codex":
         if not shutil.which(_ENGINE_BIN["codex"]):
             raise ValueError("codex CLI not found on PATH")
-        argv = [_ENGINE_BIN["codex"], "exec"]
+        # Ad-hoc critics need the same trusted launch policy as queue workers:
+        # the default Linux sandbox may fail before even read-only commands
+        # run, and a headless process cannot answer approval prompts.
+        argv = [
+            _ENGINE_BIN["codex"], "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
         if model:
             argv += ["--model", model]
         argv += codex_compact_args()
