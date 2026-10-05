@@ -2865,6 +2865,11 @@ def reap_released_workers(
     now = time.time() if now is None else float(now)
     actions: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
+    # Computed once per pass, on first need: each call lists every ticket in
+    # every queue (GitHub-backed ones parse each issue body), and calling it
+    # per released row under the workers lock pegged the daemon at 100% CPU
+    # and starved every reader of that lock (95 rows, 2026-10-05).
+    fresh_owners: Optional[set] = None
     with _WorkersFileLock():
         data = _load()
         changed = False
@@ -2876,7 +2881,9 @@ def reap_released_workers(
             if age_s < ttl_s:
                 continue
             worker_id = str(row.get("worker_id") or "")
-            if worker_id in _fresh_park_owners(now):
+            if fresh_owners is None:
+                fresh_owners = _fresh_park_owners(now)
+            if worker_id in fresh_owners:
                 continue  # WT-28: owns a park younger than the grace
             pid = int(row.get("pid", 0) or 0)
             if not _pid_alive(pid):

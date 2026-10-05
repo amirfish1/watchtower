@@ -2249,6 +2249,30 @@ def test_reap_released_workers_sigterms_past_ttl(wt):
             pass
 
 
+def test_reap_released_workers_lists_park_owners_once_per_pass(wt, monkeypatch):
+    """Each _fresh_park_owners call lists every ticket in every queue; calling
+    it per released row under the workers lock pegged the daemon at 100% CPU
+    (95 released rows, 2026-10-05). One call per pass, however many rows."""
+    pairs = [_released_worker(wt, "Q", released_age_s=7200) for _ in range(3)]
+    calls = []
+    monkeypatch.setattr(
+        wt.workers, "_fresh_park_owners",
+        lambda now: calls.append(now) or {pairs[0][0]["worker_id"]})
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600, kill_grace_s=30)
+        assert len(calls) == 1
+        # The park owner is still spared; the other two are reaped.
+        assert sorted(a["worker_id"] for a in actions) == sorted(
+            rec["worker_id"] for rec, _ in pairs[1:])
+    finally:
+        for _, proc in pairs:
+            try:
+                proc.terminate()
+                proc.wait()
+            except Exception:
+                pass
+
+
 def test_reap_released_workers_ignores_worker_released_gate(wt):
     """The GC pass must collect a released worker that every OTHER staffing
     path (live_worker_count, notify_workers, ...) correctly hides via
