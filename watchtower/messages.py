@@ -691,6 +691,50 @@ def _session_busy(sid: str) -> bool:
     return session_state(sid) == "busy"
 
 
+def _session_has_live_process(sid: str) -> bool:
+    """True unless no process can be holding claude session ``sid``.
+
+    Checks Claude's own session registry (``~/.claude/sessions/<pid>.json``,
+    a row whose pid is not provably dead), wt's ledger of resume children,
+    and finally any live process whose command line names the session.
+    Conservative: a lookup that fails counts as live, so the caller keeps
+    the old busy hold rather than racing a running turn."""
+    try:
+        from . import workers
+        claude_home = Path(
+            os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+        for f in (claude_home / "sessions").glob("*.json"):
+            try:
+                row = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if (isinstance(row, dict) and row.get("sessionId") == sid
+                    and workers.claude_session_row_liveness(row)[0] != "dead"):
+                return True
+        if live_resume_child(sid):
+            return True
+        proc = Path("/proc")
+        if not proc.is_dir():
+            return True  # no cheap process scan here (macOS): keep the hold
+        for d in proc.iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                cmd = (d / "cmdline").read_bytes()
+            except OSError:
+                continue
+            argv = cmd.split(b"\0")
+            # The claude binary itself (or node running it) with the sid as
+            # an exact argument: a sender's shell that merely mentions the sid
+            # next to a ~/.claude path must not count as the holder.
+            if (sid.encode() in argv
+                    and any(os.path.basename(a) == b"claude" for a in argv[:2])):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - unknown means keep the busy hold
+        return True
+
+
 def session_state(sid: str, now: Optional[float] = None) -> str:
     """Return busy, idle, or unknown from one targeted transcript stat."""
     p = _find_transcript(sid)
@@ -804,7 +848,11 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     _stop_prefix = _stale_claim_stop_prefix(sid)
     if _stop_prefix:
         text = _stop_prefix + text
-    if _session_busy(sid):
+    # A hot transcript only means "mid-turn" while some process still holds
+    # the session. With no holder (a dormant session, or one whose process was
+    # killed mid-turn) nothing can race the resume, so deliver now instead of
+    # parking the message for a quiet window that changes nothing.
+    if _session_busy(sid) and _session_has_live_process(sid):
         return {
             "ok": False,
             "busy": True,
@@ -1857,6 +1905,7 @@ def outbox_add(
     ticket_session: str = "",
     dedupe_key: str = "",
     ticket_gen: Optional[int] = None,
+    prefer_uds: bool = False,
 ) -> Dict[str, Any]:
     """Append a pending message to the durable outbox. Locked + atomic.
 
@@ -1890,6 +1939,8 @@ def outbox_add(
         msg["engine"] = str(engine)
     if notify:
         msg["notify"] = True
+    if prefer_uds:
+        msg["prefer_uds"] = True
     if ticket_ref:
         msg["ticket"] = str(ticket_ref)
         msg["ticket_session"] = str(ticket_session or "")
@@ -2213,6 +2264,8 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             # monkeypatched by tests with the historical three-argument
             # signature, exactly as in `send`.
             extra = {"notify": True} if m.get("notify") else {}
+            if m.get("prefer_uds"):
+                extra["prefer_uds"] = True
             outcomes[str(m.get("id"))] = deliver(
                 resolved, str(m.get("text") or ""), str(m.get("mode") or "send"),
                 **extra,
@@ -2380,6 +2433,7 @@ def send(
         error=str(result.get("error") or ""), delay_s=delay, ttl_s=ttl_s,
         engine=engine, notify=notify,
         ticket_ref=ticket_ref, ticket_session=ticket_session,
+        **({"prefer_uds": True} if prefer_uds else {}),
         **({"dedupe_key": dedupe_key} if dedupe_key else {}),
         **({"ticket_gen": ticket_gen} if ticket_gen is not None else {}),
     )

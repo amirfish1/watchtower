@@ -3461,10 +3461,14 @@ def cmd_send(args: argparse.Namespace) -> int:
         # "the complete report text" means text-for-text). Only the single
         # newline every heredoc/echo appends is dropped.
         text = raw.removesuffix("\n")
+    # Steer by default: a live Claude target gets the message over its peer
+    # socket, which injects into a running turn without aborting it, instead
+    # of waiting in the outbox for the turn to end.
     res = messages.send(
         args.target, text, mode=args.mode,
         queue_on_fail=not args.no_queue,
         ttl_s=args.ttl,
+        prefer_uds=True,
     )
     if args.json:
         print(json.dumps(res, indent=2))
