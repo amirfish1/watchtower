@@ -4261,6 +4261,24 @@ def record_worker(
     return rec
 
 
+# A dead rebound row is kept so a second continuation of the same worker id is
+# refused (5def6b5), but nothing ever expired it: 93 such rows piled up over
+# 20 days, and every pass over workers.json paid for them. A week covers any
+# realistic second-continuation attempt.
+REBOUND_RETENTION_S = 7 * 24 * 3600
+
+
+def _rebound_row_retained(w: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """True while a dead rebound row is inside its retention window, measured
+    from the later of ``rebound_at`` and ``released_at``."""
+    if not w.get("rebound_at"):
+        return False
+    now = time.time() if now is None else now
+    ages = [_iso_age_s(str(w.get(k) or ""), now) for k in ("rebound_at", "released_at")
+            if w.get(k)]
+    return min(ages) < REBOUND_RETENTION_S
+
+
 def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
     """Return tracked workers, each annotated with a live flag.
 
@@ -4324,7 +4342,7 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                 audit_state.get("release_log_pending")
                 or audit_state.get("spawn_plan_pending")
             )
-            if alive or pending_audit or w.get("rebound_at"):
+            if alive or pending_audit or _rebound_row_retained(w):
                 kept.append(w)
             elif w.get("stage") and _stage_record_kept(w, prune, postmortem):
                 # WT-24: a dead stage session keeps its record for a short

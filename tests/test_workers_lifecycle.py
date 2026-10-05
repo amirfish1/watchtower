@@ -1538,6 +1538,35 @@ def test_rebind_continued_worker_refuses_a_second_continuation(wt):
     assert rebound["pid"] == os.getpid()
 
 
+def test_dead_rebound_rows_expire_after_the_retention_window(wt):
+    """Dead rebound rows were kept forever (93 of them, up to 20 days old).
+    They now survive only REBOUND_RETENTION_S past the later of rebound_at
+    and released_at."""
+    now = time.time()
+
+    def iso(age_s):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - age_s))
+    week = wt.workers.REBOUND_RETENTION_S
+    for wid, rebound_age, released_age in (
+        ("q-old", week + 3600, week + 60),        # both stamps past the window
+        ("q-recent", 3600, None),                 # rebound an hour ago
+        ("q-old-rebind-new-release", week + 3600, 3600),
+    ):
+        wt.workers.record_worker(_dead_pid(), "Q", "claude", wid, str(wt.tmp),
+                                 str(wt.tmp / f"{wid}.log"))
+        with wt.workers._WorkersFileLock():
+            data = wt.workers._load()
+            for row in data["workers"]:
+                if row["worker_id"] == wid:
+                    row["rebound_at"] = iso(rebound_age)
+                    if released_age is not None:
+                        row["released_at"] = iso(released_age)
+            wt.workers._save(data)
+    wt.workers.list_workers()
+    kept = {w["worker_id"] for w in wt.workers.list_workers(prune=False)}
+    assert kept == {"q-recent", "q-old-rebind-new-release"}
+
+
 def test_rebind_continued_worker_refuses_a_second_continuation_after_pruning(wt):
     """FEAT-NEXT-102: the same one-continuation bound applies even when the
     worker row was pruned in between (routine reads prune dead pids) and the
