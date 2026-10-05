@@ -310,3 +310,24 @@ def test_title_reflects_live_stuck_count_end_to_end(wt):
 
     assert status == 200
     assert "<title>1 STUCK — WatchTower</title>" in page
+
+
+def test_cached_status_payload_serves_snapshot_and_dumps_stacks(monkeypatch):
+    """WT-4: concurrent polls share one status computation; SIGUSR1 dumps stacks."""
+    from watchtower import dashboard
+
+    calls = []
+    monkeypatch.setattr(dashboard, "status_payload", lambda: calls.append(1) or {"n": len(calls)})
+    monkeypatch.setitem(dashboard._status_cache, "payload", None)
+    assert dashboard.cached_status_payload() == {"n": 1}
+    assert dashboard.cached_status_payload() == {"n": 1}  # within TTL: no recompute
+    # Expired + another thread refreshing -> stale snapshot, no second compute.
+    monkeypatch.setitem(dashboard._status_cache, "at", 0.0)
+    assert dashboard._status_compute.acquire(blocking=False)
+    try:
+        assert dashboard.cached_status_payload() == {"n": 1}
+    finally:
+        dashboard._status_compute.release()
+    assert len(calls) == 1
+    assert dashboard.cached_status_payload() == {"n": 2}
+    assert dashboard.install_stack_dump_handler() is True

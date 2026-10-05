@@ -5054,8 +5054,9 @@ def _daemon_loop(args: argparse.Namespace) -> None:
     thread to stop instead of leaking it into every later test in the
     process (it is a ``daemon=True`` thread: nothing else ever joins it)."""
     import threading
-    from . import github_backend
+    from . import dashboard, github_backend
 
+    dashboard.install_stack_dump_handler()  # kill -USR1 <pid> -> all stacks on stderr
     gh_poller_stop = threading.Event()
     threading.Thread(
         target=github_backend.poll_list_caches_forever,

@@ -4533,15 +4533,16 @@ def parked_label(item: Dict[str, Any]) -> str:
             f"at {pk.get('at') or '-'}")
 
 
-def retained_counts() -> Dict[str, int]:
+def retained_counts(rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, int]:
     """Per-queue count of live workers retained for a parked answer (WT-28),
-    shown next to ``live`` in status / the dashboard."""
+    shown next to ``live`` in status / the dashboard. ``rows`` reuses an
+    already-listed roster instead of taking workers.lock again (WT-4)."""
     try:
         retained = retained_parked_ids()
     except Exception:
         return {}
     out: Dict[str, int] = {}
-    for w in list_workers():
+    for w in (list_workers() if rows is None else rows):
         if (w.get("alive") and not _worker_released(w)
                 and str(w.get("worker_id") or "") in retained):
             out[w.get("queue", "")] = out.get(w.get("queue", ""), 0) + 1
@@ -4561,14 +4562,16 @@ def live_worker_count(queue: Optional[str] = None, exclude: Optional[set] = None
     return n
 
 
-def worker_counts(prune: bool = False) -> Dict[str, Dict[str, int]]:
+def worker_counts(prune: bool = False,
+                  rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Dict[str, int]]:
     """Per-queue worker tally: ``{queue: {"total": n, "live": n}}``.
 
     A single pass over the tracked workers so callers (``wt status``, the
-    dashboard) don't fan out one liveness probe per queue.
+    dashboard) don't fan out one liveness probe per queue. ``rows`` reuses an
+    already-listed roster instead of taking workers.lock again (WT-4).
     """
     out: Dict[str, Dict[str, int]] = {}
-    for w in list_workers(prune=prune):
+    for w in (list_workers(prune=prune) if rows is None else rows):
         if w.get("stage") and not w.get("alive"):
             continue  # kept-dead stage record (WT-24): not a queue worker
         row = out.setdefault(w.get("queue", ""), {"total": 0, "live": 0})
