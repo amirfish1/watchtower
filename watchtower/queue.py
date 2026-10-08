@@ -1731,9 +1731,9 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     """
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
+        if "blocked_by" in fields:
+            raise ValueError("ticket dependencies (--after) are not supported on GitHub-backed queues")
         return backend.update(ident, **fields)
-    if "blocked_by" in fields and backend is not None:
-        raise ValueError("ticket dependencies (--after) are not supported on GitHub-backed queues")
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
