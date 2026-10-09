@@ -195,6 +195,7 @@ def test_reconcile_dispatch_on_launches_engine_with_headroom(wt, monkeypatch):
     assert "claude 3% left" in fb[0]["reason"]
     activity = (wt.tmp / "activity.log").read_text()
     assert "HEADROOM_DISPATCH" in activity
+    assert "launch failed" not in activity  # proactive pick, not a failure
 
 
 def test_reconcile_dispatch_works_with_fresh_ccc_empty_fallback_policy(wt, monkeypatch):

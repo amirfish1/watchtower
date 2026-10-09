@@ -7066,6 +7066,7 @@ def _reconcile_once_locked(dry_run: bool = False,
                         "from_engine": engine,
                         "to_engine": launch_engine,
                         "reason": choice["reason"],
+                        "kind": "headroom",
                     })
                     _q._log(
                         "HEADROOM_DISPATCH",
@@ -7317,6 +7318,8 @@ def _reconcile_once_locked(dry_run: bool = False,
             q = ref.rsplit("-", 1)[0] if "-" in ref else ""
             _log("REQUEUE", f"{ref} — {reason}, reopened for re-drain", queue=q)
         for fallback in result.get("fallbacks", []):
+            if fallback.get("kind") == "headroom":
+                continue  # proactive, already logged as HEADROOM_DISPATCH; nothing failed
             _log(
                 "FALLBACK",
                 f"{fallback.get('from_engine')} launch failed "
