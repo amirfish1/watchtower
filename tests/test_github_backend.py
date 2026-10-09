@@ -3509,3 +3509,12 @@ def test_github_backend_records_fix_commit_on_the_issue(tmp_path, monkeypatch):
     issue = json.loads(state.read_text())["issues"][0]
     assert "resolution_commit" not in issue["body"]
     assert "commit" not in q.get("GHI-1")["resolution"]
+
+
+def test_update_rejects_after_on_github_backed_queue(tmp_path, monkeypatch):
+    # WT-5: `wt edit --after` used to print EDITED and drop the blocker.
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    with pytest.raises(ValueError, match="not supported on GitHub-backed"):
+        q.update("GHI-2", blocked_by=["GHI-1"])

@@ -113,8 +113,13 @@ def tick(state: dict, queues: list[str], notify_queue: str) -> None:
     for t in blocked:
         if t["ref"] not in state["notified"]:
             if not first:  # first run records existing blocks without texting
-                send(format_question(t))
-                log(f"SENT {t['ref']}")
+                try:
+                    send(format_question(t))
+                    log(f"SENT {t['ref']}")
+                except Exception as e:
+                    # A failed send was still reaching the phone, then this
+                    # loop retried every poll. One attempt, then stop.
+                    log(f"SEND FAIL {t['ref']}: {e}")
             state["notified"].append(t["ref"])
     live = {t["ref"] for t in blocked}
     state["notified"] = [r for r in state["notified"] if r in live]  # re-block re-notifies

@@ -60,6 +60,10 @@ def test_critique_spawns_the_two_other_families(wt, monkeypatch, capsys):
     # default family is claude -> the other two, in fixed order
     assert [r["engine"] for r in out] == ["codex", "antigravity"]
     assert all(r["ok"] and r["kind"] == "adhoc" for r in out)
+    # Both critics must be able to run tools and send their report without
+    # depending on ambient sandbox settings or an interactive approval.
+    assert "--dangerously-bypass-approvals-and-sandbox" in out[0]["argv"]
+    assert "--dangerously-skip-permissions" in out[1]["argv"]
     for r in out:
         prompt = r["argv"][-1]
         assert "does this design hold up?" in prompt
@@ -351,6 +355,7 @@ def test_spawn_dry_run_codex_argv(wt, monkeypatch, capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["argv"][:2] == ["codex", "exec"]
+    assert "--dangerously-bypass-approvals-and-sandbox" in out["argv"]
     assert out["argv"][-1] == "goal"
 
 

@@ -82,6 +82,10 @@ def wt(tmp_path, monkeypatch):
     importlib.reload(codex_rpc)
     importlib.reload(codex_registry)
     monkeypatch.setattr(config, "_REGISTRY_FILE", tmp_path / "no-registry.json")
+    # Test transcripts have no real claude process behind them; treat a hot
+    # one as held by a live turn (the busy-hold tests' premise). Tests of the
+    # dormant path override this.
+    monkeypatch.setattr(messages, "_session_has_live_process", lambda sid: True)
 
     class Ns:
         pass
@@ -98,6 +102,9 @@ def wt(tmp_path, monkeypatch):
             os.close(fd)
         except OSError:
             pass
+
+
+from watchtower.messages import _session_has_live_process as _REAL_SESSION_HAS_LIVE_PROCESS  # noqa: E402
 
 
 # --------------------------------------------------------------------- helpers
@@ -1229,6 +1236,63 @@ def test_busy_transcript_defers_to_outbox(wt, monkeypatch):
     m = wt.messages.outbox_list(status="pending")[0]
     delay = wt.messages._parse_iso(m["next_attempt_at"]) - t0
     assert 50 <= delay <= 70  # held ~60s out for retry on idle
+
+
+def test_hot_transcript_without_a_live_holder_resumes_now(wt, monkeypatch):
+    """A hot transcript with no process holding the session (a dormant
+    session, or one killed mid-turn) cannot be raced: resume immediately
+    instead of parking the message for a quiet window."""
+    _write_transcript(wt, SID_B, age_s=0)
+    monkeypatch.setattr(wt.messages, "_session_has_live_process", lambda sid: False)
+    calls = []
+    monkeypatch.setattr(wt.messages.subprocess, "Popen", _fake_popen(calls))
+    res = wt.messages.send(SID_B, "wake up")
+    assert res["ok"] is True and res["transport"] == "resume"
+    assert len(calls) == 1
+    assert wt.messages.outbox_list() == []
+
+
+def test_live_holder_scan_ignores_a_shell_that_only_mentions_the_sid(
+        wt, monkeypatch, tmp_path):
+    """A sender's Bash wrapper names the sid next to a ~/.claude path; only
+    the claude binary with the sid as an argument holds the session."""
+    monkeypatch.setattr(wt.messages, "_session_has_live_process",
+                        _REAL_SESSION_HAS_LIVE_PROCESS)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-home"))
+    monkeypatch.setattr(wt.messages, "live_resume_child", lambda sid: False)
+    proc = tmp_path / "proc"
+    for pid, argv in {
+        "101": ["/bin/bash", "-c",
+                f"source /home/u/.claude/shell-snapshots/x.sh && wt send {SID_B} -"],
+        "102": ["/usr/bin/python3", "wt", "send", SID_B, "-"],
+    }.items():
+        (proc / pid).mkdir(parents=True)
+        (proc / pid / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv))
+    real_path = wt.messages.Path
+    monkeypatch.setattr(
+        wt.messages, "Path",
+        lambda *a: real_path(proc) if a == ("/proc",) else real_path(*a))
+    assert wt.messages._session_has_live_process(SID_B) is False
+    (proc / "103").mkdir()
+    (proc / "103" / "cmdline").write_bytes(
+        b"\0".join([b"/home/u/.local/bin/claude", b"-p", b"--resume", SID_B.encode()]))
+    assert wt.messages._session_has_live_process(SID_B) is True
+
+
+def test_cli_send_prefers_uds_and_parked_rows_keep_it(wt, monkeypatch):
+    """`wt send` steers by default: UDS first, and a parked row retries over
+    UDS first too."""
+    seen = []
+
+    def deliver(resolved, text, mode="send", **kw):
+        seen.append(kw.get("prefer_uds", False))
+        return {"ok": False, "busy": True, "error": "held"}
+    monkeypatch.setattr(wt.messages, "deliver", deliver)
+    from watchtower import cli
+    cli.main(["send", SID_B, "hi"])
+    assert seen == [True]
+    m = wt.messages.outbox_list(status="pending")[0]
+    assert m.get("prefer_uds") is True
 
 
 def test_busy_window_env_override(wt, monkeypatch):

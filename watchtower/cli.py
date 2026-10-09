@@ -3510,10 +3510,14 @@ def cmd_send(args: argparse.Namespace) -> int:
         # "the complete report text" means text-for-text). Only the single
         # newline every heredoc/echo appends is dropped.
         text = raw.removesuffix("\n")
+    # Steer by default: a live Claude target gets the message over its peer
+    # socket, which injects into a running turn without aborting it, instead
+    # of waiting in the outbox for the turn to end.
     res = messages.send(
         args.target, text, mode=args.mode,
         queue_on_fail=not args.no_queue,
         ttl_s=args.ttl,
+        prefer_uds=True,
     )
     if args.json:
         print(json.dumps(res, indent=2))
@@ -4643,6 +4647,9 @@ def cmd_config(args: argparse.Namespace) -> int:
     ``wt set`` and ``wt drain`` are kept as-is; this command is the single-stop
     alternative for the common case of configuring a queue from scratch."""
     from . import config
+    if not args.queue:
+        print(config.config_path())
+        return 0
     if not _validate_queue_worker_settings(args, config):
         return 1
     changed = []
@@ -5101,8 +5108,9 @@ def _daemon_loop(args: argparse.Namespace) -> None:
     thread to stop instead of leaking it into every later test in the
     process (it is a ``daemon=True`` thread: nothing else ever joins it)."""
     import threading
-    from . import github_backend
+    from . import dashboard, github_backend
 
+    dashboard.install_stack_dump_handler()  # kill -USR1 <pid> -> all stacks on stderr
     gh_poller_stop = threading.Event()
     threading.Thread(
         target=github_backend.poll_list_caches_forever,
@@ -5219,6 +5227,11 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
                     _q._log("WARN", note, queue=change["queue"])
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] config sanitize failed: {e}", flush=True)
+        try:
+            from . import config as _config
+            _config.check_outside_changes()
+        except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+            print(f"[watchtower] config audit failed: {e}", flush=True)
         # Group-chat nudge scheduler: same never-kill-the-loop contract as the
         # outbox drain above. deliver() wraps messages.send so chats.py never
         # touches transports directly; a chats.py bug must not take down
@@ -7118,7 +7131,8 @@ def build_parser() -> argparse.ArgumentParser:
             "from `wt drain`."
         ),
     )
-    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("-q", "--queue",
+                   help="queue to configure; omit to print the live config path")
     s.add_argument("--json", action="store_true",
                    help="with no setting flags: print the queue config and "
                         "role table as JSON")
