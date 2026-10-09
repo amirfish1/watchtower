@@ -1178,7 +1178,16 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
             if not repo:
                 return "no repo path for the queue"
             spawned.add(queue)
-            workers.spawn_workers(queue, 1, engine=config.engine(queue), repo_path=repo)
+            choice = workers.headroom_launch_choice(queue)
+            if choice:
+                q._log("HEADROOM_DISPATCH",
+                       f"backstop launching {queue} on {choice['engine']} instead of "
+                       f"{config.engine(queue)}: {choice['reason']}", queue=queue)
+                workers.spawn_workers(queue, 1, engine=choice["engine"],
+                                      model=choice["model"], inherit_queue_model=False,
+                                      effort=choice["effort"], repo_path=repo)
+            else:
+                workers.spawn_workers(queue, 1, engine=config.engine(queue), repo_path=repo)
     except Exception as exc:  # noqa: BLE001 - one ticket never stops the sweep
         return f"failed: {exc}"
     return "done"

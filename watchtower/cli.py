@@ -4783,6 +4783,10 @@ def cmd_config(args: argparse.Namespace) -> int:
         changed.append(
             f"fallback_to_default_worker={'on' if enabled else 'off'}"
         )
+    if getattr(args, "headroom_dispatch", None) is not None:
+        enabled = args.headroom_dispatch == "on"
+        config.set_headroom_dispatch(args.queue, enabled)
+        changed.append(f"headroom_dispatch={'on' if enabled else 'off'}")
     if getattr(args, "notify_events", None) is not None:
         raw = str(args.notify_events).strip().lower()
         if raw == "default":
@@ -4834,6 +4838,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         # answerable from the queue's own config output.
         cfg.setdefault("grace_s", config.grace_s(args.queue))
         cfg.setdefault("sent_back_release_min", config.sent_back_release_min(args.queue))
+        cfg.setdefault("headroom_dispatch", config.headroom_dispatch(args.queue))
         from . import roles as _roles
         if getattr(args, "json", False):
             print(json.dumps({"queue": args.queue, "config": cfg,
@@ -7221,6 +7226,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "failing at launch, spawn workers on the fallback "
                         "engine (the queue's engine/model setting is never "
                         "changed); off (default) = park the queue instead")
+    s.add_argument("--headroom-dispatch", default=None,
+                   choices=["on", "off"], dest="headroom_dispatch",
+                   help="on = before launching workers, check CCC quota "
+                        "headroom (/api/headroom) and start them on the "
+                        "engine in this queue's fallback chain whose quota "
+                        "resets soonest, skipping engines under 10%% left "
+                        "(launch-time only; the queue engine is never "
+                        "changed). off = always launch on the queue engine. "
+                        "Unset inherits CCC spawn-defaults "
+                        "worker_headroom_dispatch (default off)")
     s.add_argument("--notify-events", default=None, dest="notify_events",
                    help="comma-separated events a ticket's submitter is "
                         "notified about: claimed,closed,needs_input,"
