@@ -1,0 +1,35 @@
+[Unit]
+Description=WatchTower reconciler (hermes queues: BECKY, CHUCK, CCC, OPS, INTAKE, WT, CHUCKSTAGE)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=exec + --foreground, deliberately, replacing Type=oneshot/RemainAfterExit.
+#
+# The old unit let `wt start` fork a background daemon and exit, so MainPID was
+# 0 and the whole unit was one cgroup containing the reconciler AND every worker
+# it had spawned. With the default KillMode=control-group, `systemctl --user
+# restart watchtower.service` SIGTERMed every live worker — so the routine act
+# of picking up new watchtower code could kill a worker mid-edit. See VM-NEXT-9.
+#
+# Running the loop in the foreground gives systemd a real MainPID, which makes
+# KillMode=process meaningful: on stop/restart systemd signals the reconciler
+# only. Workers are spawned with start_new_session=True, so they are in their
+# own process groups and survive; the restarted reconciler re-adopts them by pid
+# (workers.py::_pid_alive) rather than spawning duplicates.
+Type=exec
+KillMode=process
+Environment=PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/hermes/.local/bin/wt start --foreground --interval 30 --stuck-minutes 10 --engine claude --host 127.0.0.1 --port 8787
+
+# The old unit could not restart a crashed daemon: with RemainAfterExit=yes the
+# unit still read as "active" after the forked daemon died, so systemd saw
+# nothing to do. Type=exec ties unit state to the actual process.
+# always, not on-failure: the daemon exited 0 on 2026-10-09 01:39 UTC (cause
+# unknown) and on-failure never restarted it, so BECKY et al. went undrained
+# for 16h. An explicit `systemctl --user stop` is still honoured.
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=default.target
