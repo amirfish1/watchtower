@@ -813,3 +813,114 @@ def test_gate_worktree_config_drives_evaluate_gates(wt, grepo, tmp_path, monkeyp
     assert results[0]["passed"] and results[0]["worktree"].endswith("repo-wt-wtgate")
     config.set_gate_worktree("GT", "fresh")
     assert "gate_worktree" not in config.get_queue_config("GT")
+
+
+def test_explicit_duplicates_share_verification_and_follow_failure_then_recovery(wt):
+    from watchtower import stages
+    q = wt.q
+    original = _file(q, "original", gates=["verify"])
+    followers = [_file(q, name, gates=["verify"]) for name in ["spruce", "palfrey"]]
+    for it in followers:
+        linked = q.link_duplicate(it["ref"], original["ref"])
+        assert linked["status"] == "blocked"
+    q.close(original["ref"], resolution={"summary": "fixed", "no_code": True})
+    assert [d["ref"] for d in stages.desired(q.list_items())] == [original["ref"]]
+    q.verdict(original["ref"], False, "middleware not registered")
+    for it in followers:
+        saved = q.get(it["ref"])
+        assert saved["status"] == "blocked"
+        assert "middleware not registered" in saved["gate_feedback"]
+    assert stages.desired(q.list_items()) == []
+    q.close(original["ref"], resolution={"summary": "actually fixed", "no_code": True})
+    q.verdict(original["ref"], True, "verified all three paths")
+    for it in followers:
+        saved = q.get(it["ref"])
+        assert saved["status"] == "closed"
+        assert saved["gate_results"][-1]["inherited_from"] == original["ref"]
+    assert stages.desired(q.list_items()) == []
+    q.update_status(original["ref"], "open", reason="regression")
+    assert all(q.get(it["ref"])["status"] == "blocked" for it in followers)
+
+
+def test_duplicate_validation_and_clearing(wt):
+    q = wt.q
+    a, b, c = [_file(q, n, gates=["verify"]) for n in ["a", "b", "c"]]
+    for ref in [a["ref"], "GT-99999"]:
+        with pytest.raises(ValueError):
+            q.link_duplicate(a["ref"], ref)
+    q.link_duplicate(b["ref"], a["ref"])
+    with pytest.raises(ValueError, match="chains"):
+        q.link_duplicate(c["ref"], b["ref"])
+    with pytest.raises(ValueError, match="chains"):
+        q.link_duplicate(a["ref"], c["ref"])
+    weak = _file(q, "weak", gates=["review"])
+    with pytest.raises(ValueError, match="every gate"):
+        q.link_duplicate(c["ref"], weak["ref"])
+    with pytest.raises(ValueError, match="follows duplicate"):
+        q.close(b["ref"], force=True, resolution="override")
+    with pytest.raises(ValueError, match="not open"):
+        q.claim_by_ref(b["ref"], "worker")
+    assert q.link_duplicate(b["ref"], "")["status"] == "open"
+    assert not q.get(b["ref"]).get("duplicate_of")
+
+
+def test_duplicate_never_inherits_force_close_without_verification(wt):
+    q = wt.q
+    a, b = [_file(q, n, gates=["verify"]) for n in ["a", "b"]]
+    q.link_duplicate(b["ref"], a["ref"])
+    q.close(a["ref"], force=True, resolution="unverified")
+    assert q.get(b["ref"])["status"] == "blocked"
+
+
+def test_incident_dedupe_key_is_atomic_and_queue_scoped(wt):
+    q = wt.q
+    a = q.enqueue(project="GT", note="one", dedupe_key="incident:d1:rsc")
+    b = q.enqueue(project="GT", note="two", dedupe_key="incident:d1:rsc")
+    c = q.enqueue(project="OTHER", note="different project", dedupe_key="incident:d1:rsc")
+    assert a["ref"] == b["ref"]
+    assert c["ref"] != a["ref"]
+    assert len([i for i in q.list_items() if i.get("dedupe_key") == "incident:d1:rsc"]) == 2
+
+
+def test_duplicates_wait_for_review_and_ignore_stale_pass_after_reopen(wt):
+    q = wt.q
+    a, b = [_file(q, n, gates=["verify", "review"]) for n in ["a", "b"]]
+    q.link_duplicate(b["ref"], a["ref"])
+    q.close(a["ref"], resolution="fixed")
+    q.verdict(a["ref"], True, "passed")
+    assert q.get(b["ref"])["status"] == "blocked"
+    q.accept(a["ref"])
+    assert q.get(b["ref"])["status"] == "closed"
+    q.update_status(a["ref"], "open")
+    q.close(a["ref"], force=True, resolution="unverified new close")
+    assert q.get(b["ref"])["status"] == "blocked"
+
+
+def test_concurrent_incident_filings_reuse_one_ticket(wt):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    barrier = Barrier(3)
+    def file_one(n):
+        barrier.wait()
+        return wt.q.enqueue(project="GT", note=str(n), dedupe_key="concurrent-incident")["ref"]
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        refs = list(pool.map(file_one, range(3)))
+    assert len(set(refs)) == 1
+
+
+def test_duplicate_cli_and_worker_close_alias(wt_env, run_cli, monkeypatch):
+    q = wt_env.queue
+    monkeypatch.setattr(wt_env.cli.stages, "request", lambda *a, **kw: None)
+    a = q.enqueue(project="DP", note="original", gates=["verify"])
+    b = q.enqueue(project="DP", note="follower", gates=["verify"])
+    result = run_cli("duplicate", b["ref"], "--of", a["ref"])
+    assert result.code == 0, result.err
+    assert q.get(b["ref"])["status"] == "blocked"
+    result = run_cli("duplicate", b["ref"], "--clear")
+    assert result.code == 0, result.err
+    q.claim_by_ref(b["ref"], "owner")
+    result = run_cli("close", b["ref"], "--worker", "other", "--duplicate-of", a["ref"], "--no-code")
+    assert result.code == 1
+    result = run_cli("close", b["ref"], "--worker", "owner", "--duplicate-of", a["ref"], "--no-code")
+    assert result.code == 0, result.err
+    assert q.get(b["ref"])["duplicate_of"] == a["ref"]

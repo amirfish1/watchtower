@@ -842,6 +842,7 @@ def _save_unlocked(data: Dict[str, Any]) -> None:
     the caller just loaded from the legacy JSON if one existed, so that
     build is the one-time migration. Callers hold ``_FileLock`` (same
     contract as the JSON era), so load→diff→write is race-free."""
+    _sync_duplicates_unlocked(data)
     db = _db_path()
     if not db.exists():
         _create_db(db, data)
@@ -1414,6 +1415,7 @@ def enqueue(
     source: str = "wt",
     project: str = "",
     annotation_id: str = "",
+    dedupe_key: str = "",
     url: str = "",
     title: str = "",
     selector: str = "",
@@ -1475,6 +1477,8 @@ def enqueue(
     # entries behind). A queue that is never run or drain-enabled leaves no
     # trace in queue-config.json.
     backend = _github_backend_for_project(proj)
+    if dedupe_key and backend is not None:
+        raise ValueError("dedupe keys currently require a local queue")
     grouped = bool(group_parent or group or children)
     if grouped:
         if backend is not None:
@@ -1515,6 +1519,11 @@ def enqueue(
         return saved
     with _FileLock(_lock_path()):
         data = _load_unlocked()
+        if dedupe_key:
+            existing = next((i for i in data["items"] if i.get("project") == proj
+                             and i.get("dedupe_key") == dedupe_key), None)
+            if existing is not None:
+                return existing
         saved = _new_item_unlocked(
             data, note=note, text=text, source=source, proj=proj, annotation_id=annotation_id,
             url=url, title=title, selector=selector, screenshot_path=screenshot_path,
@@ -1523,6 +1532,8 @@ def enqueue(
             planner_model=planner_model, verifier_model=verifier_model, submitter=submitter,
             submitter_explicit=submitter_explicit, pre_ack=pre_ack, blocked_by=blocked_by,
             gates=gates, accept_line=accept_line, assessment_origin=assessment_origin)
+        if dedupe_key:
+            saved["dedupe_key"] = dedupe_key
         if grouped:
             # Raising here leaves the store untouched (nothing saved yet).
             _group_enqueue_unlocked(data, saved, group_parent, group, list(children or []))
@@ -2005,7 +2016,7 @@ def _claim_candidates(
     just takes the next ticket instead of claiming and parking it. None
     disables the filter.
     """
-    candidates = [it for it in items if it.get("status") == "open"]
+    candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of")]
     # WT-28: a ticket whose answer is reserved for its parked worker
     # (affinity) is claimable only by that worker until the reservation
     # expires; everyone else, and every counting caller, drops it.
@@ -2746,6 +2757,8 @@ def update_status(
                         f"plan and integration (`wt group show {it.get('ref')}`)")
                 if status == "in_progress":
                     _group_claim_check_unlocked(data["items"], it)
+                if it.get("duplicate_of"):
+                    raise ValueError(f"{it.get('ref', ident)} follows duplicate original {it['duplicate_of']}; clear the link before changing status")
                 _group_child_change_unlocked(data["items"], it, status, group_force)
                 gfields: Dict[str, Any] = {}
                 it["status"] = status
@@ -3710,6 +3723,8 @@ def checks_block(item: Dict[str, Any]) -> str:
     """Plain-words "Checks after you close" block for a ticket with gates
     (empty string when it has none). Told to the worker at claim time so it
     does not run its own independent verifier."""
+    if item.get("duplicate_of"):
+        return f"Completion follows {item['duplicate_of']}; no separate verifier. Clear the duplicate link for independent work."
     gates = effective_gates(item)
     if not gates:
         return ""
@@ -4063,6 +4078,126 @@ def _note_worker_ticket_done(session_id: Any) -> None:
         pass
 
 
+
+def _sync_duplicates_unlocked(data: Dict[str, Any]) -> None:
+    """Duplicate followers share their original's completion, in the same write.
+
+    An explicit relationship is required; shared commits or summary text never
+    imply equivalence. Force-closing an original without its gates is not proof.
+    """
+    by_ref = _refs_index(data.get("items", []))
+    for it in data.get("items", []):
+        ref = it.get("duplicate_of")
+        if not ref:
+            continue
+        original = by_ref.get(ref)
+        required = sorted(set(effective_gates(it)) | set(effective_gates(original or {})))
+        results = {r.get("gate"): r for r in ((original or {}).get("gate_results") or [])}
+        history = (original or {}).get("history") or []
+        last_close = max((n for n, e in enumerate(history) if e.get("event") == "close"), default=-1)
+        after_close = history[last_close + 1:]
+
+        def proven(g):
+            if g == "verify":
+                return (results.get(g, {}).get("passed") and any(
+                    e.get("event") == "verify" and e.get("passed") for e in after_close))
+            if g == "review" or g.startswith("review:"):
+                return any(e.get("event") == "accept" for e in after_close)
+            if g == "plan" or g.startswith("plan:"):
+                return ((original or {}).get("plan") or {}).get("status") == "accepted"
+            return results.get(g, {}).get("passed")
+
+        complete = bool(original and original.get("status") == "closed"
+                        and not original.get("gate_pending")
+                        and all(proven(g) for g in required))
+        snapshot = {"ref": ref, "status": (original or {}).get("status", "missing"),
+                    "verify_cycle": (original or {}).get("verify_cycle", 0),
+                    "closed_at": (original or {}).get("closed_at"),
+                    "feedback": (original or {}).get("gate_feedback", ""),
+                    "complete": complete}
+        target_status = "closed" if complete else "blocked"
+        if it.get("duplicate_result") == snapshot and it.get("status") == target_status:
+            continue
+        now = _now_iso()
+        it["duplicate_result"] = snapshot
+        it["status"] = target_status
+        it["updated_at"] = now
+        it["closed_at"] = now if complete else None
+        it["needs_input"] = False
+        it["block_question"] = ""
+        it["gate_feedback"] = snapshot["feedback"] if not complete else ""
+        it.pop("gate_pending", None)
+        it.pop("gate_stages", None)
+        if not complete:
+            it["resolution"] = None
+            it["gate_results"] = []
+            it.pop("closed_by", None)
+            it.pop("closed_machine", None)
+        if complete:
+            it["closed_by"] = f"duplicate:{ref}"
+            it["resolution"] = {**((original or {}).get("resolution") or {}),
+                                "summary": f"Duplicate of {ref}; completion inherited from the original"}
+            it["gate_results"] = [dict(r, inherited_from=ref) for r in (original.get("gate_results") or [])]
+        _append_history(it, "duplicate_result", by=_by("system"), at=now,
+                        original=ref, passed=complete, original_status=snapshot["status"],
+                        verify_cycle=snapshot["verify_cycle"], feedback=_clip(snapshot["feedback"], 1000))
+
+
+def link_duplicate(ident: Any, original_ref: str, worker: str = "") -> Optional[Dict[str, Any]]:
+    """Explicitly declare the same incident; wait for its original, never spawn.
+
+    Both tickets must be local, in the same queue, outside plan groups. Refuse
+    chains/cycles and weaker original gates. Clearing the link reopens the
+    follower for independent work.
+    """
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        raise ValueError("duplicate links currently require a local queue")
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        it = next((i for i in data["items"] if _matches(i, ident)), None)
+        if it is None:
+            return None
+        if worker:
+            _close_owner_guard_unlocked(it, ident, worker, "")
+        if group_role(it):
+            raise ValueError("plan-group tickets cannot be linked as duplicates")
+        if not original_ref:
+            if not it.get("duplicate_of"):
+                return it
+            it.pop("duplicate_of", None)
+            it.pop("duplicate_result", None)
+            it["status"], it["closed_at"], it["resolution"] = "open", None, None
+            it["gate_results"] = []
+            it["gate_feedback"] = ""
+            _append_history(it, "duplicate_clear", by=_by("human"), at=_now_iso())
+        else:
+            original = next((i for i in data["items"] if i.get("ref") == original_ref), None)
+            if original is None or original is it:
+                raise ValueError("duplicate original must exist and be a different ticket")
+            if original.get("project") != it.get("project"):
+                raise ValueError("duplicate original must be in the same queue")
+            if original.get("duplicate_of") or any(i.get("duplicate_of") == it.get("ref") for i in data["items"]):
+                raise ValueError("duplicate chains and cycles are not allowed")
+            if group_role(original):
+                raise ValueError("plan-group tickets cannot be duplicate originals")
+            if not set(effective_gates(it)).issubset(effective_gates(original)):
+                raise ValueError("duplicate original must cover every gate required by the follower")
+            if (it.get("pending_answer") or {}).get("state") in ANSWER_INFLIGHT:
+                raise ValueError("settle the pending answer before linking a duplicate")
+            _retire_sessions_unlocked(it, ("verifier", "assessor", "planner", "plan_reviewer"),
+                                      f"duplicate of {original_ref}")
+            it["duplicate_of"] = original_ref
+            it.pop("duplicate_result", None)
+            _append_history(it, "duplicate_link", by=_by("human", worker), at=_now_iso(),
+                            original=original_ref)
+        _drop_claim_proc_unlocked(it)
+        it["claimed_by"] = ""
+        it["claimed_session_id"] = ""
+        it["updated_at"] = _now_iso()
+        _save_unlocked(data)
+        return it
+
+
 def close(
     ident: Any, session_id: str = "", resolution: Any = None, force: bool = False,
     declined: bool = False, session_uuid: str = "",
@@ -4084,6 +4219,8 @@ def close(
     bypasses the guard for a human deliberately force-closing someone's ticket."""
     if _github_backend_for_project(_project_from_ident(ident)) is None:
         cur = get(ident)
+        if cur is not None and cur.get("duplicate_of"):
+            raise ValueError(f"{cur.get('ref', ident)} follows duplicate original {cur['duplicate_of']}; clear the link before independent work")
         if cur is not None and group_role(cur) == "parent":
             raise ValueError(f"{cur.get('ref', ident)} is a group parent: it closes through its "
                              f"integration once every member is closed (`wt group show "
@@ -5488,6 +5625,8 @@ def _assessment_title_key(title: Any) -> str:
 def assessment_due(item: Dict[str, Any]) -> bool:
     """True when a just-closed ``item`` should get a post-fix assessment."""
     from . import config as _config
+    if item.get("duplicate_of"):
+        return False
     if item.get("status") != "closed" or item.get("assessment"):
         return False
     proj = str(item.get("project") or "")

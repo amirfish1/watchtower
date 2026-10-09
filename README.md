@@ -195,6 +195,34 @@ Each ticket records the resolved source file and line anchor. A stable source
 key makes repeat imports safe: importing the same document again creates no
 duplicates, while newly inferred document tasks create new tickets.
 
+### Repeated incidents and duplicate tickets
+
+For automated filing into a local queue, use a stable incident key:
+
+```bash
+wt add -q MYAPP --title "RSC response invariant" --gate verify --dedupe-key "project:deployment:error-signature"
+```
+
+Concurrent calls and retries reuse the existing ticket, including after it
+closes. Use a new key for a new deployment or incident episode. Append new
+paths and request IDs with `wt comment` so verification sees every affected path.
+
+When two existing tickets cover the same incident, explicitly link them:
+
+```bash
+wt duplicate MYAPP-17 --of MYAPP-15
+# A worker can also declare a duplicate while closing its own claim:
+wt close MYAPP-17 --duplicate-of MYAPP-15 --no-code
+wt duplicate MYAPP-17 --clear  # reopen for independent work
+```
+
+A duplicate stays blocked until its original closes with the required gate
+proof, then inherits that result. A failed verification or reopened original
+keeps its duplicates unresolved. Linked tickets never launch separate stage
+sessions. These links require the same local queue, matching or stronger gates
+on the original, and no plan-group membership; chains and cycles are refused.
+Neither a shared commit nor the words “duplicate of” in a summary create a link.
+
 ### Agent engines
 
 WatchTower supports three agent engines. Set the engine per queue with `wt set`:

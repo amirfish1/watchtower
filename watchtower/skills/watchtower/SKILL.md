@@ -90,3 +90,21 @@ back with the reason and resumes your session.
 
 If `wt find <ref>` returns "not found" or `wt` isn't installed, say so
 plainly. Don't infer a ticket's status from memory or guess at a queue name.
+
+
+## Duplicate incidents
+
+For automated local-queue filing, `wt add ... --dedupe-key <stable-incident-key>`
+atomically reuses an existing ticket. Include the project, deployment or incident
+episode, and error signature in the key; append new evidence with `wt comment`.
+
+When the same incident already has multiple tickets, use
+`wt duplicate <duplicate-ref> --of <original-ref>` or, for your own claim,
+`wt close <duplicate-ref> --duplicate-of <original-ref> --no-code`.
+The follower waits for the original's required gates without another verifier.
+Failures and reopenings keep the follower unresolved. A summary saying
+“duplicate of” or a shared commit does not establish this relationship.
+Use `wt duplicate <ref> --clear` to reopen it for independent work.
+Links are local-queue only; chains, cycles, plan groups, and weaker original
+gates are refused. Only link tickets whose acceptance criteria are covered by
+the original, and include every affected route in its verification evidence.

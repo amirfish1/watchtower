@@ -937,3 +937,14 @@ def test_concurrent_spawn_gate_staggers_engine_starts(stg, monkeypatch):
     stamps.sort()
     assert len(stamps) == 4
     assert all(b - a >= 0.25 for a, b in zip(stamps, stamps[1:]))
+
+
+def test_three_linked_incidents_spawn_one_real_verifier(stg):
+    original = _verify_ticket(stg)
+    for name in ["spruce", "palfrey"]:
+        follower = stg.q.enqueue(project="ST", title=name, note=name, gates=["verify"])
+        stg.q.link_duplicate(follower["ref"], original)
+    stg.stages.reconcile_stages()
+    assert len(stg.spawned) == 1
+    assert "INDEPENDENT verifier" in stg.spawned[0]["prompt"]
+    assert [d["ref"] for d in stg.stages.desired(stg.q.list_items(project="ST"))] == [original]

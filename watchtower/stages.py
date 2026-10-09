@@ -198,7 +198,7 @@ def desired(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for it in items:
         ref = str(it.get("ref") or "")
-        if not ref:
+        if not ref or it.get("duplicate_of"):
             continue
         if (it.get("pending_answer") or {}).get("state") in q.ANSWER_INFLIGHT:
             # WT-31 D1a: an answer in flight owns the ticket until it settles

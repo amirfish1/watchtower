@@ -868,6 +868,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             model_floor=getattr(args, "model_floor", "") or "",
             planner_model=getattr(args, "planner_model", "") or "",
             verifier_model=getattr(args, "verifier_model", "") or "",
+            dedupe_key=getattr(args, "dedupe_key", "") or "",
             submitter=submitter,
             submitter_explicit=bool((getattr(args, "submitter", "") or "").strip()),
             pre_ack=bool(getattr(args, "pre_ack", False)),
@@ -2232,7 +2233,36 @@ def _untracked_carry_items(args: argparse.Namespace) -> List[str]:
     return [s for s in carry if not _TICKET_REF_RE.search(str(s))]
 
 
+def cmd_duplicate(args: argparse.Namespace) -> int:
+    try:
+        item = q.link_duplicate(args.ref, "" if args.clear else args.of)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if item is None:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    print(f"{item['ref']}: {item['status']}" +
+          (f"; follows {item['duplicate_of']}" if item.get("duplicate_of") else "; duplicate link cleared"))
+    stages.request(item["ref"], "duplicate link changed")
+    return 0
+
+
 def cmd_close(args: argparse.Namespace) -> int:
+    if getattr(args, "duplicate_of", ""):
+        if args.commit or not args.no_code:
+            print("error: duplicate close requires --no-code and no --commit", file=sys.stderr)
+            return 1
+        try:
+            item = q.link_duplicate(args.ref, args.duplicate_of, worker=args.worker or _default_worker_id())
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if item is None:
+            return 1
+        print(f"DUPLICATE: {item['ref']} follows {item['duplicate_of']} ({item['status']})")
+        stages.request(item["ref"], "duplicate linked")
+        return 0
     if not (args.summary or "").strip():
         print(
             "error: --summary is required when closing a ticket\n"
@@ -6370,6 +6400,7 @@ def build_parser() -> argparse.ArgumentParser:
                                help="business value: H, M, or L")
         subparser.add_argument("--confidence", default="", choices=["H", "M", "L", ""],
                                help="confidence: H, M, or L")
+        subparser.add_argument("--dedupe-key", default="", help="stable incident key; atomically reuse an existing ticket in this local queue")
         subparser.add_argument("--model-floor", default="", dest="model_floor",
                                help="filer's best-guess minimum model this ticket "
                                     "needs (FEAT-NEXT-120); empty is fine, never a "
@@ -6528,7 +6559,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ready_args(s)
     s.set_defaults(func=cmd_run)
 
+    s = sub.add_parser("duplicate", help="link a duplicate ticket to its original; share completion without another verifier")
+    s.add_argument("ref")
+    dup = s.add_mutually_exclusive_group(required=True)
+    dup.add_argument("--of", metavar="REF", help="original ticket covering the same incident")
+    dup.add_argument("--clear", action="store_true", help="remove link and reopen for independent work")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_duplicate)
+
     s = sub.add_parser("close")
+    s.add_argument("--duplicate-of", default="", metavar="REF", help="link to the original instead of running another verification (requires --no-code)")
     s.add_argument("ref")
     s.add_argument("--worker", default="")
     s.add_argument("--summary", default="",
