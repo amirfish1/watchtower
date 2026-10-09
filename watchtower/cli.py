@@ -2214,6 +2214,24 @@ def _assess_new(args: argparse.Namespace) -> int:
     return rc
 
 
+# A ticket ref inside a follow-up/unresolved entry: BECKY-1625, OPS-12,
+# BECKY-DESIGN-7, or a GitHub-style #1625.
+_TICKET_REF_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:-[A-Z][A-Z0-9]*)*-\d+\b|#\d+\b")
+
+
+def _untracked_carry_items(args: argparse.Namespace) -> List[str]:
+    """Follow-up/unresolved entries that cite no ticket ref.
+
+    A follow-up that lives only in a closing comment is lost: nobody drains it
+    (BECKY-1625 closed with "run the prepared backfill" as a follow-up and the
+    backfill never ran). So every carried item must point at a real ticket,
+    unless --enqueue-follow-ups files one for it."""
+    if getattr(args, "enqueue_follow_ups", False):
+        return []
+    carry = list(getattr(args, "follow_up", None) or []) + list(getattr(args, "unresolved", None) or [])
+    return [s for s in carry if not _TICKET_REF_RE.search(str(s))]
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     if not (args.summary or "").strip():
         print(
@@ -2226,6 +2244,23 @@ def cmd_close(args: argparse.Namespace) -> int:
         print(
             "error: closing requires exactly one completion proof: --commit <SHA> "
             "for code changes or --no-code for work that changed no code",
+            file=sys.stderr,
+        )
+        return 1
+    untracked = _untracked_carry_items(args)
+    if untracked:
+        listing = "\n".join(f"  - {_oneline(str(s))[:120]}" for s in untracked)
+        print(
+            "error: every --follow-up / --unresolved item must cite the ticket that "
+            "tracks it -- a follow-up that exists only in a closing comment is lost.\n"
+            f"{listing}\n"
+            "  For each item: file a ticket (`wt add -q <QUEUE> --title ... --note ...`; "
+            "environment/tooling/credential blockers go to an OPS ticket), then put its "
+            "ref in the item text, e.g. --unresolved \"run the backfill (BECKY-1700)\".\n"
+            "  Or pass --enqueue-follow-ups to file them in this queue automatically.\n"
+            "  Optional notes that need no action belong in --caveat.\n"
+            "  If the ticket's own task is not done, do not close it: `wt block <ref> "
+            "--question ... --progress ...`.",
             file=sys.stderr,
         )
         return 1

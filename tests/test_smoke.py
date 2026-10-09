@@ -1386,7 +1386,7 @@ def test_cli_close_builds_resolution(store, capsys):
         "--summary", "did X",
         "--no-code",
         "--caveat", "watch Y",
-        "--follow-up", "do Z later",
+        "--follow-up", "do Z later (CLIRES-2)",
     ])
     assert rc == 0
     out = capsys.readouterr().out
@@ -1395,7 +1395,7 @@ def test_cli_close_builds_resolution(store, capsys):
     it = q.get("CLIRES-1")
     assert it["resolution"]["summary"] == "did X"
     assert it["resolution"]["caveats"] == ["watch Y"]
-    assert it["resolution"]["follow_ups"] == ["do Z later"]
+    assert it["resolution"]["follow_ups"] == ["do Z later (CLIRES-2)"]
 
     # The closed wt ls row shows the summary + counts.
     assert main(["ls", "-q", "CLIRES", "--status", "closed"]) == 0
@@ -1416,6 +1416,35 @@ def test_cli_ls_json_honors_limit(store, capsys):
     payload = json.loads(capsys.readouterr().out)
 
     assert [item["note"] for item in payload] == ["first", "second"]
+
+
+def test_cli_close_rejects_untracked_follow_ups(store, capsys):
+    """A follow-up/unresolved item with no ticket ref blocks the close
+    (BECKY-1625: "run the backfill" lived only in the closing comment)."""
+    import watchtower.queue as q
+    from watchtower.cli import main
+
+    q.enqueue(project="UNTRK", note="work")
+    rc = main([
+        "close", "UNTRK-1",
+        "--summary", "fixed the code",
+        "--no-code",
+        "--unresolved", "run the prepared backfill script",
+    ])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "must cite the ticket" in err
+    assert "run the prepared backfill script" in err
+    assert q.get("UNTRK-1")["status"] != "closed"
+
+    for ref in ("OPS-12", "BECKY-DESIGN-7", "#1625"):
+        q.enqueue(project="UNTRK", note=f"work {ref}")
+    open_refs = [i["ref"] for i in q.list_items(project="UNTRK", status="open")]
+    for target, ref in zip(open_refs[1:], ("OPS-12", "BECKY-DESIGN-7", "#1625")):
+        assert main([
+            "close", target, "--summary", "done", "--no-code",
+            "--unresolved", f"needs prod creds ({ref})",
+        ]) == 0
 
 
 def test_cli_close_enqueue_follow_ups(store, capsys):

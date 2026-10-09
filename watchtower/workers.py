@@ -357,6 +357,31 @@ SUMMARY_STYLE = (
     "line breaks. Never submit one dense paragraph. "
 )
 
+# Completion contract injected into both goal templates (BECKY-1625: a worker
+# fixed the code, wrote a backfill it could not run for lack of prod
+# credentials, closed the ticket as done with "run the backfill" as a
+# follow-up, and nothing ever tracked it). `wt close` also rejects any
+# follow-up/unresolved item that cites no ticket ref.
+# No braces: safe for the templates' .format() calls.
+CLOSE_COMPLETENESS = (
+    "CLOSED MEANS DONE: close a ticket only when every part it asks for has "
+    "actually happened. A data repair, backfill, migration or script you "
+    "wrote but did not run is NOT done; a conclusion you did not verify "
+    "against the real source is NOT done. If you could not finish a part, "
+    "either keep the ticket open with `wt block`, or close it only after "
+    "filing a NEW ticket for each unfinished part (`wt add -q <QUEUE> "
+    "--title ... --note ...` with enough context to pick it up cold) and "
+    "citing that ref in its --unresolved/--follow-up item -- `wt close` "
+    "rejects any item that cites no ticket ref. ENVIRONMENT BLOCKERS: when "
+    "the blocker is infrastructure -- missing or failing credentials (e.g. "
+    "no production DB access, empty env pull), a broken CLI/MCP/tool, or a "
+    "sandbox limit -- ALSO file an OPS ticket: run "
+    "`~/dev/ops/file-ops-ticket.sh \"one line\" --detail \"...\"` if that "
+    "script exists on this host, otherwise `wt add -q OPS --title \"...\" "
+    "--note \"host, what failed, exact error\"`, and cite the OPS ref too. "
+    "Never just describe a blocker in prose and close. "
+)
+
 # Push contract injected into both goal templates. Deployment pulls from
 # origin, so a commit that stays local is undeployed work; the default is
 # push-after-commit, and a ticket's worker instructions may opt out.
@@ -435,7 +460,7 @@ DRAIN_GOAL_TEMPLATE = (
     "\"...\"` for anything you could not fix (each flag is repeatable). This "
     "resolution is the trust signal the dashboard surfaces; a close without "
     "--summary will be rejected with exit code 1. "
-    + SUMMARY_STYLE +
+    + SUMMARY_STYLE + CLOSE_COMPLETENESS +
     "If a ticket genuinely cannot be resolved without a human decision, do NOT "
     "close it and do NOT guess: run `wt block <ref> --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
@@ -482,7 +507,7 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "\"what you changed\" --commit <SHA>` (or `--no-code`). Add `--caveat \"...\"` for anything to watch out "
     "for, `--follow-up \"...\"` for notable next steps, and `--unresolved "
     "\"...\"` for anything you could not fix (each flag is repeatable). "
-    + SUMMARY_STYLE +
+    + SUMMARY_STYLE + CLOSE_COMPLETENESS +
     "If it genuinely cannot be resolved without a human decision, do NOT "
     "close it and do NOT guess: run `wt block {ref} --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
