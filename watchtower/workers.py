@@ -2901,6 +2901,9 @@ def reap_released_workers(
     # per released row under the workers lock pegged the daemon at 100% CPU
     # and starved every reader of that lock (95 rows, 2026-10-05).
     fresh_owners: Optional[set] = None
+    # (worker_id, pid) -> kill stamp. record_worker can leave two rows for one
+    # worker; without this the pid is signalled and GC_RELEASED logged twice.
+    reaped: Dict[tuple, str] = {}
     with _WorkersFileLock():
         data = _load()
         changed = False
@@ -2917,6 +2920,12 @@ def reap_released_workers(
             if worker_id in fresh_owners:
                 continue  # WT-28: owns a park younger than the grace
             pid = int(row.get("pid", 0) or 0)
+            key = (worker_id, pid)
+            if key in reaped:
+                if reaped[key] and row.get("gc_kill_sent_at") != reaped[key]:
+                    row["gc_kill_sent_at"] = reaped[key]
+                    changed = True
+                continue  # sibling row for the same worker already handled
             if not _pid_alive(pid):
                 continue  # sweep_orphan_stop_signals() cleans up its sentinel
             kill_sent_at = str(row.get("gc_kill_sent_at") or "")
@@ -2943,6 +2952,7 @@ def reap_released_workers(
                     "%Y-%m-%dT%H:%M:%SZ"
                 )
                 changed = True
+            reaped[key] = str(row.get("gc_kill_sent_at") or "")
             actions.append({
                 "worker_id": worker_id,
                 "queue": str(row.get("queue") or ""),
