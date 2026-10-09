@@ -716,6 +716,48 @@ def _bad_model_floor(args: argparse.Namespace) -> bool:
     return False
 
 
+def _warn_floor_above_queue(items: List[Dict[str, Any]]) -> None:
+    """One stderr line per open ticket whose ``model_floor`` the queue's model
+    does not meet (WATCHTOWER-39). Queue workers never claim such a ticket;
+    the reconciler routes it to a one-off floor-model worker (WT-10) -- so say
+    so at filing/edit/model-change time instead of letting it sit unexplained.
+    GitHub-backed queues have no floor filter, so they are skipped."""
+    from . import config, workers
+    for it in items:
+        floor = str(it.get("model_floor") or "").strip()
+        queue = str(it.get("project") or "")
+        if not floor or it.get("status") != "open":
+            continue
+        try:
+            if q._github_backend_for_project(queue) is not None:
+                continue
+            if config.model_floor_met(queue, floor):
+                continue
+            qmodel = config.queue_model_id(queue) or "the engine default (no model set)"
+            eng = config.floor_engine(floor)
+            if not eng or not workers.engine_available(eng):
+                how = f"no installed engine serves {floor}, so it stays open"
+            elif not config.auto_drain(queue) and not it.get("run_requested"):
+                how = (f"a one-off {floor} worker is spawned for it once you run "
+                       f"`wt ready {it.get('ref')}` (auto-drain is off)")
+            else:
+                how = f"the reconciler spawns a one-off {floor} worker for it"
+        except Exception:
+            continue  # a hint, never a reason to fail the command
+        print(f"warning: {it.get('ref')} needs {floor} but queue {queue} runs "
+              f"{qmodel}; its workers won't claim it -- {how}", file=sys.stderr)
+
+
+def _warn_queue_floors(queue: str) -> None:
+    """After a queue's engine/model changes: warn for its open tickets whose
+    floor the new model no longer meets."""
+    try:
+        items = q.list_items(project=queue)
+    except Exception:
+        return
+    _warn_floor_above_queue(items)
+
+
 def cmd_edit(args: argparse.Namespace) -> int:
     """Patch fields (title/priority/type/readiness/...) on an existing
     ticket, in place -- no refile/close churn (WT-71). Only flags the
@@ -782,6 +824,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
     else:
         moved = f" (moved {old_ref} -> {item['ref']})" if old_ref else ""
         print(f"EDITED: {item['ref']}{moved}  {item.get('title') or item.get('note','')}")
+    if "model_floor" in fields or new_queue is not None:
+        _warn_floor_above_queue([item])
     return 0
 
 
@@ -839,6 +883,8 @@ def cmd_add(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
+    if not getattr(args, "claim", False):
+        _warn_floor_above_queue([item])
     if q.group_role(item) == "parent":
         g = item.get("group") or {}
         members = ", ".join(g.get("members") or []) or "none yet"
@@ -4458,6 +4504,7 @@ def cmd_set(args: argparse.Namespace) -> int:
                     str(worker.get("worker_id") or "") for worker in released
                 )
             )
+        _warn_queue_floors(args.queue)
     if args.effort is not None:
         config.set_effort(args.queue, args.effort)
         changed.append(f"effort={args.effort or '(engine default)'}")
@@ -4762,6 +4809,7 @@ def cmd_config(args: argparse.Namespace) -> int:
                     str(worker.get("worker_id") or "") for worker in released
                 )
             )
+        _warn_queue_floors(args.queue)
     if getattr(args, "effort", None) is not None:
         config.set_effort(args.queue, args.effort)
         changed.append(f"effort={args.effort or '(engine default)'}")

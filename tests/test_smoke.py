@@ -712,6 +712,54 @@ def test_edit_can_set_model_floor(store, capsys):
     assert q.get(ref)["model_floor"] == "kimi-code/k3"
 
 
+def test_add_edit_and_model_change_warn_when_floor_exceeds_queue_model(
+        store, capsys, monkeypatch):
+    """WATCHTOWER-39: a floor above the queue's model is no longer silent --
+    `wt add`, `wt edit --model-floor` and lowering the queue's model each
+    print a one-line warning naming the floor, the queue model and what
+    happens next (a one-off floor-model worker, WT-10)."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+    import watchtower.workers as workers
+
+    monkeypatch.setattr(workers, "engine_available", lambda eng: True)
+    monkeypatch.setattr(workers, "release_workers", lambda **k: [])
+    config.set_engine("Q", "claude")
+    config.set_model("Q", "claude-opus-4-8")
+
+    assert cli.main(["add", "-q", "Q", "--title", "t", "--note", "n",
+                     "--model-floor", "claude-opus-5"]) == 0
+    out = capsys.readouterr()
+    ref = out.out.split()[1]
+    assert f"warning: {ref} needs claude-opus-5 but queue Q runs claude-opus-4-8" in out.err
+    assert "one-off claude-opus-5 worker" in out.err
+
+    # A floor the queue meets is silent.
+    assert cli.main(["edit", ref, "--model-floor", "claude-opus-4-8"]) == 0
+    assert "warning" not in capsys.readouterr().err
+    # Lowering the queue's model below an open ticket's floor warns.
+    assert cli.main(["config", "-q", "Q", "--model", "claude-sonnet-5"]) == 0
+    assert f"{ref} needs claude-opus-4-8 but queue Q runs claude-sonnet-5" in capsys.readouterr().err
+    # Raising the floor by edit warns too.
+    assert cli.main(["edit", ref, "--model-floor", "claude-opus-5"]) == 0
+    assert f"{ref} needs claude-opus-5" in capsys.readouterr().err
+
+
+def test_floor_warning_names_wt_ready_when_auto_drain_is_off(store, capsys, monkeypatch):
+    import watchtower.cli as cli
+    import watchtower.config as config
+    import watchtower.workers as workers
+
+    monkeypatch.setattr(workers, "engine_available", lambda eng: True)
+    monkeypatch.setattr(config, "auto_drain", lambda queue: False)
+    config.set_engine("Q", "claude")
+    config.set_model("Q", "claude-sonnet-5")
+    assert cli.main(["add", "-q", "Q", "--title", "t", "--note", "n",
+                     "--model-floor", "claude-opus-4-8"]) == 0
+    out = capsys.readouterr()
+    assert f"`wt ready {out.out.split()[1]}`" in out.err
+
+
 def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeypatch):
     """A queue with no explicit `wt set --model` falls back to CCC's shared
     spawn-defaults.json for its engine (see config.CCC_SPAWN_DEFAULTS_FILE) --
