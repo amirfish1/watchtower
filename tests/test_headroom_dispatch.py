@@ -197,6 +197,17 @@ def test_reconcile_dispatch_on_launches_engine_with_headroom(wt, monkeypatch):
     assert "HEADROOM_DISPATCH" in activity
 
 
+def test_reconcile_dispatch_works_with_fresh_ccc_empty_fallback_policy(wt, monkeypatch):
+    # A fresh CCC writes worker_fallback {"enabled": false, "models": []}:
+    # no routes must not turn headroom dispatch into a silent no-op.
+    monkeypatch.setattr(wt.config, "worker_fallback_policy", lambda: {"enabled": False, "models": []})
+    _write_headroom(wt, monkeypatch, [_row("claude", 3, resets_in_h=1),
+                                      _row("codex", 55, resets_in_h=3)])
+    wt.config.set_headroom_dispatch("Q", True)
+    wt.workers.reconcile_once(dry_run=False)
+    assert [c["engine"] for c in wt.calls] == ["codex"]
+
+
 def test_reconcile_dispatch_off_is_unchanged(wt, monkeypatch):
     _write_headroom(wt, monkeypatch, [_row("claude", 3, resets_in_h=1),
                                       _row("codex", 55, resets_in_h=3)])

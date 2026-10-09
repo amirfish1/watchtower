@@ -3637,7 +3637,12 @@ def headroom_launch_choice(queue: str) -> Optional[Dict[str, str]]:
             return None
         engine = config.engine(queue)
         candidates = [engine]
-        for cand in config.fallback_chain():
+        # A fresh CCC writes ``worker_fallback: {"enabled": false, "models":
+        # []}``, which leaves no routes; headroom dispatch is its own opt-in,
+        # so fall back to the built-in order rather than silently doing nothing.
+        chain = config.fallback_chain() or [
+            config._ccc_worker_engine_default(), "codex", "claude", "kimi"]
+        for cand in chain:
             cand = str(cand or "").strip().lower()
             if (not cand or cand in candidates or cand not in _models.ENGINES
                     or not engine_available(cand)
