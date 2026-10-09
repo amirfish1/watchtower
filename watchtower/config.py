@@ -160,13 +160,131 @@ def _load() -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _audit_path() -> Path:
+    return config_path().with_name("queue-config.audit.json")
+
+
+def actor() -> Dict[str, Any]:
+    """Who is making this change: source, session, host, user, pid, parent cmd."""
+    import getpass
+    import socket
+    ppid = os.getppid()
+    try:
+        raw = Path(f"/proc/{ppid}/cmdline").read_bytes()
+        parent = raw.replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except OSError:
+        parent = ""
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001 - no passwd entry in some containers
+        user = os.environ.get("USER", "")
+    return {
+        "source": os.environ.get("WATCHTOWER_CONFIG_SOURCE") or "wt",
+        "session": (os.environ.get("CLAUDE_SESSION_ID")
+                    or os.environ.get("CLAUDE_CODE_SESSION_ID")
+                    or os.environ.get("CCC_SESSION_ID") or ""),
+        "host": socket.gethostname(),
+        "user": user,
+        "pid": os.getpid(),
+        "parent": f"{ppid} {parent[:120]}".strip(),
+    }
+
+
+_MISSING = object()
+
+
+def _config_diff(before: Dict[str, Any], after: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Per-queue ``key: old -> new`` lines between two config dicts."""
+    out: Dict[str, List[str]] = {}
+    for queue in sorted(set(before) | set(after)):
+        b, a = before.get(queue), after.get(queue)
+        if b == a:
+            continue
+        b = {} if b is None else b
+        a = {} if a is None else a
+        if not isinstance(b, dict) or not isinstance(a, dict):
+            out[queue] = [f"{json.dumps(b)} \u2192 {json.dumps(a)}"]
+            continue
+        out[queue] = [
+            f"{k}: {json.dumps(b[k]) if k in b else 'unset'} \u2192 "
+            f"{json.dumps(a[k]) if k in a else 'unset'}"
+            for k in sorted(set(b) | set(a)) if b.get(k, _MISSING) != a.get(k, _MISSING)
+        ]
+    return out
+
+
+def _log_config(diff: Dict[str, List[str]], tail: str) -> None:
+    try:
+        from . import queue as _q
+        for queue, lines in diff.items():
+            _q._log("CONFIG", f"{queue} updated \u2014 {'; '.join(lines)} ({tail})", queue=queue)
+    except Exception:  # noqa: BLE001 - auditing must never block a config write
+        pass
+
+
+def _record_audit(text: str, data: Dict[str, Any]) -> None:
+    import hashlib
+    try:
+        _audit_path().write_text(json.dumps(
+            {"sha": hashlib.sha256(text.encode()).hexdigest(), "config": data}))
+    except OSError:
+        pass
+
+
+def check_outside_changes() -> Dict[str, List[str]]:
+    """Daemon tick: log any edit to the live config that wt did not make.
+
+    Compares the file's hash with the one recorded by the last ``_save``.
+    Returns the diff (empty when unchanged or when there is no baseline yet).
+    """
+    import hashlib
+    path = config_path()
+    try:
+        text = path.read_text()
+        mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    except OSError:
+        return {}
+    sha = hashlib.sha256(text.encode()).hexdigest()
+    try:
+        base = json.loads(_audit_path().read_text())
+    except (OSError, ValueError):
+        base = None
+    if not isinstance(base, dict) or "config" not in base:
+        _record_audit(text, _load())  # first sight: establish the baseline
+        return {}
+    if base.get("sha") == sha:
+        return {}
+    try:
+        now = json.loads(text)
+    except ValueError:
+        now = {}
+    now = now if isinstance(now, dict) else {}
+    diff = _config_diff(base["config"] if isinstance(base["config"], dict) else {}, now)
+    stamp = mtime.strftime("%Y-%m-%d %H:%M:%S UTC")
+    _log_config(diff, f"CONFIG changed outside wt; file mtime {stamp}")
+    _record_audit(text, now)
+    return diff
+
+
 def _save(data: Dict[str, Any]) -> None:
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    # A pending outside edit is reported before our write buries it.
+    check_outside_changes()
+    try:
+        before = json.loads(path.read_text())
+    except (OSError, ValueError):
+        before = {}
     tmp = str(path) + ".tmp"
+    text = json.dumps(data, indent=2)
     with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
+        f.write(text)
     os.replace(tmp, path)
+    _record_audit(text, data)
+    a = actor()
+    tail = (f"via {a['source']}; session={a['session'] or '-'} host={a['host']} "
+            f"user={a['user']} pid={a['pid']} parent={a['parent']!r}")
+    _log_config(_config_diff(before if isinstance(before, dict) else {}, data), tail)
 
 
 def _queue_entry(queue: str) -> Dict[str, Any]:

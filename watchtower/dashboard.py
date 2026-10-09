@@ -44,10 +44,14 @@ the same way (see docs/messaging-design.md).
 
 from __future__ import annotations
 
+import faulthandler
 import hmac
 import html
 import json
 import os
+import signal
+import sys
+import threading
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -118,9 +122,12 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     """
     items = q.list_items()
     rows = health.all_status(stuck_minutes=stuck_minutes, items=items)
-    counts = workers.worker_counts()
-    retained = workers.retained_counts()
+    # One roster listing: each list_workers() takes workers.lock exclusively
+    # and probes every pid, so listing it three times per poll starved the
+    # daemon's own tick (WT-4).
     wrows = workers.list_workers(prune=False)
+    counts = workers.worker_counts(rows=wrows)
+    retained = workers.retained_counts(rows=wrows)
     workers.annotate_activity(wrows, items)
     workers_by_queue: Dict[str, List[Dict[str, Any]]] = {}
     for worker in wrows:
@@ -163,6 +170,53 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
                 f"{model or f'{engine} default model'} does not support effort {effort!r}"
             )
     return {"queues": rows, "workers": wrows, "github": health.github_connectivity()}
+
+
+STATUS_CACHE_TTL_S = 2.0
+_status_cache: Dict[str, Any] = {"at": 0.0, "payload": None}
+_status_compute = threading.Lock()
+
+
+def cached_status_payload() -> Dict[str, Any]:
+    """``status_payload()`` with a short-lived shared snapshot (WT-4).
+
+    Concurrent requests used to each recompute the payload, queueing on
+    workers.lock behind the daemon tick. Now one thread recomputes at a time;
+    the rest get the last snapshot immediately. Only the very first request
+    (no snapshot yet) waits for the computation.
+    """
+    snap = _status_cache["payload"]
+    if snap is not None and time.monotonic() - _status_cache["at"] < STATUS_CACHE_TTL_S:
+        return snap
+    if snap is not None:
+        if not _status_compute.acquire(blocking=False):
+            return snap  # someone else is refreshing: serve stale, don't queue
+    else:
+        _status_compute.acquire()
+        snap = _status_cache["payload"]
+        if snap is not None and time.monotonic() - _status_cache["at"] < STATUS_CACHE_TTL_S:
+            _status_compute.release()
+            return snap
+    try:
+        payload = status_payload()
+        _status_cache["payload"] = payload
+        _status_cache["at"] = time.monotonic()
+        return payload
+    finally:
+        _status_compute.release()
+
+
+def install_stack_dump_handler() -> bool:
+    """Dump every thread's stack to stderr on SIGUSR1 (WT-4): the only way to
+    diagnose a live stall where ptrace/py-spy are unavailable. Main thread only."""
+    sig = getattr(signal, "SIGUSR1", None)
+    if sig is None or threading.current_thread() is not threading.main_thread():
+        return False
+    try:
+        faulthandler.register(sig, file=sys.stderr, all_threads=True)
+    except (OSError, RuntimeError, ValueError, AttributeError):
+        return False
+    return True
 
 
 CLOSED_LIMIT = 50  # cap the drill-down's closed section to the most-recent N.
@@ -1492,7 +1546,7 @@ class _Handler(BaseHTTPRequestHandler):
                 chat_rows = chats.list_chats(include_archived=False)
             except Exception:
                 chat_rows = []
-            self._html(200, render_index(status_payload(), chat_rows))
+            self._html(200, render_index(cached_status_payload(), chat_rows))
         elif path.startswith("/chat/"):
             from . import chats
             ref = urllib.parse.unquote(path[len("/chat/"):])
@@ -1522,7 +1576,7 @@ class _Handler(BaseHTTPRequestHandler):
                 closed=closed_tickets(norm), total_closed=len(all_closed),
             ))
         elif path == "/api/status":
-            self._json(200, status_payload())
+            self._json(200, cached_status_payload())
         elif path == "/api/queues":
             self._json(200, q.queues())
         elif path.startswith("/api/queue/"):
@@ -1859,6 +1913,8 @@ def serve(
     the foreground path; ``wt dashboard`` normally launches it detached.
     """
     httpd = ThreadingHTTPServer((host, port), _Handler)
+    if not once:
+        install_stack_dump_handler()
     bound_host, bound_port = httpd.server_address[0], httpd.server_address[1]
     if not once:
         print(f"WatchTower dashboard on http://{bound_host}:{bound_port}")

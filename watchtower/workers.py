@@ -2865,6 +2865,11 @@ def reap_released_workers(
     now = time.time() if now is None else float(now)
     actions: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
+    # Computed once per pass, on first need: each call lists every ticket in
+    # every queue (GitHub-backed ones parse each issue body), and calling it
+    # per released row under the workers lock pegged the daemon at 100% CPU
+    # and starved every reader of that lock (95 rows, 2026-10-05).
+    fresh_owners: Optional[set] = None
     with _WorkersFileLock():
         data = _load()
         changed = False
@@ -2876,7 +2881,9 @@ def reap_released_workers(
             if age_s < ttl_s:
                 continue
             worker_id = str(row.get("worker_id") or "")
-            if worker_id in _fresh_park_owners(now):
+            if fresh_owners is None:
+                fresh_owners = _fresh_park_owners(now)
+            if worker_id in fresh_owners:
                 continue  # WT-28: owns a park younger than the grace
             pid = int(row.get("pid", 0) or 0)
             if not _pid_alive(pid):
@@ -4254,6 +4261,24 @@ def record_worker(
     return rec
 
 
+# A dead rebound row is kept so a second continuation of the same worker id is
+# refused (5def6b5), but nothing ever expired it: 93 such rows piled up over
+# 20 days, and every pass over workers.json paid for them. A week covers any
+# realistic second-continuation attempt.
+REBOUND_RETENTION_S = 7 * 24 * 3600
+
+
+def _rebound_row_retained(w: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """True while a dead rebound row is inside its retention window, measured
+    from the later of ``rebound_at`` and ``released_at``."""
+    if not w.get("rebound_at"):
+        return False
+    now = time.time() if now is None else now
+    ages = [_iso_age_s(str(w.get(k) or ""), now) for k in ("rebound_at", "released_at")
+            if w.get(k)]
+    return min(ages) < REBOUND_RETENTION_S
+
+
 def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
     """Return tracked workers, each annotated with a live flag.
 
@@ -4317,7 +4342,7 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                 audit_state.get("release_log_pending")
                 or audit_state.get("spawn_plan_pending")
             )
-            if alive or pending_audit or w.get("rebound_at"):
+            if alive or pending_audit or _rebound_row_retained(w):
                 kept.append(w)
             elif w.get("stage") and _stage_record_kept(w, prune, postmortem):
                 # WT-24: a dead stage session keeps its record for a short
@@ -4533,15 +4558,16 @@ def parked_label(item: Dict[str, Any]) -> str:
             f"at {pk.get('at') or '-'}")
 
 
-def retained_counts() -> Dict[str, int]:
+def retained_counts(rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, int]:
     """Per-queue count of live workers retained for a parked answer (WT-28),
-    shown next to ``live`` in status / the dashboard."""
+    shown next to ``live`` in status / the dashboard. ``rows`` reuses an
+    already-listed roster instead of taking workers.lock again (WT-4)."""
     try:
         retained = retained_parked_ids()
     except Exception:
         return {}
     out: Dict[str, int] = {}
-    for w in list_workers():
+    for w in (list_workers() if rows is None else rows):
         if (w.get("alive") and not _worker_released(w)
                 and str(w.get("worker_id") or "") in retained):
             out[w.get("queue", "")] = out.get(w.get("queue", ""), 0) + 1
@@ -4561,14 +4587,16 @@ def live_worker_count(queue: Optional[str] = None, exclude: Optional[set] = None
     return n
 
 
-def worker_counts(prune: bool = False) -> Dict[str, Dict[str, int]]:
+def worker_counts(prune: bool = False,
+                  rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Dict[str, int]]:
     """Per-queue worker tally: ``{queue: {"total": n, "live": n}}``.
 
     A single pass over the tracked workers so callers (``wt status``, the
-    dashboard) don't fan out one liveness probe per queue.
+    dashboard) don't fan out one liveness probe per queue. ``rows`` reuses an
+    already-listed roster instead of taking workers.lock again (WT-4).
     """
     out: Dict[str, Dict[str, int]] = {}
-    for w in list_workers(prune=prune):
+    for w in (list_workers(prune=prune) if rows is None else rows):
         if w.get("stage") and not w.get("alive"):
             continue  # kept-dead stage record (WT-24): not a queue worker
         row = out.setdefault(w.get("queue", ""), {"total": 0, "live": 0})
@@ -7579,7 +7607,13 @@ def build_adhoc_command(
     if engine == "codex":
         if not shutil.which(_ENGINE_BIN["codex"]):
             raise ValueError("codex CLI not found on PATH")
-        argv = [_ENGINE_BIN["codex"], "exec"]
+        # Ad-hoc critics need the same trusted launch policy as queue workers:
+        # the default Linux sandbox may fail before even read-only commands
+        # run, and a headless process cannot answer approval prompts.
+        argv = [
+            _ENGINE_BIN["codex"], "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
         if model:
             argv += ["--model", model]
         argv += codex_compact_args()
