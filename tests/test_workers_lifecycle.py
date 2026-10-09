@@ -5064,3 +5064,23 @@ def test_live_quota_worker_retires_promptly_without_replaying_claim(wt, holds_cl
         assert cooldown["reason"] == "engine usage limit"
     else:
         assert wt.q.list_items(project="Q")[0]["status"] == "in_progress"
+
+
+def test_stale_idle_worker_without_claim_does_not_count_as_staffed(wt, monkeypatch):
+    """An alive worker with no claim and no activity past STALE_IDLE_S is not
+    draining, so it must not hold the spawn budget: claimable work spawns a
+    fresh worker. A recently active one still counts as staffed."""
+    wt.config.set_auto_drain("Q", True)  # desired_workers defaults to 1
+    wt.q.enqueue(project="Q", note="claimable work")
+    worker = _live_worker(wt, "Q")
+
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert not [s for s in r["spawned"] if s["queue"] == "Q"]
+
+    old = time.time() - wt.workers.STALE_IDLE_S - 60
+    for path in (worker["log"], worker["_test_activity_path"]):
+        os.utime(path, (old, old))
+    monkeypatch.setattr(wt.workers, "_worker_idle_s",
+                        lambda w: wt.workers.STALE_IDLE_S + 60)
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1

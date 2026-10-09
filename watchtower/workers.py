@@ -858,6 +858,12 @@ _AUDIT_BOOT_ID = uuid.uuid4().hex[:12]
 # worker's cache is already cold well before this fires -- resuming it after
 # that point buys nothing but the leak risk the TTL exists to bound.
 RELEASED_TTL_S = int(os.environ.get("WATCHTOWER_RELEASED_TTL_S") or 1 * 3600)
+# A live worker that holds no active claim and has shown no activity for this
+# long is not draining the queue (wedged, errored out mid-session, or parked
+# between turns), so the reconciler stops counting it as staffed capacity and
+# lets a fresh worker cover the slot. It is not killed here; idle release
+# still reaps it at RELEASED_TTL_S.
+STALE_IDLE_S = int(os.environ.get("WATCHTOWER_STALE_IDLE_S") or 15 * 60)
 _RELEASED_KILL_GRACE_S = 30
 
 # A live worker that has never claimed a ticket and whose queue is stuck can be
@@ -6931,8 +6937,20 @@ def _reconcile_once_locked(dry_run: bool = False,
             and str(w.get("worker_id") or "") not in busy_ids_here
             and w not in unwakeable_blocked
         ]
-        staffed = actual - blocked_count - len(retained_here)
+        # Idle-but-alive workers with no claim (wedged, errored mid-session)
+        # were still counted as staffed until idle release reaped them an
+        # hour later, so claimable work sat with no worker spawned for it.
+        stale_idle = [
+            w for w in live
+            if str(w.get("worker_id") or "") not in busy_ids_here
+            and w not in unwakeable_blocked
+            and w not in retained_here
+            and _worker_idle_s(w) >= STALE_IDLE_S
+        ]
+        staffed = actual - blocked_count - len(retained_here) - len(stale_idle)
         blocked_note = f", {blocked_count} blocked" if blocked_count else ""
+        if stale_idle:
+            blocked_note += f", {len(stale_idle)} stale-idle"
 
         if not dry_run and depth > 0 and wakeable_blocked:
             _maybe_wake_blocked_workers(q_name, wakeable_blocked)
