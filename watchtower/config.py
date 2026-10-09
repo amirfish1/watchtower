@@ -997,6 +997,16 @@ def fallback_effort(queue: str, eng: str) -> str:
     return effort(queue)
 
 
+def fallback_chain() -> List[str]:
+    """The ordered engines a queue may be moved to: CCC's ``worker_fallback``
+    routes when that policy exists, else the worker default then the local
+    order Codex -> Claude -> Kimi. Raw order, unfiltered (may repeat or hold
+    blanks); callers skip unavailable/excluded engines themselves."""
+    policy = worker_fallback_policy()
+    return ([row["engine"] for row in policy["models"]] if policy is not None
+            else [_ccc_worker_engine_default(), "codex", "claude", "kimi"])
+
+
 def fallback_engine(failed_engine: str, *, excluded=()) -> str:
     """Choose an available replacement engine after a provider-level failure.
 
@@ -1005,9 +1015,7 @@ def fallback_engine(failed_engine: str, *, excluded=()) -> str:
     engine is never retried as its own fallback.
     """
     failed = str(failed_engine or "").strip().lower()
-    policy = worker_fallback_policy()
-    candidates = ([row["engine"] for row in policy["models"]] if policy is not None
-                  else [_ccc_worker_engine_default(), "codex", "claude", "kimi"])
+    candidates = fallback_chain()
     excluded = {str(item).strip().lower() for item in excluded}
     from . import workers as _workers
     seen = set()
@@ -1044,6 +1052,31 @@ def fallback_to_default_worker(queue: str) -> bool:
     if "fallback_to_default_worker" in entry:
         return bool(entry["fallback_to_default_worker"])
     return bool((worker_fallback_policy() or {}).get("enabled", False))
+
+
+def set_headroom_dispatch(queue: str, enabled: Optional[bool]) -> Dict[str, Any]:
+    data = _load()
+    q = data.setdefault(queue, {})
+    if enabled is None:
+        q.pop("headroom_dispatch", None)
+    else:
+        q["headroom_dispatch"] = bool(enabled)
+    _save(data)
+    return q
+
+
+def headroom_dispatch(queue: str) -> bool:
+    """Headroom-aware dispatch (31K B25): before launching, consult CCC's
+    ``/api/headroom`` and start this queue's workers on whichever engine in
+    its fallback chain has quota left -- soonest reset first, so the quota
+    that expires first is spent first -- instead of the queue engine when
+    that one is nearly exhausted. Launch-time only; the stored engine/model
+    never change. Opt-in: an explicit queue On/Off wins, else CCC's
+    spawn-defaults ``worker_headroom_dispatch``, else Off."""
+    entry = _queue_entry(queue)
+    if "headroom_dispatch" in entry:
+        return bool(entry["headroom_dispatch"])
+    return _ccc_model_settings().get("worker_headroom_dispatch") is True
 
 
 def fallback_model(eng: str) -> str:

@@ -469,6 +469,37 @@ escalates in four steps as the same failure repeats:
    no fallback installed, is parked on a repeated failure instead: `auto_drain`
    goes off with the reason logged, and `wt drain on <queue>` resumes it.
 
+#### Headroom-aware dispatch (proactive, opt-in)
+
+Everything above is reactive: it waits for an engine to hit its usage wall.
+With `wt config -q <queue> --headroom-dispatch on` (or CCC spawn-defaults
+`"worker_headroom_dispatch": true` for queues with no explicit setting;
+default **off**) the reconciler checks quota headroom *before* launching.
+`workers.headroom_launch_choice` builds candidates from the queue engine plus
+its fallback chain (`config.fallback_chain()`, the same source
+`fallback_engine` uses), drops engines that are unavailable or in launch
+cooldown, and asks `headroom.pick_engine` to rank them from CCC's
+`GET /api/headroom` rows:
+
+- a row is usable when available, not stale, not unlimited, and
+  `percent_left` >= 10; each engine uses its best account;
+- engines whose known headroom is under 10% are avoided;
+- usable engines rank by `resets_at` ascending (spend what expires first),
+  then by more headroom left;
+- no usable data (CCC down, old CCC 404, every engine low) keeps the normal
+  queue engine.
+
+When the pick differs from the queue engine, that tick launches on it exactly
+like the cooldown substitute (`fallback_model`, `fallback_effort`, queue model
+not inherited; the stored engine/model are untouched), logs `HEADROOM_DISPATCH`
+with the reason (e.g. `headroom: claude 4% left; codex 61% left, resets in
+3.0h`), and records it in reconcile's `fallbacks`. The liveness backstop spawn
+uses the same helper. Headroom is read with a 1.5 s timeout and cached
+in-process for 60 s (30 s after a failure); `WATCHTOWER_CCC_HEADROOM_URL`
+overrides the URL (default `http://127.0.0.1:<port.txt>/api/headroom`) and
+`WATCHTOWER_HEADROOM_FILE` reads a JSON file in the same shape instead
+(tests/E2E).
+
 ### `request_stop(worker_id)`
 
 Creates the stop-signal sentinel, then persists `released_at` under the

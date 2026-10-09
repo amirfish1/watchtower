@@ -3620,6 +3620,45 @@ def _launch_substitute(queue: str, engine: str, *, attempted=()) -> str:
         excluded.add(substitute)
 
 
+def headroom_launch_choice(queue: str) -> Optional[Dict[str, str]]:
+    """Headroom-aware dispatch (31K B25): the engine this queue's next
+    workers should launch on given CCC's quota headroom, or None to keep the
+    queue engine. Only for queues with ``headroom_dispatch`` on. Candidates
+    are the queue engine then its fallback chain, skipping engines that are
+    unavailable or cooling down on this queue. Like the cooldown substitute
+    this is launch-time only -- the stored engine/model are never changed.
+
+    Returns ``{"engine", "model", "effort", "reason"}`` when a different
+    engine should be used. Never raises (headroom is advisory)."""
+    from . import config, headroom
+    from . import models as _models
+    try:
+        if not config.headroom_dispatch(queue):
+            return None
+        engine = config.engine(queue)
+        candidates = [engine]
+        for cand in config.fallback_chain():
+            cand = str(cand or "").strip().lower()
+            if (not cand or cand in candidates or cand not in _models.ENGINES
+                    or not engine_available(cand)
+                    or active_launch_failure_cooldown(queue, cand)):
+                continue
+            candidates.append(cand)
+        if len(candidates) < 2:
+            return None
+        chosen, reason = headroom.pick_engine(candidates, headroom.read_rows())
+        if not chosen or chosen == engine:
+            return None
+        return {
+            "engine": chosen,
+            "model": config.fallback_model(chosen),
+            "effort": config.fallback_effort(queue, chosen),
+            "reason": reason,
+        }
+    except Exception:  # noqa: BLE001 - never let advisory data block a spawn
+        return None
+
+
 def active_launch_failure_cooldown(
     queue: str, engine: str
 ) -> Optional[Dict[str, Any]]:
@@ -7003,12 +7042,46 @@ def _reconcile_once_locked(dry_run: bool = False,
                     "to_engine": substitute,
                     "reason": reason,
                 })
+            launch_effort: Dict[str, str] = {}
+            if not cooldown and not dry_run:
+                # Headroom-aware dispatch (31K B25, opt-in): proactively
+                # launch on the engine whose quota expires soonest instead of
+                # waiting for the queue engine to hit its usage wall.
+                choice = headroom_launch_choice(q_name)
+                if choice:
+                    launch_engine = choice["engine"]
+                    launch_model = choice["model"]
+                    launch_effort = {"effort": choice["effort"]}
+                    substitute_note = (
+                        f"; headroom dispatch {engine}->{launch_engine} "
+                        f"({choice['reason']})"
+                    )
+                    result["fallbacks"].append({
+                        "queue": q_name,
+                        "from_engine": engine,
+                        "to_engine": launch_engine,
+                        "reason": choice["reason"],
+                    })
+                    _q._log(
+                        "HEADROOM_DISPATCH",
+                        f"launching {q_name} on {launch_engine} instead of "
+                        f"{engine}: {choice['reason']} | "
+                        + _audit_detail(
+                            reconcile_id=reconcile_id, queue=q_name,
+                            engine=engine, launch_engine=launch_engine,
+                            requested=to_spawn,
+                        ),
+                        queue=q_name,
+                    )
+            elif launch_engine != engine:
+                launch_effort = {
+                    "effort": config.fallback_effort(q_name, launch_engine)
+                }
             launch_failed: List[Dict[str, Any]] = []
             spawned = spawn_workers(
                 q_name, n=to_spawn, engine=launch_engine, model=launch_model,
                 inherit_queue_model=launch_engine == engine,
-                **({"effort": config.fallback_effort(q_name, launch_engine)}
-                   if launch_engine != engine else {}),
+                **launch_effort,
                 repo_path=repo_path, dry_run=dry_run,
                 launch_failures=launch_failed,
                 # On a drain-off queue the worker exists only for the tickets
