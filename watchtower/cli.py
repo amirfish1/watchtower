@@ -2617,8 +2617,11 @@ def _resume_rejected(item: dict, reason: str, engine: str = "") -> int:
 def cmd_accept(args: argparse.Namespace) -> int:
     """Accept an in_review ticket (WT-5): it closes and its dependents unblock."""
     try:
+        # actor: the caller's own session identity, so accepting a review
+        # gate you filed yourself doesn't echo "closed" back (WATCHTOWER-37).
         item = q.accept(args.ref, by=args.by or "human", force=getattr(args, "force", False),
-                        no_proof=bool(getattr(args, "no_proof", False)))
+                        no_proof=bool(getattr(args, "no_proof", False)),
+                        actor=_default_report_to()[0])
     except q.GroupFenced as exc:
         print(f"SUPERSEDED: {exc}", file=sys.stderr)
         return 1
@@ -4699,6 +4702,9 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
         changed.append(f"gates={config.gates(args.queue) or 'none'}")
+    if getattr(args, "gate_worktree", None) is not None:
+        config.set_gate_worktree(args.queue, args.gate_worktree)
+        changed.append(f"gate_worktree={args.gate_worktree}")
     if getattr(args, "post_fix_assessment", None) is not None:
         enabled = args.post_fix_assessment == "on"
         if enabled:
@@ -7133,7 +7139,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--gate", action="append", default=None, metavar="GATE",
                    help="queue default acceptance gate (repeatable, ordered): "
                         "cmd:<command>, verify, review or review:<target>; "
-                        "--gate none clears them")
+                        "--gate none clears them. A cmd gate runs in the "
+                        "ticket's repo at the closing commit -- in a detached "
+                        "worktree when that commit is not the checkout's HEAD "
+                        "(see --gate-worktree); env: WT_GATE_COMMIT, "
+                        "WT_TICKET_REF, WT_GATE_REPO (the checkout)")
+    s.add_argument("--gate-worktree", default=None, choices=["fresh", "persistent"],
+                   dest="gate_worktree",
+                   help="where cmd gates run off-HEAD: fresh (default) = a "
+                        "throwaway worktree with no gitignored files, so no "
+                        "node_modules; persistent = one reusable "
+                        "<repo>-wt-wtgate worktree force-reset to the commit "
+                        "that keeps gitignored files (node_modules, caches) "
+                        "between runs -- install deps in the command, e.g. "
+                        "cmd:'[ -d node_modules ] || npm ci; npx vitest run'")
     s.add_argument("--post-fix-assessment", default=None, choices=["on", "off"],
                    dest="post_fix_assessment",
                    help="on = every bug that closes as completed gets an independent "

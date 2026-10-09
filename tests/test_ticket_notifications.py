@@ -606,3 +606,49 @@ def test_wt_config_notify_events_flag(wt_cli, capsys):
                             "claimed,bogus"]) == 1
     err = capsys.readouterr().err
     assert "unknown notify event(s): bogus" in err
+
+
+# ------------------------------------------------- notify: accept (WATCHTOWER-37)
+def _in_review(wt, monkeypatch, submitter):
+    monkeypatch.setattr(wt.q, "_notify_review", lambda *a, **k: None)
+    item = wt.q.enqueue(project="SUB", note="gated", submitter=submitter, gates=["review"])
+    wt.q.claim_by_ref(item["ref"], "builder")
+    assert wt.q.close(item["ref"], "builder", resolution={"summary": "built"})["status"] == "in_review"
+    return item
+
+
+def test_self_accept_does_not_notify_the_accepter_but_others_still_hear(wt, monkeypatch):
+    """A session that accepts its own review gate gets no "closed" echo, even
+    though ``by`` is just the default "human" label; another subscriber does."""
+    sid = "11111111-2222-3333-4444-555555555555"
+    wt.config.add_subscriber("SUB", "watcher")
+    item = _in_review(wt, monkeypatch, sid)
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.accept(item["ref"], actor=sid)
+
+    assert [t for t, _ in calls] == ["watcher"]
+    assert "closed" in calls[0][1]
+
+
+def test_accept_by_someone_else_still_notifies_the_submitter(wt, monkeypatch):
+    item = _in_review(wt, monkeypatch, "11111111-2222-3333-4444-555555555555")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.accept(item["ref"], actor="99999999-8888-7777-6666-555555555555")
+
+    assert [t for t, _ in calls] == ["11111111-2222-3333-4444-555555555555"]
+
+
+def test_cli_accept_passes_the_callers_session_as_actor(wt_cli, monkeypatch, capsys):
+    sid = "11111111-2222-3333-4444-555555555555"
+    item = _in_review(wt_cli, monkeypatch, sid)
+    monkeypatch.setattr(wt_cli.cli.q, "_notify_review", lambda *a, **k: None)
+    calls = _record_sends(monkeypatch, wt_cli.messages)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+
+    assert wt_cli.cli.main(["accept", item["ref"]]) == 0
+    capsys.readouterr()
+
+    assert wt_cli.q.get(item["ref"])["status"] == "closed"
+    assert calls == []

@@ -3400,40 +3400,110 @@ def _pinned_setup_failed(command: str, commit: str, why: str, started: float) ->
             "seconds": round(time.time() - started, 1), "setup_failed": True}
 
 
+def _gate_worktree_path(repo: str) -> str:
+    """The persistent gate worktree for ``repo``: a ``<repo>-wt-wtgate``
+    sibling (the ``../<repo>-wt-<name>`` worktree convention)."""
+    real = os.path.realpath(repo).rstrip(os.sep)
+    return os.path.join(os.path.dirname(real), os.path.basename(real) + "-wt-wtgate")
+
+
+def _acquire_persistent_gate_worktree(repo: str, commit: str) -> Tuple[str, Any]:
+    """WATCHTOWER-38: check out ``commit`` in the repo's reusable gate worktree
+    and return ``(path, lock_fh)``; ``("", None)`` when it can't be used, and the
+    caller then falls back to a fresh worktree. The checkout is forced and
+    untracked files are cleaned, but gitignored ones (node_modules, build
+    caches) survive, so a Node gate doesn't need a full install every run.
+    Accepted only when HEAD is ``commit`` and ``git status`` is clean. One gate
+    at a time per repo: a busy lock falls back rather than waiting."""
+    import subprocess
+    if fcntl is None:
+        return "", None
+
+    def git(*a: str, at: str = repo) -> "subprocess.CompletedProcess[str]":
+        return subprocess.run(["git", "-C", at, *a], capture_output=True, text=True)
+
+    common = git("rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    full = git("rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}").stdout.strip()
+    if not common or not full:
+        return "", None
+    try:
+        fh = open(os.path.join(common, "wt-gate-worktree.lock"), "a")
+    except OSError:
+        return "", None
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return "", None
+    path = _gate_worktree_path(repo)
+    ok = False
+    try:
+        if not os.path.isdir(path):
+            git("worktree", "prune")
+            ok = git("worktree", "add", "--detach", path, full).returncode == 0
+        else:
+            theirs = git("rev-parse", "--path-format=absolute", "--git-common-dir",
+                         at=path).stdout.strip()
+            # never reset a directory that is not this repo's worktree
+            ok = bool(theirs) and os.path.realpath(theirs) == os.path.realpath(common) \
+                and git("checkout", "--quiet", "--detach", "--force", full,
+                        at=path).returncode == 0 \
+                and git("clean", "-ffdq", at=path).returncode == 0
+        if ok:
+            st = git("status", "--porcelain", at=path)
+            ok = git("rev-parse", "HEAD", at=path).stdout.strip() == full \
+                and st.returncode == 0 and not st.stdout.strip()
+    finally:
+        if not ok:
+            fh.close()
+    return (path, fh) if ok else ("", None)
+
+
 def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str,
-                  pinned: bool = False) -> Dict[str, Any]:
+                  pinned: bool = False, persistent: bool = False) -> Dict[str, Any]:
     """Run one cmd gate; at the closing commit when it differs from the repo's
     checked-out HEAD (via a throwaway detached worktree).
 
     ``pinned`` (WT-33 D7.6, a group integration): ALWAYS in a fresh detached
     worktree at ``commit`` (the checkout may be dirty even when it is at that
     commit), verified by ``rev-parse HEAD``; any setup failure returns
-    ``setup_failed`` without ever running the command in the checkout."""
+    ``setup_failed`` without ever running the command in the checkout.
+
+    ``persistent`` (WATCHTOWER-38, ``wt config --gate-worktree persistent``):
+    wherever a fresh worktree would be made, first try the repo's reusable gate
+    worktree (see ``_acquire_persistent_gate_worktree``); it is left in place
+    afterwards. The command gets ``WT_GATE_REPO`` (the checkout) either way."""
     import shutil
     import subprocess
     import tempfile
     cwd = os.path.expanduser(repo_path) if repo_path else os.getcwd()
     tmp = ""
+    kept, lock = "", None
     started = time.time()
     if pinned:
         if not (commit and repo_path and os.path.isdir(cwd)):
             return _pinned_setup_failed(command, commit, f"no checkout at {repo_path or '(none)'} "
                                         f"or no commit", started)
-        tmp = tempfile.mkdtemp(prefix="wt-gate-")
-        add = subprocess.run(["git", "-C", cwd, "worktree", "add", "--detach", tmp, commit],
-                             capture_output=True, text=True)
-        at = subprocess.run(["git", "-C", tmp, "rev-parse", "HEAD"], capture_output=True,
-                            text=True).stdout.strip() if add.returncode == 0 else ""
-        full = subprocess.run(["git", "-C", cwd, "rev-parse", commit], capture_output=True,
-                              text=True).stdout.strip()
-        if add.returncode != 0 or not at or at != full:
-            subprocess.run(["git", "-C", cwd, "worktree", "remove", "--force", tmp],
-                           capture_output=True)
-            shutil.rmtree(tmp, ignore_errors=True)
-            why = (add.stderr or "").strip()[-400:] if add.returncode != 0 else \
-                f"worktree HEAD {at or '?'} is not {full or commit}"
-            return _pinned_setup_failed(command, commit, why, started)
-        cwd = tmp
+        if persistent:
+            kept, lock = _acquire_persistent_gate_worktree(cwd, commit)
+        if kept:
+            cwd = kept
+        else:
+            tmp = tempfile.mkdtemp(prefix="wt-gate-")
+            add = subprocess.run(["git", "-C", cwd, "worktree", "add", "--detach", tmp, commit],
+                                 capture_output=True, text=True)
+            at = subprocess.run(["git", "-C", tmp, "rev-parse", "HEAD"], capture_output=True,
+                                text=True).stdout.strip() if add.returncode == 0 else ""
+            full = subprocess.run(["git", "-C", cwd, "rev-parse", commit], capture_output=True,
+                                  text=True).stdout.strip()
+            if add.returncode != 0 or not at or at != full:
+                subprocess.run(["git", "-C", cwd, "worktree", "remove", "--force", tmp],
+                               capture_output=True)
+                shutil.rmtree(tmp, ignore_errors=True)
+                why = (add.stderr or "").strip()[-400:] if add.returncode != 0 else \
+                    f"worktree HEAD {at or '?'} is not {full or commit}"
+                return _pinned_setup_failed(command, commit, why, started)
+            cwd = tmp
     try:
         if commit and repo_path and os.path.isdir(cwd) and not pinned:
             head = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
@@ -3441,16 +3511,22 @@ def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str,
             full = subprocess.run(["git", "-C", cwd, "rev-parse", commit],
                                   capture_output=True, text=True).stdout.strip()
             if full and head and full != head:
-                tmp = tempfile.mkdtemp(prefix="wt-gate-")
-                add = subprocess.run(
-                    ["git", "-C", cwd, "worktree", "add", "--detach", tmp, full],
-                    capture_output=True, text=True)
-                if add.returncode == 0:
-                    cwd = tmp
+                if persistent:
+                    kept, lock = _acquire_persistent_gate_worktree(cwd, full)
+                if kept:
+                    cwd = kept
                 else:
-                    shutil.rmtree(tmp, ignore_errors=True)
-                    tmp = ""
-        env = dict(os.environ, WT_GATE_COMMIT=commit or "", WT_TICKET_REF=ref)
+                    tmp = tempfile.mkdtemp(prefix="wt-gate-")
+                    add = subprocess.run(
+                        ["git", "-C", cwd, "worktree", "add", "--detach", tmp, full],
+                        capture_output=True, text=True)
+                    if add.returncode == 0:
+                        cwd = tmp
+                    else:
+                        shutil.rmtree(tmp, ignore_errors=True)
+                        tmp = ""
+        env = dict(os.environ, WT_GATE_COMMIT=commit or "", WT_TICKET_REF=ref,
+                   WT_GATE_REPO=os.path.expanduser(repo_path) if repo_path else "")
         try:
             proc = subprocess.run(command, shell=True, cwd=cwd, env=env,
                                   capture_output=True, text=True,
@@ -3462,13 +3538,18 @@ def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str,
         except OSError as exc:
             ok, out, code = False, str(exc), -1
     finally:
+        if lock is not None:
+            lock.close()
         if tmp:
             subprocess.run(["git", "-C", os.path.expanduser(repo_path), "worktree",
                             "remove", "--force", tmp], capture_output=True)
             shutil.rmtree(tmp, ignore_errors=True)
-    return {"gate": "cmd:" + command, "passed": ok, "exit_code": code,
-            "output_tail": out[-GATE_OUTPUT_TAIL:], "commit": commit or "",
-            "at": _now_iso(), "seconds": round(time.time() - started, 1)}
+    res = {"gate": "cmd:" + command, "passed": ok, "exit_code": code,
+           "output_tail": out[-GATE_OUTPUT_TAIL:], "commit": commit or "",
+           "at": _now_iso(), "seconds": round(time.time() - started, 1)}
+    if kept:
+        res["worktree"] = kept
+    return res
 
 
 def evaluate_gates(item: Dict[str, Any], commit: str = "",
@@ -3480,10 +3561,18 @@ def evaluate_gates(item: Dict[str, Any], commit: str = "",
     False (and ``stages`` is then empty). ``pinned``: see ``_run_cmd_gate``."""
     results: List[Dict[str, Any]] = []
     gates = effective_gates(item)
+    persistent = False
+    if any(g.startswith("cmd:") for g in gates):
+        try:
+            from . import config as _config
+            persistent = _config.gate_worktree(str(item.get("project") or "")) == "persistent"
+        except Exception:
+            persistent = False
     for g in gates:
         if g.startswith("cmd:"):
             r = _run_cmd_gate(g[4:], str(item.get("repo_path") or ""), commit,
-                              str(item.get("ref") or ""), pinned=pinned)
+                              str(item.get("ref") or ""), pinned=pinned,
+                              persistent=persistent)
             results.append(r)
             if not r["passed"]:
                 return results, []
@@ -3720,10 +3809,16 @@ def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any,
 
 
 def accept(ident: Any, by: str = "human", force: bool = False,
-           no_proof: bool = False) -> Optional[Dict[str, Any]]:
+           no_proof: bool = False, actor: Any = None) -> Optional[Dict[str, Any]]:
     """Accept an ``in_review`` ticket: it becomes ``closed`` (its dependents
     unblock). Raises ValueError when it is not awaiting review, or while the
     independent verifier's verdict is still pending (``force`` overrides).
+
+    ``actor`` is the accepting session's own identity (``wt accept`` passes
+    the caller's session UUID / codex @name), added to ``by`` when skipping
+    the "closed" echo -- ``by`` is a free-text label ("human" by default),
+    so without it a session that accepts its own review gate got its own
+    accept pushed back as a "[watchtower] Q-1 closed" message (WATCHTOWER-37).
 
     A group parent (WT-33 D7.5/D9) closes only through the proof-checking
     ``_group_close_unlocked``; ``force`` also applies to an ``open`` parent
@@ -3763,14 +3858,15 @@ def accept(ident: Any, by: str = "human", force: bool = False,
             return None
     if refused:
         raise GroupFenced(refused)
+    actors = [by] + (list(actor) if isinstance(actor, (list, tuple, set)) else [actor])
     if group_role(item) == "parent":
-        _after_group_close(item, str(by))
+        _after_group_close(item, str(by), actors)
         return get(item.get("ref") or ident) or item
     _group_wake([str(p.get("ref")) for p in _group_due_for(item)], "integration")
     _log("ACCEPT", f"{item.get('ref', '?')}", queue=item.get("project", ""))
     res = item.get("resolution") or {}
     _notify_ticket_event(item, "closed", detail=res.get("summary", "") if isinstance(res, dict) else "",
-                         actor=by)
+                         actor=actors)
     assessment_mark_due(item.get("ref") or ident)
     return get(item.get("ref") or ident) or item
 
@@ -4643,7 +4739,7 @@ def _group_close_unlocked(data: Dict[str, Any], parent: Dict[str, Any], *, force
     return ""
 
 
-def _after_group_close(item: Dict[str, Any], by: str) -> None:
+def _after_group_close(item: Dict[str, Any], by: str, actors: Any = None) -> None:
     ref = str(item.get("ref") or "")
     _log("ACCEPT", f"{ref} (group integration)", queue=item.get("project", ""))
     try:
@@ -4653,7 +4749,7 @@ def _after_group_close(item: Dict[str, Any], by: str) -> None:
         pass
     res = item.get("resolution") or {}
     _notify_ticket_event(item, "closed", detail=res.get("summary", "") if isinstance(res, dict) else "",
-                         actor=by)
+                         actor=actors if actors is not None else by)
     assessment_mark_due(ref)
 
 
