@@ -699,3 +699,117 @@ def test_fallback_nudge_unverified_send_is_lost_and_blocks(plan_cli, monkeypatch
     it = q.get(ref)
     assert it["plan"]["status"] == "blocked" and it["plan"]["discussion"]["nudges"] == 0
     assert "never landed" in it["block_question"] and it["needs_input"] is True
+
+
+# --- WATCHTOWER-38: persistent gate worktree ----------------------------------
+def _git(cwd, *args):
+    import subprocess
+    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                          capture_output=True, text=True).stdout.strip()
+
+
+@pytest.fixture()
+def grepo(tmp_path):
+    r = tmp_path / "repo"
+    r.mkdir()
+    _git(r, "init", "-q", "-b", "main")
+    _git(r, "config", "user.email", "t@example.com")
+    _git(r, "config", "user.name", "t")
+    (r / ".gitignore").write_text("node_modules/\n")
+    (r / "v.txt").write_text("1\n")
+    _git(r, "add", ".gitignore", "v.txt")
+    _git(r, "commit", "-q", "-m", "one")
+    c1 = _git(r, "rev-parse", "HEAD")
+    (r / "v.txt").write_text("2\n")
+    _git(r, "commit", "-q", "-am", "two")
+    c2 = _git(r, "rev-parse", "HEAD")
+    (r / "v.txt").write_text("3\n")
+    _git(r, "commit", "-q", "-am", "three")  # HEAD is neither gated commit
+    return r, c1, c2
+
+
+# A dependency install that only happens once, plus untracked junk.
+_DEPS_CMD = ("[ -d node_modules ] || { mkdir node_modules; echo $WT_GATE_COMMIT > "
+             "node_modules/installed; }; touch junk; cat v.txt node_modules/installed; "
+             "echo repo=$WT_GATE_REPO")
+
+
+def test_persistent_gate_worktree_keeps_ignored_deps_between_commits(wt, grepo):
+    r, c1, c2 = grepo
+    first = wt.q._run_cmd_gate(_DEPS_CMD, str(r), c1, "GT-1", persistent=True)
+    assert first["passed"], first
+    kept = first["worktree"]
+    assert kept == str(r.parent.resolve() / "repo-wt-wtgate")
+    assert first["output_tail"].split()[:2] == ["1", c1]
+    assert f"repo={r}" in first["output_tail"]
+    second = wt.q._run_cmd_gate(_DEPS_CMD, str(r), c2, "GT-2", persistent=True)
+    assert second["passed"] and second["worktree"] == kept
+    # tracked file at c2; node_modules survived from the c1 run
+    assert second["output_tail"].split()[:2] == ["2", c1]
+    import os
+    assert os.path.isdir(kept)
+    assert _git(kept, "rev-parse", "HEAD") == c2
+    # pinned also reuses it
+    pinned = wt.q._run_cmd_gate("cat v.txt", str(r), c1, "GT-3", pinned=True, persistent=True)
+    assert pinned["passed"] and pinned["worktree"] == kept
+    assert pinned["output_tail"].strip() == "1"
+
+
+def test_persistent_gate_worktree_resets_dirty_tracked_files(wt, grepo):
+    r, c1, c2 = grepo
+    first = wt.q._run_cmd_gate("echo dirty > v.txt; touch junk", str(r), c1, "GT-1",
+                               persistent=True)
+    kept = first["worktree"]
+    r2 = wt.q._run_cmd_gate("cat v.txt; ls", str(r), c1, "GT-2", persistent=True)
+    assert r2["worktree"] == kept
+    assert r2["output_tail"].splitlines()[0] == "1"
+    assert "junk" not in r2["output_tail"]
+
+
+def test_fresh_mode_is_default_and_leaves_no_worktree(wt, grepo):
+    r, c1, _ = grepo
+    res = wt.q._run_cmd_gate("cat v.txt; ls -a", str(r), c1, "GT-1")
+    assert res["passed"] and "worktree" not in res
+    assert res["output_tail"].splitlines()[0] == "1"
+    assert not (r.parent / "repo-wt-wtgate").exists()
+    assert len(_git(r, "worktree", "list").splitlines()) == 1
+
+
+def test_busy_persistent_worktree_falls_back_to_fresh(wt, grepo):
+    import fcntl
+    import os
+    r, c1, _ = grepo
+    common = _git(r, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    with open(os.path.join(common, "wt-gate-worktree.lock"), "a") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        res = wt.q._run_cmd_gate("cat v.txt", str(r), c1, "GT-1", persistent=True)
+    assert res["passed"] and "worktree" not in res
+    assert res["output_tail"].strip() == "1"
+
+
+def test_persistent_never_resets_a_foreign_directory(wt, grepo):
+    r, c1, _ = grepo
+    squatter = r.parent / "repo-wt-wtgate"
+    squatter.mkdir()
+    (squatter / "precious.txt").write_text("keep me\n")
+    res = wt.q._run_cmd_gate("cat v.txt", str(r), c1, "GT-1", persistent=True)
+    assert res["passed"] and "worktree" not in res
+    assert (squatter / "precious.txt").read_text() == "keep me\n"
+
+
+def test_gate_worktree_config_drives_evaluate_gates(wt, grepo, tmp_path, monkeypatch):
+    import watchtower.config as config
+    monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "config.json")
+    r, c1, _ = grepo
+    assert config.gate_worktree("GT") == "fresh"
+    with pytest.raises(ValueError):
+        config.set_gate_worktree("GT", "shared")
+    item = {"project": "GT", "ref": "GT-1", "repo_path": str(r), "gates": ["cmd:cat v.txt"]}
+    results, _ = wt.q.evaluate_gates(item, commit=c1)
+    assert results[0]["passed"] and "worktree" not in results[0]
+    config.set_gate_worktree("GT", "persistent")
+    assert config.gate_worktree("GT") == "persistent"
+    results, _ = wt.q.evaluate_gates(item, commit=c1)
+    assert results[0]["passed"] and results[0]["worktree"].endswith("repo-wt-wtgate")
+    config.set_gate_worktree("GT", "fresh")
+    assert "gate_worktree" not in config.get_queue_config("GT")

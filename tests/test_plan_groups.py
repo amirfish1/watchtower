@@ -473,8 +473,8 @@ def test_setup_failure_blocks_without_running_then_answer_retries(wt, repo, tmp_
     P, _, _ = _ready_group(wt, repo, gates=[f"cmd:touch {marker}"])
     real = wt.q._run_cmd_gate
 
-    def broken(command, repo_path, commit, ref, pinned=False):
-        return real(command, str(tmp_path / "nope"), commit, ref, pinned=pinned)
+    def broken(command, repo_path, commit, ref, pinned=False, **kw):
+        return real(command, str(tmp_path / "nope"), commit, ref, pinned=pinned, **kw)
     monkeypatch.setattr(wt.q, "_run_cmd_gate", broken)
     assert wt.q.group_sweep() == [(P, "gate_setup")]
     p = wt.q.get(P)

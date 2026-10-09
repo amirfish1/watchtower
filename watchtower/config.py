@@ -393,6 +393,31 @@ def gates(queue: str) -> List[str]:
     return list(_queue_entry(queue).get("gates") or [])
 
 
+GATE_WORKTREE_MODES = ("fresh", "persistent")
+
+
+def set_gate_worktree(queue: str, mode: str) -> Dict[str, Any]:
+    """WATCHTOWER-38: where cmd gates run when the closing commit is not the
+    checkout's HEAD. ``fresh`` (default) = a throwaway detached worktree;
+    ``persistent`` = one reusable worktree per repo, force-reset to the commit,
+    that keeps gitignored files (node_modules, caches) between runs."""
+    if mode not in GATE_WORKTREE_MODES:
+        raise ValueError(f"gate worktree must be one of {', '.join(GATE_WORKTREE_MODES)}")
+    data = _load()
+    q = data.setdefault(queue, {})
+    if mode == "persistent":
+        q["gate_worktree"] = mode
+    else:
+        q.pop("gate_worktree", None)
+    _save(data)
+    return q
+
+
+def gate_worktree(queue: str) -> str:
+    mode = str(_queue_entry(queue).get("gate_worktree") or "fresh")
+    return mode if mode in GATE_WORKTREE_MODES else "fresh"
+
+
 def set_post_fix_assessment(queue: str, enabled: bool) -> Dict[str, Any]:
     data = _load()
     q = data.setdefault(queue, {})
