@@ -51,6 +51,18 @@ def test_pick_low_headroom_engine_avoided(headroom):
     assert reason.startswith("headroom: claude 4% left; codex 61% left")
 
 
+def test_pick_keeps_queue_engine_without_headroom_data(headroom):
+    # A queue on an engine CCC can't meter (no row) must not be moved onto
+    # another engine just because that one reports headroom.
+    rows = [_row("codex", 61, resets_in_h=1)]
+    eng, reason = headroom.pick_engine(["devin", "codex"], rows)
+    assert eng is None
+    assert reason == "headroom: no data for devin; keeping it"
+    # ...but known-low headroom on the queue engine still moves work.
+    rows.append(_row("devin", 3, resets_in_h=1))
+    assert headroom.pick_engine(["devin", "codex"], rows)[0] == "codex"
+
+
 def test_pick_ignores_stale_unavailable_unlimited_and_unknown(headroom):
     rows = [
         _row("claude", 90, resets_in_h=1, stale=True),

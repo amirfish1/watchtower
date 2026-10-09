@@ -136,8 +136,8 @@ def pick_engine(
     usable account. Engines whose known headroom is below ``min_pct`` are
     avoided. Usable engines rank by ``resets_at`` ascending (spend what
     expires first), ties by more headroom left. Engines with no usable data
-    are never chosen here -- with no usable engine the caller keeps its
-    normal behavior."""
+    are never chosen here, and a first candidate (the queue's own engine)
+    with no data at all is kept -- the caller keeps its normal behavior."""
     order: List[str] = []
     for cand in candidates:
         eng = str(cand or "").strip().lower()
@@ -161,6 +161,11 @@ def pick_engine(
                 usable[eng] = row
         elif eng not in low or pct > (_num(low[eng].get("percent_left")) or 0.0):
             low[eng] = row
+    # The first candidate is the queue's own engine. With no headroom data
+    # for it (e.g. an engine CCC can't meter) there is nothing to say it is
+    # running out, so keep it rather than move work on another engine's data.
+    if order and order[0] not in usable and order[0] not in low:
+        return None, f"headroom: no data for {order[0]}; keeping it"
     avoided = [e for e in order if e in low and e not in usable]
     notes = [_describe(e, low[e], with_reset=False) for e in avoided]
     if not usable:

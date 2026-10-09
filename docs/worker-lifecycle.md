@@ -488,6 +488,8 @@ cooldown, and asks `headroom.pick_engine` to rank them from CCC's
   then by more headroom left;
 - no usable data (CCC down, old CCC 404, every engine low) keeps the normal
   queue engine.
+- a queue engine with no headroom row at all (an engine CCC can't meter) is
+  kept; only known-low headroom moves work off it.
 
 When the pick differs from the queue engine, that tick launches on it exactly
 like the cooldown substitute (`fallback_model`, `fallback_effort`, queue model
