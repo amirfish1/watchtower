@@ -2239,3 +2239,33 @@ def test_live_only_succeeds_via_uds_or_fifo(monkeypatch):
     res = messages.send("w1", "hi", live_only=True)
     assert res["ok"] and res["transport"] == "fifo"
     assert receipts == ["uds", "fifo"]
+
+
+def test_send_start_new_if_needed_spawns_continuation(monkeypatch):
+    from watchtower import messages
+    monkeypatch.setattr(messages, "resolve_target", lambda t: {"session_id": "sid-1", "engine": "claude"})
+    monkeypatch.setattr(messages, "_delegate_base", lambda: "http://ccc")
+    monkeypatch.setattr(messages, "_get_json", lambda url, t: {
+        "path": "new", "resolved_session_id": "sid-1", "reason": "cold"})
+    posted = {}
+
+    def _post(url, payload, timeout_s):
+        posted.update(url=url, payload=payload)
+        return {"ok": True, "new_session_id": "sid-2"}
+
+    monkeypatch.setattr(messages, "_post_json", _post)
+    monkeypatch.setattr(messages, "deliver", lambda *a, **k: pytest.fail("must not resume"))
+    res = messages.send("sid-1", "ticket closed", start_new_if_needed=True)
+    assert res["ok"] and res["transport"] == "continuation" and res["new_session_id"] == "sid-2"
+    assert posted["url"].endswith("/api/sessions/spawn-continue-from")
+    assert posted["payload"] == {"continue_from": "sid-1", "prompt": "ticket closed"}
+
+
+def test_send_start_new_if_needed_warm_delivers_normally(monkeypatch):
+    from watchtower import messages
+    monkeypatch.setattr(messages, "resolve_target", lambda t: {"session_id": "sid-1", "engine": "claude"})
+    monkeypatch.setattr(messages, "_delegate_base", lambda: "http://ccc")
+    monkeypatch.setattr(messages, "_get_json", lambda url, t: {"path": "normal"})
+    monkeypatch.setattr(messages, "deliver", lambda *a, **k: {"ok": True, "transport": "uds"})
+    res = messages.send("sid-1", "hi", start_new_if_needed=True)
+    assert res["transport"] == "uds"

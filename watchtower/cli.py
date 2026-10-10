@@ -3583,12 +3583,16 @@ def cmd_send(args: argparse.Namespace) -> int:
         queue_on_fail=not args.no_queue,
         ttl_s=args.ttl,
         prefer_uds=True,
+        **({"start_new_if_needed": True}
+           if getattr(args, "start_new_if_needed", False) else {}),
     )
     if args.json:
         print(json.dumps(res, indent=2))
         return 0 if (res.get("ok") or res.get("queued")) else 1
     if res.get("ok"):
         extra = f"  (log: {res['log']})" if res.get("log") else ""
+        if res.get("new_session_id"):
+            extra = f"  (new session: {res['new_session_id']})"
         print(f"SENT: {args.target} via {res.get('transport', '?')}{extra}")
         return 0
     if res.get("queued"):
@@ -6940,6 +6944,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="fail immediately instead of parking in the outbox")
     s.add_argument("--ttl", type=float, default=None,
                    help="seconds before a queued outbox message expires")
+    s.add_argument("--start-new-if-needed", action="store_true",
+                   dest="start_new_if_needed",
+                   help="if the target is large and cache-cold, start a new "
+                        "continuation session with this message instead of "
+                        "resuming it (avoids a full-context cache miss)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_send)
 
