@@ -41,6 +41,9 @@ OPS-1298). Pick the file by topic:
 | Gates (plan / verify / review stages, `--gate`) | `tests/test_gates.py` |
 | Product gate | `tests/test_product_gate.py` |
 | Post-fix assessment (WT-21, `wt assess`) | `tests/test_assessment.py` |
+| Workers (spawn, release, retirement, `wt workers`) | `tests/test_workers_lifecycle.py` (there is no `tests/test_workers.py`) |
+| Claim ownership / liveness | `tests/test_claim_owner.py`, `tests/test_liveness_*.py` |
+| Outbox / reclaim-resume | `tests/test_messages.py`, `tests/test_reclaim_resume.py` |
 
 Unsure? `ls tests | rg <topic>` or `python3 -m pytest --collect-only -q tests -k <word>`.
 
