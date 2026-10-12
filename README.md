@@ -315,6 +315,7 @@ gh auth login
 wt set -q MYAPP --backend github --github-repo <OWNER>/<REPO>
 
 wt add -q MYAPP --title "Fix checkout" --text "Steps to reproduce..."
+wt add -q MYAPP --title "Fix checkout now" --run  # file and request immediate dispatch
 wt run MYAPP-123                       # run this issue now (overrides drain/grace)
 wt claim -q MYAPP --worker worker-1
 wt close MYAPP-123 --worker worker-1 --summary "fixed the null state" --commit <SHA>
@@ -343,7 +344,12 @@ work_it         = auto_eligible OR manual_eligible
 So a queue with drain on works every open issue except the ones labelled
 `watchtower:no-auto-drain`, and leaves brand-new issues alone for `grace_s`
 seconds so a human can label them first. `wt run MYAPP-123` overrides all
-three. The old `watchtower:<QUEUE>` label no longer admits anything; it is
+three. `wt add --run` files a ticket and requests the same immediate dispatch
+in one command, for both local and GitHub-backed queues. It preserves queue
+policy for other tickets. Dependencies, readiness, planning gates, model
+requirements and worker capacity still apply, and a new worker needs time to
+start. `--run` cannot be combined with `--claim` or `--group-parent`.
+The old `watchtower:<QUEUE>` label no longer admits anything; it is
 only still read when two or more queues point at the *same* repo, where it is
 the only way to say which issue belongs to which queue. That label defaults to
 `watchtower:<QUEUE>`; override it per queue with

@@ -1399,6 +1399,49 @@ def test_github_backend_lists_issues_closed_within_last_14_days(tmp_path, monkey
     )
 
 
+@pytest.mark.parametrize("auto_drain", [False, True])
+@pytest.mark.parametrize("opted_out", [False, True])
+def test_github_add_run_bypasses_grace_without_changing_policy(tmp_path, monkeypatch, auto_drain, opted_out):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    config.set_auto_drain("GHI", auto_drain)
+    import watchtower.cli as cli
+    import watchtower.workers as workers
+    importlib.reload(cli)
+    dispatched = []
+
+    if opted_out:
+        enqueue = q.enqueue
+
+        def enqueue_opted_out(**kwargs):
+            item = enqueue(**kwargs)
+            data = json.loads(state.read_text())
+            data["issues"][0]["labels"].append("watchtower:no-auto-drain")
+            state.write_text(json.dumps(data))
+            return item
+
+        monkeypatch.setattr(q, "enqueue", enqueue_opted_out)
+
+    def dispatch(queue, ref):
+        item = q.get(ref)
+        assert item["run_requested"] is True
+        assert item["manual_eligible"] is True
+        assert item["no_auto_drain"] is opted_out
+        assert item["auto_eligible"] is False  # new issue still inside grace
+        assert item["claimable"] is True
+        dispatched.append((queue, ref))
+        return "immediate dispatch"
+
+    monkeypatch.setattr(workers, "dispatch_after_enqueue", dispatch)
+    assert cli.main(["add", "-q", "GHI", "--title", "Run during grace", "--run"]) == 0
+    assert dispatched == [("GHI", "GHI-1")]
+    assert "watchtower:play" in json.loads(state.read_text())["issues"][0]["labels"]
+    assert config.auto_drain("GHI") is auto_drain
+    assert config.grace_s("GHI") == 180
+
+
 def test_github_backend_refuses_direct_claim_until_a_run_is_requested(tmp_path, monkeypatch):
     """With drain off nothing is auto-eligible, so a targeted claim is refused
     — but pressing run (mark_runnable) overrides that, no whitelist involved."""

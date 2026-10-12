@@ -830,6 +830,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
+    if getattr(args, "run", False):
+        conflict = ("--claim" if getattr(args, "claim", False) else
+                    "--group-parent" if getattr(args, "group_parent", False) else "")
+        if conflict:
+            print(f"error: --run cannot be combined with {conflict}", file=sys.stderr)
+            return 1
     if _bad_model_floor(args):
         return 1
     submitter = (getattr(args, "submitter", "") or "").strip()
@@ -911,6 +917,21 @@ def cmd_add(args: argparse.Namespace) -> int:
             # Enqueue already succeeded; a claim hiccup shouldn't fail the file.
             print(f"[watchtower] could not claim {item['ref']}: {e}", file=sys.stderr)
         return 0
+    # Equivalent to filing then `wt run`: record the per-ticket request before
+    # dispatch so grace/auto-drain policy cannot hold this submission back.
+    if getattr(args, "run", False):
+        try:
+            runnable = q.mark_runnable(item["ref"])
+        except Exception as e:
+            print(f"error: filed {item['ref']}, but could not request its run: {e}",
+                  file=sys.stderr)
+            return 1
+        if runnable is None:
+            print(f"error: filed {item['ref']}, but could not request its run: ticket not found",
+                  file=sys.stderr)
+            return 1
+        item = runnable
+        print(f"RUNNABLE: {item['ref']}  {item.get('title') or item.get('note', '')}")
     # Decide + act on the new ticket NOW (nudge current staffing via FIFO, else
     # gracefully release verified-idle staffing and spawn) and log the
     # decision. Centralized in
@@ -6442,9 +6463,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--accept", default=None, metavar="LINE",
                    help="one plain-language acceptance line the verify gate "
                         "checks (falls back to the ticket text when empty)")
-    s.add_argument("--claim", action="store_true",
-                   help="immediately claim the new ticket (mark in_progress) so no "
-                        "auto-drain worker picks it up; use when you're already working it")
+    disposition = s.add_mutually_exclusive_group()
+    disposition.add_argument("--claim", action="store_true",
+                             help="immediately claim the new ticket (mark in_progress) so no "
+                                  "auto-drain worker picks it up; use when you're already working it")
+    disposition.add_argument("--run", action="store_true",
+                             help="request a run and dispatch now (like wt run): bypass "
+                                  "grace and auto-drain policy for this ticket; "
+                                  "dependencies, planning and worker capacity still apply")
     s.add_argument("--group-parent", action="store_true", dest="group_parent",
                    help="file a plan-group parent (WT-33): one plan for its members, "
                         "one integration check after they all close; never claimed")
