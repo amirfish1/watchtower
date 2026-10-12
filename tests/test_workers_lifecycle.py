@@ -2278,6 +2278,31 @@ def test_reap_released_workers_sigterms_past_ttl(wt):
             pass
 
 
+def test_reap_released_workers_signals_duplicate_rows_once(wt):
+    """Two registry rows for one worker/pid must yield one SIGTERM and one
+    action (the activity log showed every GC_RELEASED line twice)."""
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    try:
+        with wt.workers._WorkersFileLock():
+            data = wt.workers._load()
+            row = next(r for r in data["workers"]
+                       if r["worker_id"] == rec["worker_id"])
+            data["workers"].append(dict(row))
+            wt.workers._save(data)
+        actions = wt.workers.reap_released_workers(ttl_s=3600, kill_grace_s=30)
+        assert len(actions) == 1
+        rows = [r for r in wt.workers._load()["workers"]
+                if r["worker_id"] == rec["worker_id"]]
+        assert len(rows) == 2
+        assert all(r.get("gc_kill_sent_at") for r in rows)
+    finally:
+        try:
+            proc.terminate()
+            proc.wait()
+        except Exception:
+            pass
+
+
 def test_reap_released_workers_lists_park_owners_once_per_pass(wt, monkeypatch):
     """Each _fresh_park_owners call lists every ticket in every queue; calling
     it per released row under the workers lock pegged the daemon at 100% CPU

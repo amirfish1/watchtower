@@ -1336,7 +1336,7 @@ def _notify_ticket_event(
         except Exception:
             deliver_target = target
         try:
-            messages.send(deliver_target, text, notify=True)
+            messages.send(deliver_target, text, notify=True, start_new_if_needed=True)
         except Exception:
             pass  # best-effort -- a delivery hiccup never fails the transition
 

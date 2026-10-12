@@ -1609,6 +1609,42 @@ def _deliver_delegate(
     return {"ok": True, "transport": "delegate"}
 
 
+def _continue_if_cold(resolved: Dict[str, Any], text: str) -> Optional[Dict[str, Any]]:
+    """``--start-new-if-needed``: if resuming ``resolved``'s session would be a
+    full prompt-cache miss on a large context (CCC's own large-AND-stale
+    rule, ``/api/sessions/continuation-decision``), spawn a continuation
+    session seeded with ``text`` instead (``/api/sessions/spawn-continue-from``)
+    -- the same thing ``ccc send --new-if-large-and-stale`` does.
+
+    None means "deliver normally": no delegate, no session id, the decision
+    says the session is small or still warm, or any lookup/spawn failure --
+    this is a cost optimisation and must never block delivery."""
+    base = _delegate_base()
+    sid = str(resolved.get("session_id") or "")
+    if not base or not sid:
+        return None
+    decision = _get_json(
+        f"{base}/api/sessions/continuation-decision/{quote(sid, safe='')}",
+        _delegate_timeout_s(None),
+    )
+    if not decision or decision.get("path") != "new":
+        return None
+    try:
+        data = _post_json(
+            base + "/api/sessions/spawn-continue-from",
+            {"continue_from": str(decision.get("resolved_session_id") or sid),
+             "prompt": text},
+            timeout_s=_delegate_timeout_s(None),
+        )
+    except Exception:  # noqa: BLE001 - fall back to the normal chain
+        return None
+    if not data.get("ok"):
+        return None
+    return {"ok": True, "transport": "continuation",
+            "new_session_id": data.get("new_session_id"),
+            "reason": decision.get("reason", "")}
+
+
 def deliver(
     resolved: Dict[str, Any], text: str, mode: str = "send",
     *, force_queue: bool = False, prefer_uds: bool = False,
@@ -2371,9 +2407,14 @@ def send(
     live_only: bool = False,
     dedupe_key: str = "",
     ticket_gen: Optional[int] = None,
+    start_new_if_needed: bool = False,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
+    ``start_new_if_needed=True`` spawns a continuation session carrying the
+    text instead of delivering when the target is large and cache-cold
+    (``_continue_if_cold``), so a dormant 150K-token session is not woken
+    just to read the message.
     ``live_only=True`` (WT-29) delivers only over UDS/FIFO to a running target
     and never parks, whatever ``queue_on_fail`` says.
     ``ticket_ref``/``ticket_session`` ride along onto the parked row so the
@@ -2407,9 +2448,13 @@ def send(
     if live_only:
         extra["live_only"] = True
         queue_on_fail = False
-    result = deliver(resolved, text, mode, **extra)
+    result = _continue_if_cold(resolved, text) if start_new_if_needed else None
+    if result is None:
+        result = deliver(resolved, text, mode, **extra)
     if result.get("ok"):
         out = {"ok": True, "transport": result.get("transport", "?")}
+        if result.get("new_session_id"):
+            out["new_session_id"] = result["new_session_id"]
         if result.get("log"):
             out["log"] = result["log"]
         if result.get("turn_id"):
