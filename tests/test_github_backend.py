@@ -3511,10 +3511,36 @@ def test_github_backend_records_fix_commit_on_the_issue(tmp_path, monkeypatch):
     assert "commit" not in q.get("GHI-1")["resolution"]
 
 
-def test_update_rejects_after_on_github_backed_queue(tmp_path, monkeypatch):
-    # WT-5: `wt edit --after` used to print EDITED and drop the blocker.
+def test_after_gates_claim_on_github_backed_queue(tmp_path, monkeypatch):
+    # WT-36: `--after` is honoured on GitHub queues: the dependent is neither
+    # claimable nor spawn-worthy depth until its blocker closes as completed.
+    _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "test-owner/test-repo")
-    with pytest.raises(ValueError, match="not supported on GitHub-backed"):
-        q.update("GHI-2", blocked_by=["GHI-1"])
+    _drainable(config)
+
+    q.enqueue(project="GHI", title="first", note="n", text="b")
+    q.enqueue(project="GHI", title="second", note="n", text="b", blocked_by=["GHI-1"])
+    assert q.get("GHI-2")["blocked_by"] == ["GHI-1"]
+    with pytest.raises(ValueError, match="does not exist"):
+        q.update("GHI-2", blocked_by=["GHI-99"])
+    with pytest.raises(ValueError, match="cycle"):
+        q.update("GHI-1", blocked_by=["GHI-2"])
+
+    assert q.count_claimable(project="GHI") == 1
+    first = q.claim_next("worker-1", project="GHI")
+    assert first["ref"] == "GHI-1"
+    assert q.claim_next("worker-2", project="GHI") is None
+    assert q.count_claimable(project="GHI") == 0
+
+    q.close("GHI-1", "worker-1", resolution={"summary": "done", "no_code": True})
+    assert q.count_claimable(project="GHI") == 1
+    assert q.claim_next("worker-2", project="GHI")["ref"] == "GHI-2"
+
+    # Clearing the dependency on a later ticket removes the gate.
+    q.enqueue(project="GHI", title="third", note="n", text="b", blocked_by=["GHI-2"])
+    assert q.claim_next("worker-3", project="GHI") is None
+    q.update("GHI-3", blocked_by=[])
+    assert q.get("GHI-3")["blocked_by"] == []
+    assert q.claim_next("worker-3", project="GHI")["ref"] == "GHI-3"

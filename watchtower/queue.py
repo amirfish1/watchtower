@@ -1494,8 +1494,6 @@ def enqueue(
         if group_parent:
             gates = _parent_gates(gates)
     if backend is not None:
-        if blocked_by:
-            raise ValueError("ticket dependencies (--after) are not supported on GitHub-backed queues")
         saved = backend.enqueue(
             note=note,
             text=text,
@@ -1514,6 +1512,7 @@ def enqueue(
             confidence=confidence,
             submitter=submitter,
             submitter_explicit=submitter_explicit,
+            blocked_by=blocked_by,
         )
         _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
         return saved
@@ -1742,8 +1741,6 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     """
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
-        if "blocked_by" in fields:
-            raise ValueError("ticket dependencies (--after) are not supported on GitHub-backed queues")
         return backend.update(ident, **fields)
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",

@@ -22,7 +22,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import CATCH_ALL_LABEL
-from .queue import UNCLAIMABLE_READINESS, _FileLock, machine_tag
+from .queue import (
+    UNCLAIMABLE_READINESS, _FileLock, _refs_index, _validate_blocked_by,
+    blocker_verdict, machine_tag,
+)
 
 VALID_LANES = ("normal", "express")
 # `gh issue` subcommands that actually change an issue's list-visible state
@@ -1760,6 +1763,8 @@ class GitHubIssuesBackend:
             "confidence": _norm_choice(meta.get("confidence", ""), VALID_CONFIDENCES),
             "needs_input": bool(meta.get("needs_input", False)),
             "block_question": str(meta.get("block_question") or ""),
+            "blocked_by": [str(r) for r in (meta.get("blocked_by") or []) if r]
+            if isinstance(meta.get("blocked_by"), list) else [],
             "submitter": str(meta.get("submitter") or ""),
             "submitter_explicit": bool(meta.get("submitter_explicit", False)),
             "claimed_by": (
@@ -2219,6 +2224,7 @@ class GitHubIssuesBackend:
         confidence: str = "",
         submitter: str = "",
         submitter_explicit: bool = False,
+        blocked_by: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         note = _clip(note, 4000)
         text = _clip(text or note, 24000)
@@ -2251,6 +2257,8 @@ class GitHubIssuesBackend:
             # event or only the default set -- see queue._submitter_wants.
             "submitter_explicit": bool(submitter_explicit),
         }
+        if blocked_by:
+            meta["blocked_by"] = self._validate_blockers("", blocked_by)
         issue_title = _clip(title or note or "WatchTower ticket", 200)
         body = _body_with_metadata(text, meta)
         out = self._run([
@@ -2397,6 +2405,24 @@ class GitHubIssuesBackend:
             stop_dir = Path.home() / ".watchtower" / "stop-signals"
         return stop_dir / session_id
 
+    def _validate_blockers(self, ref: str, blocked_by: List[str]) -> List[str]:
+        """Normalise ``blocked_by`` (WT-36) with queue._validate_blocked_by over
+        this queue's open + recently closed tickets, falling back to a direct
+        lookup for an older closed blocker. Raises ValueError."""
+        items = self.list_items(fresh=True)
+        known = {str(it.get("ref")) for it in items}
+        for raw in blocked_by:
+            cand = f"{self.queue}-{raw}" if str(raw).isdigit() else str(raw)
+            if cand not in known and cand.startswith(f"{self.queue}-"):
+                try:
+                    older = self.get(cand)
+                except GitHubBackendError:
+                    older = None  # unknown ref: _validate_blocked_by rejects it
+                if older is not None:
+                    items.append(older)
+                    known.add(cand)
+        return _validate_blocked_by(items, ref, [str(r) for r in blocked_by])
+
     def _claim_candidates(
         self,
         *,
@@ -2437,6 +2463,17 @@ class GitHubIssuesBackend:
             it for it in self.list_items(status="open", lane=lane, fresh=fresh)
             if it.get(eligibility, False)
         ]
+        if any(it.get("blocked_by") for it in candidates):
+            # Dependencies (WT-36): a ticket with an open (or declined /
+            # unresolved) blocker is not claimable and not spawn-worthy depth.
+            # Blockers resolve among this queue's open + recently closed
+            # tickets; one gone from both counts as satisfied.
+            by_ref = _refs_index(self.list_items(fresh=fresh))
+            candidates = [
+                it for it in candidates
+                if not it.get("blocked_by")
+                or blocker_verdict(it, by_ref)[0] == "ok"
+            ]
         if readiness_filters:
             candidates = [
                 it for it in candidates
@@ -3050,7 +3087,14 @@ class GitHubIssuesBackend:
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         title = item.get("title", "")
         for key, value in fields.items():
-            if key == "title":
+            if key == "blocked_by":
+                blockers = self._validate_blockers(
+                    str(item.get("ref") or ""), list(value or []))
+                if blockers:
+                    meta["blocked_by"] = blockers
+                else:
+                    meta.pop("blocked_by", None)
+            elif key == "title":
                 title = _clip(value, 200)
             elif key == "text":
                 body = _clip(value, 24000)
