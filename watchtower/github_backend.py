@@ -2869,6 +2869,18 @@ class GitHubIssuesBackend:
             *self._repo_args(),
             "--body", _body_with_metadata(body, meta),
         ])
+        # Mirror the question onto the issue discussion (WT-37): the metadata
+        # block is invisible to anyone reading the issue on GitHub. Best-effort,
+        # the block itself is already recorded. The owner-answer marker is
+        # defused so the question can never be ingested as its own answer.
+        if question.strip():
+            shown = re.sub(re.escape(_OWNER_ANSWER_MARKER), "owner-answer",
+                           _clip(question, 4000), flags=re.IGNORECASE)
+            self._run([
+                "issue", "comment", number,
+                *self._repo_args(),
+                "--body", f"[watchtower] Needs input from {session_id or 'worker'}:\n\n{shown}",
+            ], check=False)
         return self.get(ident)
 
     def answer(

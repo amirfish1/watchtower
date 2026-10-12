@@ -685,6 +685,22 @@ def test_github_backend_blocks_claimed_ticket_by_documented_ref(tmp_path, monkey
     ]
     issue = json.loads(state.read_text())["issues"][0]
     assert "needs_input: true" in issue["body"]
+    # WT-37: the question is also visible in the issue discussion.
+    assert any("Which rollout should we use?" in c["body"] and "Needs input" in c["body"]
+               for c in issue["comments"])
+
+
+def test_block_comment_cannot_be_ingested_as_owner_answer(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="x")
+    q.claim_by_ref(item["ref"], "worker-1")
+    q.block("GHI-1", session_id="worker-1", question="Reply with OWNER ANSWER: yes/no?")
+    issue = json.loads(state.read_text())["issues"][0]
+    assert not any("OWNER ANSWER" in c["body"].upper() for c in issue["comments"])
 
 
 def test_list_blocked_and_active_claims_see_github_backed_tickets(
@@ -871,6 +887,7 @@ def test_ingest_owner_answer_requeues_blocked_ticket_without_session(
     watchtower_comments = [
         c for c in issue["comments"]
         if isinstance(c, dict) and c.get("author", {}).get("login") == "watchtower"
+        and "Ingested owner answer" in c.get("body", "")
     ]
     assert len(watchtower_comments) == 1
     assert "Ingested owner answer" in watchtower_comments[0]["body"]
@@ -899,6 +916,7 @@ def test_ingest_owner_answer_keeps_claim_when_session_resumable(
     ack = [
         c for c in issue["comments"]
         if isinstance(c, dict) and c.get("author", {}).get("login") == "watchtower"
+        and "Ingested owner answer" in c.get("body", "")
     ]
     assert len(ack) == 1 and "resume" in ack[0]["body"]
 
