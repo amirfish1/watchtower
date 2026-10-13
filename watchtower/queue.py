@@ -937,6 +937,62 @@ def machine_tag() -> str:
     return tag
 
 
+# --- machine placement -------------------------------------------------------
+# A ticket may say which kind of machine can run it. ``""`` (the legacy value,
+# and what every pre-existing ticket has) and ``"any"`` mean "any machine";
+# ``"mac"`` waits for a macOS box (Xcode/iOS, simulator, browser/GUI, Mac
+# keychain, local-only repos); ``"cloud"`` runs only on a Linux/cloud box.
+# Each machine knows its own kind (machine_placement()), and claim filtering
+# (_claim_candidates -- the single source of truth) drops tickets that machine
+# cannot run, so an always-on VM drains the rest overnight while Mac-bound
+# tickets simply wait for the Mac.
+VALID_PLACEMENTS = ("any", "mac", "cloud")
+
+# Words that mean "needs the Mac's toolchain/GUI". Deliberately narrow: a
+# false positive only delays a ticket until the Mac is up (and ``--placement
+# any`` overrides it); a false negative sends it to a box that cannot do it.
+_MAC_HINT_RE = _re.compile(
+    r"\b(xcode|xcodebuild|ios|iphone|ipad|simulator|testflight|swiftui|"
+    r"cocoapods|pod install|app ?store ?connect|safari|screenshot|"
+    r"keychain|launchctl|launchd|osascript|macos|mac app|\.app\b|"
+    r"puppeteer|chrome-devtools|playwright)\b",
+    _re.IGNORECASE,
+)
+
+
+def machine_placement() -> str:
+    """The placement kind of THIS machine: ``mac`` (darwin) or ``cloud``.
+
+    ``WATCHTOWER_PLACEMENT`` overrides (e.g. a Linux desktop that does have the
+    GUI toolchain can say ``mac``; a Mac used as a headless runner ``cloud``).
+    Read per call -- it is cheap and tests flip it.
+    """
+    raw = str(os.environ.get("WATCHTOWER_PLACEMENT") or "").strip().lower()
+    if raw in ("mac", "cloud"):
+        return raw
+    return "mac" if sys.platform == "darwin" else "cloud"
+
+
+def _norm_placement(value: Any) -> str:
+    """A valid placement, else "" (unknown/blank = legacy, claimable anywhere)."""
+    s = str(value or "").strip().lower()
+    return s if s in VALID_PLACEMENTS else ""
+
+
+def placement_allows(item: Dict[str, Any], machine: Optional[str] = None) -> bool:
+    """May a worker on ``machine`` (default: this one) claim ``item``?"""
+    p = _norm_placement(item.get("placement"))
+    if p in ("", "any"):
+        return True
+    return p == (machine or machine_placement())
+
+
+def suggest_placement(*texts: Any) -> str:
+    """``"mac"`` when the ticket text mentions Mac-only tooling, else ``""``."""
+    blob = "\n".join(str(t or "") for t in texts)
+    return "mac" if _MAC_HINT_RE.search(blob) else ""
+
+
 def with_machine(worker: Any, machine: Any) -> str:
     """``<machine>-<worker>`` for display — e.g. ``her-bym-a1b2``.
 
@@ -1341,6 +1397,22 @@ def _notify_ticket_event(
             pass  # best-effort -- a delivery hiccup never fails the transition
 
 
+def _placement_fields(placement: str, *texts: Any) -> Dict[str, Any]:
+    """Item fields for a new ticket's placement. An explicit value always wins
+    (``any`` included: that is the override of the heuristic). With none, a
+    darwin filer gets the keyword suggestion (``placement_source: auto``). A
+    non-darwin filer gets none: it cannot tell what the Mac has, and a
+    standalone Linux box must not strand its own tickets behind ``mac``."""
+    explicit = _norm_placement(placement)
+    if explicit:
+        return {"placement": explicit}
+    if sys.platform == "darwin" and machine_placement() == "mac":
+        guess = suggest_placement(*texts)
+        if guess:
+            return {"placement": guess, "placement_source": "auto"}
+    return {}
+
+
 def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: str,
                        proj: str, annotation_id: str, url: str, title: str,
                        selector: str, screenshot_path: str, repo_path: str,
@@ -1349,7 +1421,8 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
                        planner_model: str, verifier_model: str, submitter: str,
                        submitter_explicit: bool, pre_ack: bool,
                        blocked_by: Optional[List[str]], gates: Optional[List[str]],
-                       accept_line: str, assessment_origin: str = "") -> Dict[str, Any]:
+                       accept_line: str, assessment_origin: str = "",
+                       placement: str = "") -> Dict[str, Any]:
     """Append a new ``open`` item to an already-loaded local store (the caller
     holds the store lock and saves). Shared by :func:`enqueue` and the
     post-fix-assessment filer so both create identical tickets."""
@@ -1390,6 +1463,7 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
         **({"verifier_model": str(verifier_model).strip()} if str(verifier_model or "").strip() else {}),
         **({"gates": validate_gates(gates)} if gates else {}),
         **({"accept": str(accept_line).strip()} if str(accept_line or "").strip() else {}),
+        **_placement_fields(placement, note, text, title),
         "submitter": str(submitter or ""),
         "submitter_explicit": bool(submitter_explicit),
         "claimed_by": None,
@@ -1440,8 +1514,14 @@ def enqueue(
     group_parent: bool = False,
     group: str = "",
     children: Optional[List[str]] = None,
+    placement: str = "",
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
+
+    ``placement``: ``mac`` | ``cloud`` | ``any`` -- which kind of machine may
+    claim it (see ``VALID_PLACEMENTS``). Blank lets a Mac filer's keyword
+    heuristic decide; existing tickets without the field stay claimable
+    anywhere.
 
     Plan groups (WT-33, local store only): ``group_parent`` files a group
     parent (gates always include ``plan``; ``verify`` unless ``gates`` omits
@@ -1530,7 +1610,8 @@ def enqueue(
             priority=priority, value=value, confidence=confidence, model_floor=model_floor,
             planner_model=planner_model, verifier_model=verifier_model, submitter=submitter,
             submitter_explicit=submitter_explicit, pre_ack=pre_ack, blocked_by=blocked_by,
-            gates=gates, accept_line=accept_line, assessment_origin=assessment_origin)
+            gates=gates, accept_line=accept_line, assessment_origin=assessment_origin,
+            placement=placement)
         if dedupe_key:
             saved["dedupe_key"] = dedupe_key
         if grouped:
@@ -1746,8 +1827,14 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
         "needs_input", "block_question", "model_floor", "blocked_by", "gates", "accept",
-        "planner_model", "verifier_model",
+        "planner_model", "verifier_model", "placement",
     })
+    if "placement" in fields:
+        raw = str(fields["placement"] or "").strip().lower()
+        if raw and raw not in VALID_PLACEMENTS:
+            raise ValueError(f"placement must be one of {', '.join(VALID_PLACEMENTS)} (or empty to clear)")
+        fields = dict(fields)
+        fields["placement"] = raw
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -2000,6 +2087,7 @@ def _claim_candidates(
     all_items: Optional[List[Dict[str, Any]]] = None,
     worker_model: Optional[str] = None,
     claimer: Optional[Tuple[str, str]] = None,
+    machine: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return ``items`` filtered + sorted exactly as claim_next() would pick
     from them — the single source of truth for "is this ticket claimable
@@ -2012,8 +2100,16 @@ def _claim_candidates(
     ``model_floor`` that model does not meet are skipped, so a weaker worker
     just takes the next ticket instead of claiming and parking it. None
     disables the filter.
+
+    ``machine`` (``mac``/``cloud``, default: this machine's
+    machine_placement()): tickets whose ``placement`` names the other kind of
+    machine are skipped, so a Mac-bound ticket waits for the Mac and an
+    always-on VM only ever takes what it can actually run.
     """
     candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of")]
+    if any(it.get("placement") for it in candidates):
+        _m = machine or machine_placement()
+        candidates = [it for it in candidates if placement_allows(it, _m)]
     # WT-28: a ticket whose answer is reserved for its parked worker
     # (affinity) is claimable only by that worker until the reservation
     # expires; everyone else, and every counting caller, drops it.

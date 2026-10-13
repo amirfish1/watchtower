@@ -174,6 +174,9 @@ def queue_status(
         # WT-28/31: an answer reserved for its parked worker is claimable by
         # that worker only, so it is not open work for the pool.
         and not q._affinity_reserved(it, now_ts)
+        # Placement: a ticket pinned to the other kind of machine is not open
+        # work for this machine's pool either.
+        and q.placement_allows(it)
         and (
             not worker_model
             or config.model_meets_floor(worker_model, it.get("model_floor") or "")

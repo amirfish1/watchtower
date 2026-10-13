@@ -540,6 +540,8 @@ def cmd_ls(args: argparse.Namespace) -> int:
         waiting = _waiting_note(it, by_ref)
         if waiting:
             line += f"  [{waiting}]"
+        if it.get("placement") in ("mac", "cloud"):
+            line += f"  [{it['placement']} only]"
         role = q.group_role(it)
         if role == "parent":
             line += (f"  [group: {len((it.get('group') or {}).get('members') or [])} members, "
@@ -771,7 +773,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     for name in (
         "title", "note", "text", "url", "type", "readiness", "priority",
         "value", "confidence", "model_floor", "planner_model", "verifier_model",
-        "selector", "screenshot_path", "repo_path", "accept",
+        "selector", "screenshot_path", "repo_path", "accept", "placement",
     ):
         value = getattr(args, name, None)
         if value is not None:
@@ -872,6 +874,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             value=getattr(args, "value", "") or "",
             confidence=getattr(args, "confidence", "") or "",
             model_floor=getattr(args, "model_floor", "") or "",
+            placement=getattr(args, "placement", "") or "",
             planner_model=getattr(args, "planner_model", "") or "",
             verifier_model=getattr(args, "verifier_model", "") or "",
             dedupe_key=getattr(args, "dedupe_key", "") or "",
@@ -1156,6 +1159,21 @@ def cmd_claim(args: argparse.Namespace) -> int:
     # only fires for a backend that cannot (GitHub-backed queues) or a by-ref
     # claim of a ticket above this worker's model. The ticket goes straight
     # back to open (never parked blocked) for the reconciler to route.
+    # Placement: an explicit `wt claim REF` of a ticket pinned to the other
+    # kind of machine is released straight back (claim_next never offers it).
+    if not q.placement_allows(item):
+        q.update_status(
+            item["ref"], "open", worker, require_status="in_progress",
+            reason=f"placement {item.get('placement')} not runnable on {q.machine_placement()}",
+        )
+        print(
+            f"error: {item['ref']} is placement={item.get('placement')!r}; this machine is "
+            f"{q.machine_placement()!r} -- released back to open "
+            "(`wt edit REF --placement any` to allow it here)",
+            file=sys.stderr,
+        )
+        return 1
+
     model_floor = str(item.get("model_floor") or "").strip()
     if model_floor:
         from . import config
@@ -6433,6 +6451,11 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--builder-model", default="", dest="model_floor",
                                help="alias of --model-floor: the builder model this "
                                     "ticket needs (WT-14)")
+        subparser.add_argument("--placement", default="", choices=list(q.VALID_PLACEMENTS) + [""],
+                               help="which machine may run this: mac (waits for the Mac), "
+                                    "cloud (Linux/VM only), any. Default: a Mac filer's "
+                                    "Xcode/iOS/simulator/browser keyword heuristic picks mac, "
+                                    "otherwise unrestricted")
         subparser.add_argument("--planner-model", default="", dest="planner_model",
                                help="model that plans this ticket (overrides the queue)")
         subparser.add_argument("--verifier-model", default="", dest="verifier_model",
@@ -6530,6 +6553,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "(FEAT-NEXT-120)")
     s.add_argument("--builder-model", default=None, dest="model_floor",
                    help="alias of --model-floor (WT-14)")
+    s.add_argument("--placement", default=None, choices=list(q.VALID_PLACEMENTS) + [""],
+                   help="which machine may run this: mac, cloud, any; empty clears")
     s.add_argument("--planner-model", default=None, dest="planner_model",
                    help="model that plans this ticket; empty clears")
     s.add_argument("--verifier-model", default=None, dest="verifier_model",
