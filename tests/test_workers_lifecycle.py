@@ -1464,6 +1464,28 @@ def test_claim_rejects_concurrent_codex_process_for_same_thread(
     assert recorded["pid"] == os.getpid()
 
 
+def test_rebind_accepts_engine_child_of_recorded_launcher_pid(wt):
+    """OPS-1396: the npm launcher (node) is recorded; the ancestor lookup
+    lands on its native codex child. Same session, so no concurrent-rebind error."""
+    session_id = "33333333-3333-3333-3333-333333333333"
+    worker_id = "q-codex-wrapper"
+    wt.workers.record_worker(
+        os.getpid(), "Q", "codex", worker_id, str(wt.tmp),
+        str(wt.tmp / f"{worker_id}.log"), session_id=session_id,
+    )
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert wt.workers.rebind_continued_worker(
+            worker_id, session_id, child.pid
+        ) is True
+        rec = next(w for w in wt.workers._load()["workers"] if w["worker_id"] == worker_id)
+        assert rec["pid"] == os.getpid()
+        assert not rec.get("rebound_at")
+    finally:
+        child.kill()
+        child.wait()
+
+
 def test_pruned_codex_alias_from_unrelated_session_claims_ambient(
     wt, monkeypatch, capsys
 ):

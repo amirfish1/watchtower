@@ -4172,6 +4172,30 @@ def _find_engine_ancestor_pid(engine: str, max_depth: int = 8) -> int:
     return 0
 
 
+def _pid_is_descendant(pid: int, ancestor: int, max_depth: int = 8) -> bool:
+    """True when ``ancestor`` appears in ``pid``'s parent chain.
+
+    The Codex npm launcher is a node wrapper that spawns the native codex
+    binary, so a worker recorded under the wrapper pid and an ancestor lookup
+    that lands on the child are the same live session, not a concurrent rebind.
+    """
+    cur = int(pid or 0)
+    for _ in range(max_depth):
+        if cur <= 1:
+            return False
+        try:
+            out = subprocess.run(
+                ["ps", "-p", str(cur), "-o", "ppid="],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+            cur = int(out)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+        if cur == int(ancestor):
+            return True
+    return False
+
+
 def rebind_continued_worker(
     worker_id: str, session_id: str, pid: int, *, engine: str = "codex"
 ) -> bool:
@@ -4264,6 +4288,14 @@ def rebind_continued_worker(
                 return False
             recorded_pid = int(worker.get("pid") or 0)
             if recorded_pid == int(pid):
+                return True
+            if (
+                recorded_pid
+                and _pid_alive(recorded_pid)
+                and _pid_is_descendant(int(pid), recorded_pid)
+            ):
+                # Same session: recorded pid is the launcher wrapper of the
+                # live engine process we found. Not a rebind.
                 return True
             if worker.get("rebound_at"):
                 raise ValueError(
