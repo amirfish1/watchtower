@@ -638,7 +638,10 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
     results = [None, None]
 
     def run(i):
-        results[i] = wt.workers.reconcile_once(dry_run=False)
+        # Exercise the real staffing lock without unrelated fleet maintenance
+        # (stage supervision, title backfills, orphan sweeps) consuming this
+        # concurrency test's deadline on a busy development host.
+        results[i] = wt.workers.reconcile_once(dry_run=False, only_queue="Q")
 
     threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
     for t in threads:
