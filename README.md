@@ -469,15 +469,16 @@ active `tickets` and the `closed` array (closed items carry their `resolution`).
 
 A caveat or unresolved item that has been read and accepted — a standing
 limitation, something already handled elsewhere — can be acknowledged instead
-of erased. `wt ack` records who acknowledged which entry and when, alongside
-the original text; the close record itself is never rewritten and no close
-notification is re-fired.
+of erased. `wt unresolved-ack` records who acknowledged which entry and when,
+alongside the original text; the close record itself is never rewritten and no close
+notification is re-fired. `wt ack` is a separate command for approving a
+product-gate pitch; it does not acknowledge resolution notes.
 
 ```bash
-wt ack DEMO-1                      # numbered listing of this ticket's warnings
-wt ack DEMO-1 --unresolved 1       # acknowledge the first unresolved item
-wt ack DEMO-1 --all                # acknowledge every caveat/follow-up/unresolved
-wt ack DEMO-1 --unresolved 1 --undo
+wt unresolved-ack DEMO-1                      # numbered listing of this ticket's warnings
+wt unresolved-ack DEMO-1 --unresolved 1       # acknowledge the first unresolved item
+wt unresolved-ack DEMO-1 --all                # acknowledge every caveat/follow-up/unresolved
+wt unresolved-ack DEMO-1 --unresolved 1 --undo
 ```
 
 Drop the ref for the bulk form, for the case where a queue has accumulated a
@@ -485,20 +486,28 @@ backlog of terminal verdicts ("not-applicable", "guide-only by policy") that
 each keep a row amber forever:
 
 ```bash
-wt ack -q DEMO --all --dry-run                     # list what would be acked
-wt ack -q DEMO --all --matching not-applicable     # only those verdicts
-wt ack -q DEMO --all --matching not-applicable --undo
+wt unresolved-ack -q DEMO --all --dry-run                     # list what would be acked
+wt unresolved-ack -q DEMO --all --matching not-applicable     # only those verdicts
+wt unresolved-ack -q DEMO --all --matching not-applicable --undo
 ```
 
 `--matching` is a case-insensitive substring over the whole resolution — the
 summary as well as each entry. Bulk mode is `--all` only, since a 1-based
 index into one ticket's caveat list means nothing across a hundred tickets.
 
-Indexes are 1-based and match the `wt ack <ref>` listing. An acknowledged chip
-renders dimmed rather than disappearing, and its ✓ toggle on the dashboard
+Indexes are 1-based and match the `wt unresolved-ack <ref>` listing. An
+acknowledged chip renders dimmed rather than disappearing, and its ✓ toggle
+on the dashboard
 does the same thing over `POST /api/ticket/<ref>/ack`
 (`{"field", "index", "undo"}` or `{"all": true}`). Closed `wt ls` rows report
 the tally as e.g. `[2 unresolveds, 1 acked]`.
+
+Acknowledgments are per entry, stored in `resolution.<field>_ack` maps keyed
+by the original zero-based index, with `by` and `at` metadata. Consumers should
+exclude acknowledged unresolved entries from attention badges and sorting,
+while keeping every original note available in ticket details. An acknowledgment
+means "reviewed", not "fixed"; it does not reopen a ticket or satisfy a blocked
+dependency. Undo removes the marker and restores attention.
 
 #### Finding unresolved work
 
