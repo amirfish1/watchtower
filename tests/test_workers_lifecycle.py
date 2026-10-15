@@ -643,8 +643,10 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
     threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
     for t in threads:
         t.start()
+    # This checks serialization, not a latency budget. Loaded fleet hosts
+    # need time for both passes to finish before the fixture is torn down.
     for t in threads:
-        t.join(timeout=10)
+        t.join(timeout=60)
 
     assert all(r is not None for r in results), "a reconcile pass deadlocked"
     total = sum(len(r["spawned"]) for r in results)
@@ -2449,6 +2451,127 @@ def _row(wt, worker_id):
     return next(
         r for r in wt.workers._load()["workers"] if r["worker_id"] == worker_id
     )
+
+
+@pytest.mark.parametrize("released_age_s", [10, 7200])
+def test_reap_recovers_release_time_from_legacy_sentinel(wt, released_age_s):
+    """Pre-TTL releases (or a crash before the registry write) have only a
+    sentinel. They still need a bounded lifetime, measured from that file."""
+    rec, proc = _released_worker(wt, "Q", released_age_s=released_age_s)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    now = int(time.time())
+    released_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - released_age_s),
+    )
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    os.utime(sentinel, (now - released_age_s, now - released_age_s))
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600, now=now)
+        assert _row(wt, worker_id)["released_at"] == released_at
+        if released_age_s >= 3600:
+            assert [a["action"] for a in actions] == ["sigterm"]
+            assert _wait_gone(proc.pid)
+        else:
+            assert actions == []
+            assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_reap_legacy_release_survives_sentinel_consumption_and_honors_grace(wt, monkeypatch):
+    rec, proc = _released_worker(wt, "Q", released_age_s=10)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    now = int(time.time())
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    os.utime(sentinel, (now - 10, now - 10))
+    signals = []
+    monkeypatch.setattr(
+        wt.workers, "_signal_worker",
+        lambda pid, sig: signals.append((pid, sig)) or "pid",
+    )
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600, now=now) == []
+        sentinel.unlink()  # the worker consumes its one-shot stop instruction
+        term_at = now + 3600
+        actions = wt.workers.reap_released_workers(ttl_s=3600, now=term_at)
+        assert [a["action"] for a in actions] == ["sigterm"]
+        assert wt.workers.reap_released_workers(
+            ttl_s=3600, kill_grace_s=30, now=term_at + 29,
+        ) == []
+        actions = wt.workers.reap_released_workers(
+            ttl_s=3600, kill_grace_s=30, now=term_at + 30,
+        )
+        assert [a["action"] for a in actions] == ["sigkill"]
+        assert signals == [(proc.pid, 15), (proc.pid, 9)]
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@pytest.mark.parametrize("sentinel_state", ["missing", "directory", "unreadable"])
+def test_reap_never_invents_release_without_sentinel_evidence(wt, monkeypatch, sentinel_state):
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    if sentinel_state == "unreadable":
+        original_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path == sentinel:
+                raise PermissionError("unreadable sentinel")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+    else:
+        sentinel.unlink()
+        if sentinel_state == "directory":
+            sentinel.mkdir()
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        assert not _row(wt, worker_id).get("released_at")
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_reap_sentinel_mtime_does_not_replace_durable_release_time(wt):
+    rec, proc = _released_worker(wt, "Q", released_age_s=10)
+    worker_id = rec["worker_id"]
+    released_at = _row(wt, worker_id)["released_at"]
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    old = time.time() - 7200
+    os.utime(sentinel, (old, old))
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        assert _row(wt, worker_id)["released_at"] == released_at
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@pytest.mark.parametrize("identity", ["mismatch", "unknown"])
+def test_reap_legacy_sentinel_still_requires_pid_identity(wt, monkeypatch, identity):
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    old = time.time() - 7200
+    os.utime(sentinel, (old, old))
+    monkeypatch.setattr(wt.workers, "_worker_pid_identity", lambda w, pid: identity)
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        assert _row(wt, worker_id)["released_at"]
+        assert proc.poll() is None
+        assert bool(_row(wt, worker_id).get("gc_skipped")) == (identity == "mismatch")
+    finally:
+        proc.terminate()
+        proc.wait()
 
 
 @pytest.mark.parametrize("kill_sent_age_s", [None, 120])

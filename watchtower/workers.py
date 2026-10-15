@@ -23,6 +23,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -2884,6 +2885,10 @@ def reap_released_workers(
     stop-signal sentinel is dropped once the process is confirmed dead, so
     ``stop-signals/`` does not accumulate orphans for it.
 
+    Older releases and an interrupted ``request_stop`` may have only a stop
+    sentinel. Recover their missing ``released_at`` from the sentinel mtime
+    and persist it, so consuming that one-shot file cannot reset the TTL.
+
     Never signals a pid that no longer belongs to the worker (see
     ``_worker_pid_identity``): such a row is marked ``gc_skipped`` and logged
     once as GC_SKIPPED. Signals go to the worker's whole process group when it
@@ -2893,7 +2898,10 @@ def reap_released_workers(
     ``{"worker_id", "queue", "pid", "action": "sigterm"|"sigkill",
     "scope": "group"|"pid", "released_age_s"}``.
     """
-    now = time.time() if now is None else float(now)
+    # Stamp SIGTERM at signal time even if ownership discovery was slow.
+    # An explicit now supplies a fixed clock for deterministic callers.
+    clock = time.time if now is None else lambda: float(now)
+    now = clock()
     actions: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     # Computed once per pass, on first need: each call lists every ticket in
@@ -2908,13 +2916,27 @@ def reap_released_workers(
         data = _load()
         changed = False
         for row in data["workers"]:
-            released_at = str(row.get("released_at") or "")
-            if not released_at or row.get("gc_skipped"):
+            if row.get("gc_skipped"):
                 continue
+            worker_id = str(row.get("worker_id") or "")
+            released_at = str(row.get("released_at") or "")
+            if not released_at:
+                if not worker_id:
+                    continue
+                try:
+                    sentinel = (STOP_SIGNALS_DIR / worker_id).stat()
+                    if not stat.S_ISREG(sentinel.st_mode):
+                        continue
+                    released_at = datetime.fromtimestamp(
+                        sentinel.st_mtime, timezone.utc,
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except (OSError, ValueError, OverflowError):
+                    continue  # no readable release evidence; leave attached
+                row["released_at"] = released_at
+                changed = True
             age_s = _iso_age_s(released_at, now)
             if age_s < ttl_s:
                 continue
-            worker_id = str(row.get("worker_id") or "")
             if fresh_owners is None:
                 fresh_owners = _fresh_park_owners(now)
             if worker_id in fresh_owners:
@@ -2948,7 +2970,7 @@ def reap_released_workers(
             if kill_sent_at:
                 _cleanup_stop_signal(worker_id)
             else:
-                row["gc_kill_sent_at"] = datetime.now(timezone.utc).strftime(
+                row["gc_kill_sent_at"] = datetime.fromtimestamp(clock(), timezone.utc).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"
                 )
                 changed = True
@@ -5081,7 +5103,8 @@ def request_stop(worker_id: str) -> Path:
     The worker's next ``wt claim`` call will detect the file, delete it, and
     return ``{"stop": True}`` instead of claiming more queue work. The
     underlying conversation/process is preserved and may continue unrelated
-    work. Uses the file-system only -- does NOT touch workers.json.
+    work until the released-worker TTL expires. Persists ``released_at`` in
+    workers.json so detachment and the TTL survive sentinel consumption.
     """
     stop_dir = STOP_SIGNALS_DIR
     stop_dir.mkdir(parents=True, exist_ok=True)
