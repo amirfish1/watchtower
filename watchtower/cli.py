@@ -3511,16 +3511,28 @@ def cmd_workers(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
+    # The prune above already dropped every dead row it may. What survives dead
+    # is retained on purpose -- rebound tombstones (REBOUND_RETENTION_S guards a
+    # second continuation), recent stage records, rows owed a lifecycle audit --
+    # and a week of rebinds is ~100 rows that read as "stale workers". The
+    # table shows live workers unless --all; --json is unchanged.
+    hidden = 0
+    if not getattr(args, "all", False):
+        hidden = sum(1 for w in rows if not w.get("alive"))
+        rows = [w for w in rows if w.get("alive")]
     if not rows:
-        print("(no workers tracked)")
-        return 0
-    print(f"{'WORKER':<22}{'PID':>8}  {'QUEUE':<12}{'ENGINE':<8}{'ALIVE':<6}STARTED")
+        print("(no workers tracked)" if not hidden else "(no live workers)")
+    else:
+        print(f"{'WORKER':<22}{'PID':>8}  {'QUEUE':<12}{'ENGINE':<8}{'ALIVE':<6}STARTED")
     for w in rows:
         print(
             f"{w.get('worker_id',''):<22}{w.get('pid',0):>8}  "
             f"{w.get('queue',''):<12}{w.get('engine',''):<8}"
             f"{'yes' if w.get('alive') else 'no':<6}{w.get('started_at','')}"
         )
+    if hidden:
+        print(f"({hidden} dead record(s) retained by design -- rebind guard / "
+              "stage forensics; they expire on their own. --all to show)")
     return 0
 
 
@@ -6962,6 +6974,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("workers")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--all", action="store_true",
+                   help="also list dead records retained by design (rebind "
+                        "tombstones, recent stage records)")
     s.set_defaults(func=cmd_workers)
     workers_sub = s.add_subparsers(dest="workers_command")
     release_workers_parser = workers_sub.add_parser(

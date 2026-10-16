@@ -5257,3 +5257,35 @@ def test_stale_idle_worker_without_claim_does_not_count_as_staffed(wt, monkeypat
                         lambda w: wt.workers.STALE_IDLE_S + 60)
     r = wt.workers.reconcile_once(dry_run=True)
     assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1
+
+
+def test_wt_workers_table_hides_retained_dead_rows_unless_all(wt, capsys):
+    """Dead rebound rows are kept for REBOUND_RETENTION_S by design; a week of
+    rebinds left ~100 of them in `wt workers` reading as stale workers. The
+    table now shows live workers only (with a count), --all shows the rest,
+    and --json keeps every row for programmatic callers (CCC)."""
+    cli = _reloaded_cli(wt)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    wt.workers.record_worker(os.getpid(), "Q", "claude", "q-live", str(wt.tmp),
+                             str(wt.tmp / "q-live.log"))
+    wt.workers.record_worker(_dead_pid(), "Q", "claude", "q-tomb", str(wt.tmp),
+                             str(wt.tmp / "q-tomb.log"))
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        for row in data["workers"]:
+            if row["worker_id"] == "q-tomb":
+                row["rebound_at"] = now_iso
+        wt.workers._save(data)
+
+    assert cli.cmd_workers(SimpleNamespace(json=False, all=False)) == 0
+    out = capsys.readouterr().out
+    assert "q-live" in out and "q-tomb" not in out
+    assert "1 dead record(s) retained" in out
+
+    assert cli.cmd_workers(SimpleNamespace(json=False, all=True)) == 0
+    out = capsys.readouterr().out
+    assert "q-live" in out and "q-tomb" in out and "retained" not in out
+
+    assert cli.cmd_workers(SimpleNamespace(json=True, all=False)) == 0
+    ids = {w["worker_id"] for w in json.loads(capsys.readouterr().out)}
+    assert ids == {"q-live", "q-tomb"}
