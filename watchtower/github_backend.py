@@ -1713,7 +1713,49 @@ class GitHubIssuesBackend:
             return int(suffix) if suffix.isdigit() else None
         return None
 
+    _ISSUE_TO_ITEM_MEMO: Dict[tuple, Dict[str, Any]] = {}
+
     def _issue_to_item(self, issue: Dict[str, Any]) -> Dict[str, Any]:
+        comments_raw = issue.get("comments")
+        has_comments = isinstance(comments_raw, list) and bool(comments_raw)
+        created_at = issue.get("createdAt")
+        state = str(issue.get("state") or "").upper()
+        age_settled = (
+            state == "CLOSED"
+            or not self.auto_drain
+            or self.grace_s <= 0
+            or _age_seconds(created_at) >= self.grace_s
+        )
+        memo_key = None
+        if age_settled and not has_comments:
+            memo_key = (
+                id(issue),
+                issue.get("number"),
+                issue.get("updatedAt"),
+                state,
+                self.repo,
+                self.queue,
+                self.repo_path,
+                self.partition_by_label,
+                self.catch_all,
+                frozenset(self.sibling_labels),
+                self.queue_label,
+                self.in_progress_label,
+                self.no_auto_drain_label,
+                self.run_requested_label,
+                self.auto_drain,
+                self.grace_s,
+            )
+            cached_base = self._ISSUE_TO_ITEM_MEMO.get(memo_key)
+            if cached_base is not None:
+                item = dict(cached_base)
+                if "token_usage" in item:
+                    item["token_usage"] = copy.copy(item["token_usage"])
+                from . import usage
+                item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
+                usage.attach(item)
+                item.pop("_usage_namespace", None)
+                return item
         # meta is read-only here: the two containers that reach the item are
         # copied below, so the memoized parse can be shared across queues.
         body, meta = _split_body_shared(str(issue.get("body") or ""))
@@ -1730,7 +1772,6 @@ class GitHubIssuesBackend:
         else:
             queue_member = self.queue_label in labels
         number = int(issue.get("number") or 0)
-        state = str(issue.get("state") or "").upper()
         if state == "CLOSED":
             status = "closed"
         elif queue_member and (meta.get("claimed_by") or self.in_progress_label in labels):
@@ -1749,7 +1790,7 @@ class GitHubIssuesBackend:
             workable
             and self.auto_drain
             and not no_auto_drain
-            and _age_seconds(issue.get("createdAt")) >= self.grace_s
+            and _age_seconds(created_at) >= self.grace_s
         )
         manual_eligible = bool(workable and run_requested)
         work_it = auto_eligible or manual_eligible
@@ -1804,8 +1845,8 @@ class GitHubIssuesBackend:
             "closed_at": issue.get("closedAt") or meta.get("closed_at"),
             "claimed_session_id": meta.get("claimed_session_id"),
             "claimed_machine": meta.get("claimed_machine"),
-            "created_at": issue.get("createdAt") or _now_iso(),
-            "updated_at": issue.get("updatedAt") or issue.get("createdAt") or _now_iso(),
+            "created_at": created_at or _now_iso(),
+            "updated_at": issue.get("updatedAt") or created_at or _now_iso(),
             "github_repo": self.repo,
             "github_labels": labels,
             "github_assignees": assignees,
@@ -1831,8 +1872,8 @@ class GitHubIssuesBackend:
             # Owner-answer ingestion (WATCHTOWER-5) reads it to detect a human's
             # answer typed straight onto the issue.
             "_github_comments": (
-                issue.get("comments")
-                if isinstance(issue.get("comments"), list) else []
+                comments_raw
+                if isinstance(comments_raw, list) else []
             ),
         }
         if status == "closed":
@@ -1843,10 +1884,14 @@ class GitHubIssuesBackend:
         history = meta.get("history")
         if isinstance(history, list):
             item["history"] = list(history)
-        from . import usage
-        item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
         if meta.get("token_usage"):
             item["token_usage"] = copy.copy(meta["token_usage"])
+        if memo_key is not None:
+            if len(self._ISSUE_TO_ITEM_MEMO) >= 16384:
+                self._ISSUE_TO_ITEM_MEMO.clear()
+            self._ISSUE_TO_ITEM_MEMO[memo_key] = dict(item)
+        from . import usage
+        item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
         usage.attach(item)
         item.pop("_usage_namespace", None)
         return item

@@ -5473,8 +5473,22 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
             remaining -= max(0.5, time.time() - slept_from)
 
 
+def _systemd_user_service_installed() -> bool:
+    return (
+        sys.platform == "linux"
+        and _LAUNCHAGENT_PLIST == _DEFAULT_LAUNCHAGENT_PLIST
+        and (Path.home() / ".config" / "systemd" / "user" / "watchtower.service").is_file()
+    )
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     dry_run = getattr(args, "dry_run", False)
+    if not args.foreground and not dry_run and _systemd_user_service_installed():
+        rc = os.system("systemctl --user restart watchtower.service 2>/dev/null") >> 8
+        if rc == 0:
+            print("restarted watchtower.service (systemd-supervised)")
+            return 0
+        print(f"warning: systemctl exited {rc}; falling back to manual start")
     # First-time auto-install: `wt start` is the normal user entry point, so a
     # user should never have to run a separate `wt install` first. If the
     # LaunchAgent has never been written, write it now (same plist + skill
@@ -5579,6 +5593,18 @@ def cmd_stop(args: argparse.Namespace) -> int:
     # supervised daemon must tell launchd to stop-and-stay-stopped via `bootout`.
     # Only fall back to the pidfile+SIGTERM path for a manually-started daemon
     # (dev machines that never ran `wt install`).
+    if _systemd_user_service_installed():
+        rc = os.system("systemctl --user stop watchtower.service 2>/dev/null") >> 8
+        if rc == 0:
+            print("stopped watchtower.service (systemd will not relaunch)")
+            try:
+                from . import queue as _q
+                _q._log("DAEMON_STOP", "via systemctl stop")
+            except Exception:
+                pass
+            DAEMON_PID_FILE.unlink(missing_ok=True)
+            return 0
+        print(f"warning: systemctl stop exited {rc}; falling back to signal")
     if _LAUNCHAGENT_PLIST.exists() and _launchagent_loaded():
         rc = _launchctl_bootout()
         if rc == 0:
@@ -5621,7 +5647,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 _LAUNCHAGENT_LABEL = "ai.watchtower.watcher"
-_LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
+_DEFAULT_LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
+_LAUNCHAGENT_PLIST = _DEFAULT_LAUNCHAGENT_PLIST
 
 
 def _launchd_path() -> str:

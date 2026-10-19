@@ -703,22 +703,24 @@ def _db_stamp(db: Path) -> tuple:
     return tuple(stamp)
 
 
-def _read_db(db: Path, *, strict: bool = False) -> Dict[str, Any]:
+def _read_db(db: Path, *, strict: bool = False, readonly: bool = False) -> Dict[str, Any]:
     # A reconcile tick loads the whole store ~60 times; parsing ~6000 rows of
     # JSON each time dominated it. Keep the parsed store as a pickle keyed by
-    # the store's revision + file stamp and hand every caller a private copy
-    # (callers load, mutate and save the result).
+    # the store's revision + file stamp and hand mutating callers a private copy
+    # while read-only counting callers reuse the normalized snapshot directly.
     import pickle
     key = str(db)
     stamp = _db_stamp(db)
+    memo = _READ_DB_MEMO.get(key)
+    if memo is not None and memo[0][0] == stamp:
+        return memo[2] if readonly else pickle.loads(memo[1])
     try:
         conn = _connect(db)
         try:
             counter = int(_meta_get(conn, "counter", "0") or 0)
             revision = _meta_get(conn, "revision", "0")
-            memo = _READ_DB_MEMO.get(key)
             if memo is not None and memo[0] == (stamp, counter, revision):
-                return pickle.loads(memo[1])
+                return memo[2] if readonly else pickle.loads(memo[1])
             items = [
                 json.loads(row[0])
                 for row in conn.execute("SELECT item_json FROM items ORDER BY number")
@@ -729,10 +731,18 @@ def _read_db(db: Path, *, strict: bool = False) -> Dict[str, Any]:
         if strict:
             raise
         return _empty_store()
-    data = {"counter": counter, "items": items}
+    _normalize_items(items)
+    if items:
+        max_num = max(int(it.get("number", 0)) for it in items)
+        if max_num > counter:
+            counter = max_num
+    data = {"counter": counter, "items": items, "_normalized": True}
     # Only memoize when nothing moved while we were reading.
     if _db_stamp(db) == stamp:
-        _READ_DB_MEMO[key] = ((stamp, counter, revision), pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL))
+        pickled = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
+        _READ_DB_MEMO[key] = ((stamp, counter, revision), pickled, data)
+        if not readonly:
+            return pickle.loads(pickled)
     return data
 
 
@@ -825,10 +835,10 @@ def export_data() -> Dict[str, Any]:
     return {"counter": int(data.get("counter", 0)), "items": data.get("items", [])}
 
 
-def _load_unlocked(*, strict: bool = False) -> Dict[str, Any]:
+def _load_unlocked(*, strict: bool = False, readonly: bool = False) -> Dict[str, Any]:
     db = _db_path()
     if db.exists():
-        data = _read_db(db, strict=strict)
+        data = _read_db(db, strict=strict, readonly=readonly)
     else:
         try:
             with open(_resolve_store_path(), "r") as f:
@@ -843,6 +853,8 @@ def _load_unlocked(*, strict: bool = False) -> Dict[str, Any]:
         if strict:
             raise ValueError("queue store root must be a JSON object")
         return _empty_store()
+    if data.get("_normalized"):
+        return data
     data.setdefault("counter", 0)
     items = data.get("items")
     if not isinstance(items, list):
@@ -2217,7 +2229,7 @@ def count_claimable(
         return backend.count_claimable(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
-        data = _load_unlocked()
+        data = _load_unlocked(readonly=True)
         return len(_claim_candidates(
             data["items"], project=proj, lane=lane, item_types=item_types,
             worker_model=worker_model,
@@ -2242,7 +2254,7 @@ def count_manual_eligible(
         return backend.count_manual_eligible(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
-        data = _load_unlocked()
+        data = _load_unlocked(readonly=True)
         candidates = _claim_candidates(
             data["items"], project=proj, lane=lane, item_types=item_types
         )
@@ -7938,7 +7950,10 @@ def comment(ident: Any, text: str, by: str = "human", session_id: str = "") -> O
     return None
 
 
-def list_blocked(project: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_blocked(
+    project: Optional[str] = None,
+    items: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """Tickets parked for a human (``needs_input`` truthy), optionally scoped to
     one queue. The CLI's ``wt blocked`` and CCC both read this.
 
@@ -7948,13 +7963,17 @@ def list_blocked(project: Optional[str] = None) -> List[Dict[str, Any]]:
     every worker holding a blocked ticket there read as fully productive to
     the reconciler's staffing math (see ``list_active_claims``), so a queue
     stuck entirely behind blocked tickets never got replacement workers."""
-    return [it for it in list_items(project=project)
+    src = list_items(project=project) if items is None else items
+    return [it for it in src
             if it.get("needs_input")
             or (it.get("status") == PARKED_STATUS
                 and (it.get("pending_answer") or {}).get("state") == "routing")]
 
 
-def list_active_claims(project: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_active_claims(
+    project: Optional[str] = None,
+    items: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """In-progress tickets a worker is actively holding -- ``in_progress`` but
     NOT parked on ``needs_input`` (a blocked ticket stays ``in_progress``, so
     it's excluded here; use ``list_blocked`` for those). Same scope as
@@ -7962,9 +7981,10 @@ def list_active_claims(project: Optional[str] = None) -> List[Dict[str, Any]]:
     ``list_items`` instead of the file store directly). Lets the reconciler
     tell "worker has nothing else to do" apart from "worker blocked one
     ticket but is actively working another"."""
+    src = list_items(status="in_progress", project=project) if items is None else items
     return [
-        it for it in list_items(status="in_progress", project=project)
-        if not it.get("needs_input")
+        it for it in src
+        if it.get("status") == "in_progress" and not it.get("needs_input")
     ]
 
 

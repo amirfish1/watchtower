@@ -4697,12 +4697,15 @@ def parked_label(item: Dict[str, Any]) -> str:
             f"at {pk.get('at') or '-'}")
 
 
-def retained_counts(rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, int]:
+def retained_counts(
+    rows: Optional[List[Dict[str, Any]]] = None,
+    items: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, int]:
     """Per-queue count of live workers retained for a parked answer (WT-28),
     shown next to ``live`` in status / the dashboard. ``rows`` reuses an
     already-listed roster instead of taking workers.lock again (WT-4)."""
     try:
-        retained = retained_parked_ids()
+        retained = retained_parked_ids(items=items)
     except Exception:
         return {}
     out: Dict[str, int] = {}
@@ -6576,10 +6579,16 @@ def _reconcile_once_locked(dry_run: bool = False,
     # WT-131 being claimable). Track which live workers are blocked so the
     # spawn decision can staff productive capacity around them instead of
     # waiting on the block to clear.
+    from . import queue as _q
+    try:
+        _all_items = _q.list_items(project=only_queue or None) or []
+    except Exception:
+        _all_items = None
+
     from . import queue as _q_blocked
     blocked_worker_ids: Dict[str, Set[str]] = {}
     try:
-        for it in (_q_blocked.list_blocked() or []):
+        for it in (_q_blocked.list_blocked(items=_all_items) or []):
             wid = str(it.get("claimed_by") or "")
             qn = str(it.get("project") or "")
             if wid and qn:
@@ -6598,7 +6607,7 @@ def _reconcile_once_locked(dry_run: bool = False,
     # spares any worker still holding a blocked ticket (WATCHTOWER-1).
     busy_worker_ids: Dict[str, Set[str]] = {}
     try:
-        for it in (_q_blocked.list_active_claims() or []):
+        for it in (_q_blocked.list_active_claims(items=_all_items) or []):
             wid = str(it.get("claimed_by") or "")
             qn = str(it.get("project") or "")
             if wid and qn:
@@ -6607,19 +6616,18 @@ def _reconcile_once_locked(dry_run: bool = False,
         busy_worker_ids = {}
 
     try:
-        retained_parked = retained_parked_ids()
+        retained_parked = retained_parked_ids(items=_all_items)
     except Exception:
         retained_parked = set()
 
     # Use health for queue depth + stuck ground-truth -- one call covers all queues.
     health_by_queue: Dict[str, Dict[str, Any]] = {
         row["queue"]: row
-        for row in health.all_status(project=only_queue or None)
+        for row in health.all_status(project=only_queue or None, items=_all_items)
     }
 
     # Raw open depth per queue, for the "N open" figure in skip/spawn messages
     # (unfiltered -- just how big the backlog is, regardless of claimability).
-    from . import queue as _q
     _total_open_by_q: Dict[str, int] = {}
     # The same items, kept rather than only counted, so a depth==0 skip can
     # report what was actually observed about them instead of guessing
@@ -6627,7 +6635,7 @@ def _reconcile_once_locked(dry_run: bool = False,
     # list pass the reconciler already makes.
     _open_items_by_q: Dict[str, List[Dict[str, Any]]] = {}
     try:
-        for it in (_q.list_items(project=only_queue or None) or []):
+        for it in (_all_items if _all_items is not None else (_q.list_items(project=only_queue or None) or [])):
             if it.get("status") != "open":
                 continue
             qn = str(it.get("project") or "")

@@ -127,7 +127,7 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     # daemon's own tick (WT-4).
     wrows = workers.list_workers(prune=False)
     counts = workers.worker_counts(rows=wrows)
-    retained = workers.retained_counts(rows=wrows)
+    retained = workers.retained_counts(rows=wrows, items=items)
     workers.annotate_activity(wrows, items)
     workers_by_queue: Dict[str, List[Dict[str, Any]]] = {}
     for worker in wrows:
@@ -172,7 +172,7 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     return {"queues": rows, "workers": wrows, "github": health.github_connectivity()}
 
 
-STATUS_CACHE_TTL_S = 2.0
+STATUS_CACHE_TTL_S = 5.0
 _status_cache: Dict[str, Any] = {"at": 0.0, "payload": None}
 _status_compute = threading.Lock()
 

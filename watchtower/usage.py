@@ -260,13 +260,30 @@ def track_stage(item: dict, previous: dict, current: dict, at: str) -> None:
           run=str(current.get("key") or ""), attempt=int(current.get("attempt") or 0), dedicated=True)
 
 
+_LOCATION_MEMO: dict = {}
+
+
 def _location(item: dict):
     from . import queue
+    store_key = (
+        os.environ.get("WATCHTOWER_STORE"),
+        os.environ.get("WATCHTOWER_USAGE_DIR"),
+        str(getattr(queue, "STORE_FILE", "")),
+        item.get("_usage_namespace"),
+        item.get("ref"),
+    )
+    cached = _LOCATION_MEMO.get(store_key)
+    if cached is not None:
+        return cached
     base = queue._resolve_store_path()
     root = Path(os.environ.get("WATCHTOWER_USAGE_DIR") or (base.parent / "usage"))
     namespace = item.get("_usage_namespace") or f"local:{base}"
     key = hashlib.sha256(f"{namespace}:{item.get('ref')}".encode()).hexdigest()
-    return root / (key + ".json")
+    res = root / (key + ".json")
+    if len(_LOCATION_MEMO) >= 16384:
+        _LOCATION_MEMO.clear()
+    _LOCATION_MEMO[store_key] = res
+    return res
 
 
 def _read(path, *, strict=False):

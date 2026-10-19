@@ -150,14 +150,32 @@ def config_path() -> Path:
     return storage.migrate_config(_LEGACY_CONFIG_FILE)
 
 
-def _load() -> Dict[str, Any]:
+_LOAD_MEMO: Dict[str, Any] = {"sig": None, "data": {}}
+
+
+def _load_readonly() -> Dict[str, Any]:
     path = config_path()  # Migration errors must not become empty settings.
+    try:
+        st = path.stat()
+    except OSError:
+        return {}
+    sig = (str(path), st.st_mtime_ns, st.st_size)
+    if _LOAD_MEMO.get("sig") == sig:
+        return _LOAD_MEMO["data"]
     try:
         with open(path, "r") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
-    return data if isinstance(data, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    _LOAD_MEMO["sig"] = sig
+    _LOAD_MEMO["data"] = data
+    return data
+
+
+def _load() -> Dict[str, Any]:
+    import copy
+    return copy.deepcopy(_load_readonly())
 
 
 def _audit_path() -> Path:
@@ -280,6 +298,7 @@ def _save(data: Dict[str, Any]) -> None:
     with open(tmp, "w") as f:
         f.write(text)
     os.replace(tmp, path)
+    _LOAD_MEMO["sig"] = None
     _record_audit(text, data)
     a = actor()
     tail = (f"via {a['source']}; session={a['session'] or '-'} host={a['host']} "
@@ -296,7 +315,7 @@ def _queue_entry(queue: str) -> Dict[str, Any]:
     entry degrades to defaults everywhere instead of raising ``AttributeError``
     in whichever getter happens to be called first.
     """
-    entry = _load().get(queue, {})
+    entry = _load_readonly().get(queue, {})
     return entry if isinstance(entry, dict) else {}
 
 
@@ -627,7 +646,7 @@ def github_queues_for_repo(repo: str) -> list:
     if not target:
         return []
     out = []
-    for name, entry in _load().items():
+    for name, entry in _load_readonly().items():
         if not isinstance(entry, dict):
             continue
         if str(entry.get("backend") or "").strip().lower() != "github":
@@ -1429,7 +1448,7 @@ def sanitize_worker_settings(*, log=None) -> List[Dict[str, Any]]:
     ``{"queue", "unapproved_effort", "engine", "model"}`` rows.
     """
     findings: List[Dict[str, Any]] = []
-    for queue_name, entry in _load().items():
+    for queue_name, entry in _load_readonly().items():
         if not isinstance(entry, dict):
             continue
         effort_value = str(entry.get("effort") or "").strip().lower()
@@ -1497,7 +1516,8 @@ def all_queues(include_archived: bool = False) -> Dict[str, Any]:
     Archived queues (``wt queue archive``) are hidden unless ``include_archived``.
     """
     return {
-        k: v for k, v in _load().items()
+        k: (dict(v) if isinstance(v, dict) else v)
+        for k, v in _load_readonly().items()
         if include_archived or not (isinstance(v, dict) and v.get("archived"))
     }
 
