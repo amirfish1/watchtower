@@ -10,6 +10,7 @@ import json
 import uuid
 import socket
 import os
+import copy
 import hashlib
 from collections import defaultdict
 from pathlib import Path
@@ -331,10 +332,27 @@ def _write(path, record):
 
 def attach(item: dict) -> dict:
     """Merge latest private projection at read time; never contacts a provider."""
-    record = _read(_location(item))
-    if record.get("token_usage"):
-        item["token_usage"] = projection(record["token_usage"])
+    path = _location(item)
+    try:
+        st = path.stat()
+    except OSError:
+        return item   # no ledger: nothing to merge (what _read's {} did)
+    # A tick attaches the same ~6000 ledgers dozens of times; the projection
+    # only changes when the file does.
+    stamp = (st.st_mtime_ns, st.st_size)
+    hit = _ATTACH_MEMO.get(path)
+    if hit is None or hit[0] != stamp:
+        record = _read(path)
+        projected = projection(record["token_usage"]) if record.get("token_usage") else None
+        if len(_ATTACH_MEMO) >= 16384:
+            _ATTACH_MEMO.clear()
+        _ATTACH_MEMO[path] = hit = (stamp, projected)
+    if hit[1] is not None:
+        item["token_usage"] = copy.deepcopy(hit[1])
     return item
+
+
+_ATTACH_MEMO: dict = {}
 
 
 def capture(item: dict, callback, *args) -> None:

@@ -16,6 +16,7 @@ import os
 import re
 import subprocess
 import threading
+import copy
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1308,7 +1309,33 @@ def _meta_block(meta: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+_SPLIT_BODY_MEMO: Dict[str, tuple] = {}
+_SPLIT_BODY_MEMO_MAX = 4096
+
+
+def _split_body_memo(body: str) -> tuple[str, Dict[str, Any]]:
+    body = body or ""
+    hit = _SPLIT_BODY_MEMO.get(body)
+    if hit is None:
+        if len(_SPLIT_BODY_MEMO) >= _SPLIT_BODY_MEMO_MAX:
+            _SPLIT_BODY_MEMO.clear()
+        _SPLIT_BODY_MEMO[body] = hit = _split_body_uncached(body)
+    return hit
+
+
 def _split_body(body: str) -> tuple[str, Dict[str, Any]]:
+    # A reconcile tick converts every issue once per queue; the metadata parse
+    # is pure in the body text, so reuse it (callers get their own copy).
+    human, meta = _split_body_memo(body)
+    return human, copy.deepcopy(meta)
+
+
+def _split_body_shared(body: str) -> tuple[str, Dict[str, Any]]:
+    """Like _split_body but hands back the memoized meta itself: read-only."""
+    return _split_body_memo(body)
+
+
+def _split_body_uncached(body: str) -> tuple[str, Dict[str, Any]]:
     body = body or ""
     start = body.find(_META_START)
     if start < 0:
@@ -1687,7 +1714,9 @@ class GitHubIssuesBackend:
         return None
 
     def _issue_to_item(self, issue: Dict[str, Any]) -> Dict[str, Any]:
-        body, meta = _split_body(str(issue.get("body") or ""))
+        # meta is read-only here: the two containers that reach the item are
+        # copied below, so the memoized parse can be shared across queues.
+        body, meta = _split_body_shared(str(issue.get("body") or ""))
         text = _issue_text(body, meta.get("note"), issue.get("title"), issue.get("comments"))
         labels = _label_names(issue.get("labels"))
         assignees = _assignee_logins(issue.get("assignees"))
@@ -1813,11 +1842,11 @@ class GitHubIssuesBackend:
             item["resolution"] = resolution
         history = meta.get("history")
         if isinstance(history, list):
-            item["history"] = history
+            item["history"] = list(history)
         from . import usage
         item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
         if meta.get("token_usage"):
-            item["token_usage"] = meta["token_usage"]
+            item["token_usage"] = copy.copy(meta["token_usage"])
         usage.attach(item)
         item.pop("_usage_namespace", None)
         return item

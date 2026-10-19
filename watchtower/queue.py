@@ -688,11 +688,37 @@ _META_UPSERT = (
 )
 
 
+_READ_DB_MEMO: Dict[str, tuple] = {}
+
+
+def _db_stamp(db: Path) -> tuple:
+    """Cheap change token for the store: file stats of the db and its WAL."""
+    stamp = []
+    for path in (db, db.with_name(db.name + "-wal")):
+        try:
+            st = path.stat()
+            stamp += [st.st_mtime_ns, st.st_size]
+        except OSError:
+            stamp += [0, 0]
+    return tuple(stamp)
+
+
 def _read_db(db: Path, *, strict: bool = False) -> Dict[str, Any]:
+    # A reconcile tick loads the whole store ~60 times; parsing ~6000 rows of
+    # JSON each time dominated it. Keep the parsed store as a pickle keyed by
+    # the store's revision + file stamp and hand every caller a private copy
+    # (callers load, mutate and save the result).
+    import pickle
+    key = str(db)
+    stamp = _db_stamp(db)
     try:
         conn = _connect(db)
         try:
             counter = int(_meta_get(conn, "counter", "0") or 0)
+            revision = _meta_get(conn, "revision", "0")
+            memo = _READ_DB_MEMO.get(key)
+            if memo is not None and memo[0] == (stamp, counter, revision):
+                return pickle.loads(memo[1])
             items = [
                 json.loads(row[0])
                 for row in conn.execute("SELECT item_json FROM items ORDER BY number")
@@ -703,7 +729,11 @@ def _read_db(db: Path, *, strict: bool = False) -> Dict[str, Any]:
         if strict:
             raise
         return _empty_store()
-    return {"counter": counter, "items": items}
+    data = {"counter": counter, "items": items}
+    # Only memoize when nothing moved while we were reading.
+    if _db_stamp(db) == stamp:
+        _READ_DB_MEMO[key] = ((stamp, counter, revision), pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL))
+    return data
 
 
 def _create_db(db: Path, data: Dict[str, Any]) -> None:
