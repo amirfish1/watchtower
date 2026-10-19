@@ -5289,3 +5289,24 @@ def test_wt_workers_table_hides_retained_dead_rows_unless_all(wt, capsys):
     assert cli.cmd_workers(SimpleNamespace(json=True, all=False)) == 0
     ids = {w["worker_id"] for w in json.loads(capsys.readouterr().out)}
     assert ids == {"q-live", "q-tomb"}
+
+
+def test_record_worker_merges_rebind_stub_instead_of_duplicating(wt):
+    """A rebind stub that beat record_worker to the file must not leave two
+    rows for one process (double-counted as two live workers)."""
+    wid = "dup-w1"
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        data["workers"].append({
+            "worker_id": wid, "queue": "Q", "engine": "claude", "fifo": "",
+            "started_at": "", "pid": os.getpid(), "rebound_at": "2026-01-01T00:00:00Z",
+        })
+        wt.workers._save(data)
+    wt.workers.record_worker(
+        pid=os.getpid(), queue="Q", engine="claude", worker_id=wid,
+        fifo="/tmp/x.stdin", model="m",
+    )
+    rows = [r for r in wt.workers._load()["workers"] if r["worker_id"] == wid]
+    assert len(rows) == 1
+    assert rows[0]["fifo"] == "/tmp/x.stdin"
+    assert rows[0]["rebound_at"] == "2026-01-01T00:00:00Z"

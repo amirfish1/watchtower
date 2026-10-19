@@ -4384,7 +4384,21 @@ def record_worker(
             rec["exit_file"] = exit_file
         if session_id:
             rec["session_id"] = session_id
-        data["workers"].append(rec)
+        # The worker's own first `wt claim` can win the race against this
+        # write and rebind_continued_worker() then appends a stub row for the
+        # same worker_id/pid. Merge into it rather than adding a second row:
+        # two rows double-counted one process as two live workers, so the
+        # queue read as fully staffed with a released (un-nudgeable) twin.
+        stub = next(
+            (row for row in data["workers"]
+             if row.get("worker_id") == worker_id
+             and int(row.get("pid") or 0) == int(pid)),
+            None,
+        )
+        if stub is not None:
+            stub.update({k: v for k, v in rec.items() if v not in ("", None)})
+        else:
+            data["workers"].append(rec)
         _save(data)
     # Ledger the worker_id now, at spawn time, so it survives this record being
     # pruned once the worker dies (see WORKER_IDS_FILE docstring above).
@@ -6566,8 +6580,13 @@ def _reconcile_once_locked(dry_run: bool = False,
             released_by_q.setdefault(queue_name, []).append(pending_row)
     # Build live-worker counts keyed by queue.
     live_by_queue: Dict[str, List[Dict[str, Any]]] = {}
+    _live_seen: Set[str] = set()
     for w in list_workers(prune=False):
         if w.get("alive") and not _worker_released(w):
+            wid = str(w.get("worker_id") or "")
+            if wid and wid in _live_seen:
+                continue  # duplicate registry row: one process, one slot
+            _live_seen.add(wid)
             q_name = w.get("queue", "")
             live_by_queue.setdefault(q_name, []).append(w)
 
