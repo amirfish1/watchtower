@@ -5310,3 +5310,27 @@ def test_record_worker_merges_rebind_stub_instead_of_duplicating(wt):
     assert len(rows) == 1
     assert rows[0]["fifo"] == "/tmp/x.stdin"
     assert rows[0]["rebound_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_live_worker_count_ignores_duplicate_rows(wt):
+    for fifo in ("", "/tmp/a.stdin"):
+        with wt.workers._WorkersFileLock():
+            data = wt.workers._load()
+            data["workers"].append({"worker_id": "dw", "queue": "Q", "engine": "claude",
+                                    "pid": os.getpid(), "fifo": fifo})
+            wt.workers._save(data)
+    assert wt.workers.live_worker_count("Q") == 1
+    assert wt.workers.worker_counts()["Q"]["live"] == 1
+
+
+def test_renudge_idle_workers_rate_limited(wt, monkeypatch):
+    sent = []
+    monkeypatch.setattr(wt.workers, "notify_workers",
+                        lambda q, text, **kw: sent.append(kw["only"]) or 1)
+    monkeypatch.setattr(wt.workers, "_idle_renudged_at", {})
+    live = [{"worker_id": "idle1"}, {"worker_id": "busy1"}]
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1000.0) == 1
+    assert sent == [{"idle1"}]
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1010.0) == 0
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1200.0) == 1
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1", "idle1"}, now=2000.0) == 0

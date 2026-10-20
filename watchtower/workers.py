@@ -2864,6 +2864,45 @@ def _fresh_park_owners(now: float) -> set:
     return ids
 
 
+_IDLE_RENUDGE_S = 120.0
+_idle_renudged_at: Dict[str, float] = {}
+
+
+def _renudge_idle_workers(
+    queue: str, live: List[Dict[str, Any]], not_idle_ids: Set[str],
+    now: Optional[float] = None,
+) -> int:
+    """Wake idle workers when claimable work exists but nobody was told.
+
+    Dispatch nudges once, when a ticket is filed. A ticket filed inside the
+    queue's ``grace_s`` is not claimable then, so that nudge reaches nobody,
+    and nothing nudged again once grace expired: the ticket sat open while
+    live workers idled (BYM-FUTURE-2399). The reconcile tick has already
+    established claimable depth > 0, so push idle workers to `wt claim`.
+    Rate-limited per queue so a worker that cannot take the work is not
+    nagged every tick."""
+    now = time.time() if now is None else now
+    if now - _idle_renudged_at.get(queue, 0.0) < _IDLE_RENUDGE_S:
+        return 0
+    idle = {
+        str(w.get("worker_id") or "") for w in live
+        if str(w.get("worker_id") or "") not in not_idle_ids
+    } - {""}
+    if not idle:
+        return 0
+    from . import config
+    claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
+    nudge = (
+        f"{queue} has claimable work. Claim it with `wt claim -q {queue} "
+        f"--worker <your-id>{claim_filter} --json` and drain the queue."
+    )
+    _idle_renudged_at[queue] = now
+    try:
+        return notify_workers(queue, nudge, only=idle)
+    except Exception:
+        return 0
+
+
 def reap_released_workers(
     ttl_s: float = RELEASED_TTL_S,
     kill_grace_s: float = _RELEASED_KILL_GRACE_S,
@@ -4731,16 +4770,20 @@ def retained_counts(
 
 
 def live_worker_count(queue: Optional[str] = None, exclude: Optional[set] = None) -> int:
-    n = 0
+    seen: Set[str] = set()
     for w in list_workers():
         if not w.get("alive") or _worker_released(w):
             continue
         if queue and w.get("queue") != queue:
             continue
-        if exclude and str(w.get("worker_id") or "") in exclude:
+        wid = str(w.get("worker_id") or "")
+        if exclude and wid in exclude:
             continue
-        n += 1
-    return n
+        # Duplicate registry rows for one worker must not read as two live
+        # workers: that made `wt claim` call a legitimate worker "surplus"
+        # (4>2 desired with only 2 workers) and release it.
+        seen.add(wid or f"anon-{len(seen)}")
+    return len(seen)
 
 
 def worker_counts(prune: bool = False,
@@ -4752,9 +4795,15 @@ def worker_counts(prune: bool = False,
     already-listed roster instead of taking workers.lock again (WT-4).
     """
     out: Dict[str, Dict[str, int]] = {}
+    seen_ids: Set[str] = set()
     for w in (list_workers(prune=prune) if rows is None else rows):
         if w.get("stage") and not w.get("alive"):
             continue  # kept-dead stage record (WT-24): not a queue worker
+        wid = str(w.get("worker_id") or "")
+        if wid:
+            if wid in seen_ids:
+                continue  # duplicate registry row for the same worker
+            seen_ids.add(wid)
         row = out.setdefault(w.get("queue", ""), {"total": 0, "live": 0})
         row["total"] += 1
         if w.get("alive") and not _worker_released(w):
@@ -6394,6 +6443,7 @@ def _reconcile_once_locked(dry_run: bool = False,
                               "spawn_plans": [],
                               "reconcile_id": reconcile_id}
 
+    requeued_queues: Set[str] = set()
     staffing_before = list_workers(prune=False)
     eligible_before_by_q: Dict[str, List[Dict[str, Any]]] = {}
     dead_before_by_q: Dict[str, List[Dict[str, Any]]] = {}
@@ -7086,6 +7136,11 @@ def _reconcile_once_locked(dry_run: bool = False,
                 and (health_by_queue.get(q_name) or {}).get("stuck")
                 and not _all_workers_within_startup_grace(live)):
             _maybe_nudge_stuck_queue(q_name, actual)
+        elif (not dry_run and depth > 0 and q_name not in requeued_queues
+                and not _all_workers_within_startup_grace(live)):
+            # Claimable work, nobody mid-nudge: wake idle workers (a ticket
+            # filed inside grace_s got no nudge at filing time).
+            _renudge_idle_workers(q_name, live, busy_ids_here | blocked_ids_here)
 
         if staffed < desired:
             # Never spawn more workers than unclaimed tickets. Don't assume a live
