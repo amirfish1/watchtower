@@ -7149,7 +7149,19 @@ def _reconcile_once_locked(dry_run: bool = False,
             # spawn 0 more, not 1. Blocked workers are excluded from `staffed` (see
             # above) so one ticket parked on a human question can't by itself starve
             # every other claimable ticket in the queue.
-            to_spawn = min(desired - staffed, max(0, depth - staffed))
+            # Only IDLE staffed workers can take a claimable ticket now; one
+            # mid-ticket (holding an in_progress claim) won't look at the queue
+            # until it finishes, which can be an hour. Counting it against
+            # depth left a 2-worker queue running one worker with a claimable
+            # ticket waiting (BYM-FUTURE-2407/2408).
+            idle_staffed = sum(
+                1 for w in live
+                if str(w.get("worker_id") or "") not in busy_ids_here
+                and w not in unwakeable_blocked
+                and w not in retained_here
+                and w not in stale_idle
+            )
+            to_spawn = min(desired - staffed, max(0, depth - idle_staffed))
             plan = _record_spawn_plan(
                 q_name,
                 total_open=total_open,

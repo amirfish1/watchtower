@@ -5334,3 +5334,21 @@ def test_renudge_idle_workers_rate_limited(wt, monkeypatch):
     assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1010.0) == 0
     assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1200.0) == 1
     assert wt.workers._renudge_idle_workers("Q", live, {"busy1", "idle1"}, now=2000.0) == 0
+
+
+def test_reconcile_spawns_second_worker_when_only_live_worker_is_busy(wt):
+    """A worker mid-ticket cannot take the claimable ticket now, so it must not
+    'cover' it: a 2-worker queue with one busy worker spawns the other."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 2)
+    busy = _live_worker(wt, "Q")
+    held = wt.q.enqueue(project="Q", note="held")
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == held["ref"]:
+            it["status"] = "in_progress"
+            it["claimed_by"] = busy["worker_id"]
+    wt.q._save_unlocked(data)
+    wt.q.enqueue(project="Q", note="waiting")
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert [s["queue"] for s in r["spawned"]] == ["Q"]
