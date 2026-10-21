@@ -391,6 +391,21 @@ def test_dispatch_after_enqueue_acts_on_a_requested_run_with_drain_off(wt, monke
     assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-manual"
 
 
+@pytest.mark.parametrize("drain", [False, True])
+def test_dispatch_names_unready_readiness_not_auto_drain(wt, monkeypatch, drain):
+    """An unclaimable readiness is the real blocker whatever the drain
+    setting; the DISPATCH line must say so instead of "auto_drain off"."""
+    wt.config.set_auto_drain("Q", drain)
+    item = wt.q.enqueue(project="Q", note="park me", readiness="needs-rationale")
+    monkeypatch.setattr(wt.workers, "spawn_workers",
+                        lambda *a, **k: pytest.fail("spawned for an unready ticket"))
+
+    reason = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+
+    assert reason.startswith("not ready — readiness needs-rationale")
+    assert "auto_drain" not in reason
+
+
 def test_dispatch_reconciles_only_the_dispatched_queue(wt, monkeypatch):
     """WT-2: a ▶ knows which queue needs staffing, so it must not pay for a
     fleet-wide pass -- other queues' depth reads and the maintenance sweeps

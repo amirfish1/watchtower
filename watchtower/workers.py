@@ -5699,6 +5699,15 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
                       f"group plan first — waits for {_q.group_parent_ref(item)}'s plan")
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
+        readiness = str((item or {}).get("readiness") or "")
+        if readiness in _q.UNCLAIMABLE_READINESS:
+            # Checked before auto_drain: workers never claim an unready
+            # ticket, so blaming drain-off sent the owner to the wrong knob
+            # (WATCHTOWER-2 sat 22h as "auto_drain off" after drain was on).
+            reason = (f"not ready — readiness {readiness}, no worker claims it "
+                      f"until `wt edit {ref} --readiness ready`")
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
         if not config.auto_drain(queue):
             # Drain off parks the backlog, but not a run somebody just asked
             # for -- bailing here is what made ▶ report "Running" and do
