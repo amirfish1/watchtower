@@ -1422,7 +1422,15 @@ def _notify_ticket_event(
     verb = _NOTIFY_VERBS.get(event, event)
     text = f"[watchtower] {ref} {verb}"
     if detail:
-        text += f" — {_clip(detail, 200)}"
+        # Decisions and results must retain their options, recommendation,
+        # and verification evidence (including line breaks). The short
+        # claim preview is the only detail that can be safely abbreviated.
+        notice_detail = str(detail)
+        if event == "claimed":
+            notice_detail = _clip(detail, 200)
+            if len(" ".join(str(detail).split())) > 200:
+                notice_detail += f" (full text: wt find {ref})"
+        text += f" — {notice_detail}"
     for target in targets:
         # MEMORY-5: a submitter/subscriber that has since been manually
         # rebound or continued to a new session (`ccc rebind-report-to`,
