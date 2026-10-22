@@ -6214,6 +6214,11 @@ def backfill_recent_session_titles(
         sid = str(item.get("claimed_session_id") or "")
         if not sid or _item_activity_ts(item) < cutoff:
             continue
+        # A released ticket keeps its old claimed_session_id, but that session
+        # no longer holds it; renaming it would overwrite the session's own
+        # title on every tick.
+        if item.get("status") == "open":
+            continue
         worker_id = str(item.get("claimed_by") or item.get("closed_by") or sid)
         _offer(worker_id, sid, item)
     for _, worker_id, sid, item in candidates.values():

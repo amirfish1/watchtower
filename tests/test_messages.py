@@ -1804,6 +1804,18 @@ def test_recent_session_title_backfill_appends_custom_title(wt):
     }
 
 
+def test_recent_session_title_backfill_skips_released_ticket(wt):
+    p = _write_transcript(wt, SID_A)
+    item = wt.q.enqueue(project="NAMEQ", title="Released ticket", note="body")
+    wt.q.claim_next("nameq-released", project="NAMEQ")
+    wt.q.backfill_session_id(item["ref"], SID_A)
+    before = p.read_text()
+    wt.q.release(item["ref"], force=True)
+
+    assert wt.workers.backfill_recent_session_titles(hours=24) == []
+    assert p.read_text() == before
+
+
 def test_recent_session_title_backfill_uses_queue_session_when_log_is_gone(wt):
     p = _write_transcript(wt, SID_A)
     item = wt.q.enqueue(project="NAMEQ", title="Log already pruned", note="body")
