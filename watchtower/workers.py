@@ -2814,7 +2814,11 @@ def _worker_pid_identity(w: Dict[str, Any], pid: int) -> str:
     Records outlive their process (rebound rows are never pruned) and Linux
     hosts wrap pid_max within days, so a bare pid is not an identity. The
     recorded start token is authoritative; rows without one fall back to
-    checking that argv still names the worker's engine."""
+    checking that argv still names the worker's engine. A record started
+    before the last boot never matches: after a restart its pid may name
+    another live session of the same engine."""
+    if started_before_boot(w):
+        return "mismatch"
     recorded = str(w.get("pid_started") or "")
     if recorded:
         current = _pid_start_token(pid)
@@ -4125,6 +4129,59 @@ def claude_session_row_liveness(row: Dict[str, Any]) -> Tuple[str, str]:
     return "alive", ""
 
 
+_BOOT_TIME: Optional[float] = None
+BOOT_SLACK_S = 60.0  # the kernel's boot time drifts a little with clock corrections
+
+
+def boot_time() -> float:
+    """When this machine last booted (epoch seconds; 0.0 when unknown).
+    Read once per process: it cannot change while the process runs."""
+    global _BOOT_TIME
+    if _BOOT_TIME is None:
+        _BOOT_TIME = 0.0
+        try:
+            with open("/proc/stat") as fh:
+                for line in fh:
+                    if line.startswith("btime "):
+                        _BOOT_TIME = float(line.split()[1])
+                        break
+        except OSError:
+            try:
+                out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+                                     text=True, timeout=2).stdout
+                m = re.search(r"sec = (\d+)", out)
+                _BOOT_TIME = float(m.group(1)) if m else 0.0
+            except Exception:  # noqa: BLE001
+                _BOOT_TIME = 0.0
+    return _BOOT_TIME
+
+
+def started_before_boot(rec: Dict[str, Any]) -> bool:
+    """True when ``rec`` (a worker record or ``claim_proc``) was started
+    before the last boot: its process cannot still be running, whatever now
+    holds its pid. A restart (an update, a crash, a preempted cloud VM)
+    leaves records with pids the new boot hands out again."""
+    boot = boot_time()
+    if not boot:
+        return False
+    started = 0.0
+    token = " ".join(str(rec.get("pid_started") or "").split())
+    if token:
+        # The process's own start (``ps -o lstart``, local time) beats the
+        # record's write time when we have it.
+        try:
+            return time.mktime(time.strptime(token, "%a %b %d %H:%M:%S %Y")) < boot - BOOT_SLACK_S
+        except (ValueError, OverflowError):
+            pass
+    for key in ("started_at", "record_started_at"):
+        try:
+            raw = str(rec.get(key) or "").replace("Z", "+00:00")
+            started = max(started, datetime.fromisoformat(raw).timestamp() if raw else 0.0)
+        except ValueError:
+            continue
+    return bool(started) and started < boot - BOOT_SLACK_S
+
+
 def _pid_alive(pid: int) -> bool:
     """Check if a process is truly alive (not a zombie).
 
@@ -4182,6 +4239,9 @@ def record_liveness(rec: Dict[str, Any], exit_file: str = "") -> Tuple[str, str,
         why = (f"killed by signal {sig}" if sig else
                "exited without submitting" if not rc else f"exited rc {rc}")
         return "dead", why, {"rc": rc, "signal": sig, "ended_at": exit_info["ended_at"]}
+    if started_before_boot(rec):
+        ended = datetime.fromtimestamp(boot_time(), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return "dead", "machine restarted since it started", {"ended_at": ended}
     alive = rec["alive"] if "alive" in rec else _pid_alive(int(rec.get("pid") or 0))
     if not alive:
         return "dead", "process gone" + (" (wrapper missing ended_at: killed along with it)"
@@ -4513,7 +4573,7 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                     # failure streak so the next one starts from the default.
                     recovered.append((str(w.get("queue") or ""),
                                       str(w.get("engine") or "")))
-            alive = _pid_alive(int(w.get("pid", 0)))
+            alive = _pid_alive(int(w.get("pid", 0))) and not started_before_boot(w)
             # Rebound rows are kept after their process dies (see below), so
             # their pid can be reused by an unrelated process; don't let that
             # stranger read as this worker. Other dead rows are pruned on this

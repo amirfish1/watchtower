@@ -377,3 +377,35 @@ def test_claim_guard_lets_ambient_and_pruned_through(wt, procs):
     assert wt.q.claim_by_ref(ref2, "stranger",
                              session_uuid="33333333-3333-3333-3333-333333333333"
                              )["status"] == "in_progress"
+
+
+# ------------------------------------------------------------ machine restart
+def test_claim_from_before_a_reboot_is_dead_even_when_its_pid_is_reused(wt, procs, monkeypatch):
+    # The live child stands in for whatever process the new boot handed the
+    # old worker's pid to; the record says it started before that boot.
+    w = procs("w1", SID)
+    ref = _file(wt)
+    wt.q.claim_by_ref(ref, "w1", session_uuid=SID)
+    assert _owner(wt, ref).verdict == "alive"
+    monkeypatch.setattr(wt.workers, "boot_time", lambda: time.time() + 3600)
+    v = _owner(wt, ref)
+    assert v.verdict == "dead" and "machine restarted" in v.evidence
+    rows = [r for r in wt.workers.list_workers(prune=False) if r["worker_id"] == "w1"]
+    assert rows and rows[0]["alive"] is False
+    assert wt.workers._worker_pid_identity(w.rec, w.p.pid) == "mismatch"
+
+
+def test_record_started_after_boot_is_judged_as_before(wt, procs, monkeypatch):
+    procs("w1", SID)
+    ref = _file(wt)
+    wt.q.claim_by_ref(ref, "w1", session_uuid=SID)
+    monkeypatch.setattr(wt.workers, "boot_time", lambda: time.time() - 3600)
+    assert _owner(wt, ref).verdict == "alive"
+    monkeypatch.setattr(wt.workers, "boot_time", lambda: 0.0)   # unknown boot time
+    assert _owner(wt, ref).verdict == "alive"
+
+
+def test_boot_time_reads_the_kernel():
+    from watchtower import workers
+    workers._BOOT_TIME = None
+    assert 0 < workers.boot_time() <= time.time()
