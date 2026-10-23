@@ -45,6 +45,9 @@ Item shape::
       "id": "...",                       # source id (if any)
       "status": "open",                  # open | in_progress | closed
       "lane": "normal",                  # normal | express
+      "depth": "deep",                   # only when deep (absent = quick);
+                                         # + "budget_min": 90
+      "deferred_until": "...",           # `wt defer`: unclaimable until then
       "source": "wt",                    # which tool created it
       "note": "...",                     # short request
       "text": "...",                     # full prompt for a worker
@@ -111,6 +114,15 @@ VALID_STATUSES = ("open", "in_progress", "in_review", "awaiting_answer", "closed
 # as ``awaiting_answer`` with a ``parked`` record (who to route the answer to).
 PARKED_STATUS = "awaiting_answer"
 VALID_LANES = ("normal", "express")
+# Working mode. ``quick`` (the default, never stored) is fix-and-look work;
+# ``deep`` tickets get the deep-work brief at claim time (evidence first,
+# options memo incl. product options, measured goal, budget + stop rule) --
+# see watchtower/deep.py. ``budget_min`` rides along on deep tickets only.
+VALID_DEPTHS = ("quick", "deep")
+DEEP_DEFAULT_BUDGET_MIN = 90
+# `wt defer`: the longest a ticket may sit out of the claim pool waiting for
+# data. Longer waits are a human decision (`wt block`), not a data window.
+DEFER_MAX_S = 7 * 24 * 3600
 
 VALID_ITEM_TYPES = ("bug", "feature", "")
 # An item with no (or unknown) type is a bug by default. A ticket filed without
@@ -1463,6 +1475,34 @@ def _placement_fields(placement: str, *texts: Any) -> Dict[str, Any]:
     return {}
 
 
+def norm_depth(depth: Any) -> str:
+    """``deep`` or ``quick``; raises ValueError on anything else non-empty."""
+    raw = str(depth or "").strip().lower()
+    if not raw:
+        return "quick"
+    if raw not in VALID_DEPTHS:
+        raise ValueError(f"depth must be one of {', '.join(VALID_DEPTHS)}")
+    return raw
+
+
+def _depth_fields(depth: Any, budget_min: Any = 0) -> Dict[str, Any]:
+    """Stored depth fields: nothing for quick (the default), else
+    ``depth``/``budget_min`` (positive minutes, default 90)."""
+    if norm_depth(depth) != "deep":
+        return {}
+    try:
+        minutes = int(budget_min or 0)
+    except (TypeError, ValueError):
+        raise ValueError("budget must be a whole number of minutes")
+    if minutes < 0:
+        raise ValueError("budget must be a positive number of minutes")
+    return {"depth": "deep", "budget_min": minutes or DEEP_DEFAULT_BUDGET_MIN}
+
+
+def is_deep(item: Dict[str, Any]) -> bool:
+    return str((item or {}).get("depth") or "").lower() == "deep"
+
+
 def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: str,
                        proj: str, annotation_id: str, url: str, title: str,
                        selector: str, screenshot_path: str, repo_path: str,
@@ -1472,7 +1512,8 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
                        submitter_explicit: bool, pre_ack: bool,
                        blocked_by: Optional[List[str]], gates: Optional[List[str]],
                        accept_line: str, assessment_origin: str = "",
-                       placement: str = "") -> Dict[str, Any]:
+                       placement: str = "", depth: str = "",
+                       budget_min: int = 0) -> Dict[str, Any]:
     """Append a new ``open`` item to an already-loaded local store (the caller
     holds the store lock and saves). Shared by :func:`enqueue` and the
     post-fix-assessment filer so both create identical tickets."""
@@ -1513,6 +1554,7 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
         **({"verifier_model": str(verifier_model).strip()} if str(verifier_model or "").strip() else {}),
         **({"gates": validate_gates(gates)} if gates else {}),
         **({"accept": str(accept_line).strip()} if str(accept_line or "").strip() else {}),
+        **_depth_fields(depth, budget_min),
         **_placement_fields(placement, note, text, title),
         "submitter": str(submitter or ""),
         "submitter_explicit": bool(submitter_explicit),
@@ -1565,8 +1607,14 @@ def enqueue(
     group: str = "",
     children: Optional[List[str]] = None,
     placement: str = "",
+    depth: str = "",
+    budget_min: int = 0,
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
+
+    ``depth``: ``quick`` (default) or ``deep`` -- a deep ticket's claim carries
+    the deep-work brief (watchtower/deep.py); ``budget_min`` is its working
+    budget in minutes (default 90). Local store only.
 
     ``placement``: ``mac`` | ``cloud`` | ``any`` -- which kind of machine may
     claim it (see ``VALID_PLACEMENTS``). Blank lets a Mac filer's keyword
@@ -1598,6 +1646,7 @@ def enqueue(
     if not note and not text:
         raise ValueError("note or text is required")
     lane = lane if lane in VALID_LANES else "normal"
+    _depth_fields(depth, budget_min)  # validate before any write
     proj = _project_for(source, repo_path, project)
     # Registration for the reconciler (WT-131, see mark_runnable's docstring)
     # happens lazily at run/drain time, not here -- OPS-563: registering on
@@ -1609,6 +1658,8 @@ def enqueue(
     backend = _github_backend_for_project(proj)
     if dedupe_key and backend is not None:
         raise ValueError("dedupe keys currently require a local queue")
+    if norm_depth(depth) == "deep" and backend is not None:
+        raise ValueError("deep tickets currently require a local queue")
     grouped = bool(group_parent or group or children)
     if grouped:
         if backend is not None:
@@ -1661,7 +1712,7 @@ def enqueue(
             planner_model=planner_model, verifier_model=verifier_model, submitter=submitter,
             submitter_explicit=submitter_explicit, pre_ack=pre_ack, blocked_by=blocked_by,
             gates=gates, accept_line=accept_line, assessment_origin=assessment_origin,
-            placement=placement)
+            placement=placement, depth=depth, budget_min=budget_min)
         if dedupe_key:
             saved["dedupe_key"] = dedupe_key
         if grouped:
@@ -1872,6 +1923,8 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     """
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
+        if "depth" in fields or "budget_min" in fields:
+            raise ValueError("deep tickets currently require a local queue")
         return backend.update(ident, **fields)
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
@@ -1885,11 +1938,34 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
             raise ValueError(f"placement must be one of {', '.join(VALID_PLACEMENTS)} (or empty to clear)")
         fields = dict(fields)
         fields["placement"] = raw
+    depth_edit = None
+    if "depth" in fields or "budget_min" in fields:
+        fields = dict(fields)
+        depth_edit = (fields.pop("depth", None), fields.pop("budget_min", None))
+        if depth_edit[0] is not None:
+            norm_depth(depth_edit[0])
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
                 now = _now_iso()
+                if depth_edit is not None:
+                    want = norm_depth(depth_edit[0] if depth_edit[0] is not None
+                                      else it.get("depth"))
+                    if want != "deep" and depth_edit[1] is not None and depth_edit[0] is None:
+                        raise ValueError(f"{it.get('ref')} is not a deep ticket; "
+                                         "set --depth deep to give it a budget")
+                    new = _depth_fields(want, depth_edit[1] if depth_edit[1] is not None
+                                        else it.get("budget_min"))
+                    old = {k: it.get(k) for k in ("depth", "budget_min") if k in it}
+                    it.pop("depth", None)
+                    it.pop("budget_min", None)
+                    it.update(new)
+                    if new != old:
+                        _append_history(it, "edit", by=_by("system"), at=now,
+                                        fields={"depth": new.get("depth", "quick"),
+                                                **({"budget_min": new["budget_min"]}
+                                                   if "budget_min" in new else {})})
                 if "gates" in fields:
                     fields = dict(fields)
                     fields["gates"] = (_parent_gates(fields["gates"]) if group_role(it) == "parent"
@@ -2167,6 +2243,10 @@ def _claim_candidates(
     candidates = [it for it in candidates
                   if not _affinity_reserved(it, _now_ts)
                   or (claimer is not None and _affinity_owner(it, claimer[0], claimer[1]))]
+    # `wt defer`: a ticket waiting for its data window is out of the pool (and
+    # out of count_claimable, so nothing is spawned for it) until the window
+    # ends; then it is ordinary open work again.
+    candidates = [it for it in candidates if not deferred_now(it, _now_ts)]
     # Plan gate (WT-22): a ticket is planned BEFORE a build worker claims it,
     # so one whose plan has not settled is not claimable yet.
     candidates = [it for it in candidates if not plan_pending(it)]
@@ -7792,6 +7872,95 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     except Exception:  # noqa: BLE001 - the tick recovers from state
                         pass
                 return it
+    return None
+
+
+_DEFER_REL_RE = _re.compile(r"^\+?(\d+)\s*([mhd])$", _re.IGNORECASE)
+
+
+def parse_defer_until(value: Any, now: Optional[float] = None) -> float:
+    """Epoch seconds for a `wt defer --until` value: relative ``+90m`` /
+    ``+24h`` / ``+2d``, or an ISO-8601 timestamp (naive = UTC). Must be in
+    the future and within DEFER_MAX_S. Raises ValueError otherwise."""
+    now = time.time() if now is None else now
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("--until is required (e.g. +24h or 2026-10-24T09:00Z)")
+    m = _DEFER_REL_RE.match(raw)
+    if m:
+        ts = now + int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2).lower()]
+    else:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"unrecognised --until {raw!r}: use +90m/+24h/+2d or an ISO time")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        ts = dt.timestamp()
+    if ts <= now:
+        raise ValueError("--until must be in the future")
+    if ts - now > DEFER_MAX_S:
+        raise ValueError(f"--until is more than {DEFER_MAX_S // 86400} days away; a wait that "
+                         "long is a human decision -- use `wt block` instead")
+    return ts
+
+
+def deferred_now(item: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """True while ``item`` is inside a `wt defer` window."""
+    until = (item or {}).get("deferred_until")
+    if not until:
+        return False
+    return _iso_ts(until) > (time.time() if now is None else now)
+
+
+def defer(ident: Any, session_id: str, until: Any, reason: str,
+          progress: str = "") -> Optional[Dict[str, Any]]:
+    """Take a claimed ticket out of the claim pool until ``until`` while data
+    accumulates (`wt defer`). The ticket goes back to ``open`` -- not
+    blocked: no human question is pending -- but is unclaimable and uncounted
+    for staffing until the window ends, then any worker picks it up again
+    with the ``progress``/``reason`` notes in its history. Only the claimant
+    of an in_progress ticket (or anyone, on an open one) may defer it.
+    Local store only."""
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        raise ValueError("wt defer currently requires a local queue")
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("--reason is required: say what data you are waiting for")
+    ts = parse_defer_until(until)
+    until_iso = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            status = it.get("status")
+            if status not in ("open", "in_progress"):
+                raise ValueError(f"{it.get('ref')} is {status}; only an open or in-progress "
+                                 "ticket can be deferred")
+            if group_role(it) == "parent":
+                raise ValueError(f"{it.get('ref')} is a group parent; defer its members")
+            holder = str(it.get("claimed_by") or "")
+            if status == "in_progress" and holder and session_id and holder != str(session_id):
+                raise ValueError(f"{it.get('ref')} is claimed by {holder}, not {session_id}")
+            now = _now_iso()
+            actor = _by("worker", str(session_id or ""),
+                        str(_coerce_session_uuid(session_id) or ""))
+            if progress:
+                _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
+            if status == "in_progress":
+                _release_claim_to_open_unlocked(it, now, "deferred: " + reason)
+            it["deferred_until"] = until_iso
+            it["defer_reason"] = _clip(reason, 2000)
+            it["updated_at"] = now
+            _append_history(it, "defer", by=actor, at=now, until=until_iso,
+                            reason=_clip(reason, 2000))
+            _save_unlocked(data)
+            _log("DEFER", f"{it.get('ref', '?')} until {until_iso} — {_clip(reason, 200)}",
+                 queue=it.get("project", ""))
+            if status == "in_progress":
+                _note_worker_ticket_done(session_id)
+            return it
     return None
 
 

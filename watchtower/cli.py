@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
-from . import answers, health, queue as q, resume_verify, stages, workers
+from . import answers, deep, health, queue as q, resume_verify, stages, workers
 
 DAEMON_PID_FILE = Path(
     os.environ.get("WATCHTOWER_DAEMON_PID")
@@ -204,6 +204,8 @@ def _event_summary(event: dict) -> str:
         return f"claimed by {actor}"
     if name == "block":
         return f"blocked: {event.get('question') or ''}".rstrip()
+    if name == "defer":
+        return f"deferred until {event.get('until') or '?'}: {event.get('reason') or ''}".rstrip()
     if name in ("answer", "comment", "progress"):
         return f"{name}: {event.get('text') or ''}".rstrip()
     if name == "reopen":
@@ -676,6 +678,10 @@ def cmd_find(args: argparse.Namespace) -> int:
             print(f"  {note}")
     if item.get("accept"):
         print(f"  accept: {item['accept']}")
+    if q.is_deep(item):
+        print(f"  depth: deep ({item.get('budget_min') or q.DEEP_DEFAULT_BUDGET_MIN}m budget)")
+    if q.deferred_now(item):
+        print(f"  deferred until {item.get('deferred_until')}: {item.get('defer_reason') or ''}")
     if checks:
         print("  " + checks.replace("\n", "\n  "))
     if worker:
@@ -774,6 +780,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         "title", "note", "text", "url", "type", "readiness", "priority",
         "value", "confidence", "model_floor", "planner_model", "verifier_model",
         "selector", "screenshot_path", "repo_path", "accept", "placement",
+        "depth", "budget_min",
     ):
         value = getattr(args, name, None)
         if value is not None:
@@ -796,7 +803,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
             "error: no fields to edit -- pass at least one of "
             "--title/--note/--text/--url/--type/--readiness/--priority/"
             "--value/--confidence/--model-floor/--selector/"
-            "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates/--accept",
+            "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates/--accept/"
+            "--depth/--budget-min",
             file=sys.stderr,
         )
         return 1
@@ -888,11 +896,14 @@ def cmd_add(args: argparse.Namespace) -> int:
             group=getattr(args, "group", "") or "",
             children=[c.strip() for c in str(getattr(args, "children", "") or "").split(",")
                       if c.strip()] or None,
+            depth=getattr(args, "depth", "") or "",
+            budget_min=getattr(args, "budget_min", 0) or 0,
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
+    print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}"
+          + (f"  [deep, {item.get('budget_min')}m budget]" if q.is_deep(item) else ""))
     if not getattr(args, "claim", False):
         _warn_floor_above_queue([item])
     if q.group_role(item) == "parent":
@@ -1213,6 +1224,9 @@ def cmd_claim(args: argparse.Namespace) -> int:
         plan_note = _plan_note(item)
         if plan_note:
             shown = dict(shown, plan_instructions=plan_note)
+        deep_note = deep.deep_brief(item)
+        if deep_note:
+            shown = dict(shown, deep_brief=deep_note)
         _print_item(shown)
     else:
         fb = _sent_back_view(item)
@@ -1240,6 +1254,9 @@ def cmd_claim(args: argparse.Namespace) -> int:
         plan_note = _plan_note(item)
         if plan_note:
             print("\n" + plan_note)
+        deep_note = deep.deep_brief(item)
+        if deep_note:
+            print("\n" + deep_note)
         checks = q.checks_block(item)
         if checks:
             print("\n" + checks)
@@ -2929,6 +2946,28 @@ def cmd_block(args: argparse.Namespace) -> int:
         print(f"  session {sid} — resume with: wt discuss {item['ref']}")
     else:
         print("  (no resumable session id recorded; a human can still read progress notes)")
+    return 0
+
+
+def cmd_defer(args: argparse.Namespace) -> int:
+    """Wait for data, not for a human: the ticket leaves your claim and the
+    claim pool until --until, then any worker resumes it from your progress
+    note. For a decision you need from a human, use `wt block`."""
+    try:
+        item = q.defer(args.ref, args.worker or _default_worker_id(), args.until,
+                       args.reason, progress=args.progress)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
+    print(f"DEFERRED: {item['ref']} until {item['deferred_until']} — {item.get('defer_reason')}")
+    print("  the ticket left your claim; it returns to the pool when the window ends. "
+          "You may claim the next ticket now.")
     return 0
 
 
@@ -6130,6 +6169,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
+    ("Worker protocol", "defer"),
 ]
 # `install` is intentionally absent: it's a hidden alias folded into `wt start`
 # (see cmd_start's first-time auto-install), not a command users need to type.
@@ -6155,6 +6195,7 @@ COMMAND_HELP: Dict[str, str] = {
     "close": "close a ticket (record how you fixed it)",
     "unresolved-ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
     "block": "park a ticket that needs a human decision",
+    "defer": "take a ticket out of the pool until a data window ends (no human needed)",
     "blocked": "list tickets parked for a human",
     "gated": "product-gate pitches awaiting your Ack/Nack",
     "ack": "approve a product-gate pitch (Ack); resolution-caveat acks moved to unresolved-ack",
@@ -6467,6 +6508,16 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--text", default="")
         subparser.add_argument("--url", default="")
         subparser.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
+        subparser.add_argument("--depth", default="", choices=list(q.VALID_DEPTHS) + [""],
+                               help="quick (default): fix-and-look work. deep: work you "
+                                    "can't judge by using the product (perf, chronic "
+                                    "regressions) -- the claim carries the deep-work brief: "
+                                    "evidence first, options memo, measured goal, budget + "
+                                    "stop rule. Set by owners and system filers, not by "
+                                    "workers filing follow-ups")
+        subparser.add_argument("--budget-min", type=int, default=0, dest="budget_min",
+                               help=f"deep tickets: working budget in minutes "
+                                    f"(default {q.DEEP_DEFAULT_BUDGET_MIN})")
         subparser.add_argument("--type", default="", choices=["bug", "feature", ""],
                                help="item type: bug or feature")
         subparser.add_argument("--readiness", default="",
@@ -6616,6 +6667,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--clear-gates", action="store_true", dest="clear_gates",
                    help="drop this ticket's gate override (an empty override "
                         "= no gates; use --gate to set one)")
+    s.add_argument("--depth", default=None, choices=list(q.VALID_DEPTHS),
+                   help="quick or deep (deep = claim carries the deep-work brief)")
+    s.add_argument("--budget-min", type=int, default=None, dest="budget_min",
+                   help="deep tickets: working budget in minutes")
     s.add_argument("--queue", default=None,
                    help="move the ticket to a different queue in place, "
                         "reassigning its ref (WT-83); file-backed queues only")
@@ -6929,6 +6984,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_block)
+
+    s = sub.add_parser("defer", help=COMMAND_HELP.get("defer", ""))
+    s.add_argument("ref")
+    s.add_argument("--worker", default="", help="your session/worker id")
+    s.add_argument("--until", required=True,
+                   help="when the data window ends: +90m, +24h, +2d, or an ISO time "
+                        f"(at most {q.DEFER_MAX_S // 86400} days)")
+    s.add_argument("--reason", required=True,
+                   help="what data you are waiting for and why it is needed")
+    s.add_argument("--progress", default="",
+                   help="what you built and what the resuming worker should analyse")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_defer)
 
     s = sub.add_parser("blocked")
     s.add_argument("-q", "--queue", default=None)
