@@ -349,6 +349,19 @@ in one command, for both local and GitHub-backed queues. It preserves queue
 policy for other tickets. Dependencies, readiness, planning gates, model
 requirements and worker capacity still apply, and a new worker needs time to
 start. `--run` cannot be combined with `--claim` or `--group-parent`.
+For an execution wait on a GitHub-backed ticket, use
+`wt edit MYAPP-123 --after RELEASE-45`. Blockers may belong to another
+configured GitHub queue or a local queue. The dependent stays out of
+claimable depth (including explicit claims) until every blocker closes as
+completed; declined or unresolved completion does not release it. Validation
+rejects missing refs and transitive cycles across queues. No worker needs to
+poll the blocker, and no human answer is requested. If the ticket was
+previously marked as needing input, record the dependency first, then use
+`wt reopen MYAPP-123 --force --reason "execution dependency recorded"` to release its
+old claim and clear that input flag; its existing answer history is retained.
+A deployment requirement belongs in the upstream ticket's completion criteria
+and must still be verified from production before the dependent work closes.
+
 The old `watchtower:<QUEUE>` label no longer admits anything; it is
 only still read when two or more queues point at the *same* repo, where it is
 the only way to say which issue belongs to which queue. That label defaults to

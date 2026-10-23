@@ -3605,3 +3605,49 @@ def test_after_gates_claim_on_github_backed_queue(tmp_path, monkeypatch):
     q.update("GHI-3", blocked_by=[])
     assert q.get("GHI-3")["blocked_by"] == []
     assert q.claim_next("worker-3", project="GHI")["ref"] == "GHI-3"
+
+
+def test_cross_queue_after_waits_and_wakes_without_human_input(tmp_path, monkeypatch):
+    """OPS-74: GitHub queue dependencies gate depth and explicit claims."""
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    for name in ("GHI", "UPSTREAM"):
+        config.set_backend(name, "github")
+        config.set_github_repo(name, "test-owner/test-repo")
+        _drainable(config, name)
+    upstream = q.enqueue(project="UPSTREAM", title="release", note="n", text="b")
+    ref = upstream["ref"]
+    dependent = q.enqueue(project="GHI", title="verify production", note="n", text="b",
+                          blocked_by=[ref])
+    dep = dependent["ref"]
+    assert q.get(dep)["needs_input"] is False
+    assert q.count_claimable(project="GHI") == 0
+    assert q.claim_next("downstream", project="GHI") is None
+    with pytest.raises(ValueError, match="waiting"):
+        q.claim_by_ref(dep, "downstream")
+    with pytest.raises(ValueError, match="cycle"):
+        q.update(ref, blocked_by=[dep])
+    with pytest.raises(ValueError, match="does not exist"):
+        q.update(dep, blocked_by=["UPSTREAM-999"])
+    q.claim_by_ref(ref, "upstream")
+    q.close(ref, "upstream", resolution={"summary": "deployed", "no_code": True})
+    assert q.count_claimable(project="GHI") == 1
+    assert q.claim_next("downstream", project="GHI")["ref"] == dep
+
+
+def test_cross_queue_after_does_not_wake_for_unresolved_completion(tmp_path, monkeypatch):
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    blocker = q.enqueue(project="LOCAL", title="release", note="n", text="b")
+    dep = q.enqueue(project="GHI", title="verify", note="n", text="b",
+                    blocked_by=[blocker["ref"]])["ref"]
+    q.claim_by_ref(blocker["ref"], "upstream")
+    q.close(blocker["ref"], "upstream", resolution={
+        "summary": "partial", "no_code": True, "unresolved": ["LOCAL-99 pending"]})
+    assert q.count_claimable(project="GHI") == 0
+    assert q.claim_next("downstream", project="GHI") is None
+    with pytest.raises(ValueError, match="stuck"):
+        q.claim_by_ref(dep, "downstream")

@@ -2479,23 +2479,57 @@ class GitHubIssuesBackend:
             stop_dir = Path.home() / ".watchtower" / "stop-signals"
         return stop_dir / session_id
 
-    def _validate_blockers(self, ref: str, blocked_by: List[str]) -> List[str]:
-        """Normalise ``blocked_by`` (WT-36) with queue._validate_blocked_by over
-        this queue's open + recently closed tickets, falling back to a direct
-        lookup for an older closed blocker. Raises ValueError."""
-        items = self.list_items(fresh=True)
-        known = {str(it.get("ref")) for it in items}
-        for raw in blocked_by:
-            cand = f"{self.queue}-{raw}" if str(raw).isdigit() else str(raw)
-            if cand not in known and cand.startswith(f"{self.queue}-"):
+    def _blocker_index(
+        self, items: List[Dict[str, Any]], refs: List[str], *,
+        fresh: bool = True, transitive: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Resolve dependencies through their owning queues, not this repo.
+
+        Depth checks retain the owning backend's bounded list cache. Claims
+        and validation request fresh state. Missing runtime refs stay waiting
+        rather than accidentally releasing a dependent after a lookup miss.
+        """
+        from . import queue as q
+
+        by_ref = _refs_index(items)
+        loaded = {self.queue}
+        seen = set()
+        pending = list(refs)
+        while pending:
+            raw = str(pending.pop())
+            ref = f"{self.queue}-{raw}" if raw.isdigit() else raw
+            if ref in seen:
+                continue
+            seen.add(ref)
+            project = q._project_from_ident(ref)
+            if project and project not in loaded:
+                backend = q._github_backend_for_project(project)
+                others = (backend.list_items(fresh=fresh) if backend is not None
+                          else q.list_items(project=project))
+                by_ref.update(_refs_index(others))
+                loaded.add(project)
+            if ref not in by_ref:
                 try:
-                    older = self.get(cand)
-                except GitHubBackendError:
-                    older = None  # unknown ref: _validate_blocked_by rejects it
-                if older is not None:
-                    items.append(older)
-                    known.add(cand)
-        return _validate_blocked_by(items, ref, [str(r) for r in blocked_by])
+                    item = q.get(ref)
+                except GitHubBackendError as exc:
+                    detail = str(exc).lower()
+                    if "not found" not in detail and "could not resolve to an issue" not in detail:
+                        raise
+                    item = None
+                if item is not None:
+                    by_ref[ref] = item
+            item = by_ref.get(ref)
+            if item is not None and transitive:
+                pending.extend(item.get("blocked_by") or [])
+            elif item is None and not transitive:
+                by_ref[ref] = {"ref": ref, "status": "open"}
+        return by_ref
+
+    def _validate_blockers(self, ref: str, blocked_by: List[str]) -> List[str]:
+        items = self.list_items(fresh=True)
+        by_ref = self._blocker_index(items, blocked_by, transitive=True)
+        return _validate_blocked_by(list(by_ref.values()), ref,
+                                    [str(r) for r in blocked_by])
 
     def _claim_candidates(
         self,
@@ -2540,9 +2574,11 @@ class GitHubIssuesBackend:
         if any(it.get("blocked_by") for it in candidates):
             # Dependencies (WT-36): a ticket with an open (or declined /
             # unresolved) blocker is not claimable and not spawn-worthy depth.
-            # Blockers resolve among this queue's open + recently closed
-            # tickets; one gone from both counts as satisfied.
-            by_ref = _refs_index(self.list_items(fresh=fresh))
+            by_ref = self._blocker_index(
+                self.list_items(fresh=fresh),
+                [ref for it in candidates for ref in (it.get("blocked_by") or [])],
+                fresh=fresh,
+            )
             candidates = [
                 it for it in candidates
                 if not it.get("blocked_by")
@@ -2651,6 +2687,11 @@ class GitHubIssuesBackend:
                     f"no-auto-drain={'yes' if item.get('no_auto_drain') else 'no'}, "
                     f"grace={self.grace_s}s); run `wt run {ref}` to work it anyway"
                 )
+            if item.get("blocked_by"):
+                by_ref = self._blocker_index([item], item["blocked_by"])
+                state, blocker = blocker_verdict(item, by_ref)
+                if state != "ok":
+                    raise ValueError(f"{ref} {state} on {blocker}")
             number = str(item["number"])
             body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
             meta.update({
