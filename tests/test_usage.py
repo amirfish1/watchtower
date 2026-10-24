@@ -58,6 +58,17 @@ def test_missing_fields_and_zero_are_distinct(tmp_path):
     assert usage.parse(str(tmp_path / "missing"), "claude")["status"] == "unavailable"
 
 
+def test_parse_memo_tracks_file_changes_and_is_not_shared(tmp_path):
+    p = tmp_path / "session.jsonl"
+    write(p, [claude("m1")])
+    first = usage.parse(str(p), "claude")
+    first["units"].clear()  # a caller's mutation must not poison the memo
+    assert list(usage.parse(str(p), "claude")["units"]) == ["m1"]
+    write(p, [claude("m1"), claude("m2")])
+    assert list(usage.parse(str(p), "claude")["units"]) == ["m1", "m2"]
+    assert usage.parse(str(p), "codex")["status"] == "missing"  # keyed by engine too
+
+
 def test_codex_missing_cache_does_not_invent_ordinary_input(tmp_path):
     p = tmp_path / "rollout-test.jsonl"
     row = codex(100, 40, 10)
@@ -198,6 +209,10 @@ def test_late_usage_shared_across_tickets_is_not_double_counted(measured, tmp_pa
     assert second["token_usage"]["totals"]["input"] == 30
     assert first["token_usage"]["attempts"][0]["completeness"] == "ambiguous_shared_session"
     assert "late_observed" in usage._read(usage._location(first))["token_usage"]["attempts"][0]
+    # A pass with no new telemetry leaves the ledger untouched (WT-9).
+    stamp = usage._location(first).stat().st_mtime_ns
+    usage.reconcile()
+    assert usage._location(first).stat().st_mtime_ns == stamp
 
 
 def test_github_namespace_isolates_same_ref_and_safe_metadata(measured, tmp_path, monkeypatch):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import uuid
 import socket
+import threading
 import os
 import copy
 import hashlib
@@ -33,7 +34,31 @@ def parse(path: str, engine: str) -> dict:
     Repeated Claude content blocks share a message id and are replacements,
     never additive. Codex cumulative totals are differenced exactly once, with
     each delta assigned to the model in the preceding turn_context.
+
+    Memoized on the file's identity: every daemon tick re-observes ~1400
+    unsettled attempts over ~1 GB of mostly-ended transcripts (WT-9).
     """
+    try:
+        st = os.stat(path)
+        stamp = (st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    hit = _PARSE_MEMO.get((path, engine)) if stamp else None
+    if hit is not None and hit[0] == stamp:
+        return dict(hit[1], units=dict(hit[1]["units"]))
+    result = _parse(path, engine)
+    if stamp and result["status"] != "unavailable":
+        if len(_PARSE_MEMO) >= 4096:
+            _PARSE_MEMO.clear()
+        _PARSE_MEMO[(path, engine)] = (stamp, result)
+        result = dict(result, units=dict(result["units"]))
+    return result
+
+
+_PARSE_MEMO: dict = {}
+
+
+def _parse(path: str, engine: str) -> dict:
     units = {}
     model = None
     previous = {}
@@ -122,18 +147,28 @@ def parse(path: str, engine: str) -> dict:
 def observe(worker: str, sid: str = "") -> dict:
     """Resolve engine/session from the engine registry, never the requested tier."""
     from . import messages, workers
-    rec = next((r for r in workers._load().get("workers", [])
+    pass_cache = getattr(_PASS, "cache", None)
+    registry = pass_cache["registry"] if pass_cache else workers._load()
+    rec = next((r for r in registry.get("workers", [])
                 if r.get("worker_id") == worker or (sid and r.get("session_id") == sid)), {})
     if sid and rec.get("session_id") and rec["session_id"] != sid:
         # A fallback/rebound registry row may now describe a different process.
         # Do not parse the old session with the new attempt's provider semantics.
-        rec = next((r for r in workers._load().get("workers", [])
+        rec = next((r for r in registry.get("workers", [])
                     if r.get("session_id") == sid), {})
     engine = str(rec.get("engine") or "")
     sid = sid or str(rec.get("session_id") or "")
     if not sid and rec.get("log"):
         sid = workers.resolve_session_id_from_log(str(rec["log"]))
-    path = messages.locate_transcript(sid, engine) if sid else ""
+    if not sid:
+        path = ""
+    elif pass_cache:
+        located = pass_cache["located"]
+        if (sid, engine) not in located:
+            located[(sid, engine)] = messages.locate_transcript(sid, engine)
+        path = located[(sid, engine)]
+    else:
+        path = messages.locate_transcript(sid, engine)
     # Only Claude's stream log contains the same per-message usage as its
     # transcript. Plain output and result/modelUsage aggregates are not mixed.
     if not path and engine == "claude":
@@ -406,13 +441,48 @@ def reconcile() -> None:
     honestly. Preserve its provenance and mark it partial instead of estimating.
     No remote issue writes and no lifecycle changes occur here.
     """
+    from . import workers
+    # One registry read and one transcript lookup per session per pass,
+    # not one per attempt (WT-9). Thread-local: dashboard/poller threads
+    # observing mid-pass must still see the live registry.
+    _PASS.cache = {"registry": workers._load(), "located": {}}
+    try:
+        _reconcile()
+    finally:
+        _PASS.cache = None
+
+
+_PASS = threading.local()
+
+
+def _owner_keys(path) -> list:
+    """(session-or-worker, attempt id) pairs of one ledger, memoized on its stat."""
+    try:
+        st = path.stat()
+        stamp = (st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return []
+    hit = _OWNER_MEMO.get(path)
+    if hit is None or hit[0] != stamp:
+        keys = [(a.get("session_id") or a["worker_id"], a["id"])
+                for a in _read(path).get("token_usage", {}).get("attempts", [])]
+        if len(_OWNER_MEMO) >= 16384:
+            _OWNER_MEMO.clear()
+        _OWNER_MEMO[path] = hit = (stamp, keys)
+    return hit[1]
+
+
+_OWNER_MEMO: dict = {}
+
+
+def _reconcile() -> None:
     from . import queue, workers, storage
     root = Path(os.environ.get("WATCHTOWER_USAGE_DIR") or (queue._resolve_store_path().parent / "usage"))
     paths = list(root.glob("*.json")) if root.exists() else []
     owners = defaultdict(set)
     for path in paths:
-        for a in _read(path).get("token_usage", {}).get("attempts", []):
-            owners[a.get("session_id") or a["worker_id"]].add((str(path), a["id"]))
+        for key, attempt_id in _owner_keys(path):
+            owners[key].add((str(path), attempt_id))
     for path in paths:
         with storage.file_lock(path.with_suffix(".lock")):
             record = _read(path)
@@ -435,9 +505,11 @@ def reconcile() -> None:
                     continue
                 if len(owners[key]) != 1:
                     # Keep late raw observations private for later inspection.
-                    a["late_observed"] = snap
-                    a["completeness"] = "ambiguous_shared_session"
-                    changed = True
+                    # Rewrite only on news, not every tick.
+                    if a.get("late_observed") != snap or a.get("completeness") != "ambiguous_shared_session":
+                        a["late_observed"] = snap
+                        a["completeness"] = "ambiguous_shared_session"
+                        changed = True
                     continue
                 original_outcome = a["outcome"]
                 a["outcome"] = "running"
