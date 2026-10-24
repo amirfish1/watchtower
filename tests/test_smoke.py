@@ -2268,3 +2268,17 @@ def test_answer_requeues_when_session_over_context_budget(store, tmp_path, monke
     assert not item.get("needs_input")
     assert "the answer is B" in (item.get("text") or "")
     assert "which way?" in (item.get("text") or "")
+
+
+def test_config_audit_lines_stay_out_of_the_real_activity_log(tmp_path, monkeypatch):
+    """WT-8: a test that only isolates the config file must not append CONFIG
+    audit lines to the developer's real ~/.watchtower/activity.log."""
+    monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "qc.json"))
+    import watchtower.config as config
+    import watchtower.queue as q
+    importlib.reload(config)
+
+    log = q._resolve_activity_log_path()
+    assert log != q._ACTIVITY_LOG and tmp_path in log.parents
+    config.set_auto_drain("LEAKCHECK", True)
+    assert "LEAKCHECK updated" in log.read_text()

@@ -44,6 +44,15 @@ def fixture_model_catalogs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def hermetic_activity_log(tmp_path, monkeypatch):
+    """WT-8: every test gets its own activity log. Fixtures that only redirect
+    the config file (e.g. test_smoke) otherwise appended config._save's CONFIG
+    audit lines to the real ~/.watchtower/activity.log on every suite run.
+    Tests that set $WATCHTOWER_ACTIVITY_LOG themselves still win."""
+    monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
+
+
+@pytest.fixture(autouse=True)
 def strict_answer_edges(monkeypatch):
     """WT-31 D2.6g: an undeclared ``pending_answer`` transition raises in
     tests (production only logs ANSWER_EDGE_UNDECLARED)."""
