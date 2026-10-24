@@ -98,10 +98,30 @@ def wake_path():
     return workers.WORKERS_FILE.parent / "stage-wake"
 
 
+def _daemon_pid_path() -> str:
+    return os.environ.get("WATCHTOWER_DAEMON_PID") or os.path.join(
+        os.path.expanduser("~"), ".watchtower", "daemon.pid")
+
+
+def supervisor_marker_path():
+    """Written by a foreground daemon at start: ``on`` when it supervises
+    stage sessions (``--auto-spawn``), ``off`` when it does not (WT-7)."""
+    from pathlib import Path
+    return Path(_daemon_pid_path()).with_suffix(".stages")
+
+
+def daemon_supervises_stages() -> bool:
+    """False only when the live daemon recorded that it was started without
+    ``--auto-spawn``; a missing marker (older daemon) is not evidence."""
+    try:
+        return supervisor_marker_path().read_text().strip() != "off"
+    except OSError:
+        return True
+
+
 def daemon_running() -> bool:
     """Whether a ``wt start`` daemon's pidfile names a live process."""
-    path = os.environ.get("WATCHTOWER_DAEMON_PID") or os.path.join(
-        os.path.expanduser("~"), ".watchtower", "daemon.pid")
+    path = _daemon_pid_path()
     try:
         pid = int(open(path).read().strip())
         os.kill(pid, 0)
@@ -144,10 +164,17 @@ def request(ref: str, why: str = "") -> Dict[str, Any]:
     except OSError:
         pass
     watcher = daemon_running()
-    _log("STAGE_QUEUED", f"{ref} {role or 'stage'} ({why})"
-         + ("" if watcher else " (no watcher running: run 'wt start' or 'wt stages tick')"),
+    supervised = watcher and daemon_supervises_stages()
+    if not watcher:
+        hint = " (no watcher running: run 'wt start' or 'wt stages tick')"
+    elif not supervised:
+        hint = (" (watcher started without --auto-spawn does not supervise stage"
+                " sessions: restart it with --auto-spawn or run 'wt stages tick')")
+    else:
+        hint = ""
+    _log("STAGE_QUEUED", f"{ref} {role or 'stage'} ({why})" + hint,
          queue=ref.rsplit("-", 1)[0])
-    return {"ref": ref, "role": role, "watcher": watcher}
+    return {"ref": ref, "role": role, "watcher": watcher, "supervised": supervised}
 
 
 def request_assessment(ref: str, force: bool = False) -> Optional[Dict[str, Any]]:

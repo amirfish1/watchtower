@@ -20,7 +20,7 @@ Wants=network-online.target
 Type=exec
 KillMode=process
 Environment=PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/hermes/.local/bin/wt start --foreground --interval 30 --stuck-minutes 10 --engine claude --host 127.0.0.1 --port 8787
+ExecStart=/home/hermes/.local/bin/wt start --foreground --auto-spawn --interval 30 --stuck-minutes 10 --engine claude --host 127.0.0.1 --port 8787
 
 # The old unit could not restart a crashed daemon: with RemainAfterExit=yes the
 # unit still read as "active" after the forked daemon died, so systemd saw

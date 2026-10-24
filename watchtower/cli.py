@@ -5310,7 +5310,8 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     print(f"[watchtower] HTTP server on http://{host}:{port}", flush=True)
     # Log daemon start to activity log.
     try:
-        auto_spawn_status = "auto-spawn on" if getattr(args, "auto_spawn", False) else "auto-spawn off"
+        auto_spawn_status = ("auto-spawn on" if getattr(args, "auto_spawn", False)
+                             else "auto-spawn off (stage sessions NOT supervised)")
         _q._log("DAEMON_START", f"(pid {os.getpid()}) {auto_spawn_status}")
     except Exception:
         pass
@@ -5574,6 +5575,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         if not dry_run:
             DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
             DAEMON_PID_FILE.write_text(str(os.getpid()))
+            # WT-7: let `stages.request` tell a spawn-less daemon (which never
+            # supervises stage sessions, WT-24) from a supervising one.
+            stages.supervisor_marker_path().write_text(
+                "on" if getattr(args, "auto_spawn", False) else "off")
         try:
             _daemon_loop(args)
         except KeyboardInterrupt:
@@ -5587,6 +5592,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
                 DAEMON_PID_FILE.unlink(missing_ok=True)
+                stages.supervisor_marker_path().unlink(missing_ok=True)
         return 0
     # Re-exec ourselves in the background in foreground-mode. This is the only
     # supervision path on hosts without launchd, so use the same hardened PATH

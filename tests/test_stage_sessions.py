@@ -948,3 +948,18 @@ def test_three_linked_incidents_spawn_one_real_verifier(stg):
     assert len(stg.spawned) == 1
     assert "INDEPENDENT verifier" in stg.spawned[0]["prompt"]
     assert [d["ref"] for d in stg.stages.desired(stg.q.list_items(project="ST"))] == [original]
+
+
+def test_request_flags_a_spawn_less_watcher(stg):
+    # WT-7: a daemon started without --auto-spawn never supervises stage
+    # sessions; STAGE_QUEUED must say so instead of reading as handled.
+    ref = _verify_ticket(stg)
+    stg.stages.supervisor_marker_path().write_text("off")
+    out = stg.stages.request(ref, "test")
+    assert out["watcher"] and not out["supervised"]
+    assert any("does not supervise stage sessions" in ln
+               for ln in _activity(stg, "STAGE_QUEUED", ref))
+    stg.stages.supervisor_marker_path().write_text("on")
+    assert stg.stages.request(ref, "test")["supervised"]
+    stg.stages.supervisor_marker_path().unlink()
+    assert stg.stages.request(ref, "test")["supervised"]  # older daemon: no marker
