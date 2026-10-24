@@ -13,10 +13,10 @@ idle minutes (default 55; must be below 60, the cache TTL) and a mode.
   supported engine; a NEW session reads it back via /resume-from-snapshot.
   Best when the process might not survive the gap (crash, closed terminal,
   different engine next time).
-- `compact` — deliver a literal `/compact` into the SAME live session.
-  Claude Code only. Keeps the session itself alive and cheap to resume in
-  place; does nothing for you if that process is gone when you return.
-- `both` — `/compact` first, then (after waiting for it to land) also write
+- `compact` — compact the SAME live session: Claude Code uses `/compact`;
+  Codex uses its native compaction RPC through CCC when managed. Keeps the
+  session itself alive and cheap to resume in place; does nothing for you if that process is gone when you return.
+- `both` — compact first, then (after waiting for it to land) also write
   the markdown snapshot. Belt-and-suspenders: cheap in-place resume AND a
   durable fallback if the process doesn't survive.
 
@@ -30,8 +30,9 @@ idle minutes (default 55; must be below 60, the cache TTL) and a mode.
      tell the user to run /snapshot-now before stepping away, and stop.
 2. Run (network sandbox not required, but run outside any restricted shell):
    `wt snapshot arm --session <SID> --engine <ENGINE> --cwd "$PWD" --idle <MIN> --mode <MODE>`
-   (omit `--mode` for the `mdfile` default). `compact`/`both` are rejected
-   for any engine other than `claude` — fall back to `mdfile` there.
+   (omit `--mode` for the `mdfile` default). All three modes work on
+   `claude` and `codex`. For managed Codex sessions, CCC must be reachable;
+   a compaction error is reported without opening a second app-server.
 3. Relay the confirmation, including the mode and fire window. If the
    command errors, show the error verbatim — do not retry with different
    numbers unless the user asks.
