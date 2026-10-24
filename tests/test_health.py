@@ -124,3 +124,18 @@ def test_model_floor_above_worker_model_is_not_claimable():
     assert row["claimable_depth"] == 0
     assert row["stuck"] is False
     assert health.queue_status("Q", [it])["claimable_depth"] == 1
+
+
+def test_deferred_ticket_is_claimable_only_after_its_window():
+    """A `wt defer`red ticket is out of claim_next's pool until the window ends,
+    so it must not read as claimable (stalled) work in the meantime (OPS-81)."""
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    later = (now + timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    earlier = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    waiting = dict(_item(created_at=old), deferred_until=later)
+    row = health.queue_status("Q", [waiting])
+    assert row["depth"] == 1 and row["claimable_depth"] == 0
+    assert row["stuck"] is False
+    row = health.queue_status("Q", [dict(waiting, deferred_until=earlier)])
+    assert row["claimable_depth"] == 1
