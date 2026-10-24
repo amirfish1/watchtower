@@ -116,3 +116,18 @@ def test_missing_catalog_preserves_inherited_effort(wt_env, monkeypatch):
     save_policy(wt_env, worker_reasoning_effort="medium")
     monkeypatch.setattr(c._models, "catalog", lambda eng: None)
     assert c.effort("Q") == "medium"
+
+
+def test_profiles_allow_distinct_models_on_one_engine_but_fallback_does_not(wt_env, monkeypatch):
+    """WT-11: a profile may list opus then sonnet on claude (a transient model
+    fault can recover there); worker fallback stays one route per engine."""
+    c = wt_env.config
+    opus = {"engine": "claude", "model": "claude-opus-5-5", "effort": "high"}
+    save_policy(wt_env, model_profiles={"deep": {"models": [opus, CLAUDE]}})
+    assert c.model_profile("deep")["models"] == [opus, CLAUDE]
+    save_policy(wt_env, model_profiles={"deep": {"models": [CLAUDE, CLAUDE]}})
+    with pytest.raises(ValueError, match="distinct supported models"):
+        c.model_profile("deep")
+    monkeypatch.setattr(wt_env.workers, "engine_available", lambda e: True)
+    save_policy(wt_env, worker_fallback={"enabled": True, "models": [opus, CLAUDE]})
+    assert c.worker_fallback_policy() == {"enabled": False, "models": []}

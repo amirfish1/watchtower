@@ -968,11 +968,14 @@ def _ccc_model_settings() -> Dict[str, Any]:
         return {}
 
 
-def _configured_model_routes(raw: Any) -> List[Dict[str, str]]:
+def _configured_model_routes(raw: Any, *, distinct_engines: bool = True) -> List[Dict[str, str]]:
     """Validate ordered routes without inventing a model or raising budgets.
 
-    One entry per engine: an exhausted account cannot recover by selecting a
-    second model on the same provider. Reject malformed config rather than
+    Worker fallback is one entry per engine: an exhausted account cannot
+    recover by selecting a second model on the same provider. Model profiles
+    (``distinct_engines=False``) may list distinct models on one engine --
+    a transient model fault can recover there; the runner skips same-engine
+    entries after a quota failure. Reject malformed config rather than
     accidentally reverting to ambient CLI defaults.
     """
     if not isinstance(raw, list) or len(raw) > len(FALLBACK_ENGINES):
@@ -985,8 +988,9 @@ def _configured_model_routes(raw: Any) -> List[Dict[str, str]]:
         eng = str(entry.get("engine") or "").strip().lower()
         model_value = canonical_model(eng, str(entry.get("model") or "").strip())
         effort_value = str(entry.get("effort") or "").strip().lower()
-        if eng not in FALLBACK_ENGINES or eng in seen:
-            raise ValueError("model routes must use distinct supported engines")
+        if eng not in FALLBACK_ENGINES or (eng if distinct_engines else (eng, model_value)) in seen:
+            raise ValueError("model routes must use distinct supported engines"
+                             if distinct_engines else "model routes must be distinct supported models")
         if (not model_value or is_blocked_model(model_value)
                 or not is_approved_model(eng, model_value)):
             raise ValueError("model route is missing, unsupported, or blocked")
@@ -994,7 +998,7 @@ def _configured_model_routes(raw: Any) -> List[Dict[str, str]]:
                              or _effort_rejected(eng, model_value, effort_value)):
             raise ValueError("model route effort is not supported")
         routes.append({"engine": eng, "model": model_value, "effort": effort_value})
-        seen.add(eng)
+        seen.add(eng if distinct_engines else (eng, model_value))
     return routes
 
 
@@ -1021,7 +1025,7 @@ def model_profile(name: str) -> Dict[str, Any]:
     profile = profiles.get(name) if isinstance(profiles, dict) else None
     if not isinstance(profile, dict):
         raise ValueError(f"model profile {name!r} has not been configured in CCC Settings")
-    routes = _configured_model_routes(profile.get("models"))
+    routes = _configured_model_routes(profile.get("models"), distinct_engines=False)
     if not routes:
         raise ValueError(f"model profile {name!r} has no configured models")
     if any(route["engine"] not in ("claude", "codex", "devin") for route in routes):
