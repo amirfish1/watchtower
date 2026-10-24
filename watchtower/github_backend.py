@@ -1728,8 +1728,19 @@ class GitHubIssuesBackend:
         )
         memo_key = None
         if age_settled and not has_comments:
+            # Content, not id(issue): a freed dict's id is reused, and
+            # updatedAt is per-second, so an edit plus a re-read in the same
+            # second served the pre-edit item (two claim winners, WT-10).
             memo_key = (
-                id(issue),
+                str(issue.get("body") or ""),
+                str(issue.get("title") or ""),
+                tuple(_label_names(issue.get("labels"))),
+                tuple(_assignee_logins(issue.get("assignees"))),
+                str(issue.get("url") or ""),
+                str((issue.get("author") or {}).get("login") or "")
+                if isinstance(issue.get("author"), dict) else str(issue.get("author") or ""),
+                created_at,
+                issue.get("closedAt"),
                 issue.get("number"),
                 issue.get("updatedAt"),
                 state,

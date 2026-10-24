@@ -536,6 +536,23 @@ def test_github_backend_claim_by_ref_serializes_concurrent_claimants(tmp_path, m
     assert final["history"][0]["worker"] == winners[0]
 
 
+def test_issue_to_item_memo_sees_same_second_edit():
+    """WT-10: the memo was keyed on id(issue) + per-second updatedAt, so an
+    edit re-read within the same second (or a recycled dict id) served the
+    pre-edit item -- a claimed ticket read as open and two claimants won."""
+    from watchtower.github_backend import GitHubIssuesBackend
+
+    backend = GitHubIssuesBackend("GHI", repo="test-owner/test-repo")
+    issue = _fake_issue(1, "same second", body="work")
+    assert backend._issue_to_item(issue)["status"] == "open"
+    # Same object, same updatedAt: only the content changed.
+    issue["body"] = 'work\n\n<!-- watchtower\nclaimed_by: "worker-a"\n-->'
+    issue["labels"] = [{"name": "watchtower:in-progress"}]
+    item = backend._issue_to_item(issue)
+    assert item["status"] == "in_progress"
+    assert item["claimed_by"] == "worker-a"
+
+
 def test_claim_next_falls_through_stale_closed_candidate(tmp_path, monkeypatch):
     """OPS-841: a candidate that is open in the listing snapshot but already
     closed by the time claim_by_ref re-reads it (closed between list and
