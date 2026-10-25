@@ -686,6 +686,8 @@ def _transcript_mtime(engine: str, sid: str) -> float:
     return 0.0
 
 
+_TRANSCRIPT_ENGINES = ("claude", "codex", "kimi")
+
 RECENT_TRANSCRIPT_S = 120.0
 RECENT_SESSION_S = 600.0  # ambient claim: session files written this recently = working
 
@@ -815,10 +817,14 @@ def _file_activity(item: Dict[str, Any], ctx: "ResolverContext") -> float:
     cp = claim_proc_of(item) or {}
     sid = str(cp.get("session_id") or item.get("claimed_session_id") or "")
     if sid:
-        try:
-            ts.append(_transcript_mtime(str(cp.get("engine") or "claude"), sid))
-        except Exception:  # noqa: BLE001
-            pass
+        # An ambient claim records no engine (no worker record to copy it
+        # from), so its session may be a Codex rollout or Kimi wire as well
+        # as a Claude transcript: probe every engine rather than guess (OPS-102).
+        for engine in ([cp["engine"]] if cp.get("engine") else _TRANSCRIPT_ENGINES):
+            try:
+                ts.append(_transcript_mtime(str(engine), sid))
+            except Exception:  # noqa: BLE001
+                pass
     ss = item.get("stage_session") or {}
     if ss.get("worker_id"):
         rec = next((w for w in ctx.rows() if str(w.get("worker_id") or "") == ss["worker_id"]),
