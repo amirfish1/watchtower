@@ -107,7 +107,9 @@ def synth(s: Any, i: int, now: float) -> Dict[str, Any]:
     if s.block != "none":
         it["needs_input"] = True
         it["block_kind"] = s.block
-    if s.readiness != "claimable":
+    if s.readiness == "deferred":   # projection-only: a live `wt defer` window
+        it["deferred_until"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 3600))
+    elif s.readiness != "claimable":
         it["readiness"] = s.readiness
     it["blocked_by"] = list(_DEP[s.dep])
     if s.claimed:
