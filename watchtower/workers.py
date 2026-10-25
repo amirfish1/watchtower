@@ -18,6 +18,7 @@ queue ground-truth.
 from __future__ import annotations
 
 import json
+import glob as _glob
 import hashlib
 import os
 import re
@@ -975,9 +976,12 @@ def _claude_transcript_mtime(w: Dict[str, Any]) -> float:
     )
     newest = 0.0
     try:
-        for path in (claude_home / "projects").glob(f"*/{session_id}.jsonl"):
+        # glob.glob, not Path.glob: the latter lists every project dir's
+        # thousands of transcripts (~15 ms per call vs <1 ms; WT-17).
+        for path in _glob.glob(os.path.join(_glob.escape(str(claude_home / "projects")),
+                                            "*", f"{_glob.escape(session_id)}.jsonl")):
             try:
-                newest = max(newest, path.stat().st_mtime)
+                newest = max(newest, os.stat(path).st_mtime)
             except OSError:
                 continue
     except OSError:
@@ -1184,6 +1188,26 @@ def _kimi_wire_mtime(w: Dict[str, Any]) -> float:
     except OSError:
         return 0.0
     return newest
+
+
+def session_active_age_s(w: Dict[str, Any], rows: List[Dict[str, Any]],
+                         now: Optional[float] = None) -> Optional[float]:
+    """Seconds since a dead-PID row's session transcript was last written, when
+    that is recent enough to mean a resumed session is still working (WT-17).
+
+    Display evidence only: ``alive`` stays PID-based because release, kill and
+    staffing act on that process. None when the row is alive, has no session,
+    the transcript is quiet, or a live row already owns the session."""
+    sid = str(w.get("session_id") or "")
+    if w.get("alive") or not sid:
+        return None
+    if any(r.get("alive") and str(r.get("session_id") or "") == sid for r in rows):
+        return None
+    now = time.time() if now is None else now
+    from . import liveness
+    mtime = max(_codex_rollout_mtime(w), _claude_transcript_mtime(w), _kimi_wire_mtime(w))
+    age = now - mtime
+    return age if mtime and age < liveness.RECENT_SESSION_S else None
 
 
 def _worker_idle_s(w: Dict[str, Any]) -> float:

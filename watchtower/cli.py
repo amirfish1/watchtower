@@ -163,6 +163,10 @@ def _print_status(rows: List[dict]) -> None:
         return
     for w in rows_w:
         state = "LIVE" if w.get("alive") else "DEAD"
+        if not w.get("alive"):
+            age = workers.session_active_age_s(w, rows_w)
+            if age is not None:
+                state += f" (session active {int(age)}s ago)"
         ref = w.get("active_ref")
         if ref:
             since = w.get("active_since_human")
@@ -3555,10 +3559,14 @@ def cmd_workers(args: argparse.Namespace) -> int:
     # second continuation), recent stage records, rows owed a lifecycle audit --
     # and a week of rebinds is ~100 rows that read as "stale workers". The
     # table shows live workers unless --all; --json is unchanged.
+    # A dead-PID row whose resumed session is still writing is shown even
+    # without --all: it is working, just not in its original process (WT-17).
+    active = {id(w): age for w in rows if not w.get("alive")
+              for age in [workers.session_active_age_s(w, rows)] if age is not None}
     hidden = 0
     if not getattr(args, "all", False):
-        hidden = sum(1 for w in rows if not w.get("alive"))
-        rows = [w for w in rows if w.get("alive")]
+        hidden = sum(1 for w in rows if not w.get("alive") and id(w) not in active)
+        rows = [w for w in rows if w.get("alive") or id(w) in active]
     if not rows:
         print("(no workers tracked)" if not hidden else "(no live workers)")
     else:
@@ -3568,6 +3576,7 @@ def cmd_workers(args: argparse.Namespace) -> int:
             f"{w.get('worker_id',''):<22}{w.get('pid',0):>8}  "
             f"{w.get('queue',''):<12}{w.get('engine',''):<8}"
             f"{'yes' if w.get('alive') else 'no':<6}{w.get('started_at','')}"
+            + (f"  (session active {int(active[id(w)])}s ago)" if id(w) in active else "")
         )
     if hidden:
         print(f"({hidden} dead record(s) retained by design -- rebind guard / "

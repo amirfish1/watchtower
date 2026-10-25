@@ -5367,3 +5367,23 @@ def test_reconcile_spawns_second_worker_when_only_live_worker_is_busy(wt):
     wt.q.enqueue(project="Q", note="waiting")
     r = wt.workers.reconcile_once(dry_run=True)
     assert [s["queue"] for s in r["spawned"]] == ["Q"]
+
+
+def test_session_active_age_flags_dead_pid_row_whose_session_still_writes(wt, tmp_path):
+    """WT-17: a resumed session outliving its exec PID reads as active, not
+    just DEAD, while alive stays PID-based; a live owner of the session wins."""
+    import watchtower.workers as workers
+    sid = "ab1aebae-36c3-4fda-b872-caa3c3f32318"
+    row = {"worker_id": "ccc-x", "engine": "claude", "session_id": sid, "alive": False}
+    assert workers.session_active_age_s(row, [row]) is None  # no transcript
+    t = tmp_path / "claude-home" / "projects" / "-p" / f"{sid}.jsonl"
+    t.parent.mkdir(parents=True)
+    t.write_text("{}\n")
+    now = time.time()
+    os.utime(t, (now - 30, now - 30))
+    age = workers.session_active_age_s(row, [row], now=now)
+    assert age is not None and 29 <= age <= 31
+    owner = {"worker_id": "ccc-y", "session_id": sid, "alive": True}
+    assert workers.session_active_age_s(row, [row, owner], now=now) is None
+    os.utime(t, (now - 3600, now - 3600))
+    assert workers.session_active_age_s(row, [row], now=now) is None  # quiet
