@@ -16,7 +16,9 @@ import os
 import re
 import subprocess
 import threading
+import contextlib
 import copy
+import functools
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -94,6 +96,29 @@ _META_END = "-->"
 # escaping its literal backslashes (for example ``\^[[0m``).  Preserve the
 # original terminal text by escaping only sequences JSON cannot decode.
 _LEGACY_INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})')
+
+
+# Per-thread set of repo lock paths already held, so a locked writer may call
+# another (update_status -> claim_by_ref, ingest_owner_answer -> answer)
+# without flock deadlocking on its own second open of the same file.
+_BODY_LOCKS_HELD = threading.local()
+
+
+def _serialized_body_write(method):
+    """Run a read-modify-write of the issue body under the per-repo lock.
+
+    Every writer reads the body, edits its metadata block and writes the
+    whole body back; `gh issue edit` has no compare-and-swap, so two
+    unserialized writers lose one update. Observed on BECKY-2745: a `wt
+    comment` read the body just before a claim landed and wrote it back a
+    second later, erasing `claimed_by`; the read then fell back to the
+    GitHub assignee and `wt close` rejected the claiming worker (OPS-106).
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._body_lock():
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class GitHubBackendError(RuntimeError):
@@ -2575,6 +2600,23 @@ class GitHubIssuesBackend:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
+    @contextlib.contextmanager
+    def _body_lock(self):
+        """The claim lock, reentrant within a thread (see `_serialized_body_write`)."""
+        path = str(self._claim_lock_path())
+        held = getattr(_BODY_LOCKS_HELD, "paths", None)
+        if held is None:
+            held = _BODY_LOCKS_HELD.paths = set()
+        if path in held:
+            yield
+            return
+        with _FileLock(Path(path)):
+            held.add(path)
+            try:
+                yield
+            finally:
+                held.discard(path)
+
     def _stop_signal_path(self, session_id: str):
         try:
             from . import workers as _workers
@@ -2775,7 +2817,7 @@ class GitHubIssuesBackend:
     ) -> Optional[Dict[str, Any]]:
         if not session_id:
             raise ValueError("session_id is required")
-        with _FileLock(self._claim_lock_path()):
+        with self._body_lock():
             item = self.get(ref)
             if item is None:
                 return None
@@ -2822,6 +2864,7 @@ class GitHubIssuesBackend:
                 claimed["status"] = "in_progress"
             return claimed
 
+    @_serialized_body_write
     def update_status(
         self,
         ident: Any,
@@ -2963,6 +3006,7 @@ class GitHubIssuesBackend:
                 closed["resolution"] = norm
         return closed
 
+    @_serialized_body_write
     def ack_resolution(
         self,
         ident: Any,
@@ -3055,6 +3099,7 @@ class GitHubIssuesBackend:
         ])
         return self.get(ident)
 
+    @_serialized_body_write
     def defer(
         self,
         ident: Any,
@@ -3096,6 +3141,7 @@ class GitHubIssuesBackend:
         ])
         return self.get(ident)
 
+    @_serialized_body_write
     def block(
         self,
         ident: Any,
@@ -3144,6 +3190,7 @@ class GitHubIssuesBackend:
             ], check=False)
         return self.get(ident)
 
+    @_serialized_body_write
     def answer(
         self,
         ident: Any,
@@ -3242,6 +3289,7 @@ class GitHubIssuesBackend:
         repo = self.repo or ""
         return repo.split("/", 1)[0].strip() if "/" in repo else ""
 
+    @_serialized_body_write
     def ingest_owner_answer(self, ident: Any) -> Optional[Dict[str, Any]]:
         """Ingest an owner-authored answer comment on a blocked ticket, once.
 
@@ -3315,6 +3363,7 @@ class GitHubIssuesBackend:
         ], check=False)
         return updated
 
+    @_serialized_body_write
     def comment(
         self,
         ident: Any,
@@ -3353,6 +3402,7 @@ class GitHubIssuesBackend:
         ])
         return self.get(ident)
 
+    @_serialized_body_write
     def update(self, ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
         item = self.get(ident)
         if item is None:
