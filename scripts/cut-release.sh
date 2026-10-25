@@ -55,6 +55,8 @@ step() { echo "${GREEN}==> $*${NC}"; }
 warn() { echo "${YEL}!  $*${NC}"; }
 die()  { echo "${RED}cut-release: $*${NC}" >&2; exit 1; }
 run()  { if [ "$DRY_RUN" = 1 ]; then echo "   ${YEL}[dry-run]${NC} $*"; else eval "$@"; fi; }
+# GNU sed (the VM's daily release) takes -i with no suffix; BSD sed (macOS) needs -i ''.
+sed_i() { if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi; }
 
 # ── Resolve the target version ──────────────────────────────────────────────
 # pyproject.toml is the source of truth for "where we are now"; __init__.py is
@@ -101,9 +103,8 @@ fi
 
 # ── 1. Version bump (lockstep) ──────────────────────────────────────────────
 step "1/5  Bump version in pyproject.toml + watchtower/__init__.py"
-# BSD sed (this repo is developed on macOS); the -i '' is deliberate.
-run "sed -i '' 's/^version = \".*\"/version = \"${VERSION}\"/' pyproject.toml"
-run "sed -i '' 's/^__version__ = \".*\"/__version__ = \"${VERSION}\"/' watchtower/__init__.py"
+run "sed_i 's/^version = \".*\"/version = \"${VERSION}\"/' pyproject.toml"
+run "sed_i 's/^__version__ = \".*\"/__version__ = \"${VERSION}\"/' watchtower/__init__.py"
 if [ "$DRY_RUN" = 0 ]; then
   grep -q "^version = \"${VERSION}\"" pyproject.toml \
     && grep -q "^__version__ = \"${VERSION}\"" watchtower/__init__.py \
