@@ -292,6 +292,19 @@ def _read_persisted_list_cache() -> Dict[str, Any]:
             return {}
         if not isinstance(data, dict):
             data = {}
+        # Every repo's poll rewrites this one file, so most re-parses leave a
+        # given repo's list unchanged. Keep that list the same object: the
+        # list_items memo keys on its identity (WT-16).
+        previous = _PERSISTED_LIST_MEM_CACHE["data"]
+        for key, entry in data.items():
+            old = previous.get(key)
+            if (
+                isinstance(entry, dict)
+                and isinstance(old, dict)
+                and entry.get("data") is not None
+                and entry.get("data") == old.get("data")
+            ):
+                entry["data"] = old["data"]
         _PERSISTED_LIST_MEM_CACHE["mtime_ns"] = mtime_ns
         _PERSISTED_LIST_MEM_CACHE["size"] = size
         _PERSISTED_LIST_MEM_CACHE["data"] = data

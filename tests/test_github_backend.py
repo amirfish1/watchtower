@@ -624,6 +624,30 @@ def test_list_items_memo_expires_when_an_issue_leaves_its_grace_period(tmp_path,
     assert entry[3] <= time.time() + 10
 
 
+def test_persisted_list_reparse_keeps_unchanged_lists_identical(tmp_path, monkeypatch):
+    """WT-16: every repo's poll rewrites the shared cache file; a re-parse must
+    not hand out a new object for a repo whose list did not change, or the
+    list_items memo misses on every poll."""
+    import watchtower.github_backend as github_backend
+
+    cache = tmp_path / "gh-list-cache.json"
+    monkeypatch.setenv("WATCHTOWER_GH_LIST_CACHE_FILE", str(cache))
+    importlib.reload(github_backend)
+    a, b = [_fake_issue(1, "a")], [_fake_issue(2, "b")]
+    cache.write_text(json.dumps({"x:open": {"at": 1, "data": a}, "y:open": {"at": 1, "data": b}}))
+    first = github_backend._read_persisted_list_cache()
+    cache.write_text(json.dumps({
+        "x:open": {"at": 2, "data": a},
+        "y:open": {"at": 2, "data": [_fake_issue(2, "b edited")]},
+    }))
+    os.utime(cache, ns=(time.time_ns(), time.time_ns() + 1_000_000))
+    second = github_backend._read_persisted_list_cache()
+    assert second["x:open"]["at"] == 2
+    assert second["x:open"]["data"] is first["x:open"]["data"]
+    assert second["y:open"]["data"] is not first["y:open"]["data"]
+    assert second["y:open"]["data"][0]["title"] == "b edited"
+
+
 def test_claim_next_falls_through_stale_closed_candidate(tmp_path, monkeypatch):
     """OPS-841: a candidate that is open in the listing snapshot but already
     closed by the time claim_by_ref re-reads it (closed between list and
