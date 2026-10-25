@@ -455,21 +455,82 @@ def reconcile() -> None:
 _PASS = threading.local()
 
 
-def _owner_keys(path) -> list:
-    """(session-or-worker, attempt id) pairs of one ledger, memoized on its stat."""
+def _skips(a: dict) -> bool:
+    """Attempt reconcile never touches; a pure function of the ledger file."""
+    return ((a.get("backfill") or {}).get("finalization") == "frozen_historical_interval"
+            or a.get("outcome") == "running" or a.get("completeness") == "complete"
+            or a.get("attribution") == "retention_limit")
+
+
+def _digest(a: dict) -> dict:
+    """What reconcile's no-op check reads from one attempt, minus the bulk."""
+    saved = a.get("observed") or {}
+    late = a.get("late_observed")
+    return {"worker_id": a["worker_id"], "session_id": a.get("session_id") or "",
+            "path": saved.get("path"), "engine": saved.get("engine"),
+            "saved_session_id": saved.get("session_id", ""),
+            "requested_model": saved.get("requested_model"),
+            "exit_file": str((saved.get("process") or {}).get("exit_file") or ""),
+            "late": None if late is None else _fingerprint(late),
+            "completeness": a.get("completeness")}
+
+
+def _fingerprint(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _ledger_meta(path):
+    """(owner keys, digests) of one ledger, memoized on its stat.
+
+    Owner keys are its (session-or-worker, attempt id) pairs; digests cover
+    only the attempts reconcile does not skip, so a quiet tick can decide
+    there is nothing to do without decoding every ledger again (WT-12:
+    ~1.4k ledgers re-read under lock each tick was ~1.5 s CPU).
+    """
     try:
         st = path.stat()
         stamp = (st.st_ino, st.st_mtime_ns, st.st_size)
     except OSError:
-        return []
+        return [], []
     hit = _OWNER_MEMO.get(path)
     if hit is None or hit[0] != stamp:
-        keys = [(a.get("session_id") or a["worker_id"], a["id"])
-                for a in _read(path).get("token_usage", {}).get("attempts", [])]
+        attempts = _read(path).get("token_usage", {}).get("attempts", [])
+        keys = [(a.get("session_id") or a["worker_id"], a["id"]) for a in attempts]
+        digests = [_digest(a) for a in attempts if not _skips(a)]
         if len(_OWNER_MEMO) >= 16384:
             _OWNER_MEMO.clear()
-        _OWNER_MEMO[path] = hit = (stamp, keys)
-    return hit[1]
+        _OWNER_MEMO[path] = hit = (stamp, keys, digests)
+    return hit[1], hit[2]
+
+
+def _late_snapshot(worker_id, session_id, saved_path, saved_engine,
+                   saved_session_id, requested_model) -> dict:
+    snap = observe(worker_id, session_id)
+    if not snap.get("path") and saved_path:
+        snap = dict(parse(saved_path, saved_engine), session_id=saved_session_id,
+                    worker_id=worker_id, requested_model=requested_model)
+    return snap
+
+
+def _has_work(digests, owners) -> bool:
+    """Would the locked pass change this ledger? May say yes spuriously, never no."""
+    from . import workers
+    for d in digests:
+        snap = _late_snapshot(d["worker_id"], d["session_id"], d["path"], d["engine"],
+                              d["saved_session_id"], d["requested_model"])
+        exited = bool(workers.read_exit_file(d["exit_file"]).get("ended_at"))
+        if not exited and not snap.get("terminal"):
+            continue
+        if len(owners[d["session_id"] or d["worker_id"]]) != 1:
+            if d["late"] == _fingerprint(snap) and d["completeness"] == "ambiguous_shared_session":
+                continue
+        return True
+    return False
+
+
+def _owner_keys(path) -> list:
+    """(session-or-worker, attempt id) pairs of one ledger, memoized on its stat."""
+    return _ledger_meta(path)[0]
 
 
 _OWNER_MEMO: dict = {}
@@ -480,25 +541,28 @@ def _reconcile() -> None:
     root = Path(os.environ.get("WATCHTOWER_USAGE_DIR") or (queue._resolve_store_path().parent / "usage"))
     paths = list(root.glob("*.json")) if root.exists() else []
     owners = defaultdict(set)
+    pending = []
     for path in paths:
-        for key, attempt_id in _owner_keys(path):
+        keys, digests = _ledger_meta(path)
+        for key, attempt_id in keys:
             owners[key].add((str(path), attempt_id))
-    for path in paths:
+        if digests:
+            pending.append((path, digests))
+    for path, digests in pending:
+        if not _has_work(digests, owners):
+            continue
         with storage.file_lock(path.with_suffix(".lock")):
             record = _read(path)
             ledger = record.get("token_usage") or {}
             changed = False
             for a in ledger.get("attempts", []):
-                if (a.get("backfill") or {}).get("finalization") == "frozen_historical_interval":
-                    continue  # Historical bounds must never expand to later session usage.
-                if a.get("outcome") == "running" or a.get("completeness") == "complete" or a.get("attribution") == "retention_limit":
-                    continue
+                if _skips(a):
+                    continue  # Frozen historical bounds must never expand to later session usage.
                 key = a.get("session_id") or a["worker_id"]
-                snap = observe(a["worker_id"], a.get("session_id") or "")
                 saved = a["observed"]
-                if not snap.get("path") and saved.get("path"):
-                    snap = dict(parse(saved["path"], saved["engine"]), session_id=saved.get("session_id", ""),
-                                worker_id=a["worker_id"], requested_model=saved.get("requested_model"))
+                snap = _late_snapshot(a["worker_id"], a.get("session_id") or "", saved.get("path"),
+                                      saved.get("engine"), saved.get("session_id", ""),
+                                      saved.get("requested_model"))
                 proc = saved.get("process") or {}
                 exited = bool(workers.read_exit_file(str(proc.get("exit_file") or "")).get("ended_at"))
                 if not exited and not snap.get("terminal"):

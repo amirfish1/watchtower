@@ -6277,6 +6277,15 @@ def backfill_recent_session_titles(
         items = []
     out: List[Dict[str, Any]] = []
     candidates: Dict[str, tuple] = {}
+    # Index once: scanning every item per log was O(logs x items) on every
+    # reconciler tick (~0.45 s CPU with 120 logs and 1.3k tickets, WT-12).
+    by_key: Dict[str, List[int]] = {}
+    for n, it in enumerate(items):
+        if it.get("status") not in ("closed", "in_progress"):
+            continue
+        for k in {str(it.get(f) or "") for f in ("claimed_by", "claimed_session_id")}:
+            if k:
+                by_key.setdefault(k, []).append(n)
 
     def _offer(worker_id: str, session_id: str, item: Dict[str, Any]) -> None:
         key = _item_activity_key(item)
@@ -6294,7 +6303,8 @@ def backfill_recent_session_titles(
         sid = resolve_session_id_from_log(str(path))
         if not sid:
             continue
-        item = _latest_worker_item(worker_id, sid, items)
+        mine = sorted({n for k in (worker_id, sid) for n in by_key.get(k, ())})
+        item = _latest_worker_item(worker_id, sid, [items[n] for n in mine])
         if not item:
             continue
         _offer(worker_id, sid, item)

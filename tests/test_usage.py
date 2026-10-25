@@ -215,6 +215,27 @@ def test_late_usage_shared_across_tickets_is_not_double_counted(measured, tmp_pa
     assert usage._location(first).stat().st_mtime_ns == stamp
 
 
+def test_quiet_pass_skips_pending_ledger_until_it_can_settle(measured, tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_USAGE_DIR", str(tmp_path / "usage"))
+    item = {"ref": "TOK-1", "history": []}
+    usage.capture(item, usage.on_event, {"event": "claim", "at": "t0", "by": {"worker": "w"}})
+    write(measured, [claude("preexisting"), claude("work", inp=20)])
+    usage.capture(item, usage.on_event, {"event": "close", "at": "t1", "by": {"worker": "w"}})
+    path = usage._location(item)
+    usage.reconcile()  # session still live: nothing to settle
+    reads = []
+    real_read = usage._read
+    monkeypatch.setattr(usage, "_read", lambda p, **k: (reads.append(p), real_read(p, **k))[1])
+    usage.reconcile()
+    assert path not in reads  # WT-12: an unchanged, unsettleable ledger is not re-decoded
+    write(measured, [claude("preexisting"), claude("work", inp=20), claude("late", inp=7),
+                     {"type": "result"}])
+    usage.reconcile()
+    usage.attach(item)
+    assert item["token_usage"]["totals"]["input"] == 27
+    assert item["token_usage"]["completeness"] == "complete"
+
+
 def test_github_namespace_isolates_same_ref_and_safe_metadata(measured, tmp_path, monkeypatch):
     from watchtower.github_backend import GitHubIssuesBackend
     monkeypatch.setenv("WATCHTOWER_USAGE_DIR", str(tmp_path / "usage"))
