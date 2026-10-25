@@ -601,3 +601,25 @@ def test_requeue_leaves_ambient_rebound_claim_of_a_known_worker(lv, monkeypatch)
     # the session went quiet: the sweep reopens it again
     monkeypatch.setattr(lv.liveness, "_file_activity", lambda it, ctx: base - 3600)
     assert [i["ref"] for i in lv.workers.requeue_orphaned_tickets()] == [ref]
+
+
+def test_requeue_preserves_resumed_bound_claim_while_transcript_advances(lv, monkeypatch):
+    """OPS-102: the original exec PID can die while its resumed thread works."""
+    monkeypatch.setenv("CODEX_HOME", str(lv.tmp / "codex"))
+    monkeypatch.setenv("WATCHTOWER_CODEX_THREAD_REGISTRY", str(lv.tmp / "codex-registry.json"))
+    lv.worker(engine="codex")
+    ref = _claimed(lv)
+    assert lv.q.get(ref)["claim_proc"]["pid"]
+    lv.kill()
+    base = time.time()
+    monkeypatch.setattr(time, "time", lambda: base + 600)
+    rollout = lv.tmp / "codex/sessions/2026/10/25" / f"rollout-{SID}.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"response_item"}\n')
+    os.utime(rollout, (base + 590, base + 590))
+
+    assert lv.workers.requeue_orphaned_tickets() == []
+    assert lv.q.get(ref)["status"] == "in_progress"
+    # A dead process with a quiet transcript must still be recoverable.
+    os.utime(rollout, (base - 3600, base - 3600))
+    assert [it["ref"] for it in lv.workers.requeue_orphaned_tickets()] == [ref]
