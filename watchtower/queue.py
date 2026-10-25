@@ -1499,6 +1499,17 @@ def _depth_fields(depth: Any, budget_min: Any = 0) -> Dict[str, Any]:
     return {"depth": "deep", "budget_min": minutes or DEEP_DEFAULT_BUDGET_MIN}
 
 
+def _depth_edit(item: Dict[str, Any], depth: Any, budget_min: Any) -> Dict[str, Any]:
+    """The depth fields ``item`` should store after ``wt edit --depth/--budget-min``
+    (None = flag not given, keep the current value)."""
+    want = norm_depth(depth if depth is not None else item.get("depth"))
+    if want != "deep" and budget_min is not None and depth is None:
+        raise ValueError(f"{item.get('ref')} is not a deep ticket; "
+                         "set --depth deep to give it a budget")
+    return _depth_fields(want, budget_min if budget_min is not None
+                         else item.get("budget_min"))
+
+
 def is_deep(item: Dict[str, Any]) -> bool:
     return str((item or {}).get("depth") or "").lower() == "deep"
 
@@ -1658,8 +1669,6 @@ def enqueue(
     backend = _github_backend_for_project(proj)
     if dedupe_key and backend is not None:
         raise ValueError("dedupe keys currently require a local queue")
-    if norm_depth(depth) == "deep" and backend is not None:
-        raise ValueError("deep tickets currently require a local queue")
     grouped = bool(group_parent or group or children)
     if grouped:
         if backend is not None:
@@ -1694,6 +1703,7 @@ def enqueue(
             submitter=submitter,
             submitter_explicit=submitter_explicit,
             blocked_by=blocked_by,
+            depth_fields=_depth_fields(depth, budget_min),
         )
         _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
         return saved
@@ -1924,7 +1934,14 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         if "depth" in fields or "budget_min" in fields:
-            raise ValueError("deep tickets currently require a local queue")
+            fields = dict(fields)
+            want_depth, want_budget = fields.pop("depth", None), fields.pop("budget_min", None)
+            if want_depth is not None:
+                norm_depth(want_depth)
+            current = backend.get(ident)
+            if current is None:
+                return None
+            fields["depth_fields"] = _depth_edit(current, want_depth, want_budget)
         return backend.update(ident, **fields)
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
@@ -1950,13 +1967,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
             if _matches(it, ident):
                 now = _now_iso()
                 if depth_edit is not None:
-                    want = norm_depth(depth_edit[0] if depth_edit[0] is not None
-                                      else it.get("depth"))
-                    if want != "deep" and depth_edit[1] is not None and depth_edit[0] is None:
-                        raise ValueError(f"{it.get('ref')} is not a deep ticket; "
-                                         "set --depth deep to give it a budget")
-                    new = _depth_fields(want, depth_edit[1] if depth_edit[1] is not None
-                                        else it.get("budget_min"))
+                    new = _depth_edit(it, *depth_edit)
                     old = {k: it.get(k) for k in ("depth", "budget_min") if k in it}
                     it.pop("depth", None)
                     it.pop("budget_min", None)

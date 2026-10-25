@@ -2037,6 +2037,9 @@ class GitHubIssuesBackend:
             item["closed_machine"] = meta.get("closed_machine") or item.get("claimed_machine")
         if resolution:
             item["resolution"] = resolution
+        if str(meta.get("depth") or "").lower() == "deep":
+            item["depth"] = "deep"
+            item["budget_min"] = meta.get("budget_min")
         if deferred_until:
             item["deferred_until"] = deferred_until
             item["defer_reason"] = str(meta.get("defer_reason") or "")
@@ -2458,6 +2461,7 @@ class GitHubIssuesBackend:
         submitter: str = "",
         submitter_explicit: bool = False,
         blocked_by: Optional[List[str]] = None,
+        depth_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         note = _clip(note, 4000)
         text = _clip(text or note, 24000)
@@ -2492,6 +2496,8 @@ class GitHubIssuesBackend:
         }
         if blocked_by:
             meta["blocked_by"] = self._validate_blockers("", blocked_by)
+        # Pre-validated by queue._depth_fields: {} for quick, else depth+budget_min.
+        meta.update(depth_fields or {})
         issue_title = _clip(title or note or "WatchTower ticket", 200)
         body = _body_with_metadata(text, meta)
         out = self._run([
@@ -3483,6 +3489,17 @@ class GitHubIssuesBackend:
                     meta["blocked_by"] = blockers
                 else:
                     meta.pop("blocked_by", None)
+            elif key == "depth_fields":
+                # Pre-computed by queue._depth_edit; {} demotes to quick.
+                old = {k: meta[k] for k in ("depth", "budget_min") if k in meta}
+                meta.pop("depth", None)
+                meta.pop("budget_min", None)
+                meta.update(value)
+                if value != old:
+                    _append_history(meta, "edit", by={"kind": "system"},
+                                    fields={"depth": value.get("depth", "quick"),
+                                            **({"budget_min": value["budget_min"]}
+                                               if "budget_min" in value else {})})
             elif key == "title":
                 title = _clip(value, 200)
             elif key == "text":
