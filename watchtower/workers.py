@@ -5680,6 +5680,12 @@ def requeue_orphaned_tickets(
         # session) is provably alive; a dead builder of a review rejection that
         # was never resumed is resumed first (WT-30).
         verdict = None
+        # A GitHub-backed claim stores no claim_proc to prove, but a resumed
+        # session still writing its transcript is working all the same: the
+        # original exec PID exiting must not hand the ticket on (OPS-107).
+        if (github_of(it)
+                and now - _liveness._file_activity(it, ctx) < _liveness.RECENT_SESSION_S):
+            continue
         if not github_of(it):
             try:
                 verdict = _liveness.claim_owner(it, ctx)
