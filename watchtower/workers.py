@@ -5696,8 +5696,12 @@ def requeue_orphaned_tickets(
             # A resumed session can outlive its original bound PID, or have
             # no bound process at all. Recent transcript activity vetoes a
             # duplicate handoff while death remains unproven. Quiet sessions
-            # still reach recovery below (OPS-102, OPS-1333).
+            # still reach recovery below (OPS-102, OPS-1333). A bound claim
+            # carrying resume evidence was already judged by it in
+            # _builder_held (WT-30 D3): the builder's last write at reject
+            # time is not the resumed session working (WT-19).
             if (verdict is not None and verdict.verdict == "unproven"
+                    and not (has_resume and (verdict.proc or {}).get("bound") != "ambient")
                     and now - _liveness._file_activity(it, ctx) < _liveness.RECENT_SESSION_S):
                 continue
             if (verdict is not None and verdict.verdict == "dead"
