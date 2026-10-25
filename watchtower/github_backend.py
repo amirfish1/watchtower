@@ -1450,6 +1450,71 @@ def _body_with_metadata(human_body: str, meta: Dict[str, Any]) -> str:
     return _meta_block(meta)
 
 
+_UNSET = object()
+# Re-read/re-apply rounds after a body write (WT-20); each costs one view.
+_BODY_WRITE_RETRIES = 2
+
+
+def _log_body_reapply(repo: str, number: str, conflicts: List[str]) -> None:
+    try:
+        from . import queue as _q
+        _q._log("GH-REAPPLY", f"{repo}#{number} concurrent body write dropped our change; "
+                f"re-applied" + (f" (theirs kept: {', '.join(conflicts)})" if conflicts else ""))
+    except Exception:  # noqa: BLE001 - logging never breaks a write
+        pass
+
+
+def _merge_body_write(base_raw: str, ours_raw: str,
+                      fresh_raw: str) -> "tuple[Optional[str], List[str]]":
+    """Three-way merge of our body write into the body GitHub now holds (WT-20).
+
+    ``gh issue edit`` has no compare-and-swap, and the per-repo flock only
+    serializes writers on one host: a writer on another host that read the
+    body before our edit can write it back a moment later, silently erasing
+    our change. Re-apply only what *we* changed (base -> ours) and only where
+    the fresh body still carries the base value; a key the other writer also
+    changed is theirs and is reported as a conflict; a ``claimed_by``
+    conflict re-applies nothing. History merges by appending our new
+    entries. Returns (body to rewrite, or None when fresh
+    already carries every change of ours; conflicting keys)."""
+    base_h, base_m = _split_body_shared(base_raw)
+    ours_h, ours_m = _split_body_shared(ours_raw)
+    fresh_h, fresh_m = _split_body(fresh_raw)
+    merged_h, merged_m = fresh_h, fresh_m
+    conflicts: List[str] = []
+    dirty = False
+    for key in list(base_m) + [k for k in ours_m if k not in base_m]:
+        b, o = base_m.get(key, _UNSET), ours_m.get(key, _UNSET)
+        f = fresh_m.get(key, _UNSET)
+        if b == o or f == o:
+            continue
+        if key == "history" and isinstance(o, list):
+            have = f if isinstance(f, list) else []
+            old = b if isinstance(b, list) else []
+            add = [e for e in o if e not in old and e not in have]
+            if add:
+                merged_m["history"] = list(have) + add
+                dirty = True
+        elif f == b:
+            if o is _UNSET:
+                merged_m.pop(key, None)
+            else:
+                merged_m[key] = copy.deepcopy(o)
+            dirty = True
+        else:
+            conflicts.append(key)
+    if ours_h != base_h and fresh_h != ours_h:
+        if fresh_h == base_h:
+            merged_h, dirty = ours_h, True
+        else:
+            conflicts.append("body")
+    if "claimed_by" in conflicts:
+        # The ticket changed hands under us: nothing of ours belongs on the
+        # new claimant's ticket (no claimed_at, no claim history entry).
+        return None, conflicts
+    return (_body_with_metadata(merged_h, merged_m) if dirty else None), conflicts
+
+
 def _first_line(value: str) -> str:
     """First non-blank line of real content, skipping markdown ATX headings.
 
@@ -2617,6 +2682,34 @@ class GitHubIssuesBackend:
             finally:
                 held.discard(path)
 
+    def _edit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
+                   *extra: str) -> List[str]:
+        """Write ``body``+``meta`` over ``item``'s issue, then re-read and
+        re-apply our change if a concurrent (cross-host) writer dropped it
+        (see `_merge_body_write`). Returns keys a concurrent writer changed
+        too -- theirs stand; a caller that needs one of them (a claim) must
+        check. A write after our re-read can still be lost: GitHub offers no
+        precondition on issue edits, so this narrows the window only."""
+        number = str(item["number"])
+        base = item.get("_github_body") or item.get("text", "")
+        ours = _body_with_metadata(body, meta)
+        self._run(["issue", "edit", number, *self._repo_args(), "--body", ours, *extra])
+        conflicts: List[str] = []
+        for _ in range(_BODY_WRITE_RETRIES):
+            try:
+                raw = self._run(["issue", "view", number, *self._repo_args(), "--json", "body"])
+                fresh = str((json.loads(raw or "{}") or {}).get("body") or "")
+            except (GitHubBackendError, json.JSONDecodeError, AttributeError):
+                return conflicts  # the write itself landed; verification is best-effort
+            merged, found = _merge_body_write(base, ours, fresh)
+            conflicts += [k for k in found if k not in conflicts]
+            if merged is None:
+                return conflicts
+            _log_body_reapply(self.repo, number, conflicts)
+            self._run(["issue", "edit", number, *self._repo_args(), "--body", merged])
+            base, ours = fresh, merged
+        return conflicts
+
     def _stop_signal_path(self, session_id: str):
         try:
             from . import workers as _workers
@@ -2850,18 +2943,22 @@ class GitHubIssuesBackend:
                 meta["claimed_session_id"] = str(session_uuid)
             self._usage_history(meta, number, "claim", session_id=str(session_uuid or ""), worker=str(session_id))
             self._ensure_labels()
-            self._run([
-                "issue", "edit", number,
-                *self._repo_args(),
-                "--body", _body_with_metadata(body, meta),
-                "--add-assignee", self.assignee,
-                "--add-label", self.in_progress_label,
-            ])
+            self._edit_body(item, body, meta,
+                            "--add-assignee", self.assignee,
+                            "--add-label", self.in_progress_label)
+            # Trust the persisted body, not our intent: a claim another host
+            # overwrote (or never landed) must fail, not report
+            # claimed_by_you (WT-20). claim_next moves to the next candidate.
             claimed = self.get(ref)
-            if claimed:
-                claimed["claimed_by"] = str(session_id)
-                claimed["claimed_machine"] = meta.get("claimed_machine")
-                claimed["status"] = "in_progress"
+            persisted = (_split_body_shared(claimed.get("_github_body") or "")[1]
+                         if claimed else {})
+            if str(persisted.get("claimed_by") or "") != str(session_id):
+                raise ValueError(
+                    f"{ref} claim did not persist (claimed_by="
+                    f"{persisted.get('claimed_by') or 'none'}); not claimed")
+            claimed["claimed_by"] = str(session_id)
+            claimed["claimed_machine"] = meta.get("claimed_machine")
+            claimed["status"] = "in_progress"
             return claimed
 
     @_serialized_body_write
@@ -2925,12 +3022,7 @@ class GitHubIssuesBackend:
             ):
                 meta.pop(key, None)
             self._usage_history(meta, number, "reopen", reason=reason)
-            self._run([
-                "issue", "edit", number,
-                *self._repo_args(),
-                "--body", _body_with_metadata(body, meta),
-                "--remove-label", self.in_progress_label,
-            ])
+            self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
             self._run(["issue", "reopen", number, *self._repo_args()], check=False)
             return self.get(ident)
 
@@ -2985,12 +3077,7 @@ class GitHubIssuesBackend:
         self._usage_history(meta, number, "close", session_id=str(session_uuid or ""),
                          worker=str(session_id or meta.get("closed_by") or ""),
                          resolution=norm)
-        self._run([
-            "issue", "edit", number,
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-            "--remove-label", self.in_progress_label,
-        ])
+        self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
         self._run([
             "issue", "close", number,
             *self._repo_args(),
@@ -3092,11 +3179,7 @@ class GitHubIssuesBackend:
             session_id=str(session_id or ""),
             text=detail,
         )
-        self._run([
-            "issue", "edit", str(item["number"]),
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-        ])
+        self._edit_body(item, body, meta)
         return self.get(ident)
 
     @_serialized_body_write
@@ -3133,12 +3216,7 @@ class GitHubIssuesBackend:
         meta["defer_reason"] = _clip(reason, 2000)
         self._usage_history(meta, number, "defer", worker=str(session_id),
                             until=until_iso, reason=_clip(reason, 2000))
-        self._run([
-            "issue", "edit", number,
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-            "--remove-label", self.in_progress_label,
-        ])
+        self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
         return self.get(ident)
 
     @_serialized_body_write
@@ -3171,11 +3249,7 @@ class GitHubIssuesBackend:
         if progress:
             _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
         self._usage_history(meta, number, "block", worker=str(session_id), question=_clip(question, 4000))
-        self._run([
-            "issue", "edit", number,
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-        ])
+        self._edit_body(item, body, meta)
         # Mirror the question onto the issue discussion (WT-37): the metadata
         # block is invisible to anyone reading the issue on GitHub. Best-effort,
         # the block itself is already recorded. The owner-answer marker is
@@ -3256,11 +3330,7 @@ class GitHubIssuesBackend:
                 worker=str(session_id or ""),
                 reason="answered_without_resumable_session",
             )
-        self._run([
-            "issue", "edit", number,
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-        ])
+        self._edit_body(item, body, meta)
         if releasing:
             self._run([
                 "issue", "edit", number,
@@ -3390,11 +3460,7 @@ class GitHubIssuesBackend:
             worker=str(session_id or ""),
             text=comment_text,
         )
-        self._run([
-            "issue", "edit", number,
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-        ])
+        self._edit_body(item, body, meta)
         self._run([
             "issue", "comment", number,
             *self._repo_args(),
@@ -3431,12 +3497,7 @@ class GitHubIssuesBackend:
                 "needs_input", "block_question",
             }:
                 meta[key] = value
-        self._run([
-            "issue", "edit", str(item["number"]),
-            *self._repo_args(),
-            "--title", title,
-            "--body", _body_with_metadata(body, meta),
-        ])
+        self._edit_body(item, body, meta, "--title", title)
         return self.get(ident)
 
     def peek_next(
