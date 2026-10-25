@@ -766,3 +766,20 @@ def test_status_counts_blocked_separately_and_ls_shows_waiting(wt, capsys):
     assert row["depth"] == 2 and row["claimable_depth"] == 1 and row["blocked"] == 1
     note = wt.cli._waiting_note(q.get(b["ref"]), q._refs_index(q.list_items()))
     assert note == f"waiting on {a['ref']}"
+
+
+def test_scoped_status_honours_an_open_blocker_in_another_queue(wt):
+    """`wt status -q DEP` reads only DEP, so a blocker in another queue was
+    missing from by_ref and ignored: false 'stuck (claimable)' (WT-21)."""
+    import watchtower.health as health
+    q = wt.q
+    blocker = q.enqueue(project="OTHER", title="dep", note="dep")
+    _file(q, "waits", blocked_by=[blocker["ref"]])
+    for items in (None, q.list_items(project="DEP")):
+        row = next(r for r in health.all_status(project="DEP", items=items)
+                   if r["queue"] == "DEP")
+        assert row["claimable_depth"] == 0 and row["blocked"] == 1
+    q.claim_by_ref(blocker["ref"], "w1")
+    q.close(blocker["ref"], session_id="w1", resolution="done")
+    row = next(r for r in health.all_status(project="DEP") if r["queue"] == "DEP")
+    assert row["claimable_depth"] == 1 and row["blocked"] == 0
