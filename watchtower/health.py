@@ -185,17 +185,22 @@ def queue_status(
         )
     ]
     if claim_types:
-        claimable_depth = sum(
-            1 for it in claimable_open
+        claimable_open = [
+            it for it in claimable_open
             if q.effective_type(it) in claim_types  # untyped == bug, matches claim filter
-        )
-    else:
-        claimable_depth = len(claimable_open)
+        ]
+    claimable_depth = len(claimable_open)
     oldest_created = min(
         (it.get("created_at") for it in open_items if it.get("created_at")),
         default=None,
     )
     oldest_open_age = _age_seconds(oldest_created, now)
+    # Age of the oldest ticket a worker could actually claim: a long-gated
+    # ticket beside a minutes-old claimable one is not "work waiting 6h".
+    oldest_claimable_age = _age_seconds(min(
+        (it.get("created_at") for it in claimable_open if it.get("created_at")),
+        default=None,
+    ), now)
 
     # Most recent progress = most recent close OR claim (a fresh claim means a
     # worker just started on previously-idle work, which resets the clock --
@@ -289,6 +294,7 @@ def queue_status(
         "closed": len(closed),
         "oldest_open_age_s": oldest_open_age,
         "oldest_open_age": _fmt_age(oldest_open_age),
+        "oldest_claimable_age_s": oldest_claimable_age,
         "since_progress_s": since_progress,
         "since_progress": _fmt_age(since_progress),
         "stuck": stuck,

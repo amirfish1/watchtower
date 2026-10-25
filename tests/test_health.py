@@ -47,6 +47,21 @@ def test_ready_ticket_still_counts_as_claimable_alongside_needs_spec():
     assert row["stuck"] is True
 
 
+def test_oldest_claimable_age_ignores_long_gated_tickets():
+    """A queue's oldest open ticket can be gated for hours beside a minutes-old
+    claimable one; the claimable age is what a stall alarm should read (OPS-145)."""
+    now = datetime.now(timezone.utc)
+    stamp = lambda d: (now - d).strftime("%Y-%m-%dT%H:%M:%SZ")
+    items = [
+        _item(readiness="needs-shaping", created_at=stamp(timedelta(hours=7))),
+        _item(readiness="ready", created_at=stamp(timedelta(minutes=3))),
+    ]
+    row = health.queue_status("Q", items)
+    assert row["oldest_open_age_s"] > row["oldest_claimable_age_s"]
+    assert row["oldest_claimable_age_s"] < 3600
+    assert health.queue_status("Q", items[:1])["oldest_claimable_age_s"] is None
+
+
 def test_fresh_claim_on_old_ticket_is_not_immediately_stuck():
     """A ticket can sit open for a long time before anyone claims it. The
     instant a worker claims it, that's progress -- the queue must not read
