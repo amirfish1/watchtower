@@ -2752,7 +2752,9 @@ def floor_routed_candidates(
         return []
     proj = _norm_project(project)
     with _FileLock(_lock_path()):
-        data = _load_unlocked()
+        # Read-only snapshot: the reconciler calls this once per queue per
+        # tick, and a private copy each time was ~4 s of CPU (WT-12).
+        data = _load_unlocked(readonly=True)
         every = _claim_candidates(
             data["items"], project=proj, item_types=item_types,
             all_items=data["items"],

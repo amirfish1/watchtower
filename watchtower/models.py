@@ -135,10 +135,39 @@ def _user(eng: str) -> Optional[List[dict]]:
 _SOURCES = {"codex": _codex, "claude": _claude, "devin": _devin}
 
 
+def _stamp(path: Path) -> Any:
+    try:
+        st = Path(path).expanduser().stat()
+        return (str(path), st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (str(path), None)
+
+
+_ENTRIES_MEMO: Dict[Any, Optional[List[dict]]] = {}
+
+
 def entries(eng: str) -> Optional[List[dict]]:
     """Catalog rows for ``eng`` (native source, then the user file), or None
-    when no source is readable."""
+    when no source is readable.
+
+    Memoised on the source files' stat: the daemon ranks every claimable
+    ticket's floor each tick, and rebuilding the catalogs per call was ~10 s
+    of CPU per tick (WT-12). Rows are shared; callers must not mutate them.
+    """
     eng = str(eng or "").strip().lower()
+    source = _SOURCES.get(eng)
+    native_path = {"codex": CODEX_MODELS_CACHE, "claude": CLAUDE_MODELS_FILE,
+                   "devin": DEVIN_MODELS_FILE}.get(eng)
+    key = (eng, source, native_path and _stamp(native_path), _stamp(USER_MODELS_FILE))
+    if key not in _ENTRIES_MEMO:
+        if len(_ENTRIES_MEMO) >= 256:
+            _ENTRIES_MEMO.clear()
+        _ENTRIES_MEMO[key] = _entries(eng)
+    rows = _ENTRIES_MEMO[key]
+    return None if rows is None else list(rows)
+
+
+def _entries(eng: str) -> Optional[List[dict]]:
     native = _SOURCES[eng]() if eng in _SOURCES else None
     user = _user(eng)
     if native is None and user is None:

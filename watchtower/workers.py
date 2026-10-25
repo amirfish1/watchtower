@@ -4228,7 +4228,17 @@ def _pid_alive(pid: int) -> bool:
         return False
 
     # Process exists, but check if it's a zombie (defunct).
-    # On macOS, use ps; on Linux, check /proc.
+    # On Linux read /proc (no fork: the reconciler probes ~1.3k pids a tick,
+    # WT-12); elsewhere (macOS) ask ps.
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as f:
+            # "pid (comm) S ..."; comm may itself contain ") ".
+            return f.read().rsplit(b")", 1)[1].split()[0] != b"Z"
+    except FileNotFoundError:
+        if os.path.isdir("/proc/self"):
+            return False  # exited between the kill probe and the read
+    except (OSError, IndexError):
+        pass
     try:
         import subprocess
         result = subprocess.run(

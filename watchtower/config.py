@@ -153,11 +153,39 @@ def config_path() -> Path:
 _LOAD_MEMO: Dict[str, Any] = {"sig": None, "data": {}}
 
 
-def _load_readonly() -> Dict[str, Any]:
+_PATH_MEMO: Dict[Any, Path] = {}
+
+
+def _config_stat():
+    """``(config_path(), its stat)``, skipping the migration probe while the
+    resolved file exists. Settings are read ~15k times per reconciler tick;
+    re-deriving the data dir and stat-ing the migration destination on each
+    was ~1.5 s CPU (WT-12). The stat is None when the settings file is absent.
+    """
+    from . import storage
+    env = os.environ
+    key = (CONFIG_FILE, _LEGACY_CONFIG_FILE, storage.data_dir,
+           env.get("WATCHTOWER_CONFIG_FILE"), env.get("WATCHTOWER_DATA_DIR"),
+           env.get("XDG_DATA_HOME"), env.get("HOME"))
+    path = _PATH_MEMO.get(key)
+    if path is not None:
+        try:
+            return path, path.stat()
+        except OSError:
+            pass
     path = config_path()  # Migration errors must not become empty settings.
+    if len(_PATH_MEMO) >= 64:
+        _PATH_MEMO.clear()
+    _PATH_MEMO[key] = path
     try:
-        st = path.stat()
+        return path, path.stat()
     except OSError:
+        return path, None
+
+
+def _load_readonly() -> Dict[str, Any]:
+    path, st = _config_stat()
+    if st is None:
         return {}
     sig = (str(path), st.st_mtime_ns, st.st_size)
     if _LOAD_MEMO.get("sig") == sig:
