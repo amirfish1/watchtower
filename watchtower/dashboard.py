@@ -44,7 +44,6 @@ the same way (see docs/messaging-design.md).
 
 from __future__ import annotations
 
-import faulthandler
 import hmac
 import html
 import json
@@ -53,6 +52,7 @@ import signal
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -206,16 +206,72 @@ def cached_status_payload() -> Dict[str, Any]:
         _status_compute.release()
 
 
+def format_all_stacks() -> str:
+    """Every live thread's Python stack, formatted like a traceback."""
+    names = {t.ident: t.name for t in threading.enumerate()}
+    out = []
+    for ident, frame in sys._current_frames().items():
+        out.append(f"--- thread {names.get(ident, '?')} ({ident}) ---\n")
+        out.extend(traceback.format_stack(frame))
+    return "".join(out)
+
+
+def _stack_dump_loop(read_fd: int, sig: int) -> None:
+    while True:
+        try:
+            data = os.read(read_fd, 64)
+        except InterruptedError:
+            continue
+        except OSError:
+            return
+        if not data:
+            return
+        if sig in data:
+            try:
+                sys.stderr.write(format_all_stacks())
+                sys.stderr.flush()
+            except Exception:  # noqa: BLE001 -- a diagnostic must never kill the process
+                pass
+
+
+def _stack_dump_signal_handler(signum, frame) -> None:
+    """No-op: installing a Python handler is what makes CPython write the
+    signal to the wakeup fd; the dumper thread does the work."""
+
+
+_stack_dump_signal_handler._wt_stack_dump = True  # type: ignore[attr-defined]
+
+
 def install_stack_dump_handler() -> bool:
     """Dump every thread's stack to stderr on SIGUSR1 (WT-4): the only way to
-    diagnose a live stall where ptrace/py-spy are unavailable. Main thread only."""
+    diagnose a live stall where ptrace/py-spy are unavailable. Main thread only.
+
+    Not faulthandler: its all_threads dump walks other threads' frames from
+    inside the signal handler and segfaulted the daemon under repeated
+    sampling (WT-14). Instead the C-level handler only writes the signal
+    number to a wakeup pipe; a dumper thread reads it and formats
+    ``sys._current_frames()`` as ordinary Python code holding the GIL. The
+    wakeup fd is written even while the main thread is busy, so the dump does
+    not wait for the main thread to reach a safe point."""
     sig = getattr(signal, "SIGUSR1", None)
     if sig is None or threading.current_thread() is not threading.main_thread():
         return False
+    # Process-wide state, not a module global: it must survive a re-import.
+    if getattr(signal.getsignal(sig), "_wt_stack_dump", False):
+        return True
+    prev = signal.set_wakeup_fd(-1)
+    if prev != -1:
+        signal.set_wakeup_fd(prev)
+        return False  # someone else (e.g. asyncio) owns the wakeup fd
     try:
-        faulthandler.register(sig, file=sys.stderr, all_threads=True)
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(write_fd, False)
+        signal.set_wakeup_fd(write_fd, warn_on_full_buffer=False)
+        signal.signal(sig, _stack_dump_signal_handler)
     except (OSError, RuntimeError, ValueError, AttributeError):
         return False
+    threading.Thread(target=_stack_dump_loop, args=(read_fd, int(sig)),
+                     name="wt-stack-dump", daemon=True).start()
     return True
 
 
