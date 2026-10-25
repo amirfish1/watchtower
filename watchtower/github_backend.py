@@ -1120,6 +1120,21 @@ def _age_seconds(created_at: Any, *, now: Optional[datetime] = None) -> float:
     return ((now or datetime.now(timezone.utc)) - created).total_seconds()
 
 
+# Upper bound on reusing a converted list_items result; the real bounds are
+# the raw-list identity, the ledger dir stamp and each issue's time boundary.
+_LIST_ITEMS_MEMO_TTL_S = 60.0
+
+
+def _copy_listed_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy one listed item the way _issue_to_item's memo hit does: shallow,
+    except the per-caller usage projection."""
+    from . import usage
+    out = dict(item)
+    if "token_usage" in out:
+        out["token_usage"] = usage.copy_projection(out["token_usage"])
+    return out
+
+
 def _recently_closed(issue: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
     closed_at = _parse_iso(issue.get("closedAt"))
     if closed_at is None:
@@ -1714,6 +1729,24 @@ class GitHubIssuesBackend:
         return None
 
     _ISSUE_TO_ITEM_MEMO: Dict[tuple, Dict[str, Any]] = {}
+    _LIST_ITEMS_MEMO: Dict[tuple, tuple] = {}
+
+    def _memo_config(self) -> tuple:
+        """Every backend setting that shapes a converted item."""
+        return (
+            self.repo,
+            self.queue,
+            self.repo_path,
+            self.partition_by_label,
+            self.catch_all,
+            frozenset(self.sibling_labels),
+            self.queue_label,
+            self.in_progress_label,
+            self.no_auto_drain_label,
+            self.run_requested_label,
+            self.auto_drain,
+            self.grace_s,
+        )
 
     def _issue_to_item(self, issue: Dict[str, Any]) -> Dict[str, Any]:
         comments_raw = issue.get("comments")
@@ -1744,18 +1777,7 @@ class GitHubIssuesBackend:
                 issue.get("number"),
                 issue.get("updatedAt"),
                 state,
-                self.repo,
-                self.queue,
-                self.repo_path,
-                self.partition_by_label,
-                self.catch_all,
-                frozenset(self.sibling_labels),
-                self.queue_label,
-                self.in_progress_label,
-                self.no_auto_drain_label,
-                self.run_requested_label,
-                self.auto_drain,
-                self.grace_s,
+                self._memo_config(),
             )
             cached_base = self._ISSUE_TO_ITEM_MEMO.get(memo_key)
             if cached_base is not None:
@@ -2382,19 +2404,47 @@ class GitHubIssuesBackend:
         fresh: bool = False,
         strict: bool = False,
     ) -> List[Dict[str, Any]]:
-        issues: List[Dict[str, Any]] = []
-        if status != "closed":
-            issues.extend(
-                self._list_issues("open", fresh=fresh, strict=strict)
-            )
-        if status in (None, "closed"):
-            issues.extend(
-                issue
-                for issue in self._list_issues(
-                    "closed", fresh=fresh, strict=strict
-                )
-                if _recently_closed(issue)
-            )
+        from . import usage
+        open_raw = (
+            self._list_issues("open", fresh=fresh, strict=strict)
+            if status != "closed" else None
+        )
+        closed_raw = (
+            self._list_issues("closed", fresh=fresh, strict=strict)
+            if status in (None, "closed") else None
+        )
+        # A tick lists every GitHub queue dozens of times off the same cached
+        # issue lists (WT-16). Reuse the converted result while the raw lists
+        # are the same objects (the memo holds them, so identity is safe),
+        # no usage ledger was written, and no issue crossed a time boundary.
+        memo_key = (
+            self._memo_config(), status, lane,
+        )
+        ledger_stamp = None if strict else usage.ledger_dir_stamp()
+        now = time.time()
+        hit = self._LIST_ITEMS_MEMO.get(memo_key)
+        if (
+            hit is not None
+            and ledger_stamp is not None
+            and hit[0] is open_raw
+            and hit[1] is closed_raw
+            and hit[2] == ledger_stamp
+            and now < hit[3]
+        ):
+            return [_copy_listed_item(it) for it in hit[4]]
+        valid_until = now + _LIST_ITEMS_MEMO_TTL_S
+        issues: List[Dict[str, Any]] = list(open_raw or [])
+        if self.auto_drain and self.grace_s > 0:
+            for issue in issues:
+                age = _age_seconds(issue.get("createdAt"))
+                if age < self.grace_s:
+                    valid_until = min(valid_until, now + self.grace_s - age)
+        retention_s = COMPLETED_ISSUE_RETENTION_DAYS * 86400
+        for issue in closed_raw or []:
+            if _recently_closed(issue):
+                issues.append(issue)
+                age = _age_seconds(issue.get("closedAt"))
+                valid_until = min(valid_until, now + retention_s - age)
         items = [self._issue_to_item(issue) for issue in issues]
         if self.partition_by_label:
             # Two or more queues share this repo: each shows only its own
@@ -2404,7 +2454,15 @@ class GitHubIssuesBackend:
             items = [it for it in items if it.get("status") == status]
         if lane:
             items = [it for it in items if it.get("lane") == lane]
-        return sorted(items, key=lambda it: int(it.get("number", 0)))
+        items = sorted(items, key=lambda it: int(it.get("number", 0)))
+        if ledger_stamp is not None:
+            if len(self._LIST_ITEMS_MEMO) >= 512:
+                self._LIST_ITEMS_MEMO.clear()
+            self._LIST_ITEMS_MEMO[memo_key] = (
+                open_raw, closed_raw, ledger_stamp, valid_until,
+                [_copy_listed_item(it) for it in items],
+            )
+        return items
 
     def mark_runnable(self, ident: Any) -> Optional[Dict[str, Any]]:
         """Request a run for this ticket (the ▶ / ``wt run`` path).

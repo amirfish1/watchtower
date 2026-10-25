@@ -553,6 +553,77 @@ def test_issue_to_item_memo_sees_same_second_edit():
     assert item["claimed_by"] == "worker-a"
 
 
+def _memo_backend(tmp_path, monkeypatch, issues, **kwargs):
+    """A backend whose raw lists are fixed objects, with an idle usage dir."""
+    import watchtower.github_backend as github_backend
+
+    usage_dir = tmp_path / "usage"
+    usage_dir.mkdir()
+    os.utime(usage_dir, (time.time() - 60, time.time() - 60))
+    monkeypatch.setenv("WATCHTOWER_USAGE_DIR", str(usage_dir))
+    github_backend.GitHubIssuesBackend._LIST_ITEMS_MEMO.clear()
+    backend = github_backend.GitHubIssuesBackend("GHI", repo="owner/repo", **kwargs)
+    raw = {"open": issues, "closed": []}
+    monkeypatch.setattr(backend, "_list_issues", lambda state, **_: raw[state])
+    conversions = []
+    real = backend._issue_to_item
+    monkeypatch.setattr(
+        backend, "_issue_to_item",
+        lambda issue: conversions.append(issue["number"]) or real(issue),
+    )
+    return backend, raw, conversions, usage_dir
+
+
+def test_list_items_memo_reuses_unchanged_listing(tmp_path, monkeypatch):
+    """WT-16: a tick lists each queue dozens of times off one cached issue
+    list; the converted result is reused, and callers get private copies."""
+    backend, _raw, conversions, _ = _memo_backend(
+        tmp_path, monkeypatch, [_fake_issue(1, "one"), _fake_issue(2, "two")]
+    )
+    first = backend.list_items()
+    assert conversions == [1, 2]
+    first[0]["status"] = "mutated by caller"
+    second = backend.list_items()
+    assert conversions == [1, 2]
+    assert [it["status"] for it in second] == ["open", "open"]
+    # status/lane are part of the key.
+    backend.list_items(status="open")
+    assert conversions == [1, 2, 1, 2]
+
+
+def test_list_items_memo_invalidates_on_new_listing_or_ledger_write(tmp_path, monkeypatch):
+    backend, raw, conversions, usage_dir = _memo_backend(
+        tmp_path, monkeypatch, [_fake_issue(1, "one")]
+    )
+    backend.list_items()
+    raw["open"] = [_fake_issue(1, "one", body="edited")]  # poller refreshed
+    backend.list_items()
+    assert conversions == [1, 1]
+    os.utime(usage_dir, (time.time() - 30, time.time() - 30))  # a ledger was replaced
+    backend.list_items()
+    assert conversions == [1, 1, 1]
+    # A just-touched dir is not trusted (coarse mtimes): no memo at all.
+    os.utime(usage_dir, None)
+    backend.list_items()
+    backend.list_items()
+    assert conversions == [1, 1, 1, 1, 1]
+
+
+def test_list_items_memo_expires_when_an_issue_leaves_its_grace_period(tmp_path, monkeypatch):
+    import watchtower.github_backend as github_backend
+
+    young = _fake_issue(1, "young")
+    young["createdAt"] = github_backend.datetime.now(github_backend.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    backend, _raw, _conv, _ = _memo_backend(
+        tmp_path, monkeypatch, [young], auto_drain=True, grace_s=10
+    )
+    assert backend.list_items()[0]["auto_eligible"] is False
+    (entry,) = github_backend.GitHubIssuesBackend._LIST_ITEMS_MEMO.values()
+    assert entry[3] <= time.time() + 10
+
+
 def test_claim_next_falls_through_stale_closed_candidate(tmp_path, monkeypatch):
     """OPS-841: a candidate that is open in the listing snapshot but already
     closed by the time claim_by_ref re-reads it (closed between list and

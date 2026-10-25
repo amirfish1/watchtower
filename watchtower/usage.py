@@ -11,7 +11,7 @@ import uuid
 import socket
 import threading
 import os
-import copy
+import time
 import hashlib
 from collections import defaultdict
 from pathlib import Path
@@ -298,6 +298,38 @@ def track_stage(item: dict, previous: dict, current: dict, at: str) -> None:
 _LOCATION_MEMO: dict = {}
 
 
+def _root(base=None) -> Path:
+    if base is None:
+        from . import queue
+        base = queue._resolve_store_path()
+    return Path(os.environ.get("WATCHTOWER_USAGE_DIR") or (base.parent / "usage"))
+
+
+def ledger_dir_stamp():
+    """A stamp that changes whenever any ledger is written, or None.
+
+    ``_write`` only ever replaces a ledger by rename (``atomic_destination``),
+    and a rename changes the directory's mtime, so one directory stat stands
+    in for a stat of every ledger. None when the directory is missing or was
+    touched too recently to trust on a coarse-mtime filesystem."""
+    try:
+        st = _root().stat()
+    except OSError:
+        return None
+    if time.time_ns() - st.st_mtime_ns < 2_000_000_000:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def copy_projection(value):
+    """Deep copy of a JSON-shaped projection, much cheaper than deepcopy."""
+    if isinstance(value, dict):
+        return {k: copy_projection(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [copy_projection(v) for v in value]
+    return value
+
+
 def _location(item: dict):
     from . import queue
     store_key = (
@@ -311,7 +343,7 @@ def _location(item: dict):
     if cached is not None:
         return cached
     base = queue._resolve_store_path()
-    root = Path(os.environ.get("WATCHTOWER_USAGE_DIR") or (base.parent / "usage"))
+    root = _root(base)
     namespace = item.get("_usage_namespace") or f"local:{base}"
     key = hashlib.sha256(f"{namespace}:{item.get('ref')}".encode()).hexdigest()
     res = root / (key + ".json")
@@ -400,7 +432,7 @@ def attach(item: dict) -> dict:
             _ATTACH_MEMO.clear()
         _ATTACH_MEMO[path] = hit = (stamp, projected)
     if hit[1] is not None:
-        item["token_usage"] = copy.deepcopy(hit[1])
+        item["token_usage"] = copy_projection(hit[1])
     return item
 
 
