@@ -1110,6 +1110,20 @@ def _parse_iso(value: Any) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def _defer_live(until: Any) -> bool:
+    parsed = _parse_iso(until) if until else None
+    return parsed is not None and parsed.timestamp() > time.time()
+
+
+_DEFER_MARKER_RE = re.compile(r'^deferred_until:\s*"([^"]+)"', re.MULTILINE)
+
+
+def _defer_marker_live(body: Any) -> bool:
+    """Cheap pre-parse check for a live defer window in an issue body."""
+    m = _DEFER_MARKER_RE.search(str(body or ""))
+    return bool(m) and _defer_live(m.group(1))
+
+
 def _age_seconds(created_at: Any, *, now: Optional[datetime] = None) -> float:
     """Seconds since ``created_at``. An unparseable/missing timestamp reads as
     infinitely old: the grace period exists to protect *new* issues, and a
@@ -1760,7 +1774,9 @@ class GitHubIssuesBackend:
             or _age_seconds(created_at) >= self.grace_s
         )
         memo_key = None
-        if age_settled and not has_comments:
+        # A `wt defer` window ends by the clock alone, with no issue edit to
+        # bust the memo, so a still-deferred issue is never memoized.
+        if age_settled and not has_comments and not _defer_marker_live(issue.get("body")):
             # Content, not id(issue): a freed dict's id is reused, and
             # updatedAt is per-second, so an edit plus a re-read in the same
             # second served the pre-edit item (two claim winners, WT-10).
@@ -1818,7 +1834,11 @@ class GitHubIssuesBackend:
         #   work_it         = auto_eligible OR manual_eligible
         no_auto_drain = self.no_auto_drain_label in labels
         run_requested = self.run_requested_label in labels
-        workable = queue_member and status == "open"
+        deferred_until = str(meta.get("deferred_until") or "")
+        # `wt defer`: inside its data window a ticket is out of the pool for
+        # claims and spawn depth alike, ▶ included (queue._claim_candidates).
+        deferred = _defer_live(deferred_until)
+        workable = queue_member and status == "open" and not deferred
         auto_eligible = bool(
             workable
             and self.auto_drain
@@ -1914,6 +1934,9 @@ class GitHubIssuesBackend:
             item["closed_machine"] = meta.get("closed_machine") or item.get("claimed_machine")
         if resolution:
             item["resolution"] = resolution
+        if deferred_until:
+            item["deferred_until"] = deferred_until
+            item["defer_reason"] = str(meta.get("defer_reason") or "")
         history = meta.get("history")
         if isinstance(history, list):
             item["history"] = list(history)
@@ -3016,6 +3039,47 @@ class GitHubIssuesBackend:
             "issue", "edit", str(item["number"]),
             *self._repo_args(),
             "--body", _body_with_metadata(body, meta),
+        ])
+        return self.get(ident)
+
+    def defer(
+        self,
+        ident: Any,
+        *,
+        session_id: str,
+        until_iso: str,
+        reason: str,
+        progress: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """`wt defer` on a GitHub-backed ticket (OPS-100): release the claim
+        and park the issue out of the pool until ``until_iso``. Same rules as
+        the local queue.defer; the window lives in the metadata block, so it
+        survives across hosts and expires by the clock with no further edit."""
+        item = self.get(ident)
+        if item is None:
+            return None
+        status = item.get("status")
+        if status not in ("open", "in_progress"):
+            raise ValueError(f"{item.get('ref')} is {status}; only an open or in-progress "
+                             "ticket can be deferred")
+        holder = str(item.get("claimed_by") or "")
+        if status == "in_progress" and holder and session_id and holder != str(session_id):
+            raise ValueError(f"{item.get('ref')} is claimed by {holder}, not {session_id}")
+        number = str(item["number"])
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        if progress:
+            _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
+        for key in ("claimed_by", "claimed_machine", "claimed_at", "claimed_session_id"):
+            meta.pop(key, None)
+        meta["deferred_until"] = until_iso
+        meta["defer_reason"] = _clip(reason, 2000)
+        self._usage_history(meta, number, "defer", worker=str(session_id),
+                            until=until_iso, reason=_clip(reason, 2000))
+        self._run([
+            "issue", "edit", number,
+            *self._repo_args(),
+            "--body", _body_with_metadata(body, meta),
+            "--remove-label", self.in_progress_label,
         ])
         return self.get(ident)
 

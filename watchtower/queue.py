@@ -7923,14 +7923,23 @@ def defer(ident: Any, session_id: str, until: Any, reason: str,
     for staffing until the window ends, then any worker picks it up again
     with the ``progress``/``reason`` notes in its history. Only the claimant
     of an in_progress ticket (or anyone, on an open one) may defer it.
-    Local store only."""
-    if _github_backend_for_project(_project_from_ident(ident)) is not None:
-        raise ValueError("wt defer currently requires a local queue")
+    GitHub-backed queues keep the window in the issue's metadata block."""
     reason = str(reason or "").strip()
     if not reason:
         raise ValueError("--reason is required: say what data you are waiting for")
     ts = parse_defer_until(until)
     until_iso = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        before = backend.get(ident)
+        it = backend.defer(ident, session_id=str(session_id or ""), until_iso=until_iso,
+                           reason=reason, progress=str(progress or ""))
+        if it:
+            _log("DEFER", f"{it.get('ref', '?')} until {until_iso} — {_clip(reason, 200)}",
+                 queue=it.get("project", ""))
+            if (before or {}).get("status") == "in_progress":
+                _note_worker_ticket_done(session_id)
+        return it
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
