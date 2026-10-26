@@ -28,6 +28,9 @@ def installed_plist(tmp_path, monkeypatch):
 
     plist_path = tmp_path / "ai.watchtower.watcher.plist"
     monkeypatch.setattr(cli, "_LAUNCHAGENT_PLIST", plist_path)
+    # Force the macOS/launchd backend regardless of the host running the tests.
+    monkeypatch.setattr(cli, "_use_systemd", lambda: False)
+    monkeypatch.setattr(cli, "_is_macos", lambda: True)
     # Empty/nonexistent config -> no drain-on queues -> cmd_install returns
     # before any launchctl load, so the test never shells out.
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "no-config.json")
@@ -135,6 +138,9 @@ def start_env(tmp_path, monkeypatch):
 
     plist_path = tmp_path / "ai.watchtower.watcher.plist"
     monkeypatch.setattr(cli, "_LAUNCHAGENT_PLIST", plist_path)
+    # Force the macOS/launchd backend regardless of the host running the tests.
+    monkeypatch.setattr(cli, "_use_systemd", lambda: False)
+    monkeypatch.setattr(cli, "_is_macos", lambda: True)
     monkeypatch.setattr(config, "CONFIG_FILE", tmp_path / "no-config.json")
     monkeypatch.setenv("PATH", "/opt/homebrew/bin:/usr/bin:/bin")
     monkeypatch.setattr(skills_sync, "ENGINE_HOMES", {"claude": tmp_path / "claude-home"})

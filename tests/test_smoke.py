@@ -92,7 +92,7 @@ def test_help_shows_git_style_grouped_sections(capsys):
     # `install` is a hidden alias folded into `wt start`'s first-run
     # auto-install; it must not appear in the top-level listing.
     assert "\n    install " not in out
-    assert "installs the LaunchAgent on first run" in out  # start's help text
+    assert "installs the service on first run" in out  # start's help text
 
     # Closing hint line.
     assert "wt <command> --help" in out

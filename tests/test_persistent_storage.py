@@ -172,6 +172,7 @@ def test_uninstall_migrates_and_keeps_queue_data(home, monkeypatch, capsys):
     from watchtower import cli, skills_sync
     seed(queue._CCC_LEGACY_STORE)
     monkeypatch.setattr(cli, "_LAUNCHAGENT_PLIST", home / "absent.plist")
+    monkeypatch.setattr(cli, "_SYSTEMD_UNIT", home / "absent.service")
     monkeypatch.setattr(skills_sync, "remove", lambda: [])
     assert cli.cmd_uninstall(None) == 0
     assert "Queue data and settings retained" in capsys.readouterr().out
