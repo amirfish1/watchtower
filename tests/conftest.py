@@ -28,6 +28,15 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def hermetic_service_paths(tmp_path, monkeypatch):
+    """No test may install or remove the host's actual supervisor unit."""
+    from watchtower import cli
+
+    monkeypatch.setattr(cli, "_SYSTEMD_UNIT", tmp_path / "watchtower.service")
+    monkeypatch.setattr(cli, "_LAUNCHAGENT_PLIST", tmp_path / "watchtower.plist")
+
+
+@pytest.fixture(autouse=True)
 def fixture_model_catalogs(monkeypatch):
     """Model lists come from fixture catalogs, never this machine's real
     ~/.codex / CCC files (WT-13)."""
