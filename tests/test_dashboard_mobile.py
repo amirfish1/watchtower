@@ -25,10 +25,13 @@ ticket note -- that's an open owner decision for a later version).
 from __future__ import annotations
 
 import os
+import sys
 import threading
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from test_chat_cli import wt  # noqa: F401  (shared isolated-sandbox fixture)
 
@@ -330,4 +333,34 @@ def test_cached_status_payload_serves_snapshot_and_dumps_stacks(monkeypatch):
         dashboard._status_compute.release()
     assert len(calls) == 1
     assert dashboard.cached_status_payload() == {"n": 2}
-    assert dashboard.install_stack_dump_handler() is True
+
+
+def test_sigusr1_dumps_all_stacks_from_a_thread_not_the_handler(monkeypatch):
+    """WT-14: SIGUSR1 must not use faulthandler(all_threads=True), which
+    segfaulted the daemon; a dumper thread formats sys._current_frames()."""
+    import io
+    import signal
+    import threading
+    import time
+    from watchtower import dashboard
+
+    if not hasattr(signal, "SIGUSR1"):
+        pytest.skip("no SIGUSR1 on this platform")
+    buf = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", buf)
+    release = threading.Event()
+    parked = threading.Thread(target=release.wait, name="wt14-parked", daemon=True)
+    parked.start()
+    try:
+        assert dashboard.install_stack_dump_handler() is True
+        assert dashboard.install_stack_dump_handler() is True  # idempotent
+        for _ in range(20):
+            os.kill(os.getpid(), signal.SIGUSR1)
+        deadline = time.monotonic() + 5
+        while "wt14-parked" not in buf.getvalue() and time.monotonic() < deadline:
+            time.sleep(0.05)
+    finally:
+        release.set()
+    out = buf.getvalue()
+    assert "--- thread wt14-parked" in out
+    assert "--- thread MainThread" in out

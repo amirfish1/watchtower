@@ -27,11 +27,11 @@ force-push `main`.
 
 ## Deployment and hooks (don't guess)
 
-- There is no deploy/sync script. The live install is the clone at
-  `~/.ccc/watchtower` (what `wt` runs); sync it with
-  `git -C ~/.ccc/watchtower pull --ff-only origin main`. Other hosts do the
-  same from their own clone. Scripts in `scripts/` are only: `cut-release.sh`,
-  `install-hooks.sh`, `pre-push.sh`.
+- Use `wt deploy --json` to locate and inspect the checkout imported by the
+  running `wt`, then `wt deploy --sync` to update it. The guarded sync refuses
+  novel tracked edits or local commits and fast-forwards clean installations;
+  it can restore recognized stale files. Do not bypass it with a raw pull.
+  Install paths vary by host; `~/.ccc/watchtower` is not universal.
 - Hooks are not in the worktree. In a `git worktree`, `.git` is a file, so
   `.git/hooks/` does not exist there and `scripts/install-hooks.sh` (which
   writes `$REPO_ROOT/.git/hooks/pre-push`) is for the main clone only. Hooks

@@ -9,7 +9,9 @@ from __future__ import annotations
 import json
 import uuid
 import socket
+import threading
 import os
+import time
 import hashlib
 from collections import defaultdict
 from pathlib import Path
@@ -32,7 +34,31 @@ def parse(path: str, engine: str) -> dict:
     Repeated Claude content blocks share a message id and are replacements,
     never additive. Codex cumulative totals are differenced exactly once, with
     each delta assigned to the model in the preceding turn_context.
+
+    Memoized on the file's identity: every daemon tick re-observes ~1400
+    unsettled attempts over ~1 GB of mostly-ended transcripts (WT-9).
     """
+    try:
+        st = os.stat(path)
+        stamp = (st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    hit = _PARSE_MEMO.get((path, engine)) if stamp else None
+    if hit is not None and hit[0] == stamp:
+        return dict(hit[1], units=dict(hit[1]["units"]))
+    result = _parse(path, engine)
+    if stamp and result["status"] != "unavailable":
+        if len(_PARSE_MEMO) >= 4096:
+            _PARSE_MEMO.clear()
+        _PARSE_MEMO[(path, engine)] = (stamp, result)
+        result = dict(result, units=dict(result["units"]))
+    return result
+
+
+_PARSE_MEMO: dict = {}
+
+
+def _parse(path: str, engine: str) -> dict:
     units = {}
     model = None
     previous = {}
@@ -121,18 +147,28 @@ def parse(path: str, engine: str) -> dict:
 def observe(worker: str, sid: str = "") -> dict:
     """Resolve engine/session from the engine registry, never the requested tier."""
     from . import messages, workers
-    rec = next((r for r in workers._load().get("workers", [])
+    pass_cache = getattr(_PASS, "cache", None)
+    registry = pass_cache["registry"] if pass_cache else workers._load()
+    rec = next((r for r in registry.get("workers", [])
                 if r.get("worker_id") == worker or (sid and r.get("session_id") == sid)), {})
     if sid and rec.get("session_id") and rec["session_id"] != sid:
         # A fallback/rebound registry row may now describe a different process.
         # Do not parse the old session with the new attempt's provider semantics.
-        rec = next((r for r in workers._load().get("workers", [])
+        rec = next((r for r in registry.get("workers", [])
                     if r.get("session_id") == sid), {})
     engine = str(rec.get("engine") or "")
     sid = sid or str(rec.get("session_id") or "")
     if not sid and rec.get("log"):
         sid = workers.resolve_session_id_from_log(str(rec["log"]))
-    path = messages.locate_transcript(sid, engine) if sid else ""
+    if not sid:
+        path = ""
+    elif pass_cache:
+        located = pass_cache["located"]
+        if (sid, engine) not in located:
+            located[(sid, engine)] = messages.locate_transcript(sid, engine)
+        path = located[(sid, engine)]
+    else:
+        path = messages.locate_transcript(sid, engine)
     # Only Claude's stream log contains the same per-message usage as its
     # transcript. Plain output and result/modelUsage aggregates are not mixed.
     if not path and engine == "claude":
@@ -259,13 +295,62 @@ def track_stage(item: dict, previous: dict, current: dict, at: str) -> None:
           run=str(current.get("key") or ""), attempt=int(current.get("attempt") or 0), dedicated=True)
 
 
+_LOCATION_MEMO: dict = {}
+
+
+def _root(base=None) -> Path:
+    if base is None:
+        from . import queue
+        base = queue._resolve_store_path()
+    return Path(os.environ.get("WATCHTOWER_USAGE_DIR") or (base.parent / "usage"))
+
+
+def ledger_dir_stamp():
+    """A stamp that changes whenever any ledger is written, or None.
+
+    ``_write`` only ever replaces a ledger by rename (``atomic_destination``),
+    and a rename changes the directory's mtime, so one directory stat stands
+    in for a stat of every ledger. None when the directory is missing or was
+    touched too recently to trust on a coarse-mtime filesystem."""
+    try:
+        st = _root().stat()
+    except OSError:
+        return None
+    if time.time_ns() - st.st_mtime_ns < 2_000_000_000:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+def copy_projection(value):
+    """Deep copy of a JSON-shaped projection, much cheaper than deepcopy."""
+    if isinstance(value, dict):
+        return {k: copy_projection(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [copy_projection(v) for v in value]
+    return value
+
+
 def _location(item: dict):
     from . import queue
+    store_key = (
+        os.environ.get("WATCHTOWER_STORE"),
+        os.environ.get("WATCHTOWER_USAGE_DIR"),
+        str(getattr(queue, "STORE_FILE", "")),
+        item.get("_usage_namespace"),
+        item.get("ref"),
+    )
+    cached = _LOCATION_MEMO.get(store_key)
+    if cached is not None:
+        return cached
     base = queue._resolve_store_path()
-    root = Path(os.environ.get("WATCHTOWER_USAGE_DIR") or (base.parent / "usage"))
+    root = _root(base)
     namespace = item.get("_usage_namespace") or f"local:{base}"
     key = hashlib.sha256(f"{namespace}:{item.get('ref')}".encode()).hexdigest()
-    return root / (key + ".json")
+    res = root / (key + ".json")
+    if len(_LOCATION_MEMO) >= 16384:
+        _LOCATION_MEMO.clear()
+    _LOCATION_MEMO[store_key] = res
+    return res
 
 
 def _read(path, *, strict=False):
@@ -331,10 +416,27 @@ def _write(path, record):
 
 def attach(item: dict) -> dict:
     """Merge latest private projection at read time; never contacts a provider."""
-    record = _read(_location(item))
-    if record.get("token_usage"):
-        item["token_usage"] = projection(record["token_usage"])
+    path = _location(item)
+    try:
+        st = path.stat()
+    except OSError:
+        return item   # no ledger: nothing to merge (what _read's {} did)
+    # A tick attaches the same ~6000 ledgers dozens of times; the projection
+    # only changes when the file does.
+    stamp = (st.st_mtime_ns, st.st_size)
+    hit = _ATTACH_MEMO.get(path)
+    if hit is None or hit[0] != stamp:
+        record = _read(path)
+        projected = projection(record["token_usage"]) if record.get("token_usage") else None
+        if len(_ATTACH_MEMO) >= 16384:
+            _ATTACH_MEMO.clear()
+        _ATTACH_MEMO[path] = hit = (stamp, projected)
+    if hit[1] is not None:
+        item["token_usage"] = copy_projection(hit[1])
     return item
+
+
+_ATTACH_MEMO: dict = {}
 
 
 def capture(item: dict, callback, *args) -> None:
@@ -371,38 +473,139 @@ def reconcile() -> None:
     honestly. Preserve its provenance and mark it partial instead of estimating.
     No remote issue writes and no lifecycle changes occur here.
     """
+    from . import workers
+    # One registry read and one transcript lookup per session per pass,
+    # not one per attempt (WT-9). Thread-local: dashboard/poller threads
+    # observing mid-pass must still see the live registry.
+    _PASS.cache = {"registry": workers._load(), "located": {}}
+    try:
+        _reconcile()
+    finally:
+        _PASS.cache = None
+
+
+_PASS = threading.local()
+
+
+def _skips(a: dict) -> bool:
+    """Attempt reconcile never touches; a pure function of the ledger file."""
+    return ((a.get("backfill") or {}).get("finalization") == "frozen_historical_interval"
+            or a.get("outcome") == "running" or a.get("completeness") == "complete"
+            or a.get("attribution") == "retention_limit")
+
+
+def _digest(a: dict) -> dict:
+    """What reconcile's no-op check reads from one attempt, minus the bulk."""
+    saved = a.get("observed") or {}
+    late = a.get("late_observed")
+    return {"worker_id": a["worker_id"], "session_id": a.get("session_id") or "",
+            "path": saved.get("path"), "engine": saved.get("engine"),
+            "saved_session_id": saved.get("session_id", ""),
+            "requested_model": saved.get("requested_model"),
+            "exit_file": str((saved.get("process") or {}).get("exit_file") or ""),
+            "late": None if late is None else _fingerprint(late),
+            "completeness": a.get("completeness")}
+
+
+def _fingerprint(value) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _ledger_meta(path):
+    """(owner keys, digests) of one ledger, memoized on its stat.
+
+    Owner keys are its (session-or-worker, attempt id) pairs; digests cover
+    only the attempts reconcile does not skip, so a quiet tick can decide
+    there is nothing to do without decoding every ledger again (WT-12:
+    ~1.4k ledgers re-read under lock each tick was ~1.5 s CPU).
+    """
+    try:
+        st = path.stat()
+        stamp = (st.st_ino, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return [], []
+    hit = _OWNER_MEMO.get(path)
+    if hit is None or hit[0] != stamp:
+        attempts = _read(path).get("token_usage", {}).get("attempts", [])
+        keys = [(a.get("session_id") or a["worker_id"], a["id"]) for a in attempts]
+        digests = [_digest(a) for a in attempts if not _skips(a)]
+        if len(_OWNER_MEMO) >= 16384:
+            _OWNER_MEMO.clear()
+        _OWNER_MEMO[path] = hit = (stamp, keys, digests)
+    return hit[1], hit[2]
+
+
+def _late_snapshot(worker_id, session_id, saved_path, saved_engine,
+                   saved_session_id, requested_model) -> dict:
+    snap = observe(worker_id, session_id)
+    if not snap.get("path") and saved_path:
+        snap = dict(parse(saved_path, saved_engine), session_id=saved_session_id,
+                    worker_id=worker_id, requested_model=requested_model)
+    return snap
+
+
+def _has_work(digests, owners) -> bool:
+    """Would the locked pass change this ledger? May say yes spuriously, never no."""
+    from . import workers
+    for d in digests:
+        snap = _late_snapshot(d["worker_id"], d["session_id"], d["path"], d["engine"],
+                              d["saved_session_id"], d["requested_model"])
+        exited = bool(workers.read_exit_file(d["exit_file"]).get("ended_at"))
+        if not exited and not snap.get("terminal"):
+            continue
+        if len(owners[d["session_id"] or d["worker_id"]]) != 1:
+            if d["late"] == _fingerprint(snap) and d["completeness"] == "ambiguous_shared_session":
+                continue
+        return True
+    return False
+
+
+def _owner_keys(path) -> list:
+    """(session-or-worker, attempt id) pairs of one ledger, memoized on its stat."""
+    return _ledger_meta(path)[0]
+
+
+_OWNER_MEMO: dict = {}
+
+
+def _reconcile() -> None:
     from . import queue, workers, storage
     root = Path(os.environ.get("WATCHTOWER_USAGE_DIR") or (queue._resolve_store_path().parent / "usage"))
     paths = list(root.glob("*.json")) if root.exists() else []
     owners = defaultdict(set)
+    pending = []
     for path in paths:
-        for a in _read(path).get("token_usage", {}).get("attempts", []):
-            owners[a.get("session_id") or a["worker_id"]].add((str(path), a["id"]))
-    for path in paths:
+        keys, digests = _ledger_meta(path)
+        for key, attempt_id in keys:
+            owners[key].add((str(path), attempt_id))
+        if digests:
+            pending.append((path, digests))
+    for path, digests in pending:
+        if not _has_work(digests, owners):
+            continue
         with storage.file_lock(path.with_suffix(".lock")):
             record = _read(path)
             ledger = record.get("token_usage") or {}
             changed = False
             for a in ledger.get("attempts", []):
-                if (a.get("backfill") or {}).get("finalization") == "frozen_historical_interval":
-                    continue  # Historical bounds must never expand to later session usage.
-                if a.get("outcome") == "running" or a.get("completeness") == "complete" or a.get("attribution") == "retention_limit":
-                    continue
+                if _skips(a):
+                    continue  # Frozen historical bounds must never expand to later session usage.
                 key = a.get("session_id") or a["worker_id"]
-                snap = observe(a["worker_id"], a.get("session_id") or "")
                 saved = a["observed"]
-                if not snap.get("path") and saved.get("path"):
-                    snap = dict(parse(saved["path"], saved["engine"]), session_id=saved.get("session_id", ""),
-                                worker_id=a["worker_id"], requested_model=saved.get("requested_model"))
+                snap = _late_snapshot(a["worker_id"], a.get("session_id") or "", saved.get("path"),
+                                      saved.get("engine"), saved.get("session_id", ""),
+                                      saved.get("requested_model"))
                 proc = saved.get("process") or {}
                 exited = bool(workers.read_exit_file(str(proc.get("exit_file") or "")).get("ended_at"))
                 if not exited and not snap.get("terminal"):
                     continue
                 if len(owners[key]) != 1:
                     # Keep late raw observations private for later inspection.
-                    a["late_observed"] = snap
-                    a["completeness"] = "ambiguous_shared_session"
-                    changed = True
+                    # Rewrite only on news, not every tick.
+                    if a.get("late_observed") != snap or a.get("completeness") != "ambiguous_shared_session":
+                        a["late_observed"] = snap
+                        a["completeness"] = "ambiguous_shared_session"
+                        changed = True
                     continue
                 original_outcome = a["outcome"]
                 a["outcome"] = "running"

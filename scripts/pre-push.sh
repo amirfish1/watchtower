@@ -4,7 +4,7 @@
 # The full suite (~100 s) is too slow to gate every push on; CI / a manual
 # `pytest tests -q` covers the rest.
 #
-# Bypass for a genuine emergency: git push --no-verify
+# Install pytest before pushing; an unavailable gate must stop the push.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -22,7 +22,11 @@ for candidate in "$REPO_ROOT/.venv/bin/python3" $(type -aP python3 2>/dev/null);
     break
   fi
 done
-[ -z "$PY" ] && { echo "pre-push: no python3 with pytest found (checked .venv and PATH), skipping test gate"; exit 0; }
+if [ -z "$PY" ]; then
+  echo "pre-push: no python3 with pytest found (checked .venv and PATH); push blocked." >&2
+  echo "Install pytest in .venv or a python3 on PATH, then retry the push." >&2
+  exit 1
+fi
 
 echo "pre-push: running test gate…"
 if ! "$PY" -m pytest \
@@ -33,7 +37,6 @@ if ! "$PY" -m pytest \
      -q --tb=short; then
   echo ""
   echo "❌ pre-push test gate FAILED — fix the tests or don't commit."
-  echo "   (Emergency bypass: git push --no-verify)"
   exit 1
 fi
 echo "pre-push: test gate passed ✓"

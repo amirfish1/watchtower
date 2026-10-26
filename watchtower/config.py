@@ -150,14 +150,60 @@ def config_path() -> Path:
     return storage.migrate_config(_LEGACY_CONFIG_FILE)
 
 
-def _load() -> Dict[str, Any]:
+_LOAD_MEMO: Dict[str, Any] = {"sig": None, "data": {}}
+
+
+_PATH_MEMO: Dict[Any, Path] = {}
+
+
+def _config_stat():
+    """``(config_path(), its stat)``, skipping the migration probe while the
+    resolved file exists. Settings are read ~15k times per reconciler tick;
+    re-deriving the data dir and stat-ing the migration destination on each
+    was ~1.5 s CPU (WT-12). The stat is None when the settings file is absent.
+    """
+    from . import storage
+    env = os.environ
+    key = (CONFIG_FILE, _LEGACY_CONFIG_FILE, storage.data_dir,
+           env.get("WATCHTOWER_CONFIG_FILE"), env.get("WATCHTOWER_DATA_DIR"),
+           env.get("XDG_DATA_HOME"), env.get("HOME"))
+    path = _PATH_MEMO.get(key)
+    if path is not None:
+        try:
+            return path, path.stat()
+        except OSError:
+            pass
     path = config_path()  # Migration errors must not become empty settings.
+    if len(_PATH_MEMO) >= 64:
+        _PATH_MEMO.clear()
+    _PATH_MEMO[key] = path
+    try:
+        return path, path.stat()
+    except OSError:
+        return path, None
+
+
+def _load_readonly() -> Dict[str, Any]:
+    path, st = _config_stat()
+    if st is None:
+        return {}
+    sig = (str(path), st.st_mtime_ns, st.st_size)
+    if _LOAD_MEMO.get("sig") == sig:
+        return _LOAD_MEMO["data"]
     try:
         with open(path, "r") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
-    return data if isinstance(data, dict) else {}
+    data = data if isinstance(data, dict) else {}
+    _LOAD_MEMO["sig"] = sig
+    _LOAD_MEMO["data"] = data
+    return data
+
+
+def _load() -> Dict[str, Any]:
+    import copy
+    return copy.deepcopy(_load_readonly())
 
 
 def _audit_path() -> Path:
@@ -280,6 +326,7 @@ def _save(data: Dict[str, Any]) -> None:
     with open(tmp, "w") as f:
         f.write(text)
     os.replace(tmp, path)
+    _LOAD_MEMO["sig"] = None
     _record_audit(text, data)
     a = actor()
     tail = (f"via {a['source']}; session={a['session'] or '-'} host={a['host']} "
@@ -296,7 +343,7 @@ def _queue_entry(queue: str) -> Dict[str, Any]:
     entry degrades to defaults everywhere instead of raising ``AttributeError``
     in whichever getter happens to be called first.
     """
-    entry = _load().get(queue, {})
+    entry = _load_readonly().get(queue, {})
     return entry if isinstance(entry, dict) else {}
 
 
@@ -627,7 +674,7 @@ def github_queues_for_repo(repo: str) -> list:
     if not target:
         return []
     out = []
-    for name, entry in _load().items():
+    for name, entry in _load_readonly().items():
         if not isinstance(entry, dict):
             continue
         if str(entry.get("backend") or "").strip().lower() != "github":
@@ -949,11 +996,14 @@ def _ccc_model_settings() -> Dict[str, Any]:
         return {}
 
 
-def _configured_model_routes(raw: Any) -> List[Dict[str, str]]:
+def _configured_model_routes(raw: Any, *, distinct_engines: bool = True) -> List[Dict[str, str]]:
     """Validate ordered routes without inventing a model or raising budgets.
 
-    One entry per engine: an exhausted account cannot recover by selecting a
-    second model on the same provider. Reject malformed config rather than
+    Worker fallback is one entry per engine: an exhausted account cannot
+    recover by selecting a second model on the same provider. Model profiles
+    (``distinct_engines=False``) may list distinct models on one engine --
+    a transient model fault can recover there; the runner skips same-engine
+    entries after a quota failure. Reject malformed config rather than
     accidentally reverting to ambient CLI defaults.
     """
     if not isinstance(raw, list) or len(raw) > len(FALLBACK_ENGINES):
@@ -966,8 +1016,9 @@ def _configured_model_routes(raw: Any) -> List[Dict[str, str]]:
         eng = str(entry.get("engine") or "").strip().lower()
         model_value = canonical_model(eng, str(entry.get("model") or "").strip())
         effort_value = str(entry.get("effort") or "").strip().lower()
-        if eng not in FALLBACK_ENGINES or eng in seen:
-            raise ValueError("model routes must use distinct supported engines")
+        if eng not in FALLBACK_ENGINES or (eng if distinct_engines else (eng, model_value)) in seen:
+            raise ValueError("model routes must use distinct supported engines"
+                             if distinct_engines else "model routes must be distinct supported models")
         if (not model_value or is_blocked_model(model_value)
                 or not is_approved_model(eng, model_value)):
             raise ValueError("model route is missing, unsupported, or blocked")
@@ -975,7 +1026,7 @@ def _configured_model_routes(raw: Any) -> List[Dict[str, str]]:
                              or _effort_rejected(eng, model_value, effort_value)):
             raise ValueError("model route effort is not supported")
         routes.append({"engine": eng, "model": model_value, "effort": effort_value})
-        seen.add(eng)
+        seen.add(eng if distinct_engines else (eng, model_value))
     return routes
 
 
@@ -1002,7 +1053,7 @@ def model_profile(name: str) -> Dict[str, Any]:
     profile = profiles.get(name) if isinstance(profiles, dict) else None
     if not isinstance(profile, dict):
         raise ValueError(f"model profile {name!r} has not been configured in CCC Settings")
-    routes = _configured_model_routes(profile.get("models"))
+    routes = _configured_model_routes(profile.get("models"), distinct_engines=False)
     if not routes:
         raise ValueError(f"model profile {name!r} has no configured models")
     if any(route["engine"] not in ("claude", "codex", "devin") for route in routes):
@@ -1429,7 +1480,7 @@ def sanitize_worker_settings(*, log=None) -> List[Dict[str, Any]]:
     ``{"queue", "unapproved_effort", "engine", "model"}`` rows.
     """
     findings: List[Dict[str, Any]] = []
-    for queue_name, entry in _load().items():
+    for queue_name, entry in _load_readonly().items():
         if not isinstance(entry, dict):
             continue
         effort_value = str(entry.get("effort") or "").strip().lower()
@@ -1497,7 +1548,8 @@ def all_queues(include_archived: bool = False) -> Dict[str, Any]:
     Archived queues (``wt queue archive``) are hidden unless ``include_archived``.
     """
     return {
-        k: v for k, v in _load().items()
+        k: (dict(v) if isinstance(v, dict) else v)
+        for k, v in _load_readonly().items()
         if include_archived or not (isinstance(v, dict) and v.get("archived"))
     }
 

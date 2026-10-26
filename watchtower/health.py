@@ -174,23 +174,33 @@ def queue_status(
         # WT-28/31: an answer reserved for its parked worker is claimable by
         # that worker only, so it is not open work for the pool.
         and not q._affinity_reserved(it, now_ts)
+        # `wt defer`: a ticket inside its data window is out of the pool.
+        and not q.deferred_now(it, now_ts)
+        # Placement: a ticket pinned to the other kind of machine is not open
+        # work for this machine's pool either.
+        and q.placement_allows(it)
         and (
             not worker_model
             or config.model_meets_floor(worker_model, it.get("model_floor") or "")
         )
     ]
     if claim_types:
-        claimable_depth = sum(
-            1 for it in claimable_open
+        claimable_open = [
+            it for it in claimable_open
             if q.effective_type(it) in claim_types  # untyped == bug, matches claim filter
-        )
-    else:
-        claimable_depth = len(claimable_open)
+        ]
+    claimable_depth = len(claimable_open)
     oldest_created = min(
         (it.get("created_at") for it in open_items if it.get("created_at")),
         default=None,
     )
     oldest_open_age = _age_seconds(oldest_created, now)
+    # Age of the oldest ticket a worker could actually claim: a long-gated
+    # ticket beside a minutes-old claimable one is not "work waiting 6h".
+    oldest_claimable_age = _age_seconds(min(
+        (it.get("created_at") for it in claimable_open if it.get("created_at")),
+        default=None,
+    ), now)
 
     # Most recent progress = most recent close OR claim (a fresh claim means a
     # worker just started on previously-idle work, which resets the clock --
@@ -284,6 +294,7 @@ def queue_status(
         "closed": len(closed),
         "oldest_open_age_s": oldest_open_age,
         "oldest_open_age": _fmt_age(oldest_open_age),
+        "oldest_claimable_age_s": oldest_claimable_age,
         "since_progress_s": since_progress,
         "since_progress": _fmt_age(since_progress),
         "stuck": stuck,
@@ -344,6 +355,13 @@ def all_status(
             continue
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
     by_ref = q._refs_index(fetched)
+    # A project-scoped list lacks cross-queue blockers, and blocker_verdict
+    # ignores a missing one, so a ticket waiting on another queue read as
+    # claimable ("stuck") here while the claim path waits (WT-21).
+    if project and any(
+            str(b) not in by_ref for it in fetched
+            if it.get("status") == "open" for b in (it.get("blocked_by") or [])):
+        by_ref = q._refs_index(q.list_items(fresh=fresh))
     waiting_refs = {
         str(it.get("ref")) for it in fetched
         if it.get("status") == "open" and it.get("blocked_by")

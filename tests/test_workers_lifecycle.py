@@ -391,6 +391,21 @@ def test_dispatch_after_enqueue_acts_on_a_requested_run_with_drain_off(wt, monke
     assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-manual"
 
 
+@pytest.mark.parametrize("drain", [False, True])
+def test_dispatch_names_unready_readiness_not_auto_drain(wt, monkeypatch, drain):
+    """An unclaimable readiness is the real blocker whatever the drain
+    setting; the DISPATCH line must say so instead of "auto_drain off"."""
+    wt.config.set_auto_drain("Q", drain)
+    item = wt.q.enqueue(project="Q", note="park me", readiness="needs-rationale")
+    monkeypatch.setattr(wt.workers, "spawn_workers",
+                        lambda *a, **k: pytest.fail("spawned for an unready ticket"))
+
+    reason = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+
+    assert reason.startswith("not ready — readiness needs-rationale")
+    assert "auto_drain" not in reason
+
+
 def test_dispatch_reconciles_only_the_dispatched_queue(wt, monkeypatch):
     """WT-2: a ▶ knows which queue needs staffing, so it must not pay for a
     fleet-wide pass -- other queues' depth reads and the maintenance sweeps
@@ -638,13 +653,18 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
     results = [None, None]
 
     def run(i):
-        results[i] = wt.workers.reconcile_once(dry_run=False)
+        # Exercise the real staffing lock without unrelated fleet maintenance
+        # (stage supervision, title backfills, orphan sweeps) consuming this
+        # concurrency test's deadline on a busy development host.
+        results[i] = wt.workers.reconcile_once(dry_run=False, only_queue="Q")
 
     threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
     for t in threads:
         t.start()
+    # This checks serialization, not a latency budget. Loaded fleet hosts
+    # need time for both passes to finish before the fixture is torn down.
     for t in threads:
-        t.join(timeout=10)
+        t.join(timeout=60)
 
     assert all(r is not None for r in results), "a reconcile pass deadlocked"
     total = sum(len(r["spawned"]) for r in results)
@@ -1462,6 +1482,28 @@ def test_claim_rejects_concurrent_codex_process_for_same_thread(
         if worker["worker_id"] == worker_id
     )
     assert recorded["pid"] == os.getpid()
+
+
+def test_rebind_accepts_engine_child_of_recorded_launcher_pid(wt):
+    """OPS-1396: the npm launcher (node) is recorded; the ancestor lookup
+    lands on its native codex child. Same session, so no concurrent-rebind error."""
+    session_id = "33333333-3333-3333-3333-333333333333"
+    worker_id = "q-codex-wrapper"
+    wt.workers.record_worker(
+        os.getpid(), "Q", "codex", worker_id, str(wt.tmp),
+        str(wt.tmp / f"{worker_id}.log"), session_id=session_id,
+    )
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert wt.workers.rebind_continued_worker(
+            worker_id, session_id, child.pid
+        ) is True
+        rec = next(w for w in wt.workers._load()["workers"] if w["worker_id"] == worker_id)
+        assert rec["pid"] == os.getpid()
+        assert not rec.get("rebound_at")
+    finally:
+        child.kill()
+        child.wait()
 
 
 def test_pruned_codex_alias_from_unrelated_session_claims_ambient(
@@ -2427,6 +2469,127 @@ def _row(wt, worker_id):
     return next(
         r for r in wt.workers._load()["workers"] if r["worker_id"] == worker_id
     )
+
+
+@pytest.mark.parametrize("released_age_s", [10, 7200])
+def test_reap_recovers_release_time_from_legacy_sentinel(wt, released_age_s):
+    """Pre-TTL releases (or a crash before the registry write) have only a
+    sentinel. They still need a bounded lifetime, measured from that file."""
+    rec, proc = _released_worker(wt, "Q", released_age_s=released_age_s)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    now = int(time.time())
+    released_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - released_age_s),
+    )
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    os.utime(sentinel, (now - released_age_s, now - released_age_s))
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600, now=now)
+        assert _row(wt, worker_id)["released_at"] == released_at
+        if released_age_s >= 3600:
+            assert [a["action"] for a in actions] == ["sigterm"]
+            assert _wait_gone(proc.pid)
+        else:
+            assert actions == []
+            assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_reap_legacy_release_survives_sentinel_consumption_and_honors_grace(wt, monkeypatch):
+    rec, proc = _released_worker(wt, "Q", released_age_s=10)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    now = int(time.time())
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    os.utime(sentinel, (now - 10, now - 10))
+    signals = []
+    monkeypatch.setattr(
+        wt.workers, "_signal_worker",
+        lambda pid, sig: signals.append((pid, sig)) or "pid",
+    )
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600, now=now) == []
+        sentinel.unlink()  # the worker consumes its one-shot stop instruction
+        term_at = now + 3600
+        actions = wt.workers.reap_released_workers(ttl_s=3600, now=term_at)
+        assert [a["action"] for a in actions] == ["sigterm"]
+        assert wt.workers.reap_released_workers(
+            ttl_s=3600, kill_grace_s=30, now=term_at + 29,
+        ) == []
+        actions = wt.workers.reap_released_workers(
+            ttl_s=3600, kill_grace_s=30, now=term_at + 30,
+        )
+        assert [a["action"] for a in actions] == ["sigkill"]
+        assert signals == [(proc.pid, 15), (proc.pid, 9)]
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@pytest.mark.parametrize("sentinel_state", ["missing", "directory", "unreadable"])
+def test_reap_never_invents_release_without_sentinel_evidence(wt, monkeypatch, sentinel_state):
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    if sentinel_state == "unreadable":
+        original_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path == sentinel:
+                raise PermissionError("unreadable sentinel")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+    else:
+        sentinel.unlink()
+        if sentinel_state == "directory":
+            sentinel.mkdir()
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        assert not _row(wt, worker_id).get("released_at")
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_reap_sentinel_mtime_does_not_replace_durable_release_time(wt):
+    rec, proc = _released_worker(wt, "Q", released_age_s=10)
+    worker_id = rec["worker_id"]
+    released_at = _row(wt, worker_id)["released_at"]
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    old = time.time() - 7200
+    os.utime(sentinel, (old, old))
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        assert _row(wt, worker_id)["released_at"] == released_at
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@pytest.mark.parametrize("identity", ["mismatch", "unknown"])
+def test_reap_legacy_sentinel_still_requires_pid_identity(wt, monkeypatch, identity):
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    old = time.time() - 7200
+    os.utime(sentinel, (old, old))
+    monkeypatch.setattr(wt.workers, "_worker_pid_identity", lambda w, pid: identity)
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        assert _row(wt, worker_id)["released_at"]
+        assert proc.poll() is None
+        assert bool(_row(wt, worker_id).get("gc_skipped")) == (identity == "mismatch")
+    finally:
+        proc.terminate()
+        proc.wait()
 
 
 @pytest.mark.parametrize("kill_sent_age_s", [None, 120])
@@ -5109,3 +5272,118 @@ def test_stale_idle_worker_without_claim_does_not_count_as_staffed(wt, monkeypat
                         lambda w: wt.workers.STALE_IDLE_S + 60)
     r = wt.workers.reconcile_once(dry_run=True)
     assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1
+
+
+def test_wt_workers_table_hides_retained_dead_rows_unless_all(wt, capsys):
+    """Dead rebound rows are kept for REBOUND_RETENTION_S by design; a week of
+    rebinds left ~100 of them in `wt workers` reading as stale workers. The
+    table now shows live workers only (with a count), --all shows the rest,
+    and --json keeps every row for programmatic callers (CCC)."""
+    cli = _reloaded_cli(wt)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    wt.workers.record_worker(os.getpid(), "Q", "claude", "q-live", str(wt.tmp),
+                             str(wt.tmp / "q-live.log"))
+    wt.workers.record_worker(_dead_pid(), "Q", "claude", "q-tomb", str(wt.tmp),
+                             str(wt.tmp / "q-tomb.log"))
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        for row in data["workers"]:
+            if row["worker_id"] == "q-tomb":
+                row["rebound_at"] = now_iso
+        wt.workers._save(data)
+
+    assert cli.cmd_workers(SimpleNamespace(json=False, all=False)) == 0
+    out = capsys.readouterr().out
+    assert "q-live" in out and "q-tomb" not in out
+    assert "1 dead record(s) retained" in out
+
+    assert cli.cmd_workers(SimpleNamespace(json=False, all=True)) == 0
+    out = capsys.readouterr().out
+    assert "q-live" in out and "q-tomb" in out and "retained" not in out
+
+    assert cli.cmd_workers(SimpleNamespace(json=True, all=False)) == 0
+    ids = {w["worker_id"] for w in json.loads(capsys.readouterr().out)}
+    assert ids == {"q-live", "q-tomb"}
+
+
+def test_record_worker_merges_rebind_stub_instead_of_duplicating(wt):
+    """A rebind stub that beat record_worker to the file must not leave two
+    rows for one process (double-counted as two live workers)."""
+    wid = "dup-w1"
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        data["workers"].append({
+            "worker_id": wid, "queue": "Q", "engine": "claude", "fifo": "",
+            "started_at": "", "pid": os.getpid(), "rebound_at": "2026-01-01T00:00:00Z",
+        })
+        wt.workers._save(data)
+    wt.workers.record_worker(
+        pid=os.getpid(), queue="Q", engine="claude", worker_id=wid,
+        fifo="/tmp/x.stdin", model="m",
+    )
+    rows = [r for r in wt.workers._load()["workers"] if r["worker_id"] == wid]
+    assert len(rows) == 1
+    assert rows[0]["fifo"] == "/tmp/x.stdin"
+    assert rows[0]["rebound_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_live_worker_count_ignores_duplicate_rows(wt):
+    for fifo in ("", "/tmp/a.stdin"):
+        with wt.workers._WorkersFileLock():
+            data = wt.workers._load()
+            data["workers"].append({"worker_id": "dw", "queue": "Q", "engine": "claude",
+                                    "pid": os.getpid(), "fifo": fifo})
+            wt.workers._save(data)
+    assert wt.workers.live_worker_count("Q") == 1
+    assert wt.workers.worker_counts()["Q"]["live"] == 1
+
+
+def test_renudge_idle_workers_rate_limited(wt, monkeypatch):
+    sent = []
+    monkeypatch.setattr(wt.workers, "notify_workers",
+                        lambda q, text, **kw: sent.append(kw["only"]) or 1)
+    monkeypatch.setattr(wt.workers, "_idle_renudged_at", {})
+    live = [{"worker_id": "idle1"}, {"worker_id": "busy1"}]
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1000.0) == 1
+    assert sent == [{"idle1"}]
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1010.0) == 0
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1200.0) == 1
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1", "idle1"}, now=2000.0) == 0
+
+
+def test_reconcile_spawns_second_worker_when_only_live_worker_is_busy(wt):
+    """A worker mid-ticket cannot take the claimable ticket now, so it must not
+    'cover' it: a 2-worker queue with one busy worker spawns the other."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 2)
+    busy = _live_worker(wt, "Q")
+    held = wt.q.enqueue(project="Q", note="held")
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == held["ref"]:
+            it["status"] = "in_progress"
+            it["claimed_by"] = busy["worker_id"]
+    wt.q._save_unlocked(data)
+    wt.q.enqueue(project="Q", note="waiting")
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert [s["queue"] for s in r["spawned"]] == ["Q"]
+
+
+def test_session_active_age_flags_dead_pid_row_whose_session_still_writes(wt, tmp_path):
+    """WT-17: a resumed session outliving its exec PID reads as active, not
+    just DEAD, while alive stays PID-based; a live owner of the session wins."""
+    import watchtower.workers as workers
+    sid = "ab1aebae-36c3-4fda-b872-caa3c3f32318"
+    row = {"worker_id": "ccc-x", "engine": "claude", "session_id": sid, "alive": False}
+    assert workers.session_active_age_s(row, [row]) is None  # no transcript
+    t = tmp_path / "claude-home" / "projects" / "-p" / f"{sid}.jsonl"
+    t.parent.mkdir(parents=True)
+    t.write_text("{}\n")
+    now = time.time()
+    os.utime(t, (now - 30, now - 30))
+    age = workers.session_active_age_s(row, [row], now=now)
+    assert age is not None and 29 <= age <= 31
+    owner = {"worker_id": "ccc-y", "session_id": sid, "alive": True}
+    assert workers.session_active_age_s(row, [row, owner], now=now) is None
+    os.utime(t, (now - 3600, now - 3600))
+    assert workers.session_active_age_s(row, [row], now=now) is None  # quiet

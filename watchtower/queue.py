@@ -45,6 +45,9 @@ Item shape::
       "id": "...",                       # source id (if any)
       "status": "open",                  # open | in_progress | closed
       "lane": "normal",                  # normal | express
+      "depth": "deep",                   # only when deep (absent = quick);
+                                         # + "budget_min": 90
+      "deferred_until": "...",           # `wt defer`: unclaimable until then
       "source": "wt",                    # which tool created it
       "note": "...",                     # short request
       "text": "...",                     # full prompt for a worker
@@ -111,6 +114,15 @@ VALID_STATUSES = ("open", "in_progress", "in_review", "awaiting_answer", "closed
 # as ``awaiting_answer`` with a ``parked`` record (who to route the answer to).
 PARKED_STATUS = "awaiting_answer"
 VALID_LANES = ("normal", "express")
+# Working mode. ``quick`` (the default, never stored) is fix-and-look work;
+# ``deep`` tickets get the deep-work brief at claim time (evidence first,
+# options memo incl. product options, measured goal, budget + stop rule) --
+# see watchtower/deep.py. ``budget_min`` rides along on deep tickets only.
+VALID_DEPTHS = ("quick", "deep")
+DEEP_DEFAULT_BUDGET_MIN = 90
+# `wt defer`: the longest a ticket may sit out of the claim pool waiting for
+# data. Longer waits are a human decision (`wt block`), not a data window.
+DEFER_MAX_S = 7 * 24 * 3600
 
 VALID_ITEM_TYPES = ("bug", "feature", "")
 # An item with no (or unknown) type is a bug by default. A ticket filed without
@@ -688,11 +700,39 @@ _META_UPSERT = (
 )
 
 
-def _read_db(db: Path, *, strict: bool = False) -> Dict[str, Any]:
+_READ_DB_MEMO: Dict[str, tuple] = {}
+
+
+def _db_stamp(db: Path) -> tuple:
+    """Cheap change token for the store: file stats of the db and its WAL."""
+    stamp = []
+    for path in (db, db.with_name(db.name + "-wal")):
+        try:
+            st = path.stat()
+            stamp += [st.st_mtime_ns, st.st_size]
+        except OSError:
+            stamp += [0, 0]
+    return tuple(stamp)
+
+
+def _read_db(db: Path, *, strict: bool = False, readonly: bool = False) -> Dict[str, Any]:
+    # A reconcile tick loads the whole store ~60 times; parsing ~6000 rows of
+    # JSON each time dominated it. Keep the parsed store as a pickle keyed by
+    # the store's revision + file stamp and hand mutating callers a private copy
+    # while read-only counting callers reuse the normalized snapshot directly.
+    import pickle
+    key = str(db)
+    stamp = _db_stamp(db)
+    memo = _READ_DB_MEMO.get(key)
+    if memo is not None and memo[0][0] == stamp:
+        return memo[2] if readonly else pickle.loads(memo[1])
     try:
         conn = _connect(db)
         try:
             counter = int(_meta_get(conn, "counter", "0") or 0)
+            revision = _meta_get(conn, "revision", "0")
+            if memo is not None and memo[0] == (stamp, counter, revision):
+                return memo[2] if readonly else pickle.loads(memo[1])
             items = [
                 json.loads(row[0])
                 for row in conn.execute("SELECT item_json FROM items ORDER BY number")
@@ -703,7 +743,19 @@ def _read_db(db: Path, *, strict: bool = False) -> Dict[str, Any]:
         if strict:
             raise
         return _empty_store()
-    return {"counter": counter, "items": items}
+    _normalize_items(items)
+    if items:
+        max_num = max(int(it.get("number", 0)) for it in items)
+        if max_num > counter:
+            counter = max_num
+    data = {"counter": counter, "items": items, "_normalized": True}
+    # Only memoize when nothing moved while we were reading.
+    if _db_stamp(db) == stamp:
+        pickled = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
+        _READ_DB_MEMO[key] = ((stamp, counter, revision), pickled, data)
+        if not readonly:
+            return pickle.loads(pickled)
+    return data
 
 
 def _create_db(db: Path, data: Dict[str, Any]) -> None:
@@ -795,10 +847,10 @@ def export_data() -> Dict[str, Any]:
     return {"counter": int(data.get("counter", 0)), "items": data.get("items", [])}
 
 
-def _load_unlocked(*, strict: bool = False) -> Dict[str, Any]:
+def _load_unlocked(*, strict: bool = False, readonly: bool = False) -> Dict[str, Any]:
     db = _db_path()
     if db.exists():
-        data = _read_db(db, strict=strict)
+        data = _read_db(db, strict=strict, readonly=readonly)
     else:
         try:
             with open(_resolve_store_path(), "r") as f:
@@ -813,6 +865,8 @@ def _load_unlocked(*, strict: bool = False) -> Dict[str, Any]:
         if strict:
             raise ValueError("queue store root must be a JSON object")
         return _empty_store()
+    if data.get("_normalized"):
+        return data
     data.setdefault("counter", 0)
     items = data.get("items")
     if not isinstance(items, list):
@@ -935,6 +989,62 @@ def machine_tag() -> str:
     tag = _re.sub(r"[^a-z0-9]", "", raw.lower())[:3]
     _MACHINE_TAG_CACHE = tag
     return tag
+
+
+# --- machine placement -------------------------------------------------------
+# A ticket may say which kind of machine can run it. ``""`` (the legacy value,
+# and what every pre-existing ticket has) and ``"any"`` mean "any machine";
+# ``"mac"`` waits for a macOS box (Xcode/iOS, simulator, browser/GUI, Mac
+# keychain, local-only repos); ``"cloud"`` runs only on a Linux/cloud box.
+# Each machine knows its own kind (machine_placement()), and claim filtering
+# (_claim_candidates -- the single source of truth) drops tickets that machine
+# cannot run, so an always-on VM drains the rest overnight while Mac-bound
+# tickets simply wait for the Mac.
+VALID_PLACEMENTS = ("any", "mac", "cloud")
+
+# Words that mean "needs the Mac's toolchain/GUI". Deliberately narrow: a
+# false positive only delays a ticket until the Mac is up (and ``--placement
+# any`` overrides it); a false negative sends it to a box that cannot do it.
+_MAC_HINT_RE = _re.compile(
+    r"\b(xcode|xcodebuild|ios|iphone|ipad|simulator|testflight|swiftui|"
+    r"cocoapods|pod install|app ?store ?connect|safari|screenshot|"
+    r"keychain|launchctl|launchd|osascript|macos|mac app|\.app\b|"
+    r"puppeteer|chrome-devtools|playwright)\b",
+    _re.IGNORECASE,
+)
+
+
+def machine_placement() -> str:
+    """The placement kind of THIS machine: ``mac`` (darwin) or ``cloud``.
+
+    ``WATCHTOWER_PLACEMENT`` overrides (e.g. a Linux desktop that does have the
+    GUI toolchain can say ``mac``; a Mac used as a headless runner ``cloud``).
+    Read per call -- it is cheap and tests flip it.
+    """
+    raw = str(os.environ.get("WATCHTOWER_PLACEMENT") or "").strip().lower()
+    if raw in ("mac", "cloud"):
+        return raw
+    return "mac" if sys.platform == "darwin" else "cloud"
+
+
+def _norm_placement(value: Any) -> str:
+    """A valid placement, else "" (unknown/blank = legacy, claimable anywhere)."""
+    s = str(value or "").strip().lower()
+    return s if s in VALID_PLACEMENTS else ""
+
+
+def placement_allows(item: Dict[str, Any], machine: Optional[str] = None) -> bool:
+    """May a worker on ``machine`` (default: this one) claim ``item``?"""
+    p = _norm_placement(item.get("placement"))
+    if p in ("", "any"):
+        return True
+    return p == (machine or machine_placement())
+
+
+def suggest_placement(*texts: Any) -> str:
+    """``"mac"`` when the ticket text mentions Mac-only tooling, else ``""``."""
+    blob = "\n".join(str(t or "") for t in texts)
+    return "mac" if _MAC_HINT_RE.search(blob) else ""
 
 
 def with_machine(worker: Any, machine: Any) -> str:
@@ -1324,7 +1434,15 @@ def _notify_ticket_event(
     verb = _NOTIFY_VERBS.get(event, event)
     text = f"[watchtower] {ref} {verb}"
     if detail:
-        text += f" — {_clip(detail, 200)}"
+        # Decisions and results must retain their options, recommendation,
+        # and verification evidence (including line breaks). The short
+        # claim preview is the only detail that can be safely abbreviated.
+        notice_detail = str(detail)
+        if event == "claimed":
+            notice_detail = _clip(detail, 200)
+            if len(" ".join(str(detail).split())) > 200:
+                notice_detail += f" (full text: wt find {ref})"
+        text += f" — {notice_detail}"
     for target in targets:
         # MEMORY-5: a submitter/subscriber that has since been manually
         # rebound or continued to a new session (`ccc rebind-report-to`,
@@ -1341,6 +1459,61 @@ def _notify_ticket_event(
             pass  # best-effort -- a delivery hiccup never fails the transition
 
 
+def _placement_fields(placement: str, *texts: Any) -> Dict[str, Any]:
+    """Item fields for a new ticket's placement. An explicit value always wins
+    (``any`` included: that is the override of the heuristic). With none, a
+    darwin filer gets the keyword suggestion (``placement_source: auto``). A
+    non-darwin filer gets none: it cannot tell what the Mac has, and a
+    standalone Linux box must not strand its own tickets behind ``mac``."""
+    explicit = _norm_placement(placement)
+    if explicit:
+        return {"placement": explicit}
+    if sys.platform == "darwin" and machine_placement() == "mac":
+        guess = suggest_placement(*texts)
+        if guess:
+            return {"placement": guess, "placement_source": "auto"}
+    return {}
+
+
+def norm_depth(depth: Any) -> str:
+    """``deep`` or ``quick``; raises ValueError on anything else non-empty."""
+    raw = str(depth or "").strip().lower()
+    if not raw:
+        return "quick"
+    if raw not in VALID_DEPTHS:
+        raise ValueError(f"depth must be one of {', '.join(VALID_DEPTHS)}")
+    return raw
+
+
+def _depth_fields(depth: Any, budget_min: Any = 0) -> Dict[str, Any]:
+    """Stored depth fields: nothing for quick (the default), else
+    ``depth``/``budget_min`` (positive minutes, default 90)."""
+    if norm_depth(depth) != "deep":
+        return {}
+    try:
+        minutes = int(budget_min or 0)
+    except (TypeError, ValueError):
+        raise ValueError("budget must be a whole number of minutes")
+    if minutes < 0:
+        raise ValueError("budget must be a positive number of minutes")
+    return {"depth": "deep", "budget_min": minutes or DEEP_DEFAULT_BUDGET_MIN}
+
+
+def _depth_edit(item: Dict[str, Any], depth: Any, budget_min: Any) -> Dict[str, Any]:
+    """The depth fields ``item`` should store after ``wt edit --depth/--budget-min``
+    (None = flag not given, keep the current value)."""
+    want = norm_depth(depth if depth is not None else item.get("depth"))
+    if want != "deep" and budget_min is not None and depth is None:
+        raise ValueError(f"{item.get('ref')} is not a deep ticket; "
+                         "set --depth deep to give it a budget")
+    return _depth_fields(want, budget_min if budget_min is not None
+                         else item.get("budget_min"))
+
+
+def is_deep(item: Dict[str, Any]) -> bool:
+    return str((item or {}).get("depth") or "").lower() == "deep"
+
+
 def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: str,
                        proj: str, annotation_id: str, url: str, title: str,
                        selector: str, screenshot_path: str, repo_path: str,
@@ -1349,7 +1522,9 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
                        planner_model: str, verifier_model: str, submitter: str,
                        submitter_explicit: bool, pre_ack: bool,
                        blocked_by: Optional[List[str]], gates: Optional[List[str]],
-                       accept_line: str, assessment_origin: str = "") -> Dict[str, Any]:
+                       accept_line: str, assessment_origin: str = "",
+                       placement: str = "", depth: str = "",
+                       budget_min: int = 0) -> Dict[str, Any]:
     """Append a new ``open`` item to an already-loaded local store (the caller
     holds the store lock and saves). Shared by :func:`enqueue` and the
     post-fix-assessment filer so both create identical tickets."""
@@ -1390,6 +1565,8 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
         **({"verifier_model": str(verifier_model).strip()} if str(verifier_model or "").strip() else {}),
         **({"gates": validate_gates(gates)} if gates else {}),
         **({"accept": str(accept_line).strip()} if str(accept_line or "").strip() else {}),
+        **_depth_fields(depth, budget_min),
+        **_placement_fields(placement, note, text, title),
         "submitter": str(submitter or ""),
         "submitter_explicit": bool(submitter_explicit),
         "claimed_by": None,
@@ -1440,8 +1617,20 @@ def enqueue(
     group_parent: bool = False,
     group: str = "",
     children: Optional[List[str]] = None,
+    placement: str = "",
+    depth: str = "",
+    budget_min: int = 0,
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
+
+    ``depth``: ``quick`` (default) or ``deep`` -- a deep ticket's claim carries
+    the deep-work brief (watchtower/deep.py); ``budget_min`` is its working
+    budget in minutes (default 90). Local store only.
+
+    ``placement``: ``mac`` | ``cloud`` | ``any`` -- which kind of machine may
+    claim it (see ``VALID_PLACEMENTS``). Blank lets a Mac filer's keyword
+    heuristic decide; existing tickets without the field stay claimable
+    anywhere.
 
     Plan groups (WT-33, local store only): ``group_parent`` files a group
     parent (gates always include ``plan``; ``verify`` unless ``gates`` omits
@@ -1468,6 +1657,7 @@ def enqueue(
     if not note and not text:
         raise ValueError("note or text is required")
     lane = lane if lane in VALID_LANES else "normal"
+    _depth_fields(depth, budget_min)  # validate before any write
     proj = _project_for(source, repo_path, project)
     # Registration for the reconciler (WT-131, see mark_runnable's docstring)
     # happens lazily at run/drain time, not here -- OPS-563: registering on
@@ -1513,6 +1703,7 @@ def enqueue(
             submitter=submitter,
             submitter_explicit=submitter_explicit,
             blocked_by=blocked_by,
+            depth_fields=_depth_fields(depth, budget_min),
         )
         _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
         return saved
@@ -1530,7 +1721,8 @@ def enqueue(
             priority=priority, value=value, confidence=confidence, model_floor=model_floor,
             planner_model=planner_model, verifier_model=verifier_model, submitter=submitter,
             submitter_explicit=submitter_explicit, pre_ack=pre_ack, blocked_by=blocked_by,
-            gates=gates, accept_line=accept_line, assessment_origin=assessment_origin)
+            gates=gates, accept_line=accept_line, assessment_origin=assessment_origin,
+            placement=placement, depth=depth, budget_min=budget_min)
         if dedupe_key:
             saved["dedupe_key"] = dedupe_key
         if grouped:
@@ -1741,18 +1933,50 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     """
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
+        if "depth" in fields or "budget_min" in fields:
+            fields = dict(fields)
+            want_depth, want_budget = fields.pop("depth", None), fields.pop("budget_min", None)
+            if want_depth is not None:
+                norm_depth(want_depth)
+            current = backend.get(ident)
+            if current is None:
+                return None
+            fields["depth_fields"] = _depth_edit(current, want_depth, want_budget)
         return backend.update(ident, **fields)
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
         "needs_input", "block_question", "model_floor", "blocked_by", "gates", "accept",
-        "planner_model", "verifier_model",
+        "planner_model", "verifier_model", "placement",
     })
+    if "placement" in fields:
+        raw = str(fields["placement"] or "").strip().lower()
+        if raw and raw not in VALID_PLACEMENTS:
+            raise ValueError(f"placement must be one of {', '.join(VALID_PLACEMENTS)} (or empty to clear)")
+        fields = dict(fields)
+        fields["placement"] = raw
+    depth_edit = None
+    if "depth" in fields or "budget_min" in fields:
+        fields = dict(fields)
+        depth_edit = (fields.pop("depth", None), fields.pop("budget_min", None))
+        if depth_edit[0] is not None:
+            norm_depth(depth_edit[0])
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
                 now = _now_iso()
+                if depth_edit is not None:
+                    new = _depth_edit(it, *depth_edit)
+                    old = {k: it.get(k) for k in ("depth", "budget_min") if k in it}
+                    it.pop("depth", None)
+                    it.pop("budget_min", None)
+                    it.update(new)
+                    if new != old:
+                        _append_history(it, "edit", by=_by("system"), at=now,
+                                        fields={"depth": new.get("depth", "quick"),
+                                                **({"budget_min": new["budget_min"]}
+                                                   if "budget_min" in new else {})})
                 if "gates" in fields:
                     fields = dict(fields)
                     fields["gates"] = (_parent_gates(fields["gates"]) if group_role(it) == "parent"
@@ -2000,6 +2224,7 @@ def _claim_candidates(
     all_items: Optional[List[Dict[str, Any]]] = None,
     worker_model: Optional[str] = None,
     claimer: Optional[Tuple[str, str]] = None,
+    machine: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return ``items`` filtered + sorted exactly as claim_next() would pick
     from them — the single source of truth for "is this ticket claimable
@@ -2012,8 +2237,16 @@ def _claim_candidates(
     ``model_floor`` that model does not meet are skipped, so a weaker worker
     just takes the next ticket instead of claiming and parking it. None
     disables the filter.
+
+    ``machine`` (``mac``/``cloud``, default: this machine's
+    machine_placement()): tickets whose ``placement`` names the other kind of
+    machine are skipped, so a Mac-bound ticket waits for the Mac and an
+    always-on VM only ever takes what it can actually run.
     """
     candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of")]
+    if any(it.get("placement") for it in candidates):
+        _m = machine or machine_placement()
+        candidates = [it for it in candidates if placement_allows(it, _m)]
     # WT-28: a ticket whose answer is reserved for its parked worker
     # (affinity) is claimable only by that worker until the reservation
     # expires; everyone else, and every counting caller, drops it.
@@ -2021,6 +2254,10 @@ def _claim_candidates(
     candidates = [it for it in candidates
                   if not _affinity_reserved(it, _now_ts)
                   or (claimer is not None and _affinity_owner(it, claimer[0], claimer[1]))]
+    # `wt defer`: a ticket waiting for its data window is out of the pool (and
+    # out of count_claimable, so nothing is spawned for it) until the window
+    # ends; then it is ordinary open work again.
+    candidates = [it for it in candidates if not deferred_now(it, _now_ts)]
     # Plan gate (WT-22): a ticket is planned BEFORE a build worker claims it,
     # so one whose plan has not settled is not claimable yet.
     candidates = [it for it in candidates if not plan_pending(it)]
@@ -2091,7 +2328,7 @@ def count_claimable(
         return backend.count_claimable(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
-        data = _load_unlocked()
+        data = _load_unlocked(readonly=True)
         return len(_claim_candidates(
             data["items"], project=proj, lane=lane, item_types=item_types,
             worker_model=worker_model,
@@ -2116,7 +2353,7 @@ def count_manual_eligible(
         return backend.count_manual_eligible(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
     with _FileLock(_lock_path()):
-        data = _load_unlocked()
+        data = _load_unlocked(readonly=True)
         candidates = _claim_candidates(
             data["items"], project=proj, lane=lane, item_types=item_types
         )
@@ -2526,7 +2763,9 @@ def floor_routed_candidates(
         return []
     proj = _norm_project(project)
     with _FileLock(_lock_path()):
-        data = _load_unlocked()
+        # Read-only snapshot: the reconciler calls this once per queue per
+        # tick, and a private copy each time was ~4 s of CPU (WT-12).
+        data = _load_unlocked(readonly=True)
         every = _claim_candidates(
             data["items"], project=proj, item_types=item_types,
             all_items=data["items"],
@@ -7649,6 +7888,104 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
     return None
 
 
+_DEFER_REL_RE = _re.compile(r"^\+?(\d+)\s*([mhd])$", _re.IGNORECASE)
+
+
+def parse_defer_until(value: Any, now: Optional[float] = None) -> float:
+    """Epoch seconds for a `wt defer --until` value: relative ``+90m`` /
+    ``+24h`` / ``+2d``, or an ISO-8601 timestamp (naive = UTC). Must be in
+    the future and within DEFER_MAX_S. Raises ValueError otherwise."""
+    now = time.time() if now is None else now
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("--until is required (e.g. +24h or 2026-10-24T09:00Z)")
+    m = _DEFER_REL_RE.match(raw)
+    if m:
+        ts = now + int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2).lower()]
+    else:
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"unrecognised --until {raw!r}: use +90m/+24h/+2d or an ISO time")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        ts = dt.timestamp()
+    if ts <= now:
+        raise ValueError("--until must be in the future")
+    if ts - now > DEFER_MAX_S:
+        raise ValueError(f"--until is more than {DEFER_MAX_S // 86400} days away; a wait that "
+                         "long is a human decision -- use `wt block` instead")
+    return ts
+
+
+def deferred_now(item: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """True while ``item`` is inside a `wt defer` window."""
+    until = (item or {}).get("deferred_until")
+    if not until:
+        return False
+    return _iso_ts(until) > (time.time() if now is None else now)
+
+
+def defer(ident: Any, session_id: str, until: Any, reason: str,
+          progress: str = "") -> Optional[Dict[str, Any]]:
+    """Take a claimed ticket out of the claim pool until ``until`` while data
+    accumulates (`wt defer`). The ticket goes back to ``open`` -- not
+    blocked: no human question is pending -- but is unclaimable and uncounted
+    for staffing until the window ends, then any worker picks it up again
+    with the ``progress``/``reason`` notes in its history. Only the claimant
+    of an in_progress ticket (or anyone, on an open one) may defer it.
+    GitHub-backed queues keep the window in the issue's metadata block."""
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("--reason is required: say what data you are waiting for")
+    ts = parse_defer_until(until)
+    until_iso = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        before = backend.get(ident)
+        it = backend.defer(ident, session_id=str(session_id or ""), until_iso=until_iso,
+                           reason=reason, progress=str(progress or ""))
+        if it:
+            _log("DEFER", f"{it.get('ref', '?')} until {until_iso} — {_clip(reason, 200)}",
+                 queue=it.get("project", ""))
+            if (before or {}).get("status") == "in_progress":
+                _note_worker_ticket_done(session_id)
+        return it
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            status = it.get("status")
+            if status not in ("open", "in_progress"):
+                raise ValueError(f"{it.get('ref')} is {status}; only an open or in-progress "
+                                 "ticket can be deferred")
+            if group_role(it) == "parent":
+                raise ValueError(f"{it.get('ref')} is a group parent; defer its members")
+            holder = str(it.get("claimed_by") or "")
+            if status == "in_progress" and holder and session_id and holder != str(session_id):
+                raise ValueError(f"{it.get('ref')} is claimed by {holder}, not {session_id}")
+            now = _now_iso()
+            actor = _by("worker", str(session_id or ""),
+                        str(_coerce_session_uuid(session_id) or ""))
+            if progress:
+                _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
+            if status == "in_progress":
+                _release_claim_to_open_unlocked(it, now, "deferred: " + reason)
+            it["deferred_until"] = until_iso
+            it["defer_reason"] = _clip(reason, 2000)
+            it["updated_at"] = now
+            _append_history(it, "defer", by=actor, at=now, until=until_iso,
+                            reason=_clip(reason, 2000))
+            _save_unlocked(data)
+            _log("DEFER", f"{it.get('ref', '?')} until {until_iso} — {_clip(reason, 200)}",
+                 queue=it.get("project", ""))
+            if status == "in_progress":
+                _note_worker_ticket_done(session_id)
+            return it
+    return None
+
+
 def _require_rationale_block(it: Dict[str, Any], ident: Any) -> None:
     if not it.get("needs_input") or it.get("block_kind") != "rationale":
         status = it.get("status")
@@ -7812,7 +8149,10 @@ def comment(ident: Any, text: str, by: str = "human", session_id: str = "") -> O
     return None
 
 
-def list_blocked(project: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_blocked(
+    project: Optional[str] = None,
+    items: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """Tickets parked for a human (``needs_input`` truthy), optionally scoped to
     one queue. The CLI's ``wt blocked`` and CCC both read this.
 
@@ -7822,13 +8162,17 @@ def list_blocked(project: Optional[str] = None) -> List[Dict[str, Any]]:
     every worker holding a blocked ticket there read as fully productive to
     the reconciler's staffing math (see ``list_active_claims``), so a queue
     stuck entirely behind blocked tickets never got replacement workers."""
-    return [it for it in list_items(project=project)
+    src = list_items(project=project) if items is None else items
+    return [it for it in src
             if it.get("needs_input")
             or (it.get("status") == PARKED_STATUS
                 and (it.get("pending_answer") or {}).get("state") == "routing")]
 
 
-def list_active_claims(project: Optional[str] = None) -> List[Dict[str, Any]]:
+def list_active_claims(
+    project: Optional[str] = None,
+    items: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
     """In-progress tickets a worker is actively holding -- ``in_progress`` but
     NOT parked on ``needs_input`` (a blocked ticket stays ``in_progress``, so
     it's excluded here; use ``list_blocked`` for those). Same scope as
@@ -7836,9 +8180,10 @@ def list_active_claims(project: Optional[str] = None) -> List[Dict[str, Any]]:
     ``list_items`` instead of the file store directly). Lets the reconciler
     tell "worker has nothing else to do" apart from "worker blocked one
     ticket but is actively working another"."""
+    src = list_items(status="in_progress", project=project) if items is None else items
     return [
-        it for it in list_items(status="in_progress", project=project)
-        if not it.get("needs_input")
+        it for it in src
+        if it.get("status") == "in_progress" and not it.get("needs_input")
     ]
 
 

@@ -60,6 +60,13 @@ def test_new_release_needs_no_code_change(catalogs):
     assert config.is_approved_model("codex", "gpt-10")
 
 
+def test_entries_memo_hands_out_private_lists(catalogs):
+    rows = models.entries("codex")
+    rows.clear()  # WT-12: the memoised catalog must not see caller edits
+    assert [r["id"] for r in models.entries("codex")] == ["gpt-9", "gpt-6-astra"]
+    assert models.entries("codex") is not models.entries("codex")
+
+
 def test_floor_ranking_from_prices_and_overrides(catalogs):
     assert models.rank("claude-opus-9") == 30
     assert models.rank("gpt-9") is None

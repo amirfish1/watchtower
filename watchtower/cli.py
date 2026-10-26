@@ -56,7 +56,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
-from . import answers, health, queue as q, resume_verify, stages, workers
+from . import answers, deep, health, queue as q, resume_verify, stages, workers
 
 DAEMON_PID_FILE = Path(
     os.environ.get("WATCHTOWER_DAEMON_PID")
@@ -163,6 +163,10 @@ def _print_status(rows: List[dict]) -> None:
         return
     for w in rows_w:
         state = "LIVE" if w.get("alive") else "DEAD"
+        if not w.get("alive"):
+            age = workers.session_active_age_s(w, rows_w)
+            if age is not None:
+                state += f" (session active {int(age)}s ago)"
         ref = w.get("active_ref")
         if ref:
             since = w.get("active_since_human")
@@ -204,6 +208,8 @@ def _event_summary(event: dict) -> str:
         return f"claimed by {actor}"
     if name == "block":
         return f"blocked: {event.get('question') or ''}".rstrip()
+    if name == "defer":
+        return f"deferred until {event.get('until') or '?'}: {event.get('reason') or ''}".rstrip()
     if name in ("answer", "comment", "progress"):
         return f"{name}: {event.get('text') or ''}".rstrip()
     if name == "reopen":
@@ -540,6 +546,8 @@ def cmd_ls(args: argparse.Namespace) -> int:
         waiting = _waiting_note(it, by_ref)
         if waiting:
             line += f"  [{waiting}]"
+        if it.get("placement") in ("mac", "cloud"):
+            line += f"  [{it['placement']} only]"
         role = q.group_role(it)
         if role == "parent":
             line += (f"  [group: {len((it.get('group') or {}).get('members') or [])} members, "
@@ -674,6 +682,10 @@ def cmd_find(args: argparse.Namespace) -> int:
             print(f"  {note}")
     if item.get("accept"):
         print(f"  accept: {item['accept']}")
+    if q.is_deep(item):
+        print(f"  depth: deep ({item.get('budget_min') or q.DEEP_DEFAULT_BUDGET_MIN}m budget)")
+    if q.deferred_now(item):
+        print(f"  deferred until {item.get('deferred_until')}: {item.get('defer_reason') or ''}")
     if checks:
         print("  " + checks.replace("\n", "\n  "))
     if worker:
@@ -771,7 +783,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
     for name in (
         "title", "note", "text", "url", "type", "readiness", "priority",
         "value", "confidence", "model_floor", "planner_model", "verifier_model",
-        "selector", "screenshot_path", "repo_path", "accept",
+        "selector", "screenshot_path", "repo_path", "accept", "placement",
+        "depth", "budget_min",
     ):
         value = getattr(args, name, None)
         if value is not None:
@@ -794,7 +807,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
             "error: no fields to edit -- pass at least one of "
             "--title/--note/--text/--url/--type/--readiness/--priority/"
             "--value/--confidence/--model-floor/--selector/"
-            "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates/--accept",
+            "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates/--accept/"
+            "--depth/--budget-min",
             file=sys.stderr,
         )
         return 1
@@ -830,6 +844,12 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
+    if getattr(args, "run", False):
+        conflict = ("--claim" if getattr(args, "claim", False) else
+                    "--group-parent" if getattr(args, "group_parent", False) else "")
+        if conflict:
+            print(f"error: --run cannot be combined with {conflict}", file=sys.stderr)
+            return 1
     if _bad_model_floor(args):
         return 1
     submitter = (getattr(args, "submitter", "") or "").strip()
@@ -866,6 +886,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             value=getattr(args, "value", "") or "",
             confidence=getattr(args, "confidence", "") or "",
             model_floor=getattr(args, "model_floor", "") or "",
+            placement=getattr(args, "placement", "") or "",
             planner_model=getattr(args, "planner_model", "") or "",
             verifier_model=getattr(args, "verifier_model", "") or "",
             dedupe_key=getattr(args, "dedupe_key", "") or "",
@@ -879,11 +900,14 @@ def cmd_add(args: argparse.Namespace) -> int:
             group=getattr(args, "group", "") or "",
             children=[c.strip() for c in str(getattr(args, "children", "") or "").split(",")
                       if c.strip()] or None,
+            depth=getattr(args, "depth", "") or "",
+            budget_min=getattr(args, "budget_min", 0) or 0,
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
-    print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
+    print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}"
+          + (f"  [deep, {item.get('budget_min')}m budget]" if q.is_deep(item) else ""))
     if not getattr(args, "claim", False):
         _warn_floor_above_queue([item])
     if q.group_role(item) == "parent":
@@ -911,6 +935,21 @@ def cmd_add(args: argparse.Namespace) -> int:
             # Enqueue already succeeded; a claim hiccup shouldn't fail the file.
             print(f"[watchtower] could not claim {item['ref']}: {e}", file=sys.stderr)
         return 0
+    # Equivalent to filing then `wt run`: record the per-ticket request before
+    # dispatch so grace/auto-drain policy cannot hold this submission back.
+    if getattr(args, "run", False):
+        try:
+            runnable = q.mark_runnable(item["ref"])
+        except Exception as e:
+            print(f"error: filed {item['ref']}, but could not request its run: {e}",
+                  file=sys.stderr)
+            return 1
+        if runnable is None:
+            print(f"error: filed {item['ref']}, but could not request its run: ticket not found",
+                  file=sys.stderr)
+            return 1
+        item = runnable
+        print(f"RUNNABLE: {item['ref']}  {item.get('title') or item.get('note', '')}")
     # Decide + act on the new ticket NOW (nudge current staffing via FIFO, else
     # gracefully release verified-idle staffing and spawn) and log the
     # decision. Centralized in
@@ -1135,6 +1174,21 @@ def cmd_claim(args: argparse.Namespace) -> int:
     # only fires for a backend that cannot (GitHub-backed queues) or a by-ref
     # claim of a ticket above this worker's model. The ticket goes straight
     # back to open (never parked blocked) for the reconciler to route.
+    # Placement: an explicit `wt claim REF` of a ticket pinned to the other
+    # kind of machine is released straight back (claim_next never offers it).
+    if not q.placement_allows(item):
+        q.update_status(
+            item["ref"], "open", worker, require_status="in_progress",
+            reason=f"placement {item.get('placement')} not runnable on {q.machine_placement()}",
+        )
+        print(
+            f"error: {item['ref']} is placement={item.get('placement')!r}; this machine is "
+            f"{q.machine_placement()!r} -- released back to open "
+            "(`wt edit REF --placement any` to allow it here)",
+            file=sys.stderr,
+        )
+        return 1
+
     model_floor = str(item.get("model_floor") or "").strip()
     if model_floor:
         from . import config
@@ -1174,6 +1228,9 @@ def cmd_claim(args: argparse.Namespace) -> int:
         plan_note = _plan_note(item)
         if plan_note:
             shown = dict(shown, plan_instructions=plan_note)
+        deep_note = deep.deep_brief(item)
+        if deep_note:
+            shown = dict(shown, deep_brief=deep_note)
         _print_item(shown)
     else:
         fb = _sent_back_view(item)
@@ -1201,6 +1258,9 @@ def cmd_claim(args: argparse.Namespace) -> int:
         plan_note = _plan_note(item)
         if plan_note:
             print("\n" + plan_note)
+        deep_note = deep.deep_brief(item)
+        if deep_note:
+            print("\n" + deep_note)
         checks = q.checks_block(item)
         if checks:
             print("\n" + checks)
@@ -2893,6 +2953,28 @@ def cmd_block(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_defer(args: argparse.Namespace) -> int:
+    """Wait for data, not for a human: the ticket leaves your claim and the
+    claim pool until --until, then any worker resumes it from your progress
+    note. For a decision you need from a human, use `wt block`."""
+    try:
+        item = q.defer(args.ref, args.worker or _default_worker_id(), args.until,
+                       args.reason, progress=args.progress)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
+    print(f"DEFERRED: {item['ref']} until {item['deferred_until']} — {item.get('defer_reason')}")
+    print("  the ticket left your claim; it returns to the pool when the window ends. "
+          "You may claim the next ticket now.")
+    return 0
+
+
 def cmd_blocked(args: argparse.Namespace) -> int:
     """List tickets parked for a human (WT-28). With kind_filter (wt gated),
     only product-gate pitches awaiting Ack/Nack."""
@@ -3472,16 +3554,33 @@ def cmd_workers(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
+    # The prune above already dropped every dead row it may. What survives dead
+    # is retained on purpose -- rebound tombstones (REBOUND_RETENTION_S guards a
+    # second continuation), recent stage records, rows owed a lifecycle audit --
+    # and a week of rebinds is ~100 rows that read as "stale workers". The
+    # table shows live workers unless --all; --json is unchanged.
+    # A dead-PID row whose resumed session is still writing is shown even
+    # without --all: it is working, just not in its original process (WT-17).
+    active = {id(w): age for w in rows if not w.get("alive")
+              for age in [workers.session_active_age_s(w, rows)] if age is not None}
+    hidden = 0
+    if not getattr(args, "all", False):
+        hidden = sum(1 for w in rows if not w.get("alive") and id(w) not in active)
+        rows = [w for w in rows if w.get("alive") or id(w) in active]
     if not rows:
-        print("(no workers tracked)")
-        return 0
-    print(f"{'WORKER':<22}{'PID':>8}  {'QUEUE':<12}{'ENGINE':<8}{'ALIVE':<6}STARTED")
+        print("(no workers tracked)" if not hidden else "(no live workers)")
+    else:
+        print(f"{'WORKER':<22}{'PID':>8}  {'QUEUE':<12}{'ENGINE':<8}{'ALIVE':<6}STARTED")
     for w in rows:
         print(
             f"{w.get('worker_id',''):<22}{w.get('pid',0):>8}  "
             f"{w.get('queue',''):<12}{w.get('engine',''):<8}"
             f"{'yes' if w.get('alive') else 'no':<6}{w.get('started_at','')}"
+            + (f"  (session active {int(active[id(w)])}s ago)" if id(w) in active else "")
         )
+    if hidden:
+        print(f"({hidden} dead record(s) retained by design -- rebind guard / "
+              "stage forensics; they expire on their own. --all to show)")
     return 0
 
 
@@ -5220,7 +5319,8 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     print(f"[watchtower] HTTP server on http://{host}:{port}", flush=True)
     # Log daemon start to activity log.
     try:
-        auto_spawn_status = "auto-spawn on" if getattr(args, "auto_spawn", False) else "auto-spawn off"
+        auto_spawn_status = ("auto-spawn on" if getattr(args, "auto_spawn", False)
+                             else "auto-spawn off (stage sessions NOT supervised)")
         _q._log("DAEMON_START", f"(pid {os.getpid()}) {auto_spawn_status}")
     except Exception:
         pass
@@ -5422,8 +5522,22 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
             remaining -= max(0.5, time.time() - slept_from)
 
 
+def _systemd_user_service_installed() -> bool:
+    return (
+        sys.platform == "linux"
+        and _LAUNCHAGENT_PLIST == _DEFAULT_LAUNCHAGENT_PLIST
+        and (Path.home() / ".config" / "systemd" / "user" / "watchtower.service").is_file()
+    )
+
+
 def cmd_start(args: argparse.Namespace) -> int:
     dry_run = getattr(args, "dry_run", False)
+    if not args.foreground and not dry_run and _systemd_user_service_installed():
+        rc = os.system("systemctl --user restart watchtower.service 2>/dev/null") >> 8
+        if rc == 0:
+            print("restarted watchtower.service (systemd-supervised)")
+            return 0
+        print(f"warning: systemctl exited {rc}; falling back to manual start")
     # First-time auto-install: `wt start` is the normal user entry point, so a
     # user should never have to run a separate `wt install` first. If the
     # LaunchAgent has never been written, write it now (same plist + skill
@@ -5470,6 +5584,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         if not dry_run:
             DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
             DAEMON_PID_FILE.write_text(str(os.getpid()))
+            # WT-7: let `stages.request` tell a spawn-less daemon (which never
+            # supervises stage sessions, WT-24) from a supervising one.
+            stages.supervisor_marker_path().write_text(
+                "on" if getattr(args, "auto_spawn", False) else "off")
         try:
             _daemon_loop(args)
         except KeyboardInterrupt:
@@ -5483,6 +5601,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
                 DAEMON_PID_FILE.unlink(missing_ok=True)
+                stages.supervisor_marker_path().unlink(missing_ok=True)
         return 0
     # Re-exec ourselves in the background in foreground-mode. This is the only
     # supervision path on hosts without launchd, so use the same hardened PATH
@@ -5528,6 +5647,18 @@ def cmd_stop(args: argparse.Namespace) -> int:
     # supervised daemon must tell launchd to stop-and-stay-stopped via `bootout`.
     # Only fall back to the pidfile+SIGTERM path for a manually-started daemon
     # (dev machines that never ran `wt install`).
+    if _systemd_user_service_installed():
+        rc = os.system("systemctl --user stop watchtower.service 2>/dev/null") >> 8
+        if rc == 0:
+            print("stopped watchtower.service (systemd will not relaunch)")
+            try:
+                from . import queue as _q
+                _q._log("DAEMON_STOP", "via systemctl stop")
+            except Exception:
+                pass
+            DAEMON_PID_FILE.unlink(missing_ok=True)
+            return 0
+        print(f"warning: systemctl stop exited {rc}; falling back to signal")
     if _LAUNCHAGENT_PLIST.exists() and _launchagent_loaded():
         rc = _launchctl_bootout()
         if rc == 0:
@@ -5570,7 +5701,8 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 _LAUNCHAGENT_LABEL = "ai.watchtower.watcher"
-_LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
+_DEFAULT_LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
+_LAUNCHAGENT_PLIST = _DEFAULT_LAUNCHAGENT_PLIST
 
 
 def _launchd_path() -> str:
@@ -6052,6 +6184,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
+    ("Worker protocol", "defer"),
 ]
 # `install` is intentionally absent: it's a hidden alias folded into `wt start`
 # (see cmd_start's first-time auto-install), not a command users need to type.
@@ -6077,6 +6210,7 @@ COMMAND_HELP: Dict[str, str] = {
     "close": "close a ticket (record how you fixed it)",
     "unresolved-ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
     "block": "park a ticket that needs a human decision",
+    "defer": "take a ticket out of the pool until a data window ends (no human needed)",
     "blocked": "list tickets parked for a human",
     "gated": "product-gate pitches awaiting your Ack/Nack",
     "ack": "approve a product-gate pitch (Ack); resolution-caveat acks moved to unresolved-ack",
@@ -6389,6 +6523,16 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--text", default="")
         subparser.add_argument("--url", default="")
         subparser.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
+        subparser.add_argument("--depth", default="", choices=list(q.VALID_DEPTHS) + [""],
+                               help="quick (default): fix-and-look work. deep: work you "
+                                    "can't judge by using the product (perf, chronic "
+                                    "regressions) -- the claim carries the deep-work brief: "
+                                    "evidence first, options memo, measured goal, budget + "
+                                    "stop rule. Set by owners and system filers, not by "
+                                    "workers filing follow-ups")
+        subparser.add_argument("--budget-min", type=int, default=0, dest="budget_min",
+                               help=f"deep tickets: working budget in minutes "
+                                    f"(default {q.DEEP_DEFAULT_BUDGET_MIN})")
         subparser.add_argument("--type", default="", choices=["bug", "feature", ""],
                                help="item type: bug or feature")
         subparser.add_argument("--readiness", default="",
@@ -6412,6 +6556,11 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--builder-model", default="", dest="model_floor",
                                help="alias of --model-floor: the builder model this "
                                     "ticket needs (WT-14)")
+        subparser.add_argument("--placement", default="", choices=list(q.VALID_PLACEMENTS) + [""],
+                               help="which machine may run this: mac (waits for the Mac), "
+                                    "cloud (Linux/VM only), any. Default: a Mac filer's "
+                                    "Xcode/iOS/simulator/browser keyword heuristic picks mac, "
+                                    "otherwise unrestricted")
         subparser.add_argument("--planner-model", default="", dest="planner_model",
                                help="model that plans this ticket (overrides the queue)")
         subparser.add_argument("--verifier-model", default="", dest="verifier_model",
@@ -6442,9 +6591,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--accept", default=None, metavar="LINE",
                    help="one plain-language acceptance line the verify gate "
                         "checks (falls back to the ticket text when empty)")
-    s.add_argument("--claim", action="store_true",
-                   help="immediately claim the new ticket (mark in_progress) so no "
-                        "auto-drain worker picks it up; use when you're already working it")
+    disposition = s.add_mutually_exclusive_group()
+    disposition.add_argument("--claim", action="store_true",
+                             help="immediately claim the new ticket (mark in_progress) so no "
+                                  "auto-drain worker picks it up; use when you're already working it")
+    disposition.add_argument("--run", action="store_true",
+                             help="request a run and dispatch now (like wt run): bypass "
+                                  "grace and auto-drain policy for this ticket; "
+                                  "dependencies, planning and worker capacity still apply")
     s.add_argument("--group-parent", action="store_true", dest="group_parent",
                    help="file a plan-group parent (WT-33): one plan for its members, "
                         "one integration check after they all close; never claimed")
@@ -6504,6 +6658,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "(FEAT-NEXT-120)")
     s.add_argument("--builder-model", default=None, dest="model_floor",
                    help="alias of --model-floor (WT-14)")
+    s.add_argument("--placement", default=None, choices=list(q.VALID_PLACEMENTS) + [""],
+                   help="which machine may run this: mac, cloud, any; empty clears")
     s.add_argument("--planner-model", default=None, dest="planner_model",
                    help="model that plans this ticket; empty clears")
     s.add_argument("--verifier-model", default=None, dest="verifier_model",
@@ -6526,6 +6682,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--clear-gates", action="store_true", dest="clear_gates",
                    help="drop this ticket's gate override (an empty override "
                         "= no gates; use --gate to set one)")
+    s.add_argument("--depth", default=None, choices=list(q.VALID_DEPTHS),
+                   help="quick or deep (deep = claim carries the deep-work brief)")
+    s.add_argument("--budget-min", type=int, default=None, dest="budget_min",
+                   help="deep tickets: working budget in minutes")
     s.add_argument("--queue", default=None,
                    help="move the ticket to a different queue in place, "
                         "reassigning its ref (WT-83); file-backed queues only")
@@ -6840,6 +7000,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_block)
 
+    s = sub.add_parser("defer", help=COMMAND_HELP.get("defer", ""))
+    s.add_argument("ref")
+    s.add_argument("--worker", default="", help="your session/worker id")
+    s.add_argument("--until", required=True,
+                   help="when the data window ends: +90m, +24h, +2d, or an ISO time "
+                        f"(at most {q.DEFER_MAX_S // 86400} days)")
+    s.add_argument("--reason", required=True,
+                   help="what data you are waiting for and why it is needed")
+    s.add_argument("--progress", default="",
+                   help="what you built and what the resuming worker should analyse")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_defer)
+
     s = sub.add_parser("blocked")
     s.add_argument("-q", "--queue", default=None)
     s.add_argument("--json", action="store_true")
@@ -6911,6 +7085,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("workers")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--all", action="store_true",
+                   help="also list dead records retained by design (rebind "
+                        "tombstones, recent stage records)")
     s.set_defaults(func=cmd_workers)
     workers_sub = s.add_subparsers(dest="workers_command")
     release_workers_parser = workers_sub.add_parser(

@@ -155,7 +155,7 @@ def _attempt(candidate, request, directory, timeout, limit):
     rc, out, err = _capture(argv, prompt, directory, timeout, limit, env)
     if engine == 'devin':
         if rc != 0:
-            return None, workers._quota_exhausted(out + '\n' + err)
+            return None, _failure_kind(out + '\n' + err)
         # The CLI prepends a login banner (with ANSI styling) to the reply;
         # the answer is the JSON object span within it.
         text = re.sub(r'\x1b\[[0-9;]*m', '', out)
@@ -163,18 +163,48 @@ def _attempt(candidate, request, directory, timeout, limit):
         try:
             structured = json.loads(text[start:end + 1] if 0 <= start < end else text.strip())
         except ValueError:
-            return None, False
+            return None, 'failed'
         return {'subtype': 'success', 'is_error': False, 'result': text.strip(),
-                'structured_output': structured, 'modelUsage': {}}, False
+                'structured_output': structured, 'modelUsage': {}}, ''
     if engine == 'claude':
         try:
             result = json.loads(out)
         except ValueError:
             result = {}
+        if not isinstance(result, dict):
+            result = {}
         failed = rc != 0 or result.get('is_error') or result.get('subtype') != 'success'
         if failed:
-            return None, workers._quota_exhausted(out + '\n' + err)
-        return result, False
+            # A non-zero exit that spent no tokens never reached a model
+            # answer (2026-10-01 digest: exit 1, api_error, zero tokens).
+            return None, _failure_kind(out + '\n' + err,
+                                       zero_tokens=rc != 0 and not _spent_tokens(result))
+        return result, ''
+
+
+# Provider-side faults worth trying the next profile model on. Matched on the
+# CLI's own result/stderr text; never echoed (inputs and replies stay private).
+_TRANSIENT_RX = re.compile(r'api_error|overloaded|API Error: (?:5\d\d|429)', re.I)
+
+
+def _spent_tokens(result):
+    usage = result.get('usage') if isinstance(result.get('usage'), dict) else {}
+    counts = [v for k, v in usage.items() if k.endswith('tokens') and type(v) in (int, float)]
+    for per_model in (result.get('modelUsage') or {}).values() if isinstance(result.get('modelUsage'), dict) else ():
+        if isinstance(per_model, dict):
+            counts += [v for k, v in per_model.items()
+                       if k in ('inputTokens', 'outputTokens') and type(v) in (int, float)]
+    return any(v > 0 for v in counts)
+
+
+def _failure_kind(text, zero_tokens=False):
+    """'quota' (account exhausted), 'transient' (provider/model fault, try the
+    next model), or 'failed' (do not spend another model on it)."""
+    if workers._quota_exhausted(text):
+        return 'quota'
+    if zero_tokens or _TRANSIENT_RX.search(text):
+        return 'transient'
+    return 'failed'
 
 
 def run(request):
@@ -215,14 +245,20 @@ def run(request):
         if candidate['engine'] not in ('claude', 'devin'):
             raise ModelRunError('profile_capability_unavailable: ' + candidate['engine'] + ' has no enforceable tools:none structured runner')
     trace = []
+    exhausted_engines = set()
     deadline = time.monotonic() + timeout
     with tempfile.TemporaryDirectory(prefix='wt-model-') as directory:
-        for candidate in candidates:
+        for index, candidate in enumerate(candidates):
+            if candidate['engine'] in exhausted_engines:
+                # Same account, same quota: another model there cannot recover.
+                trace.append({**candidate, 'status': 'skipped_quota_engine'})
+                continue
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise ModelRunError('model execution timed out')
-            result, quota = _attempt(candidate, request, directory, remaining, limit)
-            trace.append({**candidate, 'status': 'success' if result else ('quota_exhausted' if quota else 'failed')})
+            result, failure = _attempt(candidate, request, directory, remaining, limit)
+            trace.append({**candidate, 'status': 'success' if result else (
+                'quota_exhausted' if failure == 'quota' else failure or 'failed')})
             if result:
                 validate_schema(result.get('structured_output'), request['json_schema'])
                 model_usage = result.get('modelUsage') or {}
@@ -236,8 +272,14 @@ def run(request):
                                        'configured_model': candidate['model'],
                                        'actual_model': observed, 'attempts': trace}
                 return result
-            if not quota:
-                raise ModelRunError('model execution failed; fallback only applies to quota exhaustion')
+            if failure not in ('quota', 'transient'):
+                raise ModelRunError('model execution failed; fallback only applies to quota exhaustion or transient provider errors')
+            if failure == 'quota':
+                exhausted_engines.add(candidate['engine'])
+            if index + 1 < len(candidates):
+                import sys
+                print(f"wt model run: {request['profile']} {candidate['engine']}/{candidate['model']} "
+                      f"{trace[-1]['status']}; trying next profile model", file=sys.stderr)
     raise ModelRunError('all configured profile models exhausted')
 
 

@@ -61,7 +61,8 @@ _FROZEN: Dict[str, tuple] = {
     "gate_pending": ("none", "verify", "review"),
     "assessment": ("none", "due", "running", "filing", "done", "failed"),
     "block": ("none", "input", "rationale", "awaiting-client"),
-    "readiness": ("claimable", "needs-shaping", "needs-spec", "needs-rationale"),
+    # "deferred" is projection-only: inside a `wt defer` window (WT-15).
+    "readiness": ("claimable", "needs-shaping", "needs-spec", "needs-rationale", "deferred"),
     "dep": ("ok", "waiting", "stuck"),
     "claimed": _BOOLS,
     "parked": _BOOLS,
@@ -96,7 +97,7 @@ def live_vocab() -> Dict[str, tuple]:
         "disc": tuple(q.DISC_STATUSES), "awaiting": tuple(q.DISC_AWAITING),
         "gate_pending": tuple(q.GATE_KINDS), "assessment": tuple(q.ASSESSMENT_STATUSES),
         "block": ("none",) + tuple(q.BLOCK_KINDS),
-        "readiness": ("claimable",) + tuple(q.UNCLAIMABLE_READINESS),
+        "readiness": ("claimable",) + tuple(q.UNCLAIMABLE_READINESS) + ("deferred",),
         "dep": tuple(q.DEP_VERDICTS), "claimed": _BOOLS, "parked": _BOOLS,
         "answer": tuple(q.ANSWER_STATES),
         "group": ("none",) + tuple(q.GROUP_ROLES),
@@ -238,8 +239,12 @@ ROWS: Tuple[Row, ...] = (
           {"plan": "discussing", "disc": "active", "awaiting": ("none", "reviewer")}),
          status=_LIVE, gated=True, backend="file", block="none", answer=SETTLED),
     _row("human.readiness", "human", "-", "-", NOT_PA,
-         status="open", readiness=_not("readiness", "claimable"), block="none",
+         status="open", readiness=_not("readiness", "claimable", "deferred"), block="none",
          answer=SETTLED),
+    # `wt defer`: open but unclaimable until deferred_until, on purpose (WT-15).
+    # claim_next and health skip it too; the clock, not the pool, owns it.
+    _row("time.deferred", "time", "-", "-", NOT_PA,
+         status="open", readiness="deferred", block="none", answer=SETTLED),
     _row("dep.waiting", "dependency", "-", "-", _and(NOT_PA, _POOL_GROUP),
          status="open", readiness="claimable", dep="waiting", block="none", answer=SETTLED),
     _row("dep.stuck", "reconciler", "system_op", "_escalate_stuck_blockers", NOT_PA,
@@ -478,6 +483,8 @@ def project(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = 
         if readiness not in q.VALID_READINESS:
             raise UndeclaredState(f"undeclared readiness value {readiness!r}")
         readiness = "claimable"
+    if q.deferred_now(item, now):
+        readiness = "deferred"   # outranks shaping: nothing to do until it ends
     if item.get("blocked_by"):
         if by_ref is None:
             by_ref = q._refs_index(q.list_items())
@@ -686,6 +693,8 @@ def _transcript_mtime(engine: str, sid: str) -> float:
     return 0.0
 
 
+_TRANSCRIPT_ENGINES = ("claude", "codex", "kimi")
+
 RECENT_TRANSCRIPT_S = 120.0
 RECENT_SESSION_S = 600.0  # ambient claim: session files written this recently = working
 
@@ -762,7 +771,7 @@ def claim_owner(item: Dict[str, Any], ctx: Optional[ResolverContext] = None) -> 
 # Every write is a CAS (``queue.recover_claim`` / ``queue.pa_transition``).
 
 STALL_S = 1800.0
-_SKIP_OWNERS = ("human", "terminal", "dependency")
+_SKIP_OWNERS = ("human", "terminal", "dependency", "time")
 _LOOP_GUARDED = ("stage", "spawn", "reopen", "resume", "assessment_run_ops")
 # "1 tick" rows whose state can be transient between two writes of one
 # command (plan_verdict, then block) wait this long before acting.
@@ -815,10 +824,14 @@ def _file_activity(item: Dict[str, Any], ctx: "ResolverContext") -> float:
     cp = claim_proc_of(item) or {}
     sid = str(cp.get("session_id") or item.get("claimed_session_id") or "")
     if sid:
-        try:
-            ts.append(_transcript_mtime(str(cp.get("engine") or "claude"), sid))
-        except Exception:  # noqa: BLE001
-            pass
+        # An ambient claim records no engine (no worker record to copy it
+        # from), so its session may be a Codex rollout or Kimi wire as well
+        # as a Claude transcript: probe every engine rather than guess (OPS-102).
+        for engine in ([cp["engine"]] if cp.get("engine") else _TRANSCRIPT_ENGINES):
+            try:
+                ts.append(_transcript_mtime(str(engine), sid))
+            except Exception:  # noqa: BLE001
+                pass
     ss = item.get("stage_session") or {}
     if ss.get("worker_id"):
         rec = next((w for w in ctx.rows() if str(w.get("worker_id") or "") == ss["worker_id"]),

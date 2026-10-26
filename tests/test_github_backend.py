@@ -536,6 +536,118 @@ def test_github_backend_claim_by_ref_serializes_concurrent_claimants(tmp_path, m
     assert final["history"][0]["worker"] == winners[0]
 
 
+def test_issue_to_item_memo_sees_same_second_edit():
+    """WT-10: the memo was keyed on id(issue) + per-second updatedAt, so an
+    edit re-read within the same second (or a recycled dict id) served the
+    pre-edit item -- a claimed ticket read as open and two claimants won."""
+    from watchtower.github_backend import GitHubIssuesBackend
+
+    backend = GitHubIssuesBackend("GHI", repo="test-owner/test-repo")
+    issue = _fake_issue(1, "same second", body="work")
+    assert backend._issue_to_item(issue)["status"] == "open"
+    # Same object, same updatedAt: only the content changed.
+    issue["body"] = 'work\n\n<!-- watchtower\nclaimed_by: "worker-a"\n-->'
+    issue["labels"] = [{"name": "watchtower:in-progress"}]
+    item = backend._issue_to_item(issue)
+    assert item["status"] == "in_progress"
+    assert item["claimed_by"] == "worker-a"
+
+
+def _memo_backend(tmp_path, monkeypatch, issues, **kwargs):
+    """A backend whose raw lists are fixed objects, with an idle usage dir."""
+    import watchtower.github_backend as github_backend
+
+    usage_dir = tmp_path / "usage"
+    usage_dir.mkdir()
+    os.utime(usage_dir, (time.time() - 60, time.time() - 60))
+    monkeypatch.setenv("WATCHTOWER_USAGE_DIR", str(usage_dir))
+    github_backend.GitHubIssuesBackend._LIST_ITEMS_MEMO.clear()
+    backend = github_backend.GitHubIssuesBackend("GHI", repo="owner/repo", **kwargs)
+    raw = {"open": issues, "closed": []}
+    monkeypatch.setattr(backend, "_list_issues", lambda state, **_: raw[state])
+    conversions = []
+    real = backend._issue_to_item
+    monkeypatch.setattr(
+        backend, "_issue_to_item",
+        lambda issue: conversions.append(issue["number"]) or real(issue),
+    )
+    return backend, raw, conversions, usage_dir
+
+
+def test_list_items_memo_reuses_unchanged_listing(tmp_path, monkeypatch):
+    """WT-16: a tick lists each queue dozens of times off one cached issue
+    list; the converted result is reused, and callers get private copies."""
+    backend, _raw, conversions, _ = _memo_backend(
+        tmp_path, monkeypatch, [_fake_issue(1, "one"), _fake_issue(2, "two")]
+    )
+    first = backend.list_items()
+    assert conversions == [1, 2]
+    first[0]["status"] = "mutated by caller"
+    second = backend.list_items()
+    assert conversions == [1, 2]
+    assert [it["status"] for it in second] == ["open", "open"]
+    # status/lane are part of the key.
+    backend.list_items(status="open")
+    assert conversions == [1, 2, 1, 2]
+
+
+def test_list_items_memo_invalidates_on_new_listing_or_ledger_write(tmp_path, monkeypatch):
+    backend, raw, conversions, usage_dir = _memo_backend(
+        tmp_path, monkeypatch, [_fake_issue(1, "one")]
+    )
+    backend.list_items()
+    raw["open"] = [_fake_issue(1, "one", body="edited")]  # poller refreshed
+    backend.list_items()
+    assert conversions == [1, 1]
+    os.utime(usage_dir, (time.time() - 30, time.time() - 30))  # a ledger was replaced
+    backend.list_items()
+    assert conversions == [1, 1, 1]
+    # A just-touched dir is not trusted (coarse mtimes): no memo at all.
+    os.utime(usage_dir, None)
+    backend.list_items()
+    backend.list_items()
+    assert conversions == [1, 1, 1, 1, 1]
+
+
+def test_list_items_memo_expires_when_an_issue_leaves_its_grace_period(tmp_path, monkeypatch):
+    import watchtower.github_backend as github_backend
+
+    young = _fake_issue(1, "young")
+    young["createdAt"] = github_backend.datetime.now(github_backend.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    backend, _raw, _conv, _ = _memo_backend(
+        tmp_path, monkeypatch, [young], auto_drain=True, grace_s=10
+    )
+    assert backend.list_items()[0]["auto_eligible"] is False
+    (entry,) = github_backend.GitHubIssuesBackend._LIST_ITEMS_MEMO.values()
+    assert entry[3] <= time.time() + 10
+
+
+def test_persisted_list_reparse_keeps_unchanged_lists_identical(tmp_path, monkeypatch):
+    """WT-16: every repo's poll rewrites the shared cache file; a re-parse must
+    not hand out a new object for a repo whose list did not change, or the
+    list_items memo misses on every poll."""
+    import watchtower.github_backend as github_backend
+
+    cache = tmp_path / "gh-list-cache.json"
+    monkeypatch.setenv("WATCHTOWER_GH_LIST_CACHE_FILE", str(cache))
+    importlib.reload(github_backend)
+    a, b = [_fake_issue(1, "a")], [_fake_issue(2, "b")]
+    cache.write_text(json.dumps({"x:open": {"at": 1, "data": a}, "y:open": {"at": 1, "data": b}}))
+    first = github_backend._read_persisted_list_cache()
+    cache.write_text(json.dumps({
+        "x:open": {"at": 2, "data": a},
+        "y:open": {"at": 2, "data": [_fake_issue(2, "b edited")]},
+    }))
+    os.utime(cache, ns=(time.time_ns(), time.time_ns() + 1_000_000))
+    second = github_backend._read_persisted_list_cache()
+    assert second["x:open"]["at"] == 2
+    assert second["x:open"]["data"] is first["x:open"]["data"]
+    assert second["y:open"]["data"] is not first["y:open"]["data"]
+    assert second["y:open"]["data"][0]["title"] == "b edited"
+
+
 def test_claim_next_falls_through_stale_closed_candidate(tmp_path, monkeypatch):
     """OPS-841: a candidate that is open in the listing snapshot but already
     closed by the time claim_by_ref re-reads it (closed between list and
@@ -1397,6 +1509,49 @@ def test_github_backend_lists_issues_closed_within_last_14_days(tmp_path, monkey
         arg.startswith("closed:>=")
         for arg in closed_lists[0]
     )
+
+
+@pytest.mark.parametrize("auto_drain", [False, True])
+@pytest.mark.parametrize("opted_out", [False, True])
+def test_github_add_run_bypasses_grace_without_changing_policy(tmp_path, monkeypatch, auto_drain, opted_out):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    config.set_auto_drain("GHI", auto_drain)
+    import watchtower.cli as cli
+    import watchtower.workers as workers
+    importlib.reload(cli)
+    dispatched = []
+
+    if opted_out:
+        enqueue = q.enqueue
+
+        def enqueue_opted_out(**kwargs):
+            item = enqueue(**kwargs)
+            data = json.loads(state.read_text())
+            data["issues"][0]["labels"].append("watchtower:no-auto-drain")
+            state.write_text(json.dumps(data))
+            return item
+
+        monkeypatch.setattr(q, "enqueue", enqueue_opted_out)
+
+    def dispatch(queue, ref):
+        item = q.get(ref)
+        assert item["run_requested"] is True
+        assert item["manual_eligible"] is True
+        assert item["no_auto_drain"] is opted_out
+        assert item["auto_eligible"] is False  # new issue still inside grace
+        assert item["claimable"] is True
+        dispatched.append((queue, ref))
+        return "immediate dispatch"
+
+    monkeypatch.setattr(workers, "dispatch_after_enqueue", dispatch)
+    assert cli.main(["add", "-q", "GHI", "--title", "Run during grace", "--run"]) == 0
+    assert dispatched == [("GHI", "GHI-1")]
+    assert "watchtower:play" in json.loads(state.read_text())["issues"][0]["labels"]
+    assert config.auto_drain("GHI") is auto_drain
+    assert config.grace_s("GHI") == 180
 
 
 def test_github_backend_refuses_direct_claim_until_a_run_is_requested(tmp_path, monkeypatch):
@@ -3562,3 +3717,49 @@ def test_after_gates_claim_on_github_backed_queue(tmp_path, monkeypatch):
     q.update("GHI-3", blocked_by=[])
     assert q.get("GHI-3")["blocked_by"] == []
     assert q.claim_next("worker-3", project="GHI")["ref"] == "GHI-3"
+
+
+def test_cross_queue_after_waits_and_wakes_without_human_input(tmp_path, monkeypatch):
+    """OPS-74: GitHub queue dependencies gate depth and explicit claims."""
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    for name in ("GHI", "UPSTREAM"):
+        config.set_backend(name, "github")
+        config.set_github_repo(name, "test-owner/test-repo")
+        _drainable(config, name)
+    upstream = q.enqueue(project="UPSTREAM", title="release", note="n", text="b")
+    ref = upstream["ref"]
+    dependent = q.enqueue(project="GHI", title="verify production", note="n", text="b",
+                          blocked_by=[ref])
+    dep = dependent["ref"]
+    assert q.get(dep)["needs_input"] is False
+    assert q.count_claimable(project="GHI") == 0
+    assert q.claim_next("downstream", project="GHI") is None
+    with pytest.raises(ValueError, match="waiting"):
+        q.claim_by_ref(dep, "downstream")
+    with pytest.raises(ValueError, match="cycle"):
+        q.update(ref, blocked_by=[dep])
+    with pytest.raises(ValueError, match="does not exist"):
+        q.update(dep, blocked_by=["UPSTREAM-999"])
+    q.claim_by_ref(ref, "upstream")
+    q.close(ref, "upstream", resolution={"summary": "deployed", "no_code": True})
+    assert q.count_claimable(project="GHI") == 1
+    assert q.claim_next("downstream", project="GHI")["ref"] == dep
+
+
+def test_cross_queue_after_does_not_wake_for_unresolved_completion(tmp_path, monkeypatch):
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    blocker = q.enqueue(project="LOCAL", title="release", note="n", text="b")
+    dep = q.enqueue(project="GHI", title="verify", note="n", text="b",
+                    blocked_by=[blocker["ref"]])["ref"]
+    q.claim_by_ref(blocker["ref"], "upstream")
+    q.close(blocker["ref"], "upstream", resolution={
+        "summary": "partial", "no_code": True, "unresolved": ["LOCAL-99 pending"]})
+    assert q.count_claimable(project="GHI") == 0
+    assert q.claim_next("downstream", project="GHI") is None
+    with pytest.raises(ValueError, match="stuck"):
+        q.claim_by_ref(dep, "downstream")

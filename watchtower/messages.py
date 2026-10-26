@@ -1324,28 +1324,28 @@ def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, 
 
 
 def compact_codex(resolved: Dict[str, Any]) -> Dict[str, Any]:
-    """Trigger real context compaction on a codex thread via the app-server's
-    native ``thread/compact/start`` RPC (``codex_rpc.compact``).
+    """Compact through the configured CCC owner, or WT's standalone RPC.
 
-    Standalone-only for now, unlike ``deliver``'s adapter chain: when a
-    delegate (CCC) is configured for delegate-first codex brokering, WT must
-    not open a second app-server against a thread CCC already owns (same
-    invariant ``_deliver_codex_app_server`` protects for plain delivery), and
-    CCC's ``/api/inject-input`` delegate endpoint only injects chat text --
-    it has no way to forward a structural RPC like ``thread/compact/start``.
-    So compact mode is unavailable in that configuration until CCC grows its
-    own compact-forwarding endpoint; callers should fall back to
-    ``--mode mdfile`` there instead of guessing at a workaround."""
-    if _codex_delegate_first_enabled() and _delegate_base():
-        return {
-            "ok": False,
-            "error": "compact mode isn't available for Codex when a delegate "
-                     "(CCC) is configured for delegate-first brokering; "
-                     "use --mode mdfile instead",
-        }
-    sid = str(resolved.get("session_id") or "")
+    A managed thread must stay on its owner's app-server. Use CCC's native
+    compact endpoint rather than sending slash-command text or opening a
+    competing private app-server. Delegate failures never fall back locally.
+    """
+    sid = str(resolved.get("session_id") or "").strip()
     if not sid:
         return {"ok": False, "error": "codex compact needs a thread/session id"}
+    base = _delegate_base() if _codex_delegate_first_enabled() else None
+    if base:
+        try:
+            # CCC waits for compaction to finish, including the rollout flush.
+            result = _post_json(
+                base + "/api/session/compact", {"session_id": sid}, timeout_s=360,
+            )
+        except Exception as e:  # transport failure must not change ownership
+            return {"ok": False, "error": f"delegate compact failed: {e}"}
+        if result.get("ok") is not True:
+            return {**result, "ok": False,
+                    "error": result.get("error") or "delegate compact rejected"}
+        return {**result, "transport": "delegate-compact"}
     try:
         from . import codex_rpc
     except ImportError:

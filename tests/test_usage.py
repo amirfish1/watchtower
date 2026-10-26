@@ -58,6 +58,17 @@ def test_missing_fields_and_zero_are_distinct(tmp_path):
     assert usage.parse(str(tmp_path / "missing"), "claude")["status"] == "unavailable"
 
 
+def test_parse_memo_tracks_file_changes_and_is_not_shared(tmp_path):
+    p = tmp_path / "session.jsonl"
+    write(p, [claude("m1")])
+    first = usage.parse(str(p), "claude")
+    first["units"].clear()  # a caller's mutation must not poison the memo
+    assert list(usage.parse(str(p), "claude")["units"]) == ["m1"]
+    write(p, [claude("m1"), claude("m2")])
+    assert list(usage.parse(str(p), "claude")["units"]) == ["m1", "m2"]
+    assert usage.parse(str(p), "codex")["status"] == "missing"  # keyed by engine too
+
+
 def test_codex_missing_cache_does_not_invent_ordinary_input(tmp_path):
     p = tmp_path / "rollout-test.jsonl"
     row = codex(100, 40, 10)
@@ -198,6 +209,31 @@ def test_late_usage_shared_across_tickets_is_not_double_counted(measured, tmp_pa
     assert second["token_usage"]["totals"]["input"] == 30
     assert first["token_usage"]["attempts"][0]["completeness"] == "ambiguous_shared_session"
     assert "late_observed" in usage._read(usage._location(first))["token_usage"]["attempts"][0]
+    # A pass with no new telemetry leaves the ledger untouched (WT-9).
+    stamp = usage._location(first).stat().st_mtime_ns
+    usage.reconcile()
+    assert usage._location(first).stat().st_mtime_ns == stamp
+
+
+def test_quiet_pass_skips_pending_ledger_until_it_can_settle(measured, tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_USAGE_DIR", str(tmp_path / "usage"))
+    item = {"ref": "TOK-1", "history": []}
+    usage.capture(item, usage.on_event, {"event": "claim", "at": "t0", "by": {"worker": "w"}})
+    write(measured, [claude("preexisting"), claude("work", inp=20)])
+    usage.capture(item, usage.on_event, {"event": "close", "at": "t1", "by": {"worker": "w"}})
+    path = usage._location(item)
+    usage.reconcile()  # session still live: nothing to settle
+    reads = []
+    real_read = usage._read
+    monkeypatch.setattr(usage, "_read", lambda p, **k: (reads.append(p), real_read(p, **k))[1])
+    usage.reconcile()
+    assert path not in reads  # WT-12: an unchanged, unsettleable ledger is not re-decoded
+    write(measured, [claude("preexisting"), claude("work", inp=20), claude("late", inp=7),
+                     {"type": "result"}])
+    usage.reconcile()
+    usage.attach(item)
+    assert item["token_usage"]["totals"]["input"] == 27
+    assert item["token_usage"]["completeness"] == "complete"
 
 
 def test_github_namespace_isolates_same_ref_and_safe_metadata(measured, tmp_path, monkeypatch):

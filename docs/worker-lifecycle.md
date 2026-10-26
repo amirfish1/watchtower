@@ -209,6 +209,31 @@ in-progress or blocked work, the strict queue read fails, its PID identity is
 not attributable, or required activity evidence is unavailable. WatchTower
 never sends `SIGTERM` or `SIGKILL` as part of normal queue release.
 
+### Released-worker garbage collection
+
+Release preserves the conversation for a bounded time. On each full periodic
+reconcile pass, `reap_released_workers()` sends SIGTERM to workers released at
+least `WATCHTOWER_RELEASED_TTL_S` seconds ago (default **3600**, one hour).
+Survivors receive SIGKILL on the first pass at least **30 seconds** after
+SIGTERM. These intervals are measured from persisted timestamps, so restarting
+the daemon does not restart the countdown. Set the TTL in the daemon's
+environment before starting it. Queue-scoped dispatch and dry runs skip GC.
+
+For legacy records or a release interrupted between writing the sentinel and
+the registry, the reaper recovers a missing `released_at` from the stop file's
+modification time. It persists that timestamp even before expiry, preserving
+the deadline after the worker consumes the sentinel. An existing `released_at`
+always wins; missing, unreadable or non-file sentinels establish no deadline.
+
+The reaper checks process identity before either signal and defers when
+identity is unknown. A reused PID is skipped and logged. It signals the whole
+process group only when the worker leads that group; otherwise it signals the
+worker PID. Fresh parked-ticket and answer ownership keep their existing grace
+window. `GC_RELEASED` records the action, signal scope and release age;
+`GC_SKIPPED` records PID reuse. The adjacent sentinel sweep removes stop files
+whose workers are gone. This bounds released-worker lifetime; active staffing
+continues to use each queue's desired worker count.
+
 ### Context recycle (claim-time)
 
 `wt claim` answers `{"stop": true, "reason": "context_budget"}` to a

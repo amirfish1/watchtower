@@ -18,11 +18,13 @@ queue ground-truth.
 from __future__ import annotations
 
 import json
+import glob as _glob
 import hashlib
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -364,15 +366,23 @@ SUMMARY_STYLE = (
 # follow-up/unresolved item that cites no ticket ref.
 # No braces: safe for the templates' .format() calls.
 CLOSE_COMPLETENESS = (
-    "CLOSED MEANS DONE: close a ticket only when every part it asks for has "
-    "actually happened. A data repair, backfill, migration or script you "
-    "wrote but did not run is NOT done; a conclusion you did not verify "
-    "against the real source is NOT done. If you could not finish a part, "
-    "either keep the ticket open with `wt block`, or close it only after "
+    "CLOSED MEANS DONE: done means the reason the ticket was filed has gone "
+    "away -- the symptom it reports no longer reproduces -- not that you "
+    "fixed one plausible cause of it. Close a ticket only when every part it "
+    "asks for has actually happened. A data repair, backfill, migration or "
+    "script you wrote but did not run is NOT done; a conclusion you did not "
+    "verify against the real source is NOT done. If you could not finish a "
+    "part, either keep the ticket open with `wt block`, or close it only after "
     "filing a NEW ticket for each unfinished part (`wt add -q <QUEUE> "
     "--title ... --note ...` with enough context to pick it up cold) and "
     "citing that ref in its --unresolved/--follow-up item -- `wt close` "
-    "rejects any item that cites no ticket ref. ENVIRONMENT BLOCKERS: when "
+    "rejects any item that cites no ticket ref. A follow-up may carry "
+    "genuinely separate work, NEVER the ticket's own goal: if the symptom "
+    "the ticket exists for still reproduces, do not close it with the rest "
+    "moved to a follow-up -- keep it open (`wt block`, or `wt defer` while "
+    "data accumulates). When you close with a part of the ask left "
+    "unfinished, start the --summary with 'PARTIAL:' so it never reads as "
+    "success. ENVIRONMENT BLOCKERS: when "
     "the blocker is infrastructure -- missing or failing credentials (e.g. "
     "no production DB access, empty env pull), a broken CLI/MCP/tool, or a "
     "sandbox limit -- ALSO file an OPS ticket: run "
@@ -380,6 +390,26 @@ CLOSE_COMPLETENESS = (
     "script exists on this host, otherwise `wt add -q OPS --title \"...\" "
     "--note \"host, what failed, exact error\"`, and cite the OPS ref too. "
     "Never just describe a blocker in prose and close. "
+)
+
+# Working-mode contract injected into both goal templates. Depth is set by
+# the filer (owner / system filers), never guessed by the worker; a deep
+# claim's JSON carries ``deep_brief`` (watchtower/deep.py). No braces: safe
+# for the templates' .format() calls.
+DEPTH_CONTRACT = (
+    "TICKET DEPTH: a claimed ticket is quick (the default) or deep. QUICK "
+    "means fix-and-look: no design step, and verification proportionate to "
+    "the change -- a focused test or a quick look is enough; the owner uses "
+    "the product and sees within minutes whether it is right, so do not spin "
+    "up a full browser reproduction for a small UI tweak. DEEP: if the claim "
+    "JSON has a deep_brief field, follow it -- it overrides these quick "
+    "defaults (evidence first, an options memo that includes product "
+    "options, a measured goal, a time budget and a stop rule; use `wt defer "
+    "<ref> --until ... --reason ...` to wait for data instead of guessing). "
+    "If a quick ticket turns out to be structural -- the symptom cannot be "
+    "removed by a contained fix -- do not ship a token fix and close: "
+    "`wt block` it asking the owner to promote it to deep, with what you "
+    "found. "
 )
 
 # Push contract injected into both goal templates. Deployment pulls from
@@ -460,7 +490,7 @@ DRAIN_GOAL_TEMPLATE = (
     "\"...\"` for anything you could not fix (each flag is repeatable). This "
     "resolution is the trust signal the dashboard surfaces; a close without "
     "--summary will be rejected with exit code 1. "
-    + SUMMARY_STYLE + CLOSE_COMPLETENESS +
+    + SUMMARY_STYLE + CLOSE_COMPLETENESS + DEPTH_CONTRACT +
     "If a ticket genuinely cannot be resolved without a human decision, do NOT "
     "close it and do NOT guess: run `wt block <ref> --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
@@ -507,7 +537,7 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "\"what you changed\" --commit <SHA>` (or `--no-code`). Add `--caveat \"...\"` for anything to watch out "
     "for, `--follow-up \"...\"` for notable next steps, and `--unresolved "
     "\"...\"` for anything you could not fix (each flag is repeatable). "
-    + SUMMARY_STYLE + CLOSE_COMPLETENESS +
+    + SUMMARY_STYLE + CLOSE_COMPLETENESS + DEPTH_CONTRACT +
     "If it genuinely cannot be resolved without a human decision, do NOT "
     "close it and do NOT guess: run `wt block {ref} --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
@@ -946,9 +976,12 @@ def _claude_transcript_mtime(w: Dict[str, Any]) -> float:
     )
     newest = 0.0
     try:
-        for path in (claude_home / "projects").glob(f"*/{session_id}.jsonl"):
+        # glob.glob, not Path.glob: the latter lists every project dir's
+        # thousands of transcripts (~15 ms per call vs <1 ms; WT-17).
+        for path in _glob.glob(os.path.join(_glob.escape(str(claude_home / "projects")),
+                                            "*", f"{_glob.escape(session_id)}.jsonl")):
             try:
-                newest = max(newest, path.stat().st_mtime)
+                newest = max(newest, os.stat(path).st_mtime)
             except OSError:
                 continue
     except OSError:
@@ -1155,6 +1188,26 @@ def _kimi_wire_mtime(w: Dict[str, Any]) -> float:
     except OSError:
         return 0.0
     return newest
+
+
+def session_active_age_s(w: Dict[str, Any], rows: List[Dict[str, Any]],
+                         now: Optional[float] = None) -> Optional[float]:
+    """Seconds since a dead-PID row's session transcript was last written, when
+    that is recent enough to mean a resumed session is still working (WT-17).
+
+    Display evidence only: ``alive`` stays PID-based because release, kill and
+    staffing act on that process. None when the row is alive, has no session,
+    the transcript is quiet, or a live row already owns the session."""
+    sid = str(w.get("session_id") or "")
+    if w.get("alive") or not sid:
+        return None
+    if any(r.get("alive") and str(r.get("session_id") or "") == sid for r in rows):
+        return None
+    now = time.time() if now is None else now
+    from . import liveness
+    mtime = max(_codex_rollout_mtime(w), _claude_transcript_mtime(w), _kimi_wire_mtime(w))
+    age = now - mtime
+    return age if mtime and age < liveness.RECENT_SESSION_S else None
 
 
 def _worker_idle_s(w: Dict[str, Any]) -> float:
@@ -2813,7 +2866,11 @@ def _worker_pid_identity(w: Dict[str, Any], pid: int) -> str:
     Records outlive their process (rebound rows are never pruned) and Linux
     hosts wrap pid_max within days, so a bare pid is not an identity. The
     recorded start token is authoritative; rows without one fall back to
-    checking that argv still names the worker's engine."""
+    checking that argv still names the worker's engine. A record started
+    before the last boot never matches: after a restart its pid may name
+    another live session of the same engine."""
+    if started_before_boot(w):
+        return "mismatch"
     recorded = str(w.get("pid_started") or "")
     if recorded:
         current = _pid_start_token(pid)
@@ -2863,6 +2920,45 @@ def _fresh_park_owners(now: float) -> set:
     return ids
 
 
+_IDLE_RENUDGE_S = 120.0
+_idle_renudged_at: Dict[str, float] = {}
+
+
+def _renudge_idle_workers(
+    queue: str, live: List[Dict[str, Any]], not_idle_ids: Set[str],
+    now: Optional[float] = None,
+) -> int:
+    """Wake idle workers when claimable work exists but nobody was told.
+
+    Dispatch nudges once, when a ticket is filed. A ticket filed inside the
+    queue's ``grace_s`` is not claimable then, so that nudge reaches nobody,
+    and nothing nudged again once grace expired: the ticket sat open while
+    live workers idled (BYM-FUTURE-2399). The reconcile tick has already
+    established claimable depth > 0, so push idle workers to `wt claim`.
+    Rate-limited per queue so a worker that cannot take the work is not
+    nagged every tick."""
+    now = time.time() if now is None else now
+    if now - _idle_renudged_at.get(queue, 0.0) < _IDLE_RENUDGE_S:
+        return 0
+    idle = {
+        str(w.get("worker_id") or "") for w in live
+        if str(w.get("worker_id") or "") not in not_idle_ids
+    } - {""}
+    if not idle:
+        return 0
+    from . import config
+    claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
+    nudge = (
+        f"{queue} has claimable work. Claim it with `wt claim -q {queue} "
+        f"--worker <your-id>{claim_filter} --json` and drain the queue."
+    )
+    _idle_renudged_at[queue] = now
+    try:
+        return notify_workers(queue, nudge, only=idle)
+    except Exception:
+        return 0
+
+
 def reap_released_workers(
     ttl_s: float = RELEASED_TTL_S,
     kill_grace_s: float = _RELEASED_KILL_GRACE_S,
@@ -2884,6 +2980,10 @@ def reap_released_workers(
     stop-signal sentinel is dropped once the process is confirmed dead, so
     ``stop-signals/`` does not accumulate orphans for it.
 
+    Older releases and an interrupted ``request_stop`` may have only a stop
+    sentinel. Recover their missing ``released_at`` from the sentinel mtime
+    and persist it, so consuming that one-shot file cannot reset the TTL.
+
     Never signals a pid that no longer belongs to the worker (see
     ``_worker_pid_identity``): such a row is marked ``gc_skipped`` and logged
     once as GC_SKIPPED. Signals go to the worker's whole process group when it
@@ -2893,7 +2993,10 @@ def reap_released_workers(
     ``{"worker_id", "queue", "pid", "action": "sigterm"|"sigkill",
     "scope": "group"|"pid", "released_age_s"}``.
     """
-    now = time.time() if now is None else float(now)
+    # Stamp SIGTERM at signal time even if ownership discovery was slow.
+    # An explicit now supplies a fixed clock for deterministic callers.
+    clock = time.time if now is None else lambda: float(now)
+    now = clock()
     actions: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
     # Computed once per pass, on first need: each call lists every ticket in
@@ -2908,13 +3011,27 @@ def reap_released_workers(
         data = _load()
         changed = False
         for row in data["workers"]:
-            released_at = str(row.get("released_at") or "")
-            if not released_at or row.get("gc_skipped"):
+            if row.get("gc_skipped"):
                 continue
+            worker_id = str(row.get("worker_id") or "")
+            released_at = str(row.get("released_at") or "")
+            if not released_at:
+                if not worker_id:
+                    continue
+                try:
+                    sentinel = (STOP_SIGNALS_DIR / worker_id).stat()
+                    if not stat.S_ISREG(sentinel.st_mode):
+                        continue
+                    released_at = datetime.fromtimestamp(
+                        sentinel.st_mtime, timezone.utc,
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except (OSError, ValueError, OverflowError):
+                    continue  # no readable release evidence; leave attached
+                row["released_at"] = released_at
+                changed = True
             age_s = _iso_age_s(released_at, now)
             if age_s < ttl_s:
                 continue
-            worker_id = str(row.get("worker_id") or "")
             if fresh_owners is None:
                 fresh_owners = _fresh_park_owners(now)
             if worker_id in fresh_owners:
@@ -2948,7 +3065,7 @@ def reap_released_workers(
             if kill_sent_at:
                 _cleanup_stop_signal(worker_id)
             else:
-                row["gc_kill_sent_at"] = datetime.now(timezone.utc).strftime(
+                row["gc_kill_sent_at"] = datetime.fromtimestamp(clock(), timezone.utc).strftime(
                     "%Y-%m-%dT%H:%M:%SZ"
                 )
                 changed = True
@@ -4064,6 +4181,59 @@ def claude_session_row_liveness(row: Dict[str, Any]) -> Tuple[str, str]:
     return "alive", ""
 
 
+_BOOT_TIME: Optional[float] = None
+BOOT_SLACK_S = 60.0  # the kernel's boot time drifts a little with clock corrections
+
+
+def boot_time() -> float:
+    """When this machine last booted (epoch seconds; 0.0 when unknown).
+    Read once per process: it cannot change while the process runs."""
+    global _BOOT_TIME
+    if _BOOT_TIME is None:
+        _BOOT_TIME = 0.0
+        try:
+            with open("/proc/stat") as fh:
+                for line in fh:
+                    if line.startswith("btime "):
+                        _BOOT_TIME = float(line.split()[1])
+                        break
+        except OSError:
+            try:
+                out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+                                     text=True, timeout=2).stdout
+                m = re.search(r"sec = (\d+)", out)
+                _BOOT_TIME = float(m.group(1)) if m else 0.0
+            except Exception:  # noqa: BLE001
+                _BOOT_TIME = 0.0
+    return _BOOT_TIME
+
+
+def started_before_boot(rec: Dict[str, Any]) -> bool:
+    """True when ``rec`` (a worker record or ``claim_proc``) was started
+    before the last boot: its process cannot still be running, whatever now
+    holds its pid. A restart (an update, a crash, a preempted cloud VM)
+    leaves records with pids the new boot hands out again."""
+    boot = boot_time()
+    if not boot:
+        return False
+    started = 0.0
+    token = " ".join(str(rec.get("pid_started") or "").split())
+    if token:
+        # The process's own start (``ps -o lstart``, local time) beats the
+        # record's write time when we have it.
+        try:
+            return time.mktime(time.strptime(token, "%a %b %d %H:%M:%S %Y")) < boot - BOOT_SLACK_S
+        except (ValueError, OverflowError):
+            pass
+    for key in ("started_at", "record_started_at"):
+        try:
+            raw = str(rec.get(key) or "").replace("Z", "+00:00")
+            started = max(started, datetime.fromisoformat(raw).timestamp() if raw else 0.0)
+        except ValueError:
+            continue
+    return bool(started) and started < boot - BOOT_SLACK_S
+
+
 def _pid_alive(pid: int) -> bool:
     """Check if a process is truly alive (not a zombie).
 
@@ -4082,7 +4252,17 @@ def _pid_alive(pid: int) -> bool:
         return False
 
     # Process exists, but check if it's a zombie (defunct).
-    # On macOS, use ps; on Linux, check /proc.
+    # On Linux read /proc (no fork: the reconciler probes ~1.3k pids a tick,
+    # WT-12); elsewhere (macOS) ask ps.
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as f:
+            # "pid (comm) S ..."; comm may itself contain ") ".
+            return f.read().rsplit(b")", 1)[1].split()[0] != b"Z"
+    except FileNotFoundError:
+        if os.path.isdir("/proc/self"):
+            return False  # exited between the kill probe and the read
+    except (OSError, IndexError):
+        pass
     try:
         import subprocess
         result = subprocess.run(
@@ -4121,6 +4301,9 @@ def record_liveness(rec: Dict[str, Any], exit_file: str = "") -> Tuple[str, str,
         why = (f"killed by signal {sig}" if sig else
                "exited without submitting" if not rc else f"exited rc {rc}")
         return "dead", why, {"rc": rc, "signal": sig, "ended_at": exit_info["ended_at"]}
+    if started_before_boot(rec):
+        ended = datetime.fromtimestamp(boot_time(), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return "dead", "machine restarted since it started", {"ended_at": ended}
     alive = rec["alive"] if "alive" in rec else _pid_alive(int(rec.get("pid") or 0))
     if not alive:
         return "dead", "process gone" + (" (wrapper missing ended_at: killed along with it)"
@@ -4170,6 +4353,30 @@ def _find_engine_ancestor_pid(engine: str, max_depth: int = 8) -> int:
         except (OSError, ValueError, subprocess.SubprocessError):
             return 0
     return 0
+
+
+def _pid_is_descendant(pid: int, ancestor: int, max_depth: int = 8) -> bool:
+    """True when ``ancestor`` appears in ``pid``'s parent chain.
+
+    The Codex npm launcher is a node wrapper that spawns the native codex
+    binary, so a worker recorded under the wrapper pid and an ancestor lookup
+    that lands on the child are the same live session, not a concurrent rebind.
+    """
+    cur = int(pid or 0)
+    for _ in range(max_depth):
+        if cur <= 1:
+            return False
+        try:
+            out = subprocess.run(
+                ["ps", "-p", str(cur), "-o", "ppid="],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+            cur = int(out)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+        if cur == int(ancestor):
+            return True
+    return False
 
 
 def rebind_continued_worker(
@@ -4265,6 +4472,14 @@ def rebind_continued_worker(
             recorded_pid = int(worker.get("pid") or 0)
             if recorded_pid == int(pid):
                 return True
+            if (
+                recorded_pid
+                and _pid_alive(recorded_pid)
+                and _pid_is_descendant(int(pid), recorded_pid)
+            ):
+                # Same session: recorded pid is the launcher wrapper of the
+                # live engine process we found. Not a rebind.
+                return True
             if worker.get("rebound_at"):
                 raise ValueError(
                     f"worker {worker_id!r} was already continued once "
@@ -4330,7 +4545,21 @@ def record_worker(
             rec["exit_file"] = exit_file
         if session_id:
             rec["session_id"] = session_id
-        data["workers"].append(rec)
+        # The worker's own first `wt claim` can win the race against this
+        # write and rebind_continued_worker() then appends a stub row for the
+        # same worker_id/pid. Merge into it rather than adding a second row:
+        # two rows double-counted one process as two live workers, so the
+        # queue read as fully staffed with a released (un-nudgeable) twin.
+        stub = next(
+            (row for row in data["workers"]
+             if row.get("worker_id") == worker_id
+             and int(row.get("pid") or 0) == int(pid)),
+            None,
+        )
+        if stub is not None:
+            stub.update({k: v for k, v in rec.items() if v not in ("", None)})
+        else:
+            data["workers"].append(rec)
         _save(data)
     # Ledger the worker_id now, at spawn time, so it survives this record being
     # pruned once the worker dies (see WORKER_IDS_FILE docstring above).
@@ -4406,7 +4635,7 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                     # failure streak so the next one starts from the default.
                     recovered.append((str(w.get("queue") or ""),
                                       str(w.get("engine") or "")))
-            alive = _pid_alive(int(w.get("pid", 0)))
+            alive = _pid_alive(int(w.get("pid", 0))) and not started_before_boot(w)
             # Rebound rows are kept after their process dies (see below), so
             # their pid can be reused by an unrelated process; don't let that
             # stranger read as this worker. Other dead rows are pruned on this
@@ -4643,12 +4872,15 @@ def parked_label(item: Dict[str, Any]) -> str:
             f"at {pk.get('at') or '-'}")
 
 
-def retained_counts(rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, int]:
+def retained_counts(
+    rows: Optional[List[Dict[str, Any]]] = None,
+    items: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, int]:
     """Per-queue count of live workers retained for a parked answer (WT-28),
     shown next to ``live`` in status / the dashboard. ``rows`` reuses an
     already-listed roster instead of taking workers.lock again (WT-4)."""
     try:
-        retained = retained_parked_ids()
+        retained = retained_parked_ids(items=items)
     except Exception:
         return {}
     out: Dict[str, int] = {}
@@ -4660,16 +4892,20 @@ def retained_counts(rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, in
 
 
 def live_worker_count(queue: Optional[str] = None, exclude: Optional[set] = None) -> int:
-    n = 0
+    seen: Set[str] = set()
     for w in list_workers():
         if not w.get("alive") or _worker_released(w):
             continue
         if queue and w.get("queue") != queue:
             continue
-        if exclude and str(w.get("worker_id") or "") in exclude:
+        wid = str(w.get("worker_id") or "")
+        if exclude and wid in exclude:
             continue
-        n += 1
-    return n
+        # Duplicate registry rows for one worker must not read as two live
+        # workers: that made `wt claim` call a legitimate worker "surplus"
+        # (4>2 desired with only 2 workers) and release it.
+        seen.add(wid or f"anon-{len(seen)}")
+    return len(seen)
 
 
 def worker_counts(prune: bool = False,
@@ -4681,9 +4917,15 @@ def worker_counts(prune: bool = False,
     already-listed roster instead of taking workers.lock again (WT-4).
     """
     out: Dict[str, Dict[str, int]] = {}
+    seen_ids: Set[str] = set()
     for w in (list_workers(prune=prune) if rows is None else rows):
         if w.get("stage") and not w.get("alive"):
             continue  # kept-dead stage record (WT-24): not a queue worker
+        wid = str(w.get("worker_id") or "")
+        if wid:
+            if wid in seen_ids:
+                continue  # duplicate registry row for the same worker
+            seen_ids.add(wid)
         row = out.setdefault(w.get("queue", ""), {"total": 0, "live": 0})
         row["total"] += 1
         if w.get("alive") and not _worker_released(w):
@@ -5049,7 +5291,8 @@ def request_stop(worker_id: str) -> Path:
     The worker's next ``wt claim`` call will detect the file, delete it, and
     return ``{"stop": True}`` instead of claiming more queue work. The
     underlying conversation/process is preserved and may continue unrelated
-    work. Uses the file-system only -- does NOT touch workers.json.
+    work until the released-worker TTL expires. Persists ``released_at`` in
+    workers.json so detachment and the TTL survive sentinel consumption.
     """
     stop_dir = STOP_SIGNALS_DIR
     stop_dir.mkdir(parents=True, exist_ok=True)
@@ -5461,6 +5704,12 @@ def requeue_orphaned_tickets(
         # session) is provably alive; a dead builder of a review rejection that
         # was never resumed is resumed first (WT-30).
         verdict = None
+        # A GitHub-backed claim stores no claim_proc to prove, but a resumed
+        # session still writing its transcript is working all the same: the
+        # original exec PID exiting must not hand the ticket on (OPS-107).
+        if (github_of(it)
+                and now - _liveness._file_activity(it, ctx) < _liveness.RECENT_SESSION_S):
+            continue
         if not github_of(it):
             try:
                 verdict = _liveness.claim_owner(it, ctx)
@@ -5468,13 +5717,15 @@ def requeue_orphaned_tickets(
                 verdict = None
             if verdict is not None and verdict.verdict == "alive":
                 continue
-            # An ambient claim (a session resumed or rebound without a spawned
-            # pid) has no process to prove dead. While its session's transcript
-            # or log is still being written, reopening here would hand the
-            # ticket to a second worker mid-work; once it goes quiet the
-            # reopen below (or the backstop's escalation) proceeds (OPS-1333).
+            # A resumed session can outlive its original bound PID, or have
+            # no bound process at all. Recent transcript activity vetoes a
+            # duplicate handoff while death remains unproven. Quiet sessions
+            # still reach recovery below (OPS-102, OPS-1333). A bound claim
+            # carrying resume evidence was already judged by it in
+            # _builder_held (WT-30 D3): the builder's last write at reject
+            # time is not the resumed session working (WT-19).
             if (verdict is not None and verdict.verdict == "unproven"
-                    and (verdict.proc or {}).get("bound") == "ambient"
+                    and not (has_resume and (verdict.proc or {}).get("bound") != "ambient")
                     and now - _liveness._file_activity(it, ctx) < _liveness.RECENT_SESSION_S):
                 continue
             if (verdict is not None and verdict.verdict == "dead"
@@ -5576,6 +5827,15 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             reason = ("group parent — never claimed; its members are"
                       if _q.group_role(item) == "parent" else
                       f"group plan first — waits for {_q.group_parent_ref(item)}'s plan")
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
+        readiness = str((item or {}).get("readiness") or "")
+        if readiness in _q.UNCLAIMABLE_READINESS:
+            # Checked before auto_drain: workers never claim an unready
+            # ticket, so blaming drain-off sent the owner to the wrong knob
+            # (WATCHTOWER-2 sat 22h as "auto_drain off" after drain was on).
+            reason = (f"not ready — readiness {readiness}, no worker claims it "
+                      f"until `wt edit {ref} --readiness ready`")
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
         if not config.auto_drain(queue):
@@ -6059,6 +6319,15 @@ def backfill_recent_session_titles(
         items = []
     out: List[Dict[str, Any]] = []
     candidates: Dict[str, tuple] = {}
+    # Index once: scanning every item per log was O(logs x items) on every
+    # reconciler tick (~0.45 s CPU with 120 logs and 1.3k tickets, WT-12).
+    by_key: Dict[str, List[int]] = {}
+    for n, it in enumerate(items):
+        if it.get("status") not in ("closed", "in_progress"):
+            continue
+        for k in {str(it.get(f) or "") for f in ("claimed_by", "claimed_session_id")}:
+            if k:
+                by_key.setdefault(k, []).append(n)
 
     def _offer(worker_id: str, session_id: str, item: Dict[str, Any]) -> None:
         key = _item_activity_key(item)
@@ -6076,13 +6345,19 @@ def backfill_recent_session_titles(
         sid = resolve_session_id_from_log(str(path))
         if not sid:
             continue
-        item = _latest_worker_item(worker_id, sid, items)
+        mine = sorted({n for k in (worker_id, sid) for n in by_key.get(k, ())})
+        item = _latest_worker_item(worker_id, sid, [items[n] for n in mine])
         if not item:
             continue
         _offer(worker_id, sid, item)
     for item in sorted(items, key=_item_activity_ts):
         sid = str(item.get("claimed_session_id") or "")
         if not sid or _item_activity_ts(item) < cutoff:
+            continue
+        # A released ticket keeps its old claimed_session_id, but that session
+        # no longer holds it; renaming it would overwrite the session's own
+        # title on every tick.
+        if item.get("status") == "open":
             continue
         worker_id = str(item.get("claimed_by") or item.get("closed_by") or sid)
         _offer(worker_id, sid, item)
@@ -6322,6 +6597,7 @@ def _reconcile_once_locked(dry_run: bool = False,
                               "spawn_plans": [],
                               "reconcile_id": reconcile_id}
 
+    requeued_queues: Set[str] = set()
     staffing_before = list_workers(prune=False)
     eligible_before_by_q: Dict[str, List[Dict[str, Any]]] = {}
     dead_before_by_q: Dict[str, List[Dict[str, Any]]] = {}
@@ -6508,8 +6784,13 @@ def _reconcile_once_locked(dry_run: bool = False,
             released_by_q.setdefault(queue_name, []).append(pending_row)
     # Build live-worker counts keyed by queue.
     live_by_queue: Dict[str, List[Dict[str, Any]]] = {}
+    _live_seen: Set[str] = set()
     for w in list_workers(prune=False):
         if w.get("alive") and not _worker_released(w):
+            wid = str(w.get("worker_id") or "")
+            if wid and wid in _live_seen:
+                continue  # duplicate registry row: one process, one slot
+            _live_seen.add(wid)
             q_name = w.get("queue", "")
             live_by_queue.setdefault(q_name, []).append(w)
 
@@ -6521,10 +6802,16 @@ def _reconcile_once_locked(dry_run: bool = False,
     # WT-131 being claimable). Track which live workers are blocked so the
     # spawn decision can staff productive capacity around them instead of
     # waiting on the block to clear.
+    from . import queue as _q
+    try:
+        _all_items = _q.list_items(project=only_queue or None) or []
+    except Exception:
+        _all_items = None
+
     from . import queue as _q_blocked
     blocked_worker_ids: Dict[str, Set[str]] = {}
     try:
-        for it in (_q_blocked.list_blocked() or []):
+        for it in (_q_blocked.list_blocked(items=_all_items) or []):
             wid = str(it.get("claimed_by") or "")
             qn = str(it.get("project") or "")
             if wid and qn:
@@ -6543,7 +6830,7 @@ def _reconcile_once_locked(dry_run: bool = False,
     # spares any worker still holding a blocked ticket (WATCHTOWER-1).
     busy_worker_ids: Dict[str, Set[str]] = {}
     try:
-        for it in (_q_blocked.list_active_claims() or []):
+        for it in (_q_blocked.list_active_claims(items=_all_items) or []):
             wid = str(it.get("claimed_by") or "")
             qn = str(it.get("project") or "")
             if wid and qn:
@@ -6552,19 +6839,18 @@ def _reconcile_once_locked(dry_run: bool = False,
         busy_worker_ids = {}
 
     try:
-        retained_parked = retained_parked_ids()
+        retained_parked = retained_parked_ids(items=_all_items)
     except Exception:
         retained_parked = set()
 
     # Use health for queue depth + stuck ground-truth -- one call covers all queues.
     health_by_queue: Dict[str, Dict[str, Any]] = {
         row["queue"]: row
-        for row in health.all_status(project=only_queue or None)
+        for row in health.all_status(project=only_queue or None, items=_all_items)
     }
 
     # Raw open depth per queue, for the "N open" figure in skip/spawn messages
     # (unfiltered -- just how big the backlog is, regardless of claimability).
-    from . import queue as _q
     _total_open_by_q: Dict[str, int] = {}
     # The same items, kept rather than only counted, so a depth==0 skip can
     # report what was actually observed about them instead of guessing
@@ -6572,7 +6858,7 @@ def _reconcile_once_locked(dry_run: bool = False,
     # list pass the reconciler already makes.
     _open_items_by_q: Dict[str, List[Dict[str, Any]]] = {}
     try:
-        for it in (_q.list_items(project=only_queue or None) or []):
+        for it in (_all_items if _all_items is not None else (_q.list_items(project=only_queue or None) or [])):
             if it.get("status") != "open":
                 continue
             qn = str(it.get("project") or "")
@@ -7004,6 +7290,11 @@ def _reconcile_once_locked(dry_run: bool = False,
                 and (health_by_queue.get(q_name) or {}).get("stuck")
                 and not _all_workers_within_startup_grace(live)):
             _maybe_nudge_stuck_queue(q_name, actual)
+        elif (not dry_run and depth > 0 and q_name not in requeued_queues
+                and not _all_workers_within_startup_grace(live)):
+            # Claimable work, nobody mid-nudge: wake idle workers (a ticket
+            # filed inside grace_s got no nudge at filing time).
+            _renudge_idle_workers(q_name, live, busy_ids_here | blocked_ids_here)
 
         if staffed < desired:
             # Never spawn more workers than unclaimed tickets. Don't assume a live
@@ -7012,7 +7303,19 @@ def _reconcile_once_locked(dry_run: bool = False,
             # spawn 0 more, not 1. Blocked workers are excluded from `staffed` (see
             # above) so one ticket parked on a human question can't by itself starve
             # every other claimable ticket in the queue.
-            to_spawn = min(desired - staffed, max(0, depth - staffed))
+            # Only IDLE staffed workers can take a claimable ticket now; one
+            # mid-ticket (holding an in_progress claim) won't look at the queue
+            # until it finishes, which can be an hour. Counting it against
+            # depth left a 2-worker queue running one worker with a claimable
+            # ticket waiting (BYM-FUTURE-2407/2408).
+            idle_staffed = sum(
+                1 for w in live
+                if str(w.get("worker_id") or "") not in busy_ids_here
+                and w not in unwakeable_blocked
+                and w not in retained_here
+                and w not in stale_idle
+            )
+            to_spawn = min(desired - staffed, max(0, depth - idle_staffed))
             plan = _record_spawn_plan(
                 q_name,
                 total_open=total_open,

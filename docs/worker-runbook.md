@@ -121,3 +121,54 @@ The audit (Tier 2):
      Never set, complete, or clear a native Codex thread goal (a goal makes
      Codex auto-continue after the process dies). There
      is no live stdin channel and no wake message to wait for.
+
+## Definition of done
+
+Applies to every ticket, quick or deep.
+
+- **Done means the reason the ticket was filed has gone away**: the symptom it
+  reports no longer reproduces. Fixing one plausible cause is progress, not done.
+- **Verify the way the problem was seen**: for a quick ticket, a focused check
+  proportionate to the change is enough; for a deep ticket, re-measure under the
+  conditions that produced the problem (cold paths, cache misses, real load).
+- **A follow-up carries separate work, never the ticket's own goal.** If the
+  symptom still reproduces, keep the ticket open (`wt block`, or `wt defer` while
+  data accumulates) instead of closing with the remainder in a follow-up.
+- **Partial is labelled partial**: a close that leaves part of the ask undone
+  starts its `--summary` with `PARTIAL:` and cites the follow-up ref.
+
+## Ticket depth
+
+The filer sets depth; a worker never guesses it. `quick` is the default.
+
+**Quick** is fix-and-look work. The owner uses the product and sees within
+minutes whether a fix is right, so: no design step, verification proportionate
+to the change (no full browser reproduction for a small UI tweak). Several
+related quick tickets can share one verification as a plan group
+(`wt add --group-parent --children ...`). If a quick ticket turns out to be
+structural (no contained fix removes the symptom), `wt block` it asking the
+owner to promote it to deep rather than shipping a token fix.
+
+**Deep** (`wt add --depth deep [--budget-min N]`) is for work whose outcome you
+cannot judge by using the product: performance, chronic regressions,
+multi-step optimisation. Set by owners (the filing UI) and by system filers
+that know what they file (e.g. a perf watchdog), not by workers filing
+follow-ups. A deep claim's JSON carries `deep_brief`; follow it. In short:
+
+1. **Evidence first.** If you lack the data to know the cause, build the
+   logging, ship it, decide how much data and how long, then
+   `wt defer REF --until +24h --reason "..." --progress "..."`. The ticket leaves
+   your claim and the pool, and returns when the window ends.
+2. **Options memo** with 3-5 candidates, at least one a *product* option (cut
+   scope, tier the data, change the UX). Read the queue learnings' *Product
+   constraints* first; if the best option needs an owner decision, `wt block`
+   with the memo. Record the owner's answer as a Product constraints line.
+3. **Budget** (default 90 min). Log each attempt:
+   `wt comment REF "attempt N: <change> -- metric before -> after"`.
+4. **Stop rule**: budget spent, two attempts in a row with no gain, or four
+   attempts without converging. On stop, block with the trajectory and best
+   remaining options; don't close.
+5. **Close** only when the goal is met, with the measurement in the summary.
+
+`wt defer` is not `wt block`: defer waits for *data* (no human involved, the
+ticket returns on its own); block waits for a *decision*.

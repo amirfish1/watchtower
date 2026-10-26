@@ -893,24 +893,67 @@ def test_compact_codex_via_app_server(wt, monkeypatch):
     assert res["codex_total_ms"] >= res["codex_resume_ms"]
 
 
-def test_compact_codex_refuses_when_delegate_first_is_configured(wt, delegate, monkeypatch):
-    """CCC's /api/inject-input can only inject chat text, not forward the
-    structural thread/compact/start RPC -- and WT must not open a second,
-    competing app-server against a thread CCC already brokers. So compact
-    mode fails closed here rather than silently doing the wrong thing."""
+def test_compact_codex_uses_configured_owner(wt, delegate, monkeypatch):
     srv, url = delegate
+    srv.responses.append((200, {"ok": True, "status": "compacted",
+                                "compact_result": "success", "backup_path": "/backup"}))
     monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
-    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(_write_fake_codex_bin(wt.tmp)))
 
-    def _private_should_not_run(*_args, **_kwargs):
+    def private_should_not_run(*_args, **_kwargs):
         raise AssertionError("private codex app-server should not be used")
 
-    monkeypatch.setattr(wt.codex_rpc, "compact", _private_should_not_run)
-
+    monkeypatch.setattr(wt.codex_rpc, "compact", private_should_not_run)
     res = wt.messages.compact_codex({"session_id": SID_D, "cwd": "/repo"})
 
-    assert res["ok"] is False
-    assert "delegate" in res["error"]
+    assert res["ok"] is True
+    assert res["transport"] == "delegate-compact"
+    assert res["compact_result"] == "success"
+    assert res["backup_path"] == "/backup"
+    assert srv.requests == [("/api/session/compact", {"session_id": SID_D})]
+
+
+@pytest.mark.parametrize("status,payload", [
+    (200, {"ok": False, "code": "busy", "error": "thread busy"}),
+    (200, {}),
+    (500, {"ok": False, "error": "unavailable"}),
+    (404, {}),
+])
+def test_compact_codex_delegate_failure_never_changes_owner(
+    wt, delegate, monkeypatch, status, payload,
+):
+    srv, url = delegate
+    srv.responses.append((status, payload))
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+
+    def private_should_not_run(*_args, **_kwargs):
+        raise AssertionError("private codex app-server should not be used")
+
+    monkeypatch.setattr(wt.codex_rpc, "compact", private_should_not_run)
+    res = wt.messages.compact_codex({"session_id": SID_D})
+    assert res["ok"] is False and res["error"]
+    if payload.get("code"):
+        assert res["code"] == payload["code"]
+    assert srv.requests == [("/api/session/compact", {"session_id": SID_D})]
+
+
+def test_compact_codex_delegate_timeout_never_changes_owner(wt, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "http://127.0.0.1:1")
+
+    def timed_out(url, payload, timeout_s):
+        assert url.endswith("/api/session/compact")
+        assert timeout_s >= 330
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(wt.messages, "_post_json", timed_out)
+    monkeypatch.setattr(wt.codex_rpc, "compact", lambda *a, **k: pytest.fail("private owner"))
+    res = wt.messages.compact_codex({"session_id": SID_D})
+    assert res["ok"] is False and "timed out" in res["error"]
+
+
+def test_compact_codex_requires_session_before_contacting_delegate(wt, delegate, monkeypatch):
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    assert wt.messages.compact_codex({})["ok"] is False
     assert srv.requests == []
 
 
@@ -1802,6 +1845,18 @@ def test_recent_session_title_backfill_appends_custom_title(wt):
         "customTitle": f"NAMEQ#{item['seq']}: Add useful titles",
         "sessionId": SID_A,
     }
+
+
+def test_recent_session_title_backfill_skips_released_ticket(wt):
+    p = _write_transcript(wt, SID_A)
+    item = wt.q.enqueue(project="NAMEQ", title="Released ticket", note="body")
+    wt.q.claim_next("nameq-released", project="NAMEQ")
+    wt.q.backfill_session_id(item["ref"], SID_A)
+    before = p.read_text()
+    wt.q.release(item["ref"], force=True)
+
+    assert wt.workers.backfill_recent_session_titles(hours=24) == []
+    assert p.read_text() == before
 
 
 def test_recent_session_title_backfill_uses_queue_session_when_log_is_gone(wt):
