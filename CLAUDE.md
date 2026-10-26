@@ -25,6 +25,19 @@ sync from origin, so an unpushed commit is undeployed. The pre-push hook
 test gate — if it fails, fix it or don't commit. Never `--no-verify`, never
 force-push `main`.
 
+## Deployment and hooks (don't guess)
+
+- Use `wt deploy --json` to locate and inspect the checkout imported by the
+  running `wt`, then `wt deploy --sync` to update it. The guarded sync refuses
+  novel tracked edits or local commits and fast-forwards clean installations;
+  it can restore recognized stale files. Do not bypass it with a raw pull.
+  Install paths vary by host; `~/.ccc/watchtower` is not universal.
+- Hooks are not in the worktree. In a `git worktree`, `.git` is a file, so
+  `.git/hooks/` does not exist there and `scripts/install-hooks.sh` (which
+  writes `$REPO_ROOT/.git/hooks/pre-push`) is for the main clone only. Hooks
+  are shared via `git rev-parse --git-common-dir`; run
+  `scripts/install-hooks.sh` once from the main clone, not from a worktree.
+
 ## Tests
 
 ```bash
