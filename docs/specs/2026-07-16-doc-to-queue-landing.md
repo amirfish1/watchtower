@@ -7,7 +7,7 @@ real merge (below) still needs Amir's go-ahead and has not been run against
 ## 1. Merge command sequence (mechanical, one shot)
 
 ```bash
-cd /Users/amirfish/Apps/watchtower
+cd ~/Apps/watchtower
 git checkout main            # main only, never a feature branch in the shared clone
 git merge feat/doc-to-queue
 ```

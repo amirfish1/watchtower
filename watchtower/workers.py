@@ -18,18 +18,22 @@ queue ground-truth.
 from __future__ import annotations
 
 import json
+import glob as _glob
 import hashlib
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from . import origins
 
 try:
     import fcntl
@@ -155,7 +159,8 @@ def _worker_runbook_ref() -> str:
     return _WORKER_RUNBOOK_URL
 
 
-def _spawn_env() -> Dict[str, str]:
+def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "",
+               ref: str = "", queue: str = "", role: str = "") -> Dict[str, str]:
     """Environment for a spawned worker subprocess.
 
     The child inherits the parent's environment so legitimate overrides
@@ -171,19 +176,58 @@ def _spawn_env() -> Dict[str, str]:
     variables are stripped so the worker does not inherit pytest sandbox
     variables that point at temporary test files and operate against test
     fixture state (OPS-544).
+
+    WT-23: ``WT_WORKER_ID`` names the spawned session and ``WT_VERIFY=1`` marks
+    a verifier, so a repo's scripts can refuse to run paid-API / customer-message
+    side effects when loaded by a verifier. Stale values inherited from the
+    spawner are always cleared first.
     """
     env = os.environ.copy()
     if "PYTEST_CURRENT_TEST" in os.environ:
         for key in list(env):
             if key.startswith("WATCHTOWER_"):
                 env.pop(key, None)
+    # These name the session that runs `wt`, i.e. the *spawner* -- never the
+    # worker. Claude and Codex overwrite them with their own ids at startup,
+    # but engines that set neither (devin) inherited the spawner's, so their
+    # `wt claim` recorded the spawner's session as claimed_session_id and a
+    # later `wt answer` was delivered to the wrong session (CCC-1153).
+    for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+        env.pop(key, None)
     env["WT_WORKER_COMMIT"] = "1"
+    env.pop("WT_VERIFY", None)
+    env.pop("WT_WORKER_ID", None)
+    if worker_id:
+        env["WT_WORKER_ID"] = worker_id
+    if verify:
+        env["WT_VERIFY"] = "1"
+    # WT-27: origin markers. A process started inside this session (a probe, a
+    # test, a helper) reads them via origins.env_parent so its own session can
+    # be badged in CCC with this worker/ticket/role. Stale values never leak.
+    for key in (origins.ENV_SESSION, origins.ENV_REF, origins.ENV_QUEUE, origins.ENV_ROLE):
+        env.pop(key, None)
+    for key, val in ((origins.ENV_SESSION, session_id), (origins.ENV_REF, ref),
+                     (origins.ENV_QUEUE, queue), (origins.ENV_ROLE, role)):
+        if val:
+            env[key] = val
+    # Commit attribution: distinct from interactive Hermes on this VM
+    # (`Amir Fish (hermes)` / Agent-Machine: hermes).
+    env["GIT_AUTHOR_NAME"] = "Amir Fish (watchtower)"
+    env["GIT_COMMITTER_NAME"] = "Amir Fish (watchtower)"
+    env["AGENT_MACHINE"] = "watchtower"
+    # Claude honors CLAUDE_CODE_AUTO_COMPACT_WINDOW; a daemon not started by
+    # CCC would not carry it, so every spawn gets CCC's worker threshold
+    # unless the operator already set one.
+    from . import config as _config
+    compact = _config.worker_auto_compact_tokens()
+    if compact > 0:
+        env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(compact))
     return env
 
 
 # Codex approval/sandbox policy is per-turn, not per-thread: the spawn's
 # --dangerously-bypass-approvals-and-sandbox does NOT carry over to turns
-# other clients start on the same thread (native goal continuations, desktop
+# other clients start on the same thread (desktop
 # takeovers). Such a turn runs workspace-write with on-request approvals, and
 # its first `wt` command -- which writes ~/.watchtower, outside any repo
 # workspace -- hangs on an approval prompt no headless worker can answer
@@ -213,7 +257,7 @@ def ensure_codex_wt_execpolicy() -> bool:
         rules_dir.mkdir(mode=0o700, exist_ok=True)
         rules_path.write_text(
             "# Managed by WatchTower (workers.ensure_codex_wt_execpolicy).\n"
-            "# Default-policy Codex turns (e.g. native goal continuations,\n"
+            "# Default-policy Codex turns (e.g. desktop takeovers,\n"
             "# which do not inherit a spawn's full-auto policy) would\n"
             "# otherwise hang on an approval prompt for WatchTower queue\n"
             "# commands.\n"
@@ -238,10 +282,10 @@ CLAUDE_IDLE_CONTRACT = (
 )
 
 CODEX_IDLE_CONTRACT = (
-    "Do NOT poll or sleep-loop. After the idle audit, complete this queue's "
-    "drain goal using the native goal control (or clear it if completion is "
-    "unavailable), then exit immediately. This is a one-shot run; do not wait "
-    "for a wake message. "
+    "Do NOT poll or sleep-loop. After the idle audit, end your turn and exit "
+    "immediately. This is a one-shot run; do not wait for a wake message. "
+    "Do NOT create, update, complete, or clear a native Codex thread goal: "
+    "a goal makes Codex auto-continue after you stop. "
 )
 
 CLAUDE_RESUME_CONTRACT = (
@@ -264,7 +308,26 @@ KIMI_IDLE_CONTRACT = (
     "message. "
 )
 
+DEVIN_IDLE_CONTRACT = (
+    "Do NOT poll or sleep-loop. After the idle audit, end your turn and exit "
+    "immediately. This is a one-shot run (devin -p); do not wait for a wake "
+    "message. "
+)
+
 KIMI_RESUME_CONTRACT = (
+    "RESUME CHECK: if this run starts with context indicating you were "
+    "mid-work on a ticket, follow the Resume Check protocol in {runbook} before "
+    "you edit, commit, or close anything -- skipping this is how the same "
+    "ticket gets fixed and committed twice. "
+)
+
+DEVIN_IDLE_CONTRACT = (
+    "Do NOT poll or sleep-loop. After the idle audit, end your turn and exit "
+    "immediately. This is a one-shot run (devin -p); do not wait for a wake "
+    "message. "
+)
+
+DEVIN_RESUME_CONTRACT = (
     "RESUME CHECK: if this run starts with context indicating you were "
     "mid-work on a ticket, follow the Resume Check protocol in {runbook} before "
     "you edit, commit, or close anything -- skipping this is how the same "
@@ -294,6 +357,71 @@ SUMMARY_STYLE = (
     "short '- ' bullets for what changed and where (file paths). Use real "
     "newlines inside the quoted string; they are preserved and rendered as "
     "line breaks. Never submit one dense paragraph. "
+)
+
+# Completion contract injected into both goal templates (BECKY-1625: a worker
+# fixed the code, wrote a backfill it could not run for lack of prod
+# credentials, closed the ticket as done with "run the backfill" as a
+# follow-up, and nothing ever tracked it). `wt close` also rejects any
+# follow-up/unresolved item that cites no ticket ref.
+# No braces: safe for the templates' .format() calls.
+CLOSE_COMPLETENESS = (
+    "CLOSED MEANS DONE: done means the reason the ticket was filed has gone "
+    "away -- the symptom it reports no longer reproduces -- not that you "
+    "fixed one plausible cause of it. Close a ticket only when every part it "
+    "asks for has actually happened. A data repair, backfill, migration or "
+    "script you wrote but did not run is NOT done; a conclusion you did not "
+    "verify against the real source is NOT done. If you could not finish a "
+    "part, either keep the ticket open with `wt block`, or close it only after "
+    "filing a NEW ticket for each unfinished part (`wt add -q <QUEUE> "
+    "--title ... --note ...` with enough context to pick it up cold) and "
+    "citing that ref in its --unresolved/--follow-up item -- `wt close` "
+    "rejects any item that cites no ticket ref. A follow-up may carry "
+    "genuinely separate work, NEVER the ticket's own goal: if the symptom "
+    "the ticket exists for still reproduces, do not close it with the rest "
+    "moved to a follow-up -- keep it open (`wt block`, or `wt defer` while "
+    "data accumulates). When you close with a part of the ask left "
+    "unfinished, start the --summary with 'PARTIAL:' so it never reads as "
+    "success. ENVIRONMENT BLOCKERS: when "
+    "the blocker is infrastructure -- missing or failing credentials (e.g. "
+    "no production DB access, empty env pull), a broken CLI/MCP/tool, or a "
+    "sandbox limit -- ALSO file an OPS ticket: run "
+    "`~/dev/ops/file-ops-ticket.sh \"one line\" --detail \"...\"` if that "
+    "script exists on this host, otherwise `wt add -q OPS --title \"...\" "
+    "--note \"host, what failed, exact error\"`, and cite the OPS ref too. "
+    "Never just describe a blocker in prose and close. "
+)
+
+# Working-mode contract injected into both goal templates. Depth is set by
+# the filer (owner / system filers), never guessed by the worker; a deep
+# claim's JSON carries ``deep_brief`` (watchtower/deep.py). No braces: safe
+# for the templates' .format() calls.
+DEPTH_CONTRACT = (
+    "TICKET DEPTH: a claimed ticket is quick (the default) or deep. QUICK "
+    "means fix-and-look: no design step, and verification proportionate to "
+    "the change -- a focused test or a quick look is enough; the owner uses "
+    "the product and sees within minutes whether it is right, so do not spin "
+    "up a full browser reproduction for a small UI tweak. DEEP: if the claim "
+    "JSON has a deep_brief field, follow it -- it overrides these quick "
+    "defaults (evidence first, an options memo that includes product "
+    "options, a measured goal, a time budget and a stop rule; use `wt defer "
+    "<ref> --until ... --reason ...` to wait for data instead of guessing). "
+    "If a quick ticket turns out to be structural -- the symptom cannot be "
+    "removed by a contained fix -- do not ship a token fix and close: "
+    "`wt block` it asking the owner to promote it to deep, with what you "
+    "found. "
+)
+
+# Push contract injected into both goal templates. Deployment pulls from
+# origin, so a commit that stays local is undeployed work; the default is
+# push-after-commit, and a ticket's worker instructions may opt out.
+# No braces: safe for the templates' .format() calls.
+PUSH_CONTRACT = (
+    "After each commit, push it: `git push origin HEAD` (the branch you are "
+    "on -- never switch branches, never force, never `--no-verify`). If the "
+    "push is rejected as non-fast-forward, `git fetch && git merge "
+    "origin/<branch>` and push again. Skip pushing only when the claimed "
+    "ticket's worker instructions explicitly say not to push."
 )
 
 # Appended to a worker's goal when its queue has product_gate on (2026-09-01
@@ -362,17 +490,19 @@ DRAIN_GOAL_TEMPLATE = (
     "\"...\"` for anything you could not fix (each flag is repeatable). This "
     "resolution is the trust signal the dashboard surfaces; a close without "
     "--summary will be rejected with exit code 1. "
-    + SUMMARY_STYLE +
+    + SUMMARY_STYLE + CLOSE_COMPLETENESS + DEPTH_CONTRACT +
     "If a ticket genuinely cannot be resolved without a human decision, do NOT "
     "close it and do NOT guess: run `wt block <ref> --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
     "figured out so far\"`, then move on to the next ticket. "
+    "LEARNINGS: after each `wt close` or `wt block`, append at most one "
+    "dated line to ~/.watchtower/learnings/{queue}.pending.md -- only if "
+    "the turn produced a genuinely new hard-won fact (append-only, never "
+    "rewrite it; the Idle Protocol folds it into {queue}.md on a boundary). "
     "IDLE: when `wt claim` reports the queue is drained, follow the Idle "
     "Protocol in {runbook} BEFORE ending your turn (it has you update the "
-    "queue's learnings file). {idle_contract}{resume_contract}"
-    "Push or publish exactly when the claimed ticket's worker instructions tell "
-    "you to. If the claimed ticket has no explicit push/publish instruction, "
-    "leave commits local unless the user explicitly asks you to push."
+    "queue's learnings file). {idle_contract}{resume_contract} "
+    + PUSH_CONTRACT
 )
 
 # Bounded, single-ticket variant of DRAIN_GOAL_TEMPLATE (CCC-437's per-row
@@ -407,17 +537,15 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "\"what you changed\" --commit <SHA>` (or `--no-code`). Add `--caveat \"...\"` for anything to watch out "
     "for, `--follow-up \"...\"` for notable next steps, and `--unresolved "
     "\"...\"` for anything you could not fix (each flag is repeatable). "
-    + SUMMARY_STYLE +
+    + SUMMARY_STYLE + CLOSE_COMPLETENESS + DEPTH_CONTRACT +
     "If it genuinely cannot be resolved without a human decision, do NOT "
     "close it and do NOT guess: run `wt block {ref} --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
     "figured out so far\"`. "
     "Either way -- closed or blocked -- STOP once this one ticket is "
     "resolved. Do NOT claim another ticket, do NOT poll, do NOT wait for new "
-    "work. End your turn. Push or publish exactly when the claimed ticket's "
-    "worker instructions tell you to. If the claimed ticket has no explicit "
-    "push/publish instruction, leave commits local unless the user explicitly "
-    "asks you to push."
+    "work. End your turn. "
+    + PUSH_CONTRACT
 )
 
 # Appended to the drain goal when the reconciler staffs a queue whose owner
@@ -431,11 +559,16 @@ _MANUAL_RUN_INSTRUCTIONS = (
     "do NOT wait for new work."
 )
 
-_ENGINE_BIN = {"claude": "claude", "codex": "codex", "kimi": "kimi"}
+_ENGINE_BIN = {
+    "claude": "claude",
+    "codex": "codex",
+    "kimi": "kimi",
+    "devin": "devin",
+}
 
 # Engines whose workers are one-shot processes (goal in argv, DEVNULL stdin,
 # exit when done) rather than FIFO-fed live processes like claude.
-_ONE_SHOT_ENGINES = ("codex", "kimi")
+_ONE_SHOT_ENGINES = ("codex", "kimi", "devin")
 
 
 def _resolve_engine_bin(engine: str) -> str:
@@ -453,6 +586,7 @@ def _resolve_engine_bin(engine: str) -> str:
         "claude": "WATCHTOWER_CLAUDE_BIN",
         "codex": "WATCHTOWER_CODEX_BIN",
         "kimi": "WATCHTOWER_KIMI_BIN",
+        "devin": "WATCHTOWER_DEVIN_BIN",
     }.get(engine)
     if env_name:
         env_bin = os.environ.get(env_name)
@@ -645,6 +779,11 @@ def worker_turn_open(w: Dict[str, Any]) -> bool:
                 event_type = ev.get("type")
                 if event_type == "result":
                     turn_open = False
+                elif ev.get("parent_tool_use_id"):
+                    # A background subagent's own messages; they keep
+                    # streaming after the main turn's result and must not
+                    # re-open it (queued input would be held for hours).
+                    continue
                 elif event_type in ("assistant", "user", "stream_event"):
                     turn_open = True
                 elif (
@@ -699,7 +838,7 @@ def interrupt_worker_turn(worker_id: str) -> Dict[str, Any]:
     """Interrupt the current turn of a live claude worker, leaving it running.
 
     Writes a stream-json ``interrupt`` control request to the worker's stdin
-    FIFO (SONIA-CHAT-5: a client saying "stop" must halt the in-flight turn
+    FIFO (CLIENT-CHAT-5: a client saying "stop" must halt the in-flight turn
     WITHOUT killing the process -- the session and its warm prompt cache
     survive for the next instruction).
 
@@ -774,6 +913,12 @@ _AUDIT_BOOT_ID = uuid.uuid4().hex[:12]
 # worker's cache is already cold well before this fires -- resuming it after
 # that point buys nothing but the leak risk the TTL exists to bound.
 RELEASED_TTL_S = int(os.environ.get("WATCHTOWER_RELEASED_TTL_S") or 1 * 3600)
+# A live worker that holds no active claim and has shown no activity for this
+# long is not draining the queue (wedged, errored out mid-session, or parked
+# between turns), so the reconciler stops counting it as staffed capacity and
+# lets a fresh worker cover the slot. It is not killed here; idle release
+# still reaps it at RELEASED_TTL_S.
+STALE_IDLE_S = int(os.environ.get("WATCHTOWER_STALE_IDLE_S") or 15 * 60)
 _RELEASED_KILL_GRACE_S = 30
 
 # A live worker that has never claimed a ticket and whose queue is stuck can be
@@ -831,9 +976,12 @@ def _claude_transcript_mtime(w: Dict[str, Any]) -> float:
     )
     newest = 0.0
     try:
-        for path in (claude_home / "projects").glob(f"*/{session_id}.jsonl"):
+        # glob.glob, not Path.glob: the latter lists every project dir's
+        # thousands of transcripts (~15 ms per call vs <1 ms; WT-17).
+        for path in _glob.glob(os.path.join(_glob.escape(str(claude_home / "projects")),
+                                            "*", f"{_glob.escape(session_id)}.jsonl")):
             try:
-                newest = max(newest, path.stat().st_mtime)
+                newest = max(newest, os.stat(path).st_mtime)
             except OSError:
                 continue
     except OSError:
@@ -867,32 +1015,123 @@ def _claude_transcript_bytes(session_id: str) -> int:
     return biggest
 
 
-def context_budget_exceeded(worker_id: str, session_uuid: str = "") -> int:
-    """Transcript bytes when a DRAIN WORKER is over its context budget, else 0.
+_CODEX_ROLLOUT_CACHE: Dict[tuple, str] = {}
 
-    Applies ONLY to workers registered in workers.json — a human (or any
-    non-worker session) running ``wt claim`` by hand must never be "recycled"
-    just because their own conversation is large. The registered record's
-    claude session id is authoritative for locating the transcript;
-    ``session_uuid`` is a fallback when the record predates uuid capture.
 
-    The budget is ``WATCHTOWER_CONTEXT_RECYCLE_BYTES`` (default 2.5MB ≈ a
-    third of the transcript size observed at 800K tokens — recycle early;
-    a fresh worker costs seconds and regains full-quality context). Set the
-    env var to 0 to disable recycling. Read per call so tests and operators
-    can tune it without a daemon restart.
-    """
+def _codex_rollout_path(session_id: str) -> Optional[Path]:
+    """Resolve (and cache) the rollout file for a Codex session id."""
+    session_id = str(session_id or "").strip()
+    if not session_id:
+        return None
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    key = (str(codex_home), session_id)
+    cached = _CODEX_ROLLOUT_CACHE.get(key)
+    if cached and os.path.exists(cached):
+        return Path(cached)
     try:
-        budget = int(
-            os.environ.get("WATCHTOWER_CONTEXT_RECYCLE_BYTES", "2500000") or 0
+        found = sorted(
+            (codex_home / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")
         )
-    except (TypeError, ValueError):
-        budget = 2_500_000
-    if budget <= 0:
+    except OSError:
+        return None
+    if not found:
+        return None
+    _CODEX_ROLLOUT_CACHE[key] = str(found[-1])
+    return found[-1]
+
+
+def _codex_input_tokens(session_id: str) -> int:
+    """Cumulative input tokens of a Codex session, or 0 if unknown.
+
+    Reads the LAST ``event_msg`` / ``token_count`` line's
+    ``info.total_token_usage.input_tokens`` from the tail of the rollout
+    (256KB, widened x4 up to the whole file when none is found). Cumulative
+    input counts cached tokens on purpose: it measures per-call resend volume.
+    """
+    path = _codex_rollout_path(session_id)
+    if path is None:
         return 0
+    try:
+        size = path.stat().st_size
+        window = 256 * 1024
+        with open(path, "rb") as f:
+            while True:
+                start = max(0, size - window)
+                f.seek(start)
+                chunk = f.read(size - start)
+                lines = chunk.split(b"\n")
+                if start > 0:
+                    lines = lines[1:]  # first line may be cut mid-record
+                for raw in reversed(lines):
+                    if b"token_count" not in raw:
+                        continue
+                    try:
+                        obj = json.loads(raw)
+                    except ValueError:
+                        continue
+                    pl = obj.get("payload") if isinstance(obj, dict) else None
+                    if (
+                        obj.get("type") != "event_msg"
+                        or not isinstance(pl, dict)
+                        or pl.get("type") != "token_count"
+                    ):
+                        continue
+                    usage = ((pl.get("info") or {}).get("total_token_usage") or {})
+                    try:
+                        return int(usage.get("input_tokens") or 0)
+                    except (TypeError, ValueError):
+                        return 0
+                if start == 0:
+                    return 0
+                window *= 4
+    except OSError:
+        return 0
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)) or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def note_ticket_done(worker_id: str) -> None:
+    """Count one closed/blocked ticket on a registered worker's record.
+
+    Feeds the engine-independent WATCHTOWER_RECYCLE_TICKETS cap. Unregistered
+    callers (humans) are ignored. Best-effort: never raises."""
     worker_id = str(worker_id or "").strip()
     if not worker_id:
-        return 0
+        return
+    try:
+        with _WorkersFileLock():
+            data = _load()
+            for row in data["workers"]:
+                if row.get("worker_id") == worker_id and not row.get("released_at"):
+                    row["tickets_done"] = int(row.get("tickets_done") or 0) + 1
+                    _save(data)
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def context_budget_exceeded(worker_id: str, session_uuid: str = "") -> tuple:
+    """``(limit, value)`` when a DRAIN WORKER is over a recycle limit, else ``()``.
+
+    ``limit`` is ``claude_bytes`` / ``codex_input_tokens`` / ``tickets``
+    (truthy tuple, falsy when fine). Applies ONLY to workers registered in
+    workers.json -- a human running ``wt claim`` by hand is never recycled.
+    Env knobs, read per call (0 disables each):
+
+    * ``WATCHTOWER_CONTEXT_RECYCLE_BYTES`` (default 2.5MB): claude transcript.
+    * ``WATCHTOWER_CODEX_RECYCLE_INPUT_TOKENS`` (default 30M): codex cumulative
+      input tokens from the rollout's last token_count event.
+    * ``WATCHTOWER_RECYCLE_TICKETS`` (default 10): any engine, tickets closed
+      or blocked this run (``tickets_done`` on the worker record).
+    """
+    worker_id = str(worker_id or "").strip()
+    if not worker_id:
+        return ()
     record = next(
         (
             w
@@ -901,11 +1140,28 @@ def context_budget_exceeded(worker_id: str, session_uuid: str = "") -> int:
         ),
         None,
     )
-    if record is None or str(record.get("engine") or "") != "claude":
-        return 0
+    if record is None:
+        return ()
+    engine = str(record.get("engine") or "")
     sid = str(record.get("session_id") or "").strip() or str(session_uuid or "")
-    size = _claude_transcript_bytes(sid)
-    return size if size >= budget else 0
+    if engine == "claude":
+        budget = _env_int("WATCHTOWER_CONTEXT_RECYCLE_BYTES", 2_500_000)
+        if budget > 0:
+            size = _claude_transcript_bytes(sid)
+            if size >= budget:
+                return ("claude_bytes", size)
+    elif engine == "codex":
+        budget = _env_int("WATCHTOWER_CODEX_RECYCLE_INPUT_TOKENS", 30_000_000)
+        if budget > 0:
+            used = _codex_input_tokens(sid)
+            if used >= budget:
+                return ("codex_input_tokens", used)
+    cap = _env_int("WATCHTOWER_RECYCLE_TICKETS", 10)
+    if cap > 0:
+        done = int(record.get("tickets_done") or 0)
+        if done >= cap:
+            return ("tickets", done)
+    return ()
 
 
 def _kimi_wire_mtime(w: Dict[str, Any]) -> float:
@@ -932,6 +1188,26 @@ def _kimi_wire_mtime(w: Dict[str, Any]) -> float:
     except OSError:
         return 0.0
     return newest
+
+
+def session_active_age_s(w: Dict[str, Any], rows: List[Dict[str, Any]],
+                         now: Optional[float] = None) -> Optional[float]:
+    """Seconds since a dead-PID row's session transcript was last written, when
+    that is recent enough to mean a resumed session is still working (WT-17).
+
+    Display evidence only: ``alive`` stays PID-based because release, kill and
+    staffing act on that process. None when the row is alive, has no session,
+    the transcript is quiet, or a live row already owns the session."""
+    sid = str(w.get("session_id") or "")
+    if w.get("alive") or not sid:
+        return None
+    if any(r.get("alive") and str(r.get("session_id") or "") == sid for r in rows):
+        return None
+    now = time.time() if now is None else now
+    from . import liveness
+    mtime = max(_codex_rollout_mtime(w), _claude_transcript_mtime(w), _kimi_wire_mtime(w))
+    age = now - mtime
+    return age if mtime and age < liveness.RECENT_SESSION_S else None
 
 
 def _worker_idle_s(w: Dict[str, Any]) -> float:
@@ -975,7 +1251,7 @@ def _worker_released(w: Dict[str, Any]) -> bool:
 def _worker_wakeable(w: Dict[str, Any]) -> bool:
     """True if a live, blocked-only worker can be pushed a message to retry
     `wt claim` instead of needing a fresh spawn for the same budget slot
-    (SONIA-CHAT-21).
+    (CLIENT-CHAT-21).
 
     Two gates, mirroring why the worker would otherwise sit uncovered
     forever: a FIFO stdin that can actually reach it (a Codex worker that
@@ -1058,42 +1334,11 @@ def notify_workers(
             or str(w.get("session_id") or "") in exclude
         ):
             continue  # never push a nudge back at whoever caused it
-        # UDS first. It is steer by construction -- the frame goes at peer
-        # priority `next`, which Claude injects into a running turn without
-        # aborting it -- so unlike a FIFO write it is safe even mid-turn, and
-        # it arrives as a proper cross-session message rather than as text
-        # indistinguishable from the user's own typing.
-        if str(w.get("engine") or "") == "claude" and deliver_via_uds(
-            str(w.get("session_id") or ""), text,
-            from_name="watchtower-reconciler",
-        ):
+        got = _nudge_one(w, text)
+        if got == "sent":
             n += 1
-            continue
-        if worker_turn_open(w):
+        elif got == "deferred":
             deferred += 1
-            continue  # mid-turn: defer to the next tick rather than interrupt
-        fifo = w.get("fifo")
-        if fifo and write_to_worker_fifo(fifo, text, engine=str(w.get("engine") or "claude")):
-            n += 1
-            continue
-        # WATCHTOWER-14: a worker with no fifo (or a failed write) used to get
-        # nothing at all -- this loop was the one delivery path in WT that had
-        # no fallback whatsoever. Route it through the shared adapter chain
-        # instead. verb=steer because a nudge is only useful before the turn
-        # it is nudging about ends, and expire=30 because a stale nudge is
-        # noise: the reconcile tick will produce a fresh one.
-        target = str(w.get("session_id") or "").strip()
-        if not target:
-            continue
-        try:
-            from . import messages
-            if messages.deliver_message(
-                target, text, verb="steer", expire=30,
-                delegate_timeout_s=_NUDGE_DELEGATE_TIMEOUT_S,
-            ).get("ok"):
-                n += 1
-        except Exception:  # noqa: BLE001 - a nudge must never break reconcile
-            pass
     if deferred:
         try:
             from .queue import _log
@@ -1105,6 +1350,69 @@ def notify_workers(
         except Exception:
             pass
     return n
+
+
+def _nudge_one(w: Dict[str, Any], text: str, attempt: int = 1) -> str:
+    """One worker's nudge, verified (WT-31 D4): ``sent`` / ``deferred`` /
+    ``failed``. The ledger row (``nudge:<worker_id>``) is confirmed only when
+    the nonce lands; a lost nudge is resent once, then the worker is marked
+    ``undeliverable_since``.
+
+    UDS first. It is steer by construction -- the frame goes at peer priority
+    ``next``, which Claude injects into a running turn without aborting it --
+    so unlike a FIFO write it is safe even mid-turn, and it arrives as a
+    proper cross-session message rather than as text indistinguishable from
+    the user's own typing. A mid-turn worker without UDS is deferred to the
+    next tick rather than interrupted.
+
+    WATCHTOWER-14: a worker with no fifo (or a failed write) used to get
+    nothing at all. It goes through the shared adapter chain instead:
+    verb=steer because a nudge is only useful before the turn it is nudging
+    about ends, and expire=30 because a stale nudge is noise: the reconcile
+    tick will produce a fresh one."""
+    from . import liveness
+    wid = str(w.get("worker_id") or "")
+    sid = str(w.get("session_id") or "").strip()
+    try:
+        res = liveness.deliver(
+            sid, text, purpose="nudge", dedupe_key=f"nudge:{wid}",
+            queue=str(w.get("queue") or ""), worker_id=wid, session_id=sid,
+            engine=str(w.get("engine") or "claude"),
+            transports=("uds", "fifo", "message"), fifo=str(w.get("fifo") or ""),
+            fifo_ready=lambda: not worker_turn_open(w), fifo_busy="defer",
+            from_name="watchtower-reconciler",
+            message={"verb": "steer", "expire": 30,
+                     "delegate_timeout_s": _NUDGE_DELEGATE_TIMEOUT_S},
+            attempt=attempt)
+    except Exception:  # noqa: BLE001 - a nudge must never break reconcile
+        return "failed"
+    if res.get("state") == "deferred":
+        return "deferred"
+    return "sent" if res.get("ok") else "failed"
+
+
+def _set_undeliverable(worker_id: str, since: Optional[float]) -> bool:
+    """Mark (or clear, ``since=None``) a worker whose nudges never land."""
+    if not worker_id:
+        return False
+    try:
+        with _WorkersFileLock():
+            data = _load()
+            for row in data["workers"]:
+                if row.get("worker_id") != worker_id:
+                    continue
+                if since is None:
+                    if "undeliverable_since" not in row:
+                        return False
+                    row.pop("undeliverable_since", None)
+                else:
+                    row.setdefault("undeliverable_since",
+                                   time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since)))
+                _save(data)
+                return True
+    except Exception:
+        return False
+    return False
 
 
 # Hard ceiling on how long the fifo-less fallback in notify_workers may wait
@@ -1151,7 +1459,7 @@ _last_blocked_wake: Dict[str, float] = {}
 
 def _maybe_wake_blocked_workers(queue: str, wakeable: List[Dict[str, Any]]) -> int:
     """Wake blocked-only worker(s) that are being counted as staffed capacity
-    for `queue` (SONIA-CHAT-21), so they retry `wt claim` themselves instead
+    for `queue` (CLIENT-CHAT-21), so they retry `wt claim` themselves instead
     of the reconciler spawning a second worker into the budget slot they're
     already covering.
 
@@ -1183,6 +1491,53 @@ def _maybe_wake_blocked_workers(queue: str, wakeable: List[Dict[str, Any]]) -> i
     return delivered
 
 
+def _release_stalled_sent_back() -> List[Dict[str, Any]]:
+    """WT-34: release silent sent-back claims and tell the former holder."""
+    from . import queue as _q
+    released = _q.release_stalled_sent_back()
+    for it in released:
+        rel = it.get("sent_back_released") or {}
+        wid = str(rel.get("worker_id") or "")
+        if not wid:
+            continue
+        note = (f"{it.get('ref')} was sent back to you and showed no progress, so it "
+                "was released to the pool for another worker. If it is still open "
+                f"you may `wt claim {it.get('ref')} --worker {wid}` to take it back; "
+                "do not close it without claiming.")
+        try:
+            notify_workers(str(it.get("project") or ""), note, only={wid})
+        except Exception:
+            pass
+    return released
+
+
+def _nudge_sent_back_holders(queue: str) -> set:
+    """WT-34: targeted nudge naming each held sent-back ticket and its age.
+    Returns the worker ids nudged, to exclude from the generic broadcast."""
+    from . import queue as _q
+    from .queue import _log
+    out: set = set()
+    for it in _q.sent_back_claims(queue):
+        sb = it.get("sent_back") or {}
+        wid = str(sb.get("worker_id") or it.get("claimed_by") or "")
+        if not wid:
+            continue
+        mins = _q._sent_back_minutes(it)
+        dl = _q._sent_back_deadline(it, mins)
+        tail = (f" It is released to another worker at {_q._hhmmz(dl)} without progress."
+                if dl else "")
+        msg = (f"{it.get('ref')} was sent back to you {_q._age_min(sb.get('at'))}m ago "
+               f"and is still unfixed. Work it before any other ticket, then `wt close`."
+               f"{tail} A `wt comment {it.get('ref')}` counts as progress.")
+        try:
+            if notify_workers(queue, msg, only={wid}):
+                out.add(wid)
+        except Exception:
+            pass
+        _log("NUDGE", f"{it.get('ref')} sent-back holder {wid} nudged", queue=queue)
+    return out
+
+
 def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
     """Nudge live workers on a stuck-but-staffed queue to retry/continue.
 
@@ -1203,7 +1558,11 @@ def _maybe_nudge_stuck_queue(queue: str, live_count: int) -> int:
         f"{claim_filter} "
         "--json` and keep draining."
     )
-    delivered = notify_workers(queue, nudge)
+    try:
+        held = _nudge_sent_back_holders(queue)  # WT-34: they get a targeted nudge
+    except Exception:
+        held = set()
+    delivered = notify_workers(queue, nudge, exclude=held or None)
     _log("NUDGE", f"stuck queue — nudged {delivered}/{live_count} live worker(s)",
          queue=queue)
     return delivered
@@ -1241,18 +1600,6 @@ def _find_claude_session_row(session_id: str) -> Optional[Dict[str, Any]]:
     if len(matches) != 1:
         return None
     return matches[0]
-
-
-def _release_instruction(w: Dict[str, Any]) -> str:
-    queue = str(w.get("queue") or "this queue")
-    return (
-        "This is from the WatchTower Reconciler. You are no longer a "
-        f"WatchTower worker for {queue}. Do not claim any more tickets from "
-        "this queue. If the active goal is this queue's WatchTower drain goal, "
-        "clear/complete that goal now; do not clear or interrupt an unrelated "
-        "goal. This release is queue-scoped: continue any unrelated work "
-        "already underway in this conversation."
-    )
 
 
 def _uds_delivery_receipt(
@@ -1406,52 +1753,40 @@ def _deliver_release_instruction_via_uds(
 
 
 def _deliver_release_instruction(
-    w: Dict[str, Any], text: str
+    w: Dict[str, Any], text: str, attempt: int = 1
 ) -> Dict[str, Any]:
-    if str(w.get("engine") or "") == "claude":
-        uds_result = _deliver_release_instruction_via_uds(w, text)
-        if uds_result is not None:
-            return uds_result
-    fifo = str(w.get("fifo") or "")
-    # A mid-turn FIFO write can steer (and truncate) the response in flight.
-    # messages.send below is the safe alternative: it holds/queues on a busy
-    # target and retries, instead of interrupting.
-    if fifo and not worker_turn_open(w):
-        try:
-            if write_to_worker_fifo(fifo, text, engine=str(w.get("engine") or "claude")):
-                return {"transport": "fifo", "delivered": True, "error": ""}
-        except Exception as exc:
-            return {
-                "transport": "fifo",
-                "delivered": False,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
+    """Verified (WT-31 D4, ``release:<worker_id>``): UDS, then the FIFO when
+    the turn is closed, then ``messages.deliver_message``. A mid-turn FIFO
+    write can steer (and truncate) the response in flight; deliver_message is
+    the safe alternative: it holds/queues on a busy target and retries,
+    instead of interrupting. verb=engine_default maps to today's mode="send"
+    exactly. A lost instruction is resent once, then logged
+    RELEASE_UNDELIVERED."""
+    from . import liveness
+    engine = str(w.get("engine") or "claude")
     target = str(w.get("session_id") or "").strip()
-    if not target:
-        return {
-            "transport": "unavailable",
-            "delivered": False,
-            "error": "missing session id",
-        }
     try:
-        from . import messages
-        # verb=engine_default maps to today's mode="send" exactly. This path
-        # was hardened by the UDS release-delivery hotfix and works; the point
-        # of routing it through deliver_message is the single entry point and
-        # the shared adapter chain, not new timing semantics.
-        result = messages.deliver_message(target, text, verb="engine_default")
-        delivered = bool(result.get("ok"))
-        return {
-            "transport": "native_session",
-            "delivered": delivered,
-            "error": "" if delivered else str(result.get("error") or "delivery failed"),
-        }
+        res = liveness.deliver(
+            target, text, purpose="release",
+            dedupe_key=f"release:{w.get('worker_id') or target}",
+            queue=str(w.get("queue") or ""), worker_id=str(w.get("worker_id") or ""),
+            session_id=target, engine=engine, transports=("uds", "fifo", "message"),
+            uds_fn=lambda body: _deliver_release_instruction_via_uds(w, body),
+            fifo=str(w.get("fifo") or ""), fifo_ready=lambda: not worker_turn_open(w),
+            message={"verb": "engine_default"}, attempt=attempt)
     except Exception as exc:
-        return {
-            "transport": "native_session",
-            "delivered": False,
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+        return {"transport": "native_session", "delivered": False,
+                "error": f"{type(exc).__name__}: {exc}"}
+    transport = str(res.get("transport") or "")
+    if transport in ("uds", "fifo"):
+        return {"transport": transport, "delivered": bool(res.get("ok")),
+                "error": str(res.get("error") or "")}
+    if not target:
+        return {"transport": "unavailable", "delivered": False,
+                "error": "missing session id"}
+    delivered = bool(res.get("ok"))
+    return {"transport": "native_session", "delivered": delivered,
+            "error": "" if delivered else str(res.get("error") or "delivery failed")}
 
 
 def _audit_value(value: Any) -> str:
@@ -1477,6 +1812,37 @@ def _audit_value(value: Any) -> str:
 
 def _audit_detail(**fields: Any) -> str:
     return " ".join(f"{key}={_audit_value(value)}" for key, value in fields.items())
+
+
+_SPAWN_CAUSE_TEXT = {
+    "initial_staffing": "initial staffing",
+    "scale_up": "scale up",
+    "dead_worker_recovery": "replacing a dead worker",
+    "release_replacement": "replacing a released worker",
+    "manual_or_run_once": "manual run",
+}
+
+_ZERO_SPAWN_TEXT = {
+    "live_workers_cover_claimable_work": "live workers already cover the claimable work",
+    "no_claimable_work": "nothing claimable",
+    "auto_drain_off": "auto-drain is off",
+    "depth_lookup_failed": "could not read the queue",
+    "surplus_staffing_after_release": "already over-staffed",
+    "staffing_sufficient_after_release": "already fully staffed",
+}
+
+
+def _spawn_plan_summary(plan: Dict[str, Any]) -> str:
+    """One plain-English sentence for a SPAWN_PLAN line; the key=value audit
+    fields still follow it for machines."""
+    running = f"{plan['eligible_after']}/{plan['desired']} workers running"
+    work = f"{plan['claimable_depth']} of {plan['total_open']} open tickets claimable"
+    cause = _SPAWN_CAUSE_TEXT.get(plan["cause"], plan["cause"])
+    if plan["requested"] > 0:
+        noun = "worker" if plan["requested"] == 1 else "workers"
+        return f"wants to spawn {plan['requested']} {noun} ({cause}); {running}, {work} |"
+    why = _ZERO_SPAWN_TEXT.get(plan["zero_spawn_reason"], plan["zero_spawn_reason"])
+    return f"no spawn wanted: {why}; {running}, {work} |"
 
 
 def _whole_age(value: Any) -> Any:
@@ -1576,6 +1942,23 @@ def _engine_activity(w: Dict[str, Any]) -> Dict[str, Any]:
             (home / "sessions").glob(pattern),
             "kimi_wire",
             str(home / "sessions" / pattern),
+        )
+    if engine == "antigravity":
+        # The AGY CLI keeps each conversation in its own SQLite db. The db and
+        # its WAL are written per step; the -shm index is excluded because any
+        # reader (CCC, sqlite3) touches it without the worker doing anything.
+        home = Path(
+            os.environ.get("WATCHTOWER_ANTIGRAVITY_HOME")
+            or (Path.home() / ".gemini" / "antigravity-cli")
+        )
+        conv = home / "conversations"
+        return _matched_activity(
+            (
+                p for p in (conv / f"{session_id}.db", conv / f"{session_id}.db-wal")
+                if p.exists()
+            ),
+            "antigravity_conversation",
+            str(conv / f"{session_id}.db"),
         )
     return _file_activity(None, f"{engine or 'engine'}_activity")
 
@@ -1729,6 +2112,17 @@ def _idle_snapshot(
         }
     ]
     owned_refs = set(owned_by_worker + owned_by_session)
+    # WT-28: a worker retaining a parked ticket (or an unexpired affinity
+    # reservation) for an unanswered question is never idle-released.
+    parked_refs = sorted(
+        str(it.get("ref") or "")
+        for it in (_parked_rows(items=items or []) + _affinity_rows(items=items or []))
+        if worker_id and worker_id in {
+            str((it.get("parked") or {}).get("worker_id") or ""),
+            str((it.get("pending_answer") or {}).get("prior_worker_id") or "")
+            if it.get("status") == "open" else "",
+        }
+    )
     blocked_refs = [
         str(item.get("ref") or "")
         for item in (items or [])
@@ -1776,13 +2170,15 @@ def _idle_snapshot(
             reasons.append("owned_by_session")
         if blocked_refs:
             reasons.append("blocked_ticket")
+    if parked_refs:
+        reasons.append("parked_retention")
     if not session_id:
         reasons.append("session_identity_missing")
     if not worker_id:
         reasons.append("worker_identity_missing")
     if not str(w.get("queue") or ""):
         reasons.append("queue_identity_missing")
-    if engine not in {"claude", "codex", "kimi"}:
+    if engine not in {"claude", "codex", "kimi", "antigravity"}:
         reasons.append("authoritative_activity_unknown")
     elif session_id:
         if not evidence["engine_activity"]["exists"]:
@@ -1814,6 +2210,7 @@ def _idle_snapshot(
         "worker_refs": sorted(owned_by_worker),
         "session_refs": sorted(owned_by_session),
         "blocked_refs": sorted(blocked_refs),
+        "parked_refs": parked_refs,
         "reasons": sorted(set(reasons)),
     }
     snapshot["fingerprint"] = _audit_fingerprint(snapshot)
@@ -2111,9 +2508,12 @@ def release_idle_workers(max_idle_s: float = RELEASE_IDLE_S,
             # sentinel creation have both succeeded. A failed request_stop
             # therefore remains retryable on the next tick.
             _persist_worker_audit_state(worker_id, state)
-            delivery = _deliver_release_instruction(
-                w, _release_instruction(w)
-            )
+            # No message to the worker (WATCHTOWER-31). It is verified idle,
+            # so its prompt cache is cold, and any message would start a
+            # full-price uncached turn just to say "stop". The sentinel is
+            # enough: notify_workers skips released workers, so the worker
+            # never wakes from us again, and its next wt claim returns stop.
+            delivery = {"transport": "none", "delivered": False, "error": ""}
             released_at = _released_at(worker_id)
             idle_min = int(snapshot["idle_s"] / 60)
             floor_min = int(max_idle_s / 60)
@@ -2222,7 +2622,9 @@ def release_zombie_workers(queue: Optional[str] = None,
             continue
         if _worker_released(w):
             continue
-        if q_name not in stuck_queues:
+        failure_reason = _classify_zombie_log(str(w.get("log") or ""))
+        quota_blocked = failure_reason == "engine usage limit"
+        if q_name not in stuck_queues and not quota_blocked:
             continue
 
         started = w.get("started_at")
@@ -2235,7 +2637,7 @@ def release_zombie_workers(queue: Optional[str] = None,
                 age_s = max(0.0, now - dt.timestamp())
             except (ValueError, TypeError):
                 pass
-        if age_s < threshold:
+        if age_s < threshold and not quota_blocked:
             continue
 
         worker_id = str(w.get("worker_id") or "")
@@ -2258,7 +2660,7 @@ def release_zombie_workers(queue: Optional[str] = None,
                 if closed_at and closed_at >= started:
                     closed_since_start = True
                     break
-        if closed_since_start:
+        if closed_since_start and not quota_blocked:
             continue
 
         try:
@@ -2277,7 +2679,6 @@ def release_zombie_workers(queue: Optional[str] = None,
             )])
             continue
 
-        failure_reason = _classify_zombie_log(str(w.get("log") or ""))
         if failure_reason:
             log_path = Path(str(w.get("log") or ""))
             _record_launch_failure(
@@ -2286,7 +2687,8 @@ def release_zombie_workers(queue: Optional[str] = None,
                 worker_id=worker_id,
                 pid=int(w.get("pid") or 0),
                 log_path=log_path,
-                reason=f"zombie worker: {failure_reason}",
+                reason=(failure_reason if failure_reason == "engine usage limit"
+                        else f"zombie worker: {failure_reason}"),
                 model=str(w.get("model") or ""),
             )
 
@@ -2442,6 +2844,121 @@ def sweep_orphan_stop_signals() -> List[str]:
     return removed
 
 
+def _pid_argv(pid: int) -> str:
+    """argv of a live pid via ps, '' on any failure."""
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def _worker_pid_identity(w: Dict[str, Any], pid: int) -> str:
+    """Is ``pid`` still the process this worker record was written for?
+
+    Returns ``"match"``, ``"mismatch"`` (the pid now belongs to some other
+    process), or ``"unknown"`` (ps could not answer -- try again later).
+    Records outlive their process (rebound rows are never pruned) and Linux
+    hosts wrap pid_max within days, so a bare pid is not an identity. The
+    recorded start token is authoritative; rows without one fall back to
+    checking that argv still names the worker's engine. A record started
+    before the last boot never matches: after a restart its pid may name
+    another live session of the same engine."""
+    if started_before_boot(w):
+        return "mismatch"
+    recorded = str(w.get("pid_started") or "")
+    if recorded:
+        current = _pid_start_token(pid)
+        if not current:
+            return "unknown"
+        return "match" if current == recorded else "mismatch"
+    argv = _pid_argv(pid)
+    if not argv:
+        return "unknown"
+    engine_bin = _ENGINE_BIN.get(str(w.get("engine") or "").lower(), "")
+    head = [Path(tok).name.lower() for tok in argv.split()[:2]]
+    return "match" if engine_bin and engine_bin in head else "mismatch"
+
+
+def _signal_worker(pid: int, sig: int) -> str:
+    """Signal a worker and everything it started; returns the scope used.
+
+    Spawned workers are session leaders (``start_new_session=True``), so their
+    engine's MCP servers and tool subprocesses share the worker's process
+    group. Signalling only the leader orphans those children -- exactly the
+    pile-up GH issue #1 is about. A worker that is not its own group leader
+    (a rebound continuation living in someone's terminal) gets a pid-only
+    signal: that group belongs to someone else."""
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        pgid = 0
+    if pgid == pid and pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, sig)
+            return "group"
+        except OSError:
+            pass
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
+    return "pid"
+
+
+def _fresh_park_owners(now: float) -> set:
+    ids = {str((it.get("parked") or {}).get("worker_id"))
+           for it in _parked_rows(now=now)
+           if _iso_age_s(str((it.get("parked") or {}).get("at") or ""), now) < park_grace_s()}
+    ids |= {str((it.get("pending_answer") or {}).get("prior_worker_id") or "")
+            for it in _affinity_rows(now=now)} - {""}
+    return ids
+
+
+_IDLE_RENUDGE_S = 120.0
+_idle_renudged_at: Dict[str, float] = {}
+
+
+def _renudge_idle_workers(
+    queue: str, live: List[Dict[str, Any]], not_idle_ids: Set[str],
+    now: Optional[float] = None,
+) -> int:
+    """Wake idle workers when claimable work exists but nobody was told.
+
+    Dispatch nudges once, when a ticket is filed. A ticket filed inside the
+    queue's ``grace_s`` is not claimable then, so that nudge reaches nobody,
+    and nothing nudged again once grace expired: the ticket sat open while
+    live workers idled (BYM-FUTURE-2399). The reconcile tick has already
+    established claimable depth > 0, so push idle workers to `wt claim`.
+    Rate-limited per queue so a worker that cannot take the work is not
+    nagged every tick."""
+    now = time.time() if now is None else now
+    if now - _idle_renudged_at.get(queue, 0.0) < _IDLE_RENUDGE_S:
+        return 0
+    idle = {
+        str(w.get("worker_id") or "") for w in live
+        if str(w.get("worker_id") or "") not in not_idle_ids
+    } - {""}
+    if not idle:
+        return 0
+    from . import config
+    claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
+    nudge = (
+        f"{queue} has claimable work. Claim it with `wt claim -q {queue} "
+        f"--worker <your-id>{claim_filter} --json` and drain the queue."
+    )
+    _idle_renudged_at[queue] = now
+    try:
+        return notify_workers(queue, nudge, only=idle)
+    except Exception:
+        return 0
+
+
 def reap_released_workers(
     ttl_s: float = RELEASED_TTL_S,
     kill_grace_s: float = _RELEASED_KILL_GRACE_S,
@@ -2463,72 +2980,128 @@ def reap_released_workers(
     stop-signal sentinel is dropped once the process is confirmed dead, so
     ``stop-signals/`` does not accumulate orphans for it.
 
+    Older releases and an interrupted ``request_stop`` may have only a stop
+    sentinel. Recover their missing ``released_at`` from the sentinel mtime
+    and persist it, so consuming that one-shot file cannot reset the TTL.
+
+    Never signals a pid that no longer belongs to the worker (see
+    ``_worker_pid_identity``): such a row is marked ``gc_skipped`` and logged
+    once as GC_SKIPPED. Signals go to the worker's whole process group when it
+    leads one (see ``_signal_worker``).
+
     Returns one dict per action taken:
     ``{"worker_id", "queue", "pid", "action": "sigterm"|"sigkill",
-    "released_age_s"}``.
+    "scope": "group"|"pid", "released_age_s"}``.
     """
-    now = time.time() if now is None else float(now)
+    # Stamp SIGTERM at signal time even if ownership discovery was slow.
+    # An explicit now supplies a fixed clock for deterministic callers.
+    clock = time.time if now is None else lambda: float(now)
+    now = clock()
     actions: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    # Computed once per pass, on first need: each call lists every ticket in
+    # every queue (GitHub-backed ones parse each issue body), and calling it
+    # per released row under the workers lock pegged the daemon at 100% CPU
+    # and starved every reader of that lock (95 rows, 2026-10-05).
+    fresh_owners: Optional[set] = None
+    # (worker_id, pid) -> kill stamp. record_worker can leave two rows for one
+    # worker; without this the pid is signalled and GC_RELEASED logged twice.
+    reaped: Dict[tuple, str] = {}
     with _WorkersFileLock():
         data = _load()
         changed = False
         for row in data["workers"]:
+            if row.get("gc_skipped"):
+                continue
+            worker_id = str(row.get("worker_id") or "")
             released_at = str(row.get("released_at") or "")
             if not released_at:
-                continue
+                if not worker_id:
+                    continue
+                try:
+                    sentinel = (STOP_SIGNALS_DIR / worker_id).stat()
+                    if not stat.S_ISREG(sentinel.st_mode):
+                        continue
+                    released_at = datetime.fromtimestamp(
+                        sentinel.st_mtime, timezone.utc,
+                    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+                except (OSError, ValueError, OverflowError):
+                    continue  # no readable release evidence; leave attached
+                row["released_at"] = released_at
+                changed = True
             age_s = _iso_age_s(released_at, now)
             if age_s < ttl_s:
                 continue
-            worker_id = str(row.get("worker_id") or "")
+            if fresh_owners is None:
+                fresh_owners = _fresh_park_owners(now)
+            if worker_id in fresh_owners:
+                continue  # WT-28: owns a park younger than the grace
             pid = int(row.get("pid", 0) or 0)
+            key = (worker_id, pid)
+            if key in reaped:
+                if reaped[key] and row.get("gc_kill_sent_at") != reaped[key]:
+                    row["gc_kill_sent_at"] = reaped[key]
+                    changed = True
+                continue  # sibling row for the same worker already handled
             if not _pid_alive(pid):
                 continue  # sweep_orphan_stop_signals() cleans up its sentinel
             kill_sent_at = str(row.get("gc_kill_sent_at") or "")
-            if not kill_sent_at:
-                try:
-                    os.kill(pid, 15)
-                except OSError:
-                    pass
-                row["gc_kill_sent_at"] = datetime.now(timezone.utc).strftime(
-                    "%Y-%m-%dT%H:%M:%SZ"
-                )
+            if kill_sent_at and _iso_age_s(kill_sent_at, now) < kill_grace_s:
+                continue  # SIGTERM was just sent -- give it the grace window
+            identity = _worker_pid_identity(row, pid)
+            if identity == "unknown":
+                continue  # ps could not answer; never signal blind -- next tick
+            if identity == "mismatch":
+                row["gc_skipped"] = "pid_reused"
                 changed = True
-                actions.append({
+                skipped.append({
                     "worker_id": worker_id,
                     "queue": str(row.get("queue") or ""),
                     "pid": pid,
-                    "action": "sigterm",
-                    "released_age_s": int(age_s),
                 })
                 continue
-            if _iso_age_s(kill_sent_at, now) < kill_grace_s:
-                continue  # SIGTERM was just sent -- give it the grace window
-            try:
-                os.kill(pid, 9)
-            except OSError:
-                pass
-            _cleanup_stop_signal(worker_id)
+            action = "sigkill" if kill_sent_at else "sigterm"
+            scope = _signal_worker(pid, 9 if kill_sent_at else 15)
+            if kill_sent_at:
+                _cleanup_stop_signal(worker_id)
+            else:
+                row["gc_kill_sent_at"] = datetime.fromtimestamp(clock(), timezone.utc).strftime(
+                    "%Y-%m-%dT%H:%M:%SZ"
+                )
+                changed = True
+            reaped[key] = str(row.get("gc_kill_sent_at") or "")
             actions.append({
                 "worker_id": worker_id,
                 "queue": str(row.get("queue") or ""),
                 "pid": pid,
-                "action": "sigkill",
+                "action": action,
+                "scope": scope,
                 "released_age_s": int(age_s),
             })
         if changed:
             _save(data)
-    if actions:
+    events = [
+        (
+            "GC_RELEASED",
+            f"worker {a['worker_id']} pid {a['pid']} {a['action']} "
+            f"{a['scope']} (released {a['released_age_s']}s ago, "
+            f"TTL {int(ttl_s)}s)",
+            a["queue"],
+        )
+        for a in actions
+    ] + [
+        (
+            "GC_SKIPPED",
+            f"worker {s['worker_id']} pid {s['pid']} not signalled: the pid "
+            "now belongs to another process (worker already gone)",
+            s["queue"],
+        )
+        for s in skipped
+    ]
+    if events:
         try:
             from .queue import _log_many
-            _log_many([
-                (
-                    "GC_RELEASED",
-                    f"worker {a['worker_id']} pid {a['pid']} {a['action']} "
-                    f"(released {a['released_age_s']}s ago, TTL {int(ttl_s)}s)",
-                    a["queue"],
-                )
-                for a in actions
-            ])
+            _log_many(events)
         except Exception:
             pass
     return actions
@@ -2651,7 +3224,7 @@ def _legacy_claude_continuity(worker_id: str, session_id: str) -> Dict[str, Any]
     known_names: set = set()
     try:
         from . import config
-        known_names |= set(config.all_queues())
+        known_names |= set(config.all_queues(include_archived=True))
     except Exception:
         pass
     try:
@@ -2765,6 +3338,45 @@ def _parse_usage_retry_at(text: str, now: Optional[float] = None) -> Optional[fl
     return candidate.timestamp()
 
 
+# The engine's own auth-error phrasing, as one phrase. Matching the two words
+# anywhere in the log flagged a worker that finished fine: its answer was a
+# card-payment plan mentioning "Delayed authentication" and "a failed mark".
+_AUTH_FAILED_RE = re.compile(
+    r"authentication[ _-]?(?:failed|error)|failed to authenticate"
+)
+
+
+def _quota_exhausted(text: str) -> bool:
+    """Provider exhaustion, including Claude's spend wall and structured errors.
+
+    Structured output must be an actual error, not a tool result quoting an
+    error string. Plain CLI diagnostics remain supported.
+    """
+    phrases = ("usage limit", "monthly spend limit", "weekly limit reached",
+               "insufficient_quota", "quota exceeded", "quota exhausted",
+               "credit balance is too low", "resource_exhausted")
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            if any(phrase in line.lower() for phrase in phrases):
+                return True
+            continue
+        if not isinstance(event, dict):
+            continue
+        is_error = (event.get("is_error") is True
+                    or event.get("is_api_error_message") is True
+                    or event.get("type") in {"error", "turn.failed"})
+        if not is_error:
+            continue
+        lower = json.dumps(event).lower()
+        if any(phrase in lower for phrase in phrases):
+            return True
+        if event.get("error") == "rate_limit" or event.get("api_error_status") == 429:
+            return True
+    return False
+
+
 def _classify_launch_failure_log(
     log_path: Path, now: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
@@ -2775,14 +3387,25 @@ def _classify_launch_failure_log(
     lower = text.lower()
     reason = ""
     retry_at = None
-    if "usage limit" in lower:
+    if _quota_exhausted(text):
         reason = "engine usage limit"
         retry_at = _parse_usage_retry_at(text, now=now)
     elif "http 503" in lower or "upstream connect error" in lower:
         reason = "engine api unavailable"
+    elif "model is not supported" in lower or "model_not_found" in lower:
+        # Codex on a ChatGPT login rejects API-only models ("The 'gpt-5.6'
+        # model is not supported when using Codex with a ChatGPT account").
+        # The fix is the queue's model, not the engine, so say so.
+        reason = "engine rejected the queue's model"
+    elif "subscription does not have access" in lower or "upgrade your plan" in lower:
+        # Kimi's lapsed plan: "provider.auth_error: 403 Your current
+        # subscription does not have access". Logged in fine; needs billing.
+        reason = "engine subscription has no access"
+    elif "not inside a trusted directory" in lower:
+        reason = "engine refused the working directory (not trusted)"
     elif "not logged in" in lower or "please run /login" in lower:
         reason = "engine authentication required"
-    elif "authentication" in lower and ("failed" in lower or "error" in lower):
+    elif _AUTH_FAILED_RE.search(lower):
         reason = "engine authentication failed"
     elif (
         "cannot find module" in lower
@@ -2825,7 +3448,7 @@ def _classify_zombie_log(log_path: str, lines: int = ZOMBIE_LOG_SCAN_LINES) -> O
                 or recent.count("not exist or you may not have access") >= 2):
             return "repeated model_not_found"
         # Usage / auth / connectivity failures that would also stall a worker.
-        if "usage limit" in recent:
+        if _quota_exhausted("".join(all_lines[-lines:])):
             return "engine usage limit"
         if ("authentication" in recent
                 and ("failed" in recent or "required" in recent)):
@@ -2939,6 +3562,25 @@ def _record_launch_failure(
     return rec
 
 
+def _launch_effort(queue: str, engine: str, model: str, effort: str) -> str:
+    """Per-launch effort: drop a catalog-rejected pin for this launch only (the
+    stored pin stays), with a log line (WT-19)."""
+    if not effort:
+        return effort
+    from . import config
+    if config._effort_rejected(engine, model or config.model(queue), effort):
+        msg = (f"effort {effort!r} not listed for {model or config.model(queue)!r} "
+               f"in the {engine} catalog; launching without it")
+        print(f"[watchtower] {queue}: {msg}", flush=True)
+        try:
+            from .queue import _log
+            _log("WARN", msg, queue=queue)
+        except Exception:
+            pass
+        return ""
+    return effort
+
+
 def _alert_launch_failure_queue(queue: str) -> str:
     """Which queue a spawn-then-die self-report is filed into.
 
@@ -2991,7 +3633,8 @@ def _alert_repeated_launch_failure(rec: Dict[str, Any]) -> str:
                 f"Nothing on {queue} is moving while this lasts, and the "
                 f"reconciler will keep backing off rather than fixing it. Check "
                 f"the engine itself first (binary installed and runnable, login "
-                f"valid, quota available):\n"
+                f"valid, plan active, quota available, queue model accepted "
+                f"by this login):\n"
                 f"  last worker log: {rec.get('log') or '(none)'}\n"
                 f"  cooldown until:  {rec.get('cooldown_until_human') or '(none)'}\n\n"
                 f"Once the engine works again the streak clears on the first "
@@ -3052,7 +3695,7 @@ def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any
         simultaneously-pruned casualties logs one LAUNCH_FAIL, not five).
     """
     log_path = str(worker.get("log") or "")
-    queue = str(worker.get("queue") or "")
+    queue = str(worker.get("ticket_queue") or worker.get("queue") or "")
     if not log_path or not queue or worker.get("session_id"):
         return None
     started_at = worker.get("started_at")
@@ -3088,23 +3731,95 @@ def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any
     )
 
 
+_SWAP_ON_SIGHT_REASONS = frozenset({
+    "engine usage limit",
+    "engine subscription has no access",
+    "engine rejected the queue's model",
+})
+
+
 def _warrants_engine_swap(rec: Optional[Dict[str, Any]]) -> bool:
     """Whether this launch failure is worth moving the queue off its engine.
 
-    A usage limit is swapped away from on sight: the provider has already said
-    it will not serve us and named no alternative, so waiting costs the queue
-    the whole cooldown. Every other failure has to prove it is not transient by
-    repeating -- a single 503 or a flaky first start must not permanently
-    rewrite a queue's configured engine."""
+    A usage limit (or a lapsed plan, or a model this login cannot use) is
+    swapped away from on sight: the provider has already said it will not serve
+    us and named no alternative, so waiting costs the queue the whole cooldown.
+    Every other failure has to prove it is not transient by repeating -- a
+    single 503 or a flaky first start must not move a queue's workers off its
+    configured engine."""
     if not isinstance(rec, dict):
         return False
-    if rec.get("reason") == "engine usage limit":
+    if rec.get("reason") in _SWAP_ON_SIGHT_REASONS:
         return True
     try:
         consecutive = int(rec.get("consecutive") or 0)
     except (TypeError, ValueError):
         return False
     return consecutive >= _LAUNCH_FAILURE_ALERT_STREAK
+
+
+def _launch_substitute(queue: str, engine: str, *, attempted=()) -> str:
+    """Engine to launch this queue's workers on instead of its failing
+    ``engine``, or "" to not substitute. Only a queue that opted in to
+    "Revert to CCC default worker" gets one (WATCHTOWER-30), and never an
+    engine that is itself cooling down on this queue."""
+    from . import config
+    if not config.fallback_to_default_worker(queue):
+        return ""
+    excluded = set(attempted)
+    # Preserve the configured/default order, skipping every exhausted engine.
+    # Each candidate can be visited only once, even if a provider keeps failing.
+    while True:
+        substitute = config.fallback_engine(engine, excluded=excluded)
+        if not substitute or substitute in excluded:
+            return ""
+        if not active_launch_failure_cooldown(queue, substitute):
+            return substitute
+        excluded.add(substitute)
+
+
+def headroom_launch_choice(queue: str) -> Optional[Dict[str, str]]:
+    """Headroom-aware dispatch (31K B25): the engine this queue's next
+    workers should launch on given CCC's quota headroom, or None to keep the
+    queue engine. Only for queues with ``headroom_dispatch`` on. Candidates
+    are the queue engine then its fallback chain, skipping engines that are
+    unavailable or cooling down on this queue. Like the cooldown substitute
+    this is launch-time only -- the stored engine/model are never changed.
+
+    Returns ``{"engine", "model", "effort", "reason"}`` when a different
+    engine should be used. Never raises (headroom is advisory)."""
+    from . import config, headroom
+    from . import models as _models
+    try:
+        if not config.headroom_dispatch(queue):
+            return None
+        engine = config.engine(queue)
+        candidates = [engine]
+        # A fresh CCC writes ``worker_fallback: {"enabled": false, "models":
+        # []}``, which leaves no routes; headroom dispatch is its own opt-in,
+        # so fall back to the built-in order rather than silently doing nothing.
+        chain = config.fallback_chain() or [
+            config._ccc_worker_engine_default(), "codex", "claude", "kimi"]
+        for cand in chain:
+            cand = str(cand or "").strip().lower()
+            if (not cand or cand in candidates or cand not in _models.ENGINES
+                    or not engine_available(cand)
+                    or active_launch_failure_cooldown(queue, cand)):
+                continue
+            candidates.append(cand)
+        if len(candidates) < 2:
+            return None
+        chosen, reason = headroom.pick_engine(candidates, headroom.read_rows())
+        if not chosen or chosen == engine:
+            return None
+        return {
+            "engine": chosen,
+            "model": config.fallback_model(chosen),
+            "effort": config.fallback_effort(queue, chosen),
+            "reason": reason,
+        }
+    except Exception:  # noqa: BLE001 - never let advisory data block a spawn
+        return None
 
 
 def active_launch_failure_cooldown(
@@ -3142,11 +3857,20 @@ def _wait_for_immediate_launch_failure(
     worker_id: str,
     log_path: Path,
     model: str = "",
+    classified_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    if _LAUNCH_FAILURE_GRACE_S <= 0:
+    """Watch the first seconds after spawn for a launch failure.
+
+    ``classified_only`` (WT-24, stage sessions): an UNclassified non-zero exit
+    does not set the shared cooldown; the caller gets
+    ``{"classified": False, "reason", "exit_code"}`` and decides (a stage death
+    consumes an attempt). A classifier hit is recorded as always and returned
+    with ``"classified": True``. The default path is unchanged for builders."""
+    grace = _stage_launch_grace_s() if classified_only else _LAUNCH_FAILURE_GRACE_S
+    if grace <= 0:
         return None
     try:
-        exit_code = proc.wait(timeout=_LAUNCH_FAILURE_GRACE_S)
+        exit_code = proc.wait(timeout=grace)
     except subprocess.TimeoutExpired:
         return None
     classified = _classify_launch_failure_log(log_path)
@@ -3159,8 +3883,14 @@ def _wait_for_immediate_launch_failure(
         # silent respawn every tick -- the classifier can only ever name the
         # failures we have already seen, and this is the one that hurt
         # (WATCHTOWER-29: 242 dead workers over 5 days, none of them recorded).
-        classified = {"reason": f"engine exited immediately (exit {exit_code})"}
-    return _record_launch_failure(
+        reason = f"engine exited immediately (exit {exit_code})"
+        tail = _last_log_line(log_path)
+        if tail:
+            reason += f": {tail}"
+        if classified_only:
+            return {"classified": False, "reason": reason, "exit_code": exit_code}
+        classified = {"reason": reason}
+    rec = _record_launch_failure(
         queue=queue,
         engine=engine,
         worker_id=worker_id,
@@ -3171,6 +3901,114 @@ def _wait_for_immediate_launch_failure(
         model=model,
         exit_code=exit_code,
     )
+    if classified_only and isinstance(rec, dict):
+        rec = dict(rec, classified=True)
+    return rec
+
+
+def _stage_launch_grace_s() -> float:
+    """Immediate-failure window for stage sessions; per call so tests tune it."""
+    try:
+        return float(os.environ.get("WATCHTOWER_STAGE_LAUNCH_GRACE_S",
+                                    str(_LAUNCH_FAILURE_GRACE_S)))
+    except ValueError:
+        return _LAUNCH_FAILURE_GRACE_S
+
+
+def _spawn_stagger_s(engine: str) -> float:
+    raw = os.environ.get("WATCHTOWER_SPAWN_STAGGER_S")
+    if raw not in (None, ""):
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            pass
+    return 3.0 if str(engine).lower() == "claude" else 1.0
+
+
+_SPAWN_GATE_MAX_WAIT_S = 30.0
+
+
+def _spawn_gate(engine: str) -> float:
+    """Host-wide stagger between engine starts (WT-24). A cross-process file
+    lock plus a last-spawn epoch per engine: concurrent ``claude -p`` starts
+    (the 2026-09-30 silent-death suspect) can no longer land in the same
+    second, whichever process spawns them. Waits at most 30 s, then logs
+    SPAWN_GATE timeout and proceeds. Returns the seconds waited."""
+    stagger = _spawn_stagger_s(engine)
+    if stagger <= 0:
+        return 0.0
+    import fcntl
+    base = WORKERS_FILE.parent
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(base / "spawn-gate.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return 0.0
+    started = time.time()
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.time() - started > _SPAWN_GATE_MAX_WAIT_S:
+                    _log_spawn_gate_timeout(engine)
+                    return time.time() - started
+                time.sleep(0.05)
+        state_path = base / "spawn-gate.json"
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            state = {}
+        last = float(state.get(engine) or 0)
+        wait = last + stagger - time.time()
+        if wait > 0:
+            wait = min(wait, max(0.0, _SPAWN_GATE_MAX_WAIT_S - (time.time() - started)))
+            time.sleep(wait)
+        state[engine] = time.time()
+        try:
+            state_path.write_text(json.dumps(state))
+        except OSError:
+            pass
+        return time.time() - started
+    finally:
+        try:
+            os.close(fd)  # releases the flock
+        except OSError:
+            pass
+
+
+def _log_spawn_gate_timeout(engine: str) -> None:
+    try:
+        from .queue import _log
+        _log("SPAWN_GATE", f"timeout waiting for the {engine} spawn gate; proceeding")
+    except Exception:
+        pass
+
+
+def _last_log_line(log_path: Path, limit: int = 160) -> str:
+    """Last non-blank line of a startup log, trimmed -- the engine's own words
+    for why it died (e.g. ``unexpected argument '--input-format'``)."""
+    try:
+        lines = [
+            line.strip()
+            for line in log_path.read_text(errors="replace").splitlines()
+            if line.strip()
+        ]
+    except OSError:
+        return ""
+    if not lines:
+        return ""
+    # Prefer the newest error-looking line over the literal last one: clap-style
+    # CLIs (devin) close with "For more information, try '--help'." after the
+    # actual complaint.
+    tail = lines[-12:]
+    line = next(
+        (ln for ln in reversed(tail)
+         if re.search(r"error|unexpected|invalid|unknown|failed", ln, re.I)),
+        tail[-1],
+    )
+    return line if len(line) <= limit else line[: limit - 1] + "…"
 
 
 def resolve_session_id_from_log(log_path: str) -> str:
@@ -3297,20 +4135,103 @@ def _upsert_codex_worker_registry(
         pass
 
 
-def _pid_start_token(pid: int) -> str:
-    """Return the OS-reported process start time used to detect PID reuse."""
+def _pid_start_token(pid: int, utc: bool = False) -> str:
+    """Return the OS-reported process start time used to detect PID reuse.
+
+    ``utc=True`` renders it in UTC, the form Claude Code records as a session
+    registry row's ``procStart``."""
     if not pid:
         return ""
     try:
+        env = dict(os.environ, TZ="UTC") if utc else None
         result = subprocess.run(
             ["ps", "-p", str(pid), "-o", "lstart="],
             capture_output=True,
             text=True,
             timeout=2,
+            env=env,
         )
         return result.stdout.strip() if result.returncode == 0 else ""
     except Exception:
         return ""
+
+
+def claude_session_row_liveness(row: Dict[str, Any]) -> Tuple[str, str]:
+    """``('alive'|'dead'|'unproven', why)`` for one Claude session registry
+    row (WT-31 D1): alive only when its pid is live AND the start token the
+    row recorded (``procStart``, UTC ``lstart``; or a WT-style
+    ``pid_started``) equals that pid's current start. A token mismatch is a
+    reused pid (dead: it must never veto orphan/backstop recovery); a live
+    pid without a recorded token proves nothing (unproven)."""
+    pid = int((row or {}).get("pid") or 0)
+    if not pid or not _pid_alive(pid):
+        return "dead", "registry pid gone"
+    proc_start = " ".join(str(row.get("procStart") or "").split())
+    if proc_start:
+        cur = " ".join(_pid_start_token(pid, utc=True).split())
+    else:
+        proc_start = " ".join(str(row.get("pid_started") or "").split())
+        cur = " ".join(_pid_start_token(pid).split()) if proc_start else ""
+    if not proc_start:
+        return "unproven", f"registry pid {pid} live but its row has no start token"
+    if not cur:
+        return "unproven", f"registry pid {pid}: start token unreadable"
+    if cur != proc_start:
+        return "dead", f"registry pid {pid} reused (start token mismatch)"
+    return "alive", ""
+
+
+_BOOT_TIME: Optional[float] = None
+BOOT_SLACK_S = 60.0  # the kernel's boot time drifts a little with clock corrections
+
+
+def boot_time() -> float:
+    """When this machine last booted (epoch seconds; 0.0 when unknown).
+    Read once per process: it cannot change while the process runs."""
+    global _BOOT_TIME
+    if _BOOT_TIME is None:
+        _BOOT_TIME = 0.0
+        try:
+            with open("/proc/stat") as fh:
+                for line in fh:
+                    if line.startswith("btime "):
+                        _BOOT_TIME = float(line.split()[1])
+                        break
+        except OSError:
+            try:
+                out = subprocess.run(["sysctl", "-n", "kern.boottime"], capture_output=True,
+                                     text=True, timeout=2).stdout
+                m = re.search(r"sec = (\d+)", out)
+                _BOOT_TIME = float(m.group(1)) if m else 0.0
+            except Exception:  # noqa: BLE001
+                _BOOT_TIME = 0.0
+    return _BOOT_TIME
+
+
+def started_before_boot(rec: Dict[str, Any]) -> bool:
+    """True when ``rec`` (a worker record or ``claim_proc``) was started
+    before the last boot: its process cannot still be running, whatever now
+    holds its pid. A restart (an update, a crash, a preempted cloud VM)
+    leaves records with pids the new boot hands out again."""
+    boot = boot_time()
+    if not boot:
+        return False
+    started = 0.0
+    token = " ".join(str(rec.get("pid_started") or "").split())
+    if token:
+        # The process's own start (``ps -o lstart``, local time) beats the
+        # record's write time when we have it.
+        try:
+            return time.mktime(time.strptime(token, "%a %b %d %H:%M:%S %Y")) < boot - BOOT_SLACK_S
+        except (ValueError, OverflowError):
+            pass
+    for key in ("started_at", "record_started_at"):
+        try:
+            raw = str(rec.get(key) or "").replace("Z", "+00:00")
+            started = max(started, datetime.fromisoformat(raw).timestamp() if raw else 0.0)
+        except ValueError:
+            continue
+    return bool(started) and started < boot - BOOT_SLACK_S
 
 
 def _pid_alive(pid: int) -> bool:
@@ -3331,7 +4252,17 @@ def _pid_alive(pid: int) -> bool:
         return False
 
     # Process exists, but check if it's a zombie (defunct).
-    # On macOS, use ps; on Linux, check /proc.
+    # On Linux read /proc (no fork: the reconciler probes ~1.3k pids a tick,
+    # WT-12); elsewhere (macOS) ask ps.
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as f:
+            # "pid (comm) S ..."; comm may itself contain ") ".
+            return f.read().rsplit(b")", 1)[1].split()[0] != b"Z"
+    except FileNotFoundError:
+        if os.path.isdir("/proc/self"):
+            return False  # exited between the kill probe and the read
+    except (OSError, IndexError):
+        pass
     try:
         import subprocess
         result = subprocess.run(
@@ -3346,6 +4277,43 @@ def _pid_alive(pid: int) -> bool:
     except Exception:
         # If ps fails, assume the process is alive (safer than killing live processes).
         return True
+
+
+def read_exit_file(path: str) -> Dict[str, Any]:
+    """The wrapper's exit record (``ended_at``, ``rc``, ``signal``), or {}."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def record_liveness(rec: Dict[str, Any], exit_file: str = "") -> Tuple[str, str, Dict[str, Any]]:
+    """``('alive'|'dead', reason, extra)`` for one worker record or a ticket's
+    ``claim_proc`` (WT-31): dead on the exit file's ``ended_at``, a gone pid,
+    or a reused pid (start-token mismatch). A listed record's ``alive`` flag
+    is trusted; a bare ``claim_proc`` is probed. ``extra`` carries rc/signal
+    and ``ended_at`` when the exit file has them."""
+    exit_info = read_exit_file(str(rec.get("exit_file") or exit_file or ""))
+    if exit_info.get("ended_at"):
+        rc, sig = exit_info.get("rc"), int(exit_info.get("signal") or 0)
+        why = (f"killed by signal {sig}" if sig else
+               "exited without submitting" if not rc else f"exited rc {rc}")
+        return "dead", why, {"rc": rc, "signal": sig, "ended_at": exit_info["ended_at"]}
+    if started_before_boot(rec):
+        ended = datetime.fromtimestamp(boot_time(), timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return "dead", "machine restarted since it started", {"ended_at": ended}
+    alive = rec["alive"] if "alive" in rec else _pid_alive(int(rec.get("pid") or 0))
+    if not alive:
+        return "dead", "process gone" + (" (wrapper missing ended_at: killed along with it)"
+                                         if exit_info else ""), {}
+    token = str(rec.get("pid_started") or "")
+    if token:
+        cur = _pid_start_token(int(rec.get("pid") or 0))
+        if cur and cur != token:
+            return "dead", "pid reused (start token mismatch)", {}
+    return "alive", "", {}
 
 
 def _find_engine_ancestor_pid(engine: str, max_depth: int = 8) -> int:
@@ -3385,6 +4353,30 @@ def _find_engine_ancestor_pid(engine: str, max_depth: int = 8) -> int:
         except (OSError, ValueError, subprocess.SubprocessError):
             return 0
     return 0
+
+
+def _pid_is_descendant(pid: int, ancestor: int, max_depth: int = 8) -> bool:
+    """True when ``ancestor`` appears in ``pid``'s parent chain.
+
+    The Codex npm launcher is a node wrapper that spawns the native codex
+    binary, so a worker recorded under the wrapper pid and an ancestor lookup
+    that lands on the child are the same live session, not a concurrent rebind.
+    """
+    cur = int(pid or 0)
+    for _ in range(max_depth):
+        if cur <= 1:
+            return False
+        try:
+            out = subprocess.run(
+                ["ps", "-p", str(cur), "-o", "ppid="],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+            cur = int(out)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return False
+        if cur == int(ancestor):
+            return True
+    return False
 
 
 def rebind_continued_worker(
@@ -3480,6 +4472,14 @@ def rebind_continued_worker(
             recorded_pid = int(worker.get("pid") or 0)
             if recorded_pid == int(pid):
                 return True
+            if (
+                recorded_pid
+                and _pid_alive(recorded_pid)
+                and _pid_is_descendant(int(pid), recorded_pid)
+            ):
+                # Same session: recorded pid is the launcher wrapper of the
+                # live engine process we found. Not a rebind.
+                return True
             if worker.get("rebound_at"):
                 raise ValueError(
                     f"worker {worker_id!r} was already continued once "
@@ -3513,6 +4513,10 @@ def record_worker(
     session_id: str = "",
     model: str = "",
     kind: str = "",
+    ref: str = "",
+    stage: str = "",
+    ticket_queue: str = "",
+    exit_file: str = "",
 ) -> Dict[str, Any]:
     with _WorkersFileLock():
         data = _load()
@@ -3531,17 +4535,62 @@ def record_worker(
             rec["model"] = model
         if kind:
             rec["kind"] = kind
+        if ref:
+            rec["ref"] = ref
+        if stage:
+            rec["stage"] = stage
+        if ticket_queue:
+            rec["ticket_queue"] = ticket_queue
+        if exit_file:
+            rec["exit_file"] = exit_file
         if session_id:
             rec["session_id"] = session_id
-        data["workers"].append(rec)
+        # The worker's own first `wt claim` can win the race against this
+        # write and rebind_continued_worker() then appends a stub row for the
+        # same worker_id/pid. Merge into it rather than adding a second row:
+        # two rows double-counted one process as two live workers, so the
+        # queue read as fully staffed with a released (un-nudgeable) twin.
+        stub = next(
+            (row for row in data["workers"]
+             if row.get("worker_id") == worker_id
+             and int(row.get("pid") or 0) == int(pid)),
+            None,
+        )
+        if stub is not None:
+            stub.update({k: v for k, v in rec.items() if v not in ("", None)})
+        else:
+            data["workers"].append(rec)
         _save(data)
     # Ledger the worker_id now, at spawn time, so it survives this record being
     # pruned once the worker dies (see WORKER_IDS_FILE docstring above).
     _add_worker_id(worker_id)
     # If a session_id is somehow known at record time, ledger it (survives prune).
     _add_worker_session_id(rec.get("session_id", ""))
+    if rec.get("session_id"):
+        origins.note_spawn(
+            rec["session_id"], role=stage or ("adhoc" if kind == "adhoc" else "worker"),
+            ref=ref, queue=ticket_queue or queue, worker_id=worker_id, engine=engine,
+            via="record_worker")
     _upsert_codex_worker_registry(rec)
     return rec
+
+
+# A dead rebound row is kept so a second continuation of the same worker id is
+# refused (5def6b5), but nothing ever expired it: 93 such rows piled up over
+# 20 days, and every pass over workers.json paid for them. A week covers any
+# realistic second-continuation attempt.
+REBOUND_RETENTION_S = 7 * 24 * 3600
+
+
+def _rebound_row_retained(w: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """True while a dead rebound row is inside its retention window, measured
+    from the later of ``rebound_at`` and ``released_at``."""
+    if not w.get("rebound_at"):
+        return False
+    now = time.time() if now is None else now
+    ages = [_iso_age_s(str(w.get(k) or ""), now) for k in ("rebound_at", "released_at")
+            if w.get(k)]
+    return min(ages) < REBOUND_RETENTION_S
 
 
 def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
@@ -3559,6 +4608,7 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         kept: List[Dict[str, Any]] = []
         backfilled = False
+        died_seen = {id(w): w.get("died_at") for w in data["workers"]}
         for w in data["workers"]:
             # Backfill the cloud session UUID from the worker's output log once
             # it appears (the worker has to start its first turn before the init
@@ -3566,17 +4616,34 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
             # and link to its conversation. Parsed at most once per worker.
             if not w.get("session_id") and w.get("log"):
                 sid = resolve_session_id_from_log(w["log"])
+                if not sid and str(w.get("engine") or "").lower() == "devin":
+                    sid = resolve_devin_session_id(str(w.get("worker_id") or ""))
                 if sid:
                     w["session_id"] = sid
                     backfilled = True
                     # Ledger it so it survives this worker being pruned later.
                     _add_worker_session_id(sid)
+                    origins.note_spawn(
+                        sid, role=str(w.get("stage") or "") or (
+                            "adhoc" if w.get("kind") == "adhoc" else "worker"),
+                        ref=str(w.get("ref") or ""),
+                        queue=str(w.get("ticket_queue") or w.get("queue") or ""),
+                        worker_id=str(w.get("worker_id") or ""),
+                        engine=str(w.get("engine") or ""), via="log_backfill")
                     _upsert_codex_worker_registry(w)
                     # A session means this engine really did launch -- end any
                     # failure streak so the next one starts from the default.
                     recovered.append((str(w.get("queue") or ""),
                                       str(w.get("engine") or "")))
-            alive = _pid_alive(int(w.get("pid", 0)))
+            alive = _pid_alive(int(w.get("pid", 0))) and not started_before_boot(w)
+            # Rebound rows are kept after their process dies (see below), so
+            # their pid can be reused by an unrelated process; don't let that
+            # stranger read as this worker. Other dead rows are pruned on this
+            # very pass, so only rebound rows pay for the extra ps call.
+            if alive and w.get("rebound_at") and w.get("pid_started"):
+                current = _pid_start_token(int(w.get("pid", 0)))
+                if current and current != w.get("pid_started"):
+                    alive = False
             row = dict(w)
             row["alive"] = alive
             out.append(row)
@@ -3589,12 +4656,18 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                 audit_state.get("release_log_pending")
                 or audit_state.get("spawn_plan_pending")
             )
-            if alive or pending_audit or w.get("rebound_at"):
+            if alive or pending_audit or _rebound_row_retained(w):
                 kept.append(w)
+            elif w.get("stage") and _stage_record_kept(w, prune, postmortem):
+                # WT-24: a dead stage session keeps its record for a short
+                # window (forensics + the stage watcher's death reason).
+                kept.append(w)
+                if w.get("died_at") and not died_seen.get(id(w)):
+                    backfilled = True  # persist the died_at stamp
             else:
                 # This record is about to be dropped -- last chance to learn why
                 # the worker died (see _postmortem_launch_failure).
-                if prune:
+                if prune and not w.get("died_at"):   # stage records were post-mortemed at stamping
                     postmortem.append(dict(w))
                 # Dead worker: unlink its FIFO node so it doesn't linger on disk.
                 fifo = w.get("fifo")
@@ -3621,25 +4694,238 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
     return out
 
 
-def live_worker_count(queue: Optional[str] = None) -> int:
-    n = 0
+def _adhoc_dead_keep_s() -> float:
+    try:
+        return float(os.environ.get("WATCHTOWER_ADHOC_DEAD_KEEP_S", "1800"))
+    except ValueError:
+        return 1800.0
+
+
+def _stage_record_kept(w: Dict[str, Any], prune: bool, postmortem: List[Dict[str, Any]]) -> bool:
+    """Decide whether a dead stage record stays (called under the workers
+    lock). Stamps ``died_at`` on the first dead observation and queues the
+    launch-failure post-mortem exactly once, at that moment."""
+    if not prune:
+        return True
+    now = time.time()
+    died = w.get("died_at")
+    if not died:
+        w["died_at"] = now
+        postmortem.append(dict(w))
+        return True
+    try:
+        return (now - float(died)) < _adhoc_dead_keep_s()
+    except (TypeError, ValueError):
+        return False
+
+
+def worker_model(worker_id: str, queue: str) -> str:
+    """Canonical model id the claiming ``worker_id`` runs (WT-10).
+
+    The model recorded at spawn wins (a floor-routed run-once worker runs a
+    different model than its queue); a worker with no record or no recorded
+    model runs whatever the queue is configured for.
+    """
+    from . import config
+    for w in _load().get("workers", []):
+        if w.get("worker_id") == worker_id and w.get("model"):
+            return config.canonical_model(
+                str(w.get("engine") or config.engine(queue)), str(w["model"])
+            )
+    return config.queue_model_id(queue)
+
+
+def _env_s(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+PARK_RETENTION_S = 55 * 60.0  # keep a parked ticket's worker alive this long (WT-28)
+PARK_GRACE_S = 55 * 60.0      # defer a released owner's SIGTERM this long (WATCHTOWER_PARK_GRACE_S)
+
+
+def park_grace_s() -> float:
+    return _env_s("WATCHTOWER_PARK_GRACE_S", PARK_GRACE_S)
+
+
+def park_retention_s() -> float:
+    """One configurable window (``WATCHTOWER_PARK_GRACE_S``) shared by idle
+    retention, PARK-EXPIRED and the released-worker reap deferral."""
+    return park_grace_s()
+
+
+def _affinity_rows(queue: Optional[str] = None,
+                   items: Optional[List[Dict[str, Any]]] = None,
+                   now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Tickets reserved (unexpired affinity) for their parked worker's answer."""
+    from . import queue as _q
+    now = time.time() if now is None else now
+    if items is None:
+        try:
+            items = _q.list_items()
+        except Exception:
+            return []
+    out = []
+    for it in items:
+        if queue and it.get("project") != queue:
+            continue
+        if it.get("status") == "open" and _q._affinity_reserved(it, now):
+            out.append(it)
+    return out
+
+
+def expire_parked_retention(now: Optional[float] = None) -> List[str]:
+    """Log PARK-EXPIRED once per park whose retention window has passed."""
+    from . import queue as _q
+    now = time.time() if now is None else now
+    done: List[str] = []
+    try:
+        items = _q.list_items()
+    except Exception:
+        return done
+    for it in items:
+        pk = it.get("parked") or {}
+        if it.get("status") != _q.PARKED_STATUS or pk.get("retention_expired_at"):
+            continue
+        at = str(pk.get("at") or "")
+        if not at or _iso_age_s(at, now) < park_retention_s():
+            continue
+        if _q.mark_park_retention_expired(it["ref"]):
+            _q._log("PARK-EXPIRED", f"{it['ref']} — {pk.get('worker_id') or '-'} no longer "
+                    f"retained after {int(park_retention_s() // 60)}m; answer will resume or hand off",
+                    queue=it.get("project", ""))
+            done.append(str(it["ref"]))
+    return done
+
+
+def _parked_rows(queue: Optional[str] = None, items: Optional[List[Dict[str, Any]]] = None,
+                 now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Parked (``awaiting_answer``) tickets still inside the retention window."""
+    from . import queue as _q
+    now = time.time() if now is None else now
+    if items is None:
+        try:
+            items = _q.list_items()
+        except Exception:
+            return []
+    rows = []
+    for it in items:
+        if it.get("status") != _q.PARKED_STATUS:
+            continue
+        if queue and it.get("project") != queue:
+            continue
+        parked = it.get("parked") or {}
+        if not parked.get("worker_id"):
+            continue
+        at = str(parked.get("at") or "")
+        if at and _iso_age_s(at, now) >= park_retention_s():
+            continue
+        rows.append(it)
+    return rows
+
+
+def retained_parked_refs(queue: Optional[str], worker_id: str) -> List[str]:
+    return [str(it.get("ref")) for it in _parked_rows(queue)
+            if (it.get("parked") or {}).get("worker_id") == worker_id]
+
+
+def retained_parked_ids(queue: Optional[str] = None,
+                        items: Optional[List[Dict[str, Any]]] = None) -> set:
+    """Worker ids kept alive (never STOPped, not counted against the spawn
+    budget) because they own a parked ticket within the retention window.
+
+    DESIGN (INTAKE-CONSOL-8, decided by Amir): excluding these from the spawn
+    budget is intentional elasticity, not a leak. Under ``desired_workers=1`` a
+    queue may run one parked worker plus one live worker, so a long-parked
+    awaiting-client topic never leaves the queue unstaffed for new tickets and
+    the parked worker's warm session survives for ``wt answer`` / resume. There
+    is deliberately no ceiling or ``max_total_workers`` knob; the total worker
+    count is bounded only by ``PARK_RETENTION_S`` expiry."""
+    if items is None:
+        try:
+            from . import queue as _q
+            items = _q.list_items()
+        except Exception:
+            items = []
+    ids = {str((it.get("parked") or {}).get("worker_id")) for it in _parked_rows(queue, items)}
+    ids |= {str((it.get("pending_answer") or {}).get("prior_worker_id") or "")
+            for it in _affinity_rows(queue, items)} - {""}
+    # A worker actively working another ticket is busy, not retained; a known
+    # dead or released worker retains nothing.
+    busy = {str(it.get("claimed_by") or "") for it in items
+            if it.get("status") == "in_progress" and not it.get("needs_input")}
+    ids -= busy
+    try:
+        for w in list_workers(prune=False):
+            if not w.get("alive") or _worker_released(w):
+                ids.discard(str(w.get("worker_id") or ""))
+    except Exception:
+        pass
+    return ids
+
+
+def parked_label(item: Dict[str, Any]) -> str:
+    pk = item.get("parked") or {}
+    return (f"parked by {pk.get('worker_id') or '-'} session={pk.get('session_id') or '-'} "
+            f"at {pk.get('at') or '-'}")
+
+
+def retained_counts(
+    rows: Optional[List[Dict[str, Any]]] = None,
+    items: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, int]:
+    """Per-queue count of live workers retained for a parked answer (WT-28),
+    shown next to ``live`` in status / the dashboard. ``rows`` reuses an
+    already-listed roster instead of taking workers.lock again (WT-4)."""
+    try:
+        retained = retained_parked_ids(items=items)
+    except Exception:
+        return {}
+    out: Dict[str, int] = {}
+    for w in (list_workers() if rows is None else rows):
+        if (w.get("alive") and not _worker_released(w)
+                and str(w.get("worker_id") or "") in retained):
+            out[w.get("queue", "")] = out.get(w.get("queue", ""), 0) + 1
+    return out
+
+
+def live_worker_count(queue: Optional[str] = None, exclude: Optional[set] = None) -> int:
+    seen: Set[str] = set()
     for w in list_workers():
         if not w.get("alive") or _worker_released(w):
             continue
         if queue and w.get("queue") != queue:
             continue
-        n += 1
-    return n
+        wid = str(w.get("worker_id") or "")
+        if exclude and wid in exclude:
+            continue
+        # Duplicate registry rows for one worker must not read as two live
+        # workers: that made `wt claim` call a legitimate worker "surplus"
+        # (4>2 desired with only 2 workers) and release it.
+        seen.add(wid or f"anon-{len(seen)}")
+    return len(seen)
 
 
-def worker_counts(prune: bool = False) -> Dict[str, Dict[str, int]]:
+def worker_counts(prune: bool = False,
+                  rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Dict[str, int]]:
     """Per-queue worker tally: ``{queue: {"total": n, "live": n}}``.
 
     A single pass over the tracked workers so callers (``wt status``, the
-    dashboard) don't fan out one liveness probe per queue.
+    dashboard) don't fan out one liveness probe per queue. ``rows`` reuses an
+    already-listed roster instead of taking workers.lock again (WT-4).
     """
     out: Dict[str, Dict[str, int]] = {}
-    for w in list_workers(prune=prune):
+    seen_ids: Set[str] = set()
+    for w in (list_workers(prune=prune) if rows is None else rows):
+        if w.get("stage") and not w.get("alive"):
+            continue  # kept-dead stage record (WT-24): not a queue worker
+        wid = str(w.get("worker_id") or "")
+        if wid:
+            if wid in seen_ids:
+                continue  # duplicate registry row for the same worker
+            seen_ids.add(wid)
         row = out.setdefault(w.get("queue", ""), {"total": 0, "live": 0})
         row["total"] += 1
         if w.get("alive") and not _worker_released(w):
@@ -3826,11 +5112,13 @@ def drain_goal(
         idle_contract=(
             CODEX_IDLE_CONTRACT if engine == "codex"
             else KIMI_IDLE_CONTRACT if engine == "kimi"
+            else DEVIN_IDLE_CONTRACT if engine == "devin"
             else CLAUDE_IDLE_CONTRACT
         ),
         resume_contract=(
             CODEX_RESUME_CONTRACT if engine == "codex"
             else KIMI_RESUME_CONTRACT if engine == "kimi"
+            else DEVIN_RESUME_CONTRACT if engine == "devin"
             else CLAUDE_RESUME_CONTRACT
         ).format(runbook=_worker_runbook_ref()),
     )
@@ -3903,6 +5191,9 @@ def build_drain_command(
             argv += ["--model", model]
         if effort:
             argv += ["--config", f'model_reasoning_effort="{effort}"']
+        # Codex ignores CCC's CLAUDE_CODE_AUTO_COMPACT_WINDOW; without this
+        # workers ran to ~780K context (model_context_window=1M) before compact.
+        argv += codex_compact_args()
         argv.append(goal or drain_goal(queue, worker_id, repo_path, engine=engine))
         return argv
     if engine == "kimi":
@@ -3920,6 +5211,27 @@ def build_drain_command(
             goal or drain_goal(queue, worker_id, repo_path, engine=engine),
             "--output-format",
             "stream-json",
+        ]
+        if model:
+            argv += ["--model", model]
+        return argv
+    if engine == "devin":
+        # One-shot print mode like kimi: goal rides in argv, stdin is DEVNULL,
+        # the process exits when the drain loop ends. Devin rejects Claude's
+        # --input-format (exit 2), so it must not reach the default branch.
+        # "dangerous" auto-approves every tool, matching the bypass flag the
+        # other engines get; print mode cannot show the workspace-trust prompt
+        # and fails in an untrusted repo unless the check is skipped. Devin has
+        # no --effort flag (effort is baked into the model id suffix,
+        # -low/-medium/-high/-max); queue effort config is ignored here.
+        # devin -p prints no session id, so the worker's session is recovered
+        # from devin's own store instead (resolve_devin_session_id).
+        argv = [
+            bin_name,
+            "-p",
+            goal or drain_goal(queue, worker_id, repo_path, engine=engine),
+            "--permission-mode", "dangerous",
+            "--respect-workspace-trust", "false",
         ]
         if model:
             argv += ["--model", model]
@@ -3944,7 +5256,7 @@ def build_drain_command(
         # attached (empty) prompt before any other flags. Its NDJSON envelope
         # also differs from Claude's; see _stream_json_user_line.
         # Like kimi, AGY has no --effort flag -- effort is baked into the
-        # model id suffix (-high/-medium/-low; see MODEL_EFFORTS). Passing
+        # model id suffix (-high/-medium/-low; see the model catalog). Passing
         # --effort here (even the fleet-wide default) makes AGY exit 1 with
         # "--effort is not supported for model ...".
         argv = [
@@ -3979,7 +5291,8 @@ def request_stop(worker_id: str) -> Path:
     The worker's next ``wt claim`` call will detect the file, delete it, and
     return ``{"stop": True}`` instead of claiming more queue work. The
     underlying conversation/process is preserved and may continue unrelated
-    work. Uses the file-system only -- does NOT touch workers.json.
+    work until the released-worker TTL expires. Persists ``released_at`` in
+    workers.json so detachment and the TTL survive sentinel consumption.
     """
     stop_dir = STOP_SIGNALS_DIR
     stop_dir.mkdir(parents=True, exist_ok=True)
@@ -4079,6 +5392,214 @@ def _answer_in_flight(
     return False
 
 
+# ---------------------------------------------------------------------------
+# Post-fix assessment spawning (WT-21)
+# ---------------------------------------------------------------------------
+
+def assessment_repo(item: Dict[str, Any]) -> str:
+    """Local repo the assessor runs in: the ticket's repo_path, else the
+    queue's configured one. Never falls back to the caller's cwd. Raises
+    ValueError with a fixable message when unresolvable."""
+    from . import config
+    queue = str(item.get("project") or "")
+    path = str(item.get("repo_path") or "").strip() or str(config.repo_path(queue) or "").strip()
+    if not path or path.startswith("host:") or not os.path.isdir(path):
+        raise ValueError(f"no local repo for queue {queue} (set wt config -q {queue} --repo-path)")
+    return path
+
+
+def assessor_goal(item: Dict[str, Any], token: str) -> str:
+    from . import queue as _q
+    res = item.get("resolution") or {}
+    ref = item.get("ref", "?")
+    points = "\n".join(f'  - "{p}": {_q.ASSESSMENT_QUESTIONS[p]}' for p in _q.ASSESSMENT_POINTS)
+    return (
+        f"You are the independent post-fix assessor for the bug ticket {ref}. You did "
+        f"not build the fix. Read the ticket, look at the fix"
+        + (f" (commit {res['commit']}: `git show {res['commit']}`)" if res.get("commit") else "")
+        + f", and judge it against six points, in the repo you are in.\n\n"
+        f"TICKET {ref}: {item.get('title') or item.get('note', '')}\n{item.get('text', '')}\n\n"
+        f"RESOLUTION SUMMARY: {res.get('summary', '') if isinstance(res, dict) else res}\n\n"
+        f"THE SIX POINTS:\n{points}\n\n"
+        f"For each point answer verdict \"adequate\" (one line why; may be blank) or \"gap\". "
+        f"A gap needs 1-3 concrete followups ({{\"title\", \"note\", optional \"queue\"}}) "
+        f"and/or \"existing\": [refs of OPEN tickets that already cover it] -- check "
+        f"`wt ls --status open` first so you do not duplicate. Be concrete and small; "
+        f"'nothing to add' is a valid, good answer. Do not edit code or file tickets yourself.\n\n"
+        f"Submit exactly once with:\n"
+        f"  wt assess submit {ref} --token {token} --json '{{\"logging\": {{\"verdict\": \"adequate\", "
+        f"\"note\": \"...\"}}, \"ui_message\": {{...}}, \"automation\": {{...}}, "
+        f"\"monitoring\": {{...}}, \"auditors\": {{...}}, \"other\": {{...}}}}'\n"
+        f"(or --file PATH). All six keys are required. Then stop."
+    )
+
+
+def start_assessment(item: Dict[str, Any], *, force: bool = False,
+                     dry_run: bool = False) -> Dict[str, Any]:
+    """Reserve an attempt for ``item`` and spawn its assessor. Returns
+    ``{"status": spawned|skipped|failed|dry_run, ...}``; never raises."""
+    from . import queue as _q
+    ref = str(item.get("ref") or "")
+    try:
+        repo = assessment_repo(item)
+        target = _q.assessor_target(item)
+        if dry_run:
+            return {"status": "dry_run", "repo": repo, "assessor": target,
+                    "prompt": assessor_goal(item, "<token>")}
+    except Exception as exc:  # noqa: BLE001
+        if dry_run:
+            return {"status": "failed", "reason": str(exc)}
+        token = _q.assessment_reserve(ref, force=force)
+        if token:
+            _q.assessment_fail(ref, token, str(exc))
+            return {"status": "failed", "reason": str(exc)}
+        return {"status": "skipped"}
+    token = _q.assessment_reserve(ref, force=force)
+    if not token:
+        return {"status": "skipped"}
+    try:
+        if target["blocked"]:
+            raise ValueError(f"model {target['model']!r} for the assessor ({target['engine']}) "
+                             f"is blocked by model policy; not substituting another model")
+        rec = spawn_adhoc(assessor_goal(item, token), target["engine"], model=target["model"],
+                          repo_path=repo, name=f"assess-{ref}", report_to="")
+    except Exception as exc:  # noqa: BLE001
+        _q.assessment_fail(ref, token, f"could not spawn the assessor: {exc}")
+        return {"status": "failed", "reason": str(exc)}
+    _q.assessment_set_running(ref, token, {"engine": target["engine"], "model": target["model"],
+                                           "source": target["source"],
+                                           "worker_id": rec.get("worker_id", "")})
+    return {"status": "spawned", "token": token, "worker_id": rec.get("worker_id", ""),
+            "assessor": target}
+
+
+def spawn_due_assessments(max_actions: int = 3) -> List[str]:
+    """Compatibility wrapper (WT-24): the reconciler's stage pass now owns
+    assessor spawn/watch/respawn and stale-``filing`` resume. Returns the same
+    ``ref:spawned|resumed|settled`` strings."""
+    from . import stages
+    tags = {"spawned": "spawned", "launch_failed": "spawned", "resumed": "resumed",
+            "blocked": "settled", "failed": "settled"}
+    return [f"{ref}:{tags[action]}" for ref, action in stages.reconcile_stages()
+            if action in tags][:max(0, max_actions)]
+
+
+def reconcile_stages_only() -> List[Any]:
+    """A stage-only pass under ``reconcile.lock`` (daemon wake path): skips the
+    fleet maintenance of a full tick."""
+    from .queue import _FileLock
+    from . import stages
+    with _FileLock(WORKERS_FILE.parent / "reconcile.lock"):
+        return stages.reconcile_stages()
+
+
+def _requeue_ref(entry: Any) -> str:
+    """``result["requeued"]`` holds ``{"ref", "reason"}``; bare refs still parse."""
+    return str(entry.get("ref") if isinstance(entry, dict) else entry or "")
+
+
+RESUME_START_S = 45.0  # delegate resume start window (WT-30 D3 (e))
+
+
+def _resume_start_s() -> float:
+    try:
+        return float(os.environ.get("WATCHTOWER_RESUME_START_S", str(RESUME_START_S)))
+    except (TypeError, ValueError):
+        return RESUME_START_S
+
+
+def _resolve_claimer(claimer: str, known_workers: Optional[List[Dict[str, Any]]] = None,
+                     known_ids: Optional[set] = None) -> Tuple[str, str]:
+    """Classify a ticket's ``claimed_by`` for the orphan sweep (WT-30 D2):
+    ``(kind, worker_id)`` with kind ``builder | stage | unknown``. First
+    conclusive answer wins; ``unknown`` (ambient sessions, OPS-104) and
+    ``stage`` (WT-24 supervises those) are never reopened by the sweep."""
+    claimer = str(claimer or "")
+    if known_workers is None:
+        known_workers = list_workers(prune=False)
+    if known_ids is None:
+        known_ids = ({str(w.get("worker_id", "")) for w in known_workers}
+                     | set(_load_worker_id_ledger()))
+    if claimer in known_ids:
+        return "builder", claimer
+    if not _is_worker_session_id(claimer):
+        return "unknown", ""
+    for w in known_workers:
+        if str(w.get("session_id") or "") == claimer:
+            if w.get("stage"):
+                return "stage", ""
+            return "builder", str(w.get("worker_id") or "")
+    try:
+        from . import origins as _origins
+        rec = _origins.get(claimer) or {}
+    except Exception:
+        rec = {}
+    role = str(rec.get("role") or "").strip()
+    if role:
+        if role in ("worker", "adhoc"):
+            return "builder", str(rec.get("worker_id") or "")
+        return "stage", ""
+    if claimer in set(_load_worker_session_ledger()):
+        return "builder", ""
+    return "unknown", ""
+
+
+def _effective_resume(resume: Dict[str, Any], now: float) -> Tuple[str, str, float]:
+    """``(state, transport, age_s)`` of the resume evidence, folding in the
+    outbox row for a ``queued`` resume (WT-30 R3)."""
+    state = str(resume.get("state") or "")
+    transport = str(resume.get("transport") or "")
+    at = str(resume.get("at") or "")
+    if state == "queued":
+        from . import messages
+        entry = None
+        try:
+            entry = messages.outbox_entry(str(resume.get("outbox_id") or ""))
+        except Exception:
+            entry = None
+        status = (entry or {}).get("status")
+        if status == "pending":
+            return "queued", "", 0.0
+        if status == "delivered":
+            state = "running"
+            transport = str(entry.get("transport") or "")
+            at = str(entry.get("delivered_at") or at)
+        else:
+            return "failed", "", 0.0
+    age = _iso_age_s(at, now) if at else 0.0
+    return state, transport, age
+
+
+def _builder_held(it: Dict[str, Any], wid: str, live_ids: set,
+                  live_sessions: set, now: float) -> bool:
+    """True while the ticket's builder/resume still shows evidence of life."""
+    sid = str(it.get("claimed_session_id") or "")
+    if wid and wid in live_ids:
+        return True                                   # (a)
+    if sid and sid in live_sessions:
+        return True                                   # (b)
+    from . import messages
+    try:
+        if sid and messages.live_resume_child(sid):
+            return True                               # (c)
+    except Exception:
+        pass
+    resume = it.get("resume") if isinstance(it.get("resume"), dict) else None
+    if not resume:
+        return False
+    state, transport, age = _effective_resume(resume, now)
+    if state == "queued":
+        return True                                   # (d)
+    if state in ("pending", "running") and transport in ("delegate", ""):
+        if age < _resume_start_s():
+            return True                               # (e) start window
+        try:
+            return messages.session_state(sid) == "busy"  # busy counts for delegate only
+        except Exception:
+            return False
+    return False
+
+
 def requeue_orphaned_tickets(
     grace_s: float = 120.0, answer_grace_s: Optional[float] = None
 ) -> List[Dict[str, Any]]:
@@ -4113,6 +5634,8 @@ def requeue_orphaned_tickets(
             answer_grace_s = 300.0
     known_workers = list_workers(prune=False)
     live_ids = {str(w.get("worker_id", "")) for w in known_workers if w.get("alive")}
+    live_sessions = {str(w.get("session_id") or "") for w in known_workers
+                     if w.get("alive") and w.get("session_id")}
     # Union with the persistent ledger, not just the current (prunable) store:
     # workers.json drops a dead worker's record on the next routine read, often
     # within seconds, which used to make every genuinely-dead worker look
@@ -4124,6 +5647,13 @@ def requeue_orphaned_tickets(
         items = _q.list_items()
     except Exception:
         return reopened
+    from . import liveness as _liveness
+    by_ref = _q._refs_index(items)
+    ctx = _liveness.ResolverContext(now)
+
+    def github_of(item: Dict[str, Any]) -> bool:
+        return _liveness._github(str(item.get("project") or ""))
+
     for it in items:
         if it.get("status") != "in_progress":
             continue
@@ -4137,20 +5667,31 @@ def requeue_orphaned_tickets(
         # via the liveness-aware messaging primitive, so the original worker can
         # look dead here while the resumed/steered session works the answer;
         # reopening now would duplicate that work (see _answer_in_flight).
-        if _answer_in_flight(
-            it.get("answered_at"), str(it.get("claimed_session_id") or ""),
+        pa_at = ((it.get("pending_answer") or {}).get("state_at")
+                 if it.get("pending_answer") else None)
+        has_resume = isinstance(it.get("resume"), dict)
+        # A ticket carrying resume evidence is judged by that evidence below
+        # (WT-30 D3); the flat answer grace only covers answers that carry none.
+        if not has_resume and _answer_in_flight(
+            pa_at or it.get("answered_at"), str(it.get("claimed_session_id") or ""),
             now, answer_grace_s,
         ):
             continue
         claimer = str(it.get("claimed_by") or "")
+        wid = ""
+        if claimer:
+            kind, wid = _resolve_claimer(claimer, known_workers, known_ids)
+            if kind != "builder":
+                continue  # stage (WT-24) or never a spawned worker (OPS-104)
         if claimer and claimer in live_ids:
             continue  # its worker is alive — leave it
-        if claimer and claimer not in known_ids:
-            continue  # never a spawned worker — no evidence it's dead (OPS-104)
+        if _builder_held(it, wid, live_ids, live_sessions, now):
+            continue
         # Grace window guards against a just-claimed ticket whose worker record
-        # hasn't been written yet (spawn/claim race).
+        # hasn't been written yet (spawn/claim race). A reject reclaim cannot
+        # have that race, so it is skipped when resume evidence is present.
         claimed_at = it.get("claimed_at")
-        if claimed_at:
+        if claimed_at and not has_resume:
             try:
                 from datetime import datetime, timezone
                 ts = datetime.fromisoformat(str(claimed_at).replace("Z", "+00:00")).timestamp()
@@ -4159,6 +5700,47 @@ def requeue_orphaned_tickets(
             except Exception:
                 pass
         ref = it.get("ref")
+        # WT-31: the resolver vetoes a reopen when the bound process (or its
+        # session) is provably alive; a dead builder of a review rejection that
+        # was never resumed is resumed first (WT-30).
+        verdict = None
+        # A GitHub-backed claim stores no claim_proc to prove, but a resumed
+        # session still writing its transcript is working all the same: the
+        # original exec PID exiting must not hand the ticket on (OPS-107).
+        if (github_of(it)
+                and now - _liveness._file_activity(it, ctx) < _liveness.RECENT_SESSION_S):
+            continue
+        if not github_of(it):
+            try:
+                verdict = _liveness.claim_owner(it, ctx)
+            except Exception:
+                verdict = None
+            if verdict is not None and verdict.verdict == "alive":
+                continue
+            # A resumed session can outlive its original bound PID, or have
+            # no bound process at all. Recent transcript activity vetoes a
+            # duplicate handoff while death remains unproven. Quiet sessions
+            # still reach recovery below (OPS-102, OPS-1333). A bound claim
+            # carrying resume evidence was already judged by it in
+            # _builder_held (WT-30 D3): the builder's last write at reject
+            # time is not the resumed session working (WT-19).
+            if (verdict is not None and verdict.verdict == "unproven"
+                    and not (has_resume and (verdict.proc or {}).get("bound") != "ambient")
+                    and now - _liveness._file_activity(it, ctx) < _liveness.RECENT_SESSION_S):
+                continue
+            if (verdict is not None and verdict.verdict == "dead"
+                    and _liveness._resume_first(it)):
+                done = _q.recover_claim(
+                    ref, expect=_liveness._expect(it, by_ref), action="resume",
+                    reason="builder dead; resuming its session with the rejection",
+                    evidence=verdict.evidence, state="work.claimed")
+                if done:
+                    try:
+                        from . import cli as _cli
+                        _cli._resume_rejected(done, str(done.get("gate_feedback") or ""))
+                    except Exception:
+                        pass
+                continue
         try:
             # quiet=True: the reconciler emits the single REQUEUE line for this
             # event, so suppress update_status's primitive REOPEN to avoid a
@@ -4170,10 +5752,25 @@ def requeue_orphaned_tickets(
             # close back to "open" — this ticket briefly (and wrongly)
             # reappearing as open/in_progress right after a real close was
             # reported as OPS-72. The guard makes the write a no-op instead.
-            item = _q.update_status(ref, "open", quiet=True, require_status="in_progress",
-                                     reason="worker gone")
+            why = "worker gone"
+            if it.get("gate_feedback") and has_resume:
+                why = (f"worker gone (verify-rejected; builder "
+                       f"{wid or str(it.get('claimed_session_id') or '')[:8]} dead)")
+            sid_d = str(it.get("claimed_session_id") or "")
+            if github_of(it):
+                item = _q.update_status(
+                    ref, "open", quiet=True, require_status="in_progress", reason=why,
+                    orphan=({"session_id": sid_d, "claimed_by": claimer}
+                            if (sid_d or claimer) else None))
+            else:
+                # CAS on the snapshot this decision was made from (claim
+                # fields, claim_proc, state fingerprint); records the backstop.
+                item = _q.recover_claim(
+                    ref, expect=_liveness._expect(it, by_ref), action="reopen", reason=why,
+                    evidence=(f"{verdict.verdict}: {verdict.evidence}" if verdict else ""),
+                    state="work.claimed")
             if item:
-                reopened.append(item)
+                reopened.append(dict(item, requeue_reason=why))
         except Exception:
             pass
     return reopened
@@ -4216,6 +5813,31 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
                  if str(it.get("ref") or "") == ref),
                 None,
             )
+        if item and _q.plan_pending(item):
+            # Plan-gated (WT-22): plan first; no worker until it is accepted
+            # (cmd_plan's accept verdict dispatches again).
+            from . import cli as _cli
+            _cli.start_pending_plans(queue)  # requests the stage; the daemon spawns it
+            reason = "planning first — no worker until the plan is accepted"
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
+        if item and _q.group_role(item) and _q.claim_blocked_by_plan(item):
+            # WT-33: a group parent is never claimed (its members are); a
+            # member waits for its group plan (the plan accept dispatches it).
+            reason = ("group parent — never claimed; its members are"
+                      if _q.group_role(item) == "parent" else
+                      f"group plan first — waits for {_q.group_parent_ref(item)}'s plan")
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
+        readiness = str((item or {}).get("readiness") or "")
+        if readiness in _q.UNCLAIMABLE_READINESS:
+            # Checked before auto_drain: workers never claim an unready
+            # ticket, so blaming drain-off sent the owner to the wrong knob
+            # (WATCHTOWER-2 sat 22h as "auto_drain off" after drain was on).
+            reason = (f"not ready — readiness {readiness}, no worker claims it "
+                      f"until `wt edit {ref} --readiness ready`")
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
         if not config.auto_drain(queue):
             # Drain off parks the backlog, but not a run somebody just asked
             # for -- bailing here is what made ▶ report "Running" and do
@@ -4249,15 +5871,26 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             f"`wt claim -q {queue} --worker <your-id>{claim_filter} --json` and drain the queue."
         )
         # ...and the session that filed it (or pressed ▶) already knows.
-        delivered = notify_workers(queue, nudge, exclude=_self_identities())
+        exclude = set(_self_identities())
+        if not run_requested:
+            # A worker mid-ticket is not who a new ticket is for: nudging it
+            # steers it off its claim, and it drains the queue on its own
+            # when it finishes (WT-15). Idle workers get first shot; if none
+            # is idle the reconcile below decides whether to staff up.
+            exclude |= {
+                str(it.get("claimed_by") or "")
+                for it in (_q.list_items(project=queue) or [])
+                if it.get("status") == "in_progress" and it.get("claimed_by")
+            }
+        delivered = notify_workers(queue, nudge, exclude=exclude)
         if delivered:
             reason = f"nudged {delivered} live worker(s) — immediate pickup"
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
-        # No warm worker: only release workers past the separate lifecycle
-        # floor, then reconcile. Cache coldness alone is not a release signal.
-        release_idle_workers(queue=queue)
-        result = reconcile_once()
+        # No warm worker: reconcile just this queue (WT-2) -- its pass
+        # releases workers past the separate lifecycle floor, then staffs it.
+        # Cache coldness alone is not a release signal.
+        result = reconcile_once(only_queue=queue)
         spawned = [r for r in result.get("spawned", []) if r.get("queue") == queue]
         if spawned:
             wids = ", ".join(r.get("worker_id", "?") for r in spawned)
@@ -4514,6 +6147,155 @@ def _kimi_worker_session_ids(cutoff: float) -> List[str]:
     return out
 
 
+def _devin_sessions_db() -> Path:
+    override = os.environ.get("WATCHTOWER_DEVIN_SESSIONS_DB")
+    if override:
+        return Path(override)
+    return Path.home() / ".local" / "share" / "devin" / "cli" / "sessions.db"
+
+
+def resolve_devin_session_id(worker_id: str) -> str:
+    """Session id of the devin session spawned as WT worker ``worker_id``.
+
+    ``devin -p`` prints plain text and never its session id, so the log-based
+    ``resolve_session_id_from_log`` can never backfill a devin worker -- which
+    left every devin worker unsteerable (WATCHTOWER-32: comments parked in the
+    outbox forever, ``wt answer`` could not ``devin --resume``). Devin records
+    every prompt, print mode included, in its own sessions.db
+    ``prompt_history`` table keyed by session id, and the drain goal's first
+    prompt carries "Your worker id is <id>". Match that line exactly (the
+    regex group must equal the whole id, so ``wt-1`` never claims
+    ``wt-12``'s session) and take the newest hit. Read-only; any failure
+    (no devin install, locked or unknown schema) returns ""."""
+    wid = str(worker_id or "").strip()
+    if not wid:
+        return ""
+    db = _devin_sessions_db()
+    if not db.is_file():
+        return ""
+    import sqlite3
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=1.0)
+    except sqlite3.Error:
+        return ""
+    try:
+        rows = conn.execute(
+            "SELECT session_id, content FROM prompt_history "
+            "WHERE instr(content, ?) > 0 ORDER BY timestamp DESC LIMIT 20",
+            (f"Your worker id is {wid}",),
+        ).fetchall()
+    except sqlite3.Error:
+        return ""
+    finally:
+        conn.close()
+    for sid, content in rows:
+        m = _KIMI_WORKER_GOAL_RE.search(str(content or ""))
+        if m and m.group(1) == wid and sid:
+            return str(sid)
+    return ""
+
+
+# CCC's session id for a devin-cli session: its word-slug with a prefix that
+# keeps it from colliding with a cloud Devin session (ccc_server/devin.py's
+# DEVIN_CLI_SESSION_PREFIX). This is the address `wt send`/notifications must
+# use, because it is the address CCC's /api/inject-input answers to.
+DEVIN_CLI_SESSION_PREFIX = "devincli-"
+
+
+def _devin_cli_locks_dirs() -> List[Path]:
+    """Directories holding devin-cli's per-session lock files.
+
+    Devin writes ``<locks>/<slug>.lock`` containing the owning pid for every
+    live session. Derived from ``_devin_sessions_db()`` so the one
+    ``$WATCHTOWER_DEVIN_SESSIONS_DB`` override isolates both stores in tests;
+    with no override we scan devin's ``cli`` and ``cli-next`` trees, the same
+    pair CCC scans."""
+    if os.environ.get("WATCHTOWER_DEVIN_SESSIONS_DB"):
+        return [_devin_sessions_db().parent / "session_locks"]
+    base = Path.home() / ".local" / "share" / "devin"
+    return [base / "cli" / "session_locks", base / "cli-next" / "session_locks"]
+
+
+def _devin_cli_lock_pids() -> Dict[int, str]:
+    """``{pid: slug}`` for every devin-cli session lock we can read."""
+    out: Dict[int, str] = {}
+    for locks_dir in _devin_cli_locks_dirs():
+        try:
+            entries = list(locks_dir.iterdir())
+        except OSError:
+            continue
+        for p in entries:
+            if p.suffix != ".lock" or len(p.name) <= 5:
+                continue
+            try:
+                pid = int((p.read_text(encoding="utf-8") or "").strip())
+            except (OSError, ValueError):
+                continue
+            if pid > 0:
+                out[pid] = p.name[:-5]
+    return out
+
+
+def _ps_snapshot() -> Dict[int, tuple]:
+    """``{pid: (ppid, command)}`` for every process on the machine."""
+    try:
+        proc = subprocess.run(
+            ["ps", "-ax", "-o", "pid=,ppid=,comm="],
+            capture_output=True, text=True, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out: Dict[int, tuple] = {}
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        try:
+            out[int(parts[0])] = (int(parts[1]), parts[2] if len(parts) > 2 else "")
+        except ValueError:
+            continue
+    return out
+
+
+def current_devin_session_id(pid: Optional[int] = None) -> str:
+    """CCC session id of the devin session running THIS process, or "".
+
+    A devin-cli session sets no session env var -- neither
+    ``CLAUDE_CODE_SESSION_ID`` nor ``CODEX_THREAD_ID`` -- so a ``wt add`` run
+    from inside one filed with ``submitter=""`` and its filer could never be
+    notified (WATCHTOWER-33). Devin does record the owning pid in a per-session
+    lock file, so walk our own parent chain until a pid matches one: that lock's
+    slug is the session we are running inside. Returns the ``devincli-``
+    prefixed form CCC addresses, or "" when we are not inside a devin session
+    (the overwhelmingly common case, and the only cost is one ``ps``).
+
+    Locks are matched only against pids that are STILL a live ``devin``: devin
+    never prunes them (199 of 201 on this machine were dead), and macOS recycles
+    pids, so a bare pid match would eventually name a stranger's session as the
+    filer of a ticket -- a wrong answer is worse here than none.
+
+    We walk UP from ourselves, unlike CCC's ``_devin_cli_raw_id_for_pid``,
+    which walks DOWN from a spawn pid it already knows."""
+    locks = _devin_cli_lock_pids()
+    if not locks:
+        return ""
+    procs = _ps_snapshot()
+    locks = {
+        p: slug for p, slug in locks.items()
+        if "devin" in os.path.basename(procs.get(p, (0, ""))[1])
+    }
+    if not locks:
+        return ""
+    cur = int(pid if pid is not None else os.getpid())
+    seen: Set[int] = set()
+    while cur > 1 and cur not in seen:
+        if cur in locks:
+            return DEVIN_CLI_SESSION_PREFIX + locks[cur]
+        seen.add(cur)
+        cur = procs.get(cur, (0, ""))[0]
+    return ""
+
+
 def backfill_recent_session_titles(
     hours: float = 24.0,
     dry_run: bool = False,
@@ -4537,6 +6319,15 @@ def backfill_recent_session_titles(
         items = []
     out: List[Dict[str, Any]] = []
     candidates: Dict[str, tuple] = {}
+    # Index once: scanning every item per log was O(logs x items) on every
+    # reconciler tick (~0.45 s CPU with 120 logs and 1.3k tickets, WT-12).
+    by_key: Dict[str, List[int]] = {}
+    for n, it in enumerate(items):
+        if it.get("status") not in ("closed", "in_progress"):
+            continue
+        for k in {str(it.get(f) or "") for f in ("claimed_by", "claimed_session_id")}:
+            if k:
+                by_key.setdefault(k, []).append(n)
 
     def _offer(worker_id: str, session_id: str, item: Dict[str, Any]) -> None:
         key = _item_activity_key(item)
@@ -4554,13 +6345,19 @@ def backfill_recent_session_titles(
         sid = resolve_session_id_from_log(str(path))
         if not sid:
             continue
-        item = _latest_worker_item(worker_id, sid, items)
+        mine = sorted({n for k in (worker_id, sid) for n in by_key.get(k, ())})
+        item = _latest_worker_item(worker_id, sid, [items[n] for n in mine])
         if not item:
             continue
         _offer(worker_id, sid, item)
     for item in sorted(items, key=_item_activity_ts):
         sid = str(item.get("claimed_session_id") or "")
         if not sid or _item_activity_ts(item) < cutoff:
+            continue
+        # A released ticket keeps its old claimed_session_id, but that session
+        # no longer holds it; renaming it would overwrite the session's own
+        # title on every tick.
+        if item.get("status") == "open":
             continue
         worker_id = str(item.get("claimed_by") or item.get("closed_by") or sid)
         _offer(worker_id, sid, item)
@@ -4575,7 +6372,9 @@ def backfill_recent_session_titles(
     return out
 
 
-def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
+def reconcile_once(dry_run: bool = False,
+                   only_queue: str = "",
+                   supervise_stages: bool = True) -> Dict[str, Any]:
     """One reconciler tick.
 
     Loads the registry + live workers + queue depths and for each registered
@@ -4601,49 +6400,35 @@ def reconcile_once(dry_run: bool = False) -> Dict[str, Any]:
     delta, over-spawning the queue (WT-75: 4 spawned for desired=2).
     ``spawn_workers`` persists every worker via ``record_worker()`` before the
     lock is released, so a blocked pass sees the fresh workers and skips.
+
+    ``only_queue`` is the event-driven fast path (WT-2): ``dispatch_after_
+    enqueue`` already knows which queue just gained work (a filed ticket or a
+    ▶), so it staffs just that queue -- its idle release, its depth read, its
+    spawn decision -- and skips the fleet-wide maintenance passes (zombie
+    release, reaping, requeue, backfills) and the depth reads of every other
+    queue. Those belong to the periodic tick, and running them inline is what
+    made a ▶ take ~13 s to reach SPAWN_PLAN.
     """
     from .queue import _FileLock
     with _FileLock(WORKERS_FILE.parent / "reconcile.lock"):
-        return _reconcile_once_locked(dry_run)
+        return _reconcile_once_locked(dry_run, only_queue=only_queue,
+                                      supervise_stages=supervise_stages)
 
 
-def bump_timeboxed_model_floor_blocks(
-    reconcile_id: str = "",
-) -> List[Dict[str, Any]]:
-    """SIDE-39 -- per-ticket watchdog for model-floor auto-parks.
+def reopen_legacy_floor_parks(reconcile_id: str = "") -> List[Dict[str, Any]]:
+    """Reopen tickets parked by the retired claim-time model-floor park.
 
-    A ticket whose ``model_floor`` exceeds its queue's model is parked
-    blocked at claim time (FEAT-NEXT-120, see ``cli.cmd_claim``) and then
-    waits on a human indefinitely. Once such a ticket has sat blocked past
-    ``config.model_floor_bump_minutes(queue)`` (keyed off ``blocked_at``,
-    which ``queue.block()`` stamps), this bumps the queue's configured model
-    ONE same-engine tier up ``config.MODEL_FLOOR_TIERS``, records the
-    auto-answer on the ticket, and reopens it so the now-stronger queue
-    re-claims it.
-
-    Deliberately conservative:
-      - Only blocks carrying the recognizable claim-time question
-        (``config.MODEL_FLOOR_BLOCK_PREFIX``) on a ticket with a non-empty
-        ``model_floor`` are touched. An ordinary human-decision block is
-        NEVER auto-answered -- that would silently erase a real question.
-      - At most one tier bump per queue per pass. A still-unmet floor simply
-        re-parks at the next claim with a fresh ``blocked_at``, so escalation
-        proceeds one tier per timebox, each step logged.
-      - No higher same-engine tier (queue already at its engine's top, or
-        running an unranked model): the ticket stays blocked for a human.
-      - If the floor is already met (a human raised the queue's model after
-        the park), the ticket is answered + reopened without any bump.
-
-    Distinct from ``health.STUCK_MINUTES``, which is queue-level ("no close
-    anywhere in the queue lately"); this watchdog is per-ticket.
+    Before WT-10 a worker claimed a ticket above its model and parked it
+    blocked (``config.MODEL_FLOOR_BLOCK_PREFIX``), and SIDE-39 then bumped the
+    WHOLE queue's model a tier every 30 minutes. Floors are now filtered at
+    claim time and routed per ticket, so any such park still on the books is
+    just put back in the pool; the queue's configured model is never touched.
+    Ordinary human-decision blocks are left alone.
     """
-    from . import config, health
     from . import queue as q
 
     out: List[Dict[str, Any]] = []
-    now = datetime.now(timezone.utc)
     actor = reconcile_id or "watchtower-reconciler"
-    bumped_queues: Set[str] = set()
     try:
         blocked = q.list_blocked() or []
     except Exception:
@@ -4652,82 +6437,130 @@ def bump_timeboxed_model_floor_blocks(
         ref = str(it.get("ref") or "")
         queue_name = str(it.get("project") or "")
         floor = str(it.get("model_floor") or "").strip()
-        question = str(it.get("block_question") or "")
-        if not ref or not queue_name or not floor:
+        if not (ref and queue_name and floor):
             continue
-        if not question.startswith(config.MODEL_FLOOR_BLOCK_PREFIX):
-            # A human-decision block that happens to sit on a floor-carrying
-            # ticket. Not ours to answer.
+        from . import config
+        if not str(it.get("block_question") or "").startswith(
+            config.MODEL_FLOOR_BLOCK_PREFIX
+        ):
             continue
-        age_s = health._age_seconds(it.get("blocked_at"), now)
-        if age_s is None or age_s < config.model_floor_bump_minutes(queue_name) * 60:
-            continue
-        eng = config.engine(queue_name)
-        queue_model = config.canonical_model(eng, config.model(queue_name))
-        bumped_to = ""
-        if config.model_floor_met(queue_name, floor):
-            # Human already raised the queue since the park; just unblock.
-            pass
-        elif queue_name in bumped_queues:
-            # One tier per queue per pass; this ticket gets the next pass.
-            continue
-        else:
-            bumped_to = config.next_model_floor_tier(eng, queue_model)
-            if not bumped_to:
-                out.append({
-                    "ref": ref, "queue": queue_name, "action": "left_blocked",
-                    "reason": (
-                        f"no {eng} tier above {queue_model or '(unset)'!r} "
-                        f"to meet floor {floor!r}"
-                    ),
-                })
-                continue
-            config.set_model(queue_name, bumped_to)
-            bumped_queues.add(queue_name)
-        answer_text = (
-            f"[auto] Model-floor timebox: blocked {age_s // 60} min on floor "
-            f"{floor!r} with queue model {queue_model or '(unset)'!r}. "
-            + (
-                f"Bumped queue {queue_name!r} model to {bumped_to!r} and reopened "
-                f"for a stronger worker. (SIDE-39 reconciler watchdog)"
-                if bumped_to else
-                f"Queue model now satisfies the floor; reopened for re-claim. "
-                f"(SIDE-39 reconciler watchdog)"
-            )
-        )
         try:
-            q.answer(ref, answer_text, session_id=actor)
-            # answer() reopens on its own when no resumable session is bound;
-            # otherwise the ticket is still in_progress -- CAS it back to open
-            # so the pool (not the stale claim) owns it. A CAS miss just means
-            # answer() already reopened it (or someone else raced us): fine.
+            q.answer(
+                ref,
+                f"[auto] Model floor {floor!r} is now routed per ticket to a "
+                "floor-model worker; reopened. (WT-10)",
+                session_id=actor,
+            )
             q.update_status(
                 ref, "open", actor, require_status="in_progress",
-                reason="model-floor timebox auto-bump (SIDE-39)",
+                reason="legacy model-floor park reopened (WT-10)",
             )
         except Exception:
             continue
         q._log(
-            "FLOOR_BUMP",
-            (
-                f"{ref} — blocked {age_s // 60}m on floor {floor!r}; "
-                + (
-                    f"queue model {queue_model or '(unset)'!r} -> {bumped_to!r}, reopened"
-                    if bumped_to else
-                    f"floor now met by {queue_model or '(unset)'!r}, reopened"
-                )
-            ),
+            "FLOOR_REOPEN",
+            f"{ref} — legacy floor park ({floor!r}) reopened for routing",
             queue=queue_name,
         )
-        out.append({
-            "ref": ref, "queue": queue_name,
-            "action": "bumped" if bumped_to else "reopened",
-            "floor": floor, "from_model": queue_model, "to_model": bumped_to,
-        })
+        out.append({"ref": ref, "queue": queue_name, "action": "reopened",
+                    "floor": floor})
     return out
 
 
-def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
+# Minimum gap before re-spawning a floor worker for the same ticket, so a
+# worker that dies at launch cannot turn the reconciler into a spawn loop.
+FLOOR_SPAWN_RETRY_S = 600
+
+
+def spawn_floor_routed_workers(
+    reconcile_id: str = "", dry_run: bool = False,
+) -> List[Dict[str, Any]]:
+    """WT-10: per-ticket routing for tickets whose ``model_floor`` exceeds the
+    queue's model.
+
+    Normal workers never see those tickets (``claim_next`` filters on the
+    worker's model), so each one gets a single run-once worker at the floor
+    model pinned to that ref. The queue's configured model is never changed.
+    Tickets are taken in claim order (priority, then age), so the ticket the
+    rest of the queue waits on is not starved. A queue with auto-drain off only
+    routes tickets a human pressed run on. A failed spawn is logged
+    (``FLOOR_SPAWN_FAIL``) and the ticket stays open; it is retried after
+    ``FLOOR_SPAWN_RETRY_S``.
+    """
+    from . import config
+    from . import queue as q
+
+    out: List[Dict[str, Any]] = []
+    try:
+        tracked = list_workers()
+    except Exception:
+        tracked = []
+    now = time.time()
+    routed_refs: Set[str] = set()
+    for w in tracked:
+        if not w.get("ref"):
+            continue
+        started = 0.0
+        try:
+            started = datetime.strptime(
+                str(w.get("started_at") or ""), "%Y-%m-%dT%H:%M:%SZ"
+            ).replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+        if w.get("alive") or now - started < FLOOR_SPAWN_RETRY_S:
+            routed_refs.add(str(w["ref"]))
+    for queue_name in sorted(config.all_queues()):
+        try:
+            queue_model = config.queue_model_id(queue_name)
+            types = config.claim_types(queue_name) or None
+            tickets = q.floor_routed_candidates(queue_name, queue_model, types)
+        except Exception:
+            continue
+        auto_on = config.auto_drain(queue_name)
+        for it in tickets:
+            ref = str(it.get("ref") or "")
+            floor = str(it.get("model_floor") or "")
+            if not ref or ref in routed_refs:
+                continue
+            if not auto_on and not it.get("run_requested"):
+                continue
+            eng = config.floor_engine(floor)
+            if not eng or not engine_available(eng):
+                out.append({"ref": ref, "queue": queue_name, "action": "skipped",
+                            "floor": floor,
+                            "reason": f"no available engine serves {floor!r}"})
+                continue
+            entry = {"ref": ref, "queue": queue_name, "action": "spawn",
+                     "floor": floor, "engine": eng}
+            if dry_run:
+                out.append(entry)
+                continue
+            try:
+                rec = spawn_run_once_worker(
+                    queue_name, ref, repo_path=str(it.get("repo_path") or ""),
+                    engine=eng, model=floor,
+                )
+            except Exception as exc:
+                q._log("FLOOR_SPAWN_FAIL",
+                       f"{ref} — could not spawn a {floor} worker: {exc}",
+                       queue=queue_name)
+                out.append({**entry, "action": "failed", "reason": str(exc)})
+                continue
+            routed_refs.add(ref)
+            q._log(
+                "FLOOR_SPAWN",
+                f"{ref} — floor {floor!r} above queue model "
+                f"{queue_model or '(unset)'!r}; spawned {rec.get('worker_id')}"
+                " at the floor model",
+                queue=queue_name,
+            )
+            out.append({**entry, "worker_id": rec.get("worker_id")})
+    return out
+
+
+def _reconcile_once_locked(dry_run: bool = False,
+                           only_queue: str = "",
+                           supervise_stages: bool = True) -> Dict[str, Any]:
     from . import config, health
     import sys
     reconcile_id = f"reconcile-{uuid.uuid4().hex[:12]}"
@@ -4754,7 +6587,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     result: Dict[str, Any] = {"spawned": [], "stopped": [], "skipped": [],
                               "released": [], "zombies_released": [],
                               "reaped": [], "requeued": [],
-                              "model_floor_bumped": [],
+                              "model_floor_reopened": [], "model_floor_routed": [],
                               "stop_signals_swept": [],
                               "backfilled": [],
                               "session_title_backfilled": [],
@@ -4764,6 +6597,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                               "spawn_plans": [],
                               "reconcile_id": reconcile_id}
 
+    requeued_queues: Set[str] = set()
     staffing_before = list_workers(prune=False)
     eligible_before_by_q: Dict[str, List[Dict[str, Any]]] = {}
     dead_before_by_q: Dict[str, List[Dict[str, Any]]] = {}
@@ -4778,7 +6612,17 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
 
     # Gracefully release workers only after engine-aware activity clocks are
     # stale past the lifecycle floor. Never derive lifecycle from cache warmth.
-    if not dry_run:
+    if not dry_run and only_queue:
+        # Scoped dispatch pass: release only this queue's idle workers (so
+        # replacement bookkeeping still sees them) and leave the fleet-wide
+        # maintenance below to the periodic tick.
+        try:
+            result["released"] = release_idle_workers(
+                queue=only_queue, reconcile_id=reconcile_id
+            )
+        except Exception:
+            pass
+    elif not dry_run:
         try:
             result["released"] = release_idle_workers(
                 reconcile_id=reconcile_id
@@ -4811,10 +6655,43 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         # the spawn pass below re-drains them. Without this a queue reads depth=0
         # ("Ready") while work is unfinished. Must run BEFORE the depth read.
         try:
-            result["requeued"] = [it.get("ref", "")
-                                  for it in requeue_orphaned_tickets()]
+            result["requeued"] = [
+                {"ref": it.get("ref", ""), "reason": it.get("requeue_reason") or "worker gone"}
+                for it in requeue_orphaned_tickets()]
         except Exception:
             pass
+        # WT-34: a live session that sits on a sent-back claim without any
+        # progress loses it to the pool (the orphan sweep above owns dead ones).
+        if not dry_run:
+            try:
+                result["sent_back_released"] = [
+                    {"ref": it.get("ref", "")} for it in _release_stalled_sent_back()]
+            except Exception:
+                pass
+        # WT-28: park legacy blocks, then route answers to parked tickets.
+        if not dry_run:
+            try:
+                from . import answers as _answers, queue as _qpa
+                _qpa.migrate_legacy_blocks()
+                result["answers_routed"] = _answers.route_pending_answers(time.time())
+                expire_parked_retention()
+            except Exception:
+                pass
+        # Single supervisor (WT-24): only a real auto-spawn daemon supervises stage
+        # sessions -- never a --dry-run or spawn-less one.
+        if supervise_stages and not dry_run:
+            try:
+                from . import stages as _stages
+                result["stages"] = [f"{r}:{a}" for r, a in _stages.reconcile_stages()]
+            except Exception:
+                pass
+            # WT-31 D3: the liveness backstop, after every specific handler.
+            try:
+                from . import liveness as _liveness
+                result["backstop"] = [f"{a['ref']}:{a['action']}:{a['result']}"
+                                      for a in _liveness.sweep()]
+            except Exception:
+                pass
         # Nudge any live worker already on an affected queue so the reopened
         # ticket is re-claimed right away. Without this, a requeue only gets
         # picked up when the spawn pass below decides actual<desired (it won't,
@@ -4822,8 +6699,8 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         # existing worker happens to poll again on its own — leaving the ticket
         # visibly "open" but unworked for however long that takes.
         try:
-            requeued_queues = {ref.rsplit("-", 1)[0]
-                               for ref in result["requeued"] if ref}
+            requeued_queues = {_requeue_ref(r).rsplit("-", 1)[0]
+                               for r in result["requeued"] if _requeue_ref(r)}
             for q_name in requeued_queues:
                 claim_filter = "".join(
                     f" --type {t}" for t in config.claim_types(q_name)
@@ -4836,12 +6713,14 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 notify_workers(q_name, nudge)
         except Exception:
             pass
-        # SIDE-39: per-ticket watchdog for model-floor auto-parks. Runs before
-        # the depth reads below so a ticket it reopens counts as claimable on
-        # this same pass (the spawn decision then staffs the bumped queue
-        # immediately instead of one tick later).
+        # WT-10: reopen any legacy claim-time floor parks, then route tickets
+        # above the queue's model to per-ticket floor-model workers. Runs before
+        # the depth reads below, which exclude those tickets for normal workers.
         try:
-            result["model_floor_bumped"] = bump_timeboxed_model_floor_blocks(
+            result["model_floor_reopened"] = reopen_legacy_floor_parks(
+                reconcile_id=reconcile_id
+            )
+            result["model_floor_routed"] = spawn_floor_routed_workers(
                 reconcile_id=reconcile_id
             )
         except Exception:
@@ -4905,8 +6784,13 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             released_by_q.setdefault(queue_name, []).append(pending_row)
     # Build live-worker counts keyed by queue.
     live_by_queue: Dict[str, List[Dict[str, Any]]] = {}
+    _live_seen: Set[str] = set()
     for w in list_workers(prune=False):
         if w.get("alive") and not _worker_released(w):
+            wid = str(w.get("worker_id") or "")
+            if wid and wid in _live_seen:
+                continue  # duplicate registry row: one process, one slot
+            _live_seen.add(wid)
             q_name = w.get("queue", "")
             live_by_queue.setdefault(q_name, []).append(w)
 
@@ -4918,10 +6802,16 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     # WT-131 being claimable). Track which live workers are blocked so the
     # spawn decision can staff productive capacity around them instead of
     # waiting on the block to clear.
+    from . import queue as _q
+    try:
+        _all_items = _q.list_items(project=only_queue or None) or []
+    except Exception:
+        _all_items = None
+
     from . import queue as _q_blocked
     blocked_worker_ids: Dict[str, Set[str]] = {}
     try:
-        for it in (_q_blocked.list_blocked() or []):
+        for it in (_q_blocked.list_blocked(items=_all_items) or []):
             wid = str(it.get("claimed_by") or "")
             qn = str(it.get("project") or "")
             if wid and qn:
@@ -4940,7 +6830,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     # spares any worker still holding a blocked ticket (WATCHTOWER-1).
     busy_worker_ids: Dict[str, Set[str]] = {}
     try:
-        for it in (_q_blocked.list_active_claims() or []):
+        for it in (_q_blocked.list_active_claims(items=_all_items) or []):
             wid = str(it.get("claimed_by") or "")
             qn = str(it.get("project") or "")
             if wid and qn:
@@ -4948,14 +6838,19 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     except Exception:
         busy_worker_ids = {}
 
+    try:
+        retained_parked = retained_parked_ids(items=_all_items)
+    except Exception:
+        retained_parked = set()
+
     # Use health for queue depth + stuck ground-truth -- one call covers all queues.
     health_by_queue: Dict[str, Dict[str, Any]] = {
-        row["queue"]: row for row in health.all_status()
+        row["queue"]: row
+        for row in health.all_status(project=only_queue or None, items=_all_items)
     }
 
     # Raw open depth per queue, for the "N open" figure in skip/spawn messages
     # (unfiltered -- just how big the backlog is, regardless of claimability).
-    from . import queue as _q
     _total_open_by_q: Dict[str, int] = {}
     # The same items, kept rather than only counted, so a depth==0 skip can
     # report what was actually observed about them instead of guessing
@@ -4963,7 +6858,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     # list pass the reconciler already makes.
     _open_items_by_q: Dict[str, List[Dict[str, Any]]] = {}
     try:
-        for it in (_q.list_items() or []):
+        for it in (_all_items if _all_items is not None else (_q.list_items(project=only_queue or None) or [])):
             if it.get("status") != "open":
                 continue
             qn = str(it.get("project") or "")
@@ -4983,7 +6878,9 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         a hand-rolled copy of the filter here disagreed with claim_next's."""
         total = _total_open_by_q.get(qn, 0)
         types = config.claim_types(qn) or None
-        claimable = _q.count_claimable(project=qn, item_types=types)
+        claimable = _q.count_claimable(
+            project=qn, item_types=types, worker_model=config.queue_model_id(qn),
+        )
         return claimable, total
 
     def _manual_depth(qn: str) -> int:
@@ -5147,7 +7044,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         }
         result["spawn_plans"].append(plan)
         planned_queues.add(qn)
-        plan_detail = _audit_detail(
+        plan_detail = _spawn_plan_summary(plan) + " " + _audit_detail(
                 reconcile_id=plan["reconcile_id"],
                 queue=plan["queue"],
                 total_open=plan["total_open"],
@@ -5242,7 +7139,10 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
     except Exception:
         pass
 
-    for q_name in sorted(set(all_cfg) | set(released_by_q)):
+    loop_queues = set(all_cfg) | set(released_by_q)
+    if only_queue:
+        loop_queues &= {only_queue}
+    for q_name in sorted(loop_queues):
         auto = config.auto_drain(q_name)
         desired = config.desired_workers(q_name) if auto else 0
         manual_run = False
@@ -5334,7 +7234,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             if str(w.get("worker_id") or "") in blocked_ids_here
             and str(w.get("worker_id") or "") not in busy_ids_here
         ]
-        # A blocked-only worker that's still reachable (SONIA-CHAT-21) can be
+        # A blocked-only worker that's still reachable (CLIENT-CHAT-21) can be
         # woken to retry `wt claim` instead of a second worker spawning into
         # the same budget slot -- so it still counts toward `staffed` below,
         # same as before this split existed. One that can't be reached (no
@@ -5350,8 +7250,28 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
         # logging and the nudge/stuck check, which cares about real processes.
         # A worker that holds a blocked ticket but is *also* actively working
         # an in_progress one isn't idle, so it stays out of blocked_count.
-        staffed = actual - blocked_count
+        # WT-28: an idle worker retaining a parked ticket is waiting for its
+        # answer, not draining; it must not consume the spawn budget either.
+        retained_here = [
+            w for w in live
+            if str(w.get("worker_id") or "") in retained_parked
+            and str(w.get("worker_id") or "") not in busy_ids_here
+            and w not in unwakeable_blocked
+        ]
+        # Idle-but-alive workers with no claim (wedged, errored mid-session)
+        # were still counted as staffed until idle release reaped them an
+        # hour later, so claimable work sat with no worker spawned for it.
+        stale_idle = [
+            w for w in live
+            if str(w.get("worker_id") or "") not in busy_ids_here
+            and w not in unwakeable_blocked
+            and w not in retained_here
+            and _worker_idle_s(w) >= STALE_IDLE_S
+        ]
+        staffed = actual - blocked_count - len(retained_here) - len(stale_idle)
         blocked_note = f", {blocked_count} blocked" if blocked_count else ""
+        if stale_idle:
+            blocked_note += f", {len(stale_idle)} stale-idle"
 
         if not dry_run and depth > 0 and wakeable_blocked:
             _maybe_wake_blocked_workers(q_name, wakeable_blocked)
@@ -5370,6 +7290,11 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 and (health_by_queue.get(q_name) or {}).get("stuck")
                 and not _all_workers_within_startup_grace(live)):
             _maybe_nudge_stuck_queue(q_name, actual)
+        elif (not dry_run and depth > 0 and q_name not in requeued_queues
+                and not _all_workers_within_startup_grace(live)):
+            # Claimable work, nobody mid-nudge: wake idle workers (a ticket
+            # filed inside grace_s got no nudge at filing time).
+            _renudge_idle_workers(q_name, live, busy_ids_here | blocked_ids_here)
 
         if staffed < desired:
             # Never spawn more workers than unclaimed tickets. Don't assume a live
@@ -5378,7 +7303,19 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             # spawn 0 more, not 1. Blocked workers are excluded from `staffed` (see
             # above) so one ticket parked on a human question can't by itself starve
             # every other claimable ticket in the queue.
-            to_spawn = min(desired - staffed, max(0, depth - staffed))
+            # Only IDLE staffed workers can take a claimable ticket now; one
+            # mid-ticket (holding an in_progress claim) won't look at the queue
+            # until it finishes, which can be an hour. Counting it against
+            # depth left a 2-worker queue running one worker with a claimable
+            # ticket waiting (BYM-FUTURE-2407/2408).
+            idle_staffed = sum(
+                1 for w in live
+                if str(w.get("worker_id") or "") not in busy_ids_here
+                and w not in unwakeable_blocked
+                and w not in retained_here
+                and w not in stale_idle
+            )
+            to_spawn = min(desired - staffed, max(0, depth - idle_staffed))
             plan = _record_spawn_plan(
                 q_name,
                 total_open=total_open,
@@ -5410,26 +7347,103 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 continue
             from . import queue as _q
             # Peek at the next ticket to get its repo_path; fall back to queue config.
-            peeked = _q.peek_next(project=q_name)
+            peeked = _q.peek_next(
+                project=q_name, worker_model=config.queue_model_id(q_name),
+            )
             repo_path = (
                 config.repo_path(q_name)
                 or (peeked or {}).get("repo_path", "")
             )
             engine = config.engine(q_name)
+            # A fallback engine is a launch-time substitution only
+            # (WATCHTOWER-30): the queue's stored engine/model are the user's
+            # and stay put, so once the preferred engine's cooldown ends the
+            # next tick tries it again.
+            launch_engine = engine
+            launch_model = ""
+            substitute_note = ""
             cooldown = (
                 None if dry_run else active_launch_failure_cooldown(q_name, engine)
             )
             if cooldown:
                 until = cooldown.get("cooldown_until_human", "later")
                 reason = cooldown.get("reason", "recent worker launch failure")
-                result["skipped"].append(
-                    {"queue": q_name,
-                     "reason": f"launch cooldown until {until} — {reason}"}
+                substitute = _launch_substitute(q_name, engine)
+                if not substitute:
+                    skip_reason = f"launch cooldown until {until} — {reason}"
+                    result["skipped"].append(
+                        {"queue": q_name, "reason": skip_reason}
+                    )
+                    hint = (
+                        "no fallback engine is available"
+                        if config.fallback_to_default_worker(q_name)
+                        else "fallback to the default worker is off for this queue"
+                    )
+                    _q._log(
+                        "SPAWN_SKIP",
+                        f"spawn of {to_spawn} blocked: {engine} is cooling down "
+                        f"until {until} ({reason}); {hint} | "
+                        + _audit_detail(
+                            reconcile_id=reconcile_id, queue=q_name,
+                            engine=engine, requested=to_spawn,
+                            cooldown_until=until,
+                            fallback_to_default_worker=config.fallback_to_default_worker(q_name),
+                        ),
+                        queue=q_name,
+                    )
+                    continue
+                launch_engine = substitute
+                launch_model = config.fallback_model(substitute)
+                substitute_note = (
+                    f"; fallback from {engine} ({reason}) until {until}"
                 )
-                continue
+                result["fallbacks"].append({
+                    "queue": q_name,
+                    "from_engine": engine,
+                    "to_engine": substitute,
+                    "reason": reason,
+                })
+            launch_effort: Dict[str, str] = {}
+            if not cooldown and not dry_run:
+                # Headroom-aware dispatch (31K B25, opt-in): proactively
+                # launch on the engine whose quota expires soonest instead of
+                # waiting for the queue engine to hit its usage wall.
+                choice = headroom_launch_choice(q_name)
+                if choice:
+                    launch_engine = choice["engine"]
+                    launch_model = choice["model"]
+                    launch_effort = {"effort": choice["effort"]}
+                    substitute_note = (
+                        f"; headroom dispatch {engine}->{launch_engine} "
+                        f"({choice['reason']})"
+                    )
+                    result["fallbacks"].append({
+                        "queue": q_name,
+                        "from_engine": engine,
+                        "to_engine": launch_engine,
+                        "reason": choice["reason"],
+                        "kind": "headroom",
+                    })
+                    _q._log(
+                        "HEADROOM_DISPATCH",
+                        f"launching {q_name} on {launch_engine} instead of "
+                        f"{engine}: {choice['reason']} | "
+                        + _audit_detail(
+                            reconcile_id=reconcile_id, queue=q_name,
+                            engine=engine, launch_engine=launch_engine,
+                            requested=to_spawn,
+                        ),
+                        queue=q_name,
+                    )
+            elif launch_engine != engine:
+                launch_effort = {
+                    "effort": config.fallback_effort(q_name, launch_engine)
+                }
             launch_failed: List[Dict[str, Any]] = []
             spawned = spawn_workers(
-                q_name, n=to_spawn, engine=engine,
+                q_name, n=to_spawn, engine=launch_engine, model=launch_model,
+                inherit_queue_model=launch_engine == engine,
+                **launch_effort,
                 repo_path=repo_path, dry_run=dry_run,
                 launch_failures=launch_failed,
                 # On a drain-off queue the worker exists only for the tickets
@@ -5447,6 +7461,7 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             spawn_reason = (
                 f"{depth} {counted}, {staffed} staffed < {desired} desired "
                 f"({actual} live{blocked_note}), {unclaimed} unclaimed, spawn {to_spawn}"
+                f"{substitute_note}"
             )
             _annotate_spawn_records(spawned, plan, spawn_reason)
             _annotate_spawn_records(launch_failed, plan, spawn_reason)
@@ -5458,16 +7473,16 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 if swap_failures
                 else ""
             )
+            attempted_engines = {engine, launch_engine}
             fallback = (
-                ""
-                if dry_run or not swap_failures
-                else config.fallback_engine(engine)
+                _launch_substitute(q_name, engine, attempted=attempted_engines)
+                if swap_failures and not dry_run
+                else ""
             )
-            if fallback:
-                fallback_model = config.default_model(fallback)
-                config.set_engine(q_name, fallback)
-                config.set_model(q_name, fallback_model)
-                fallback_reason = f"fallback from {engine} {swap_cause}"
+            while fallback:
+                attempted_engines.add(fallback)
+                fallback_model = config.fallback_model(fallback)
+                fallback_reason = f"fallback from {engine} ({swap_cause})"
                 fallback_failures: List[Dict[str, Any]] = []
                 failed_indices = [
                     int(rec.get("_spawn_index", index))
@@ -5475,8 +7490,14 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 ]
                 fallback_spawned = spawn_workers(
                     q_name, n=len(failed_indices), engine=fallback,
+                    model=fallback_model, inherit_queue_model=False,
+                    effort=config.fallback_effort(q_name, fallback),
                     repo_path=repo_path, dry_run=False,
                     launch_failures=fallback_failures,
+                    extra_instructions=(
+                        _MANUAL_RUN_INSTRUCTIONS.format(queue=q_name)
+                        if manual_run else ""
+                    ),
                 )
                 for rec in fallback_spawned + fallback_failures:
                     local_index = int(rec.get("_spawn_index", 0))
@@ -5494,13 +7515,20 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 )
                 result["fallbacks"].append({
                     "queue": q_name,
-                    "from_engine": engine,
+                    "from_engine": launch_engine,
                     "to_engine": fallback,
                     "reason": swap_cause,
                 })
                 spawned.extend(fallback_spawned)
                 launch_failed.extend(fallback_failures)
-            elif swap_failures and not dry_run:
+                launch_engine = fallback
+                swap_failures = [rec for rec in fallback_failures
+                                 if _warrants_engine_swap(rec)]
+                swap_cause = (str(swap_failures[0].get("reason") or "launch failure")
+                              if swap_failures else "")
+                fallback = (_launch_substitute(q_name, engine, attempted=attempted_engines)
+                            if swap_failures else "")
+            if swap_failures and not dry_run:
                 # No engine left to fall back to. A cooldown alone would keep
                 # this queue in a spawn-then-die loop for as long as the
                 # breakage lasts (5 days on hermes INTAKE), so park it: the
@@ -5515,13 +7543,20 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
                 ]
                 if repeated and config.auto_drain(q_name):
                     config.set_auto_drain(q_name, False)
+                    why_not = (
+                        "no fallback engine is available"
+                        if config.fallback_to_default_worker(q_name)
+                        else "fallback to the CCC default worker is off for "
+                        "this queue"
+                    )
                     park_reason = (
-                        f"parked: {engine} keeps failing at launch "
-                        f"({swap_cause}) and no fallback engine is available "
+                        f"parked: {launch_engine} keeps failing at launch "
+                        f"({swap_cause}) and {why_not} "
                         f"— run `wt drain on {q_name}` once it is fixed"
                     )
                     result["parked"].append(
-                        {"queue": q_name, "engine": engine, "reason": swap_cause}
+                        {"queue": q_name, "engine": launch_engine,
+                         "reason": swap_cause}
                     )
                     result["skipped"].append(
                         {"queue": q_name, "reason": park_reason}
@@ -5633,14 +7668,19 @@ def _reconcile_once_locked(dry_run: bool = False) -> Dict[str, Any]:
             q = (w.get("queue", "") if isinstance(w, dict) else "")
             reason = (w.get("reason", "") if isinstance(w, dict) else "")
             _log("STOP", str(wid) + (f" — {reason}" if reason else ""), queue=q)
-        for ref in result.get("requeued", []):
+        for entry in result.get("requeued", []):
+            ref = _requeue_ref(entry)
+            reason = (entry.get("reason") if isinstance(entry, dict) else "") or "worker gone"
             q = ref.rsplit("-", 1)[0] if "-" in ref else ""
-            _log("REQUEUE", f"{ref} — worker gone, reopened for re-drain", queue=q)
+            _log("REQUEUE", f"{ref} — {reason}, reopened for re-drain", queue=q)
         for fallback in result.get("fallbacks", []):
+            if fallback.get("kind") == "headroom":
+                continue  # proactive, already logged as HEADROOM_DISPATCH; nothing failed
             _log(
                 "FALLBACK",
-                f"{fallback.get('from_engine')} usage limit — switched to "
-                f"{fallback.get('to_engine')} default",
+                f"{fallback.get('from_engine')} launch failed "
+                f"({fallback.get('reason') or 'unknown reason'}) — this launch "
+                f"used {fallback.get('to_engine')}; queue engine unchanged",
                 queue=fallback.get("queue", ""),
             )
     except Exception:
@@ -5660,6 +7700,8 @@ def spawn_workers(
     kind: str = "",
     dry_run: bool = False,
     launch_failures: Optional[List[Dict[str, Any]]] = None,
+    inherit_queue_model: bool = True,
+    effort: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Launch ``n`` worker subprocesses draining ``queue``.
 
@@ -5674,13 +7716,17 @@ def spawn_workers(
     need dispatcher guidance beyond the standard drain contract). ``kind``
     tags the worker record (e.g. ``"bespoke"`` for one-off custom spawns) so
     dashboards can tell them from reconciler-spawned drain workers.
+
+    ``inherit_queue_model=False`` keeps an empty ``model`` empty (the engine's
+    own default) instead of reading the queue's configured model -- for a
+    worker substituted onto a different engine than the queue's own.
     """
     repo_path = repo_path or os.getcwd()
-    if not model:
+    if not model and inherit_queue_model:
         from . import config
         model = config.model(queue)
     from . import config
-    effort = config.effort(queue)
+    effort = config.effort(queue) if effort is None else effort
     if _is_fable_model(model):
         import sys
         print(
@@ -5689,6 +7735,7 @@ def spawn_workers(
             file=sys.stderr, flush=True,
         )
         model = ""
+    effort = _launch_effort(queue, engine, model, effort)
     log_dir = WORKERS_FILE.parent / "logs"
     spawned: List[Dict[str, Any]] = []
     for spawn_index in range(n):
@@ -5766,7 +7813,7 @@ def spawn_workers(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 cwd=repo_path,
-                env=_spawn_env(),
+                env=_spawn_env(worker_id, role="worker"),
             )
         except OSError as e:
             popen_error = e
@@ -5867,6 +7914,7 @@ def spawn_run_once_worker(
     effort = config.effort(queue)
     if _is_fable_model(model):
         model = ""
+    effort = _launch_effort(queue, engine, model, effort)
     worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
     goal = run_once_goal(queue, worker_id, ref, repo_path)
     argv = build_drain_command(
@@ -5894,7 +7942,7 @@ def spawn_run_once_worker(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             cwd=repo_path,
-            env=_spawn_env(),
+            env=_spawn_env(worker_id, role="worker"),
         )
     finally:
         logf.close()
@@ -5908,10 +7956,9 @@ def spawn_run_once_worker(
             _close_fd_quiet(None)
     rec = record_worker(
         proc.pid, queue, engine, worker_id, repo_path, str(log_path),
-        fifo=fifo_path or "", model=model,
+        fifo=fifo_path or "", model=model, ref=ref,
     )
     rec["argv"] = argv
-    rec["ref"] = ref
     if effort:
         rec["effort"] = effort
     # WT-103: run-once spawns bypass reconcile(), which is the only other
@@ -5966,9 +8013,28 @@ ADHOC_REPORT_FOOTER = (
 )
 
 
+def compact_env() -> Dict[str, str]:
+    """Copy of the environment with the worker auto-compact window set for
+    Claude (an operator-set value wins)."""
+    env = os.environ.copy()
+    from . import config as _config
+    compact = _config.worker_auto_compact_tokens()
+    if compact > 0:
+        env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(compact))
+    return env
+
+
+def codex_compact_args() -> List[str]:
+    """``-c model_auto_compact_token_limit=N`` for every codex spawn: Codex
+    ignores CLAUDE_CODE_AUTO_COMPACT_WINDOW and otherwise runs to ~780K."""
+    from . import config as _config
+    compact = _config.worker_auto_compact_tokens()
+    return ["-c", f"model_auto_compact_token_limit={compact}"] if compact > 0 else []
+
+
 def build_adhoc_command(
     engine: str, prompt: str, *, model: str = "", repo_path: str = "",
-    log_path: str = "",
+    log_path: str = "", session_id: str = "",
 ) -> List[str]:
     """Argv for a one-shot ad-hoc agent. All engines run in print/exec mode
     with the goal in argv -- no FIFO, no drain loop; the process exits when
@@ -5978,9 +8044,16 @@ def build_adhoc_command(
     if engine == "codex":
         if not shutil.which(_ENGINE_BIN["codex"]):
             raise ValueError("codex CLI not found on PATH")
-        argv = [_ENGINE_BIN["codex"], "exec"]
+        # Ad-hoc critics need the same trusted launch policy as queue workers:
+        # the default Linux sandbox may fail before even read-only commands
+        # run, and a headless process cannot answer approval prompts.
+        argv = [
+            _ENGINE_BIN["codex"], "exec",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
         if model:
             argv += ["--model", model]
+        argv += codex_compact_args()
         argv.append(prompt)
         return argv
     if engine == "antigravity":
@@ -6010,6 +8083,17 @@ def build_adhoc_command(
                 "--permission-mode", "bypassPermissions"]
         if model:
             argv += ["--model", model]
+        if not session_id and origins.env_parent():
+            # WT-27: a worker (or its descendant) building a claude command
+            # itself -- a probe, a test -- gets a pinned session id plus a
+            # durable origin record, so CCC can badge it.
+            session_id = str(uuid.uuid4())
+            origins.note_spawn(session_id, role="probe", engine="claude",
+                               via="build_adhoc_command")
+        if session_id:
+            # Plain `-p` text output never names the session, so the log
+            # backfill can't ledger it; pin the id instead (CCC-1241).
+            argv += ["--session-id", session_id]
         argv.append(prompt)
         return argv
     if engine == "kimi":
@@ -6039,8 +8123,18 @@ def spawn_adhoc(
     name: str = "",
     report_to: str = "",
     dry_run: bool = False,
+    verify: bool = False,
+    stage: str = "",
+    ticket_ref: str = "",
+    ticket_queue: str = "",
 ) -> Dict[str, Any]:
     """Spawn one one-shot ad-hoc agent on ``prompt`` and return its record.
+
+    ``stage`` (planner/plan_reviewer/verifier/assessor, WT-24) marks a stage
+    session owned by ``stages.py``: its argv runs under ``_exitwrap`` (exit
+    forensics), the start goes through ``_spawn_gate``, the record carries
+    ``stage``/``ref``/``ticket_queue``, and an immediate launch failure comes
+    back on the record as ``launch_failure`` (classified -> shared cooldown).
 
     ``report_to`` (worker id, @agent name, or session UUID) appends the
     WT-native reply-to footer so the agent reports back via `wt send`.
@@ -6071,8 +8165,13 @@ def spawn_adhoc(
     worker_id = f"{label}-{engine}-{uuid.uuid4().hex[:8]}"
     log_dir = WORKERS_FILE.parent / "logs"
     log_path = log_dir / f"{worker_id}.log"
+    # Claude's print mode is the one engine whose log never carries its session
+    # id, so mint it here: the ledger then knows the planner/reviewer/verifier
+    # session at spawn time and CCC files it under Workers (CCC-1241).
+    session_id = str(uuid.uuid4()) if engine == "claude" else ""
     argv = build_adhoc_command(
         engine, prompt, model=model, repo_path=repo_path, log_path=str(log_path),
+        session_id=session_id,
     )
     if dry_run:
         rec = {
@@ -6080,10 +8179,18 @@ def spawn_adhoc(
             "engine": engine, "repo_path": repo_path, "argv": argv,
             "kind": "adhoc", "dry_run": True,
         }
+        if session_id:
+            rec["session_id"] = session_id
         if model:
             rec["model"] = model
         return rec
     log_dir.mkdir(parents=True, exist_ok=True)
+    exit_file = ""
+    if stage:
+        exit_file = f"{log_path}.exit"
+        argv = [sys.executable, str(Path(__file__).with_name("_exitwrap.py")),
+                "--exit-file", exit_file, "--"] + list(argv)
+        _spawn_gate(engine)
     logf = open(log_path, "ab")
     try:
         proc = subprocess.Popen(
@@ -6093,13 +8200,26 @@ def spawn_adhoc(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             cwd=repo_path,
-            env=_spawn_env(),
+            env=_spawn_env(worker_id, verify=verify, session_id=session_id,
+                           ref=ticket_ref, queue=ticket_queue,
+                           role=stage or "adhoc"),
         )
     finally:
         logf.close()
     rec = record_worker(
         proc.pid, label.upper(), engine, worker_id, repo_path, str(log_path),
-        model=model, kind="adhoc",
+        model=model, kind="adhoc", session_id=session_id,
+        ref=ticket_ref, stage=stage, ticket_queue=ticket_queue, exit_file=exit_file,
     )
     rec["argv"] = argv
+    if stage:
+        try:
+            failure = _wait_for_immediate_launch_failure(
+                proc, queue=ticket_queue or label.upper(), engine=engine,
+                worker_id=worker_id, log_path=log_path, model=model,
+                classified_only=True)
+        except Exception:  # noqa: BLE001 - a probe must never fail the spawn
+            failure = None
+        if failure:
+            rec["launch_failure"] = failure
     return rec

@@ -1,4 +1,4 @@
-"""SONIA-CHAT-19: reopen_and_claim -- the re-entry re-bind primitive.
+"""CLIENT-CHAT-19: reopen_and_claim -- the re-entry re-bind primitive.
 
 A topic's ticket closed (or is parked blocked); the client re-engages the
 same subject. reopen_and_claim() re-binds the ticket to the SAME session
@@ -39,10 +39,10 @@ def test_reopen_and_claim_rebinds_closed_ticket_to_original_session(q):
     reopen()'s existing behavior) and reopen_and_claim() re-binds the
     ticket to exactly that session, landing directly on in_progress -- no
     intermediate open state observable to a caller."""
-    worker_id = "sonia-chat-19-worker"
+    worker_id = "client-chat-19-worker"
     sid = "cccccccc-dddd-eeee-ffff-000000000000"
-    item = q.enqueue(project="SONIACHAT19TEST", note="topic work")
-    claimed = q.claim_next(worker_id, project="SONIACHAT19TEST", session_uuid=sid)
+    item = q.enqueue(project="CLIENTCHAT19TEST", note="topic work")
+    claimed = q.claim_next(worker_id, project="CLIENTCHAT19TEST", session_uuid=sid)
     q.update_status(claimed["ref"], "closed", worker_id, resolution={"summary": "turn done"})
 
     closed = q.get(claimed["ref"])
@@ -57,14 +57,14 @@ def test_reopen_and_claim_rebinds_closed_ticket_to_original_session(q):
 
 
 def test_reopen_and_claim_rebinds_blocked_awaiting_client_ticket(q):
-    """The actual SONIA-CHAT-19 use case: a ticket parked awaiting-client
-    (SONIA-CHAT-14) gets a continue: answer after already having been
+    """The actual CLIENT-CHAT-19 use case: a ticket parked awaiting-client
+    (CLIENT-CHAT-14) gets a continue: answer after already having been
     closed via TID -- re-binding must work from blocked too, with force
     since needs_input is set."""
-    worker_id = "sonia-chat-19-worker-2"
+    worker_id = "client-chat-19-worker-2"
     sid = "11111111-2222-3333-4444-555555555555"
-    item = q.enqueue(project="SONIACHAT19TEST", note="topic work")
-    claimed = q.claim_next(worker_id, project="SONIACHAT19TEST", session_uuid=sid)
+    item = q.enqueue(project="CLIENTCHAT19TEST", note="topic work")
+    claimed = q.claim_next(worker_id, project="CLIENTCHAT19TEST", session_uuid=sid)
     q.block(claimed["ref"], session_id=worker_id, question="awaiting client", kind="awaiting-client")
     q.update_status(claimed["ref"], "closed", worker_id, resolution={"summary": "topic done"})
 
@@ -79,10 +79,10 @@ def test_reopen_and_claim_rebinds_blocked_awaiting_client_ticket(q):
 def test_reopen_and_claim_refuses_blocked_without_force(q):
     """Same guard reopen() already has: refuse a needs_input ticket unless
     force=True, so a live open question isn't silently erased."""
-    worker_id = "sonia-chat-19-worker-3"
+    worker_id = "client-chat-19-worker-3"
     sid = "22222222-3333-4444-5555-666666666666"
-    item = q.enqueue(project="SONIACHAT19TEST", note="topic work")
-    claimed = q.claim_next(worker_id, project="SONIACHAT19TEST", session_uuid=sid)
+    item = q.enqueue(project="CLIENTCHAT19TEST", note="topic work")
+    claimed = q.claim_next(worker_id, project="CLIENTCHAT19TEST", session_uuid=sid)
     q.block(claimed["ref"], session_id=worker_id, question="which color?")
 
     with pytest.raises(ValueError, match="blocked awaiting human input"):
@@ -90,7 +90,7 @@ def test_reopen_and_claim_refuses_blocked_without_force(q):
 
 
 def test_reopen_and_claim_refuses_already_open_ticket(q):
-    item = q.enqueue(project="SONIACHAT19TEST", note="topic work")
+    item = q.enqueue(project="CLIENTCHAT19TEST", note="topic work")
     with pytest.raises(ValueError, match="already open"):
         q.reopen_and_claim(item["ref"], "some-worker")
 
@@ -102,10 +102,10 @@ def test_reopen_and_claim_concurrency_no_second_claimant_can_win(q, tmp_path):
     closed ticket -- exactly one must win the re-bind; none may observe
     the ticket sitting externally-open in between (that observable window
     is what the two-call reopen()+claim_by_ref() sequence had)."""
-    worker_id = "sonia-chat-19-race-worker"
+    worker_id = "client-chat-19-race-worker"
     sid = "33333333-4444-5555-6666-777777777777"
-    item = q.enqueue(project="SONIACHAT19TEST", note="topic work")
-    claimed = q.claim_next(worker_id, project="SONIACHAT19TEST", session_uuid=sid)
+    item = q.enqueue(project="CLIENTCHAT19TEST", note="topic work")
+    claimed = q.claim_next(worker_id, project="CLIENTCHAT19TEST", session_uuid=sid)
     q.update_status(claimed["ref"], "closed", worker_id, resolution={"summary": "done"})
 
     results = []

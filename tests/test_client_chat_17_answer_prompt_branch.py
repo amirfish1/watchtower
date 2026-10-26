@@ -1,4 +1,4 @@
-"""SONIA-CHAT-17: cmd_answer's delivered prompt branches on block_kind.
+"""CLIENT-CHAT-17: cmd_answer's delivered prompt branches on block_kind.
 
 Three variants:
 1. Default (no block_kind / not awaiting-client) -- today's unchanged
@@ -49,17 +49,17 @@ def _capturing_deliver(captured):
 
 
 def _make_blocked_ticket(q, workers, tmp_path, *, kind: str = "") -> tuple[dict, str]:
-    worker_id = "sonia-chat-17-worker"
+    worker_id = "client-chat-17-worker"
     sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
-    item = q.enqueue(project="SONIACHAT17TEST", note="topic work")
-    claimed = q.claim_next(worker_id, project="SONIACHAT17TEST", session_uuid=sid)
+    item = q.enqueue(project="CLIENTCHAT17TEST", note="topic work")
+    claimed = q.claim_next(worker_id, project="CLIENTCHAT17TEST", session_uuid=sid)
     kwargs = {"session_id": worker_id, "question": "what next?"}
     if kind:
         kwargs["kind"] = kind
     q.block(claimed["ref"], **kwargs)
     workers.record_worker(
         1,  # arbitrary; not checked for liveness in these prompt-shape tests
-        "SONIACHAT17TEST", "claude", worker_id,
+        "CLIENTCHAT17TEST", "claude", worker_id,
         repo_path=str(tmp_path), session_id=sid,
     )
     return claimed, worker_id

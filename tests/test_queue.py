@@ -10,6 +10,7 @@ import pytest
 def wt(tmp_path, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "queue.json"))
     monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
+    monkeypatch.delenv("WATCHTOWER_MACHINE", raising=False)
 
     import watchtower.queue as q
     import watchtower.cli as cli
@@ -31,6 +32,46 @@ def _events(timeline):
     return [event["event"] for event in timeline]
 
 
+def test_notify_ticket_event_forwards_submitter_through_ccc(wt, monkeypatch):
+    """MEMORY-5: a ticket's submitter that CCC has since forwarded (a manual
+    `ccc rebind-report-to` or a spawned continuation) gets the notice at its
+    successor, not at the stale sid recorded on the ticket."""
+    import watchtower.messages as messages
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
+    monkeypatch.setattr(
+        messages, "ccc_forward_target",
+        lambda sid, timeout_s=1.5: "new-sid" if sid == "old-sid" else None,
+    )
+    sent = []
+    monkeypatch.setattr(
+        messages, "send",
+        lambda target, text, **kw: sent.append(target) or {"ok": True},
+    )
+    item = {
+        "project": "MEMORY", "ref": "MEMORY-1", "number": 1,
+        "submitter": "old-sid", "pre_ack": True,
+    }
+    wt.q._notify_ticket_event(item, "closed", detail="done")
+    assert sent == ["new-sid"]
+
+
+def test_notify_ticket_event_no_forward_uses_target_unchanged(wt, monkeypatch):
+    import watchtower.messages as messages
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
+    monkeypatch.setattr(messages, "ccc_forward_target", lambda sid, timeout_s=1.5: None)
+    sent = []
+    monkeypatch.setattr(
+        messages, "send",
+        lambda target, text, **kw: sent.append(target) or {"ok": True},
+    )
+    item = {
+        "project": "MEMORY", "ref": "MEMORY-1", "number": 1,
+        "submitter": "still-here-sid", "pre_ack": True,
+    }
+    wt.q._notify_ticket_event(item, "closed", detail="done")
+    assert sent == ["still-here-sid"]
+
+
 def test_mutations_append_canonical_history_and_stop_legacy_lists(wt):
     item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
     assert _events(item["history"]) == ["filed"]
@@ -44,6 +85,7 @@ def test_mutations_append_canonical_history_and_stop_legacy_lists(wt):
         "kind": "worker",
         "worker": "worker-a",
         "session_id": "11111111-2222-3333-4444-555555555555",
+        "machine": wt.q.machine_tag(),
     }
 
     blocked = wt.q.block(claimed["ref"], session_id="worker-a", question="ship it?", progress="ready except decision")
@@ -68,7 +110,13 @@ def test_mutations_append_canonical_history_and_stop_legacy_lists(wt):
 
     closed = wt.q.close(claimed["ref"], "worker-a", resolution={"summary": "done"})
     assert closed["history"][-1]["event"] == "close"
-    assert closed["history"][-1]["resolution"] == {"summary": "done"}
+    # Auto-filled from the earlier claim's session_uuid (S8a: close records
+    # who did the work so ccc shipped/brief can attribute it).
+    assert closed["history"][-1]["resolution"] == {
+        "summary": "done",
+        "machine": wt.q.machine_tag(),
+        "session_id": "11111111-2222-3333-4444-555555555555",
+    }
 
 
 def test_ticket_updates_appear_in_activity_log(wt):
@@ -120,7 +168,7 @@ def test_cli_block_json_returns_the_blocked_ticket(wt, capsys):
 
     blocked = json.loads(capsys.readouterr().out)
     assert blocked["ref"] == item["ref"]
-    assert blocked["status"] == "in_progress"
+    assert blocked["status"] == "awaiting_answer"  # WT-28: a worker block parks
     assert blocked["block_question"] == "approve the rollout?"
 
 
@@ -240,13 +288,13 @@ def test_close_ownership_guard_blocks_reap_duplicate(wt):
     wt.q.update_status(item["ref"], "open", reason="worker gone")
     wt.q.claim_by_ref(item["ref"], "worker-b")
     real = wt.q.close(item["ref"], "worker-b", resolution={"summary": "real fix"})
-    assert real["resolution"] == {"summary": "real fix"}
+    assert real["resolution"] == {"summary": "real fix", "machine": wt.q.machine_tag()}
 
     # worker-a resumes from stale context and tries to close it too -> rejected.
     with pytest.raises(ValueError, match="already closed"):
         wt.q.close(item["ref"], "worker-a", resolution={"summary": "duplicate fix"})
     # The real resolution is untouched.
-    assert wt.q.get(item["ref"])["resolution"] == {"summary": "real fix"}
+    assert wt.q.get(item["ref"])["resolution"] == {"summary": "real fix", "machine": wt.q.machine_tag()}
     # A close event was NOT appended for the rejected attempt.
     assert _events(wt.q.get(item["ref"])["history"]).count("close") == 1
 
@@ -261,9 +309,10 @@ def test_close_guard_rejects_crosscloser_but_allows_force_and_unclaimed(wt):
     assert wt.q.get(x["ref"])["status"] == "in_progress"
 
     # Own in_progress ticket closes normally.
+    # (WT-28: one active claim per worker, so the own-ticket case uses worker-c.)
     a = wt.q.enqueue(project="OWN", note="mine", source="test")
-    wt.q.claim_by_ref(a["ref"], "worker-a")
-    assert wt.q.close(a["ref"], "worker-a", resolution="ok")["status"] == "closed"
+    wt.q.claim_by_ref(a["ref"], "worker-c")
+    assert wt.q.close(a["ref"], "worker-c", resolution="ok")["status"] == "closed"
 
     # force lets a human re-close an already-closed ticket.
     forced = wt.q.close(a["ref"], "human-x", resolution="override", force=True)
@@ -272,6 +321,53 @@ def test_close_guard_rejects_crosscloser_but_allows_force_and_unclaimed(wt):
     # dedup-close by ref (no session_id -> expect_owner empty) is unguarded.
     b = wt.q.enqueue(project="OWN", note="dupe", source="test")
     assert wt.q.close(b["ref"], resolution="duplicate of OWN-1")["status"] == "closed"
+
+
+def test_cli_close_records_session_engine_and_transcript(wt, monkeypatch, tmp_path, capsys):
+    """S8a: `wt close` records machine/session_id/engine/transcript_path in
+    the resolution so `ccc shipped`/`ccc brief` can attribute a closed
+    ticket to a session even when the transcript is on a different node."""
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    monkeypatch.setenv(
+        "WATCHTOWER_CLAUDE_PROJECTS_DIR", str(tmp_path / "claude-projects")
+    )
+    sid = "11111111-2222-3333-4444-555555555555"
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+    transcript_dir = tmp_path / "claude-projects" / "some-project"
+    transcript_dir.mkdir(parents=True)
+    transcript_path = transcript_dir / f"{sid}.jsonl"
+    transcript_path.write_text('{"type":"user"}\n')
+
+    item = wt.q.enqueue(project="EVT", note="attribute this close", source="test")
+    assert wt.cli.main(
+        ["close", item["ref"], "--summary", "fixed it", "--no-code", "--worker", "worker-a"]
+    ) == 0
+    capsys.readouterr()
+
+    res = wt.q.get(item["ref"])["resolution"]
+    assert res["session_id"] == sid
+    assert res["engine"] == "claude"
+    assert res["transcript_path"] == str(transcript_path)
+    assert res["machine"] == wt.q.machine_tag()
+
+
+def test_cli_close_without_session_env_omits_engine_and_transcript(wt, monkeypatch, capsys):
+    """No CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID (e.g. a human closing from a
+    plain shell) must not fabricate attribution fields."""
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+
+    item = wt.q.enqueue(project="EVT", note="no session env", source="test")
+    assert wt.cli.main(
+        ["close", item["ref"], "--summary", "fixed it", "--no-code", "--worker", "worker-a"]
+    ) == 0
+    capsys.readouterr()
+
+    res = wt.q.get(item["ref"])["resolution"]
+    assert "engine" not in res
+    assert "transcript_path" not in res
+    assert "session_id" not in res
+    assert res["machine"] == wt.q.machine_tag()
 
 
 def test_cli_ready_reopens_a_closed_file_backed_ticket(wt, capsys):
@@ -495,3 +591,195 @@ def test_timeline_same_timestamp_precedence(wt):
     }
     tl = wt.q.timeline(item)
     assert _events(tl) == ["filed", "claim"]
+
+
+def test_machine_tag_env_override_and_derivation(wt, monkeypatch):
+    """WATCHTOWER_MACHINE wins; otherwise the tag is derived from the
+    hostname's first label, lowercase alnum, first 3 chars."""
+    monkeypatch.setenv("WATCHTOWER_MACHINE", "Hermes-VM")
+    wt.q._MACHINE_TAG_CACHE = None
+    assert wt.q.machine_tag() == "her"
+
+    monkeypatch.delenv("WATCHTOWER_MACHINE")
+    wt.q._MACHINE_TAG_CACHE = None
+    monkeypatch.setattr("socket.gethostname", lambda: "Bobs-Mac-mini.local")
+    assert wt.q.machine_tag() == "bob"
+
+
+def test_worker_events_carry_machine_tag(wt, monkeypatch):
+    """claim/progress/block/close events record by.machine so a shared queue's
+    timeline can show which host the worker ran on (the human/system events
+    around them don't claim a machine)."""
+    monkeypatch.setenv("WATCHTOWER_MACHINE", "tst")
+    wt.q._MACHINE_TAG_CACHE = None
+
+    item = wt.q.enqueue(project="MAC", note="machine tag")
+    assert item["history"][0]["by"] == {"kind": "system"}
+
+    claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
+    assert claimed["claimed_machine"] == "tst"
+    claim_by = claimed["history"][-1]["by"]
+    assert claim_by["worker"] == "worker-a" and claim_by["machine"] == "tst"
+
+    blocked = wt.q.block(item["ref"], session_id="worker-a",
+                         question="ok?", progress="halfway")
+    assert blocked["history"][-2]["by"]["machine"] == "tst"
+    assert blocked["history"][-1]["by"]["machine"] == "tst"
+
+    closed = wt.q.close(item["ref"], "worker-a",
+                        resolution={"summary": "done"}, force=True)
+    assert closed["closed_machine"] == "tst"
+    assert closed["history"][-1]["by"]["machine"] == "tst"
+
+    # Human events (answer/comment) carry no machine tag.
+    assert all(
+        "machine" not in (e.get("by") or {})
+        for e in closed["history"]
+        if (e.get("by") or {}).get("kind") in ("human", "system")
+    )
+
+
+def test_machine_tag_survives_timeline_and_reopen_clears(wt, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_MACHINE", "tst")
+    wt.q._MACHINE_TAG_CACHE = None
+
+    item = wt.q.enqueue(project="MAC2", note="reopen clears machine")
+    claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
+    timeline = wt.q.timeline(wt.q.get(item["ref"]))
+    assert timeline[-1]["by"]["machine"] == "tst"
+
+    reopened = wt.q.reopen(item["ref"], reason="retry", force=True)
+    assert reopened.get("claimed_machine") is None
+    assert reopened.get("closed_machine") is None
+
+
+def test_with_machine_prefix_display(wt):
+    assert wt.q.with_machine("bym-zxcv", "her") == "her-bym-zxcv"
+    assert wt.q.with_machine("her-bym-zxcv", "her") == "her-bym-zxcv"
+    assert wt.q.with_machine("bym-zxcv", "") == "bym-zxcv"
+    assert wt.q.with_machine("", "her") == ""
+    assert wt.q.with_machine(None, None) == ""
+
+
+def test_normalize_items_keeps_refs_stable_across_moves():
+    from watchtower.queue import _normalize_items
+
+    items = [
+        {"number": 1, "project": "A", "seq": 1, "ref": "A-1"},
+        {"number": 2, "project": "A", "seq": 2, "ref": "A-2"},
+        {"number": 3, "project": "B", "seq": 1, "ref": "B-1"},
+    ]
+    items[0]["project"] = "B"  # move A-1 into B
+    _normalize_items(items)
+    assert [i["ref"] for i in items] == ["B-2", "A-2", "B-1"]
+
+
+def _file(q, title, **kw):
+    return q.enqueue(project="DEP", title=title, note=title, **kw)
+
+
+def test_claim_skips_blocked_until_blocker_closes_completed(wt):
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    assert b["blocked_by"] == [a["ref"]]
+    assert q.count_claimable("DEP") == 1
+    assert q.claim_next("w1", project="DEP")["ref"] == a["ref"]
+    assert q.claim_next("w2", project="DEP") is None  # b still waiting
+    q.close(a["ref"], session_id="w1", resolution="done")
+    assert q.count_claimable("DEP") == 1
+    assert q.claim_next("w2", project="DEP")["ref"] == b["ref"]
+
+
+def test_unresolved_blocker_escalates_and_answer_unblocks(wt):
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    q.claim_next("w1", project="DEP")
+    q.close(a["ref"], session_id="w1",
+            resolution={"summary": "partial", "unresolved": ["thing not fixed"]})
+    got = q.get(b["ref"])
+    assert got["needs_input"] is True and a["ref"] in got["block_question"]
+    assert q.claim_next("w2", project="DEP") is None
+    q.answer(b["ref"], "go ahead")
+    assert q.count_claimable("DEP") == 1
+    assert q.claim_next("w2", project="DEP")["ref"] == b["ref"]
+
+
+def test_nacked_blocker_escalates(wt):
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    q.claim_next("w1", project="DEP")
+    q.update_status(a["ref"], "in_progress", "w1")
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked()
+        for it in data["items"]:
+            if it["ref"] == a["ref"]:
+                it["product_nack"] = {"by": "h", "comment": "no"}
+        q._save_unlocked(data)
+    q.close(a["ref"], session_id="w1", resolution="declined")
+    assert q.get(b["ref"])["needs_input"] is True
+
+
+def test_ls_json_emits_waiting_on_from_blocker_rule(wt, capsys):
+    import json
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+
+    def rows():
+        assert wt.cli.main(["ls", "-q", "DEP", "--status", "all", "--json"]) == 0
+        return {r["ref"]: r for r in json.loads(capsys.readouterr().out)}
+
+    got = rows()
+    assert got[a["ref"]]["waiting_on"] == []
+    assert got[b["ref"]]["waiting_on"] == [a["ref"]]
+    q.claim_next("w1", project="DEP")
+    q.close(a["ref"], session_id="w1",
+            resolution={"summary": "partial", "unresolved": ["x"]})
+    assert rows()[b["ref"]]["waiting_on"] == [a["ref"]]  # stuck != completed
+    q.answer(b["ref"], "go ahead")
+    assert rows()[b["ref"]]["waiting_on"] == []
+
+
+def test_blocked_by_rejects_unknown_self_and_cycles(wt):
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    with pytest.raises(ValueError):
+        _file(q, "bad", blocked_by=["DEP-999"])
+    with pytest.raises(ValueError):
+        q.update(a["ref"], blocked_by=[a["ref"]])
+    with pytest.raises(ValueError):
+        q.update(a["ref"], blocked_by=[b["ref"]])  # a -> b -> a
+    assert q.update(b["ref"], blocked_by=[])["blocked_by"] == []
+
+
+def test_status_counts_blocked_separately_and_ls_shows_waiting(wt, capsys):
+    import watchtower.health as health
+    q = wt.q
+    a = _file(q, "first")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    rows = health.all_status(project="DEP", items=q.list_items(project="DEP"))
+    row = next(r for r in rows if r["queue"] == "DEP")
+    assert row["depth"] == 2 and row["claimable_depth"] == 1 and row["blocked"] == 1
+    note = wt.cli._waiting_note(q.get(b["ref"]), q._refs_index(q.list_items()))
+    assert note == f"waiting on {a['ref']}"
+
+
+def test_scoped_status_honours_an_open_blocker_in_another_queue(wt):
+    """`wt status -q DEP` reads only DEP, so a blocker in another queue was
+    missing from by_ref and ignored: false 'stuck (claimable)' (WT-21)."""
+    import watchtower.health as health
+    q = wt.q
+    blocker = q.enqueue(project="OTHER", title="dep", note="dep")
+    _file(q, "waits", blocked_by=[blocker["ref"]])
+    for items in (None, q.list_items(project="DEP")):
+        row = next(r for r in health.all_status(project="DEP", items=items)
+                   if r["queue"] == "DEP")
+        assert row["claimable_depth"] == 0 and row["blocked"] == 1
+    q.claim_by_ref(blocker["ref"], "w1")
+    q.close(blocker["ref"], session_id="w1", resolution="done")
+    row = next(r for r in health.all_status(project="DEP") if r["queue"] == "DEP")
+    assert row["claimable_depth"] == 1 and row["blocked"] == 0

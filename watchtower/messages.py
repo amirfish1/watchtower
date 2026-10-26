@@ -86,7 +86,7 @@ import uuid as _uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from . import queue as queue_mod
 from . import resume_verify
@@ -113,6 +113,9 @@ _UUID_RE = re.compile(
 _WORKER_ID_SHAPE = re.compile(r"^[a-z0-9][a-z0-9_-]*-[0-9a-f]{8}$")
 # A candidate session-id prefix: hex plus dashes, at least 8 chars.
 _HEX_PREFIX_RE = re.compile(r"^[0-9a-fA-F][0-9a-fA-F-]{7,}$")
+# CCC's id for a devin-cli session: the "devincli-" prefix plus devin's own
+# word slug ("glorious-sturgeon"). Never hex, so it matches no branch above.
+_DEVIN_CLI_SESSION_RE = re.compile(r"^devincli-[A-Za-z0-9][A-Za-z0-9._-]*$")
 _AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
@@ -128,6 +131,13 @@ def _outbox_file() -> Path:
     return Path(
         os.environ.get("WATCHTOWER_OUTBOX_FILE")
         or (Path.home() / ".watchtower" / "outbox.json")
+    ).expanduser()
+
+
+def _ledger_file() -> Path:
+    return Path(
+        os.environ.get("WATCHTOWER_DELIVERY_LEDGER_FILE")
+        or (_outbox_file().parent / "delivery-ledger.json")
     ).expanduser()
 
 
@@ -426,8 +436,11 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
     "worker": dict|None, "engine": str}``. Resolution order:
 
       1. exact live worker_id match,
-      2. agents registry name (a leading ``@`` is allowed),
-      3. raw session UUID, or a unique hex prefix (>= 8 chars) of a known
+      2. a devin-cli session id (``devincli-<slug>``): the prefix names the
+         engine, so it is addressable without a lookup (delivery goes out
+         through the delegate),
+      3. agents registry name (a leading ``@`` is allowed),
+      4. raw session UUID, or a unique hex prefix (>= 8 chars) of a known
          session; an unknown value is accepted only as a full 36-char UUID.
 
     Known sessions for prefix matching are live workers + the registry, plus
@@ -449,6 +462,38 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
                 "engine": str(w.get("engine") or "claude"),
                 "cwd": str(w.get("cwd") or ""),
             }
+    # A live worker's own session id, whatever its shape. Devin ids are word
+    # slugs ("patch-macadamia"), not UUIDs, so the hex-prefix branch below
+    # can never match the claimed_session_id a devin ticket carries; a BARE
+    # slug is only addressable here, while its devincli- prefixed form (what
+    # CCC records for an embedded devin session) has its own branch below.
+    for w in live:
+        if str(w.get("session_id") or "") == t:
+            return {
+                "kind": "worker",
+                "session_id": t,
+                "worker": w,
+                "engine": str(w.get("engine") or "claude"),
+                "cwd": str(w.get("cwd") or ""),
+            }
+    # A devin-cli session id (CCC's "devincli-<word-slug>"). It is neither hex
+    # nor a UUID, so every branch below rejects it and devin sessions were
+    # unaddressable -- unsubscribable as a ticket's submitter, unreachable by
+    # `wt send` (WATCHTOWER-33). The prefix names the engine outright, so no
+    # lookup is needed to know the transport: no FIFO and no claude resume, so
+    # the chain falls through to the delegate, and CCC's /api/inject-input
+    # speaks devincli- ids natively (it strips the prefix and steers over ACP).
+    # Placed after the two live-worker branches on purpose: a devin session
+    # that IS a live WT worker has a record saying so, and that record (with
+    # its fifo and cwd) beats anything this shape can tell us.
+    if _DEVIN_CLI_SESSION_RE.match(t):
+        return {
+            "kind": "session",
+            "session_id": t,
+            "worker": None,
+            "engine": "devin",
+            "known": True,
+        }
     agents = _load_agents()
     name = t.lstrip("@")
     rec = agents.get(name)
@@ -567,6 +612,29 @@ def _find_codex_rollout(sid: str) -> Optional[Path]:
     return newest
 
 
+def locate_transcript(sid: str, engine_hint: str = "") -> str:
+    """Resolve a session id to its transcript path on this machine, if any.
+
+    Tries the engine the caller already knows (``engine_hint``) first, then
+    falls back to the other finder -- a worker's own env vars name its
+    engine, but callers resolving *someone else's* session may not know it.
+    Returns "" when the session has no transcript on this machine (e.g. an
+    ephemeral queue-worker sandbox whose transcript never lands here; see
+    S8b's harvest-before-wipe for that case)."""
+    if not sid:
+        return ""
+    finders = {"claude": _find_transcript, "codex": _find_codex_rollout}
+    order = [engine_hint] + [e for e in finders if e != engine_hint]
+    for engine in order:
+        finder = finders.get(engine)
+        if finder is None:
+            continue
+        path = finder(sid)
+        if path is not None:
+            return str(path)
+    return ""
+
+
 def _latest_session_title(path: Path) -> str:
     """Return the last explicit Claude title/agent-name in a transcript."""
     try:
@@ -623,6 +691,50 @@ def _session_busy(sid: str) -> bool:
     return session_state(sid) == "busy"
 
 
+def _session_has_live_process(sid: str) -> bool:
+    """True unless no process can be holding claude session ``sid``.
+
+    Checks Claude's own session registry (``~/.claude/sessions/<pid>.json``,
+    a row whose pid is not provably dead), wt's ledger of resume children,
+    and finally any live process whose command line names the session.
+    Conservative: a lookup that fails counts as live, so the caller keeps
+    the old busy hold rather than racing a running turn."""
+    try:
+        from . import workers
+        claude_home = Path(
+            os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+        for f in (claude_home / "sessions").glob("*.json"):
+            try:
+                row = json.loads(f.read_text())
+            except (OSError, ValueError):
+                continue
+            if (isinstance(row, dict) and row.get("sessionId") == sid
+                    and workers.claude_session_row_liveness(row)[0] != "dead"):
+                return True
+        if live_resume_child(sid):
+            return True
+        proc = Path("/proc")
+        if not proc.is_dir():
+            return True  # no cheap process scan here (macOS): keep the hold
+        for d in proc.iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                cmd = (d / "cmdline").read_bytes()
+            except OSError:
+                continue
+            argv = cmd.split(b"\0")
+            # The claude binary itself (or node running it) with the sid as
+            # an exact argument: a sender's shell that merely mentions the sid
+            # next to a ~/.claude path must not count as the holder.
+            if (sid.encode() in argv
+                    and any(os.path.basename(a) == b"claude" for a in argv[:2])):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - unknown means keep the busy hold
+        return True
+
+
 def session_state(sid: str, now: Optional[float] = None) -> str:
     """Return busy, idle, or unknown from one targeted transcript stat."""
     p = _find_transcript(sid)
@@ -637,19 +749,17 @@ def session_state(sid: str, now: Optional[float] = None) -> str:
 
 
 def _displaced_claim_for_session(sid: str) -> Optional[Dict[str, str]]:
-    """If ``sid`` was a worker that got reaped mid-ticket and its claim was
-    taken over, return ``{"ref", "reason"}`` describing the displacement; else
-    None. Used to guard a headless resume so a revived worker does not silently
-    resume onto -- and re-commit -- work another worker already redrained.
+    """If ``sid`` had a claim taken from it by the orphan sweep (its worker was
+    found dead mid-ticket), return ``{"ref", "reason"}``; else None. Used to
+    guard a headless resume so a revived worker does not silently resume onto --
+    and re-commit -- work another worker already redrained.
 
-    Signal (false-positive-free by construction): the ticket still records this
-    session as owner (``claimed_session_id == sid``) AND its history carries a
-    ``reopen`` event with reason "worker gone" (the reaper's mark -- a normally
-    closed ticket never has one) AND it is no longer actively in_progress under
-    this session (status is ``open`` = reopened, or ``closed`` = reassigned and
-    closed by another). A worker that finished its own ticket has no reopen
-    event, so it is never flagged; one that was reaped-then-legitimately
-    reclaimed by ITSELF is back to in_progress, so it is not flagged either.
+    Keys on the reopen event's displacement record (WT-30 R2: ``orphan`` +
+    ``displaced_session_id``), not on the ticket's CURRENT ``claimed_session_id``
+    -- a fresh worker's claim overwrites that. Legacy events with only the
+    "worker gone" reason still match while the ticket records ``sid``. A later
+    claim/reopen by ``sid`` itself (legitimate self-reclaim), or the ticket being
+    in_progress under ``sid``, clears the displacement.
 
     Best-effort: any lookup failure returns None -- the guard must never break
     delivery."""
@@ -661,21 +771,36 @@ def _displaced_claim_for_session(sid: str) -> Optional[Dict[str, str]]:
     except Exception:
         return None
     for it in items:
-        if str(it.get("claimed_session_id") or "") != sid:
+        status = str(it.get("status") or "")
+        if status == "in_progress" and str(it.get("claimed_session_id") or "") == sid:
+            continue  # legitimately theirs
+        hist = it.get("history") or []
+        hit = -1
+        legacy = False
+        for i, e in enumerate(hist):
+            if e.get("event") != "reopen":
+                continue
+            if e.get("orphan") is True and str(e.get("displaced_session_id") or "") == sid:
+                hit, legacy = i, False
+            elif (not e.get("displaced_session_id")
+                  and "worker gone" in str(e.get("reason") or "").lower()
+                  and str(it.get("claimed_session_id") or "") == sid
+                  and status in ("open", "closed")):
+                hit, legacy = i, True
+        if hit < 0:
             continue
-        status = it.get("status")
-        if status not in ("open", "closed"):
-            continue  # in_progress under this session -> still legitimately theirs
-        reaped = any(
-            e.get("event") == "reopen"
-            and "worker gone" in str(e.get("reason") or "").lower()
-            for e in (it.get("history") or [])
-        )
-        if not reaped:
-            continue  # closed/released normally, not taken away
-        reason = ("reopened after you were reaped for idling"
-                  if status == "open"
-                  else "reassigned and closed by another worker after you were reaped")
+        if any(e.get("event") in ("claim", "reopen")
+               and str((e.get("by") or {}).get("session_id") or "") == sid
+               for e in hist[hit + 1:]):
+            continue  # sid re-bound itself after the displacement
+        if legacy:
+            reason = ("reopened after you were reaped for idling" if status == "open"
+                      else "reassigned and closed by another worker after you were reaped")
+        else:
+            reason = {
+                "open": "reopened after your process was found dead",
+                "closed": "reassigned and closed by another worker",
+            }.get(status, "taken over by another worker")
         return {"ref": str(it.get("ref") or "?"), "reason": reason}
     return None
 
@@ -723,7 +848,11 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     _stop_prefix = _stale_claim_stop_prefix(sid)
     if _stop_prefix:
         text = _stop_prefix + text
-    if _session_busy(sid):
+    # A hot transcript only means "mid-turn" while some process still holds
+    # the session. With no holder (a dormant session, or one whose process was
+    # killed mid-turn) nothing can race the resume, so deliver now instead of
+    # parking the message for a quiet window that changes nothing.
+    if _session_busy(sid) and _session_has_live_process(sid):
         return {
             "ok": False,
             "busy": True,
@@ -1095,6 +1224,48 @@ def _post_json(url: str, payload: Dict[str, Any], timeout_s: float) -> Dict[str,
     return data if isinstance(data, dict) else {}
 
 
+def _get_json(url: str, timeout_s: float) -> Optional[Dict[str, Any]]:
+    """GET JSON, return the parsed object or None on any transport/parse
+    failure -- read-only counterpart to ``_post_json``, deliberately
+    swallowing errors itself since every caller treats a failed lookup as
+    'nothing to report', not a delivery failure."""
+    headers = {}
+    token = (os.environ.get("WATCHTOWER_DELEGATE_TOKEN") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read().decode("utf-8", "replace")
+        data = json.loads(body)
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def ccc_forward_target(sid: str, timeout_s: float = 1.5) -> Optional[str]:
+    """Ask CCC -- the one source of truth for lineage forwards, see
+    ``ccc_server/continuation.py`` -- whether ``sid`` currently forwards
+    elsewhere: a manual ``ccc rebind-report-to`` or a spawned continuation.
+    None when no delegate is configured, ``sid`` is falsy, the lookup fails,
+    or there simply is no forward -- all of which mean "deliver to sid as
+    given", the same as a standalone WT with no CCC at all. Used at the two
+    places WT would otherwise keep addressing a session that has moved on:
+    ``_notify_ticket_event``'s submitter/subscriber targets (queue.py) and
+    ``cmd_find``'s ``filed_by`` display (cli.py)."""
+    if not sid:
+        return None
+    base = _delegate_base()
+    if not base:
+        return None
+    url = f"{base}/api/session/{quote(sid, safe='')}/forward-target"
+    data = _get_json(url, timeout_s)
+    if not data:
+        return None
+    forwarded = data.get("forwarded_to")
+    return forwarded if forwarded and forwarded != sid else None
+
+
 def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     """Standalone codex fallback: native delivery via WT's private app-server.
 
@@ -1153,28 +1324,28 @@ def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, 
 
 
 def compact_codex(resolved: Dict[str, Any]) -> Dict[str, Any]:
-    """Trigger real context compaction on a codex thread via the app-server's
-    native ``thread/compact/start`` RPC (``codex_rpc.compact``).
+    """Compact through the configured CCC owner, or WT's standalone RPC.
 
-    Standalone-only for now, unlike ``deliver``'s adapter chain: when a
-    delegate (CCC) is configured for delegate-first codex brokering, WT must
-    not open a second app-server against a thread CCC already owns (same
-    invariant ``_deliver_codex_app_server`` protects for plain delivery), and
-    CCC's ``/api/inject-input`` delegate endpoint only injects chat text --
-    it has no way to forward a structural RPC like ``thread/compact/start``.
-    So compact mode is unavailable in that configuration until CCC grows its
-    own compact-forwarding endpoint; callers should fall back to
-    ``--mode mdfile`` there instead of guessing at a workaround."""
-    if _codex_delegate_first_enabled() and _delegate_base():
-        return {
-            "ok": False,
-            "error": "compact mode isn't available for Codex when a delegate "
-                     "(CCC) is configured for delegate-first brokering; "
-                     "use --mode mdfile instead",
-        }
-    sid = str(resolved.get("session_id") or "")
+    A managed thread must stay on its owner's app-server. Use CCC's native
+    compact endpoint rather than sending slash-command text or opening a
+    competing private app-server. Delegate failures never fall back locally.
+    """
+    sid = str(resolved.get("session_id") or "").strip()
     if not sid:
         return {"ok": False, "error": "codex compact needs a thread/session id"}
+    base = _delegate_base() if _codex_delegate_first_enabled() else None
+    if base:
+        try:
+            # CCC waits for compaction to finish, including the rollout flush.
+            result = _post_json(
+                base + "/api/session/compact", {"session_id": sid}, timeout_s=360,
+            )
+        except Exception as e:  # transport failure must not change ownership
+            return {"ok": False, "error": f"delegate compact failed: {e}"}
+        if result.get("ok") is not True:
+            return {**result, "ok": False,
+                    "error": result.get("error") or "delegate compact rejected"}
+        return {**result, "transport": "delegate-compact"}
     try:
         from . import codex_rpc
     except ImportError:
@@ -1427,8 +1598,51 @@ def _deliver_delegate(
     except Exception as e:  # noqa: BLE001 - any transport failure means fall through
         return {"ok": False, "error": f"delegate: {e}"}
     if data.get("ok") is False:
-        return {"ok": False, "error": "delegate rejected the message"}
+        # Keep the delegate's own reason/code so operators (and the outbox
+        # last_error) can see why it refused, not just that it did.
+        detail = str(data.get("error") or data.get("reason") or "").strip()
+        code = str(data.get("code") or "").strip()
+        msg = "delegate rejected the message"
+        if code or detail:
+            msg += " (" + ": ".join(x for x in (code, detail) if x) + ")"
+        return {"ok": False, "error": msg}
     return {"ok": True, "transport": "delegate"}
+
+
+def _continue_if_cold(resolved: Dict[str, Any], text: str) -> Optional[Dict[str, Any]]:
+    """``--start-new-if-needed``: if resuming ``resolved``'s session would be a
+    full prompt-cache miss on a large context (CCC's own large-AND-stale
+    rule, ``/api/sessions/continuation-decision``), spawn a continuation
+    session seeded with ``text`` instead (``/api/sessions/spawn-continue-from``)
+    -- the same thing ``ccc send --new-if-large-and-stale`` does.
+
+    None means "deliver normally": no delegate, no session id, the decision
+    says the session is small or still warm, or any lookup/spawn failure --
+    this is a cost optimisation and must never block delivery."""
+    base = _delegate_base()
+    sid = str(resolved.get("session_id") or "")
+    if not base or not sid:
+        return None
+    decision = _get_json(
+        f"{base}/api/sessions/continuation-decision/{quote(sid, safe='')}",
+        _delegate_timeout_s(None),
+    )
+    if not decision or decision.get("path") != "new":
+        return None
+    try:
+        data = _post_json(
+            base + "/api/sessions/spawn-continue-from",
+            {"continue_from": str(decision.get("resolved_session_id") or sid),
+             "prompt": text},
+            timeout_s=_delegate_timeout_s(None),
+        )
+    except Exception:  # noqa: BLE001 - fall back to the normal chain
+        return None
+    if not data.get("ok"):
+        return None
+    return {"ok": True, "transport": "continuation",
+            "new_session_id": data.get("new_session_id"),
+            "reason": decision.get("reason", "")}
 
 
 def deliver(
@@ -1436,8 +1650,12 @@ def deliver(
     *, force_queue: bool = False, prefer_uds: bool = False,
     notify: bool = False,
     delegate_timeout_s: Optional[float] = None,
+    live_only: bool = False,
 ) -> Dict[str, Any]:
     """Try each adapter in order.
+
+    ``live_only=True`` uses ``_deliver_live_only``: UDS then FIFO, nothing that
+    can open a turn in a process nobody supervises.
 
     ``notify=True`` swaps in the much shorter event-notice chain
     (``_deliver_notify``): live transports only, never a resume.
@@ -1452,12 +1670,26 @@ def deliver(
 
     Every success is recorded as a delivery receipt (WT-77) so "delivered"
     can later be verified against the target transcript — the result
-    carries ``receipt_id``."""
-    result = _deliver_unreceipted(
-        resolved, text, mode, force_queue=force_queue, prefer_uds=prefer_uds,
-        notify=notify, delegate_timeout_s=delegate_timeout_s,
-    )
+    carries ``receipt_id``. A text carrying a WT-31 nonce on its last line
+    gets its receipt recorded *before* the send (the pre-send offset is what
+    makes only a later nonce count); a failed send drops it."""
     sid = str(resolved.get("session_id") or "")
+    pre = _pre_send_receipt(resolved, text) if sid else None
+    if live_only:
+        result = _deliver_live_only(resolved, text)
+    else:
+        result = _deliver_unreceipted(
+            resolved, text, mode, force_queue=force_queue, prefer_uds=prefer_uds,
+            notify=notify, delegate_timeout_s=delegate_timeout_s,
+        )
+    if pre is not None:
+        from . import receipts
+        if result.get("ok"):
+            receipts.set_transport(pre["id"], str(result.get("transport") or "?"))
+            result["receipt_id"] = pre["id"]
+        else:
+            receipts.discard(pre["id"])
+        return result
     if result.get("ok") and sid:
         try:
             from . import receipts
@@ -1478,6 +1710,22 @@ def deliver(
                              f"is unavailable for receipt verification: {exc}",
                 }
     return result
+
+
+def _pre_send_receipt(resolved: Dict[str, Any], text: str) -> Optional[Dict[str, Any]]:
+    """The WT-31 nonce receipt for ``text``, recorded before the send; None
+    for a text without a nonce (the WT-77 after-send receipt applies)."""
+    from . import receipts
+    nonce = receipts.nonce_of(text)
+    if not nonce:
+        return None
+    try:
+        return receipts.record(
+            str(resolved.get("session_id") or ""), text, "sending",
+            engine=str(resolved.get("engine") or "claude"), nonce=nonce,
+            delivery_id=nonce[len("\u27e8wt:"):-1])
+    except Exception:  # noqa: BLE001 - no receipt: the ledger reads it lost
+        return None
 
 
 def _deliver_uds(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
@@ -1506,6 +1754,25 @@ def _deliver_uds(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     if not result:
         return {"ok": False, "error": "uds declined (no row, held, or unconfirmed)"}
     return {"ok": True, "transport": "uds"}
+
+
+def _deliver_live_only(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """Strictest chain (WT-29): hand the message to a target that is running
+    right now -- native peer socket, else WT stdin FIFO -- and nothing else.
+    Never the CCC delegate, a headless resume, a codex/gemini/antigravity turn
+    or a tty write: each of those can start a turn WT cannot supervise and
+    still report ``ok``."""
+    errors: List[str] = []
+    r = _deliver_uds(resolved, text)
+    if r.get("ok"):
+        return r
+    errors.append(f"uds: {r.get('error', 'failed')}")
+    r = _deliver_fifo(resolved, text)
+    if r.get("ok"):
+        return r
+    errors.append(f"fifo: {r.get('error', 'failed')}")
+    return {"ok": False, "busy": False, "live_only": True,
+            "error": "; ".join(errors)}
 
 
 def _deliver_notify(
@@ -1670,11 +1937,26 @@ def outbox_add(
     now: Optional[float] = None,
     engine: str = "",
     notify: bool = False,
+    ticket_ref: str = "",
+    ticket_session: str = "",
+    dedupe_key: str = "",
+    ticket_gen: Optional[int] = None,
+    prefer_uds: bool = False,
 ) -> Dict[str, Any]:
     """Append a pending message to the durable outbox. Locked + atomic.
 
+    ``dedupe_key`` (WT-28): at most one live (non-dead, non-cancelled) row per
+    key; a second call returns the existing row, and the delivery ledger is
+    marked ``queued{msg_id}`` in the same lock. ``ticket_gen`` binds the row to
+    the ticket's answer generation: the drain skips it once that gen is no
+    longer current (R4-4).
+
     ``notify`` persists the event-notice delivery class so ``drain_outbox``
-    retries it over the live-only chain instead of resuming the target."""
+    retries it over the live-only chain instead of resuming the target.
+
+    ``ticket_ref`` binds the message to a ticket (and ``ticket_session`` to
+    the claim session it was addressed to): ``drain_outbox`` cancels it once
+    that ticket closes or changes session instead of retrying it (WT-1)."""
     now = time.time() if now is None else float(now)
     msg = {
         "id": f"msg-{_uuid.uuid4().hex[:12]}",
@@ -1693,11 +1975,179 @@ def outbox_add(
         msg["engine"] = str(engine)
     if notify:
         msg["notify"] = True
+    if prefer_uds:
+        msg["prefer_uds"] = True
+    if ticket_ref:
+        msg["ticket"] = str(ticket_ref)
+        msg["ticket_session"] = str(ticket_session or "")
+    if ticket_gen is not None:
+        msg["ticket_gen"] = int(ticket_gen)
+    if dedupe_key:
+        msg["dedupe_key"] = str(dedupe_key)
     with queue_mod._FileLock(_outbox_lock()):
         data = _load_outbox()
+        if dedupe_key:
+            for old in data["messages"]:
+                if (old.get("dedupe_key") == dedupe_key
+                        and old.get("status") not in ("dead", "cancelled")):
+                    return old
         data["messages"].append(msg)
         _save_outbox(data)
+        if dedupe_key:
+            ledger = _load_ledger()
+            ledger["entries"][str(dedupe_key)] = {
+                "state": "queued", "msg_id": msg["id"], "at": _iso(now),
+                "ref": str(ticket_ref or "")}
+            _save_ledger(ledger)
     return msg
+
+
+# --------------------------------------------------- delivery ledger (WT-28)
+LEDGER_TTL_S = 7 * 24 * 3600
+DEDUPE_LEASE_S = 120.0
+
+
+def _load_ledger() -> Dict[str, Any]:
+    try:
+        with open(_ledger_file(), "r") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {"entries": {}}
+    if not isinstance(data, dict) or not isinstance(data.get("entries"), dict):
+        return {"entries": {}}
+    return data
+
+
+def _save_ledger(data: Dict[str, Any]) -> None:
+    cutoff = time.time() - LEDGER_TTL_S
+    data["entries"] = {k: v for k, v in data["entries"].items()
+                       if _parse_iso(v.get("at")) >= cutoff}
+    path = _ledger_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = str(path) + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def ledger_reserve(key: str, ref: str = "", now: Optional[float] = None) -> Dict[str, Any]:
+    """Durable dedupe (WT-28). ``{"action": ...}``: ``sent`` (already
+    delivered), ``queued`` (a live outbox row holds it; ``msg_id``),
+    ``in_flight`` (another caller holds a fresh reservation) or ``proceed``
+    (reserved for this caller)."""
+    now = time.time() if now is None else float(now)
+    with queue_mod._FileLock(_outbox_lock()):
+        ledger = _load_ledger()
+        entry = ledger["entries"].get(key) or {}
+        state = entry.get("state")
+        if state == "sent":
+            return {"action": "sent"}
+        if state == "queued":
+            row = next((m for m in _load_outbox()["messages"]
+                        if str(m.get("id")) == str(entry.get("msg_id"))), None)
+            if row is not None and row.get("status") not in ("dead", "cancelled"):
+                return {"action": "queued", "msg_id": entry.get("msg_id")}
+        if state == "reserved" and now - _parse_iso(entry.get("at")) < DEDUPE_LEASE_S:
+            return {"action": "in_flight"}
+        ledger["entries"][key] = {"state": "reserved", "at": _iso(now), "ref": ref}
+        _save_ledger(ledger)
+    return {"action": "proceed"}
+
+
+def ledger_mark(key: str, state: str, msg_id: str = "") -> None:
+    with queue_mod._FileLock(_outbox_lock()):
+        ledger = _load_ledger()
+        entry = dict(ledger["entries"].get(key) or {})
+        entry.update(state=state, at=_iso(time.time()))
+        if msg_id:
+            entry["msg_id"] = msg_id
+        ledger["entries"][key] = entry
+        _save_ledger(ledger)
+
+
+def ledger_release(key: str) -> None:
+    """Drop a ``reserved`` entry after a failed attempt (never a sent/queued one)."""
+    with queue_mod._FileLock(_outbox_lock()):
+        ledger = _load_ledger()
+        if (ledger["entries"].get(key) or {}).get("state") == "reserved":
+            ledger["entries"].pop(key, None)
+            _save_ledger(ledger)
+
+
+def ledger_clear_ref(ref: str) -> None:
+    with queue_mod._FileLock(_outbox_lock()):
+        ledger = _load_ledger()
+        kept = {k: v for k, v in ledger["entries"].items() if v.get("ref") != ref}
+        if len(kept) != len(ledger["entries"]):
+            ledger["entries"] = kept
+            _save_ledger(ledger)
+
+
+def outbox_row(msg_id: str) -> Optional[Dict[str, Any]]:
+    """``{status, last_error}`` of one outbox row, or None when it is gone."""
+    for m in _load_outbox()["messages"]:
+        if str(m.get("id")) == str(msg_id):
+            return {"status": m.get("status"), "last_error": m.get("last_error", "")}
+    return None
+
+
+def outbox_entry(msg_id: str) -> Optional[Dict[str, Any]]:
+    """Resume-evidence view of one outbox row (WT-30): status, transport of the
+    delivery, real delivery time and last error; None when the row is gone."""
+    for m in _load_outbox()["messages"]:
+        if str(m.get("id")) == str(msg_id):
+            return {"status": m.get("status"), "last_error": m.get("last_error", ""),
+                    "transport": str(m.get("transport") or ""),
+                    "delivered_at": str(m.get("delivered_at") or "")}
+    return None
+
+
+def live_resume_child(sid: str) -> bool:
+    """True when the resume ledger holds a still-running ``claude ... <sid>``
+    child (pid alive and argv identity matches, as ``reap_resume_children``)."""
+    if not sid:
+        return False
+    with queue_mod._FileLock(_resume_ledger_lock()):
+        entries = _load_resume_ledger()
+    for e in entries:
+        if not isinstance(e, dict) or str(e.get("sid") or "") != sid:
+            continue
+        try:
+            pid = int(e.get("pid") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0:
+            continue
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+        except OSError:
+            return True
+        cmd = _pid_command(pid)
+        if "claude" in cmd and sid in cmd:
+            return True
+    return False
+
+
+def outbox_cancel_ticket(ref: str, reason: str) -> List[str]:
+    """Cancel pending generation-bound answer rows of ``ref`` (R4-4): the row
+    is marked stale so the drain never retries it. A transport already started
+    cannot be recalled (at-least-once)."""
+    cancelled: List[str] = []
+    with queue_mod._FileLock(_outbox_lock()):
+        data = _load_outbox()
+        for m in data["messages"]:
+            if (m.get("ticket") == ref and m.get("ticket_gen") is not None
+                    and m.get("status") == "pending"):
+                m["status"] = "cancelled"
+                m["last_error"] = reason
+                cancelled.append(str(m.get("id")))
+        if cancelled:
+            _save_outbox(data)
+    return cancelled
 
 
 def outbox_list(status: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1758,14 +2208,57 @@ def outbox_remove(message_id: str) -> bool:
     return True
 
 
+def _ticket_stale_reason(m: Dict[str, Any]) -> str:
+    """Why a ticket-bound outbox message must not be delivered, or "".
+
+    Callers bind only messages sent while the ticket is ``in_progress``,
+    addressed to the session that held it then. Once the ticket closes, or
+    its claim is released or moves to another session, delivering it is at
+    best noise and at worst tells a session to work a ticket it no longer
+    owns -- and every retry re-injects it (WT-1; the 09-15 CCC inject
+    circuit-breaker trips).
+    A store read failure answers "": delivering as before beats dropping a
+    human's answer on a transient error."""
+    ref = str(m.get("ticket") or "")
+    if not ref:
+        return ""
+    try:
+        item = queue_mod.get(ref)
+    except Exception:  # noqa: BLE001 - best-effort guard, never block delivery
+        return ""
+    if item is None:
+        return ""
+    status = str(item.get("status") or "")
+    if status == "closed":
+        return f"ticket {ref} closed"
+    if status != "in_progress":
+        # Released or reopened: the claim is gone even though reopen keeps
+        # claimed_session_id as a `wt discuss` handle, so compare status too.
+        return f"ticket {ref} released (now {status or 'unknown'})"
+    bound = str(m.get("ticket_session") or "")
+    current = str(item.get("claimed_session_id") or "")
+    if bound and current != bound:
+        return (f"ticket {ref} changed session "
+                f"({bound[:8]} -> {current[:8] or 'unclaimed'})")
+    if m.get("ticket_gen") is not None:
+        # R4-4: an answer row is bound to the answer generation it carries; a
+        # re-block or new answer moves the ticket on, even when the SAME
+        # session is rebound (status and session above would still match).
+        pa = item.get("pending_answer") or {}
+        if int(pa.get("gen") or -1) != int(m["ticket_gen"]):
+            return f"ticket {ref} answer gen {m['ticket_gen']} superseded"
+    return ""
+
+
 def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
     """One daemon tick over the outbox: retry due pending messages.
 
     Delivery attempts run OUTSIDE the file lock (a delegate POST can take
     seconds), then results are folded back in under the lock. Backoff is
     30 * 2^attempts capped at 600s; after ``MAX_ATTEMPTS`` or TTL expiry a
-    message goes ``dead`` and is logged as DEADMSG. Returns id lists per
-    outcome."""
+    message goes ``dead`` and is logged as DEADMSG. A ticket-bound message
+    whose ticket has closed or changed session goes ``cancelled`` without a
+    delivery attempt (CANCELMSG). Returns id lists per outcome."""
     now = time.time() if now is None else float(now)
     with queue_mod._FileLock(_outbox_lock()):
         data = _load_outbox()
@@ -1783,11 +2276,19 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             and str(m.get("id")) not in expired_ids
             and _parse_iso(m.get("next_attempt_at")) <= now
         ]
-    result: Dict[str, List[str]] = {"delivered": [], "retried": [], "dead": []}
+    result: Dict[str, List[str]] = {
+        "delivered": [], "retried": [], "dead": [], "cancelled": [],
+    }
     if not due and not expired_ids:
         return result
     outcomes: Dict[str, Dict[str, Any]] = {}
+    stale: Dict[str, str] = {}
+    writebacks: List[Tuple[str, str, str, str, str, str, str]] = []
     for m in due:
+        reason = _ticket_stale_reason(m)
+        if reason:
+            stale[str(m.get("id"))] = reason
+            continue
         try:
             # include_recent=False: the daemon tick must never enumerate the
             # transcript archive; outbox targets are already resolved sids
@@ -1799,6 +2300,8 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             # monkeypatched by tests with the historical three-argument
             # signature, exactly as in `send`.
             extra = {"notify": True} if m.get("notify") else {}
+            if m.get("prefer_uds"):
+                extra["prefer_uds"] = True
             outcomes[str(m.get("id"))] = deliver(
                 resolved, str(m.get("text") or ""), str(m.get("mode") or "send"),
                 **extra,
@@ -1813,9 +2316,21 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
                 m["status"] = "dead"
                 m["last_error"] = "expired"
                 result["dead"].append(msg_id)
+                if m.get("ticket"):
+                    writebacks.append((str(m["ticket"]), str(m.get("ticket_session") or ""),
+                                       msg_id, "failed", "", "expired", ""))
                 queue_mod._log(
                     "DEADMSG",
                     f"{m.get('id','?')} to {m.get('to','?')}: expired",
+                )
+                continue
+            if msg_id in stale and m.get("status") == "pending":
+                m["status"] = "cancelled"
+                m["last_error"] = stale[msg_id]
+                result["cancelled"].append(msg_id)
+                queue_mod._log(
+                    "CANCELMSG",
+                    f"{m.get('id','?')} to {m.get('to','?')}: {stale[msg_id]}",
                 )
                 continue
             res = outcomes.get(str(m.get("id")))
@@ -1826,8 +2341,19 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             if res.get("ok"):
                 m["status"] = "delivered"
                 m["delivered_at"] = _iso(now)
+                m["transport"] = str(res.get("transport") or "")
                 m["last_error"] = ""
                 result["delivered"].append(str(m["id"]))
+                if m.get("ticket"):
+                    writebacks.append((str(m["ticket"]), str(m.get("ticket_session") or ""),
+                                       str(m["id"]), "running", m["transport"], "",
+                                       m["delivered_at"]))
+                if m.get("dedupe_key"):
+                    ledger = _load_ledger()
+                    ledger["entries"][str(m["dedupe_key"])] = {
+                        "state": "sent", "at": _iso(now), "msg_id": str(m["id"]),
+                        "ref": str(m.get("ticket") or "")}
+                    _save_ledger(ledger)
                 queue_mod._log(
                     "SEND",
                     f"{m.get('to','?')} via {res.get('transport','?')} "
@@ -1838,6 +2364,9 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
                 if attempts >= MAX_ATTEMPTS:
                     m["status"] = "dead"
                     result["dead"].append(str(m["id"]))
+                    if m.get("ticket"):
+                        writebacks.append((str(m["ticket"]), str(m.get("ticket_session") or ""),
+                                           str(m["id"]), "failed", "", m["last_error"], ""))
                     queue_mod._log(
                         "DEADMSG",
                         f"{m.get('id','?')} to {m.get('to','?')} after "
@@ -1847,6 +2376,17 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
                     m["next_attempt_at"] = _iso(now + _backoff_s(attempts))
                     result["retried"].append(str(m["id"]))
         _save_outbox(data)
+    # Outside the outbox lock (no nested locks): push delivery / dead-letter
+    # outcomes to the ticket's resume evidence (WT-30 R3). The sweep reads the
+    # outbox row itself, so a lost write-back only leaves a stale state.
+    for ref, sid, msg_id, state, transport, error, at in writebacks:
+        try:
+            queue_mod.set_resume_state(ref, sid, state, transport=transport, error=error,
+                                       outbox_id=msg_id, at=at or None)
+            queue_mod._log("RESUME", f"{ref} — " + (f"{transport or '?'} (outbox)" if state == "running"
+                                                   else "failed (outbox dead)"))
+        except Exception:  # noqa: BLE001
+            pass
     return result
 
 
@@ -1862,9 +2402,23 @@ def send(
     prefer_uds: bool = False,
     notify: bool = False,
     delegate_timeout_s: Optional[float] = None,
+    ticket_ref: str = "",
+    ticket_session: str = "",
+    live_only: bool = False,
+    dedupe_key: str = "",
+    ticket_gen: Optional[int] = None,
+    start_new_if_needed: bool = False,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
+    ``start_new_if_needed=True`` spawns a continuation session carrying the
+    text instead of delivering when the target is large and cache-cold
+    (``_continue_if_cold``), so a dormant 150K-token session is not woken
+    just to read the message.
+    ``live_only=True`` (WT-29) delivers only over UDS/FIFO to a running target
+    and never parks, whatever ``queue_on_fail`` says.
+    ``ticket_ref``/``ticket_session`` ride along onto the parked row so the
+    daemon cancels it once the ticket closes or changes session.
 
     ``notify=True`` marks this as an event notice (``_deliver_notify``): live
     transports only, never a headless resume. The flag rides along into the
@@ -1891,9 +2445,16 @@ def send(
         extra["notify"] = True
     if delegate_timeout_s is not None:
         extra["delegate_timeout_s"] = delegate_timeout_s
-    result = deliver(resolved, text, mode, **extra)
+    if live_only:
+        extra["live_only"] = True
+        queue_on_fail = False
+    result = _continue_if_cold(resolved, text) if start_new_if_needed else None
+    if result is None:
+        result = deliver(resolved, text, mode, **extra)
     if result.get("ok"):
         out = {"ok": True, "transport": result.get("transport", "?")}
+        if result.get("new_session_id"):
+            out["new_session_id"] = result["new_session_id"]
         if result.get("log"):
             out["log"] = result["log"]
         if result.get("turn_id"):
@@ -1916,6 +2477,10 @@ def send(
         to, text, mode=mode,
         error=str(result.get("error") or ""), delay_s=delay, ttl_s=ttl_s,
         engine=engine, notify=notify,
+        ticket_ref=ticket_ref, ticket_session=ticket_session,
+        **({"prefer_uds": True} if prefer_uds else {}),
+        **({"dedupe_key": dedupe_key} if dedupe_key else {}),
+        **({"ticket_gen": ticket_gen} if ticket_gen is not None else {}),
     )
     return {
         "ok": False,
@@ -2022,6 +2587,10 @@ def deliver_message(
     timeout_ms: int = 30000,
     engine: str = "",
     delegate_timeout_s: Optional[float] = None,
+    ticket_ref: str = "",
+    ticket_session: str = "",
+    dedupe_key: str = "",
+    ticket_gen: Optional[int] = None,
 ) -> Dict[str, Any]:
     """One delivery entry point for every WT caller (CCC-1000 Phase 3).
 
@@ -2049,6 +2618,16 @@ def deliver_message(
     ``hold`` parks it in the outbox for the daemon to retry (optionally with
     ``expire`` seconds of TTL), ``drop`` discards it, ``reject`` fails fast so
     the caller can react rather than waiting on a timeout it cannot see.
+
+    ``ticket_ref`` (with the ``ticket_session`` it is addressed to) marks a
+    held message as about that ticket, so the outbox cancels it rather than
+    retrying once the ticket closes or changes session (WT-1).
+
+    ``dedupe_key`` (WT-28) makes the call idempotent across retries and
+    crashes through the durable delivery ledger: an already-sent key is not
+    sent again, a key held by a live outbox row returns that row, and a fresh
+    reservation elsewhere returns ``in_flight`` (try later). ``ticket_gen``
+    binds a held row to the ticket's answer generation (R4-4).
     """
     verb = str(verb or "engine_default").strip().lower()
     if verb not in DELIVERY_VERBS:
@@ -2066,6 +2645,44 @@ def deliver_message(
     send_kwargs: Dict[str, Any] = {}
     if delegate_timeout_s is not None:
         send_kwargs["delegate_timeout_s"] = delegate_timeout_s
+    if ticket_ref:
+        send_kwargs["ticket_ref"] = ticket_ref
+        send_kwargs["ticket_session"] = ticket_session
+    if ticket_gen is not None:
+        send_kwargs["ticket_gen"] = ticket_gen
+    if dedupe_key:
+        reserved = ledger_reserve(dedupe_key, ref=ticket_ref)
+        act = reserved.get("action")
+        if act == "sent":
+            return {"ok": True, "deduped": True, "transport": "ledger", "verb": verb}
+        if act == "queued":
+            return {"ok": False, "queued": True, "deduped": True,
+                    "id": reserved.get("msg_id"), "verb": verb}
+        if act == "in_flight":
+            return {"ok": False, "deduped": True, "in_flight": True, "verb": verb,
+                    "error": "delivery in flight elsewhere"}
+        send_kwargs["dedupe_key"] = dedupe_key
+    try:
+        result = _deliver_message_send(target, text, verb, on_busy, expire, engine,
+                                       position, send_kwargs)
+    except Exception:
+        if dedupe_key:
+            ledger_release(dedupe_key)
+        raise
+    if dedupe_key:
+        if result.get("ok"):
+            ledger_mark(dedupe_key, "sent")
+        elif not result.get("queued"):
+            ledger_release(dedupe_key)
+    if not result.get("ok") and on_busy == "drop":
+        return {"ok": False, "dropped": True,
+                "error": str(result.get("error") or "delivery failed")}
+    result.setdefault("verb", verb)
+    return result
+
+
+def _deliver_message_send(target, text, verb, on_busy, expire, engine, position,
+                          send_kwargs) -> Dict[str, Any]:
     result = send(
         target,
         text,
@@ -2077,10 +2694,6 @@ def deliver_message(
         prefer_uds=(verb == "steer"),
         **send_kwargs,
     )
-    if not result.get("ok") and on_busy == "drop":
-        return {"ok": False, "dropped": True,
-                "error": str(result.get("error") or "delivery failed")}
-    result.setdefault("verb", verb)
     return result
 
 

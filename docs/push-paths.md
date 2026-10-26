@@ -27,6 +27,10 @@ the codebase is stdout, not a push.
   target is idle: the notice waits in the outbox, and the `notify` flag
   persists on the outbox row so `drain_outbox` keeps the same guarantee.
 
+Actionable notice detail is preserved in full; only claim previews may be
+clipped, with a `wt find <ref>` pointer. See [length investigation](ticket-notice-length.md)
+for history, measurements, transport limits, and a received long-question replay.
+
 ## 2. Dispatch nudges — `workers.dispatch_after_enqueue` → `notify_workers`
 
 Fired after `wt add` and behind ▶ (`wt run`). Broadcasts "claim this" to every

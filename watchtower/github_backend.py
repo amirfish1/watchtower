@@ -16,12 +16,19 @@ import os
 import re
 import subprocess
 import threading
+import contextlib
+import copy
+import functools
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .queue import UNCLAIMABLE_READINESS, _FileLock
+from .config import CATCH_ALL_LABEL
+from .queue import (
+    UNCLAIMABLE_READINESS, _FileLock, _refs_index, _validate_blocked_by,
+    blocker_verdict, machine_tag,
+)
 
 VALID_LANES = ("normal", "express")
 # `gh issue` subcommands that actually change an issue's list-visible state
@@ -62,7 +69,7 @@ COMPLETED_ISSUE_RETENTION_DAYS = 14
 # every ticket in exchange for zero quota.
 _LIST_LIMIT_DEFAULT = 200
 _LIST_JSON_FIELDS = (
-    "number,title,body,state,url,assignees,labels,createdAt,updatedAt,closedAt"
+    "number,title,body,state,url,assignees,labels,author,createdAt,updatedAt,closedAt"
 )
 
 
@@ -89,6 +96,29 @@ _META_END = "-->"
 # escaping its literal backslashes (for example ``\^[[0m``).  Preserve the
 # original terminal text by escaping only sequences JSON cannot decode.
 _LEGACY_INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})')
+
+
+# Per-thread set of repo lock paths already held, so a locked writer may call
+# another (update_status -> claim_by_ref, ingest_owner_answer -> answer)
+# without flock deadlocking on its own second open of the same file.
+_BODY_LOCKS_HELD = threading.local()
+
+
+def _serialized_body_write(method):
+    """Run a read-modify-write of the issue body under the per-repo lock.
+
+    Every writer reads the body, edits its metadata block and writes the
+    whole body back; `gh issue edit` has no compare-and-swap, so two
+    unserialized writers lose one update. Observed on BECKY-2745: a `wt
+    comment` read the body just before a claim landed and wrote it back a
+    second later, erasing `claimed_by`; the read then fell back to the
+    GitHub assignee and `wt close` rejected the claiming worker (OPS-106).
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._body_lock():
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class GitHubBackendError(RuntimeError):
@@ -287,6 +317,19 @@ def _read_persisted_list_cache() -> Dict[str, Any]:
             return {}
         if not isinstance(data, dict):
             data = {}
+        # Every repo's poll rewrites this one file, so most re-parses leave a
+        # given repo's list unchanged. Keep that list the same object: the
+        # list_items memo keys on its identity (WT-16).
+        previous = _PERSISTED_LIST_MEM_CACHE["data"]
+        for key, entry in data.items():
+            old = previous.get(key)
+            if (
+                isinstance(entry, dict)
+                and isinstance(old, dict)
+                and entry.get("data") is not None
+                and entry.get("data") == old.get("data")
+            ):
+                entry["data"] = old["data"]
         _PERSISTED_LIST_MEM_CACHE["mtime_ns"] = mtime_ns
         _PERSISTED_LIST_MEM_CACHE["size"] = size
         _PERSISTED_LIST_MEM_CACHE["data"] = data
@@ -1105,6 +1148,20 @@ def _parse_iso(value: Any) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def _defer_live(until: Any) -> bool:
+    parsed = _parse_iso(until) if until else None
+    return parsed is not None and parsed.timestamp() > time.time()
+
+
+_DEFER_MARKER_RE = re.compile(r'^deferred_until:\s*"([^"]+)"', re.MULTILINE)
+
+
+def _defer_marker_live(body: Any) -> bool:
+    """Cheap pre-parse check for a live defer window in an issue body."""
+    m = _DEFER_MARKER_RE.search(str(body or ""))
+    return bool(m) and _defer_live(m.group(1))
+
+
 def _age_seconds(created_at: Any, *, now: Optional[datetime] = None) -> float:
     """Seconds since ``created_at``. An unparseable/missing timestamp reads as
     infinitely old: the grace period exists to protect *new* issues, and a
@@ -1113,6 +1170,21 @@ def _age_seconds(created_at: Any, *, now: Optional[datetime] = None) -> float:
     if created is None:
         return float("inf")
     return ((now or datetime.now(timezone.utc)) - created).total_seconds()
+
+
+# Upper bound on reusing a converted list_items result; the real bounds are
+# the raw-list identity, the ledger dir stamp and each issue's time boundary.
+_LIST_ITEMS_MEMO_TTL_S = 60.0
+
+
+def _copy_listed_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy one listed item the way _issue_to_item's memo hit does: shallow,
+    except the per-caller usage projection."""
+    from . import usage
+    out = dict(item)
+    if "token_usage" in out:
+        out["token_usage"] = usage.copy_projection(out["token_usage"])
+    return out
 
 
 def _recently_closed(issue: Dict[str, Any], *, now: Optional[datetime] = None) -> bool:
@@ -1162,6 +1234,13 @@ def _append_history(meta: Dict[str, Any], event: str, **fields: Any) -> None:
     for key, value in fields.items():
         if value:
             entry[key] = value
+    # Worker lifecycle events carry the recording machine's tag (queue.py's
+    # _append_history stamps by.machine on the file backend); human-kind
+    # events (answers, human reopens) don't claim a machine.
+    if entry.get("worker") and entry.get("kind") != "human" and "machine" not in entry:
+        tag = machine_tag()
+        if tag:
+            entry["machine"] = tag
     hist.append(entry)
     meta["history"] = hist
 
@@ -1224,6 +1303,23 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
     summary = _clip(resolution.get("summary", ""), 4000)
     if summary:
         out["summary"] = summary
+    # The verified fixing commit. Kept so the issue itself records WHICH commit
+    # closed it: downstream consumers (BYM's What's New carousel) gate on it
+    # being deployed, and a close comment without it left them nothing to check.
+    commit = _clip(resolution.get("commit", ""), 128)
+    if commit:
+        out["commit"] = commit
+    # session_id/engine/transcript_path/machine attribute the close to the
+    # session and node that did the work. Mirrors queue._normalize_resolution.
+    for field, max_len in (
+        ("session_id", 128),
+        ("engine", 32),
+        ("transcript_path", 1024),
+        ("machine", 16),
+    ):
+        val = _clip(resolution.get(field, ""), max_len)
+        if val:
+            out[field] = val
     for field in ("caveats", "follow_ups", "unresolved"):
         raw = resolution.get(field)
         if raw is None:
@@ -1262,6 +1358,10 @@ def _resolution_comment(resolution: Optional[Dict[str, Any]]) -> str:
         if values:
             lines.append(f"{label}:")
             lines.extend(f"- {value}" for value in values)
+    if resolution.get("commit"):
+        # Machine-readable, one per close comment; the same value is stored as
+        # ``resolution_commit`` in the issue's metadata block.
+        lines.append(f"Fix-Commit: {resolution['commit']}")
     return "\n".join(lines)
 
 
@@ -1276,7 +1376,33 @@ def _meta_block(meta: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+_SPLIT_BODY_MEMO: Dict[str, tuple] = {}
+_SPLIT_BODY_MEMO_MAX = 4096
+
+
+def _split_body_memo(body: str) -> tuple[str, Dict[str, Any]]:
+    body = body or ""
+    hit = _SPLIT_BODY_MEMO.get(body)
+    if hit is None:
+        if len(_SPLIT_BODY_MEMO) >= _SPLIT_BODY_MEMO_MAX:
+            _SPLIT_BODY_MEMO.clear()
+        _SPLIT_BODY_MEMO[body] = hit = _split_body_uncached(body)
+    return hit
+
+
 def _split_body(body: str) -> tuple[str, Dict[str, Any]]:
+    # A reconcile tick converts every issue once per queue; the metadata parse
+    # is pure in the body text, so reuse it (callers get their own copy).
+    human, meta = _split_body_memo(body)
+    return human, copy.deepcopy(meta)
+
+
+def _split_body_shared(body: str) -> tuple[str, Dict[str, Any]]:
+    """Like _split_body but hands back the memoized meta itself: read-only."""
+    return _split_body_memo(body)
+
+
+def _split_body_uncached(body: str) -> tuple[str, Dict[str, Any]]:
     body = body or ""
     start = body.find(_META_START)
     if start < 0:
@@ -1322,6 +1448,71 @@ def _body_with_metadata(human_body: str, meta: Dict[str, Any]) -> str:
     if human_body:
         return f"{human_body}\n\n{_meta_block(meta)}"
     return _meta_block(meta)
+
+
+_UNSET = object()
+# Re-read/re-apply rounds after a body write (WT-20); each costs one view.
+_BODY_WRITE_RETRIES = 2
+
+
+def _log_body_reapply(repo: str, number: str, conflicts: List[str]) -> None:
+    try:
+        from . import queue as _q
+        _q._log("GH-REAPPLY", f"{repo}#{number} concurrent body write dropped our change; "
+                f"re-applied" + (f" (theirs kept: {', '.join(conflicts)})" if conflicts else ""))
+    except Exception:  # noqa: BLE001 - logging never breaks a write
+        pass
+
+
+def _merge_body_write(base_raw: str, ours_raw: str,
+                      fresh_raw: str) -> "tuple[Optional[str], List[str]]":
+    """Three-way merge of our body write into the body GitHub now holds (WT-20).
+
+    ``gh issue edit`` has no compare-and-swap, and the per-repo flock only
+    serializes writers on one host: a writer on another host that read the
+    body before our edit can write it back a moment later, silently erasing
+    our change. Re-apply only what *we* changed (base -> ours) and only where
+    the fresh body still carries the base value; a key the other writer also
+    changed is theirs and is reported as a conflict; a ``claimed_by``
+    conflict re-applies nothing. History merges by appending our new
+    entries. Returns (body to rewrite, or None when fresh
+    already carries every change of ours; conflicting keys)."""
+    base_h, base_m = _split_body_shared(base_raw)
+    ours_h, ours_m = _split_body_shared(ours_raw)
+    fresh_h, fresh_m = _split_body(fresh_raw)
+    merged_h, merged_m = fresh_h, fresh_m
+    conflicts: List[str] = []
+    dirty = False
+    for key in list(base_m) + [k for k in ours_m if k not in base_m]:
+        b, o = base_m.get(key, _UNSET), ours_m.get(key, _UNSET)
+        f = fresh_m.get(key, _UNSET)
+        if b == o or f == o:
+            continue
+        if key == "history" and isinstance(o, list):
+            have = f if isinstance(f, list) else []
+            old = b if isinstance(b, list) else []
+            add = [e for e in o if e not in old and e not in have]
+            if add:
+                merged_m["history"] = list(have) + add
+                dirty = True
+        elif f == b:
+            if o is _UNSET:
+                merged_m.pop(key, None)
+            else:
+                merged_m[key] = copy.deepcopy(o)
+            dirty = True
+        else:
+            conflicts.append(key)
+    if ours_h != base_h and fresh_h != ours_h:
+        if fresh_h == base_h:
+            merged_h, dirty = ours_h, True
+        else:
+            conflicts.append("body")
+    if "claimed_by" in conflicts:
+        # The ticket changed hands under us: nothing of ours belongs on the
+        # new claimant's ticket (no claimed_at, no claim history entry).
+        return None, conflicts
+    return (_body_with_metadata(merged_h, merged_m) if dirty else None), conflicts
 
 
 def _first_line(value: str) -> str:
@@ -1450,12 +1641,26 @@ class GitHubIssuesBackend:
         auto_drain: Optional[bool] = None,
         grace_s: Optional[int] = None,
         partition_by_label: Optional[bool] = None,
+        queue_label: Optional[str] = None,
     ):
         self.queue = queue
         self.repo = str(repo or "").strip()
         self.repo_path = str(repo_path or "").strip()
         self.assignee = str(assignee or "@me").strip() or "@me"
-        self.queue_label = f"watchtower:{queue}"
+        # `queue_label` in queue-config.json overrides the default
+        # `watchtower:<QUEUE>`; unset keeps the default exactly.
+        self.queue_label = (
+            str(queue_label).strip()
+            if queue_label is not None and str(queue_label).strip()
+            else self._config_queue_label()
+        )
+        # The catch-all queue (`queue_label: "*"`) owns every issue on a shared
+        # repo that no sibling queue's label claims. It has no label of its own,
+        # so nothing below ever creates, adds, or matches on one.
+        self.catch_all = self.queue_label == CATCH_ALL_LABEL
+        self.sibling_labels = (
+            frozenset(self._config_sibling_labels()) if self.catch_all else frozenset()
+        )
         self.in_progress_label = "watchtower:in-progress"
         self.no_auto_drain_label = NO_AUTO_DRAIN_LABEL
         self.run_requested_label = RUN_REQUESTED_LABEL
@@ -1475,6 +1680,31 @@ class GitHubIssuesBackend:
             if partition_by_label is not None
             else self._config_partitions_by_label()
         )
+
+    def _usage_history(self, meta, number, event, **fields):
+        _append_history(meta, event, **fields)
+        from . import usage
+        tracking = dict(meta, ref=f"{self.queue}-{number}",
+                        _usage_namespace=f"github:{self.repo}:{self.queue}")
+        entry = dict(meta["history"][-1], by={"worker": fields.get("worker", ""),
+                                              "session_id": fields.get("session_id", "")})
+        usage.capture(tracking, usage.on_event, entry)
+        if tracking.get("token_usage"):
+            meta["token_usage"] = tracking["token_usage"]
+
+    def _config_sibling_labels(self) -> List[str]:
+        try:
+            from . import config
+            return config.sibling_queue_labels(self.queue, self.repo)
+        except Exception:
+            return []
+
+    def _config_queue_label(self) -> str:
+        try:
+            from . import config
+            return config.queue_label(self.queue)
+        except Exception:
+            return f"watchtower:{self.queue}"
 
     def _config_auto_drain(self) -> bool:
         try:
@@ -1578,11 +1808,12 @@ class GitHubIssuesBackend:
         )
 
     def _ensure_labels(self) -> None:
-        self._ensure_label(
-            self.queue_label,
-            "5319e7",
-            f"WatchTower queue {self.queue}",
-        )
+        if not self.catch_all:
+            self._ensure_label(
+                self.queue_label,
+                "5319e7",
+                f"WatchTower queue {self.queue}",
+            )
         self._ensure_label(
             self.in_progress_label,
             "fbca04",
@@ -1614,17 +1845,85 @@ class GitHubIssuesBackend:
             return int(suffix) if suffix.isdigit() else None
         return None
 
+    _ISSUE_TO_ITEM_MEMO: Dict[tuple, Dict[str, Any]] = {}
+    _LIST_ITEMS_MEMO: Dict[tuple, tuple] = {}
+
+    def _memo_config(self) -> tuple:
+        """Every backend setting that shapes a converted item."""
+        return (
+            self.repo,
+            self.queue,
+            self.repo_path,
+            self.partition_by_label,
+            self.catch_all,
+            frozenset(self.sibling_labels),
+            self.queue_label,
+            self.in_progress_label,
+            self.no_auto_drain_label,
+            self.run_requested_label,
+            self.auto_drain,
+            self.grace_s,
+        )
+
     def _issue_to_item(self, issue: Dict[str, Any]) -> Dict[str, Any]:
-        body, meta = _split_body(str(issue.get("body") or ""))
+        comments_raw = issue.get("comments")
+        has_comments = isinstance(comments_raw, list) and bool(comments_raw)
+        created_at = issue.get("createdAt")
+        state = str(issue.get("state") or "").upper()
+        age_settled = (
+            state == "CLOSED"
+            or not self.auto_drain
+            or self.grace_s <= 0
+            or _age_seconds(created_at) >= self.grace_s
+        )
+        memo_key = None
+        # A `wt defer` window ends by the clock alone, with no issue edit to
+        # bust the memo, so a still-deferred issue is never memoized.
+        if age_settled and not has_comments and not _defer_marker_live(issue.get("body")):
+            # Content, not id(issue): a freed dict's id is reused, and
+            # updatedAt is per-second, so an edit plus a re-read in the same
+            # second served the pre-edit item (two claim winners, WT-10).
+            memo_key = (
+                str(issue.get("body") or ""),
+                str(issue.get("title") or ""),
+                tuple(_label_names(issue.get("labels"))),
+                tuple(_assignee_logins(issue.get("assignees"))),
+                str(issue.get("url") or ""),
+                str((issue.get("author") or {}).get("login") or "")
+                if isinstance(issue.get("author"), dict) else str(issue.get("author") or ""),
+                created_at,
+                issue.get("closedAt"),
+                issue.get("number"),
+                issue.get("updatedAt"),
+                state,
+                self._memo_config(),
+            )
+            cached_base = self._ISSUE_TO_ITEM_MEMO.get(memo_key)
+            if cached_base is not None:
+                item = dict(cached_base)
+                if "token_usage" in item:
+                    item["token_usage"] = copy.copy(item["token_usage"])
+                from . import usage
+                item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
+                usage.attach(item)
+                item.pop("_usage_namespace", None)
+                return item
+        # meta is read-only here: the two containers that reach the item are
+        # copied below, so the memoized parse can be shared across queues.
+        body, meta = _split_body_shared(str(issue.get("body") or ""))
         text = _issue_text(body, meta.get("note"), issue.get("title"), issue.get("comments"))
         labels = _label_names(issue.get("labels"))
         assignees = _assignee_logins(issue.get("assignees"))
         # Membership, not admission: under the blacklist model every issue in
         # the repo belongs to this queue unless the repo is shared, in which
         # case the legacy label is the only thing that can divide them.
-        queue_member = (not self.partition_by_label) or self.queue_label in labels
+        if not self.partition_by_label:
+            queue_member = True
+        elif self.catch_all:
+            queue_member = not self.sibling_labels.intersection(labels)
+        else:
+            queue_member = self.queue_label in labels
         number = int(issue.get("number") or 0)
-        state = str(issue.get("state") or "").upper()
         if state == "CLOSED":
             status = "closed"
         elif queue_member and (meta.get("claimed_by") or self.in_progress_label in labels):
@@ -1638,24 +1937,33 @@ class GitHubIssuesBackend:
         #   work_it         = auto_eligible OR manual_eligible
         no_auto_drain = self.no_auto_drain_label in labels
         run_requested = self.run_requested_label in labels
-        workable = queue_member and status == "open"
+        deferred_until = str(meta.get("deferred_until") or "")
+        # `wt defer`: inside its data window a ticket is out of the pool for
+        # claims and spawn depth alike, ▶ included (queue._claim_candidates).
+        deferred = _defer_live(deferred_until)
+        workable = queue_member and status == "open" and not deferred
         auto_eligible = bool(
             workable
             and self.auto_drain
             and not no_auto_drain
-            and _age_seconds(issue.get("createdAt")) >= self.grace_s
+            and _age_seconds(created_at) >= self.grace_s
         )
         manual_eligible = bool(workable and run_requested)
         work_it = auto_eligible or manual_eligible
 
         resolution = _normalize_resolution({
             "summary": meta.get("resolution_summary", ""),
+            "commit": meta.get("resolution_commit", ""),
             "caveats": meta.get("resolution_caveats", []),
             "follow_ups": meta.get("resolution_follow_ups", []),
             "unresolved": meta.get("resolution_unresolved", []),
             "caveats_ack": meta.get("resolution_caveats_ack") or {},
             "follow_ups_ack": meta.get("resolution_follow_ups_ack") or {},
             "unresolved_ack": meta.get("resolution_unresolved_ack") or {},
+            "session_id": meta.get("resolution_session_id", ""),
+            "engine": meta.get("resolution_engine", ""),
+            "transcript_path": meta.get("resolution_transcript_path", ""),
+            "machine": meta.get("resolution_machine", ""),
         })
 
         item: Dict[str, Any] = {
@@ -1681,6 +1989,8 @@ class GitHubIssuesBackend:
             "confidence": _norm_choice(meta.get("confidence", ""), VALID_CONFIDENCES),
             "needs_input": bool(meta.get("needs_input", False)),
             "block_question": str(meta.get("block_question") or ""),
+            "blocked_by": [str(r) for r in (meta.get("blocked_by") or []) if r]
+            if isinstance(meta.get("blocked_by"), list) else [],
             "submitter": str(meta.get("submitter") or ""),
             "submitter_explicit": bool(meta.get("submitter_explicit", False)),
             "claimed_by": (
@@ -1690,11 +2000,17 @@ class GitHubIssuesBackend:
             "claimed_at": meta.get("claimed_at"),
             "closed_at": issue.get("closedAt") or meta.get("closed_at"),
             "claimed_session_id": meta.get("claimed_session_id"),
-            "created_at": issue.get("createdAt") or _now_iso(),
-            "updated_at": issue.get("updatedAt") or issue.get("createdAt") or _now_iso(),
+            "claimed_machine": meta.get("claimed_machine"),
+            "created_at": created_at or _now_iso(),
+            "updated_at": issue.get("updatedAt") or created_at or _now_iso(),
             "github_repo": self.repo,
             "github_labels": labels,
             "github_assignees": assignees,
+            # The issue's GitHub author -- "who opened it" for synced tickets
+            # (CCC-1166). Kept separate from ``submitter`` (a wt-addressable
+            # notify target): a GitHub login is not resolvable by
+            # messages.resolve_target.
+            "github_author": str((issue.get("author") or {}).get("login") or ""),
             "watchtower_label": self.queue_label,
             "watchtower_runnable": bool(queue_member),
             "no_auto_drain": no_auto_drain,
@@ -1712,17 +2028,34 @@ class GitHubIssuesBackend:
             # Owner-answer ingestion (WATCHTOWER-5) reads it to detect a human's
             # answer typed straight onto the issue.
             "_github_comments": (
-                issue.get("comments")
-                if isinstance(issue.get("comments"), list) else []
+                comments_raw
+                if isinstance(comments_raw, list) else []
             ),
         }
         if status == "closed":
             item["closed_by"] = meta.get("closed_by") or item.get("claimed_by")
+            item["closed_machine"] = meta.get("closed_machine") or item.get("claimed_machine")
         if resolution:
             item["resolution"] = resolution
+        if str(meta.get("depth") or "").lower() == "deep":
+            item["depth"] = "deep"
+            item["budget_min"] = meta.get("budget_min")
+        if deferred_until:
+            item["deferred_until"] = deferred_until
+            item["defer_reason"] = str(meta.get("defer_reason") or "")
         history = meta.get("history")
         if isinstance(history, list):
-            item["history"] = history
+            item["history"] = list(history)
+        if meta.get("token_usage"):
+            item["token_usage"] = copy.copy(meta["token_usage"])
+        if memo_key is not None:
+            if len(self._ISSUE_TO_ITEM_MEMO) >= 16384:
+                self._ISSUE_TO_ITEM_MEMO.clear()
+            self._ISSUE_TO_ITEM_MEMO[memo_key] = dict(item)
+        from . import usage
+        item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
+        usage.attach(item)
+        item.pop("_usage_namespace", None)
         return item
 
     def _list_probe_path(self, state: str) -> str:
@@ -2127,6 +2460,8 @@ class GitHubIssuesBackend:
         confidence: str = "",
         submitter: str = "",
         submitter_explicit: bool = False,
+        blocked_by: Optional[List[str]] = None,
+        depth_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         note = _clip(note, 4000)
         text = _clip(text or note, 24000)
@@ -2159,6 +2494,10 @@ class GitHubIssuesBackend:
             # event or only the default set -- see queue._submitter_wants.
             "submitter_explicit": bool(submitter_explicit),
         }
+        if blocked_by:
+            meta["blocked_by"] = self._validate_blockers("", blocked_by)
+        # Pre-validated by queue._depth_fields: {} for quick, else depth+budget_min.
+        meta.update(depth_fields or {})
         issue_title = _clip(title or note or "WatchTower ticket", 200)
         body = _body_with_metadata(text, meta)
         out = self._run([
@@ -2166,7 +2505,8 @@ class GitHubIssuesBackend:
             *self._repo_args(),
             "--title", issue_title,
             "--body", body,
-            "--label", self.queue_label,
+            # The catch-all owns unlabelled issues, so it files without one.
+            *([] if self.catch_all else ["--label", self.queue_label]),
         ])
         match = _ISSUE_URL_RE.search(out.strip())
         if not match:
@@ -2196,19 +2536,47 @@ class GitHubIssuesBackend:
         fresh: bool = False,
         strict: bool = False,
     ) -> List[Dict[str, Any]]:
-        issues: List[Dict[str, Any]] = []
-        if status != "closed":
-            issues.extend(
-                self._list_issues("open", fresh=fresh, strict=strict)
-            )
-        if status in (None, "closed"):
-            issues.extend(
-                issue
-                for issue in self._list_issues(
-                    "closed", fresh=fresh, strict=strict
-                )
-                if _recently_closed(issue)
-            )
+        from . import usage
+        open_raw = (
+            self._list_issues("open", fresh=fresh, strict=strict)
+            if status != "closed" else None
+        )
+        closed_raw = (
+            self._list_issues("closed", fresh=fresh, strict=strict)
+            if status in (None, "closed") else None
+        )
+        # A tick lists every GitHub queue dozens of times off the same cached
+        # issue lists (WT-16). Reuse the converted result while the raw lists
+        # are the same objects (the memo holds them, so identity is safe),
+        # no usage ledger was written, and no issue crossed a time boundary.
+        memo_key = (
+            self._memo_config(), status, lane,
+        )
+        ledger_stamp = None if strict else usage.ledger_dir_stamp()
+        now = time.time()
+        hit = self._LIST_ITEMS_MEMO.get(memo_key)
+        if (
+            hit is not None
+            and ledger_stamp is not None
+            and hit[0] is open_raw
+            and hit[1] is closed_raw
+            and hit[2] == ledger_stamp
+            and now < hit[3]
+        ):
+            return [_copy_listed_item(it) for it in hit[4]]
+        valid_until = now + _LIST_ITEMS_MEMO_TTL_S
+        issues: List[Dict[str, Any]] = list(open_raw or [])
+        if self.auto_drain and self.grace_s > 0:
+            for issue in issues:
+                age = _age_seconds(issue.get("createdAt"))
+                if age < self.grace_s:
+                    valid_until = min(valid_until, now + self.grace_s - age)
+        retention_s = COMPLETED_ISSUE_RETENTION_DAYS * 86400
+        for issue in closed_raw or []:
+            if _recently_closed(issue):
+                issues.append(issue)
+                age = _age_seconds(issue.get("closedAt"))
+                valid_until = min(valid_until, now + retention_s - age)
         items = [self._issue_to_item(issue) for issue in issues]
         if self.partition_by_label:
             # Two or more queues share this repo: each shows only its own
@@ -2218,7 +2586,15 @@ class GitHubIssuesBackend:
             items = [it for it in items if it.get("status") == status]
         if lane:
             items = [it for it in items if it.get("lane") == lane]
-        return sorted(items, key=lambda it: int(it.get("number", 0)))
+        items = sorted(items, key=lambda it: int(it.get("number", 0)))
+        if ledger_stamp is not None:
+            if len(self._LIST_ITEMS_MEMO) >= 512:
+                self._LIST_ITEMS_MEMO.clear()
+            self._LIST_ITEMS_MEMO[memo_key] = (
+                open_raw, closed_raw, ledger_stamp, valid_until,
+                [_copy_listed_item(it) for it in items],
+            )
+        return items
 
     def mark_runnable(self, ident: Any) -> Optional[Dict[str, Any]]:
         """Request a run for this ticket (the ▶ / ``wt run`` path).
@@ -2237,7 +2613,7 @@ class GitHubIssuesBackend:
             raise ValueError(f"{item.get('ref', ident)} is closed")
         self._ensure_labels()
         add_labels = ["--add-label", self.run_requested_label]
-        if self.partition_by_label:
+        if self.partition_by_label and not self.catch_all:
             add_labels += ["--add-label", self.queue_label]
         self._run([
             "issue", "edit", str(item["number"]),
@@ -2269,7 +2645,7 @@ class GitHubIssuesBackend:
         raw = self._run([
             "issue", "view", str(number),
             *self._repo_args(),
-            "--json", "number,title,body,state,url,assignees,labels,comments,createdAt,updatedAt,closedAt",
+            "--json", "number,title,body,state,url,assignees,labels,author,comments,createdAt,updatedAt,closedAt",
         ])
         try:
             issue = json.loads(raw or "{}")
@@ -2295,6 +2671,51 @@ class GitHubIssuesBackend:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path
 
+    @contextlib.contextmanager
+    def _body_lock(self):
+        """The claim lock, reentrant within a thread (see `_serialized_body_write`)."""
+        path = str(self._claim_lock_path())
+        held = getattr(_BODY_LOCKS_HELD, "paths", None)
+        if held is None:
+            held = _BODY_LOCKS_HELD.paths = set()
+        if path in held:
+            yield
+            return
+        with _FileLock(Path(path)):
+            held.add(path)
+            try:
+                yield
+            finally:
+                held.discard(path)
+
+    def _edit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
+                   *extra: str) -> List[str]:
+        """Write ``body``+``meta`` over ``item``'s issue, then re-read and
+        re-apply our change if a concurrent (cross-host) writer dropped it
+        (see `_merge_body_write`). Returns keys a concurrent writer changed
+        too -- theirs stand; a caller that needs one of them (a claim) must
+        check. A write after our re-read can still be lost: GitHub offers no
+        precondition on issue edits, so this narrows the window only."""
+        number = str(item["number"])
+        base = item.get("_github_body") or item.get("text", "")
+        ours = _body_with_metadata(body, meta)
+        self._run(["issue", "edit", number, *self._repo_args(), "--body", ours, *extra])
+        conflicts: List[str] = []
+        for _ in range(_BODY_WRITE_RETRIES):
+            try:
+                raw = self._run(["issue", "view", number, *self._repo_args(), "--json", "body"])
+                fresh = str((json.loads(raw or "{}") or {}).get("body") or "")
+            except (GitHubBackendError, json.JSONDecodeError, AttributeError):
+                return conflicts  # the write itself landed; verification is best-effort
+            merged, found = _merge_body_write(base, ours, fresh)
+            conflicts += [k for k in found if k not in conflicts]
+            if merged is None:
+                return conflicts
+            _log_body_reapply(self.repo, number, conflicts)
+            self._run(["issue", "edit", number, *self._repo_args(), "--body", merged])
+            base, ours = fresh, merged
+        return conflicts
+
     def _stop_signal_path(self, session_id: str):
         try:
             from . import workers as _workers
@@ -2303,6 +2724,58 @@ class GitHubIssuesBackend:
             from pathlib import Path
             stop_dir = Path.home() / ".watchtower" / "stop-signals"
         return stop_dir / session_id
+
+    def _blocker_index(
+        self, items: List[Dict[str, Any]], refs: List[str], *,
+        fresh: bool = True, transitive: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Resolve dependencies through their owning queues, not this repo.
+
+        Depth checks retain the owning backend's bounded list cache. Claims
+        and validation request fresh state. Missing runtime refs stay waiting
+        rather than accidentally releasing a dependent after a lookup miss.
+        """
+        from . import queue as q
+
+        by_ref = _refs_index(items)
+        loaded = {self.queue}
+        seen = set()
+        pending = list(refs)
+        while pending:
+            raw = str(pending.pop())
+            ref = f"{self.queue}-{raw}" if raw.isdigit() else raw
+            if ref in seen:
+                continue
+            seen.add(ref)
+            project = q._project_from_ident(ref)
+            if project and project not in loaded:
+                backend = q._github_backend_for_project(project)
+                others = (backend.list_items(fresh=fresh) if backend is not None
+                          else q.list_items(project=project))
+                by_ref.update(_refs_index(others))
+                loaded.add(project)
+            if ref not in by_ref:
+                try:
+                    item = q.get(ref)
+                except GitHubBackendError as exc:
+                    detail = str(exc).lower()
+                    if "not found" not in detail and "could not resolve to an issue" not in detail:
+                        raise
+                    item = None
+                if item is not None:
+                    by_ref[ref] = item
+            item = by_ref.get(ref)
+            if item is not None and transitive:
+                pending.extend(item.get("blocked_by") or [])
+            elif item is None and not transitive:
+                by_ref[ref] = {"ref": ref, "status": "open"}
+        return by_ref
+
+    def _validate_blockers(self, ref: str, blocked_by: List[str]) -> List[str]:
+        items = self.list_items(fresh=True)
+        by_ref = self._blocker_index(items, blocked_by, transitive=True)
+        return _validate_blocked_by(list(by_ref.values()), ref,
+                                    [str(r) for r in blocked_by])
 
     def _claim_candidates(
         self,
@@ -2344,6 +2817,19 @@ class GitHubIssuesBackend:
             it for it in self.list_items(status="open", lane=lane, fresh=fresh)
             if it.get(eligibility, False)
         ]
+        if any(it.get("blocked_by") for it in candidates):
+            # Dependencies (WT-36): a ticket with an open (or declined /
+            # unresolved) blocker is not claimable and not spawn-worthy depth.
+            by_ref = self._blocker_index(
+                self.list_items(fresh=fresh),
+                [ref for it in candidates for ref in (it.get("blocked_by") or [])],
+                fresh=fresh,
+            )
+            candidates = [
+                it for it in candidates
+                if not it.get("blocked_by")
+                or blocker_verdict(it, by_ref)[0] == "ok"
+            ]
         if readiness_filters:
             candidates = [
                 it for it in candidates
@@ -2430,7 +2916,7 @@ class GitHubIssuesBackend:
     ) -> Optional[Dict[str, Any]]:
         if not session_id:
             raise ValueError("session_id is required")
-        with _FileLock(self._claim_lock_path()):
+        with self._body_lock():
             item = self.get(ref)
             if item is None:
                 return None
@@ -2447,29 +2933,41 @@ class GitHubIssuesBackend:
                     f"no-auto-drain={'yes' if item.get('no_auto_drain') else 'no'}, "
                     f"grace={self.grace_s}s); run `wt run {ref}` to work it anyway"
                 )
+            if item.get("blocked_by"):
+                by_ref = self._blocker_index([item], item["blocked_by"])
+                state, blocker = blocker_verdict(item, by_ref)
+                if state != "ok":
+                    raise ValueError(f"{ref} {state} on {blocker}")
             number = str(item["number"])
             body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
             meta.update({
                 "claimed_by": str(session_id),
+                "claimed_machine": machine_tag(),
                 "claimed_at": _now_iso(),
             })
             if session_uuid:
                 meta["claimed_session_id"] = str(session_uuid)
-            _append_history(meta, "claim", session_id=str(session_uuid or ""), worker=str(session_id))
+            self._usage_history(meta, number, "claim", session_id=str(session_uuid or ""), worker=str(session_id))
             self._ensure_labels()
-            self._run([
-                "issue", "edit", number,
-                *self._repo_args(),
-                "--body", _body_with_metadata(body, meta),
-                "--add-assignee", self.assignee,
-                "--add-label", self.in_progress_label,
-            ])
+            self._edit_body(item, body, meta,
+                            "--add-assignee", self.assignee,
+                            "--add-label", self.in_progress_label)
+            # Trust the persisted body, not our intent: a claim another host
+            # overwrote (or never landed) must fail, not report
+            # claimed_by_you (WT-20). claim_next moves to the next candidate.
             claimed = self.get(ref)
-            if claimed:
-                claimed["claimed_by"] = str(session_id)
-                claimed["status"] = "in_progress"
+            persisted = (_split_body_shared(claimed.get("_github_body") or "")[1]
+                         if claimed else {})
+            if str(persisted.get("claimed_by") or "") != str(session_id):
+                raise ValueError(
+                    f"{ref} claim did not persist (claimed_by="
+                    f"{persisted.get('claimed_by') or 'none'}); not claimed")
+            claimed["claimed_by"] = str(session_id)
+            claimed["claimed_machine"] = meta.get("claimed_machine")
+            claimed["status"] = "in_progress"
             return claimed
 
+    @_serialized_body_write
     def update_status(
         self,
         ident: Any,
@@ -2518,21 +3016,19 @@ class GitHubIssuesBackend:
 
         if status == "open":
             for key in (
-                "claimed_by", "claimed_at", "closed_by", "closed_at",
-                "resolution_summary", "resolution_caveats",
+                "claimed_by", "claimed_machine", "claimed_at",
+                "closed_by", "closed_machine", "closed_at",
+                "resolution_summary", "resolution_commit", "resolution_caveats",
                 "resolution_follow_ups", "resolution_unresolved",
                 "resolution_caveats_ack", "resolution_follow_ups_ack",
                 "resolution_unresolved_ack",
+                "resolution_session_id", "resolution_engine",
+                "resolution_transcript_path", "resolution_machine",
                 "needs_input", "block_question",
             ):
                 meta.pop(key, None)
-            _append_history(meta, "reopen", reason=reason)
-            self._run([
-                "issue", "edit", number,
-                *self._repo_args(),
-                "--body", _body_with_metadata(body, meta),
-                "--remove-label", self.in_progress_label,
-            ])
+            self._usage_history(meta, number, "reopen", reason=reason)
+            self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
             self._run(["issue", "reopen", number, *self._repo_args()], check=False)
             return self.get(ident)
 
@@ -2545,16 +3041,36 @@ class GitHubIssuesBackend:
         meta["needs_input"] = False
         if session_id:
             meta["closed_by"] = str(session_id)
+            meta["closed_machine"] = machine_tag()
             # Backfill claimed_by on a never-claimed issue so attribution
             # isn't dropped when a worker closes by ref without claiming
             # first (WT-81). Never overwrites a real claimant.
             if not meta.get("claimed_by"):
                 meta["claimed_by"] = str(session_id)
+                meta["claimed_machine"] = meta["closed_machine"]
         if norm:
+            # session_id/machine default to this close's own attribution
+            # (mirrors queue.update_status) so CCC can resolve "session X on
+            # node Y" even when the caller didn't pass them explicitly.
+            # Mutated in place (not just written to ``meta``) so the enriched
+            # values also come back on ``closed["resolution"]`` below, which
+            # overwrites the self.get() round-trip with this same ``norm``.
+            if not norm.get("session_id"):
+                sid = str(session_uuid or "") or meta.get("claimed_session_id", "")
+                if sid:
+                    norm["session_id"] = sid
+            norm.setdefault("machine", meta.get("closed_machine") or machine_tag())
             meta["resolution_summary"] = norm.get("summary", "")
+            # Always overwrite (possibly with ""), so a re-close without a
+            # commit can't leave the previous close's SHA vouching for it.
+            meta["resolution_commit"] = norm.get("commit", "")
             meta["resolution_caveats"] = norm.get("caveats", [])
             meta["resolution_follow_ups"] = norm.get("follow_ups", [])
             meta["resolution_unresolved"] = norm.get("unresolved", [])
+            meta["resolution_session_id"] = norm.get("session_id", "")
+            meta["resolution_engine"] = norm.get("engine", "")
+            meta["resolution_transcript_path"] = norm.get("transcript_path", "")
+            meta["resolution_machine"] = norm.get("machine", "")
             # A (re-)close writes a fresh resolution, so acks carry over only
             # when the caller handed them back -- same as the local backend,
             # where close replaces `resolution` wholesale.
@@ -2564,15 +3080,10 @@ class GitHubIssuesBackend:
                     meta[f"resolution_{field}_ack"] = acks
                 else:
                     meta.pop(f"resolution_{field}_ack", None)
-        _append_history(meta, "close", session_id=str(session_uuid or ""),
+        self._usage_history(meta, number, "close", session_id=str(session_uuid or ""),
                          worker=str(session_id or meta.get("closed_by") or ""),
                          resolution=norm)
-        self._run([
-            "issue", "edit", number,
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-            "--remove-label", self.in_progress_label,
-        ])
+        self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
         self._run([
             "issue", "close", number,
             *self._repo_args(),
@@ -2581,10 +3092,14 @@ class GitHubIssuesBackend:
         closed = self.get(ident)
         if closed:
             closed["closed_by"] = str(session_id or closed.get("claimed_by") or "")
+            closed["closed_machine"] = str(
+                meta.get("closed_machine") or closed.get("claimed_machine") or ""
+            )
             if norm:
                 closed["resolution"] = norm
         return closed
 
+    @_serialized_body_write
     def ack_resolution(
         self,
         ident: Any,
@@ -2670,13 +3185,47 @@ class GitHubIssuesBackend:
             session_id=str(session_id or ""),
             text=detail,
         )
-        self._run([
-            "issue", "edit", str(item["number"]),
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-        ])
+        self._edit_body(item, body, meta)
         return self.get(ident)
 
+    @_serialized_body_write
+    def defer(
+        self,
+        ident: Any,
+        *,
+        session_id: str,
+        until_iso: str,
+        reason: str,
+        progress: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """`wt defer` on a GitHub-backed ticket (OPS-100): release the claim
+        and park the issue out of the pool until ``until_iso``. Same rules as
+        the local queue.defer; the window lives in the metadata block, so it
+        survives across hosts and expires by the clock with no further edit."""
+        item = self.get(ident)
+        if item is None:
+            return None
+        status = item.get("status")
+        if status not in ("open", "in_progress"):
+            raise ValueError(f"{item.get('ref')} is {status}; only an open or in-progress "
+                             "ticket can be deferred")
+        holder = str(item.get("claimed_by") or "")
+        if status == "in_progress" and holder and session_id and holder != str(session_id):
+            raise ValueError(f"{item.get('ref')} is claimed by {holder}, not {session_id}")
+        number = str(item["number"])
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        if progress:
+            _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
+        for key in ("claimed_by", "claimed_machine", "claimed_at", "claimed_session_id"):
+            meta.pop(key, None)
+        meta["deferred_until"] = until_iso
+        meta["defer_reason"] = _clip(reason, 2000)
+        self._usage_history(meta, number, "defer", worker=str(session_id),
+                            until=until_iso, reason=_clip(reason, 2000))
+        self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
+        return self.get(ident)
+
+    @_serialized_body_write
     def block(
         self,
         ident: Any,
@@ -2684,8 +3233,12 @@ class GitHubIssuesBackend:
         session_id: str = "",
         question: str = "",
         progress: str = "",
+        origin: str = "system",
+        **_ignored: Any,
     ) -> Optional[Dict[str, Any]]:
-        """Record a worker's request for input on a GitHub-backed ticket."""
+        """Record a worker's request for input on a GitHub-backed ticket.
+        ``origin`` is accepted and ignored: GitHub queues keep the legacy
+        hold-while-blocked behaviour (WT-28b)."""
         item = self.get(ident)
         if item is None:
             return None
@@ -2696,17 +3249,28 @@ class GitHubIssuesBackend:
         meta["block_question"] = _clip(question, 4000)
         meta["blocked_at"] = now
         if session_id:
-            meta.setdefault("claimed_by", str(session_id))
+            if not meta.get("claimed_by"):
+                meta["claimed_by"] = str(session_id)
+                meta["claimed_machine"] = machine_tag()
         if progress:
             _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
-        _append_history(meta, "block", worker=str(session_id), question=_clip(question, 4000))
-        self._run([
-            "issue", "edit", number,
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-        ])
+        self._usage_history(meta, number, "block", worker=str(session_id), question=_clip(question, 4000))
+        self._edit_body(item, body, meta)
+        # Mirror the question onto the issue discussion (WT-37): the metadata
+        # block is invisible to anyone reading the issue on GitHub. Best-effort,
+        # the block itself is already recorded. The owner-answer marker is
+        # defused so the question can never be ingested as its own answer.
+        if question.strip():
+            shown = re.sub(re.escape(_OWNER_ANSWER_MARKER), "owner-answer",
+                           _clip(question, 4000), flags=re.IGNORECASE)
+            self._run([
+                "issue", "comment", number,
+                *self._repo_args(),
+                "--body", f"[watchtower] Needs input from {session_id or 'worker'}:\n\n{shown}",
+            ], check=False)
         return self.get(ident)
 
+    @_serialized_body_write
     def answer(
         self,
         ident: Any,
@@ -2760,7 +3324,8 @@ class GitHubIssuesBackend:
         )
         if releasing:
             for key in (
-                "claimed_by", "claimed_at", "claimed_session_id",
+                "claimed_by", "claimed_machine", "claimed_at",
+                "claimed_session_id",
                 "block_question", "blocked_at",
             ):
                 meta.pop(key, None)
@@ -2771,11 +3336,7 @@ class GitHubIssuesBackend:
                 worker=str(session_id or ""),
                 reason="answered_without_resumable_session",
             )
-        self._run([
-            "issue", "edit", number,
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-        ])
+        self._edit_body(item, body, meta)
         if releasing:
             self._run([
                 "issue", "edit", number,
@@ -2804,6 +3365,7 @@ class GitHubIssuesBackend:
         repo = self.repo or ""
         return repo.split("/", 1)[0].strip() if "/" in repo else ""
 
+    @_serialized_body_write
     def ingest_owner_answer(self, ident: Any) -> Optional[Dict[str, Any]]:
         """Ingest an owner-authored answer comment on a blocked ticket, once.
 
@@ -2877,6 +3439,7 @@ class GitHubIssuesBackend:
         ], check=False)
         return updated
 
+    @_serialized_body_write
     def comment(
         self,
         ident: Any,
@@ -2903,11 +3466,7 @@ class GitHubIssuesBackend:
             worker=str(session_id or ""),
             text=comment_text,
         )
-        self._run([
-            "issue", "edit", number,
-            *self._repo_args(),
-            "--body", _body_with_metadata(body, meta),
-        ])
+        self._edit_body(item, body, meta)
         self._run([
             "issue", "comment", number,
             *self._repo_args(),
@@ -2915,6 +3474,7 @@ class GitHubIssuesBackend:
         ])
         return self.get(ident)
 
+    @_serialized_body_write
     def update(self, ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
         item = self.get(ident)
         if item is None:
@@ -2922,7 +3482,25 @@ class GitHubIssuesBackend:
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         title = item.get("title", "")
         for key, value in fields.items():
-            if key == "title":
+            if key == "blocked_by":
+                blockers = self._validate_blockers(
+                    str(item.get("ref") or ""), list(value or []))
+                if blockers:
+                    meta["blocked_by"] = blockers
+                else:
+                    meta.pop("blocked_by", None)
+            elif key == "depth_fields":
+                # Pre-computed by queue._depth_edit; {} demotes to quick.
+                old = {k: meta[k] for k in ("depth", "budget_min") if k in meta}
+                meta.pop("depth", None)
+                meta.pop("budget_min", None)
+                meta.update(value)
+                if value != old:
+                    _append_history(meta, "edit", by={"kind": "system"},
+                                    fields={"depth": value.get("depth", "quick"),
+                                            **({"budget_min": value["budget_min"]}
+                                               if "budget_min" in value else {})})
+            elif key == "title":
                 title = _clip(value, 200)
             elif key == "text":
                 body = _clip(value, 24000)
@@ -2936,12 +3514,7 @@ class GitHubIssuesBackend:
                 "needs_input", "block_question",
             }:
                 meta[key] = value
-        self._run([
-            "issue", "edit", str(item["number"]),
-            *self._repo_args(),
-            "--title", title,
-            "--body", _body_with_metadata(body, meta),
-        ])
+        self._edit_body(item, body, meta, "--title", title)
         return self.get(ident)
 
     def peek_next(

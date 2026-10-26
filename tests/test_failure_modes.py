@@ -66,8 +66,24 @@ def test_missing_engine_binary_sets_a_cooldown_so_the_reconciler_stops_retrying(
     [
         ("Error: not logged in. Please run /login", "engine authentication required"),
         ("authentication failed: token expired", "engine authentication failed"),
+        (
+            'API Error: 401 {"type":"error","error":{"type":"authentication_error"}}',
+            "engine authentication failed",
+        ),
         ("You've hit your usage limit. Try again later.", "engine usage limit"),
         ("HTTP 503 upstream connect error", "engine api unavailable"),
+        (
+            'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'
+            "\"message\":\"The 'gpt-5.6' model is not supported when using Codex with a "
+            'ChatGPT account."}}',
+            "engine rejected the queue's model",
+        ),
+        (
+            "error: failed to run prompt: provider.auth_error: 403 Your current "
+            "subscription does not have access to Kimi Code right now. Upgrade your "
+            "plan to keep coding with Kimi Code",
+            "engine subscription has no access",
+        ),
         (
             "node:internal/modules: Cannot find module '@openai/codex-linux-x64'",
             "engine binary broken",
@@ -87,6 +103,18 @@ def test_launch_failure_log_is_classified_into_an_actionable_reason(
     assert verdict["reason"] == expected
 
 
+def test_agent_prose_mentioning_authentication_is_not_an_auth_failure(wt_env, tmp_path):
+    """A worker that finished its job and wrote about card authentication and a
+    failed write is not an engine login failure (PLAN-VM-NEXT-85-R3)."""
+    log = tmp_path / "worker.log"
+    log.write_text(
+        "- **Delayed authentication:** a card that finishes its 3D Secure check "
+        "last now wins.\n"
+        "- **Tests:** a crash after the Stripe write and a failed mark.\n"
+    )
+    assert wt_env.workers._classify_launch_failure_log(log) is None
+
+
 def test_worker_that_dies_unauthenticated_is_recorded_not_registered(wt_env, fake_bin):
     """The headline case: the engine is installed, the login has expired. The
     worker exits immediately; WatchTower must classify it as an auth failure
@@ -102,6 +130,25 @@ def test_worker_that_dies_unauthenticated_is_recorded_not_registered(wt_env, fak
     assert spawned == []
     assert failures and "authentication" in failures[0]["reason"]
     assert wt_env.workers.list_workers() == []
+
+
+def test_unrecognised_launch_failure_reason_carries_the_engines_own_error(wt_env, fake_bin):
+    """`exit 2` alone told the operator nothing; the reason must quote what the
+    engine printed so the activity log names the actual breakage."""
+    fake_bin(
+        "codex",
+        "echo \"error: unexpected argument '--input-format' found\" >&2\n"
+        "echo 'Usage: codex [OPTIONS]' >&2\n"
+        "echo \"For more information, try '--help'.\" >&2\nexit 2",
+    )
+    failures = []
+    wt_env.workers.spawn_workers(
+        QUEUE, 1, engine="codex", repo_path=str(wt_env.tmp), launch_failures=failures
+    )
+    assert failures
+    reason = failures[0]["reason"]
+    assert reason.startswith("engine exited immediately (exit 2)")
+    assert "unexpected argument '--input-format'" in reason
 
 
 def test_usage_limit_cooldown_honours_the_provider_supplied_retry_time(wt_env, tmp_path):
@@ -270,17 +317,100 @@ def test_a_recovered_engine_lets_the_next_outage_alert_again(wt_env, tmp_path):
 
 def test_a_repeatedly_failing_engine_is_swapped_for_one_that_works(wt_env, fake_bin):
     """Falling back was reserved for usage limits. Every other way an engine
-    can be down — broken binary, expired login — left the queue on it."""
+    can be down — broken binary, expired login — left the queue on it. The
+    swap is per launch only (WATCHTOWER-30): the user's stored engine and
+    model survive it, so the preferred engine is retried once it cools down."""
+    fake_bin("claude")
+    fake_bin("codex", 'echo "Cannot find module" >&2\nexit 1')
+    wt_env.config.set_engine(QUEUE, "codex")
+    wt_env.config.set_model(QUEUE, "gpt-5.5")
+    wt_env.config.set_fallback_to_default_worker(QUEUE, True)
+    wt_env.config.set_auto_drain(QUEUE, True)
+    wt_env.config.set_grace_s(QUEUE, 0)
+    wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
+    spawned = []
+    for _ in range(3):
+        _expire_cooldown(wt_env)
+        spawned += wt_env.workers.reconcile_once()["spawned"]
+    assert [w["engine"] for w in spawned] == ["claude"]
+    assert spawned[0].get("model", "") != "gpt-5.5"
+    stored = wt_env.config.get_queue_config(QUEUE)
+    assert stored["engine"] == "codex" and stored["model"] == "gpt-5.5"
+    assert wt_env.config.engine(QUEUE) == "codex"
+
+
+def test_fallback_off_parks_the_queue_instead_of_switching(wt_env, fake_bin):
+    """Without the per-queue opt-in the reconciler must never put a queue's
+    work on an engine the user did not choose -- it parks and says why."""
     fake_bin("claude")
     fake_bin("codex", 'echo "Cannot find module" >&2\nexit 1')
     wt_env.config.set_engine(QUEUE, "codex")
     wt_env.config.set_auto_drain(QUEUE, True)
     wt_env.config.set_grace_s(QUEUE, 0)
     wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
+    spawned, fallbacks = [], []
+    for _ in range(3):
+        _expire_cooldown(wt_env)
+        result = wt_env.workers.reconcile_once()
+        spawned += result["spawned"]
+        fallbacks += result["fallbacks"]
+    assert spawned == [] and fallbacks == []
+    assert result["parked"] and result["parked"][0]["queue"] == QUEUE
+    assert wt_env.config.auto_drain(QUEUE) is False
+    assert wt_env.config.get_queue_config(QUEUE)["engine"] == "codex"
+    park = next(s for s in result["skipped"] if s["reason"].startswith("parked"))
+    assert "fallback to the CCC default worker is off" in park["reason"]
+
+
+def test_fallback_log_names_the_real_launch_failure(wt_env, fake_bin):
+    """FALLBACK said "usage limit" for every cause, including a CLI that
+    rejected its own arguments. It must say what actually failed."""
+    fake_bin("claude")
+    fake_bin(
+        "codex",
+        "echo \"error: unexpected argument '--input-format' found\" >&2\nexit 2",
+    )
+    wt_env.config.set_engine(QUEUE, "codex")
+    wt_env.config.set_fallback_to_default_worker(QUEUE, True)
+    wt_env.config.set_auto_drain(QUEUE, True)
+    wt_env.config.set_grace_s(QUEUE, 0)
+    wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
     for _ in range(3):
         _expire_cooldown(wt_env)
         wt_env.workers.reconcile_once()
-    assert wt_env.config.engine(QUEUE) == "claude"
+    lines = [
+        line for line in (wt_env.tmp / "activity.log").read_text().splitlines()
+        if "FALLBACK" in line
+    ]
+    assert lines
+    assert "usage limit" not in lines[0]
+    assert "unexpected argument '--input-format'" in lines[0]
+    assert "queue engine unchanged" in lines[0]
+
+
+def test_opted_in_queue_keeps_draining_on_fallback_while_engine_cools_down(
+    wt_env, fake_bin, tmp_path
+):
+    """With the preferred engine in cooldown, an opted-in queue launches on the
+    fallback engine for that tick; an opted-out one waits the cooldown out."""
+    fake_bin("claude")
+    wt_env.config.set_engine(QUEUE, "codex")
+    wt_env.config.set_auto_drain(QUEUE, True)
+    wt_env.config.set_grace_s(QUEUE, 0)
+    wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
+    _record_failures(wt_env, tmp_path, 1)
+    assert wt_env.workers.reconcile_once()["spawned"] == []
+    wt_env.config.set_fallback_to_default_worker(QUEUE, True)
+    result = wt_env.workers.reconcile_once()
+    assert [w["engine"] for w in result["spawned"]] == ["claude"]
+    assert wt_env.config.engine(QUEUE) == "codex"
+
+
+def test_fallback_opt_in_is_settable_from_the_cli(wt_env, run_cli):
+    assert wt_env.config.fallback_to_default_worker(QUEUE) is False
+    res = run_cli("config", "-q", QUEUE, "--fallback-to-default-worker", "on")
+    assert res.code == 0, res.output
+    assert wt_env.config.fallback_to_default_worker(QUEUE) is True
 
 
 def _expire_cooldown(wt_env, queue=QUEUE, engine="codex"):
@@ -396,11 +526,11 @@ def test_invalid_backend_is_rejected_by_the_config_api(wt_env):
         wt_env.config.set_backend(QUEUE, "sqlite")
 
 
-def test_ticket_model_floor_above_the_queue_model_parks_instead_of_working_it(
+def test_ticket_model_floor_above_the_queue_model_is_skipped_not_parked(
     wt_env, run_cli, monkeypatch
 ):
-    """A ticket that named a higher model floor must not be quietly worked by a
-    cheaper queue — it parks blocked with the reason."""
+    """A ticket that named a higher model floor is invisible to a cheaper
+    worker (WT-10): the claim finds nothing, and the ticket stays open."""
     wt_env.config.set_engine(QUEUE, "claude")
     wt_env.config.set_model(QUEUE, "claude-sonnet-5")
     wt_env.config.set_auto_drain(QUEUE, True)
@@ -410,11 +540,10 @@ def test_ticket_model_floor_above_the_queue_model_parks_instead_of_working_it(
         model_floor="claude-opus-5",
     )
     res = run_cli("claim", "--queue", QUEUE, "--worker", "sess-floor")
-    assert res.code == 1, res.output
-    assert "model floor" in res.err
-    parked = wt_env.queue.get(item["ref"])
-    assert parked["needs_input"] is True
-    assert "claude-opus-5" in parked["block_question"]
+    assert res.code == 0, res.output
+    untouched = wt_env.queue.get(item["ref"])
+    assert untouched["status"] == "open"
+    assert untouched["needs_input"] is False
 
 
 # =========================================================================== #
@@ -766,3 +895,21 @@ def test_an_unregistered_queue_is_invisible_to_the_reconciler(wt_env, fake_bin):
     wt_env.queue.mark_runnable(item["ref"])
     assert "GHOSTQ" in wt_env.config.all_queues()
     assert wt_env.config.auto_drain("GHOSTQ") is False
+
+
+@pytest.mark.parametrize(
+    "reason,swaps",
+    [
+        ("engine usage limit", True),
+        ("engine subscription has no access", True),
+        ("engine rejected the queue's model", True),
+        ("engine api unavailable", False),
+    ],
+)
+def test_provider_refusals_swap_engine_on_first_failure(wt_env, reason, swaps):
+    """A lapsed plan or a model this login cannot use will not fix itself by
+    waiting (OPS-8 codex/gpt-5.6, OPS-9 kimi 403), so like a usage limit it
+    moves an opted-in queue off the engine on the first failure; a transient
+    503 still has to repeat first."""
+    rec = {"reason": reason, "consecutive": 1}
+    assert wt_env.workers._warrants_engine_swap(rec) is swaps

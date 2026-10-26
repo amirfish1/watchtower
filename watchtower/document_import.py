@@ -41,6 +41,7 @@ RESPONSE_SCHEMA = {
                         "type": "array",
                         "items": {"type": "string", "minLength": 1, "maxLength": 200},
                     },
+                    "accept": {"type": "string", "maxLength": 400},
                     "source_anchor": {
                         "type": "string",
                         "pattern": r"^L[1-9][0-9]*(?:-L[1-9][0-9]*)?$",
@@ -69,6 +70,7 @@ class ImportCandidate:
     import_key: str
     item_type: str
     depends_on: tuple[str, ...]
+    accept: str = ""
 
 
 @dataclass(frozen=True)
@@ -113,7 +115,11 @@ Reasoning rules:
 6. Choose bug for correcting broken behavior and feature for other work.
 7. source_anchor must be the narrowest supporting source line or inclusive
    range, such as L12 or L12-L18. The cited lines must exist below.
-8. Ticket titles must be unique. Return an empty tickets array if no actionable
+8. Optionally set accept to ONE plain-language acceptance line a verifier could
+   check against the finished work (e.g. "On a 390px screen the rows show the
+   short ticket ID"). Omit it, or use an empty string, when the document gives
+   no observable outcome; never invent one.
+9. Ticket titles must be unique. Return an empty tickets array if no actionable
    work is present.
 
 Source: {source}
@@ -244,7 +250,7 @@ def _validate_response(
     normalized_titles: set[str] = set()
     source_occurrences: dict[str, int] = {}
     for index, raw in enumerate(raw_tickets, 1):
-        if not isinstance(raw, dict) or set(raw) != _TICKET_FIELDS:
+        if not isinstance(raw, dict) or set(raw) - {"accept"} != _TICKET_FIELDS:
             raise ReasoningError(
                 f"ticket {index} must contain exactly these fields: "
                 "title, body, type, depends_on, source_anchor"
@@ -288,6 +294,10 @@ def _validate_response(
                     f"ticket {index} dependency {dependency!r} must name an earlier ticket"
                 )
 
+        accept = raw.get("accept", "")
+        if not isinstance(accept, str) or "\n" in accept or len(accept.strip()) > 400:
+            raise ReasoningError(f"ticket {index} accept must be one line of at most 400 characters")
+
         anchor = _validate_anchor(
             raw["source_anchor"], line_count=len(lines), ticket_number=index
         )
@@ -315,6 +325,7 @@ def _validate_response(
                 import_key=f"doc-import:v3:{digest}",
                 item_type=item_type,
                 depends_on=tuple(dependencies),
+                accept=accept.strip(),
             )
         )
         prior_titles.add(title)

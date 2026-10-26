@@ -83,6 +83,7 @@ def project_fields(issue):
         "url": issue["url"],
         "assignees": [{"login": a} for a in issue["assignees"]],
         "labels": [{"name": name} for name in issue["labels"]],
+        "author": issue.get("author"),
         "comments": issue.get("comments", []),
         "createdAt": issue["createdAt"],
         "updatedAt": issue["updatedAt"],
@@ -459,6 +460,30 @@ def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     assert any("fixed it" in c for c in issue["comments"])
 
 
+def test_github_backend_close_records_session_and_machine(tmp_path, monkeypatch):
+    """S8a parity: a GitHub-backed close must attribute the same way as a
+    file-backed one (machine always, session_id when a claim/close supplied
+    one) -- CCC's ccc shipped/brief must not lose attribution just because a
+    queue happens to be GitHub-backed."""
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    item = q.enqueue(project="GHI", note="attribute this", source="test")
+    sid = "11111111-2222-3333-4444-555555555555"
+    q.claim_by_ref(item["ref"], "worker-1", session_uuid=sid)
+    closed = q.close(item["ref"], "worker-1", resolution={"summary": "fixed it"})
+
+    assert closed["resolution"]["session_id"] == sid
+    assert closed["resolution"]["machine"] == q.machine_tag()
+
+    reloaded = q.get(item["ref"])
+    assert reloaded["resolution"]["session_id"] == sid
+    assert reloaded["resolution"]["machine"] == q.machine_tag()
+
+
 def test_github_backend_claim_by_ref_serializes_concurrent_claimants(tmp_path, monkeypatch):
     """Regression for a double-claim race: two workers claiming the same ref
     at the same instant (e.g. both nudged awake for a stuck queue) must not
@@ -509,6 +534,118 @@ def test_github_backend_claim_by_ref_serializes_concurrent_claimants(tmp_path, m
     assert final["claimed_by"] == winners[0]
     assert [e["event"] for e in final["history"]] == ["claim"]
     assert final["history"][0]["worker"] == winners[0]
+
+
+def test_issue_to_item_memo_sees_same_second_edit():
+    """WT-10: the memo was keyed on id(issue) + per-second updatedAt, so an
+    edit re-read within the same second (or a recycled dict id) served the
+    pre-edit item -- a claimed ticket read as open and two claimants won."""
+    from watchtower.github_backend import GitHubIssuesBackend
+
+    backend = GitHubIssuesBackend("GHI", repo="test-owner/test-repo")
+    issue = _fake_issue(1, "same second", body="work")
+    assert backend._issue_to_item(issue)["status"] == "open"
+    # Same object, same updatedAt: only the content changed.
+    issue["body"] = 'work\n\n<!-- watchtower\nclaimed_by: "worker-a"\n-->'
+    issue["labels"] = [{"name": "watchtower:in-progress"}]
+    item = backend._issue_to_item(issue)
+    assert item["status"] == "in_progress"
+    assert item["claimed_by"] == "worker-a"
+
+
+def _memo_backend(tmp_path, monkeypatch, issues, **kwargs):
+    """A backend whose raw lists are fixed objects, with an idle usage dir."""
+    import watchtower.github_backend as github_backend
+
+    usage_dir = tmp_path / "usage"
+    usage_dir.mkdir()
+    os.utime(usage_dir, (time.time() - 60, time.time() - 60))
+    monkeypatch.setenv("WATCHTOWER_USAGE_DIR", str(usage_dir))
+    github_backend.GitHubIssuesBackend._LIST_ITEMS_MEMO.clear()
+    backend = github_backend.GitHubIssuesBackend("GHI", repo="owner/repo", **kwargs)
+    raw = {"open": issues, "closed": []}
+    monkeypatch.setattr(backend, "_list_issues", lambda state, **_: raw[state])
+    conversions = []
+    real = backend._issue_to_item
+    monkeypatch.setattr(
+        backend, "_issue_to_item",
+        lambda issue: conversions.append(issue["number"]) or real(issue),
+    )
+    return backend, raw, conversions, usage_dir
+
+
+def test_list_items_memo_reuses_unchanged_listing(tmp_path, monkeypatch):
+    """WT-16: a tick lists each queue dozens of times off one cached issue
+    list; the converted result is reused, and callers get private copies."""
+    backend, _raw, conversions, _ = _memo_backend(
+        tmp_path, monkeypatch, [_fake_issue(1, "one"), _fake_issue(2, "two")]
+    )
+    first = backend.list_items()
+    assert conversions == [1, 2]
+    first[0]["status"] = "mutated by caller"
+    second = backend.list_items()
+    assert conversions == [1, 2]
+    assert [it["status"] for it in second] == ["open", "open"]
+    # status/lane are part of the key.
+    backend.list_items(status="open")
+    assert conversions == [1, 2, 1, 2]
+
+
+def test_list_items_memo_invalidates_on_new_listing_or_ledger_write(tmp_path, monkeypatch):
+    backend, raw, conversions, usage_dir = _memo_backend(
+        tmp_path, monkeypatch, [_fake_issue(1, "one")]
+    )
+    backend.list_items()
+    raw["open"] = [_fake_issue(1, "one", body="edited")]  # poller refreshed
+    backend.list_items()
+    assert conversions == [1, 1]
+    os.utime(usage_dir, (time.time() - 30, time.time() - 30))  # a ledger was replaced
+    backend.list_items()
+    assert conversions == [1, 1, 1]
+    # A just-touched dir is not trusted (coarse mtimes): no memo at all.
+    os.utime(usage_dir, None)
+    backend.list_items()
+    backend.list_items()
+    assert conversions == [1, 1, 1, 1, 1]
+
+
+def test_list_items_memo_expires_when_an_issue_leaves_its_grace_period(tmp_path, monkeypatch):
+    import watchtower.github_backend as github_backend
+
+    young = _fake_issue(1, "young")
+    young["createdAt"] = github_backend.datetime.now(github_backend.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    backend, _raw, _conv, _ = _memo_backend(
+        tmp_path, monkeypatch, [young], auto_drain=True, grace_s=10
+    )
+    assert backend.list_items()[0]["auto_eligible"] is False
+    (entry,) = github_backend.GitHubIssuesBackend._LIST_ITEMS_MEMO.values()
+    assert entry[3] <= time.time() + 10
+
+
+def test_persisted_list_reparse_keeps_unchanged_lists_identical(tmp_path, monkeypatch):
+    """WT-16: every repo's poll rewrites the shared cache file; a re-parse must
+    not hand out a new object for a repo whose list did not change, or the
+    list_items memo misses on every poll."""
+    import watchtower.github_backend as github_backend
+
+    cache = tmp_path / "gh-list-cache.json"
+    monkeypatch.setenv("WATCHTOWER_GH_LIST_CACHE_FILE", str(cache))
+    importlib.reload(github_backend)
+    a, b = [_fake_issue(1, "a")], [_fake_issue(2, "b")]
+    cache.write_text(json.dumps({"x:open": {"at": 1, "data": a}, "y:open": {"at": 1, "data": b}}))
+    first = github_backend._read_persisted_list_cache()
+    cache.write_text(json.dumps({
+        "x:open": {"at": 2, "data": a},
+        "y:open": {"at": 2, "data": [_fake_issue(2, "b edited")]},
+    }))
+    os.utime(cache, ns=(time.time_ns(), time.time_ns() + 1_000_000))
+    second = github_backend._read_persisted_list_cache()
+    assert second["x:open"]["at"] == 2
+    assert second["x:open"]["data"] is first["x:open"]["data"]
+    assert second["y:open"]["data"] is not first["y:open"]["data"]
+    assert second["y:open"]["data"][0]["title"] == "b edited"
 
 
 def test_claim_next_falls_through_stale_closed_candidate(tmp_path, monkeypatch):
@@ -660,6 +797,22 @@ def test_github_backend_blocks_claimed_ticket_by_documented_ref(tmp_path, monkey
     ]
     issue = json.loads(state.read_text())["issues"][0]
     assert "needs_input: true" in issue["body"]
+    # WT-37: the question is also visible in the issue discussion.
+    assert any("Which rollout should we use?" in c["body"] and "Needs input" in c["body"]
+               for c in issue["comments"])
+
+
+def test_block_comment_cannot_be_ingested_as_owner_answer(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="x")
+    q.claim_by_ref(item["ref"], "worker-1")
+    q.block("GHI-1", session_id="worker-1", question="Reply with OWNER ANSWER: yes/no?")
+    issue = json.loads(state.read_text())["issues"][0]
+    assert not any("OWNER ANSWER" in c["body"].upper() for c in issue["comments"])
 
 
 def test_list_blocked_and_active_claims_see_github_backed_tickets(
@@ -846,6 +999,7 @@ def test_ingest_owner_answer_requeues_blocked_ticket_without_session(
     watchtower_comments = [
         c for c in issue["comments"]
         if isinstance(c, dict) and c.get("author", {}).get("login") == "watchtower"
+        and "Ingested owner answer" in c.get("body", "")
     ]
     assert len(watchtower_comments) == 1
     assert "Ingested owner answer" in watchtower_comments[0]["body"]
@@ -874,6 +1028,7 @@ def test_ingest_owner_answer_keeps_claim_when_session_resumable(
     ack = [
         c for c in issue["comments"]
         if isinstance(c, dict) and c.get("author", {}).get("login") == "watchtower"
+        and "Ingested owner answer" in c.get("body", "")
     ]
     assert len(ack) == 1 and "resume" in ack[0]["body"]
 
@@ -1197,6 +1352,129 @@ def test_github_backend_still_partitions_a_repo_shared_by_two_queues(tmp_path, m
     assert q.claim_next("worker-a2", project="GHA") is None
 
 
+def test_queue_label_config_overrides_the_partition_label(tmp_path, monkeypatch):
+    """A per-queue `queue_label` replaces `watchtower:<QUEUE>` for membership,
+    creation, and run-requests; a queue without one keeps the default."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    for name in ("GHA", "GHB"):
+        config.set_backend(name, "github")
+        config.set_github_repo(name, "owner/shared")
+        config.set_auto_drain(name, True)
+        config.set_grace_s(name, 0)
+    config.set_queue_label("GHA", "team-a")
+    assert config.queue_label("GHA") == "team-a"
+    assert config.queue_label("GHB") == "watchtower:GHB"
+    _write_fake_issues(state, [
+        _fake_issue(1, "Old default label for A", labels=["watchtower:GHA"]),
+        _fake_issue(2, "Custom label for A", labels=["team-a"]),
+        _fake_issue(3, "Default label for B", labels=["watchtower:GHB"]),
+    ])
+
+    a_items = q.list_items(project="GHA")
+    assert [it["ref"] for it in a_items] == ["GHA-2"]
+    assert a_items[0]["watchtower_label"] == "team-a"
+    assert [it["ref"] for it in q.list_items(project="GHB")] == ["GHB-3"]
+
+    created = q.enqueue(project="GHA", note="New A ticket", source="test")
+    assert "team-a" in json.loads(state.read_text())["issues"][-1]["labels"]
+    assert "watchtower:GHA" not in json.loads(state.read_text())["issues"][-1]["labels"]
+    assert created["watchtower_label"] == "team-a"
+
+    config.set_queue_label("GHA", "")
+    assert config.queue_label("GHA") == "watchtower:GHA"
+    assert "queue_label" not in config.get_queue_config("GHA")
+
+
+def _shared_repo_queues(config, catch_all="GHC", labelled=(("GHA", "team-a"), ("GHB", None))):
+    for name in [n for n, _ in labelled] + [catch_all]:
+        config.set_backend(name, "github")
+        config.set_github_repo(name, "owner/shared")
+        config.set_auto_drain(name, True)
+        config.set_grace_s(name, 0)
+    for name, label in labelled:
+        if label:
+            config.set_queue_label(name, label)
+    config.set_queue_label(catch_all, "*")
+
+
+def test_catch_all_queue_owns_every_issue_no_sibling_claims(tmp_path, monkeypatch):
+    """`queue_label: "*"` = everything on the shared repo that no OTHER queue's
+    label (custom or default `watchtower:<Q>`) already claims."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    _shared_repo_queues(config)
+    assert config.is_catch_all("GHC") and not config.is_catch_all("GHA")
+    _write_fake_issues(state, [
+        _fake_issue(1, "Unlabelled", labels=[]),
+        _fake_issue(2, "Only a plain label", labels=["bug"]),
+        _fake_issue(3, "A's custom label", labels=["team-a"]),
+        _fake_issue(4, "B's default label", labels=["watchtower:GHB"]),
+        _fake_issue(5, "Claimed by both siblings", labels=["team-a", "watchtower:GHB"]),
+    ])
+
+    assert [it["ref"] for it in q.list_items(project="GHC")] == ["GHC-1", "GHC-2"]
+    # The labelled queues are unchanged: still exactly their own slice.
+    assert [it["ref"] for it in q.list_items(project="GHA")] == ["GHA-3", "GHA-5"]
+    assert [it["ref"] for it in q.list_items(project="GHB")] == ["GHB-4", "GHB-5"]
+    assert q.claim_next("worker-c", project="GHC")["ref"] == "GHC-1"
+
+
+def test_catch_all_files_and_runs_without_creating_a_star_label(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    _shared_repo_queues(config)
+    _write_fake_issues(state, [_fake_issue(1, "Plain")])
+
+    q.enqueue(project="GHC", note="filed via catch-all", source="test")
+    issues = json.loads(state.read_text())["issues"]
+    assert issues[-1]["labels"] == []
+    q.mark_runnable("GHC-1")
+    labels = json.loads(state.read_text())["issues"][0]["labels"]
+    assert "*" not in labels and "watchtower:play" in labels
+    # ...and the file is still the catch-all's, since it has no sibling label.
+    assert {it["ref"] for it in q.list_items(project="GHC")} == {"GHC-1", "GHC-2"}
+
+
+def test_a_repo_can_have_only_one_catch_all(tmp_path, monkeypatch):
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    _shared_repo_queues(config)
+    config.set_backend("GHD", "github")
+    config.set_github_repo("GHD", "owner/shared")
+    with pytest.raises(ValueError, match="already the catch-all"):
+        config.set_queue_label("GHD", "*")
+    assert "queue_label" not in config.get_queue_config("GHD")
+    # A different repo is independent.
+    config.set_github_repo("GHD", "owner/elsewhere")
+    config.set_queue_label("GHD", "*")
+    assert config.is_catch_all("GHD")
+
+
+def test_catch_all_alone_on_a_repo_sees_everything(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHC", "github")
+    config.set_github_repo("GHC", "owner/solo")
+    config.set_queue_label("GHC", "*")
+    _write_fake_issues(state, [_fake_issue(1, "Any"), _fake_issue(2, "Other", labels=["x"])])
+    assert [it["ref"] for it in q.list_items(project="GHC")] == ["GHC-1", "GHC-2"]
+
+
+def test_queue_label_rejects_values_gh_would_mangle(tmp_path, monkeypatch, capsys):
+    config, _q = _reload_isolated(tmp_path, monkeypatch)
+    from watchtower.cli import main
+
+    for bad in ("a,b", "x" * 51, "watchtower:play"):
+        with pytest.raises(ValueError):
+            config.set_queue_label("GHI", bad)
+    assert "queue_label" not in config.get_queue_config("GHI")
+
+    assert main(["config", "-q", "GHI", "--queue-label", "BYM"]) == 0
+    assert "queue_label=BYM" in capsys.readouterr().out
+    assert config.queue_label("GHI") == "BYM"
+    assert main(["config", "-q", "GHI", "--queue-label", "a,b"]) == 1
+
+
 def test_github_backend_lists_issues_closed_within_last_14_days(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
@@ -1231,6 +1509,49 @@ def test_github_backend_lists_issues_closed_within_last_14_days(tmp_path, monkey
         arg.startswith("closed:>=")
         for arg in closed_lists[0]
     )
+
+
+@pytest.mark.parametrize("auto_drain", [False, True])
+@pytest.mark.parametrize("opted_out", [False, True])
+def test_github_add_run_bypasses_grace_without_changing_policy(tmp_path, monkeypatch, auto_drain, opted_out):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    config.set_auto_drain("GHI", auto_drain)
+    import watchtower.cli as cli
+    import watchtower.workers as workers
+    importlib.reload(cli)
+    dispatched = []
+
+    if opted_out:
+        enqueue = q.enqueue
+
+        def enqueue_opted_out(**kwargs):
+            item = enqueue(**kwargs)
+            data = json.loads(state.read_text())
+            data["issues"][0]["labels"].append("watchtower:no-auto-drain")
+            state.write_text(json.dumps(data))
+            return item
+
+        monkeypatch.setattr(q, "enqueue", enqueue_opted_out)
+
+    def dispatch(queue, ref):
+        item = q.get(ref)
+        assert item["run_requested"] is True
+        assert item["manual_eligible"] is True
+        assert item["no_auto_drain"] is opted_out
+        assert item["auto_eligible"] is False  # new issue still inside grace
+        assert item["claimable"] is True
+        dispatched.append((queue, ref))
+        return "immediate dispatch"
+
+    monkeypatch.setattr(workers, "dispatch_after_enqueue", dispatch)
+    assert cli.main(["add", "-q", "GHI", "--title", "Run during grace", "--run"]) == 0
+    assert dispatched == [("GHI", "GHI-1")]
+    assert "watchtower:play" in json.loads(state.read_text())["issues"][0]["labels"]
+    assert config.auto_drain("GHI") is auto_drain
+    assert config.grace_s("GHI") == 180
 
 
 def test_github_backend_refuses_direct_claim_until_a_run_is_requested(tmp_path, monkeypatch):
@@ -1416,6 +1737,23 @@ def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
     monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 0.0)
     github_backend._LIST_CACHE.clear()
 
+    # Drive the cache clock by hand: real 50 ms / 200 ms windows expire under
+    # CPU load (full suite, sibling agents) and made the "within the TTL"
+    # assertions flaky.
+    import time as _real_time
+
+    class _FakeClock:
+        now = _real_time.time()
+
+        def time(self):
+            return self.now
+
+        def __getattr__(self, name):
+            return getattr(_real_time, name)
+
+    clock = _FakeClock()
+    monkeypatch.setattr(github_backend, "time", clock)
+
     backend = github_backend.GitHubIssuesBackend("T", repo="acme/cache-test")
     calls = {"n": 0}
     good_issue = {
@@ -1446,8 +1784,7 @@ def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
         raise github_backend.GitHubBackendError("API rate limit already exceeded")
 
     monkeypatch.setattr(backend, "_run", failing_run)
-    import time as _time
-    _time.sleep(0.06)  # expire the TTL so the next call actually attempts gh
+    clock.now += 0.06  # expire the TTL so the next call actually attempts gh
     third = backend._list_issues()
     assert third == [good_issue]  # stale-but-good data, served silently
     assert calls["n"] == 2  # exactly one real attempt, not one per call
@@ -3310,3 +3647,119 @@ def test_reconcile_skip_reason_names_readiness_when_readiness_is_the_gate(
 
     assert "needs-spec" in reason, reason
     assert "grace" not in reason, reason
+
+
+def test_github_backend_records_fix_commit_on_the_issue(tmp_path, monkeypatch):
+    """BYM BECKY-1651: the verified --commit SHA must survive onto the issue.
+
+    A What's New card fires on issue CLOSE; the consumer can only gate it on
+    the fix being deployed if the issue says which commit fixed it. The SHA is
+    written to the metadata block (read from the issue body, no extra fetch)
+    AND as a ``Fix-Commit:`` line in the close comment, round-trips on re-read,
+    and is dropped again if the ticket is re-closed without one.
+    """
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    sha = "ed66bfd65" + "a" * 31
+
+    q.enqueue(project="GHI", title="ship it", note="n", text="b")
+    q.claim_next("worker-1", project="GHI")
+    closed = q.close("GHI-1", "worker-1", resolution={"summary": "done", "commit": sha})
+
+    assert closed["resolution"]["commit"] == sha
+    assert q.get("GHI-1")["resolution"]["commit"] == sha
+    issue = json.loads(state.read_text())["issues"][0]
+    assert f'resolution_commit: "{sha}"' in issue["body"]
+    assert any(c.rstrip().endswith(f"Fix-Commit: {sha}") for c in issue["comments"])
+
+    # A no-code re-close must not leave the earlier close's SHA vouching for it.
+    q.update_status("GHI-1", "open", reason="redo")
+    q.claim_next("worker-1", project="GHI")
+    q.close("GHI-1", "worker-1", resolution={"summary": "no code", "no_code": True})
+    issue = json.loads(state.read_text())["issues"][0]
+    assert "resolution_commit" not in issue["body"]
+    assert "commit" not in q.get("GHI-1")["resolution"]
+
+
+def test_after_gates_claim_on_github_backed_queue(tmp_path, monkeypatch):
+    # WT-36: `--after` is honoured on GitHub queues: the dependent is neither
+    # claimable nor spawn-worthy depth until its blocker closes as completed.
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    q.enqueue(project="GHI", title="first", note="n", text="b")
+    q.enqueue(project="GHI", title="second", note="n", text="b", blocked_by=["GHI-1"])
+    assert q.get("GHI-2")["blocked_by"] == ["GHI-1"]
+    with pytest.raises(ValueError, match="does not exist"):
+        q.update("GHI-2", blocked_by=["GHI-99"])
+    with pytest.raises(ValueError, match="cycle"):
+        q.update("GHI-1", blocked_by=["GHI-2"])
+
+    assert q.count_claimable(project="GHI") == 1
+    first = q.claim_next("worker-1", project="GHI")
+    assert first["ref"] == "GHI-1"
+    assert q.claim_next("worker-2", project="GHI") is None
+    assert q.count_claimable(project="GHI") == 0
+
+    q.close("GHI-1", "worker-1", resolution={"summary": "done", "no_code": True})
+    assert q.count_claimable(project="GHI") == 1
+    assert q.claim_next("worker-2", project="GHI")["ref"] == "GHI-2"
+
+    # Clearing the dependency on a later ticket removes the gate.
+    q.enqueue(project="GHI", title="third", note="n", text="b", blocked_by=["GHI-2"])
+    assert q.claim_next("worker-3", project="GHI") is None
+    q.update("GHI-3", blocked_by=[])
+    assert q.get("GHI-3")["blocked_by"] == []
+    assert q.claim_next("worker-3", project="GHI")["ref"] == "GHI-3"
+
+
+def test_cross_queue_after_waits_and_wakes_without_human_input(tmp_path, monkeypatch):
+    """OPS-74: GitHub queue dependencies gate depth and explicit claims."""
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    for name in ("GHI", "UPSTREAM"):
+        config.set_backend(name, "github")
+        config.set_github_repo(name, "test-owner/test-repo")
+        _drainable(config, name)
+    upstream = q.enqueue(project="UPSTREAM", title="release", note="n", text="b")
+    ref = upstream["ref"]
+    dependent = q.enqueue(project="GHI", title="verify production", note="n", text="b",
+                          blocked_by=[ref])
+    dep = dependent["ref"]
+    assert q.get(dep)["needs_input"] is False
+    assert q.count_claimable(project="GHI") == 0
+    assert q.claim_next("downstream", project="GHI") is None
+    with pytest.raises(ValueError, match="waiting"):
+        q.claim_by_ref(dep, "downstream")
+    with pytest.raises(ValueError, match="cycle"):
+        q.update(ref, blocked_by=[dep])
+    with pytest.raises(ValueError, match="does not exist"):
+        q.update(dep, blocked_by=["UPSTREAM-999"])
+    q.claim_by_ref(ref, "upstream")
+    q.close(ref, "upstream", resolution={"summary": "deployed", "no_code": True})
+    assert q.count_claimable(project="GHI") == 1
+    assert q.claim_next("downstream", project="GHI")["ref"] == dep
+
+
+def test_cross_queue_after_does_not_wake_for_unresolved_completion(tmp_path, monkeypatch):
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    blocker = q.enqueue(project="LOCAL", title="release", note="n", text="b")
+    dep = q.enqueue(project="GHI", title="verify", note="n", text="b",
+                    blocked_by=[blocker["ref"]])["ref"]
+    q.claim_by_ref(blocker["ref"], "upstream")
+    q.close(blocker["ref"], "upstream", resolution={
+        "summary": "partial", "no_code": True, "unresolved": ["LOCAL-99 pending"]})
+    assert q.count_claimable(project="GHI") == 0
+    assert q.claim_next("downstream", project="GHI") is None
+    with pytest.raises(ValueError, match="stuck"):
+        q.claim_by_ref(dep, "downstream")

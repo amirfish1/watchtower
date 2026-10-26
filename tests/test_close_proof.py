@@ -3,7 +3,7 @@
 Own module rather than test_smoke.py so the search-order and remote-parsing
 rules stay legible together.
 
-Context: the VM-NEXT queue tracking the 2026-08-10 Chuck incident had tickets
+Context: the VM-NEXT queue tracking the 2026-08-10 client-site incident had tickets
 in five different places while the queue had one repo_path, so genuinely
 committed work could not be closed. The fix widens WHERE a proof is looked for
 without weakening WHAT counts as one -- these tests pin both halves.

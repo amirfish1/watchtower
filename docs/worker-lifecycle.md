@@ -30,9 +30,12 @@ open  →  in_progress  →  closed
 |-------|---------|
 | `open` | Unclaimed. Available for the next `wt claim`. |
 | `in_progress` | Claimed by a worker. Has a `claimed_session_id`. Not reclaimable by another worker. |
+| `awaiting_answer` | Parked by `wt block` (WT-28): claim released, waiting for a human answer. Not claimable. |
 | `closed` | Done. Has a resolution. Immutable. |
 
-`needs_input` is a flag on an `in_progress` ticket — NOT a fourth state. A
+`needs_input` is a flag on an `in_progress` ticket (the legacy hold-while-blocked
+form, still used by plan-gate / stage-escalation blocks and GitHub-backed queues
+until WT-28b) — NOT a separate state. A
 ticket stays `in_progress` while blocked; the flag signals that it is waiting
 for human input before the worker can continue. Keeping it a flag (not a state)
 prevents agents from using it as a comfortable parking lot for hard tickets.
@@ -126,7 +129,7 @@ reconciler spawns Codex worker
   └─ one-shot worker loop:
        wt claim → ticket → do work → wt close --summary "..."
        wt claim → ticket → ...
-       wt claim → empty  → idle audit → complete drain goal → exit immediately
+       wt claim → empty  → idle audit → exit immediately
   └─ reconciler spawns a new process when later work needs staffing
 ```
 
@@ -146,6 +149,30 @@ worker reaches a decision it can't make alone
 
 The blocked ticket stays `in_progress` and is NOT reclaimable. Continuity lives
 in the resumable session, not in a running process.
+
+### Parking (WT-28)
+
+A worker `wt block` on a local queue now **parks** the ticket: status
+`awaiting_answer`, claim released, `parked` = `{worker_id, session_id, machine,
+engine, repo_path, transcript_path, at}`. The worker may claim the next ticket
+immediately. A retained parked worker is never STOPped for ~55 minutes and does
+not consume the spawn budget while idle.
+
+`wt answer` / `wt ack` / `wt plan decide` on a parked ticket write a
+`pending_answer` (`gen`-keyed; states `routing -> affinity | delivering | queued
+| delivered | handed_off`) and route it through compare-and-swap transitions so
+a stale router is a no-op:
+
+| Route | When | Effect |
+|---|---|---|
+| `affinity` | parked worker still alive | ticket reopens reserved for that worker, which is woken; nothing is bound |
+| `resume` | worker gone, session resumable | `resume_claim` rebinds the ticket to the parked session and the answer is delivered to it |
+| `reopen` | no session / over the context budget / session busy elsewhere | ticket opens; the next claimer gets question + answer + transcript pointer (`answer_brief`) |
+
+Answer outbox rows are generation-bound (R4-4): the drain re-checks the ticket's
+`gen` and cancels on re-block, forced release/reopen and close. Delivery is
+at-least-once; the `[answer REF#gen]` tag lets a session ignore a repeat.
+`wt migrate-blocks [--dry-run] [-q Q]` (and the reconciler) parks legacy blocks.
 
 ### Resolution is mandatory
 
@@ -171,7 +198,8 @@ worker crosses the 30-minute inactivity floor
   └─ strict queue read confirms no ticket is owned by worker ID or session ID
   └─ complete IDLE_CANDIDATE / IDLE_SIGNAL / IDLE_DECISION bundle is logged
   └─ released_at is persisted and a one-shot stop sentinel is written
-  └─ queue-scoped release instruction is attempted over FIFO/session delivery
+  └─ no message is sent: the worker is idle and cache-cold, so a message
+     would buy a full-price uncached turn just to say "stop" (WATCHTOWER-31)
   └─ worker's next wt claim returns {"stop": true}
   └─ process and unrelated conversation work continue untouched
 ```
@@ -181,6 +209,44 @@ in-progress or blocked work, the strict queue read fails, its PID identity is
 not attributable, or required activity evidence is unavailable. WatchTower
 never sends `SIGTERM` or `SIGKILL` as part of normal queue release.
 
+### Released-worker garbage collection
+
+Release preserves the conversation for a bounded time. On each full periodic
+reconcile pass, `reap_released_workers()` sends SIGTERM to workers released at
+least `WATCHTOWER_RELEASED_TTL_S` seconds ago (default **3600**, one hour).
+Survivors receive SIGKILL on the first pass at least **30 seconds** after
+SIGTERM. These intervals are measured from persisted timestamps, so restarting
+the daemon does not restart the countdown. Set the TTL in the daemon's
+environment before starting it. Queue-scoped dispatch and dry runs skip GC.
+
+For legacy records or a release interrupted between writing the sentinel and
+the registry, the reaper recovers a missing `released_at` from the stop file's
+modification time. It persists that timestamp even before expiry, preserving
+the deadline after the worker consumes the sentinel. An existing `released_at`
+always wins; missing, unreadable or non-file sentinels establish no deadline.
+
+The reaper checks process identity before either signal and defers when
+identity is unknown. A reused PID is skipped and logged. It signals the whole
+process group only when the worker leads that group; otherwise it signals the
+worker PID. Fresh parked-ticket and answer ownership keep their existing grace
+window. `GC_RELEASED` records the action, signal scope and release age;
+`GC_SKIPPED` records PID reuse. The adjacent sentinel sweep removes stop files
+whose workers are gone. This bounds released-worker lifetime; active staffing
+continues to use each queue's desired worker count.
+
+### Context recycle (claim-time)
+
+`wt claim` answers `{"stop": true, "reason": "context_budget"}` to a
+**registered** drain worker (never a human) that holds no active claim and has
+hit any limit below; the STOP log line names the limit and value. Each knob is
+read per call and `0` disables it.
+
+| Env var | Default | Applies to | Measures |
+| --- | --- | --- | --- |
+| `WATCHTOWER_CONTEXT_RECYCLE_BYTES` | `2500000` | claude | session transcript bytes (`claude_bytes`) |
+| `WATCHTOWER_CODEX_RECYCLE_INPUT_TOKENS` | `30000000` | codex | cumulative `input_tokens` from the rollout's last `token_count` event, cached tokens included (`codex_input_tokens`) |
+| `WATCHTOWER_RECYCLE_TICKETS` | `10` | every engine | tickets closed or blocked this run, counted as `tickets_done` on the worker record (`tickets`) |
+
 ### Engine-specific idle behavior
 
 When `wt claim` returns empty, neither engine polls or sleep-loops. A Claude
@@ -188,10 +254,87 @@ worker ends its turn and remains blocked on its live FIFO, so a later ticket can
 wake the same conversation. Its prompt cache is typically warm for about five
 minutes, but cache warmth does not control staffing; the reconciler may release
 the conversation after 30 minutes of verified inactivity. A Codex exec worker
-has no FIFO, so after its idle audit it completes the active queue-drain goal and
-exits immediately. A wind-down STOP makes either engine exit between tickets.
+has no FIFO, so after its idle audit it exits immediately. No native Codex
+thread goal is used, and spawns pass `-c model_auto_compact_token_limit=<worker_auto_compact_k*1000>`
+(CCC spawn-defaults.json, default 250000). A wind-down STOP makes either engine exit between tickets.
 
 ---
+
+## Stage sessions (planner, plan reviewer, verifier, assessor)
+
+Stage sessions are owned by the reconciler, not by whichever build worker ran
+`wt claim` / `wt close`. Ticket state is the intent; the CLI only calls
+`stages.request()`, which appends to `~/.watchtower/stage-wake` and logs
+`STAGE_QUEUED`. Only the one real daemon (`wt start --auto-spawn`, never
+`--dry-run`, always under `reconcile.lock`) or a manual `wt stages tick` spawns
+or respawns. The daemon sleeps in 0.5 s chunks and runs a stage pass as soon as
+the wake file's mtime advances; a lost wake is caught by the next full tick.
+
+Supervision key per stage: `plan:r<round>`, `review:r<round>`,
+`verify:<verify_cycle>`, `assess:<assessment.cycle>`. Two attempts per key: the
+first death respawns, the second escalates to `needs_input` (`wt answer REF
+"retry"` grants a fresh budget). Classified launch failures (auth, quota, engine
+missing, rejected model, untrusted cwd) set the shared cooldown and are refunded
+(max 3 per key); any other immediate death consumes an attempt and sets no
+cooldown. Sessions run under `_exitwrap.py`, which records exit code/signal.
+Idle is judged by the claude transcript mtime (claude -p writes nothing to its
+log until it exits), other engines by log mtime. Dead stage records are kept
+30 min (`WATCHTOWER_ADHOC_DEAD_KEEP_S`). Engine starts are staggered host-wide
+(`WATCHTOWER_SPAWN_STAGGER_S`, claude 3 s, others 1 s). The cwd is the ticket's
+`repo_path`, else the queue's; never the daemon's.
+
+| Verb | Meaning |
+|------|---------|
+| `STAGE_QUEUED` | A CLI transition requested a stage; wake file touched. |
+| `STAGE_SPAWN` | A stage session started (`attempt n/2`, `cause=initial|respawn|retry|adopted`). |
+| `STAGE_DEAD` | A session died or could not start, with the reason and exit forensics. |
+| `STAGE_LOST` | A verified plan message to the live stage session never landed; the next pass kills it and respawns (one attempt). |
+| `STAGE_WAIT` | Spawn deferred by an engine launch cooldown (logged once). |
+| `STAGE_DEFER` | Per-tick spawn cap (`WATCHTOWER_STAGE_SPAWNS_PER_TICK`) reached. |
+| `STAGE_BLOCK` | Out of attempts; the ticket is waiting for a human. |
+| `ASSESS_RESUME` | An assessor was respawned with a rotated (fenced) token. |
+| `SPAWN_GATE` | The host-wide spawn stagger timed out and proceeded. |
+
+### Plan discussion turns (WT-29)
+
+After a plan rejection, the planner<->reviewer discussion runs as stage
+sessions, not as messages to the original one-shot sessions (they have
+usually exited by then). Each turn has its own key and its own 2-attempt budget:
+
+- `discuss:r<round>:d<n>:planner` while `plan.status == discussing` and the
+  discussion awaits the planner (amend the plan, answer the objections).
+- `discuss:r<round>:v<version>:reviewer` while `reviewing` and the discussion
+  awaits the reviewer (a verdict on that exact version).
+
+`wt plan verdict` / `wt plan submit` only call `stages.request`. The supervisor
+adopts the participant if its session is still running (attempt 0, no message);
+otherwise it spawns a fresh session that same tick, seeded with the ticket, the
+plan, the objections and the last discussion messages. Dying twice escalates
+like any stage (`wt answer REF retry` restarts the turn).
+
+Plan messages (`wt plan discuss`, fallback reminders) use the live-only
+transport (`messages.send(..., live_only=True)`: UDS, then WT stdin FIFO; never
+the delegate, a resume, or the outbox). A send result is never taken as
+liveness: `wt plan discuss` to a peer that is not running is recorded in the
+transcript and reported as "recorded"; a live send is reported as "sent live;
+awaiting its receipt". The reminder/nudge fallback (`recover_plan_discussions`)
+only covers tickets outside the supervisor (github-backed or otherwise
+unsupervised): a dead peer blocks the plan for a human at once, and a send no
+transport took blocks without counting. A reminder a live transport took is
+**not** counted yet (WT-31 D4): it is noted as `discussion.reminder =
+{delivery_id, role, at}` (no second reminder while it is pending), and the
+delivery ledger settles it. Only its confirmed nonce bumps `nudges` toward
+`PLAN_DISCUSSION_MAX_NUDGES` (escalating past it); a lost or unverified one
+blocks the plan for a human. Both are compare-and-swaps on the pending
+`delivery_id`, so a late outcome after the discussion moved on is a no-op.
+
+A lost plan message to the ticket's **live stage session** (`wt plan discuss`
+to the participant the supervisor adopted) means that session is not working
+the turn: `stages.mark_delivery_lost` sets `stage_session.lost`, and the next
+`_supervise` pass kills the session, records the death (`delivery lost: ...`,
+one attempt of the 2-attempt budget) and respawns it, or escalates once the
+budget is spent. A lost message to anyone else (not the current stage session)
+is only recorded; the next turn reads the transcript.
 
 ## Auditable idle decisions
 
@@ -202,7 +345,7 @@ an operator to reconstruct the transaction without reading a worker transcript.
 | Verb | Meaning |
 |------|---------|
 | `IDLE_CANDIDATE` | Identity, release floor, and newest effective activity clock for a worker that crossed the floor. |
-| `IDLE_SIGNAL` | One line per safety signal: PID, WT stdout, Claude transcript/Codex rollout/Kimi wire log, queue-read result, owned and blocked refs, and `pid_signal_planned=false`. |
+| `IDLE_SIGNAL` | One line per safety signal: PID, WT stdout, Claude transcript/Codex rollout/Kimi wire log/Antigravity conversation db, queue-read result, owned and blocked refs, and `pid_signal_planned=false`. |
 | `IDLE_DECISION` | Exactly one `PRESERVE` (with every reason) or `RELEASE` result for an evaluation. |
 | `ACTIVE_AGAIN` | A prior idle candidate received newer authoritative activity and fell below the floor. |
 | `RELEASE` | Durable detachment, delivery outcome, sentinel state, and `pid_signalled=false`. |
@@ -306,7 +449,9 @@ only the capped deficit. A same-pass release plus claimable work is labeled
 plan. Returns `spawned`, `released`, `spawn_plans`, `launch_failed`, `skipped`,
 and related maintenance results. In `dry_run` mode, no subprocesses or releases
 occur; staffing plans and synthetic spawn records are still returned and
-logged for tests.
+logged for tests. With `supervise_stages` (and not `dry_run`) the stage pass is
+followed by the liveness backstop (`result["backstop"]`, see "Liveness
+backstop").
 
 ### Launch-failure escalation (spawn-then-die)
 
@@ -325,7 +470,7 @@ escalates in four steps as the same failure repeats:
    reason an operator can act on — usage limit, auth, API down, broken binary.
    It can only ever name failures we have already seen, so an unrecognised
    non-zero exit inside the grace window is still recorded, under a generic
-   `engine exited immediately (exit N)`. That fallback is the load-bearing
+   `engine exited immediately (exit N): <last log line>`. That fallback is the load-bearing
    part: WATCHTOWER-29 was an *unclassified* failure (a half-installed codex
    npm package), and "no phrase matched" used to mean "no cooldown at all".
 3. **Say so.** At `_LAUNCH_FAILURE_ALERT_STREAK` consecutive failures,
@@ -334,12 +479,53 @@ escalates in four steps as the same failure repeats:
    days. The ref is written back onto the failure record, so one outage files
    one ticket however long it lasts; the streak (and the alert) clear when a
    worker finally establishes a session.
-4. **Swap or park.** `_warrants_engine_swap` moves the queue to
-   `config.fallback_engine()` — immediately for a usage limit (the provider has
-   already told us it will not serve us), only on a repeat for anything else,
-   so one flaky start never rewrites a queue's configured engine. With no
-   fallback installed, a repeated failure parks the queue instead: `auto_drain`
-   goes off and `wt drain on <queue>` is the deliberate act that resumes it.
+4. **Substitute or park.** Only a queue that opted in with
+   `wt config -q <queue> --fallback-to-default-worker on` ("Revert to CCC
+   default worker if current model is exhausted"; default **off**) gets a
+   substitute. `_warrants_engine_swap` decides when: immediately for a usage
+   limit, only on a repeat for anything else. `_launch_substitute` then
+   launches that tick's workers on `config.fallback_engine()` with
+   `config.fallback_model()`, and keeps doing so while the preferred engine's
+   cooldown runs. It is a **launch-time substitution only**: the queue's stored
+   engine/model are never rewritten (WATCHTOWER-30 — the reconciler used to
+   `set_engine`/`set_model`, silently overwriting a user's choice), so the next
+   tick after the cooldown tries the preferred engine again. The `FALLBACK`
+   log line names the real failure reason. A queue that did not opt in, or has
+   no fallback installed, is parked on a repeated failure instead: `auto_drain`
+   goes off with the reason logged, and `wt drain on <queue>` resumes it.
+
+#### Headroom-aware dispatch (proactive, opt-in)
+
+Everything above is reactive: it waits for an engine to hit its usage wall.
+With `wt config -q <queue> --headroom-dispatch on` (or CCC spawn-defaults
+`"worker_headroom_dispatch": true` for queues with no explicit setting;
+default **off**) the reconciler checks quota headroom *before* launching.
+`workers.headroom_launch_choice` builds candidates from the queue engine plus
+its fallback chain (`config.fallback_chain()`, the same source
+`fallback_engine` uses), drops engines that are unavailable or in launch
+cooldown, and asks `headroom.pick_engine` to rank them from CCC's
+`GET /api/headroom` rows:
+
+- a row is usable when available, not stale, not unlimited, and
+  `percent_left` >= 10; each engine uses its best account;
+- engines whose known headroom is under 10% are avoided;
+- usable engines rank by `resets_at` ascending (spend what expires first),
+  then by more headroom left;
+- no usable data (CCC down, old CCC 404, every engine low) keeps the normal
+  queue engine.
+- a queue engine with no headroom row at all (an engine CCC can't meter) is
+  kept; only known-low headroom moves work off it.
+
+When the pick differs from the queue engine, that tick launches on it exactly
+like the cooldown substitute (`fallback_model`, `fallback_effort`, queue model
+not inherited; the stored engine/model are untouched), logs `HEADROOM_DISPATCH`
+with the reason (e.g. `headroom: claude 4% left; codex 61% left, resets in
+3.0h`), and records it in reconcile's `fallbacks`. The liveness backstop spawn
+uses the same helper. Headroom is read with a 1.5 s timeout and cached
+in-process for 60 s (30 s after a failure); `WATCHTOWER_CCC_HEADROOM_URL`
+overrides the URL (default `http://127.0.0.1:<port.txt>/api/headroom`) and
+`WATCHTOWER_HEADROOM_FILE` reads a JSON file in the same shape instead
+(tests/E2E).
 
 ### `request_stop(worker_id)`
 
@@ -388,3 +574,492 @@ migration has run (2026-08-20 spec).
   bounces is "lazy." Needs real numbers from production data.
 - **Per-queue engine override** — today the engine (claude/codex) is a spawn-time
   flag; it could live in the registry instead.
+
+## Orphan sweep and verifier-rejection reclaim (WT-30)
+
+`requeue_orphaned_tickets` (reconciler tick) reopens an `in_progress` ticket
+whose claimer is gone. A verifier/reviewer rejection re-binds the ticket to the
+builder's session but **keeps `claimed_by` = the builder's worker id** (the
+session id rides in `claimed_session_id`), stamps `resume = {sid, state, at}` and
+delivers the rejection to that session.
+
+`workers._resolve_claimer` classifies `claimed_by` as `builder | stage |
+unknown`: a known worker id, a `list_workers` row with that session id, the
+session-origin ledger (`worker`/`adhoc` = builder, any other role = stage,
+terminal), then `worker-sessions.json`. `unknown` (ambient sessions, OPS-104) and
+`stage` (WT-24) are never reopened by the sweep.
+
+A builder ticket is **held** while any evidence of life exists: (a) its worker
+is alive, (b) a live worker row owns the session, (c) a live resume child in the
+resume ledger, (d) the resume is still queued in the outbox, (e) **delegate
+transport only**: within `WATCHTOWER_RESUME_START_S` (45 s) of the real delivery
+time, or the transcript is busy. For local transports process identity is the
+only liveness evidence: a transcript written just before the process died does
+**not** hold the ticket (busy protects against forking a parallel resume, not
+against reclaiming from a dead process). Otherwise the ticket reopens on that
+tick (`REQUEUE <ref> — worker gone (verify-rejected; builder <id> dead)`), with
+`gate_feedback` kept for the next claimer (`wt claim` prints it). The reopen
+event records `orphan`, `displaced_session_id` and `displaced_claimed_by`, so a
+later resume of the displaced session gets the STOP preamble even after a fresh
+worker re-claims; a legitimate self-reclaim clears it.
+
+Every resume attempt logs `RESUME <ref> — <transport|queued|headless|failed|skipped>`.
+A builder over the context budget is skipped (released with the rejection text);
+a total delivery failure releases the claim instead of asking a human to resume
+manually. `drain_outbox` writes delivery / dead-letter outcomes back to the
+ticket's `resume` state, and the sweep also reads the outbox row itself.
+
+## Sent-back claims (WT-34)
+
+A rejection (`wt reject`, verifier FAIL, `wt reopen --resume`) re-binds the
+ticket to its builder and stamps `sent_back` (`at`, `by`, `worker_id`,
+`session_id`, `reason`, `hist_from`, `handed_back_at`, `progress_at`). While the
+marker is live:
+
+- **Hand-back first.** `wt claim` by that worker id or session returns the
+  sent-back ticket (`HANDED BACK:` / `handed_back: true`, idempotent) instead of
+  a new one; `wt claim <other-ref>` is refused with the rejection text. The
+  decision is made in the same lock as the claim.
+- **Age bound.** With no claimer `comment`/`progress`/`block`/`park`/`in_review`
+  event after the send-back, `reconcile_once` releases it to the pool after
+  `sent_back_release_min` minutes (default 30, `wt config -q Q
+  --sent-back-release-min N`, 0 disables; the clock restarts once at the first
+  hand-back; a `failed` resume shortens it to 5 min). The release keeps
+  `gate_feedback`, records `sent_back_released` (the next claimer sees the
+  rejection text; the former holder may `wt claim` it back) and sorts the ticket
+  ahead of same-priority peers. The orphan sweep still owns dead sessions.
+- **Nudge.** The stuck-queue nudge names each held sent-back ticket, its age and
+  the release time; those holders are excluded from the generic broadcast.
+- `wt block`/park, close, release and any new claim clear the marker.
+
+Close ownership (already-closed, foreign in_progress, foreign parked, and a
+holder whose claim was released) is enforced in the store lock on every mutating
+outcome of a worker-attributed `wt close`, including the failed-gate reopen,
+which also compare-and-swaps on the pre-gate status.
+
+## Plan groups (WT-33)
+
+Opt-in only: no ticket joins a group unless a human files or attaches it. A
+group is a **parent** ticket (`group.role = "parent"`) and up to
+`GROUP_MAX_MEMBERS` (6) **members** (`group = {role: child, parent, kind:
+member}`). Plans run once for the whole group, each member is built and
+verified on its own, and one integration check runs over all of them together.
+Groups work on the local store only, not on GitHub-backed queues.
+
+**Filing.**
+- `wt add -q Q --group-parent --children A,B` files a parent and seals it.
+- Without `--children` the parent is unsealed and stays in `group.parent.forming`
+  (owner: human). Grow it with `wt group attach P REFS... [--replan] [--seal]`,
+  then run `wt group seal P`.
+- `wt add -q Q --group P` files a new member of an unsealed parent.
+- A parent's gates are always `plan` first, then the rest (default
+  `["plan","verify"]`).
+- Refused:
+  - a parent with `--group`
+  - `--children` without `--group-parent`
+  - manual `blocked_by` on a parent, or on a member pointing at its parent
+  - sealing with fewer than 2 members
+  - adding to a sealed group
+  - attaching a ticket that has its own plan without `--replan` (`--replan`
+    supersedes that plan)
+
+The parent's `blocked_by` mirrors its members plus its open integration fixes.
+
+**Membership version.** `group.membership_version` (mv) starts at 0 and is
+bumped by attach, seal and detach. The parent's plan stage keys carry it
+(`plan:r1:m3`), so a membership change starts a fresh session. Every parent
+`wt plan submit|verdict|discuss|decide` must pass `--mv N`, and a stale mv is
+refused with `SUPERSEDED` (`GroupFenced`). `plan_start` is a no-op until the
+group is sealed.
+
+**The group plan.** The planner writes:
+- one `## Shared` section
+- one `## Section: REF` per member, with no unknown, missing or duplicate
+  sections
+
+Each section is clipped at `PLAN_TEXT_MAX`, and the whole plan at
+`GROUP_PLAN_TEXT_MAX` (96000). A resubmission may write
+`(unchanged)` (`GROUP_PLAN_UNCHANGED`) as a section body to keep the previous text. The
+reviewer may reject individual sections with `wt plan verdict P --reject --mv N
+--section REF` (repeatable). Results go to `plan.section_reviews`, and the
+sections not named count as accepted. When the revision budget runs out, the
+block question names `wt group detach <REF>` for each rejected section.
+Detaching that member sends the remaining text back to review. Members are
+unclaimable until the plan settles (`accepted`, or `failed`):
+- row `group.child.plan_wait`
+- `claim_next` skips them
+- `claim_by_ref` raises `GroupClaimRefused`
+
+**Claims.**
+- Every member claim is stamped `group_claim = {parent, mv, via}`.
+- At claim time the member sees the shared section, its own section and a list
+  of its siblings, never the siblings' sections (`render_plan(...,
+  sections=REF)`).
+- `reject_with` re-binds the member only while the plan is still settled.
+  Otherwise the ticket goes back to `open` (`group_reclaim_deferred`).
+- The parent itself is never claimed, parked, in_progress or answered by
+  resume. A worker `wt block` on it stays a plain `needs_input`.
+
+**Detach table** (`wt group detach REF`):
+
+| Member / group state | Result |
+|---|---|
+| closed member, or an integration fix | refused |
+| parent closed or integrating (gating, verifying, reviewing) | refused |
+| last member of a sealed group | refused |
+| plan accepted/failed and the member is not `open` | refused |
+| unsealed group | removed; mv unchanged |
+| sealed, plan planning/reviewing | removed; mv+1; plan restarts at the new key; live planner/reviewer retired |
+| sealed, plan blocked (exhausted) | removed; mv+1; the text minus the section goes back to review; the block is cleared |
+| sealed, plan accepted | removed; mv+1; the section is archived (`group_section_removed`) |
+
+**Integration (D7).** When every member and fix is closed, `group_sweep` runs
+on each `reconcile_stages` tick, and in the liveness backstop as the recover
+for `group.parent.ready` / `gating_stale`. It:
+1. Takes a lease (`gating`). The lease TTL is `GATE_CMD_TIMEOUT_S × (cmd gates +
+   1) + 300`, and a lapsed lease reads `gating_stale` and is retaken.
+2. Picks commit X with `integration_git.containing_sha`. X is the first
+   candidate that contains every member commit, in this order:
+   - member commits, newest first
+   - `HEAD`
+   - `@{u}`
+
+   No-code members are ignored, and when every member is no-code X is `HEAD`.
+3. Runs the `cmd:` gates pinned at X in a clean detached checkout.
+4. Compare-and-swaps the outcome back, with the child commit map recorded as
+   `integration.proven`.
+
+Outcomes:
+- **pass:** goes to `verifying` (one integration verifier, `review.verify` with
+  key `verify:<verify_cycle>`), then `reviewing`, then `done`. A run with only
+  `cmd:` gates closes directly.
+- **diverged** or **gate failed:** files an integration-fix member (`kind:
+  integration_fix`) and goes to `fixing`.
+- **setup failure** or **missing commit:** a human block (`integration.blocked`).
+  Answering it retries.
+- **fix allowance used up** (`GROUP_INTEGRATION_ALLOWANCE`, 2): goes to
+  `capped`, which is a human block. Answering it, or `wt group fix P --text`,
+  files one more fix and raises the allowance by one, up to `GROUP_MAX_FIXES`
+  (8).
+
+Integration verifier:
+- **Scope:** the integration verifier checks the group as a whole at X. It
+  checks the shared plan's contracts and every member's acceptance line, but
+  does not re-verify each member's own criteria.
+- **Model:** it uses the queue's normal verifier model and engine.
+- **Verdict:** it must file `wt verdict P --verify-cycle N`. A stale cycle is
+  fenced, and a fail files a fix.
+
+`wt reject P` is accepted only in `in_review`. `wt accept P --force` closes from
+any state if X is proven against the live map (`proof: proven`). Otherwise it
+requires `--no-proof`, which records `proof: forced` and says so in the
+resolution. A late gate commit or verdict after a force accept is discarded.
+
+**R7, members during integration.** While a parent is `gating`, `verifying`
+or `reviewing`, a closed member is locked: `wt reopen` raises
+`GroupChildLocked` and nothing is written. `wt reopen --force` reopens the
+member and invalidates the integration in the same write: the parent goes back
+to `idle`/`open`, `proven` is cleared and `verify_cycle` is bumped, so the old
+verdict is fenced. Completion re-checks the live map against `proven` and
+refuses (`group_completion_refused`) if they differ.
+
+**D8 (amended): a done parent keeps its proof.** The live-map invariant covers
+only an **unfinished** integration (`verifying`/`reviewing` ⇒ `gproof =
+match`). A done parent is never re-evaluated:
+- reopening a member after the group closed only records
+  `group_member_reopened_after_close` on the parent
+- the parent stays `closed`, with its original `integration.proven` and
+  resolution commit
+- the parent projects `gint=done, gproof=stale` and classifies as `closed`
+
+`gproof=forced` exists only when the parent is done, and `done ∧ none` is
+unreachable.
+
+**R8, retiring stage sessions.** Detach, a plan restart, force accept and an
+integration failure append the live stage session's `{worker_id, pid,
+pid_started}` to `stage_retired`. `stages._retire_pass` runs on every
+`reconcile_stages` tick, before the desired targets:
+- it kills the session's process group only when the pid's start token
+  matches (`killed`)
+- `already_gone` and `token_mismatch` are never signalled
+- it logs `STAGE_RETIRED`
+
+Retired worker ids are never adopted again.
+
+## Liveness state table (WT-31)
+
+`watchtower/liveness.py` is the single state table: `project(item)` maps a
+ticket to a `State` over the dims `status, gated, backend, plan, disc, awaiting,
+gate_pending, assessment, block, readiness, dep, claimed, parked, answer`, plus
+the WT-33 group dims:
+- `group`: `none|parent|child`
+- `gplan`: the parent's plan, `pending|settled`
+- `gint`: the integration state, with `gating_stale` for a lapsed lease
+- `gproof`: `none|match|stale|forced`
+
+Ungrouped tickets project `none/n/a/n/a/n/a`. The group rows are
+`group.child.plan_wait`, `group.parent.forming|wait|ready|gating|gating_stale|capped`.
+Parent plan and verify stages reuse the `plan.*` and `review.*` rows, and a
+parent's human blocks use `human.block`. The `group_*` `UNREACHABLE` entries
+cite the queue code behind each one.
+
+`classify(state)` returns the one `Row` it is in (`id`, `owner`, `proof`,
+`recover`), or raises when the state is in `UNREACHABLE` or in no row.
+`prove(item, row)` names what proves the owner is at work (for stage rows, the
+exact `stages.desired()` role and key).
+
+Answer states (`pending_answer.state`, vocab `queue.ANSWER_STATES`) move only
+along `queue.ANSWER_TRANSITIONS` (E1–E17). Each edge declares `from`, `to`
+(`"="` = self-loop), the `(old_status, new_status)` pairs and its writers.
+`_pa_cas` checks every move at runtime (strict under
+`WATCHTOWER_STRICT_EDGES=1`, which the test suite sets; production logs
+`ANSWER_EDGE_UNDECLARED`), as do `block()` and `update(needs_input=True)` for
+their in-lock supersession (E17).
+
+Plan gate vs answers (D1a): while `PLAN_ACTIVE` (plan-gated, plan not
+`accepted`/`failed`) the plan stage owns the ticket. A worker `wt block` stays
+legacy `needs_input` instead of parking, `resume_claim` refuses, and
+`route_answer` / the reconciler hand a pending answer to the plan stage
+(`plan gate active; answer handed to the plan stage`). `desired()` spawns no
+stage while an answer is in flight (`ANSWER_INFLIGHT`).
+
+Every claim write records `claim_proc` (`worker_id, session_id, engine, pid,
+pid_started, exit_file, record_started_at, bound`); `bound` is `record` (a WT
+worker record), `ambient` (no record: never provably dead) or `inherited` (a
+re-bind that kept the builder's process: reject, `reopen --resume`, a resume
+after the parked worker exited). Parking moves it to `parked.proc`; ending a
+claim keeps it as `prior_claim_proc`. `liveness.claim_owner(item)` answers
+`alive | dead | unproven` from it.
+
+The claim-time guard (`queue._verify_worker_live`, run by `claim_next` /
+`claim_by_ref`) asks the same resolver about the `claim_proc` the claim would
+write, and rejects (`... not currently alive ... claim rejected`) only on
+`dead`. A dead worker record whose session is alive in the Claude registry (a
+resumed session) is `alive` and claims normally. The registry counts as alive
+only when the row's pid is live **and** its recorded start token (`procStart`,
+the UTC `lstart` Claude Code writes; or a WT-style `pid_started`) equals the
+pid's current start (`workers.claude_session_row_liveness`): a mismatch is a
+reused pid and never vetoes recovery; a live pid with no token is `unproven`. a claimer with no record
+(never spawned, or pruned) is `ambient`, and an unprovable death (registry
+unreadable, codex rollout missing, a process still naming the session) is
+`unproven` — both go through.
+
+### Adding a state value, a dim or an edge
+
+1. Add the value to its vocabulary tuple in `queue.py` (`VALID_STATUSES`,
+   `PLAN_STATUSES`, `ANSWER_STATES`, ...). `tests/test_liveness_table.py`
+   now fails: the frozen copy in `liveness._FROZEN` differs (D2.4) and the
+   value is in no row (D2.1).
+2. Add it to `liveness._FROZEN`, then either widen a row's boxes, add a row
+   (with owner, proof and recover), or add an `UNREACHABLE` entry citing the
+   code that makes it impossible. Rows must stay disjoint on reachable states.
+3. A stage row needs its key rule in `prove()`, and `stages.desired()` must
+   agree over the whole product (D2.3).
+4. A new dim: add it to `DIMS`, `_FROZEN`, `project()` and `synth()` in
+   `tests/liveness_golden.py`; boxes built with `_box()` admit every value of a
+   dim they omit.
+5. A new answer move: declare it in `ANSWER_TRANSITIONS` with its writer. Write
+   it only through `pa_transition` / `pa_bump_attempts` with literal
+   arguments, or in a function listed in `liveness.PA_INLOCK_WRITERS`; the AST
+   scan (D2.6) rejects anything else. Only `RECEIPT_CONFIRMED_WRITERS` may move
+   an answer to `delivered`. Add a golden in `tests/test_liveness_goldens.py`
+   that drives the real function through the edge (`Golden.step(..., edge=)`).
+
+## Liveness backstop (WT-31 phase B)
+
+`liveness.sweep()` runs every reconciler tick after `reconcile_stages`
+(`reconcile_once` with `supervise_stages` and not `dry_run`) and in `wt stages
+tick [--ref REF]`. It walks every live ticket (closed ones only with a
+due/running/filing assessment), calls `assess()`, and acts on at most one step
+per ticket. `wt liveness [-q Q] [REF] [--json]` prints the same assessment
+read-only (row, owner, proof, verdict, evidence, idle, the action it would take).
+
+**Idle gate.** Stage, claim and staffing rows act only after `STALL_S` of no
+activity (`WATCHTOWER_STALL_S`, default 1800 s). Activity is the newest store
+stamp (`updated_at`, `claimed_at`, `stage_session.spawned_at`, answer
+`state_at`, `parked.at`, recent history) and then the claim transcript / stage
+worker file mtimes. System-op rows (`dep.stuck`, `answer.parked_bare`,
+`answer.plan_conflict`, `answer.affinity_expired`) act on the first sweep;
+`plan.blocked` waits one tick (120 s), because `plan_verdict` sets `blocked`
+before its caller blocks the ticket.
+
+| Row kind | Evidence | Action |
+|---|---|---|
+| stage (`plan.*`, `review.verify`, `assess.*`) | `stage_session` worker alive, or a launch cooldown | `stage`: `reconcile_stages(only_ref)` |
+| `assess.filing` | idle | `assessment_run_ops` (the idempotent op replay) |
+| claim (`work.claimed`, sent-back) | `claim_owner` | dead: `resume` if resume-first applies, else `reopen`; unproven or GitHub: `escalate`; alive: none |
+| `work.unowned` (in_progress, no claimer, e.g. `update_status(in_progress, worker='')`) | owner `reconciler`; only a bound session `claim_owner` proves alive vetoes | `reopen` to the pool (no claimer to protect); GitHub: `escalate` |
+| `work.open` (staffing) | a live, unreleased queue worker | `spawn` one worker (auto_drain on, no launch-failure cooldown; one per queue per sweep) |
+| `dep.stuck` | stuck blocker not yet escalated | `escalate_stuck_blockers`; `BACKSTOP_NO_ESCALATION` if it still is not flagged |
+| `plan.blocked` | idle one tick | `BACKSTOP_UNBLOCKED_PLAN`, escalate to a human |
+| human / terminal / dependency rows | - | none |
+
+A live sent-back claim inside its WT-34 release window is never touched;
+`release_stalled_sent_back` owns it. A stage row with no `desired()` entry
+escalates (`no supervisor for state <id>`).
+
+**Answer floors.** Each floor is an edge through `pa_transition`, declared with
+its writer: `answer.routing` older than 2 x `ROUTE_LEASE_S` (the router gets its
+lease first) hands off by E5 (`_floor_routing`); `queued` older than
+`ANSWER_QUEUE_TTL_S` + lease, and `delivering` older than lease x
+(`MAX_DELIVERY_ATTEMPTS`+1) or with a dead owner after one lease, hand off by
+E10 (`_floor_bound`); `affinity_expired` (and an `affinity` whose prior worker
+is not alive after one lease) hands off by E11 (`_floor_affinity`);
+`plan_conflict` hands the answer to the plan stage (E5); `parked_bare` reopens.
+
+**`queue.recover_claim(ref, expect=, action=, reason=, ...)`** is the only
+backstop writer of claim state. It compares `expect` (status, `claimed_by`,
+`claimed_session_id`, `claim_proc`, and `liveness.fingerprint()`) inside the
+store lock; any race (reclaim, block, answer, comment/progress, re-bind) makes
+it a no-op with `BACKSTOP_SKIP <ref> race: ...`. Actions: `reopen` (the same
+field reset as `update_status(open)`, keeping `gate_feedback`, handing off a
+settled answer by E14, recording `orphan`/`displaced_*`), `resume` (stamps
+`claim_proc.resumed_at`), `escalate` (a system `needs_input` block, E17
+supersession) and `mark` (before a stage/spawn/assessment action). Every write
+appends a `backstop` history event and sets `backstop = {state, action, count,
+at, fingerprint}`. GitHub tickets are refused (the sweep escalates them with
+`q.block`).
+
+**Loop guard.** If a ticket is still in the same row with the fingerprint the
+backstop recorded (nothing moved since its last action), a prior `resume`
+becomes `reopen` and anything else becomes `escalate` (`second stall ...`), so
+the backstop never repeats one action forever.
+
+**Resume first (WT-30).** A dead builder holding a verifier rejection
+(`gate_feedback`, `resume.state == "pending"`, a resumable session) is resumed
+before it is reopened, both in the sweep and in `requeue_orphaned_tickets`. The
+orphan sweep stays the fast path: `claim_owner` alive vetoes a reopen, and a
+local reopen goes through `recover_claim` (GitHub still uses `update_status`).
+
+**Log lines.** `BACKSTOP <ref> state=<row> owner= proof= verdict= evidence=
+idle=Ns action=<a> [result]`, plus `BACKSTOP_SKIP`, `BACKSTOP_ANSWER_HANDOFF`,
+`BACKSTOP_ANSWER_PLAN_CONFLICT`, `BACKSTOP_NO_ESCALATION`,
+`BACKSTOP_UNBLOCKED_PLAN`.
+
+**Health (D5).** `claimable_depth` excludes plan-active tickets, `dep.stuck` and
+a reserved answer affinity. `queue_status` adds `stage_owned` (the `desired()`
+count), `stage_stuck` (no stage event for max(stuck minutes, stage idle limit +
+120 s)) and `stuck_reason` (`claimable` or `stage`). A stalled stage sets
+`state = "stuck"` even at depth 0, but the `stuck` bool keeps its old meaning
+(claimable work with no progress), since workers use it for nudges and spawns.
+There is no CCC alarm banner.
+
+## Verified delivery (WT-31 phase C)
+
+A send is not a delivery. `liveness.deliver(target, text, purpose=,
+dedupe_key=, ...)` is the one way a verified sender reaches a session. It tries
+UDS, then the FIFO, then `messages.deliver_message` / `send`, then a headless
+resume, in the order the caller lists. Every send:
+
+1. gets a delivery id and a nonce `⟨wt:<delivery_id>⟩` alone on the last line
+   of the text (a slash command gets none: it would become the command's
+   argument, so it is sent `unverified`);
+2. writes a `sending` row to the ledger, `~/.watchtower/deliveries.json`
+   (next to the outbox; `$WATCHTOWER_DELIVERIES_FILE` or
+   `liveness.DELIVERIES_FILE` override it);
+3. records a receipt (`receipts.record(nonce=)`) **before** the send, with the
+   transcript size as its offset. `messages.deliver` does the same for nonce'd
+   text it sends, and drops the receipt if every adapter fails.
+
+A receipt is `landed` only when its nonce appears in the transcript at or
+after the offset (raw or JSON-escaped). Earlier bytes, the same text sent
+before, and a nonce pasted mid-message never count. `advanced` (the transcript
+grew) stays pending. After `WATCHTOWER_RECEIPT_WAIT_S` (600 s) the receipt is
+`lost`. A transcript smaller than the offset (compacted or rewritten) resets
+the offset to 0.
+
+`deliver()` returns `state`:
+
+| State | Meaning |
+|---|---|
+| `pending` | sent; the row waits for the receipt |
+| `unverified` | sent; there is no receipt source (no session id, kimi/devin, slash command), and the sweep reads it lost |
+| `queued` | the outbox holds it (`msg_id`) |
+| `deferred` | `fifo_busy="defer"` and the turn is open; there is no row |
+| `in_flight` / `duplicate` | the messages ledger already holds the key; there is no row |
+| `failed` | no transport took it; the row keeps `failed_at` and is settled through the purpose's handler (see the sweep) |
+
+A headless resume is refused for an engine with no receipt source (anything
+outside `RECEIPT_ENGINES` = claude, codex); there is no override. Callers hand
+such engines off **before** any resume, so no verified sender lacks a receipt
+source: `_deliver_to_blocked_session` (`wt answer`, `wt reject`, `wt ack`,
+`wt plan decide`, `wt reopen --resume`, the WT-30 resume-first backstop) records
+`resume = skipped`, writes the answer onto the ticket text (a rejection's
+`gate_feedback` already survives) and force-releases the claim for a fresh
+worker, with nothing sent or spawned; `answers._resumable` is false for
+kimi/devin, so a parked answer is handed off (E5) instead of resumed, and the
+backstop reopens a rejected kimi/devin claim instead of resuming it. Claude and
+codex keep steer -> outbox -> headless resume.
+
+**Ledger.** There is one live row per `dedupe_key`: a new send supersedes the
+older `sending`/`pending` rows. Every retry has a new nonce, so an old send's
+nonce never confirms the new one. Rows are pruned after 24 h, and at most 2000
+are kept.
+
+**Sweep.** `liveness.sweep_deliveries()` runs on every daemon tick, after
+`receipts.sweep()`, and settles each pending row under the ledger lock:
+
+- **`confirmed`**: the nonce landed.
+- **`lost`**: any one of these:
+  - the receipt was lost or is missing;
+  - the row was pending for more than 2 x the window;
+  - the row was unverified;
+  - a queued row was still waiting after `expire + 2 x window`;
+  - a `sending` row is older than 2 x the window.
+- **`failed`** (settled): a send no transport took. A caller that owns the
+  outcome settles it synchronously with `liveness.settle_failed(delivery_id)`
+  (the answer router: E10; `_deliver_to_blocked_session`: resume evidence
+  `failed`, then release; the plan reminder fallback: block). Otherwise the
+  sweep settles it once it is `FAILED_SETTLE_GRACE_S` (30 s) old (nudge,
+  release, review, plan discussion messages). The row is claimed under the
+  ledger lock either way, so its handler runs exactly once. Failed rows written
+  before this rule (no `failed_at`) are left alone.
+
+It then runs the purpose's handler and logs
+`DELIVERY <ref|worker> <purpose> <key> <id> <state> (<reason>) -> <result>`.
+
+| Purpose | Key | Confirmed | Lost / failed |
+|---|---|---|---|
+| `answer` | `answer:<ref>:<sid>:<gen>` | E9 `_on_answer_confirmed` (`delivering`/`queued` -> `delivered`) | E10 `_fallback_reopen` (hand off) |
+| `stage_answer` | `stage_answer:<ref>:<gen>:<key>` | E13 `stages._confirm_stage_answer` | stays `handed_off` |
+| `nudge` | `nudge:<worker_id>` | clears `undeliverable_since` | resend once, then set `undeliverable_since` on the worker record |
+| `release` | `release:<worker_id>` | - | resend once, then `RELEASE_UNDELIVERED` |
+| `plan` | `plan:<ref>:<role>:<kind>` | a `reminder` bumps `nudges` (escalates past the max) | a `reminder` blocks the plan for a human; any other message to the live stage session marks it lost (killed, death recorded, respawned within the attempt budget) |
+| `review` | `review:<ref>:<n>` | - | renotify once (the second send's own row settles it), then `wt blocked` (system block); blocks at once if the target is gone. `_notify_review` returns the `deliver` result and logs `REVIEW_NOTIFY` on a failed send |
+| `resume` | `resume:<ref>:<sid>` | - | `set_resume_state(failed)` |
+
+E9, E10 and E13 are compare-and-swap moves on `gen` and the state. A confirm that
+arrives after E14 or E17 (release, reopen, re-block) is therefore a no-op.
+`delivered` is written only by `RECEIPT_CONFIRMED_WRITERS`. The answer router
+treats a ledger row that is still pending as in flight, so it does not resend,
+and the E10 floors wait for it.
+
+A stage prompt that carries a handed-off answer ends with the nonce. The
+session did not exist before the spawn, so its receipt offset is 0
+(`register_spawn_delivery`). A codex stage has no session id at spawn, so its row
+is unverified and the answer stays `handed_off` until the next claim (E12).
+
+**Sender lists (D2.8).** Every function that calls a raw transport
+(`deliver_via_uds`, `write_to_worker_fifo`, `_write_fifo_frame`, `send_lines`,
+`messages.send`, `deliver_message`, `_resume_session_headless`), or calls
+`_deliver_to_blocked_session` or `liveness.deliver`, is in exactly one list:
+
+- **`liveness.VERIFIED_SENDERS`**: reaches a session only through `deliver`.
+- **`ADVISORY_SENDERS`**: best effort. The result of the send never feeds a
+  ticket-state write, either as an argument or as the test of an `if`.
+- **`TRANSPORT_LAYER`**: the plumbing itself.
+
+`tests/test_liveness_delivery.py` checks this with an AST scan, and also fails
+on stale list entries.
+
+### Adding a verified sender
+
+1. Call `liveness.deliver(...)` with one of the `DELIVERY_PURPOSES`, a stable
+   `dedupe_key`, and `ref` / `worker_id` / `meta` for the handler. Do not call a
+   raw transport.
+2. Treat `ok` as "sent", not as "delivered". Any state change that depends on
+   the session reading the message belongs in the purpose's handler
+   (`liveness.HANDLERS`).
+3. Add `module.function` to `VERIFIED_SENDERS`. A new purpose needs a handler,
+   and if it moves an answer, a declared edge with `sweep_deliveries` as its
+   caller.

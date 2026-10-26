@@ -47,6 +47,21 @@ def test_ready_ticket_still_counts_as_claimable_alongside_needs_spec():
     assert row["stuck"] is True
 
 
+def test_oldest_claimable_age_ignores_long_gated_tickets():
+    """A queue's oldest open ticket can be gated for hours beside a minutes-old
+    claimable one; the claimable age is what a stall alarm should read (OPS-145)."""
+    now = datetime.now(timezone.utc)
+    stamp = lambda d: (now - d).strftime("%Y-%m-%dT%H:%M:%SZ")
+    items = [
+        _item(readiness="needs-shaping", created_at=stamp(timedelta(hours=7))),
+        _item(readiness="ready", created_at=stamp(timedelta(minutes=3))),
+    ]
+    row = health.queue_status("Q", items)
+    assert row["oldest_open_age_s"] > row["oldest_claimable_age_s"]
+    assert row["oldest_claimable_age_s"] < 3600
+    assert health.queue_status("Q", items[:1])["oldest_claimable_age_s"] is None
+
+
 def test_fresh_claim_on_old_ticket_is_not_immediately_stuck():
     """A ticket can sit open for a long time before anyone claims it. The
     instant a worker claims it, that's progress -- the queue must not read
@@ -111,3 +126,31 @@ def test_github_connectivity_alert_false_under_threshold_true_at_it(tmp_path, mo
     assert result["outage_duration"] == "5m"
     assert result["last_error"] == "gh auth unavailable"
     assert result["consecutive_failures"] == 5
+
+
+def test_model_floor_above_worker_model_is_not_claimable():
+    """A ticket whose model_floor the queue's worker can't meet is skipped by
+    claim_next, so it must not read as stuck (OPS-1278: endless nudges to an
+    idle worker whose `wt claim` returned nothing)."""
+    old = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    it = _item(created_at=old)
+    it["model_floor"] = "claude-opus-5"
+    row = health.queue_status("Q", [it], worker_model="claude-haiku-4-5")
+    assert row["claimable_depth"] == 0
+    assert row["stuck"] is False
+    assert health.queue_status("Q", [it])["claimable_depth"] == 1
+
+
+def test_deferred_ticket_is_claimable_only_after_its_window():
+    """A `wt defer`red ticket is out of claim_next's pool until the window ends,
+    so it must not read as claimable (stalled) work in the meantime (OPS-81)."""
+    now = datetime.now(timezone.utc)
+    old = (now - timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    later = (now + timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    earlier = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    waiting = dict(_item(created_at=old), deferred_until=later)
+    row = health.queue_status("Q", [waiting])
+    assert row["depth"] == 1 and row["claimable_depth"] == 0
+    assert row["stuck"] is False
+    row = health.queue_status("Q", [dict(waiting, deferred_until=earlier)])
+    assert row["claimable_depth"] == 1

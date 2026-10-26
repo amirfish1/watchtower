@@ -1,7 +1,7 @@
 """Model-id normalization in config.canonical_model().
 
 Lives in its own module rather than test_smoke.py so the two alias layers --
-the explicit MODEL_ALIASES remap table and the structural claude- prefix for
+the catalog-derived alias table and the structural claude- prefix for
 versioned short forms -- are pinned together in one readable place.
 
 The prefix layer is a fix that was written directly on the hermes VM
@@ -11,12 +11,16 @@ behavior from regressing back to either half.
 """
 
 import watchtower.config as config
+import watchtower.queue as queue
 
 
 def test_table_alias_wins_over_structural_prefix():
     """opus-5 is a REMAP, not a prefix: it once pointed at claude-opus-4-8.
     The table must be consulted first so a retarget stays possible."""
     assert config.canonical_model("claude", "opus-5") == "claude-opus-5"
+    assert config.canonical_model("claude", "opus-5-5") == "claude-opus-5-5"
+    assert "claude-opus-5-5" in config.approved_models("claude")
+    assert config.is_valid_model_floor("claude-opus-5-5")
 
 
 def test_versioned_short_form_gets_the_claude_prefix():

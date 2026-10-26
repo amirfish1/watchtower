@@ -17,7 +17,7 @@ import json
 
 import pytest
 
-from test_messages import wt  # noqa: F401  (shared isolated-sandbox fixture)
+from test_messages import wt, _live_worker, _read_fifo_msg  # noqa: F401
 from test_github_backend import _install_fake_gh, _reload_isolated, _drainable
 
 
@@ -125,6 +125,59 @@ def test_block_notifies_submitter_with_question(wt, monkeypatch):
     assert target == "worker-sub"
     assert "needs input" in text
     assert "ship it?" in text
+
+
+@pytest.mark.parametrize("event", ["needs_input", "closed", "awaits_decision"])
+def test_actionable_notice_keeps_full_multiline_detail(wt, monkeypatch, event):
+    calls = _record_sends(monkeypatch, wt.messages)
+    detail = "Choose a rollout:\n" + ("- Keep existing bookings; verify credits.\n" * 45)
+    detail += "Recommendation: preserve credits. Approve option B? בדיקה"
+    wt.q._notify_ticket_event(
+        {"ref": "SUB-1", "project": "SUB", "submitter": "worker-sub"},
+        event, detail=detail,
+    )
+    assert len(detail) > 1500
+    assert calls == [("worker-sub", f"[watchtower] SUB-1 {wt.q._NOTIFY_VERBS[event]} — {detail}")]
+
+
+def test_clipped_claim_notice_has_lookup_pointer(wt, monkeypatch):
+    calls = _record_sends(monkeypatch, wt.messages)
+    wt.config.set_notify_events("SUB", ["claimed"])
+    wt.q._notify_ticket_event(
+        {"ref": "SUB-1", "project": "SUB", "submitter": "worker-sub"},
+        "claimed", detail="long claim " * 30,
+    )
+    assert calls[0][1].endswith("… (full text: wt find SUB-1)")
+
+
+@pytest.mark.parametrize("event", ["needs_input", "closed"])
+@pytest.mark.parametrize("long_unicode", [False, True])
+def test_long_actionable_notice_arrives_intact_over_real_fifo(
+    wt, monkeypatch, event, long_unicode
+):
+    recipient = _live_worker(wt, "SUB")
+    # Exercise real queue transitions, send(), JSON framing, and an OS FIFO,
+    # without contacting another session or the optional CCC forward service.
+    monkeypatch.setattr(wt.messages, "ccc_forward_target", lambda target: target)
+    item = wt.q.enqueue(project="SUB", note="long notice", submitter=recipient["worker_id"])
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    # Original BYM-FUTURE-2419 decision, recovered from its worker log.
+    detail = (
+        'Owner approval needed before spending tokens (the ticket requires it). OK to run: '
+        '(1) becky:eval before/after on 39b18cf90/f523b830b with '
+        '--model=openrouter:openai/gpt-6-luna (Luna replies plus one Sonnet grader call per '
+        'finding); (2) about 7 sibling replays via replay-fixture.ts; (3) 5 repeats of the '
+        "'\\$816 or \\$812?' run? Reply 'go' (and any token or cost cap) and the worker will "
+        'run them, fix the prompt if the question recurs, and report the score change.'
+    )
+    if long_unicode:
+        detail = "אפשרות א: לשמור את ההיסטוריה.\n" * 100
+    if event == "needs_input":
+        wt.q.block(item["ref"], session_id="worker-a", question=detail)
+    else:
+        wt.q.close(item["ref"], "worker-a", resolution={"summary": detail})
+    received = _read_fifo_msg(wt)["message"]["content"][0]["text"]
+    assert received == f"[watchtower] {item['ref']} {wt.q._NOTIFY_VERBS[event]} — {detail}"
 
 
 # --------------------------------------------------- no self-notify (actor)
@@ -429,15 +482,18 @@ def test_github_backend_submitter_round_trips_and_notifies_on_claim_close_block(
     assert {t for t, _ in calls} == {"watcher-1"}
 
     calls.clear()
-    blocked = q.block(item["ref"], session_id="worker-a", question="which repo?")
+    blocked = q.block(item["ref"], session_id="worker-a", question="which repo?\n" + "Preserve audit history. " * 30)
     assert blocked["needs_input"] is True
     assert {t for t, _ in calls} == {"worker-sub", "watcher-1"}
 
+    assert all(text.endswith(blocked["block_question"]) for _, text in calls)
+
     calls.clear()
     q.answer(item["ref"], "the primary one", session_id="human-a")
-    closed = q.close(item["ref"], "worker-a", resolution={"summary": "fixed on GH"})
+    closed = q.close(item["ref"], "worker-a", resolution={"summary": "fixed on GH\n" + "Verified payment records. " * 30})
     assert closed["status"] == "closed"
     assert {t for t, _ in calls} == {"worker-sub", "watcher-1"}
+    assert all(text.endswith(closed["resolution"]["summary"]) for _, text in calls)
 
 
 # ------------------------------------------------------- delivery class (WT-22)
@@ -606,3 +662,49 @@ def test_wt_config_notify_events_flag(wt_cli, capsys):
                             "claimed,bogus"]) == 1
     err = capsys.readouterr().err
     assert "unknown notify event(s): bogus" in err
+
+
+# ------------------------------------------------- notify: accept (WATCHTOWER-37)
+def _in_review(wt, monkeypatch, submitter):
+    monkeypatch.setattr(wt.q, "_notify_review", lambda *a, **k: None)
+    item = wt.q.enqueue(project="SUB", note="gated", submitter=submitter, gates=["review"])
+    wt.q.claim_by_ref(item["ref"], "builder")
+    assert wt.q.close(item["ref"], "builder", resolution={"summary": "built"})["status"] == "in_review"
+    return item
+
+
+def test_self_accept_does_not_notify_the_accepter_but_others_still_hear(wt, monkeypatch):
+    """A session that accepts its own review gate gets no "closed" echo, even
+    though ``by`` is just the default "human" label; another subscriber does."""
+    sid = "11111111-2222-3333-4444-555555555555"
+    wt.config.add_subscriber("SUB", "watcher")
+    item = _in_review(wt, monkeypatch, sid)
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.accept(item["ref"], actor=sid)
+
+    assert [t for t, _ in calls] == ["watcher"]
+    assert "closed" in calls[0][1]
+
+
+def test_accept_by_someone_else_still_notifies_the_submitter(wt, monkeypatch):
+    item = _in_review(wt, monkeypatch, "11111111-2222-3333-4444-555555555555")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.accept(item["ref"], actor="99999999-8888-7777-6666-555555555555")
+
+    assert [t for t, _ in calls] == ["11111111-2222-3333-4444-555555555555"]
+
+
+def test_cli_accept_passes_the_callers_session_as_actor(wt_cli, monkeypatch, capsys):
+    sid = "11111111-2222-3333-4444-555555555555"
+    item = _in_review(wt_cli, monkeypatch, sid)
+    monkeypatch.setattr(wt_cli.cli.q, "_notify_review", lambda *a, **k: None)
+    calls = _record_sends(monkeypatch, wt_cli.messages)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", sid)
+
+    assert wt_cli.cli.main(["accept", item["ref"]]) == 0
+    capsys.readouterr()
+
+    assert wt_cli.q.get(item["ref"])["status"] == "closed"
+    assert calls == []

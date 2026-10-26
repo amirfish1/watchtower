@@ -1,0 +1,34 @@
+{
+ "engines": {
+  "kimi": [
+   {
+    "id": "kimi-code/k3"
+   },
+   {
+    "id": "kimi-code/kimi-for-coding",
+    "output_per_mtok": 4
+   },
+   {
+    "id": "kimi-code/kimi-for-coding-highspeed",
+    "output_per_mtok": 8
+   }
+  ],
+  "antigravity": [
+   {
+    "id": "gemini-3.1-pro-high",
+    "label": "Gemini 3.1 Pro (High)"
+   },
+   {
+    "id": "gemini-3.1-pro-low",
+    "label": "Gemini 3.1 Pro (Low)"
+   },
+   {
+    "id": "gemini-3.8-flash-high",
+    "label": "Gemini 3.8 Flash (High)"
+   }
+  ]
+ },
+ "rank": {
+  "kimi-code/k3": 1
+ }
+}

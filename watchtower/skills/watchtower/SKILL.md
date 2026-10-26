@@ -77,7 +77,34 @@ the command fails before filing anything.
 rejected with exit code 1. The summary is the trust signal surfaced on the
 dashboard; the proof keeps uncommitted or fabricated fixes from being closed.
 
+Tickets can carry acceptance gates (`wt add/edit --gate cmd:<command> | verify |
+review`, or `wt config <queue> --gate ...`). A ticket with gates lands in
+`in_review` on `wt close`, not `closed`, until every gate passes. `wt claim` and
+`wt find` print a "Checks after you close" block listing them; if it shows a
+verify check, skip your own independent verifier -- WatchTower spawns one after
+you close, and it files its verdict with `wt verdict`. `wt accept` / `wt reject
+--reason` are the reviewer's verbs; a failed gate or rejection sends the ticket
+back with the reason and resumes your session.
+
 ## Don't fabricate
 
 If `wt find <ref>` returns "not found" or `wt` isn't installed, say so
 plainly. Don't infer a ticket's status from memory or guess at a queue name.
+
+
+## Duplicate incidents
+
+For automated local-queue filing, `wt add ... --dedupe-key <stable-incident-key>`
+atomically reuses an existing ticket. Include the project, deployment or incident
+episode, and error signature in the key; append new evidence with `wt comment`.
+
+When the same incident already has multiple tickets, use
+`wt duplicate <duplicate-ref> --of <original-ref>` or, for your own claim,
+`wt close <duplicate-ref> --duplicate-of <original-ref> --no-code`.
+The follower waits for the original's required gates without another verifier.
+Failures and reopenings keep the follower unresolved. A summary saying
+“duplicate of” or a shared commit does not establish this relationship.
+Use `wt duplicate <ref> --clear` to reopen it for independent work.
+Links are local-queue only; chains, cycles, plan groups, and weaker original
+gates are refused. Only link tickets whose acceptance criteria are covered by
+the original, and include every affected route in its verification evidence.

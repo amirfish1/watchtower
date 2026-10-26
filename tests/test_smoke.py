@@ -631,14 +631,24 @@ def test_model_floor_met_ranks_across_engines(store):
     config.set_model("Q", "claude-sonnet-5")
     assert config.model_floor_met("Q", "claude-opus-4-8") is False
 
-    # Empty or unranked floors never block a claim (fail open).
+    # Empty or unranked floors are not enforceable, so they are met.
     assert config.model_floor_met("Q", "") is True
     assert config.model_floor_met("Q", "gpt-5.6") is True
+
+    # WT-10: sonnet-5-5 is ranked, and below opus-5-5.
+    config.set_model("Q", "claude-sonnet-5-5")
+    assert config.model_floor_met("Q", "claude-opus-5-5") is False
+    assert config.model_floor_met("Q", "claude-sonnet-5") is True
+
+    # An unranked queue model fails closed against a ranked floor.
+    config.set_engine("Q", "codex")
+    config.set_model("Q", "gpt-5.5")
+    assert config.model_floor_met("Q", "claude-sonnet-5") is False
 
 
 def test_model_floor_accepts_claude_opus_5(store, capsys):
     """MYTOPOFMIND-12: ``claude-opus-5`` is an approved model (WT-116) but was
-    missing from VALID_MODEL_FLOORS/MODEL_FLOOR_TIERS, so ``wt add
+    missing from the old hard-coded floor lists, so ``wt add
     --model-floor claude-opus-5`` failed argparse's choices check with
     "invalid choice" -- opus-5 not recognized as a valid floor -- and any
     ticket that did carry it as a floor silently failed open (ranked as
@@ -647,7 +657,7 @@ def test_model_floor_accepts_claude_opus_5(store, capsys):
     import watchtower.config as config
     import watchtower.queue as q
 
-    assert "claude-opus-5" in q.VALID_MODEL_FLOORS
+    assert config.is_valid_model_floor("claude-opus-5")
 
     config.set_engine("Q", "claude")
     config.set_model("Q", "claude-opus-4-8")
@@ -679,20 +689,15 @@ def test_add_and_claim_honor_model_floor(store, capsys):
     ]) == 0
     ref = capsys.readouterr().out.split()[1]
 
+    # WT-10: the sonnet-5 worker skips the opus-4-8 ticket instead of
+    # claiming and parking it.
     rc = cli.main(["claim", "-q", "Q", "--worker", "w1", "--json"])
-    assert rc == 1
-    err = capsys.readouterr().err
-    assert "model floor" in err
-    assert "claude-opus-4-8" in err
-
+    assert rc == 0
     item = q.get(ref)
-    assert item["status"] == "in_progress"  # parked, not reopened
-    assert item["needs_input"] is True
-    assert "claude-opus-4-8" in item["block_question"]
+    assert item["status"] == "open"
+    assert item["needs_input"] is False
 
-    # Bumping the queue's model to meet the floor is enough for the same
-    # check to pass -- the re-claim/reopen mechanics of answer() are a
-    # pre-existing, separately-tested path, not re-exercised here.
+    # A queue whose model meets the floor can claim it.
     config.set_model("Q", "claude-opus-4-8")
     assert config.model_floor_met("Q", "claude-opus-4-8") is True
 
@@ -705,6 +710,54 @@ def test_edit_can_set_model_floor(store, capsys):
     ref = capsys.readouterr().out.split()[1]
     assert cli.main(["edit", ref, "--model-floor", "kimi-code/k3"]) == 0
     assert q.get(ref)["model_floor"] == "kimi-code/k3"
+
+
+def test_add_edit_and_model_change_warn_when_floor_exceeds_queue_model(
+        store, capsys, monkeypatch):
+    """WATCHTOWER-39: a floor above the queue's model is no longer silent --
+    `wt add`, `wt edit --model-floor` and lowering the queue's model each
+    print a one-line warning naming the floor, the queue model and what
+    happens next (a one-off floor-model worker, WT-10)."""
+    import watchtower.cli as cli
+    import watchtower.config as config
+    import watchtower.workers as workers
+
+    monkeypatch.setattr(workers, "engine_available", lambda eng: True)
+    monkeypatch.setattr(workers, "release_workers", lambda **k: [])
+    config.set_engine("Q", "claude")
+    config.set_model("Q", "claude-opus-4-8")
+
+    assert cli.main(["add", "-q", "Q", "--title", "t", "--note", "n",
+                     "--model-floor", "claude-opus-5"]) == 0
+    out = capsys.readouterr()
+    ref = out.out.split()[1]
+    assert f"warning: {ref} needs claude-opus-5 but queue Q runs claude-opus-4-8" in out.err
+    assert "one-off claude-opus-5 worker" in out.err
+
+    # A floor the queue meets is silent.
+    assert cli.main(["edit", ref, "--model-floor", "claude-opus-4-8"]) == 0
+    assert "warning" not in capsys.readouterr().err
+    # Lowering the queue's model below an open ticket's floor warns.
+    assert cli.main(["config", "-q", "Q", "--model", "claude-sonnet-5"]) == 0
+    assert f"{ref} needs claude-opus-4-8 but queue Q runs claude-sonnet-5" in capsys.readouterr().err
+    # Raising the floor by edit warns too.
+    assert cli.main(["edit", ref, "--model-floor", "claude-opus-5"]) == 0
+    assert f"{ref} needs claude-opus-5" in capsys.readouterr().err
+
+
+def test_floor_warning_names_wt_ready_when_auto_drain_is_off(store, capsys, monkeypatch):
+    import watchtower.cli as cli
+    import watchtower.config as config
+    import watchtower.workers as workers
+
+    monkeypatch.setattr(workers, "engine_available", lambda eng: True)
+    monkeypatch.setattr(config, "auto_drain", lambda queue: False)
+    config.set_engine("Q", "claude")
+    config.set_model("Q", "claude-sonnet-5")
+    assert cli.main(["add", "-q", "Q", "--title", "t", "--note", "n",
+                     "--model-floor", "claude-opus-4-8"]) == 0
+    out = capsys.readouterr()
+    assert f"`wt ready {out.out.split()[1]}`" in out.err
 
 
 def test_ccc_shared_default_model_used_when_queue_unset(store, tmp_path, monkeypatch):
@@ -1333,7 +1386,7 @@ def test_cli_close_builds_resolution(store, capsys):
         "--summary", "did X",
         "--no-code",
         "--caveat", "watch Y",
-        "--follow-up", "do Z later",
+        "--follow-up", "do Z later (CLIRES-2)",
     ])
     assert rc == 0
     out = capsys.readouterr().out
@@ -1342,7 +1395,7 @@ def test_cli_close_builds_resolution(store, capsys):
     it = q.get("CLIRES-1")
     assert it["resolution"]["summary"] == "did X"
     assert it["resolution"]["caveats"] == ["watch Y"]
-    assert it["resolution"]["follow_ups"] == ["do Z later"]
+    assert it["resolution"]["follow_ups"] == ["do Z later (CLIRES-2)"]
 
     # The closed wt ls row shows the summary + counts.
     assert main(["ls", "-q", "CLIRES", "--status", "closed"]) == 0
@@ -1363,6 +1416,35 @@ def test_cli_ls_json_honors_limit(store, capsys):
     payload = json.loads(capsys.readouterr().out)
 
     assert [item["note"] for item in payload] == ["first", "second"]
+
+
+def test_cli_close_rejects_untracked_follow_ups(store, capsys):
+    """A follow-up/unresolved item with no ticket ref blocks the close
+    (BECKY-1625: "run the backfill" lived only in the closing comment)."""
+    import watchtower.queue as q
+    from watchtower.cli import main
+
+    q.enqueue(project="UNTRK", note="work")
+    rc = main([
+        "close", "UNTRK-1",
+        "--summary", "fixed the code",
+        "--no-code",
+        "--unresolved", "run the prepared backfill script",
+    ])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "must cite the ticket" in err
+    assert "run the prepared backfill script" in err
+    assert q.get("UNTRK-1")["status"] != "closed"
+
+    for ref in ("OPS-12", "BECKY-DESIGN-7", "#1625"):
+        q.enqueue(project="UNTRK", note=f"work {ref}")
+    open_refs = [i["ref"] for i in q.list_items(project="UNTRK", status="open")]
+    for target, ref in zip(open_refs[1:], ("OPS-12", "BECKY-DESIGN-7", "#1625")):
+        assert main([
+            "close", target, "--summary", "done", "--no-code",
+            "--unresolved", f"needs prod creds ({ref})",
+        ]) == 0
 
 
 def test_cli_close_enqueue_follow_ups(store, capsys):
@@ -2186,3 +2268,17 @@ def test_answer_requeues_when_session_over_context_budget(store, tmp_path, monke
     assert not item.get("needs_input")
     assert "the answer is B" in (item.get("text") or "")
     assert "which way?" in (item.get("text") or "")
+
+
+def test_config_audit_lines_stay_out_of_the_real_activity_log(tmp_path, monkeypatch):
+    """WT-8: a test that only isolates the config file must not append CONFIG
+    audit lines to the developer's real ~/.watchtower/activity.log."""
+    monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(tmp_path / "qc.json"))
+    import watchtower.config as config
+    import watchtower.queue as q
+    importlib.reload(config)
+
+    log = q._resolve_activity_log_path()
+    assert log != q._ACTIVITY_LOG and tmp_path in log.parents
+    config.set_auto_drain("LEAKCHECK", True)
+    assert "LEAKCHECK updated" in log.read_text()

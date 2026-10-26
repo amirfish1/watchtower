@@ -140,7 +140,7 @@ def test_find_engine_ancestor_ignores_codex_app_server(wt, monkeypatch):
         "run",
         lambda *args, **kwargs: SimpleNamespace(
             stdout=(
-                "9000 /Users/amirfish/.local/bin/codex -c "
+                "9000 /Users/x/.local/bin/codex -c "
                 "model_context_window=1000000 app-server --listen stdio://\n"
             )
         ),
@@ -173,6 +173,12 @@ def _live_worker(wt, queue, *, with_fifo=True):
     )
     rec["_test_activity_path"] = str(transcript)
     return rec
+
+
+def _claude_registry_readable(wt):
+    """WT-31: the claim_owner resolver judges a claude worker ``dead`` only
+    when the Claude session registry is readable (else ``unproven``)."""
+    (wt.tmp / "claude-home" / "sessions").mkdir(parents=True, exist_ok=True)
 
 
 def _dead_worker(wt, queue):
@@ -385,6 +391,50 @@ def test_dispatch_after_enqueue_acts_on_a_requested_run_with_drain_off(wt, monke
     assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-manual"
 
 
+@pytest.mark.parametrize("drain", [False, True])
+def test_dispatch_names_unready_readiness_not_auto_drain(wt, monkeypatch, drain):
+    """An unclaimable readiness is the real blocker whatever the drain
+    setting; the DISPATCH line must say so instead of "auto_drain off"."""
+    wt.config.set_auto_drain("Q", drain)
+    item = wt.q.enqueue(project="Q", note="park me", readiness="needs-rationale")
+    monkeypatch.setattr(wt.workers, "spawn_workers",
+                        lambda *a, **k: pytest.fail("spawned for an unready ticket"))
+
+    reason = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+
+    assert reason.startswith("not ready — readiness needs-rationale")
+    assert "auto_drain" not in reason
+
+
+def test_dispatch_reconciles_only_the_dispatched_queue(wt, monkeypatch):
+    """WT-2: a ▶ knows which queue needs staffing, so it must not pay for a
+    fleet-wide pass -- other queues' depth reads and the maintenance sweeps
+    are the periodic tick's job, and running them inline delayed SPAWN_PLAN
+    by ~13 s."""
+    wt.config.set_auto_drain("OTHER", True)
+    wt.q.enqueue(project="OTHER", note="backlog elsewhere")
+    wt.config.set_auto_drain("Q", False)
+    item = wt.q.mark_runnable(wt.q.enqueue(project="Q", note="run me")["ref"])
+
+    swept = []
+    for name in ("release_zombie_workers", "reap_released_workers",
+                 "requeue_orphaned_tickets", "backfill_recent_session_titles"):
+        monkeypatch.setattr(wt.workers, name,
+                            lambda *a, _n=name, **k: swept.append(_n) or [])
+    monkeypatch.setattr(
+        wt.workers, "spawn_workers",
+        lambda queue, n=1, **kwargs: [{"worker_id": f"{queue.lower()}-w", "queue": queue}],
+    )
+
+    assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-w"
+    assert swept == []
+
+    scoped = wt.workers.reconcile_once(dry_run=True, only_queue="Q")
+    assert {s["queue"] for s in scoped["spawned"] + scoped["skipped"]} <= {"Q"}
+    full = wt.workers.reconcile_once(dry_run=True)
+    assert "OTHER" in {s["queue"] for s in full["spawned"]}
+
+
 def test_reconcile_empty_queue_skips(wt):
     wt.config.set_auto_drain("Q", True)  # config entry exists, but no tickets
     r = wt.workers.reconcile_once(dry_run=True)
@@ -427,14 +477,14 @@ def test_reconcile_live_equals_desired_skips(wt):
     assert not r["spawned"]
 
 
-def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
+def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt, monkeypatch):
     """A worker parked on a human question (``needs_input``) is alive but does
     no dispatch work until answered, which can take hours. Before WT-129 it
     still counted toward desired_workers, so one blocked ticket could occupy
     the queue's entire budget and starve every other claimable ticket
     alongside it (WT-129 blocking WT-131's dispatch).
 
-    Since SONIA-CHAT-21, a reachable blocked-only worker still covers the
+    Since CLIENT-CHAT-21, a reachable blocked-only worker still covers the
     budget slot (no second worker spawns for it) but now via a wake nudge on
     its FIFO rather than sitting there doing nothing -- it retries
     `wt claim` itself and picks up the other ticket."""
@@ -448,6 +498,9 @@ def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
     )
     assert claimed["ref"] == blocked["ref"]
     wt.q.block(blocked["ref"], question="fix or dismiss?", session_id=worker["worker_id"])
+    # Legacy hold-while-blocked scenario (GitHub / plan-gate style); WT-28
+    # parking has its own coverage in test_park_blocks.py.
+    monkeypatch.setattr(wt.q, "migrate_legacy_blocks", lambda *a, **k: [])
 
     r = wt.workers.reconcile_once(dry_run=False)
     assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 0
@@ -458,7 +511,7 @@ def test_reconcile_blocked_worker_does_not_starve_other_claimable_work(wt):
 
 
 def test_reconcile_wakes_fifo_less_blocked_worker_falls_back_to_spawn(wt):
-    """SONIA-CHAT-21's other half: a blocked-only worker with no live FIFO
+    """CLIENT-CHAT-21's other half: a blocked-only worker with no live FIFO
     (e.g. a Codex worker that already exited between turns) can't be woken,
     so it must NOT be counted as covering the spawn budget -- a second
     worker still needs to spawn to pick up the other claimable ticket."""
@@ -600,13 +653,18 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
     results = [None, None]
 
     def run(i):
-        results[i] = wt.workers.reconcile_once(dry_run=False)
+        # Exercise the real staffing lock without unrelated fleet maintenance
+        # (stage supervision, title backfills, orphan sweeps) consuming this
+        # concurrency test's deadline on a busy development host.
+        results[i] = wt.workers.reconcile_once(dry_run=False, only_queue="Q")
 
     threads = [threading.Thread(target=run, args=(i,)) for i in range(2)]
     for t in threads:
         t.start()
+    # This checks serialization, not a latency budget. Loaded fleet hosts
+    # need time for both passes to finish before the fixture is torn down.
     for t in threads:
-        t.join(timeout=10)
+        t.join(timeout=60)
 
     assert all(r is not None for r in results), "a reconcile pass deadlocked"
     total = sum(len(r["spawned"]) for r in results)
@@ -620,8 +678,10 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
 def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
     """A Codex quota failure exits after creating a session. Reconcile must not
     create a fresh cloud session every tick while the reset/cooldown is active."""
+    monkeypatch.setattr(wt.workers, "engine_available", lambda e: e in {"claude", "codex"})
     wt.config.set_auto_drain("Q", True)
     wt.config.set_engine("Q", "codex")
+    wt.config.set_fallback_to_default_worker("Q", True)
     wt.q.enqueue(project="Q", note="work")
     sid = "11111111-1111-1111-1111-111111111111"
     script = (
@@ -648,7 +708,7 @@ def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
         "queue": "Q", "from_engine": "codex", "to_engine": "claude",
         "reason": "engine usage limit",
     }]
-    assert wt.config.engine("Q") == "claude"
+    assert wt.config.engine("Q") == "codex"
     activity = (wt.tmp / "activity.log").read_text()
     correlated_failures = [
         line for line in activity.splitlines() if "  SPAWN_FAIL" in line
@@ -672,37 +732,89 @@ def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
     )
 
 
+def test_spawn_plan_line_is_readable_and_cooldown_skip_is_logged(wt):
+    """The plan line leads with a plain-English sentence, the verb never glues
+    onto the first field, and a cooldown that blocks the spawn says so in the
+    activity log rather than only in reconcile's return value."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_engine("Q", "codex")
+    wt.q.enqueue(project="Q", note="work")
+    log = wt.tmp / "fail.log"
+    log.write_text("error: unexpected argument\n")
+    wt.workers._record_launch_failure(
+        queue="Q", engine="codex", worker_id="q-old", pid=1, log_path=log,
+        reason="engine exited immediately (exit 2)",
+    )
+
+    result = wt.workers.reconcile_once(dry_run=False)
+
+    assert result["spawned"] == []
+    plan = _activity_lines(wt, "SPAWN_PLAN")[0]
+    assert "SPAWN_PLAN wants to spawn 1 worker (initial staffing); 0/1 workers running, 1 of 1 open tickets claimable | reconcile_id=" in plan
+    skip = _activity_lines(wt, "SPAWN_SKIP")[0]
+    assert "codex is cooling down until" in skip
+    assert "engine exited immediately (exit 2)" in skip
+    assert "fallback to the default worker is off for this queue" in skip
+    assert "requested=1" in skip
+
+
 def test_reconcile_usage_limit_falls_back_to_default_engine(wt, monkeypatch):
-    """A quota-exhausted explicit engine is replaced once, not retried forever."""
+    """A quota-exhausted engine is substituted for this launch only: the
+    queue's stored engine/model are the user's and are never rewritten
+    (WATCHTOWER-30)."""
     wt.config.set_auto_drain("Q", True)
     wt.config.set_engine("Q", "kimi")
     wt.config.set_model("Q", "kimi-code/k3")
+    wt.config.set_fallback_to_default_worker("Q", True)
     wt.q.enqueue(project="Q", note="work")
     calls = []
 
     def fake_spawn(
         queue, n=1, engine="claude", *, repo_path="", dry_run=False,
-        launch_failures=None, **_kwargs,
+        launch_failures=None, model="", inherit_queue_model=True, **_kwargs,
     ):
-        calls.append(engine)
+        calls.append((engine, model, inherit_queue_model))
         if engine == "kimi":
             launch_failures.append({"reason": "engine usage limit"})
             return []
         return [{"worker_id": "fallback-worker", "queue": queue, "engine": engine}]
 
     monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
-    monkeypatch.setattr(wt.config, "fallback_engine", lambda failed: "codex")
-    monkeypatch.setattr(wt.config, "default_model", lambda engine: "gpt-5.6-terra")
+    monkeypatch.setattr(wt.config, "fallback_engine", lambda failed, **kw: "codex")
+    monkeypatch.setattr(wt.config, "fallback_model", lambda engine: "gpt-5.6-terra")
 
     result = wt.workers.reconcile_once(dry_run=False)
 
-    assert calls == ["kimi", "codex"]
-    assert wt.config.engine("Q") == "codex"
-    assert wt.config.model("Q") == "gpt-5.6-terra"
+    assert calls == [("kimi", "", True), ("codex", "gpt-5.6-terra", False)]
+    assert wt.config.engine("Q") == "kimi"
+    assert wt.config.model("Q") == "kimi-code/k3"
     assert result["fallbacks"] == [{
         "queue": "Q", "from_engine": "kimi", "to_engine": "codex",
         "reason": "engine usage limit",
     }]
+
+
+def test_reconcile_usage_limit_without_opt_in_does_not_substitute(
+    wt, monkeypatch
+):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_engine("Q", "kimi")
+    wt.q.enqueue(project="Q", note="work")
+    calls = []
+
+    def fake_spawn(queue, n=1, engine="claude", launch_failures=None, **_kw):
+        calls.append(engine)
+        launch_failures.append({"reason": "engine usage limit"})
+        return []
+
+    monkeypatch.setattr(wt.workers, "spawn_workers", fake_spawn)
+    monkeypatch.setattr(wt.config, "fallback_engine", lambda failed, **kw: "codex")
+
+    result = wt.workers.reconcile_once(dry_run=False)
+
+    assert calls == ["kimi"]
+    assert result["fallbacks"] == []
+    assert wt.config.engine("Q") == "kimi"
 
 
 _KIMI_QUOTA_LOG = (
@@ -954,8 +1066,29 @@ def test_spawn_workers_inherits_env_outside_pytest(wt, monkeypatch):
     worker_env = captured_envs[0][1]
     assert worker_env is not None
     assert worker_env["WT_WORKER_COMMIT"] == "1"
-    # Rest of the parent's environment (e.g. WATCHTOWER_* vars) is preserved.
+    assert worker_env["GIT_AUTHOR_NAME"] == "Amir Fish (watchtower)"
+    assert worker_env["GIT_COMMITTER_NAME"] == "Amir Fish (watchtower)"
+    assert worker_env["AGENT_MACHINE"] == "watchtower"
     assert worker_env["WATCHTOWER_STORE"] == "/custom/queue.json"
+
+
+def test_spawn_env_never_carries_the_spawners_session_identity(wt, monkeypatch):
+    """`wt` run inside a Claude/Codex session can spawn workers. The child must
+    not inherit that session's id: devin sets neither variable, so it claimed
+    tickets under the spawner's session and `wt answer` went to the wrong
+    session (CCC-1153)."""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "spawner-claude-session")
+    monkeypatch.setenv("CODEX_THREAD_ID", "spawner-codex-thread")
+    monkeypatch.setenv("WATCHTOWER_STORE", "/custom/queue.json")
+
+    env = wt.workers._spawn_env()
+
+    assert "CLAUDE_CODE_SESSION_ID" not in env
+    assert "CODEX_THREAD_ID" not in env
+    # Everything else still inherits.
+    assert env["WATCHTOWER_STORE"] == "/custom/queue.json"
+    assert env["WT_WORKER_COMMIT"] == "1"
 
 
 def test_engine_available_uses_codex_env_override(wt, monkeypatch):
@@ -1018,7 +1151,7 @@ def test_reconcile_nudges_live_worker_on_orphan_requeue(wt):
     _age_worker_log(wt, rec, wt.workers.WARM_TTL_S - 30)  # warm: nudge, don't reap
 
     r = wt.workers.reconcile_once(dry_run=False)
-    assert ref in r["requeued"]
+    assert ref in [x["ref"] for x in r["requeued"]]
 
     fd = wt._readers[-1]
     data = os.read(fd, 65536).decode()
@@ -1115,6 +1248,7 @@ def test_claim_next_rejects_dead_spawned_worker(wt):
     """WT-92: claim_next must fail loudly when the session_id is a registered
     spawned worker that is no longer alive, so the caller gets an immediate
     error instead of a silent requeue 2 minutes later."""
+    _claude_registry_readable(wt)
     rec = _dead_worker(wt, "Q")
     dead_id = rec["worker_id"]  # "q-dead" — _dead_worker lowercases the queue name
     wt.q.enqueue(project="Q", note="work")
@@ -1128,6 +1262,7 @@ def test_claim_next_rejects_dead_spawned_worker(wt):
 
 def test_claim_by_ref_rejects_dead_spawned_worker(wt):
     """WT-92: claim_by_ref must also fail loudly for a dead registered worker."""
+    _claude_registry_readable(wt)
     rec = _dead_worker(wt, "Q")
     dead_id = rec["worker_id"]  # "q-dead"
     item = wt.q.enqueue(project="Q", note="work")
@@ -1142,6 +1277,7 @@ def test_dead_worker_rejection_message_guides_resumed_sessions(wt):
     bug because the message read as transient. The message must name the
     recorded pid and tell the caller not to retry or file."""
     import pytest
+    _claude_registry_readable(wt)
     rec = _dead_worker(wt, "Q")
     dead_id = rec["worker_id"]
     wt.q.enqueue(project="Q", note="work")
@@ -1348,9 +1484,36 @@ def test_claim_rejects_concurrent_codex_process_for_same_thread(
     assert recorded["pid"] == os.getpid()
 
 
-def test_claim_rejects_pruned_codex_alias_from_unrelated_session(
+def test_rebind_accepts_engine_child_of_recorded_launcher_pid(wt):
+    """OPS-1396: the npm launcher (node) is recorded; the ancestor lookup
+    lands on its native codex child. Same session, so no concurrent-rebind error."""
+    session_id = "33333333-3333-3333-3333-333333333333"
+    worker_id = "q-codex-wrapper"
+    wt.workers.record_worker(
+        os.getpid(), "Q", "codex", worker_id, str(wt.tmp),
+        str(wt.tmp / f"{worker_id}.log"), session_id=session_id,
+    )
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert wt.workers.rebind_continued_worker(
+            worker_id, session_id, child.pid
+        ) is True
+        rec = next(w for w in wt.workers._load()["workers"] if w["worker_id"] == worker_id)
+        assert rec["pid"] == os.getpid()
+        assert not rec.get("rebound_at")
+    finally:
+        child.kill()
+        child.wait()
+
+
+def test_pruned_codex_alias_from_unrelated_session_claims_ambient(
     wt, monkeypatch, capsys
 ):
+    """WT-31 (plan v6: ``_verify_worker_live`` -> resolver ``dead`` only).
+    The alias's record is pruned, so nothing proves its process dead: the
+    claim is not rejected, it is bound ``ambient`` (never dead, so the orphan
+    sweep never requeues it). The unrelated session is still not rebound onto
+    the old worker record (that stays the FEAT-NEXT-102 rebind guard)."""
     cli = _reloaded_cli(wt)
     worker_id = "q-codex-dead"
     wt.workers.record_worker(
@@ -1372,9 +1535,13 @@ def test_claim_rejects_pruned_codex_alias_from_unrelated_session(
 
     rc = cli.cmd_claim(_claim_ns("Q", worker_id, json_out=True))
 
-    assert rc == 1
-    assert "not currently alive" in capsys.readouterr().err
-    assert wt.q.get(ticket["ref"])["status"] == "open"
+    assert rc == 0
+    assert "not currently alive" not in capsys.readouterr().err
+    it = wt.q.get(ticket["ref"])
+    assert it["status"] == "in_progress"
+    assert it["claim_proc"]["bound"] == "ambient"
+    assert all(w["worker_id"] != worker_id or w.get("session_id") != it["claimed_session_id"]
+               for w in wt.workers._load()["workers"])
 
 
 def test_rebind_continued_worker_refuses_a_second_continuation(wt):
@@ -1411,6 +1578,35 @@ def test_rebind_continued_worker_refuses_a_second_continuation(wt):
         if w["worker_id"] == worker_id
     )
     assert rebound["pid"] == os.getpid()
+
+
+def test_dead_rebound_rows_expire_after_the_retention_window(wt):
+    """Dead rebound rows were kept forever (93 of them, up to 20 days old).
+    They now survive only REBOUND_RETENTION_S past the later of rebound_at
+    and released_at."""
+    now = time.time()
+
+    def iso(age_s):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - age_s))
+    week = wt.workers.REBOUND_RETENTION_S
+    for wid, rebound_age, released_age in (
+        ("q-old", week + 3600, week + 60),        # both stamps past the window
+        ("q-recent", 3600, None),                 # rebound an hour ago
+        ("q-old-rebind-new-release", week + 3600, 3600),
+    ):
+        wt.workers.record_worker(_dead_pid(), "Q", "claude", wid, str(wt.tmp),
+                                 str(wt.tmp / f"{wid}.log"))
+        with wt.workers._WorkersFileLock():
+            data = wt.workers._load()
+            for row in data["workers"]:
+                if row["worker_id"] == wid:
+                    row["rebound_at"] = iso(rebound_age)
+                    if released_age is not None:
+                        row["released_at"] = iso(released_age)
+            wt.workers._save(data)
+    wt.workers.list_workers()
+    kept = {w["worker_id"] for w in wt.workers.list_workers(prune=False)}
+    assert kept == {"q-recent", "q-old-rebind-new-release"}
 
 
 def test_rebind_continued_worker_refuses_a_second_continuation_after_pruning(wt):
@@ -1593,6 +1789,23 @@ def test_claim_empty_queue_surplus_worker_stops(wt, capsys):
     assert json.loads(out) == {"stop": True}
 
 
+def test_claim_surplus_stop_releases_worker(wt, capsys):
+    """WT-17: a surplus STOP must detach the worker from queue staffing, like
+    the reconciler and context-budget stops do. Otherwise the stopped worker
+    stays counted live and keeps receiving new-ticket nudges it refuses, so
+    fresh tickets sit unclaimed with nobody spawned to cover them."""
+    cli = _reloaded_cli(wt)
+    wt.config.set_auto_drain("Q", True)  # desired 1
+    _live_worker(wt, "Q")
+    _live_worker(wt, "Q")
+    cli.cmd_claim(_claim_ns("Q", "q-live-0", json_out=True))
+    assert json.loads(capsys.readouterr().out.strip()) == {"stop": True}
+    assert wt.workers.live_worker_count("Q") == 1
+    stopped = next(w for w in wt.workers.list_workers(prune=False)
+                   if w.get("worker_id") == "q-live-0")
+    assert wt.workers._worker_released(stopped)
+
+
 def test_claim_empty_queue_surplus_worker_stops_text(wt, capsys):
     cli = _reloaded_cli(wt)
     wt.config.set_auto_drain("Q", True)
@@ -1639,7 +1852,30 @@ def test_claim_empty_queue_drain_off_stays_warm(wt, capsys):
     assert json.loads(capsys.readouterr().out.strip()) == {"stop": True}
 
 
+def test_claim_drain_off_stop_log_names_manual_run(wt, capsys):
+    """WATCHTOWER-35: on a drain-off queue the STOP row must say the manual
+    run is done, not "surplus (1>0 desired)" -- the SPAWN row for that same
+    worker said "1 desired", so the bare count read as a contradiction."""
+    cli = _reloaded_cli(wt)
+    wt.config.set_auto_drain("Q", False)
+    _live_worker(wt, "Q")
+    cli.cmd_claim(_claim_ns("Q", "q-live-0", json_out=True))
+    log = wt.q._resolve_activity_log_path().read_text()
+    stop = [ln for ln in log.splitlines() if "STOP" in ln]
+    assert stop and "manual run done" in stop[-1]
+    assert "surplus" not in stop[-1]
+
+
 # ====================================================================== FIFO push
+def _unnonced(text):
+    """A nudge is a verified delivery (WT-31 D4): its last line is the
+    ``⟨wt:<delivery_id>⟩`` nonce. Return the text without it."""
+    from watchtower import receipts
+    nonce = receipts.nonce_of(text)
+    assert nonce, f"no delivery nonce on the last line of {text!r}"
+    return text.rstrip()[: -len(nonce)].rstrip("\n")
+
+
 def test_notify_live_worker_delivers(wt):
     rec = _live_worker(wt, "Q")
     n = wt.workers.notify_workers("Q", "hello worker")
@@ -1649,7 +1885,7 @@ def test_notify_live_worker_delivers(wt):
     data = os.read(fd, 65536).decode()
     msg = json.loads(data.strip())
     assert msg["type"] == "user"
-    assert msg["message"]["content"][0]["text"] == "hello worker"
+    assert _unnonced(msg["message"]["content"][0]["text"]) == "hello worker"
 
 
 def test_notify_prefers_uds_over_raw_fifo(wt, monkeypatch):
@@ -1674,7 +1910,7 @@ def test_notify_prefers_uds_over_raw_fifo(wt, monkeypatch):
     assert wt.workers.notify_workers("Q", "nudge") == 1
 
     assert [c[0] for c in calls] == [rec["session_id"]]
-    assert calls[0][1] == "nudge"
+    assert _unnonced(calls[0][1]) == "nudge"
     assert calls[0][2]["from_name"] == "watchtower-reconciler"
     assert written == [], "FIFO must not be used when UDS delivered"
 
@@ -1712,7 +1948,7 @@ def test_notify_falls_back_to_fifo_when_uds_declines(wt, monkeypatch):
         lambda fifo, text, engine="claude": written.append(text) or True,
     )
     assert wt.workers.notify_workers("Q", "nudge") == 1
-    assert written == ["nudge"]
+    assert [_unnonced(t) for t in written] == ["nudge"]
 
 
 def test_notify_fifoless_worker_falls_back_to_adapter_chain(wt, monkeypatch):
@@ -1735,7 +1971,7 @@ def test_notify_fifoless_worker_falls_back_to_adapter_chain(wt, monkeypatch):
     assert len(calls) == 1
     target, text, kw = calls[0]
     assert target == rec["session_id"]
-    assert text == "wake up"
+    assert _unnonced(text) == "wake up"
     # A nudge is only useful before the turn it nudges about ends, and a
     # stale one is noise -- the next reconcile tick makes a fresh one.
     assert kw["verb"] == "steer"
@@ -2084,6 +2320,55 @@ def test_reap_released_workers_sigterms_past_ttl(wt):
             pass
 
 
+def test_reap_released_workers_signals_duplicate_rows_once(wt):
+    """Two registry rows for one worker/pid must yield one SIGTERM and one
+    action (the activity log showed every GC_RELEASED line twice)."""
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    try:
+        with wt.workers._WorkersFileLock():
+            data = wt.workers._load()
+            row = next(r for r in data["workers"]
+                       if r["worker_id"] == rec["worker_id"])
+            data["workers"].append(dict(row))
+            wt.workers._save(data)
+        actions = wt.workers.reap_released_workers(ttl_s=3600, kill_grace_s=30)
+        assert len(actions) == 1
+        rows = [r for r in wt.workers._load()["workers"]
+                if r["worker_id"] == rec["worker_id"]]
+        assert len(rows) == 2
+        assert all(r.get("gc_kill_sent_at") for r in rows)
+    finally:
+        try:
+            proc.terminate()
+            proc.wait()
+        except Exception:
+            pass
+
+
+def test_reap_released_workers_lists_park_owners_once_per_pass(wt, monkeypatch):
+    """Each _fresh_park_owners call lists every ticket in every queue; calling
+    it per released row under the workers lock pegged the daemon at 100% CPU
+    (95 released rows, 2026-10-05). One call per pass, however many rows."""
+    pairs = [_released_worker(wt, "Q", released_age_s=7200) for _ in range(3)]
+    calls = []
+    monkeypatch.setattr(
+        wt.workers, "_fresh_park_owners",
+        lambda now: calls.append(now) or {pairs[0][0]["worker_id"]})
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600, kill_grace_s=30)
+        assert len(calls) == 1
+        # The park owner is still spared; the other two are reaped.
+        assert sorted(a["worker_id"] for a in actions) == sorted(
+            rec["worker_id"] for rec, _ in pairs[1:])
+    finally:
+        for _, proc in pairs:
+            try:
+                proc.terminate()
+                proc.wait()
+            except Exception:
+                pass
+
+
 def test_reap_released_workers_ignores_worker_released_gate(wt):
     """The GC pass must collect a released worker that every OTHER staffing
     path (live_worker_count, notify_workers, ...) correctly hides via
@@ -2171,6 +2456,277 @@ def test_reconcile_once_reaps_and_sweeps(wt):
             pass
 
 
+def _set_row(wt, worker_id, **fields):
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        for row in data["workers"]:
+            if row["worker_id"] == worker_id:
+                row.update(fields)
+        wt.workers._save(data)
+
+
+def _row(wt, worker_id):
+    return next(
+        r for r in wt.workers._load()["workers"] if r["worker_id"] == worker_id
+    )
+
+
+@pytest.mark.parametrize("released_age_s", [10, 7200])
+def test_reap_recovers_release_time_from_legacy_sentinel(wt, released_age_s):
+    """Pre-TTL releases (or a crash before the registry write) have only a
+    sentinel. They still need a bounded lifetime, measured from that file."""
+    rec, proc = _released_worker(wt, "Q", released_age_s=released_age_s)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    now = int(time.time())
+    released_at = time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - released_age_s),
+    )
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    os.utime(sentinel, (now - released_age_s, now - released_age_s))
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600, now=now)
+        assert _row(wt, worker_id)["released_at"] == released_at
+        if released_age_s >= 3600:
+            assert [a["action"] for a in actions] == ["sigterm"]
+            assert _wait_gone(proc.pid)
+        else:
+            assert actions == []
+            assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_reap_legacy_release_survives_sentinel_consumption_and_honors_grace(wt, monkeypatch):
+    rec, proc = _released_worker(wt, "Q", released_age_s=10)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    now = int(time.time())
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    os.utime(sentinel, (now - 10, now - 10))
+    signals = []
+    monkeypatch.setattr(
+        wt.workers, "_signal_worker",
+        lambda pid, sig: signals.append((pid, sig)) or "pid",
+    )
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600, now=now) == []
+        sentinel.unlink()  # the worker consumes its one-shot stop instruction
+        term_at = now + 3600
+        actions = wt.workers.reap_released_workers(ttl_s=3600, now=term_at)
+        assert [a["action"] for a in actions] == ["sigterm"]
+        assert wt.workers.reap_released_workers(
+            ttl_s=3600, kill_grace_s=30, now=term_at + 29,
+        ) == []
+        actions = wt.workers.reap_released_workers(
+            ttl_s=3600, kill_grace_s=30, now=term_at + 30,
+        )
+        assert [a["action"] for a in actions] == ["sigkill"]
+        assert signals == [(proc.pid, 15), (proc.pid, 9)]
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@pytest.mark.parametrize("sentinel_state", ["missing", "directory", "unreadable"])
+def test_reap_never_invents_release_without_sentinel_evidence(wt, monkeypatch, sentinel_state):
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    if sentinel_state == "unreadable":
+        original_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path == sentinel:
+                raise PermissionError("unreadable sentinel")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", stat)
+    else:
+        sentinel.unlink()
+        if sentinel_state == "directory":
+            sentinel.mkdir()
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        assert not _row(wt, worker_id).get("released_at")
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_reap_sentinel_mtime_does_not_replace_durable_release_time(wt):
+    rec, proc = _released_worker(wt, "Q", released_age_s=10)
+    worker_id = rec["worker_id"]
+    released_at = _row(wt, worker_id)["released_at"]
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    old = time.time() - 7200
+    os.utime(sentinel, (old, old))
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        assert _row(wt, worker_id)["released_at"] == released_at
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@pytest.mark.parametrize("identity", ["mismatch", "unknown"])
+def test_reap_legacy_sentinel_still_requires_pid_identity(wt, monkeypatch, identity):
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    worker_id = rec["worker_id"]
+    _set_row(wt, worker_id, released_at="")
+    sentinel = wt.workers.STOP_SIGNALS_DIR / worker_id
+    old = time.time() - 7200
+    os.utime(sentinel, (old, old))
+    monkeypatch.setattr(wt.workers, "_worker_pid_identity", lambda w, pid: identity)
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        assert _row(wt, worker_id)["released_at"]
+        assert proc.poll() is None
+        assert bool(_row(wt, worker_id).get("gc_skipped")) == (identity == "mismatch")
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+@pytest.mark.parametrize("kill_sent_age_s", [None, 120])
+def test_reap_released_workers_never_signals_a_reused_pid(wt, kill_sent_age_s):
+    """A record can outlive its process (rebound rows are kept forever), and
+    Linux hosts wrap pid_max within days. Once the pid belongs to someone else
+    the reaper must neither SIGTERM nor SIGKILL it -- the same pid-identity
+    rule the release path already enforces."""
+    rec, proc = _released_worker(
+        wt, "Q", released_age_s=7200, kill_sent_age_s=kill_sent_age_s,
+    )
+    _set_row(wt, rec["worker_id"], pid_started="Mon Jan  1 00:00:00 2024")
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600, kill_grace_s=30)
+        assert actions == []
+        time.sleep(0.2)
+        assert proc.poll() is None, "reaper signalled a process it did not own"
+        assert _row(wt, rec["worker_id"]).get("gc_skipped") == "pid_reused"
+        log = (wt.tmp / "activity.log").read_text()
+        assert log.count("GC_SKIPPED") == 1
+        # Marked once, never re-evaluated or re-logged on later ticks.
+        wt.workers.reap_released_workers(ttl_s=3600, kill_grace_s=30)
+        assert (wt.tmp / "activity.log").read_text().count("GC_SKIPPED") == 1
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def test_reap_released_workers_legacy_row_without_start_token(wt):
+    """Rows recorded before pid_started existed fall back to an argv check:
+    a pid whose command is not the worker's engine is never signalled."""
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    _set_row(wt, rec["worker_id"], pid_started="")  # argv is `sleep`, not claude
+    try:
+        assert wt.workers.reap_released_workers(ttl_s=3600) == []
+        time.sleep(0.2)
+        assert proc.poll() is None
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
+def _group_members(pgid):
+    out = subprocess.run(
+        ["ps", "-Ao", "pid=,pgid=,stat="], capture_output=True, text=True,
+    ).stdout
+    members = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and int(parts[1]) == pgid and not parts[2].startswith("Z"):
+            members.append(int(parts[0]))
+    return members
+
+
+def test_reap_released_workers_takes_the_whole_process_group(wt):
+    """Workers are spawned as session leaders; an engine's MCP servers and tool
+    subprocesses share its process group. Signalling only the leader orphans
+    them -- the pile-up GH issue #1 is about -- so the reaper signals the group."""
+    leader = subprocess.Popen(
+        ["sh", "-c", "sleep 60 & sleep 60 & wait"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    try:
+        deadline = time.time() + 5
+        while len(_group_members(leader.pid)) < 3 and time.time() < deadline:
+            time.sleep(0.05)
+        assert len(_group_members(leader.pid)) >= 3
+        rec = wt.workers.record_worker(
+            leader.pid, "Q", "claude", f"q-group-{leader.pid}",
+            str(wt.tmp), str(wt.tmp / "group.log"),
+        )
+        _set_row(
+            wt, rec["worker_id"],
+            released_at=time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 7200)
+            ),
+        )
+        actions = wt.workers.reap_released_workers(ttl_s=3600)
+        assert [a["action"] for a in actions] == ["sigterm"]
+        assert actions[0]["scope"] == "group"
+        leader.wait(timeout=5)
+        deadline = time.time() + 5
+        while _group_members(leader.pid) and time.time() < deadline:
+            time.sleep(0.05)
+        assert _group_members(leader.pid) == []
+    finally:
+        try:
+            os.killpg(leader.pid, 9)
+        except OSError:
+            pass
+        leader.wait()
+
+
+def test_reap_released_workers_spares_a_shared_process_group(wt):
+    """A worker that is NOT its own group leader (e.g. a rebound continuation
+    living in someone's terminal) gets a pid-only signal, never killpg --
+    the group belongs to someone else. Here that group is pytest's own."""
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600)
+        assert actions[0]["scope"] == "pid"
+        assert _wait_gone(proc.pid)
+    finally:
+        try:
+            proc.terminate()
+            proc.wait()
+        except Exception:
+            pass
+
+
+def test_list_workers_dead_rebound_row_with_reused_pid_reads_dead(wt):
+    """Rebound rows survive pruning. If the pid is later reused, the row must
+    not read alive -- otherwise it counts toward staffing (and the reaper
+    would treat an unrelated process as the worker)."""
+    proc = _spawn_sleeper()
+    try:
+        rec = wt.workers.record_worker(
+            proc.pid, "Q", "claude", "q-rebound", str(wt.tmp),
+            str(wt.tmp / "rb.log"),
+        )
+        _set_row(
+            wt, rec["worker_id"],
+            rebound_at="2026-09-01T00:00:00Z",
+            pid_started="Mon Jan  1 00:00:00 2024",
+        )
+        row = next(
+            w for w in wt.workers.list_workers() if w["worker_id"] == "q-rebound"
+        )
+        assert row["alive"] is False
+        assert wt.workers.live_worker_count("Q") == 0
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
 # =========================================================== tracking & cleanup
 def test_prune_drops_dead_and_unlinks_fifo(wt):
     dead = _dead_worker(wt, "Q")
@@ -2208,6 +2764,17 @@ def test_build_claude_is_stream_json_no_goal(wt):
     assert not any("Drain the Q" in a for a in argv)  # goal not in argv
 
 
+def test_build_codex_passes_auto_compact_limit(wt, tmp_path, monkeypatch):
+    f = tmp_path / "sd.json"
+    f.write_text('{"worker_auto_compact_k": 200}')
+    monkeypatch.setattr(wt.config, "CCC_SPAWN_DEFAULTS_FILE", f)
+    argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")
+    assert argv[argv.index("-c") + 1] == "model_auto_compact_token_limit=200000"
+    f.write_text("{}")
+    argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")
+    assert "model_auto_compact_token_limit=250000" in argv
+
+
 def test_build_codex_has_goal_in_argv(wt):
     argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")
     assert argv[:2] == ["codex", "exec"]
@@ -2218,7 +2785,9 @@ def test_build_codex_has_goal_in_argv(wt):
     assert "full warm context" not in goal
     assert "whenever you wake" not in goal
     assert "released from queue staffing" not in goal
-    assert "complete this queue's drain goal" in goal.lower()
+    assert "native codex thread goal" in goal.lower()
+    assert "complete this queue's drain goal" not in goal.lower()
+    assert "native goal control" not in goal.lower()
     assert "after the idle audit" in goal.lower()
 
 
@@ -2229,6 +2798,184 @@ def test_build_grok_uses_supported_one_shot_json_mode(wt):
     assert "--input-format" not in argv
     assert argv[argv.index("--output-format") + 1] == "streaming-json"
     assert "Drain the Q" in argv[2]
+
+
+def test_build_devin_is_one_shot_print_without_claude_flags(wt):
+    """devin exits 2 on Claude's --input-format; it needs its own one-shot
+    print command (the 2026-09-18 CCC devin fallback loop)."""
+    argv = wt.workers.build_drain_command("Q", "devin", "q-1", "/repo", model="swe-2")
+
+    assert argv[:2] == ["devin", "-p"]
+    assert "Drain the Q" in argv[2]
+    assert "--input-format" not in argv
+    assert "--output-format" not in argv
+    assert "--verbose" not in argv
+    assert argv[argv.index("--permission-mode") + 1] == "dangerous"
+    assert argv[argv.index("--respect-workspace-trust") + 1] == "false"
+    assert argv[argv.index("--model") + 1] == "swe-2"
+    assert "--effort" not in argv
+    assert "devin" in wt.workers._ONE_SHOT_ENGINES
+    assert "(devin -p)" in argv[2]
+
+
+def _devin_store(wt, rows):
+    """A minimal devin sessions.db with the prompt_history rows given as
+    (session_id, content, timestamp)."""
+    import sqlite3
+    db = Path(os.environ["WATCHTOWER_DEVIN_SESSIONS_DB"])
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE prompt_history (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+        "content TEXT NOT NULL, timestamp INTEGER NOT NULL, "
+        "session_id TEXT NOT NULL, is_shell INTEGER NOT NULL DEFAULT 0)"
+    )
+    conn.executemany(
+        "INSERT INTO prompt_history (session_id, content, timestamp) "
+        "VALUES (?, ?, ?)",
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_resolve_devin_session_id_matches_the_exact_worker(wt):
+    """devin -p prints no session id (WATCHTOWER-32); the drain goal in
+    devin's prompt_history links worker -> session. A worker id that is a
+    prefix of another must not steal its session."""
+    goal = wt.workers.drain_goal("Q", "q-devin-1", "/repo", engine="devin")
+    other = wt.workers.drain_goal("Q", "q-devin-12", "/repo", engine="devin")
+    _devin_store(wt, [
+        ("patch-macadamia", goal, 100),
+        ("elated-chalk", other, 200),
+        ("user-chat", "what does Your worker id is mean?", 300),
+    ])
+
+    assert wt.workers.resolve_devin_session_id("q-devin-1") == "patch-macadamia"
+    assert wt.workers.resolve_devin_session_id("q-devin-12") == "elated-chalk"
+    assert wt.workers.resolve_devin_session_id("q-devin-9") == ""
+
+
+def test_resolve_devin_session_id_without_a_store_is_empty(wt):
+    assert wt.workers.resolve_devin_session_id("q-devin-1") == ""
+
+
+def _devin_lock(wt, slug, pid):
+    """Write devin's per-session lock file (it holds the owning pid)."""
+    d = wt.workers._devin_cli_locks_dirs()[0]
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{slug}.lock").write_text(f"{pid}\n")
+
+
+def _fake_ps(wt, monkeypatch, procs):
+    """Stand in for `ps`: ``{pid: (ppid, command)}``."""
+    monkeypatch.setattr(wt.workers, "_ps_snapshot", lambda: dict(procs))
+
+
+def test_current_devin_session_id_walks_up_the_parent_chain(wt, monkeypatch):
+    """WATCHTOWER-33: devin exports no session env var, so a `wt add` from
+    inside one had no submitter to notify. The lock file devin writes holds
+    the session's pid, so our own ancestry names the session we're in --
+    `wt` runs as devin's grandchild (devin -> shell -> wt), so a direct pid
+    match is the exception, not the rule."""
+    _devin_lock(wt, "patch-macadamia", 4001)
+    _fake_ps(wt, monkeypatch, {
+        5003: (5002, "python3"),
+        5002: (4001, "zsh"),
+        4001: (1, "/Users/x/.local/bin/devin"),
+    })
+    assert (
+        wt.workers.current_devin_session_id(pid=5003)
+        == "devincli-patch-macadamia"
+    )
+
+
+def test_current_devin_session_id_ignores_a_stale_lock(wt, monkeypatch):
+    """Devin never prunes its lock files (199 of 201 on the dev machine held
+    dead pids) and macOS recycles pids, so a bare pid match would eventually
+    name a stranger's session as a ticket's filer. Only a pid that is still
+    a live `devin` counts."""
+    _devin_lock(wt, "long-gone", 4001)
+    _fake_ps(wt, monkeypatch, {
+        5003: (4001, "python3"),
+        4001: (1, "Google Chrome Helper"),  # pid recycled away from devin
+    })
+    assert wt.workers.current_devin_session_id(pid=5003) == ""
+
+
+def test_current_devin_session_id_outside_devin_is_empty(wt, monkeypatch):
+    """The common case: not a devin session at all. A live devin exists, but
+    it is not an ancestor of ours, so nothing is claimed."""
+    assert wt.workers.current_devin_session_id() == ""  # no locks at all
+    _devin_lock(wt, "someone-else", 4001)
+    _fake_ps(wt, monkeypatch, {
+        5003: (5002, "python3"), 5002: (1, "zsh"), 4001: (1, "devin"),
+    })
+    assert wt.workers.current_devin_session_id(pid=5003) == ""
+
+
+def test_current_devin_session_id_survives_a_junk_lock(wt, monkeypatch):
+    _devin_lock(wt, "empty", "")
+    _devin_lock(wt, "not-a-pid", "banana")
+    _devin_lock(wt, "real-one", 4001)
+    _fake_ps(wt, monkeypatch, {5003: (4001, "python3"), 4001: (1, "devin")})
+    assert (
+        wt.workers.current_devin_session_id(pid=5003) == "devincli-real-one"
+    )
+
+
+def test_current_devin_session_id_stops_on_a_pid_cycle(wt, monkeypatch):
+    """A malformed ps snapshot must not hang the walk."""
+    _devin_lock(wt, "unreachable", 4001)
+    _fake_ps(wt, monkeypatch, {
+        5003: (5002, "python3"), 5002: (5003, "zsh"), 4001: (1, "devin"),
+    })
+    assert wt.workers.current_devin_session_id(pid=5003) == ""
+
+
+def test_list_workers_backfills_a_devin_session_from_its_store(wt):
+    log = wt.tmp / "q-devin-1.log"
+    log.write_text("plain text, no session id line\n")
+    wt.workers.record_worker(
+        os.getpid(), "Q", "devin", "q-devin-1", str(wt.tmp), str(log),
+    )
+    goal = wt.workers.drain_goal("Q", "q-devin-1", "/repo", engine="devin")
+    _devin_store(wt, [("patch-macadamia", goal, 100)])
+
+    rows = wt.workers.list_workers(prune=False)
+
+    assert [w["session_id"] for w in rows] == ["patch-macadamia"]
+
+
+def test_resolve_target_finds_a_live_worker_by_devin_session_slug(wt):
+    """A devin ticket's claimed_session_id is a slug, not a UUID; wt comment
+    targets it first, so it must resolve to the live worker."""
+    import watchtower.messages as messages
+    log = wt.tmp / "q-devin-1.log"
+    log.write_text("")
+    wt.workers.record_worker(
+        os.getpid(), "Q", "devin", "q-devin-1", str(wt.tmp), str(log),
+        session_id="patch-macadamia",
+    )
+
+    resolved = messages.resolve_target("patch-macadamia", include_recent=False)
+
+    assert resolved["kind"] == "worker"
+    assert resolved["engine"] == "devin"
+    assert resolved["worker"]["worker_id"] == "q-devin-1"
+
+
+def test_comment_warns_when_queued_for_an_unsessioned_one_shot_worker(wt):
+    import watchtower.cli as cli
+    log = wt.tmp / "q-devin-1.log"
+    log.write_text("")
+    wt.workers.record_worker(
+        os.getpid(), "Q", "devin", "q-devin-1", str(wt.tmp), str(log),
+    )
+
+    warning = cli._unsessioned_target_warning("q-devin-1")
+
+    assert "one-shot devin worker with no session id" in warning
+    assert "wt outbox ls" in warning
 
 
 def test_build_antigravity_uses_its_stream_json_contract(wt):
@@ -2273,10 +3020,11 @@ def test_drain_goal_content(wt):
     # hand-off (WATCHTOWER-11: a recycle must update learnings before exit).
     assert goal.count(runbook) == 3
     # Push policy must not override queue-specific ticket instructions such as
-    # CHUCK's "commit and push main" workflow.
+    # a client queue's "commit and push main" workflow.
     assert "Do not push unless explicitly asked" not in goal
     assert "claimed ticket's worker instructions" in goal
-    assert "leave commits local" in goal
+    assert "git push origin HEAD" in goal
+    assert "leave commits local" not in goal
 
 
 def test_run_once_goal_uses_ticket_push_policy(wt):
@@ -2284,7 +3032,8 @@ def test_run_once_goal_uses_ticket_push_policy(wt):
     assert "Q-12" in goal and "q-8" in goal and "/repo" in goal
     assert "Do not push unless explicitly asked" not in goal
     assert "claimed ticket's worker instructions" in goal
-    assert "leave commits local" in goal
+    assert "git push origin HEAD" in goal
+    assert "leave commits local" not in goal
 
 
 def test_goals_tell_worker_to_announce_the_ticket(wt):
@@ -2485,7 +3234,9 @@ def test_release_floor_is_30_minutes_for_claude(wt):
     assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
 
 
-def test_release_idle_claude_worker_without_killing_session(wt):
+def test_release_idle_claude_worker_without_killing_session(
+    wt, no_real_message_delivery
+):
     rec = _live_worker(wt, "Q")
     _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
 
@@ -2496,10 +3247,11 @@ def test_release_idle_claude_worker_without_killing_session(wt):
     assert wt.workers._pid_alive(os.getpid())
     assert wt.workers.live_worker_count("Q") == 0
     assert wt.workers.worker_counts()["Q"] == {"total": 1, "live": 0}
-    payload = json.loads(os.read(wt._readers[-1], 65536).decode())
-    text = payload["message"]["content"][0]["text"]
-    assert "no longer a WatchTower worker for Q" in text
-    assert "continue any unrelated work" in text
+    # WATCHTOWER-31: release sends the worker nothing. Messaging a verified
+    # idle (cache-cold) session would buy a full-price turn just to say stop.
+    assert not _fifo_pending(wt._readers[-1])
+    assert released[0]["_release_transport"] == "none"
+    assert no_real_message_delivery == []
     assert wt.q.claim_next(rec["worker_id"], project="Q") == {"stop": True}
     assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
     # The one-shot signal is gone, but durable detachment keeps this live
@@ -2615,7 +3367,9 @@ def test_reap_spares_codex_worker_with_fresh_rollout_activity(wt, monkeypatch):
         child.wait(timeout=5)
 
 
-def test_release_injects_queue_scoped_instruction_into_codex_session(wt, monkeypatch):
+def test_release_sends_nothing_into_idle_codex_session(wt, monkeypatch):
+    """WATCHTOWER-31: the stop sentinel is the whole release; a message into
+    a cache-cold session costs a full uncached turn for nothing."""
     import watchtower.messages as messages
 
     sent = []
@@ -2643,8 +3397,8 @@ def test_release_injects_queue_scoped_instruction_into_codex_session(wt, monkeyp
     released = wt.workers.release_idle_workers(queue="Q")
 
     assert [row["worker_id"] for row in released] == [rec["worker_id"]]
-    assert sent and sent[0][0] == sid
-    assert "continue any unrelated work" in sent[0][1]
+    assert sent == []
+    assert (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
     assert wt.workers._pid_alive(os.getpid())
 
 
@@ -3005,6 +3759,58 @@ def test_unknown_engine_preserves_stale_worker(wt):
     decision = _activity_lines(wt, "IDLE_DECISION")[0]
     assert "decision=PRESERVE" in decision
     assert "authoritative_activity_unknown" in decision
+
+
+def _antigravity_worker(wt, monkeypatch, wid):
+    """An antigravity worker whose conversation store is the AGY CLI's
+    per-session SQLite db (``conversations/<sid>.db`` + WAL sidecars)."""
+    home = wt.tmp / "agy-home"
+    monkeypatch.setenv("WATCHTOWER_ANTIGRAVITY_HOME", str(home))
+    sid = "f67fcf91-e571-49cb-aa4d-38fb4d841d3f"
+    conv = home / "conversations"
+    conv.mkdir(parents=True, exist_ok=True)
+    db = conv / f"{sid}.db"
+    db.write_text("")
+    (conv / f"{sid}.db-wal").write_text("")
+    log = wt.tmp / f"{wid}.log"
+    log.write_text("")
+    rec = wt.workers.record_worker(
+        os.getpid(), "Q", "antigravity", wid, str(wt.tmp), str(log),
+        session_id=sid,
+    )
+    rec["_test_activity_path"] = str(db)
+    old = time.time() - (wt.workers.RELEASE_IDLE_S + 60)
+    os.utime(conv / f"{sid}.db-wal", (old, old))
+    return rec, conv / f"{sid}.db-shm"
+
+
+def test_stale_antigravity_worker_is_released(wt, monkeypatch):
+    """WATCHTOWER-36: AGY workers were PRESERVEd forever with
+    authoritative_activity_unknown, so the dashboard showed them working
+    days after their last turn."""
+    rec, shm = _antigravity_worker(wt, monkeypatch, "q-agy-stale")
+    _age_worker_log(wt, rec, wt.workers.RELEASE_IDLE_S + 60)
+    # A reader (CCC, sqlite3) touches the shared-memory index without any
+    # conversation activity; it must not count as the worker being busy.
+    shm.write_text("")
+
+    released = wt.workers.release_idle_workers(queue="Q")
+
+    assert [w["worker_id"] for w in released] == [rec["worker_id"]]
+    signal = [
+        line for line in _activity_lines(wt, "IDLE_SIGNAL")
+        if "signal=antigravity_conversation" in line
+    ]
+    assert signal and "exists=true" in signal[0]
+
+
+def test_active_antigravity_conversation_keeps_worker(wt, monkeypatch):
+    rec, _ = _antigravity_worker(wt, monkeypatch, "q-agy-busy")
+    os.utime(rec["log"], (time.time() - 7200,) * 2)
+    Path(rec["_test_activity_path"]).touch()
+
+    assert wt.workers.release_idle_workers(queue="Q") == []
+    assert not (wt.workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
 
 
 def test_unknown_pid_identity_preserves_worker(wt):
@@ -3414,6 +4220,7 @@ def test_partial_usage_fallback_preserves_failed_slot_causality(
     wt.config.set_auto_drain("Q", True)
     wt.config.set_desired_workers("Q", 2)
     wt.config.set_engine("Q", "codex")
+    wt.config.set_fallback_to_default_worker("Q", True)
     wt.q.enqueue(project="Q", note="work one")
     wt.q.enqueue(project="Q", note="work two")
     cold = _live_worker(wt, "Q")
@@ -4191,6 +4998,22 @@ def test_dispatch_still_nudges_for_an_unclaimed_ticket(wt):
     assert item["ref"] in msg["message"]["content"][0]["text"]
 
 
+def test_dispatch_nudges_idle_workers_not_ones_holding_a_ticket(wt):
+    """WT-15: a worker mid-ticket is not disturbed by a new ticket while
+    another worker is idle and can take it."""
+    wt.config.set_auto_drain("Q", True)
+    busy = _live_worker(wt, "Q")
+    _live_worker(wt, "Q")  # idle
+    held = wt.q.enqueue(project="Q", note="in flight")
+    wt.q.claim_by_ref(held["ref"], busy["worker_id"])
+    item = wt.q.enqueue(project="Q", note="new")
+
+    reason = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+
+    assert reason == "nudged 1 live worker(s) — immediate pickup"
+    assert [_fifo_pending(fd) for fd in wt._readers] == [False, True]
+
+
 def test_dispatch_does_not_nudge_the_session_that_filed_the_ticket(wt, monkeypatch):
     """Telling a session about its own `wt add` is never news -- and it lands
     as a steer mid-turn (same class as WATCHTOWER-21's comment echo)."""
@@ -4217,6 +5040,350 @@ def test_notify_workers_exclude_skips_by_worker_id_and_session_id(wt):
 
     assert delivered == 1
     msg = json.loads(os.read(wt._readers[-1], 65536).decode().strip())
-    assert msg["message"]["content"][0]["text"] == "nudge"
+    assert _unnonced(msg["message"]["content"][0]["text"]) == "nudge"
     assert other["worker_id"] not in {by_worker["worker_id"],
                                       by_session["worker_id"]}
+
+
+def test_spawn_env_marks_worker_and_verifier(wt, monkeypatch):
+    """WT-23: repos key off WT_WORKER_ID / WT_VERIFY to refuse production side
+    effects; stale values from the spawner never leak to an ordinary worker."""
+    monkeypatch.setenv("WT_VERIFY", "1")
+    monkeypatch.setenv("WT_WORKER_ID", "spawner")
+
+    plain = wt.workers._spawn_env("q-abc123")
+    assert plain["WT_WORKER_ID"] == "q-abc123"
+    assert "WT_VERIFY" not in plain
+
+    ver = wt.workers._spawn_env("verify-q-1-codex-deadbeef", verify=True)
+    assert ver["WT_VERIFY"] == "1"
+    assert ver["WT_WORKER_ID"] == "verify-q-1-codex-deadbeef"
+
+    assert "WT_VERIFY" not in wt.workers._spawn_env()
+    assert "WT_WORKER_ID" not in wt.workers._spawn_env()
+
+
+def test_spawn_adhoc_verify_sets_marker(wt, monkeypatch):
+    captured = {}
+
+    class _P:
+        pid = 4242
+
+    def fake_popen(argv, **kw):
+        captured["env"] = kw.get("env")
+        return _P()
+
+    monkeypatch.setattr(wt.workers.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(wt.workers, "record_worker", lambda *a, **k: {"worker_id": a[3]})
+    monkeypatch.setattr(wt.workers, "WORKERS_FILE", wt.tmp / "workers.json")
+    rec = wt.workers.spawn_adhoc("check", "codex", repo_path=str(wt.tmp), name="verify-X-1", verify=True)
+    assert captured["env"]["WT_VERIFY"] == "1"
+    assert captured["env"]["WT_WORKER_ID"] == rec["worker_id"]
+
+
+def test_verifier_goal_forbids_production_side_effects(wt):
+    from watchtower import cli
+    goal = cli._verifier_goal({"ref": "X-1", "text": "it works"})
+    assert "paid APIs" in goal and "WT_VERIFY=1" in goal
+
+
+def test_spawn_adhoc_claude_ledgers_pinned_session_id(wt, monkeypatch):
+    """CCC-1241: `claude -p` text logs never name the session, so stage-role
+    sessions (planner/reviewer/verifier) missed the worker-session ledger and
+    CCC showed them under Coding. spawn_adhoc pins the id and ledgers it."""
+    class _P:
+        pid = 4243
+
+    monkeypatch.setattr(wt.workers.shutil, "which", lambda b: "/usr/bin/" + b)
+    monkeypatch.setattr(wt.workers.subprocess, "Popen", lambda argv, **kw: _P())
+    monkeypatch.setattr(wt.workers, "WORKERS_FILE", wt.tmp / "workers.json")
+    rec = wt.workers.spawn_adhoc("check", "claude", repo_path=str(wt.tmp), name="verify-X-1", verify=True)
+    sid = rec["session_id"]
+    argv = rec["argv"]
+    assert argv[argv.index("--session-id") + 1] == sid
+    assert sid in wt.workers._load_worker_session_ledger()
+    codex = wt.workers.spawn_adhoc("check", "codex", repo_path=str(wt.tmp), name="verify-X-1", dry_run=True)
+    assert "session_id" not in codex and "--session-id" not in codex["argv"]
+
+
+def test_retained_parked_worker_does_not_consume_spawn_budget(wt, monkeypatch):
+    """WT-28: an idle worker retaining a parked ticket waits for its answer; it
+    must not cover the queue's spawn budget, so claimable work still staffs."""
+    wt.config.set_auto_drain("Q", True)  # desired_workers defaults to 1
+    parked = wt.q.enqueue(project="Q", note="needs a human call")
+    wt.q.enqueue(project="Q", note="unrelated claimable work")
+    worker = _live_worker(wt, "Q")
+    claimed = wt.q.claim_next(worker["worker_id"], project="Q",
+                              session_uuid=worker["session_id"])
+    assert claimed["ref"] == parked["ref"]
+    blocked = wt.q.block(parked["ref"], question="fix or dismiss?",
+                         session_id=worker["worker_id"], origin="worker")
+    assert blocked["status"] == "awaiting_answer"
+    assert worker["worker_id"] in wt.workers.retained_parked_ids("Q")
+
+    r = wt.workers.reconcile_once(dry_run=False)
+    assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1
+    # The retained worker is excluded from the live count the claim-time STOP uses.
+    assert wt.workers.live_worker_count(
+        "Q", exclude=wt.workers.retained_parked_ids("Q")) <= 1
+
+
+def test_every_codex_spawn_carries_the_compact_limit(wt, tmp_path, monkeypatch):
+    f = tmp_path / "sd.json"
+    f.write_text('{"worker_auto_compact_k": 200}')
+    monkeypatch.setattr(wt.config, "CCC_SPAWN_DEFAULTS_FILE", f)
+    monkeypatch.setattr(wt.workers.shutil, "which", lambda b: "/usr/bin/" + b)
+    argv = wt.workers.build_adhoc_command("codex", "do it", model="m")
+    assert argv[argv.index("-c") + 1] == "model_auto_compact_token_limit=200000"
+    assert argv[-1] == "do it"
+    f.write_text('{"worker_auto_compact_k": 0}')
+    assert "-c" not in wt.workers.build_adhoc_command("codex", "do it")
+
+
+def test_claude_spawns_get_the_compact_window_env(wt, tmp_path, monkeypatch):
+    f = tmp_path / "sd.json"
+    f.write_text('{"worker_auto_compact_k": 200}')
+    monkeypatch.setattr(wt.config, "CCC_SPAWN_DEFAULTS_FILE", f)
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    assert wt.workers._spawn_env("w")["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+    assert wt.workers.compact_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "123")  # operator wins
+    assert wt.workers._spawn_env("w")["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "123"
+
+
+def test_headless_resume_carries_the_compact_settings(wt, tmp_path, monkeypatch):
+    f = tmp_path / "sd.json"
+    f.write_text('{"worker_auto_compact_k": 200}')
+    monkeypatch.setattr(wt.config, "CCC_SPAWN_DEFAULTS_FILE", f)
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    import watchtower.cli as cli
+    wt.cli = cli
+    seen = []
+
+    class P:
+        pid = 1
+
+    monkeypatch.setattr(wt.cli.subprocess, "Popen",
+                        lambda argv, **kw: seen.append((argv, kw.get("env"))) or P())
+    monkeypatch.setattr(wt.cli.resume_verify, "verify_resume_child", lambda p: (False, ""))
+    assert wt.cli._resume_session_headless("sid1", "", "go", "codex")
+    assert wt.cli._resume_session_headless("sid2", "", "go", "claude")
+    codex, claude = seen
+    assert "model_auto_compact_token_limit=200000" in codex[0]
+    assert codex[0].index("-c") < codex[0].index("sid1")
+    assert claude[1]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "200000"
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "result", "is_error": True, "api_error_status": 429,
+     "result": "You've hit your monthly spend limit"},
+    {"type": "assistant", "is_api_error_message": True, "error": "rate_limit"},
+    {"type": "error", "error": {"code": "insufficient_quota"}},
+])
+def test_quota_errors_detected_at_launch_and_in_live_tail(wt, event):
+    log = wt.tmp / "quota.log"
+    log.write_text(json.dumps(event) + "\n")
+    assert wt.workers._classify_launch_failure_log(log)["reason"] == "engine usage limit"
+    assert wt.workers._classify_zombie_log(str(log)) == "engine usage limit"
+
+
+def test_quoted_quota_error_is_not_provider_failure(wt):
+    log = wt.tmp / "quote.log"
+    log.write_text(json.dumps({"type": "assistant", "message": {
+        "content": [{"type": "text", "text": "monthly spend limit / insufficient_quota"}]
+    }}) + "\n")
+    assert wt.workers._classify_launch_failure_log(log) is None
+    assert wt.workers._classify_zombie_log(str(log)) is None
+
+
+def test_fallback_skips_exhausted_candidates_in_existing_order(wt, monkeypatch):
+    wt.config.set_fallback_to_default_worker("Q", True)
+    monkeypatch.setattr(wt.workers, "engine_available", lambda e: True)
+    monkeypatch.setattr(wt.workers, "active_launch_failure_cooldown",
+                        lambda q, e: {"reason": "engine usage limit"} if e == "codex" else None)
+    assert wt.workers._launch_substitute("Q", "claude") == "kimi"
+    assert wt.workers._launch_substitute("Q", "claude", attempted={"kimi"}) == ""
+
+
+@pytest.mark.parametrize("all_exhausted", [False, True])
+def test_fallback_chain_is_bounded_and_replaces_only_failed_slots(wt, monkeypatch, all_exhausted):
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_engine("Q", "claude")
+    wt.config.set_fallback_to_default_worker("Q", True)
+    wt.config.set_desired_workers("Q", 2)
+    for i in range(2):
+        wt.q.enqueue(project="Q", note=f"work {i}")
+    monkeypatch.setattr(wt.workers, "engine_available", lambda e: e in {"claude", "codex", "kimi"})
+    calls = []
+    def spawn(queue, n=1, engine="claude", launch_failures=None, **kw):
+        calls.append((engine, n))
+        if engine == "claude":
+            launch_failures.append({"reason": "engine usage limit", "_spawn_index": 1})
+            return [{"worker_id": "successful-primary", "queue": queue, "engine": engine, "_spawn_index": 0}]
+        if engine == "codex" or all_exhausted:
+            launch_failures.append({"reason": "engine usage limit", "_spawn_index": 0})
+            return []
+        return [{"worker_id": "successful-fallback", "queue": queue, "engine": engine, "_spawn_index": 0}]
+    monkeypatch.setattr(wt.workers, "spawn_workers", spawn)
+    result = wt.workers.reconcile_once(dry_run=False)
+    assert calls == [("claude", 2), ("codex", 1), ("kimi", 1)]
+    assert len(result["spawned"]) == (1 if all_exhausted else 2)
+    if not all_exhausted:
+        assert result["spawned"][-1]["_spawn_index"] == 1
+    assert wt.config.engine("Q") == "claude"
+
+
+@pytest.mark.parametrize("holds_claim", [False, True])
+def test_live_quota_worker_retires_promptly_without_replaying_claim(wt, holds_claim):
+    wt.config.set_auto_drain("Q", True)
+    item = wt.q.enqueue(project="Q", note="fresh work")
+    rec = _live_worker(wt, "Q")
+    Path(rec["log"]).write_text(json.dumps({
+        "type": "result", "is_error": True, "api_error_status": 429,
+        "result": "You've hit your monthly spend limit",
+    }) + "\n")
+    if holds_claim:
+        wt.q.claim_by_ref(item["ref"], rec["worker_id"])
+    released = wt.workers.release_zombie_workers(queue="Q")
+    assert len(released) == (0 if holds_claim else 1)
+    if not holds_claim:
+        cooldown = wt.workers.active_launch_failure_cooldown("Q", "claude")
+        assert cooldown["reason"] == "engine usage limit"
+    else:
+        assert wt.q.list_items(project="Q")[0]["status"] == "in_progress"
+
+
+def test_stale_idle_worker_without_claim_does_not_count_as_staffed(wt, monkeypatch):
+    """An alive worker with no claim and no activity past STALE_IDLE_S is not
+    draining, so it must not hold the spawn budget: claimable work spawns a
+    fresh worker. A recently active one still counts as staffed."""
+    wt.config.set_auto_drain("Q", True)  # desired_workers defaults to 1
+    wt.q.enqueue(project="Q", note="claimable work")
+    worker = _live_worker(wt, "Q")
+
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert not [s for s in r["spawned"] if s["queue"] == "Q"]
+
+    old = time.time() - wt.workers.STALE_IDLE_S - 60
+    for path in (worker["log"], worker["_test_activity_path"]):
+        os.utime(path, (old, old))
+    monkeypatch.setattr(wt.workers, "_worker_idle_s",
+                        lambda w: wt.workers.STALE_IDLE_S + 60)
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert len([s for s in r["spawned"] if s["queue"] == "Q"]) == 1
+
+
+def test_wt_workers_table_hides_retained_dead_rows_unless_all(wt, capsys):
+    """Dead rebound rows are kept for REBOUND_RETENTION_S by design; a week of
+    rebinds left ~100 of them in `wt workers` reading as stale workers. The
+    table now shows live workers only (with a count), --all shows the rest,
+    and --json keeps every row for programmatic callers (CCC)."""
+    cli = _reloaded_cli(wt)
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    wt.workers.record_worker(os.getpid(), "Q", "claude", "q-live", str(wt.tmp),
+                             str(wt.tmp / "q-live.log"))
+    wt.workers.record_worker(_dead_pid(), "Q", "claude", "q-tomb", str(wt.tmp),
+                             str(wt.tmp / "q-tomb.log"))
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        for row in data["workers"]:
+            if row["worker_id"] == "q-tomb":
+                row["rebound_at"] = now_iso
+        wt.workers._save(data)
+
+    assert cli.cmd_workers(SimpleNamespace(json=False, all=False)) == 0
+    out = capsys.readouterr().out
+    assert "q-live" in out and "q-tomb" not in out
+    assert "1 dead record(s) retained" in out
+
+    assert cli.cmd_workers(SimpleNamespace(json=False, all=True)) == 0
+    out = capsys.readouterr().out
+    assert "q-live" in out and "q-tomb" in out and "retained" not in out
+
+    assert cli.cmd_workers(SimpleNamespace(json=True, all=False)) == 0
+    ids = {w["worker_id"] for w in json.loads(capsys.readouterr().out)}
+    assert ids == {"q-live", "q-tomb"}
+
+
+def test_record_worker_merges_rebind_stub_instead_of_duplicating(wt):
+    """A rebind stub that beat record_worker to the file must not leave two
+    rows for one process (double-counted as two live workers)."""
+    wid = "dup-w1"
+    with wt.workers._WorkersFileLock():
+        data = wt.workers._load()
+        data["workers"].append({
+            "worker_id": wid, "queue": "Q", "engine": "claude", "fifo": "",
+            "started_at": "", "pid": os.getpid(), "rebound_at": "2026-01-01T00:00:00Z",
+        })
+        wt.workers._save(data)
+    wt.workers.record_worker(
+        pid=os.getpid(), queue="Q", engine="claude", worker_id=wid,
+        fifo="/tmp/x.stdin", model="m",
+    )
+    rows = [r for r in wt.workers._load()["workers"] if r["worker_id"] == wid]
+    assert len(rows) == 1
+    assert rows[0]["fifo"] == "/tmp/x.stdin"
+    assert rows[0]["rebound_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_live_worker_count_ignores_duplicate_rows(wt):
+    for fifo in ("", "/tmp/a.stdin"):
+        with wt.workers._WorkersFileLock():
+            data = wt.workers._load()
+            data["workers"].append({"worker_id": "dw", "queue": "Q", "engine": "claude",
+                                    "pid": os.getpid(), "fifo": fifo})
+            wt.workers._save(data)
+    assert wt.workers.live_worker_count("Q") == 1
+    assert wt.workers.worker_counts()["Q"]["live"] == 1
+
+
+def test_renudge_idle_workers_rate_limited(wt, monkeypatch):
+    sent = []
+    monkeypatch.setattr(wt.workers, "notify_workers",
+                        lambda q, text, **kw: sent.append(kw["only"]) or 1)
+    monkeypatch.setattr(wt.workers, "_idle_renudged_at", {})
+    live = [{"worker_id": "idle1"}, {"worker_id": "busy1"}]
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1000.0) == 1
+    assert sent == [{"idle1"}]
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1010.0) == 0
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1"}, now=1200.0) == 1
+    assert wt.workers._renudge_idle_workers("Q", live, {"busy1", "idle1"}, now=2000.0) == 0
+
+
+def test_reconcile_spawns_second_worker_when_only_live_worker_is_busy(wt):
+    """A worker mid-ticket cannot take the claimable ticket now, so it must not
+    'cover' it: a 2-worker queue with one busy worker spawns the other."""
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 2)
+    busy = _live_worker(wt, "Q")
+    held = wt.q.enqueue(project="Q", note="held")
+    data = wt.q._load_unlocked()
+    for it in data["items"]:
+        if it["ref"] == held["ref"]:
+            it["status"] = "in_progress"
+            it["claimed_by"] = busy["worker_id"]
+    wt.q._save_unlocked(data)
+    wt.q.enqueue(project="Q", note="waiting")
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert [s["queue"] for s in r["spawned"]] == ["Q"]
+
+
+def test_session_active_age_flags_dead_pid_row_whose_session_still_writes(wt, tmp_path):
+    """WT-17: a resumed session outliving its exec PID reads as active, not
+    just DEAD, while alive stays PID-based; a live owner of the session wins."""
+    import watchtower.workers as workers
+    sid = "ab1aebae-36c3-4fda-b872-caa3c3f32318"
+    row = {"worker_id": "ccc-x", "engine": "claude", "session_id": sid, "alive": False}
+    assert workers.session_active_age_s(row, [row]) is None  # no transcript
+    t = tmp_path / "claude-home" / "projects" / "-p" / f"{sid}.jsonl"
+    t.parent.mkdir(parents=True)
+    t.write_text("{}\n")
+    now = time.time()
+    os.utime(t, (now - 30, now - 30))
+    age = workers.session_active_age_s(row, [row], now=now)
+    assert age is not None and 29 <= age <= 31
+    owner = {"worker_id": "ccc-y", "session_id": sid, "alive": True}
+    assert workers.session_active_age_s(row, [row, owner], now=now) is None
+    os.utime(t, (now - 3600, now - 3600))
+    assert workers.session_active_age_s(row, [row], now=now) is None  # quiet

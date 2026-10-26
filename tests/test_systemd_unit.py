@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 
 import pytest
 
@@ -38,7 +39,7 @@ def installed_unit(tmp_path, monkeypatch):
     from watchtower import config
     from watchtower import skills_sync
 
-    unit_path = tmp_path / "ai.watchtower.watcher.service"
+    unit_path = tmp_path / "watchtower.service"
     monkeypatch.setattr(cli, "_SYSTEMD_UNIT", unit_path)
     monkeypatch.setattr(cli, "_use_systemd", lambda: True)
     monkeypatch.setattr(cli, "_is_macos", lambda: False)
@@ -63,7 +64,7 @@ def test_exec_start_absolute_interpreter_and_module(installed_unit):
     line = next(
         l for l in installed_unit.splitlines() if l.startswith("ExecStart=")
     )
-    args = line.split("=", 1)[1].split()
+    args = shlex.split(line.split("=", 1)[1])
     assert args[0].startswith("/"), args
     assert args[1:] == [
         "-m", "watchtower.cli", "start", "--foreground", "--auto-spawn",
@@ -77,7 +78,7 @@ def test_restart_always(installed_unit):
 
 def test_environment_path_present(installed_unit):
     line = next(
-        l for l in installed_unit.splitlines() if l.startswith("Environment=PATH=")
+        l for l in installed_unit.splitlines() if l.startswith("Environment=")
     )
     path_val = line.split("=", 1)[1]
     assert "/usr/local/bin" in path_val
@@ -128,7 +129,7 @@ def test_start_installs_systemd_unit_when_missing(tmp_path, monkeypatch, capsys)
     from watchtower import cli
     from watchtower import skills_sync
 
-    unit_path = tmp_path / "ai.watchtower.watcher.service"
+    unit_path = tmp_path / "watchtower.service"
     monkeypatch.setattr(cli, "_SYSTEMD_UNIT", unit_path)
     monkeypatch.setattr(cli, "_use_systemd", lambda: True)
     monkeypatch.setattr(cli, "_is_macos", lambda: False)
@@ -149,14 +150,14 @@ def test_start_installs_systemd_unit_when_missing(tmp_path, monkeypatch, capsys)
     assert rc == 0
     assert unit_path.exists()
     out = capsys.readouterr().out
-    assert "first start: installed systemd user service ai.watchtower.watcher.service" in out
+    assert "first start: installed systemd user service watchtower.service" in out
     assert any("systemctl --user" in c for c in calls)
 
 
 def test_stop_uses_systemctl_disable_now(tmp_path, monkeypatch):
     from watchtower import cli
 
-    unit_path = tmp_path / "ai.watchtower.watcher.service"
+    unit_path = tmp_path / "watchtower.service"
     unit_path.write_text("[Unit]\n")
     monkeypatch.setattr(cli, "_SYSTEMD_UNIT", unit_path)
     monkeypatch.setattr(cli, "_use_systemd", lambda: True)
@@ -170,3 +171,52 @@ def test_stop_uses_systemctl_disable_now(tmp_path, monkeypatch):
 
     assert rc == 0
     assert any("disable --now" in c for c in calls)
+
+
+def test_restart_preserves_worker_processes(installed_unit):
+    # Restarting the reconciler must not SIGTERM every worker in its cgroup.
+    assert "Type=exec" in installed_unit
+    assert "KillMode=process" in installed_unit
+
+
+def test_existing_unit_is_restarted_without_installing_second_service(tmp_path, monkeypatch):
+    from watchtower import cli
+
+    unit_path = tmp_path / "watchtower.service"
+    unit_path.write_text("existing custom unit")
+    monkeypatch.setattr(cli, "_SYSTEMD_UNIT", unit_path)
+    monkeypatch.setattr(cli, "_use_systemd", lambda: True)
+    calls = []
+    monkeypatch.setattr(cli.os, "system", lambda cmd: calls.append(cmd) or 0)
+    monkeypatch.setattr(cli, "_write_service_file", lambda: pytest.fail("rewrote existing unit"))
+    assert cli.cmd_start(_StartArgs()) == 0
+    assert unit_path.read_text() == "existing custom unit"
+    assert any("restart 'watchtower.service'" in cmd for cmd in calls)
+
+
+def test_stop_disables_inactive_enabled_unit(tmp_path, monkeypatch):
+    from watchtower import cli
+
+    unit_path = tmp_path / "watchtower.service"
+    unit_path.touch()
+    monkeypatch.setattr(cli, "_SYSTEMD_UNIT", unit_path)
+    monkeypatch.setattr(cli, "_use_systemd", lambda: True)
+    monkeypatch.setattr(cli, "_service_loaded", lambda: False)
+    monkeypatch.setattr(cli, "DAEMON_PID_FILE", tmp_path / "daemon.pid")
+    calls = []
+    monkeypatch.setattr(cli.os, "system", lambda cmd: calls.append(cmd) or 0)
+    assert cli.cmd_stop(argparse.Namespace()) == 0
+    assert any("disable --now 'watchtower.service'" in cmd for cmd in calls)
+
+
+def test_unit_quotes_paths_and_expansion_characters(tmp_path, monkeypatch):
+    from watchtower import cli
+
+    unit_path = tmp_path / "watchtower.service"
+    monkeypatch.setattr(cli, "_SYSTEMD_UNIT", unit_path)
+    monkeypatch.setattr(cli.sys, "executable", "/opt/my python/$python%/bin/python")
+    monkeypatch.setattr(cli, "_launchd_path", lambda: "/opt/my tools/%bin:/usr/bin")
+    cli._write_systemd_unit()
+    unit = unit_path.read_text()
+    assert 'ExecStart="/opt/my python/$$python%%/bin/python"' in unit
+    assert 'Environment="PATH=/opt/my tools/%%bin:/usr/bin"' in unit

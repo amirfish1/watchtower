@@ -250,11 +250,16 @@ def test_answer_infers_kimi_engine_after_worker_exit(wt, tmp_path, monkeypatch):
     )
 
     assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
-    assert calls[0][0][3] == "kimi"
-    assert calls[0][1] == {
-        "queue": "THROUGHPUT",
-        "worker_id": worker_id,
-    }
+    # WT-31 D2.8: the engine is still inferred as kimi, but a kimi session has
+    # no receipt source, so it is handed off BEFORE any resume (this test used
+    # to require the headless kimi resume): no spawn, claim released, the
+    # answer rides the ticket to a fresh worker.
+    assert calls == []
+    it = q.get(item["ref"])
+    assert it["status"] == "open" and not it.get("claimed_by")
+    assert "A: A" in it["text"] and "could not be verified-resumed" in it["text"]
+    assert cli._answer_engine({"claimed_session_id": sid, "claimed_by": worker_id},
+                              None) == "kimi"
 
 
 def test_answer_resume_reports_immediate_process_exit(wt, tmp_path, monkeypatch):
@@ -398,7 +403,7 @@ def test_answer_and_message_resume_share_boot_verifier(wt, tmp_path, monkeypatch
     assert len(verified) == 2
 
 
-def test_answer_fallback_failure_names_engine_for_manual_resume(
+def test_answer_total_delivery_failure_releases_with_qa_embedded(
     wt, tmp_path, monkeypatch, capsys
 ):
     cli, q, workers = wt
@@ -417,8 +422,13 @@ def test_answer_fallback_failure_names_engine_for_manual_resume(
     assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
 
     output = capsys.readouterr().out
-    assert "codex resume also failed to stay running" in output
-    assert f"wt discuss {item['ref']} --engine codex" in output
+    # WT-30 D7: every transport failed -> release the claim, no "resume manually".
+    assert "codex resume did not stay running" in output
+    assert "claim released" in output
+    assert "Resume manually" not in output
+    after = q.get(item["ref"])
+    assert after["status"] == "open"
+    assert "[ANSWERED while blocked" in after["text"]
 
 
 def test_answered_ticket_not_reopened_while_answer_in_flight(wt, tmp_path):
@@ -437,3 +447,62 @@ def test_answered_ticket_not_reopened_while_answer_in_flight(wt, tmp_path):
     reopened = workers.requeue_orphaned_tickets(grace_s=0, answer_grace_s=0)
     assert [r["ref"] for r in reopened] == [item["ref"]]
     assert q.get(item["ref"])["status"] == "open"
+
+
+def _park_everything(monkeypatch, tmp_path):
+    """Sandbox the outbox and make every transport fail so send() parks."""
+    import watchtower.messages as messages
+    monkeypatch.setenv("WATCHTOWER_OUTBOX_FILE", str(tmp_path / "outbox.json"))
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "off")
+    monkeypatch.setattr(
+        messages, "deliver", lambda *a, **k: {"ok": False, "error": "down"}
+    )
+    return messages
+
+
+def test_held_answer_is_cancelled_not_retried_after_ticket_closes(
+    wt, tmp_path, monkeypatch
+):
+    """WT-1 end to end: `wt answer` parks the answer in the outbox, the worker
+    closes the ticket anyway, and the daemon must cancel the parked answer
+    instead of re-injecting it on every backoff tick until dead."""
+    cli, q, workers = wt
+    messages = _park_everything(monkeypatch, tmp_path)
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    item = _blocked_codex_ticket(q, workers, tmp_path, worker_id="w-1", sid=sid)
+
+    assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
+    parked = messages.outbox_list(status="pending")
+    assert [(m["ticket"], m["ticket_session"]) for m in parked] == [
+        (item["ref"], sid)
+    ]
+
+    q.close(item["ref"], force=True)
+    delivered = []
+    monkeypatch.setattr(messages, "deliver",
+                        lambda *a, **k: delivered.append(a) or {"ok": True})
+    out = messages.drain_outbox(now=10 ** 12)
+
+    assert out["cancelled"] == [parked[0]["id"]]
+    assert delivered == []
+    assert messages.outbox_list()[0]["status"] == "cancelled"
+
+
+def test_held_comment_is_bound_to_its_ticket_claim(wt, tmp_path, monkeypatch):
+    cli, q, workers = wt
+    messages = _park_everything(monkeypatch, tmp_path)
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    item = q.enqueue(project="THROUGHPUT", note="work")
+    q.claim_next("w-1", project="THROUGHPUT", session_uuid=sid)
+    workers.record_worker(
+        _dead_pid(), "THROUGHPUT", "codex", "w-1",
+        repo_path=str(tmp_path), session_id=sid,
+    )
+    args = argparse.Namespace(ref=item["ref"], text="also check X",
+                              by="human", worker="human")
+
+    assert cli.cmd_comment(args) == 0
+    parked = messages.outbox_list(status="pending")
+    assert [(m["ticket"], m["ticket_session"]) for m in parked] == [
+        (item["ref"], sid)
+    ]

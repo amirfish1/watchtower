@@ -208,8 +208,8 @@ investigation:
 ```
 amirfish1/claude-command-center:open    at_age=1168s  fetch_age=3091s   n=7
 amirfish1/claude-command-center:closed  at_age=1168s  fetch_age=6663s   n=10
-amirfish1/stramp-platform:open          at_age=1177s  fetch_age=152717s n=2
-amirfish1/stramp-platform:closed        at_age=1177s  fetch_age=6293s   n=13
+amirfish1/client-platform:open          at_age=1177s  fetch_age=152717s n=2
+amirfish1/client-platform:closed        at_age=1177s  fetch_age=6293s   n=13
 test-owner/test-repo:open               (test fixture, 21 days old)
 ```
 
@@ -373,7 +373,7 @@ Distinct `gh` invocations, 180 s, with parent attribution:
 
 The ETag layer is working where it has an ETag: 118 conditional probes in three
 minutes cost nothing, and the repos holding a real ETag
-(`claude-command-center`, `stramp-platform`) were last fetched 2.6–44 hours ago.
+(`claude-command-center`, `client-platform`) were last fetched 2.6–44 hours ago.
 That is the read-cap design behaving exactly as `docs/github-read-caps.md`
 describes.
 
@@ -386,8 +386,8 @@ describes.
 | `amirfish1/BYM-Finie:open` | **`""` (empty)** | 53 s |
 | `amirfish1/claude-command-center:open` | present | 2.6 h |
 | `amirfish1/claude-command-center:closed` | present | 3.6 h |
-| `amirfish1/stramp-platform:open` | present | 44 h |
-| `amirfish1/stramp-platform:closed` | present | 3.5 h |
+| `amirfish1/client-platform:open` | present | 44 h |
+| `amirfish1/client-platform:closed` | present | 3.5 h |
 
 `BYM-Finie` — the one repo with live workers, and the source of the 9
 `gh issue edit` calls in the sample — is stuck in the ratchet described under
@@ -419,7 +419,7 @@ the second one is no longer WatchTower's.
 | `amirfish1/BYM-Finie:open` | present | false | **2,009 s ago** |
 | `amirfish1/BYM-Finie:closed` | present | false | 2,007 s ago |
 | `amirfish1/claude-command-center:open` | present | false | 34,015 s ago |
-| `amirfish1/stramp-platform:open` | present | false | 13,422 s ago |
+| `amirfish1/client-platform:open` | present | false | 13,422 s ago |
 
 Compare the same table before the fix: `BYM-Finie:open` at `etag=""` with an
 age of 53 seconds. Every entry now holds a validator, nothing is stuck stale,
@@ -459,7 +459,7 @@ passes through `_list_issues`, so none of the caps in this file apply to it.
 
 ### What is left, and where it lives
 
-All of it is in `/Users/amirfish/Apps/claude-command-center`:
+All of it is in `~/Apps/claude-command-center`:
 
 - `ccc_server/morning_launch.py:_open_prs_cached` — `_OPEN_PRS_TTL = 30.0`,
   keyed per repo directory, requesting `statusCheckRollup,mergeable,reviewDecision`

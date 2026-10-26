@@ -1,4 +1,4 @@
-"""Tests for the worker-turn interrupt primitive (SONIA-CHAT-5).
+"""Tests for the worker-turn interrupt primitive (CLIENT-CHAT-5).
 
 ``wt interrupt <target>`` writes claude's stream-json ``interrupt`` control
 request to a live worker's stdin FIFO, aborting the in-flight turn WITHOUT

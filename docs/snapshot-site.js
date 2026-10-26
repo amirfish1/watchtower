@@ -12,7 +12,7 @@ const http = require('http');
 const path = require('path');
 const os = require('os');
 
-const CCC = '/Users/amirfish/Apps/claude-command-center';
+const CCC = process.env.CCC_DIR || path.join(os.homedir(), 'Apps', 'claude-command-center');
 const puppeteer = require(path.join(CCC, 'require-puppeteer.js'));
 
 const DOCS_DIR = path.resolve(__dirname);

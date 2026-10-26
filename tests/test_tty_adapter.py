@@ -26,7 +26,7 @@ _PS_SAMPLE = """\
   PID TTY           COMMAND
     1 ??            /sbin/launchd
  2201 ttys001       /Applications/iTerm.app/Contents/MacOS/iTerm2
- 2345 ttys001       /Users/amir/.local/bin/claude --resume 7f72634b-b0bd-4c78-b931-3d877ed84187 --verbose
+ 2345 ttys001       /Users/x/.local/bin/claude --resume 7f72634b-b0bd-4c78-b931-3d877ed84187 --verbose
  2400 ttys002       /usr/local/bin/claude --print --output-format text
  2500 ??            /usr/local/bin/claude -p --resume aaaaaaaa-1111-4111-8111-111111111111
  2600 ttys003       -bash

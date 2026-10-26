@@ -57,7 +57,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
-from . import health, queue as q, resume_verify, workers
+from . import answers, deep, health, queue as q, resume_verify, stages, workers
 
 DAEMON_PID_FILE = Path(
     os.environ.get("WATCHTOWER_DAEMON_PID")
@@ -109,6 +109,13 @@ def _print_status(rows: List[dict]) -> None:
     dash_state   = _svc_state(DASHBOARD_PID_FILE)
     print(f"service:  daemon={daemon_state}  dashboard={dash_state}")
     print(f"store:    {q.store_path()}")
+    try:
+        from . import deploy
+        _dw = deploy.warning_line()
+    except Exception:  # noqa: BLE001
+        _dw = ""
+    if _dw:
+        print(_dw)
     print()
     counts = workers.worker_counts()
     if not rows:
@@ -123,20 +130,30 @@ def _print_status(rows: List[dict]) -> None:
         for r in rows:
             flag = {"stuck": "STUCK", "backlog": "backlog",
                     "active": "draining", "clear": "ok"}.get(r.get("state"), "ok")
+            if _cfg.is_archived(r["queue"]):
+                flag = "archived"
             wc = counts.get(r["queue"], {"total": 0, "live": 0})
             wcell = f"{wc['total']} ({wc['live']} live)"
             drain_val = _cfg.auto_drain(r["queue"])
             drain_cell = "on " if drain_val else "off"
             ctypes = _cfg.claim_types(r["queue"])
             note = _eta_note(r)
+            if r.get("blocked"):
+                note = f"{note} [{r['blocked']} waiting on deps]".strip()
             if ctypes:
                 label = f"{ctypes[0]}s only" if len(ctypes) == 1 else ",".join(ctypes)
                 note = f"{note} [{label}]".strip()
+            eff = r.get("worker_model") or _cfg.model(r["queue"])
+            note = f"{note} [{r.get('worker_engine') or _cfg.engine(r['queue'])}:{eff or 'default'}]".strip()
             print(
                 f"{r['queue']:<14}{r['depth']:>5}{r['in_progress']:>5}{r['closed']:>6}"
                 f"  {r['oldest_open_age']:>8}  {r['since_progress']:>8}"
                 f"  {wcell:<12}{drain_cell:<7}{flag}  {note}"
             )
+            if r.get("model_pin_warning"):
+                print(f"  ⚠ {r['queue']}: {r['model_pin_warning']}")
+            if r.get("effort_pin_warning"):
+                print(f"  ⚠ {r['queue']}: {r['effort_pin_warning']}")
 
     rows_w = workers.list_workers(prune=False)
     workers.annotate_activity(rows_w, q.list_items())
@@ -147,6 +164,10 @@ def _print_status(rows: List[dict]) -> None:
         return
     for w in rows_w:
         state = "LIVE" if w.get("alive") else "DEAD"
+        if not w.get("alive"):
+            age = workers.session_active_age_s(w, rows_w)
+            if age is not None:
+                state += f" (session active {int(age)}s ago)"
         ref = w.get("active_ref")
         if ref:
             since = w.get("active_since_human")
@@ -177,16 +198,29 @@ def _with_timeline(item: dict) -> dict:
 def _event_summary(event: dict) -> str:
     name = str(event.get("event") or "")
     if name == "filed":
-        return f"filed from {event.get('source') or 'unknown'}"
+        filer = str(event.get("submitter") or "").strip()
+        return f"filed from {event.get('source') or 'unknown'}" + (f" by {filer}" if filer else "")
     if name == "claim":
         by = event.get("by") or {}
-        return f"claimed by {by.get('worker') or by.get('session_id') or by.get('kind') or 'unknown'}"
+        actor = q.with_machine(
+            by.get("worker") or by.get("session_id") or by.get("kind") or "unknown",
+            by.get("machine"),
+        )
+        return f"claimed by {actor}"
     if name == "block":
         return f"blocked: {event.get('question') or ''}".rstrip()
+    if name == "defer":
+        return f"deferred until {event.get('until') or '?'}: {event.get('reason') or ''}".rstrip()
     if name in ("answer", "comment", "progress"):
         return f"{name}: {event.get('text') or ''}".rstrip()
     if name == "reopen":
         return f"reopened: {event.get('reason') or ''}".rstrip()
+    if name == "in_review":
+        return f"in review (gates passed; reviewer: {event.get('reviewer') or 'submitter'})"
+    if name == "accept":
+        return "accepted"
+    if name == "verify":
+        return f"verifier passed: {event.get('findings') or ''}".rstrip()
     if name == "close":
         res = event.get("resolution") or {}
         summary = res.get("summary") if isinstance(res, dict) else ""
@@ -291,13 +325,46 @@ def _mark_self(item: dict, worker: str, session: str) -> dict:
 
 
 # ----------------------------------------------------------------------- commands
+def cmd_deploy(args: argparse.Namespace) -> int:
+    """Show the installed tree vs origin; --sync fast-forwards it (WT-16)."""
+    from . import deploy
+    st = deploy.sync() if args.sync else deploy.status()
+    if args.json:
+        print(json.dumps(st, indent=2))
+        return 0
+    if not st.get("path"):
+        print("installed copy is not a git checkout; nothing to sync")
+        return 0
+    line = (f"{st['path']} @ {st['head'][:8]} ({st['branch']}); "
+            f"origin {st['origin_head'][:8]}, behind {st['behind']}, ahead {st['ahead']}")
+    if st["dirty"]:
+        line += f", dirty: {', '.join(st['dirty'][:5])}"
+    print(line)
+    if st.get("restored"):
+        print(f"restored stale files: {', '.join(st['restored'])}")
+    if st.get("action"):
+        print(f"{st['action']}" + (f": {st['reason']}" if st.get("reason") else ""))
+    return 1 if st.get("action") == "refused" else 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     # fresh=True: a human asking for status gets current state, never a cached
     # snapshot. On a GitHub queue that is an ETag revalidation, so the usual
     # answer is a ~0.5s 304 that costs no rate limit.
     rows = health.all_status(
-        project=args.queue, stuck_minutes=args.stuck_minutes, fresh=True
+        project=args.queue, stuck_minutes=args.stuck_minutes, fresh=True,
+        include_archived=getattr(args, "all", False),
     )
+    from . import config as _cfg
+    for r in rows:
+        # The model the next worker on this queue will actually run, plus any
+        # stored pin we are ignoring (WT-10).
+        r["worker_engine"] = _cfg.engine(r["queue"])
+        r["worker_model"] = _cfg.model(r["queue"])
+        r["model_pin_warning"] = _cfg.model_pin_warning(r["queue"])
+        r["effort_pin_warning"] = _cfg.effort_pin_warning(r["queue"])
+        from . import roles as _roles
+        r["roles"] = _roles.role_table(r["queue"])
     if args.json:
         print(json.dumps(rows, indent=2))
     else:
@@ -345,11 +412,100 @@ def _ack_counts(item: dict) -> Tuple[int, int]:
     return len(entries), acked
 
 
+def _waiting_note(item: dict, by_ref: dict) -> str:
+    """"waiting on REF" for an open ticket held back by an unsatisfied
+    blocked_by dependency (WT-4), else ""."""
+    if item.get("status") != "open" or not item.get("blocked_by"):
+        return ""
+    state, ref = q.blocker_verdict(item, by_ref)
+    if state == "waiting":
+        return f"waiting on {ref}"
+    if state == "stuck":
+        return f"blocked: {ref} declined/unresolved"
+    return ""
+
+
+def cmd_queue_archive(args: argparse.Namespace) -> int:
+    """Retire a queue: hidden from status/migrate/dashboard, history kept."""
+    from . import config
+    name = args.name
+    if name not in config.all_queues(include_archived=True):
+        print(f"wt: unknown queue {name!r}", file=sys.stderr)
+        return 1
+    if config.is_archived(name):
+        print(f"{name}: already archived")
+        return 0
+    live = [it for it in q.list_items(project=name, fresh=True)
+            if it.get("status") in ("open", "in_progress")]
+    if live and not args.force:
+        if args.json:
+            print(json.dumps({"queue": name, "archived": False,
+                              "blocked_by_tickets": [it.get("ref") for it in live]}, indent=2))
+        else:
+            print(f"{name}: refusing to archive, {len(live)} open/WIP ticket(s):", file=sys.stderr)
+            for it in live:
+                print(f"  {it.get('ref')}  [{it.get('status')}]  {it.get('title', '')}", file=sys.stderr)
+            print("close/move them first, or pass --force", file=sys.stderr)
+        return 1
+    if not args.apply:
+        if args.json:
+            print(json.dumps({"queue": name, "archived": False, "dry_run": True,
+                              "open_tickets": len(live)}, indent=2))
+        else:
+            print(f"{name}: would archive (auto_drain off, hidden from status); "
+                  f"re-run with --apply")
+        return 0
+    config.set_archived(name, True)
+    if args.json:
+        print(json.dumps({"queue": name, "archived": True}, indent=2))
+    else:
+        print(f"{name}: archived (history kept; `wt status --all` shows it, "
+              f"`wt queue unarchive {name}` restores)")
+    return 0
+
+
+def cmd_queue_unarchive(args: argparse.Namespace) -> int:
+    from . import config
+    name = args.name
+    if not config.is_archived(name):
+        print(f"wt: {name!r} is not archived", file=sys.stderr)
+        return 1
+    config.set_archived(name, False)
+    if args.json:
+        print(json.dumps({"queue": name, "archived": False}, indent=2))
+    else:
+        print(f"{name}: unarchived (auto_drain is still off; `wt drain on {name}` to staff it)")
+    return 0
+
+
+def cmd_queue_ls(args: argparse.Namespace) -> int:
+    from . import config
+    rows = []
+    for name, entry in sorted(config.all_queues(include_archived=True).items()):
+        arch = config.is_archived(name)
+        if args.archived and not arch:
+            continue
+        if not (args.archived or args.all) and arch:
+            continue
+        at = entry.get("archived_at", "") if isinstance(entry, dict) else ""
+        rows.append({"queue": name, "archived": arch, "archived_at": at})
+    if args.json:
+        print(json.dumps(rows, indent=2))
+    else:
+        for r in rows:
+            tag = f"  archived {r['archived_at']}".rstrip() if r["archived"] else ""
+            print(f"{r['queue']}{tag}")
+        if not rows:
+            print("(no queues)")
+    return 0
+
+
 def cmd_ls(args: argparse.Namespace) -> int:
     """List the tickets in a single queue (the actual items, not just counts)."""
     # fresh=True for the same reason as `wt status`: a CLI read always
     # revalidates, so `wt ls` is never behind the repo.
     items = q.list_items(project=args.queue, fresh=True)
+    all_items = items
     # Counted over the WHOLE queue, before the status filter, so the default
     # (active) view still surfaces that closed-but-unresolved work exists.
     unresolved_total = len(_unresolved_items(items))
@@ -357,7 +513,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
     if getattr(args, "unresolved", False):
         want = "unresolved"
     if want == "active":
-        items = [i for i in items if i.get("status") in ("open", "in_progress")]
+        items = [i for i in items if i.get("status") in ("open", "in_progress", "in_review", "awaiting_answer")]
     elif want == "blocked":
         items = [i for i in items if i.get("needs_input")]
     elif want == "unresolved":
@@ -366,7 +522,10 @@ def cmd_ls(args: argparse.Namespace) -> int:
         items = [i for i in items if i.get("status") == want]
     limit = args.limit or len(items)
     if args.json:
-        print(json.dumps(items[:limit], indent=2))
+        # Blockers may live in other queues, so resolve against every queue.
+        by_ref = q._refs_index(q.list_items(fresh=True) + all_items)
+        rows = [dict(i, waiting_on=q.waiting_on(i, by_ref)) for i in items[:limit]]
+        print(json.dumps(rows, indent=2))
         return 0
     if not items:
         print(f"(no {('' if want=='all' else want+' ')}items in {args.queue})")
@@ -377,11 +536,30 @@ def cmd_ls(args: argparse.Namespace) -> int:
               f"items (wt unresolved -q {args.queue})")
     print(f"{'REF':<14}{'STATUS':<12}{'WORKER':<22}TITLE")
     print("-" * 72)
+    by_ref = q._refs_index(all_items)
     for it in items[:limit]:
-        worker = str(it.get("claimed_by") or it.get("claimed_session_id") or "")[:20]
+        machine = it.get("claimed_machine") or it.get("closed_machine") or ""
+        worker = q.with_machine(
+            it.get("claimed_by") or it.get("claimed_session_id"), machine
+        )[:20]
         title = _oneline(it.get("title") or it.get("note") or "")[:56]
         line = f"{str(it.get('ref','')):<14}{str(it.get('status','')):<12}{worker:<22}{title}"
-        res = it.get("resolution") if it.get("status") == "closed" else None
+        waiting = _waiting_note(it, by_ref)
+        if waiting:
+            line += f"  [{waiting}]"
+        if it.get("placement") in ("mac", "cloud"):
+            line += f"  [{it['placement']} only]"
+        role = q.group_role(it)
+        if role == "parent":
+            line += (f"  [group: {len((it.get('group') or {}).get('members') or [])} members, "
+                     f"integration {q.group_integration_state(it)}]")
+        elif role == "child":
+            line += f"  [group {q.group_parent_ref(it)}]"
+        if it.get("status") == "in_review":
+            line += f"  [gate pending: {q.gate_stage_label(str(it.get('gate_pending') or 'review'))}]"
+        elif it.get("status") == "open" and it.get("gate_feedback"):
+            line += f"  [gate: {_oneline(it['gate_feedback'])[:60]}]"
+        res = it.get("resolution") if it.get("status") in ("closed", "in_review") else None
         if res and res.get("summary"):
             line += f"  — {res['summary']}"
             extras = []
@@ -448,6 +626,12 @@ def cmd_unresolved(args: argparse.Namespace) -> int:
     return 0
 
 
+def _print_ticket_usage(item: dict) -> None:
+    if item.get("token_usage"):
+        from . import usage
+        print("  " + usage.render(item).replace("\n", "\n  "))
+
+
 def cmd_find(args: argparse.Namespace) -> int:
     """Look up one ticket by ref or number, searching every queue -- the CLI
     surface for queue.get(), which already matches globally. No -q needed,
@@ -461,22 +645,66 @@ def cmd_find(args: argparse.Namespace) -> int:
     item_with_timeline = _mark_self(
         _with_timeline(item), caller_worker, caller_session
     )
+    checks = q.checks_block(item)
     if args.json:
+        if checks:
+            item_with_timeline = dict(item_with_timeline, checks_after_close=checks)
         print(json.dumps(item_with_timeline, indent=2))
         return 0
-    worker = str(item.get("claimed_by") or item.get("claimed_session_id") or "")
+    worker = q.with_machine(
+        item.get("claimed_by") or item.get("claimed_session_id"),
+        item.get("claimed_machine"),
+    )
     title = _oneline(item.get("title") or item.get("note") or "")
     print(f"{item.get('ref',''):<14}[{item.get('status',''):<11}] {title}")
+    filer = str(item.get("submitter") or item.get("github_author") or "")
+    if filer:
+        from . import messages
+        try:
+            forwarded = messages.ccc_forward_target(filer)
+        except Exception:
+            forwarded = None
+        print(f"  filed_by: {filer}" + (f" -> {forwarded}" if forwarded else ""))
+    if q.group_role(item) == "parent":
+        g = item.get("group") or {}
+        print(f"  group: parent of {', '.join(q.group_children(item)) or '(none)'} "
+              f"({'sealed' if g.get('sealed') else 'unsealed'}, membership v{q.group_mv(item)}, "
+              f"integration {q.group_integration_state(item)}); `wt group show {item.get('ref')}`")
+    elif q.group_role(item) == "child":
+        print(f"  group: {(item.get('group') or {}).get('kind', 'member')} of "
+              f"{q.group_parent_ref(item)}")
+    if item.get("blocked_by"):
+        print(f"  blocked_by: {', '.join(item['blocked_by'])}")
+        try:
+            note = _waiting_note(item, q._refs_index(q.list_items()))
+        except Exception:
+            note = ""
+        if note:
+            print(f"  {note}")
+    if item.get("accept"):
+        print(f"  accept: {item['accept']}")
+    if q.is_deep(item):
+        print(f"  depth: deep ({item.get('budget_min') or q.DEEP_DEFAULT_BUDGET_MIN}m budget)")
+    if q.deferred_now(item):
+        print(f"  deferred until {item.get('deferred_until')}: {item.get('defer_reason') or ''}")
+    if checks:
+        print("  " + checks.replace("\n", "\n  "))
     if worker:
         you = " (you)" if item_with_timeline.get("claimed_by_you") else ""
         print(f"  claimed_by: {worker}{you}")
-    closed_by = str(item.get("closed_by") or "")
+    closed_by = q.with_machine(item.get("closed_by"), item.get("closed_machine"))
     if closed_by:
         you = " (you)" if item_with_timeline.get("closed_by_you") else ""
         print(f"  closed_by: {closed_by}{you}")
     res = item.get("resolution") if item.get("status") == "closed" else None
     if res and res.get("summary"):
         print(f"  resolution: {res['summary']}")
+    asmt = item.get("assessment") or {}
+    if asmt:
+        print(f"  assessment: {asmt.get('status')} (attempt {asmt.get('attempt', 0)})"
+              + (f" -- {asmt['reason']}" if asmt.get("reason") else "")
+              + (f" -- follow-ups: {', '.join(asmt['followups'])}" if asmt.get("followups") else ""))
+    _print_ticket_usage(item)
     timeline = item_with_timeline.get("timeline") or []
     if timeline:
         print("  activity:")
@@ -486,6 +714,63 @@ def cmd_find(args: argparse.Namespace) -> int:
     return 0
 
 
+def _bad_model_floor(args: argparse.Namespace) -> bool:
+    """Reject a --model-floor no model catalog knows (WT-13; formerly an
+    argparse choices list)."""
+    from . import config
+    for attr, flag in (("model_floor", "--model-floor/--builder-model"),
+                       ("planner_model", "--planner-model"),
+                       ("verifier_model", "--verifier-model")):
+        value = getattr(args, attr, None)
+        if value and not config.is_valid_model_floor(value):
+            print(f"error: {flag} {value!r} is not a model in any catalog "
+                  "(see `wt models --engine <engine>`)", file=sys.stderr)
+            return True
+    return False
+
+
+def _warn_floor_above_queue(items: List[Dict[str, Any]]) -> None:
+    """One stderr line per open ticket whose ``model_floor`` the queue's model
+    does not meet (WATCHTOWER-39). Queue workers never claim such a ticket;
+    the reconciler routes it to a one-off floor-model worker (WT-10) -- so say
+    so at filing/edit/model-change time instead of letting it sit unexplained.
+    GitHub-backed queues have no floor filter, so they are skipped."""
+    from . import config, workers
+    for it in items:
+        floor = str(it.get("model_floor") or "").strip()
+        queue = str(it.get("project") or "")
+        if not floor or it.get("status") != "open":
+            continue
+        try:
+            if q._github_backend_for_project(queue) is not None:
+                continue
+            if config.model_floor_met(queue, floor):
+                continue
+            qmodel = config.queue_model_id(queue) or "the engine default (no model set)"
+            eng = config.floor_engine(floor)
+            if not eng or not workers.engine_available(eng):
+                how = f"no installed engine serves {floor}, so it stays open"
+            elif not config.auto_drain(queue) and not it.get("run_requested"):
+                how = (f"a one-off {floor} worker is spawned for it once you run "
+                       f"`wt ready {it.get('ref')}` (auto-drain is off)")
+            else:
+                how = f"the reconciler spawns a one-off {floor} worker for it"
+        except Exception:
+            continue  # a hint, never a reason to fail the command
+        print(f"warning: {it.get('ref')} needs {floor} but queue {queue} runs "
+              f"{qmodel}; its workers won't claim it -- {how}", file=sys.stderr)
+
+
+def _warn_queue_floors(queue: str) -> None:
+    """After a queue's engine/model changes: warn for its open tickets whose
+    floor the new model no longer meets."""
+    try:
+        items = q.list_items(project=queue)
+    except Exception:
+        return
+    _warn_floor_above_queue(items)
+
+
 def cmd_edit(args: argparse.Namespace) -> int:
     """Patch fields (title/priority/type/readiness/...) on an existing
     ticket, in place -- no refile/close churn (WT-71). Only flags the
@@ -493,22 +778,38 @@ def cmd_edit(args: argparse.Namespace) -> int:
     --queue moves the ticket to a different queue in place (WT-83), also
     without refile/close churn -- its ref is reassigned within the target
     queue since refs are derived from project+number."""
+    if _bad_model_floor(args):
+        return 1
     fields = {}
     for name in (
         "title", "note", "text", "url", "type", "readiness", "priority",
-        "value", "confidence", "model_floor", "selector", "screenshot_path",
-        "repo_path",
+        "value", "confidence", "model_floor", "planner_model", "verifier_model",
+        "selector", "screenshot_path", "repo_path", "accept", "placement",
+        "depth", "budget_min",
     ):
         value = getattr(args, name, None)
         if value is not None:
             fields[name] = value
+    after = getattr(args, "after", None)
+    # --clear-X + --X means "replace": clear first, then apply the new values.
+    if after or getattr(args, "clear_after", False):
+        existing = []
+        if not getattr(args, "clear_after", False):
+            try:
+                existing = list((q.get(args.ref) or {}).get("blocked_by") or [])
+            except Exception:
+                existing = []
+        fields["blocked_by"] = existing + [a for a in (after or []) if a not in existing]
+    if getattr(args, "clear_gates", False) or getattr(args, "gate", None):
+        fields["gates"] = list(getattr(args, "gate", None) or [])
     new_queue = getattr(args, "queue", None)
     if not fields and new_queue is None:
         print(
             "error: no fields to edit -- pass at least one of "
             "--title/--note/--text/--url/--type/--readiness/--priority/"
             "--value/--confidence/--model-floor/--selector/"
-            "--screenshot-path/--repo-path/--queue",
+            "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates/--accept/"
+            "--depth/--budget-min",
             file=sys.stderr,
         )
         return 1
@@ -538,10 +839,20 @@ def cmd_edit(args: argparse.Namespace) -> int:
     else:
         moved = f" (moved {old_ref} -> {item['ref']})" if old_ref else ""
         print(f"EDITED: {item['ref']}{moved}  {item.get('title') or item.get('note','')}")
+    if "model_floor" in fields or new_queue is not None:
+        _warn_floor_above_queue([item])
     return 0
 
 
 def cmd_add(args: argparse.Namespace) -> int:
+    if getattr(args, "run", False):
+        conflict = ("--claim" if getattr(args, "claim", False) else
+                    "--group-parent" if getattr(args, "group_parent", False) else "")
+        if conflict:
+            print(f"error: --run cannot be combined with {conflict}", file=sys.stderr)
+            return 1
+    if _bad_model_floor(args):
+        return 1
     submitter = (getattr(args, "submitter", "") or "").strip()
     if not submitter:
         # Same auto-detection --report-to already relies on: a Claude session
@@ -561,25 +872,56 @@ def cmd_add(args: argparse.Namespace) -> int:
                 "notifications sent before it's known/registered will fail",
                 file=sys.stderr,
             )
-    item = q.enqueue(
-        project=args.queue,
-        title=args.title or "",
-        note=args.note or (args.title or ""),
-        text=args.text or "",
-        url=args.url or "",
-        lane=args.lane,
-        source="wt",
-        item_type=getattr(args, "type", "") or "",
-        readiness=getattr(args, "readiness", "") or "",
-        priority=getattr(args, "priority", "") or "",
-        value=getattr(args, "value", "") or "",
-        confidence=getattr(args, "confidence", "") or "",
-        model_floor=getattr(args, "model_floor", "") or "",
-        submitter=submitter,
-        submitter_explicit=bool((getattr(args, "submitter", "") or "").strip()),
-        pre_ack=bool(getattr(args, "pre_ack", False)),
-    )
-    print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}")
+    try:
+        item = q.enqueue(
+            project=args.queue,
+            title=args.title or "",
+            note=args.note or (args.title or ""),
+            text=args.text or "",
+            url=args.url or "",
+            lane=args.lane,
+            source="wt",
+            item_type=getattr(args, "type", "") or "",
+            readiness=getattr(args, "readiness", "") or "",
+            priority=getattr(args, "priority", "") or "",
+            value=getattr(args, "value", "") or "",
+            confidence=getattr(args, "confidence", "") or "",
+            model_floor=getattr(args, "model_floor", "") or "",
+            placement=getattr(args, "placement", "") or "",
+            planner_model=getattr(args, "planner_model", "") or "",
+            verifier_model=getattr(args, "verifier_model", "") or "",
+            dedupe_key=getattr(args, "dedupe_key", "") or "",
+            submitter=submitter,
+            submitter_explicit=bool((getattr(args, "submitter", "") or "").strip()),
+            pre_ack=bool(getattr(args, "pre_ack", False)),
+            blocked_by=list(getattr(args, "after", None) or []),
+            gates=list(getattr(args, "gate", None) or []) or None,
+            accept_line=getattr(args, "accept", "") or "",
+            group_parent=bool(getattr(args, "group_parent", False)),
+            group=getattr(args, "group", "") or "",
+            children=[c.strip() for c in str(getattr(args, "children", "") or "").split(",")
+                      if c.strip()] or None,
+            depth=getattr(args, "depth", "") or "",
+            budget_min=getattr(args, "budget_min", 0) or 0,
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}"
+          + (f"  [deep, {item.get('budget_min')}m budget]" if q.is_deep(item) else ""))
+    if not getattr(args, "claim", False):
+        _warn_floor_above_queue([item])
+    if q.group_role(item) == "parent":
+        g = item.get("group") or {}
+        members = ", ".join(g.get("members") or []) or "none yet"
+        print(f"GROUP: {item['ref']} members [{members}] "
+              + ("sealed; the group plan starts now" if g.get("sealed") else
+                 f"unsealed; `wt group attach {item['ref']} REF...` then "
+                 f"`wt group seal {item['ref']}`"))
+        return 0   # a parent is never claimed or dispatched
+    if q.group_role(item) == "child":
+        print(f"GROUP: {item['ref']} is a member of {q.group_parent_ref(item)}; claimable "
+              f"once the group plan is accepted")
     # Enqueue-and-claim: file the ticket, then immediately mark it in_progress so
     # the reconciler (which only spawns for OPEN tickets) leaves it alone. For the
     # user who's already working the bug they're documenting. Skip the dispatch
@@ -594,6 +936,21 @@ def cmd_add(args: argparse.Namespace) -> int:
             # Enqueue already succeeded; a claim hiccup shouldn't fail the file.
             print(f"[watchtower] could not claim {item['ref']}: {e}", file=sys.stderr)
         return 0
+    # Equivalent to filing then `wt run`: record the per-ticket request before
+    # dispatch so grace/auto-drain policy cannot hold this submission back.
+    if getattr(args, "run", False):
+        try:
+            runnable = q.mark_runnable(item["ref"])
+        except Exception as e:
+            print(f"error: filed {item['ref']}, but could not request its run: {e}",
+                  file=sys.stderr)
+            return 1
+        if runnable is None:
+            print(f"error: filed {item['ref']}, but could not request its run: ticket not found",
+                  file=sys.stderr)
+            return 1
+        item = runnable
+        print(f"RUNNABLE: {item['ref']}  {item.get('title') or item.get('note', '')}")
     # Decide + act on the new ticket NOW (nudge current staffing via FIFO, else
     # gracefully release verified-idle staffing and spawn) and log the
     # decision. Centralized in
@@ -681,6 +1038,11 @@ def cmd_import(args: argparse.Namespace) -> int:
                 url=candidate.source_ref,
                 repo_path=str(Path(candidate.source_path).parent),
                 item_type=args.type or candidate.item_type,
+                accept_line=candidate.accept,
+                blocked_by=[
+                    refs_by_title[t] for t in candidate.depends_on
+                    if t in refs_by_title
+                ],
             )
         except Exception as exc:
             print(
@@ -751,6 +1113,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 oldest=getattr(args, "oldest", False),
                 item_types=getattr(args, "type", None) or [],
                 readiness_filters=getattr(args, "readiness", None) or [],
+                worker_model=workers.worker_model(worker, args.queue),
             )
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
@@ -763,12 +1126,35 @@ def cmd_claim(args: argparse.Namespace) -> int:
             # (its next `wt add` nudge wakes it), with queue-scoped release as the
             # persistently-idle safety net.
             from . import config
-            desired = config.desired_workers(args.queue) if config.auto_drain(args.queue) else 0
-            live = workers.live_worker_count(args.queue)
+            drain_on = config.auto_drain(args.queue)
+            desired = config.desired_workers(args.queue) if drain_on else 0
+            retained = workers.retained_parked_ids(args.queue)
+            live = workers.live_worker_count(args.queue, exclude=retained)
+            if worker in retained:
+                owned = ", ".join(sorted(workers.retained_parked_refs(args.queue, worker)))
+                if args.json:
+                    print(json.dumps({}))
+                else:
+                    print(f"(nothing open in {args.queue}; you own parked {owned or 'a ticket'} "
+                          f"awaiting an answer -- stay idle)")
+                return 0
             if live > desired:
                 from watchtower.queue import _log
-                _log("STOP", f"{worker} — surplus at claim ({live}>{desired} desired)",
-                     queue=args.queue)
+                # With auto-drain off, desired_workers only staffs manual runs;
+                # once no run-requested ticket is left the run is done. Say so,
+                # or "(1>0 desired)" reads as contradicting the SPAWN row's
+                # "1 desired" (WATCHTOWER-35).
+                why = (
+                    f"surplus at claim ({live}>{desired} desired)" if drain_on
+                    else "manual run done — auto-drain off and no "
+                         "run-requested ticket left to claim"
+                )
+                # Detach it from staffing like every other STOP path does:
+                # otherwise it stays counted live and keeps getting new-ticket
+                # nudges it (correctly) refuses, and nobody spawns to cover
+                # them (WT-17).
+                workers._mark_worker_released(worker)
+                _log("STOP", f"{worker} — {why}", queue=args.queue)
                 if args.json:
                     print(json.dumps({"stop": True}))
                 else:
@@ -785,50 +1171,776 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 print("STOP: reconciler requested shutdown; exiting")
             return 0
 
-    # FEAT-NEXT-120 — per-ticket model floor. Checked here, after a genuine
-    # claim (not the nothing-open/stop early-returns above), so an
-    # under-tiered queue never silently works a ticket that named a higher
-    # floor. Auto-parks it via the existing block() path -- "worker parks
-    # the ticket blocked with a note" per the design -- rather than
-    # bouncing it back to open, so a human sees exactly why and can either
-    # reconfigure the queue's model or hand it to a stronger one.
+    # WT-10 fallback: the file backend filters floors in claim_next, so this
+    # only fires for a backend that cannot (GitHub-backed queues) or a by-ref
+    # claim of a ticket above this worker's model. The ticket goes straight
+    # back to open (never parked blocked) for the reconciler to route.
+    # Placement: an explicit `wt claim REF` of a ticket pinned to the other
+    # kind of machine is released straight back (claim_next never offers it).
+    if not q.placement_allows(item):
+        q.update_status(
+            item["ref"], "open", worker, require_status="in_progress",
+            reason=f"placement {item.get('placement')} not runnable on {q.machine_placement()}",
+        )
+        print(
+            f"error: {item['ref']} is placement={item.get('placement')!r}; this machine is "
+            f"{q.machine_placement()!r} -- released back to open "
+            "(`wt edit REF --placement any` to allow it here)",
+            file=sys.stderr,
+        )
+        return 1
+
     model_floor = str(item.get("model_floor") or "").strip()
     if model_floor:
         from . import config
-        if not config.model_floor_met(args.queue, model_floor):
-            queue_model = config.canonical_model(config.engine(args.queue), config.model(args.queue))
-            q.block(
-                item["ref"],
-                session_uuid,
-                question=(
-                    # Built from the shared prefix so the reconciler's SIDE-39
-                    # timebox watchdog can recognize a floor-park (and only a
-                    # floor-park) from the question text alone.
-                    f"{config.MODEL_FLOOR_BLOCK_PREFIX} {model_floor!r}, but queue "
-                    f"{args.queue!r} is configured for {queue_model or '(unset)'!r}. "
-                    "Reassign to a queue running at least that model, or bump this "
-                    "queue's --model, then answer to resume."
-                ),
-                progress=f"Auto-parked at claim time by {worker} — floor not met.",
+        my_model = workers.worker_model(worker, args.queue)
+        if not config.model_meets_floor(my_model, model_floor):
+            q.update_status(
+                item["ref"], "open", worker, require_status="in_progress",
+                reason=f"model floor {model_floor} not met by {my_model or '(unset)'}",
             )
             print(
                 f"error: {item['ref']} requires model floor {model_floor!r}; "
-                f"queue {args.queue!r} runs {queue_model or '(unset)'!r} — "
-                "parked blocked instead of claimed",
+                f"this worker runs {my_model or '(unset)'!r} — released back to "
+                "open for a floor-model worker",
                 file=sys.stderr,
             )
             return 1
 
     _rename_claiming_session(item)
+    item = _start_plan_stage(item)
 
     if args.json:
         # The claim just made is by definition the caller's; marking history
         # events under the same identity keeps a re-claimed ticket's earlier
         # activity from reading as another worker's (CCC-675).
-        _print_item(_mark_self(item, worker, session_uuid))
+        shown = _mark_self(item, worker, session_uuid)
+        brief = answers.claim_brief(item, worker, str(item.get("claimed_session_id") or ""))
+        if brief:
+            shown = dict(shown, answer_brief=brief)
+        fb = _sent_back_view(item)
+        if fb:
+            shown = dict(shown, sent_back_feedback=fb["reason"])
+        if item.get("handed_back"):
+            shown = dict(shown, handed_back=True)
+        checks = q.checks_block(item)
+        if checks:
+            shown = dict(shown, checks_after_close=checks)
+        plan_note = _plan_note(item)
+        if plan_note:
+            shown = dict(shown, plan_instructions=plan_note)
+        deep_note = deep.deep_brief(item)
+        if deep_note:
+            shown = dict(shown, deep_brief=deep_note)
+        _print_item(shown)
     else:
-        print(f"CLAIMED: {item['ref']} -> {worker}")
+        fb = _sent_back_view(item)
+        if item.get("handed_back"):
+            age = q._age_min((item.get("sent_back") or {}).get("at"))
+            print(f"HANDED BACK: {item['ref']} -> {worker} (sent back {age}m ago; "
+                  "fix this before any new ticket)")
+        else:
+            print(f"CLAIMED: {item['ref']} -> {worker}")
         print(item.get("text") or item.get("note") or "")
+        if fb:
+            print(f"\nSENT BACK by {fb['by']} {fb['age']}m ago: {fb['reason']}")
+            if item.get("handed_back") and fb.get("deadline"):
+                print(f"Released to the pool at {fb['deadline']} if you show no "
+                      f"progress (a `wt comment {item['ref']}` counts).")
+            elif item.get("sent_back_released"):
+                print(f"(released from {fb['released_from']} for no progress)")
+        if item.get("gate_feedback") and str(item["gate_feedback"]) != (fb or {}).get("reason"):
+            print("\n" + ("EARLIER GATE FEEDBACK" if fb else
+                          "GATE FEEDBACK (the previous attempt was sent back)")
+                  + ": " + str(item["gate_feedback"]))
+        brief = answers.claim_brief(item, worker, str(item.get("claimed_session_id") or ""))
+        if brief:
+            print("\n" + brief)
+        plan_note = _plan_note(item)
+        if plan_note:
+            print("\n" + plan_note)
+        deep_note = deep.deep_brief(item)
+        if deep_note:
+            print("\n" + deep_note)
+        checks = q.checks_block(item)
+        if checks:
+            print("\n" + checks)
+    return 0
+
+
+def _sent_back_view(item: dict) -> dict:
+    """WT-34: the current send-back feedback (live marker, else the released one)."""
+    sb = item.get("sent_back")
+    if isinstance(sb, dict) and sb.get("reason"):
+        dl = q._sent_back_deadline(item, q._sent_back_minutes(item))
+        return {"reason": str(sb["reason"]), "by": str(sb.get("by") or "?"),
+                "age": q._age_min(sb.get("at")),
+                "deadline": q._hhmmz(dl) if dl else ""}
+    rel = item.get("sent_back_released")
+    if isinstance(rel, dict) and rel.get("reason"):
+        return {"reason": str(rel["reason"]), "by": str(rel.get("by") or "?"),
+                "age": q._age_min(rel.get("sent_back_at")), "deadline": "",
+                "released_from": str(rel.get("worker_id") or "?")}
+    return {}
+
+
+def _group_plan_brief(item: dict) -> Tuple[str, str]:
+    """(tickets block, format rules) for a group parent's plan sessions."""
+    ref = item["ref"]
+    members = list((item.get("group") or {}).get("members") or [])
+    by_ref = q._refs_index(q.list_items())
+    blocks = []
+    for r in members:
+        ch = by_ref.get(r) or {}
+        blocks.append(f"### {r}: {ch.get('title') or ch.get('note') or ''}\n"
+                      f"{ch.get('text') or ch.get('note') or ''}"
+                      + (f"\nACCEPT LINE: {ch['accept']}" if ch.get("accept") else ""))
+    tickets = (f"GROUP {ref}: {item.get('text') or item.get('note') or item.get('title') or ''}\n"
+               + (f"GROUP ACCEPT LINE: {item['accept']}\n" if item.get("accept") else "")
+               + "\nMEMBER TICKETS:\n" + "\n\n".join(blocks))
+    rules = (f"This is ONE plan for the whole group: start with `## Shared` (the "
+             f"contracts, interfaces, ordering and conventions every member must "
+             f"follow), then exactly one `## Section: <REF>` per member ("
+             f"{', '.join(members)}) with that member's own work. A section whose "
+             f"text is exactly `{q.GROUP_PLAN_UNCHANGED}` keeps its previous text. "
+             f"Each member's builder sees the shared section and its own section only.")
+    return tickets, rules
+
+
+def _mv_flag(item: dict) -> str:
+    return f" --mv {q.group_mv(item)}" if q.group_role(item) == "parent" else ""
+
+
+def _rejected_sections(item: dict) -> List[str]:
+    plan = item.get("plan") or {}
+    return [r for r, v in (plan.get("section_reviews") or {}).items()
+            if isinstance(v, dict) and not v.get("accepted")]
+
+
+def _group_plan_goal(item: dict, feedback: str = "") -> str:
+    ref = item["ref"]
+    plan = item.get("plan") or {}
+    tickets, rules = _group_plan_brief(item)
+    rejected = _rejected_sections(item)
+    revise = ""
+    if feedback:
+        revise = (f"\nYour previous plan (round {int(plan.get('round') or 2) - 1}):\n"
+                  f"{q.render_plan(item)}\n\nThe reviewer REJECTED it: {feedback}\n"
+                  + (f"Rejected sections (fix these first): {', '.join(rejected)}. "
+                     f"Other sections may stay `{q.GROUP_PLAN_UNCHANGED}`.\n" if rejected else "")
+                  + "Revise the plan to address that.\n")
+    return (
+        f"You are the PLANNER for WatchTower plan group {ref} (membership v{q.group_mv(item)}). "
+        f"Do not write code or edit files. Read the tickets and the relevant code, then "
+        f"write an implementation plan for the group: approach, files to change, risks, "
+        f"the test list, and any open decisions you resolved (decide them yourself; "
+        f"nobody will answer questions).\n\n{rules}\n\n{tickets}\n{revise}"
+        f"\nWhen done, file the plan (not to anyone else): `wt plan submit {ref}"
+        f"{_mv_flag(item)} --file <path-to-plan.md>`. A refused submit names what is "
+        f"missing; a SUPERSEDED one means the membership changed: stop."
+    )
+
+
+def _plan_goal(item: dict, feedback: str = "") -> str:
+    if q.group_role(item) == "parent":
+        return _group_plan_goal(item, feedback)
+    ref = item["ref"]
+    plan = item.get("plan") or {}
+    return (
+        f"You are the PLANNER for WatchTower ticket {ref}. Do not write code or "
+        f"edit files. Read the ticket and the relevant code, then write an "
+        f"implementation plan: approach, files to change, risks, the test list, "
+        f"and any open decisions you resolved (decide them yourself; nobody "
+        f"will answer questions).\n\nTICKET:\n"
+        f"{item.get('text') or item.get('note') or item.get('title') or ''}\n"
+        + (f"\nACCEPT LINE: {item['accept']}\n" if item.get("accept") else "")
+        + (f"\nYour previous plan (round {int(plan.get('round') or 2) - 1}):\n"
+           f"{plan.get('text', '')}\n\nThe reviewer REJECTED it: {feedback}\n"
+           f"Revise the plan to address that.\n" if feedback else "")
+        + f"\nWhen done, file the plan (not to anyone else): "
+        f"`wt plan submit {ref} --file <path-to-plan.md>` or "
+        f"`wt plan submit {ref} --text \"...\"`."
+    )
+
+
+def _plan_review_goal(item: dict) -> str:
+    if q.group_role(item) == "parent":
+        ref = item["ref"]
+        plan = item.get("plan") or {}
+        tickets, rules = _group_plan_brief(item)
+        mv = _mv_flag(item)
+        return (
+            f"You are an independent PLAN REVIEWER for WatchTower plan group {ref} "
+            f"(membership v{q.group_mv(item)}). You did not write the plan. Do not edit "
+            f"files. Check the plan against every member ticket and the real code: is "
+            f"the shared section a sound contract for all members, is each member's "
+            f"section right and adequate (files, risks, tests, its accept line)?\n\n"
+            f"{rules}\n\n{tickets}\n\nPLAN (round {plan.get('round', 1)}, "
+            f"v{plan.get('version') or plan.get('round', 1)}):\n{q.render_plan(item)}\n\n"
+            f"File your verdict: `wt plan verdict {ref}{mv} --accept --reasons \"why it is "
+            f"sound\"` or `wt plan verdict {ref}{mv} --reject --section <REF> [--section "
+            f"<REF>...] --reasons \"what must change\"` naming every member section that "
+            f"must change (omit --section when the shared section is the problem). Reject "
+            f"only for real defects; a different-but-workable approach is an accept."
+        )
+    ref = item["ref"]
+    plan = item.get("plan") or {}
+    return (
+        f"You are an independent PLAN REVIEWER for WatchTower ticket {ref}. "
+        f"You did not write the plan. Do not edit files. Check the plan against "
+        f"the ticket and the real code: is the approach sound, are the files "
+        f"and risks right, is the test list adequate, does it satisfy the "
+        f"accept line?\n\nTICKET:\n"
+        f"{item.get('text') or item.get('note') or item.get('title') or ''}\n"
+        + (f"\nACCEPT LINE: {item['accept']}\n" if item.get("accept") else "")
+        + f"\nPLAN (round {plan.get('round', 1)}):\n{plan.get('text', '')}\n\n"
+        f"File your verdict on the ticket: `wt plan verdict {ref} --accept "
+        f"--reasons \"why it is sound\"` or `wt plan verdict {ref} --reject "
+        f"--reasons \"what must change\"`. Reject only for real defects; a "
+        f"different-but-workable approach is an accept."
+    )
+
+
+def _spawn_plan_role(item: dict, role: str, goal: str = "", name: str = "") -> bool:
+    """Shim (WT-24): the daemon spawns planner / reviewer sessions. The ticket's
+    plan state is the intent; this only wakes the daemon."""
+    stages.request(item["ref"], f"plan {role}")
+    return True
+
+
+def config_is_blocked(model: str) -> bool:
+    from . import config
+    return config.is_blocked_model(model)
+
+
+def _start_plan_stage(item: dict) -> dict:
+    """On claim: if the ticket has a plan gate and planning has not begun,
+    start it and ask the daemon for the planner (WT-24: the daemon spawns
+    stage sessions, never this process). Returns the (refreshed) item."""
+    if q.plan_gate(item) is None:
+        return item
+    started = q.plan_start(item["ref"])
+    if started is None:
+        return item
+    if started.pop("_plan_started", False):
+        stages.request(item["ref"], "plan start")
+    return q.get(item["ref"]) or started
+
+
+def start_pending_plans(queue: str) -> int:
+    """Start the plan stage for every open, unclaimed plan-gated ticket on
+    ``queue`` whose planning has not begun (WT-22). Planning happens BEFORE a
+    build worker claims; ``_claim_candidates`` keeps the ticket unclaimable
+    until the plan settles. Best-effort; returns how many planners started."""
+    n = 0
+    try:
+        for it in q.list_items(project=queue) or []:
+            if it.get("status") != "open" or q.plan_gate(it) is None:
+                continue
+            if (it.get("plan") or {}).get("status"):
+                continue
+            started = q.plan_start(it["ref"])
+            if started is not None and started.pop("_plan_started", False):
+                stages.request(it["ref"], "plan-gated add")
+                n += 1
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
+
+def _plan_role_alive(item: dict, role: str) -> bool:
+    """Is the ``role`` session of ``item``'s plan running right now? An
+    optimisation before a send; the guarantee is the live-only transport."""
+    wid = ((item.get("plan") or {}).get(role) or {}).get("worker_id")
+    return bool(wid) and stages.session_alive(str(wid))
+
+
+def _plan_send(item: dict, role: str, text: str, kind: str = "discuss") -> dict:
+    """Message the planner/reviewer session of ``item`` over a live-only
+    transport (UDS / WT stdin FIFO): never parks in the outbox, never spawns or
+    resumes a session. Returns the ``liveness.deliver`` result: ``ok`` means a
+    running peer took it (sent), NOT that it was read. Verified (WT-31 D4,
+    ``plan:<ref>:<role>:<kind>``): the delivery ledger settles it -- a lost
+    message marks the live stage session lost so the supervisor respawns it;
+    a reminder is counted only when its nonce lands, and a lost one blocks the
+    plan (``liveness._h_plan``)."""
+    wid = ((item.get("plan") or {}).get(role) or {}).get("worker_id")
+    if not wid:
+        return {"ok": False, "state": "failed", "error": "no worker id"}
+    try:
+        from . import liveness
+        ref = str(item.get("ref") or "")
+        return liveness.deliver(str(wid), text, purpose="plan",
+                                dedupe_key=f"plan:{ref}:{role}:{kind}", ref=ref,
+                                queue=str(item.get("project") or ""), worker_id=str(wid),
+                                transports=("message",),
+                                message={"fn": "send", "live_only": True},
+                                meta={"kind": kind, "role": role})
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "state": "failed", "error": str(exc)}
+
+
+def _block_stalled_plan(ref: str, item: Optional[dict]) -> bool:
+    """A plan discussion just escalated (``plan.status == blocked``): put the
+    question to a human. True when it blocked."""
+    if not item or (item.get("plan") or {}).get("status") != "blocked":
+        return False
+    q.block(ref, str(item.get("claimed_session_id") or ""), origin="plan_gate",
+            question=(f"Plan discussion stalled: "
+                      f"{item['plan'].get('discussion', {}).get('reason', '')}. "
+                      f"Decide with `wt plan decide {ref} --accept|--retry`."),
+            progress=f"Plan v{item['plan'].get('version')}:\n"
+                     f"{item['plan'].get('text', '')}")
+    return True
+
+
+def _plan_discussion_goal(item: dict, role: str) -> str:
+    """Prompt for one supervised discussion turn (WT-29): everything the
+    session needs is on the ticket, so nothing is resumed or messaged in."""
+    ref = item["ref"]
+    plan = item.get("plan") or {}
+    disc = plan.get("discussion") or {}
+    version = plan.get("version") or plan.get("round", 1)
+    base = (f"\nTICKET:\n{item.get('text') or item.get('note') or item.get('title') or ''}\n"
+            + (f"\nACCEPT LINE: {item['accept']}\n" if item.get("accept") else ""))
+    mv = _mv_flag(item)
+    if mv:
+        tickets, rules = _group_plan_brief(item)
+        base = f"\n{rules}\n\n{tickets}\n"
+        rejected = _rejected_sections(item)
+        if rejected:
+            base += f"\nREJECTED SECTIONS: {', '.join(rejected)}\n"
+        plan = dict(plan, text=q.render_plan(item))
+    msgs = (disc.get("messages") or [])[-10:]
+    transcript = "\n".join(f"- [{m.get('from')}] {str(m.get('text') or '')[:600]}" for m in msgs)
+    transcript = f"\nDISCUSSION SO FAR:\n{transcript}\n" if transcript else ""
+    objections = f"\nREVIEWER OBJECTIONS:\n{disc.get('objections', '')}\n"
+    if role == "planner":
+        return (
+            f"You are the PLANNER for WatchTower ticket {ref}, in plan discussion round "
+            f"{disc.get('round')}. Your previous session has ended; this is a fresh turn. "
+            f"Do not write code or edit files.\n{base}"
+            f"\nPLAN v{version} (as reviewed):\n{plan.get('text', '')}\n{objections}{transcript}"
+            f"\nFix the objections rather than rewriting the plan wholesale. If you "
+            f"disagree with one, say so: `wt plan discuss {ref}{mv} --from planner --text \"...\"`. "
+            f"Then file the amended plan: `wt plan submit {ref}{mv} --file <path-to-plan.md>`."
+        )
+    return (
+        f"You are the independent PLAN REVIEWER for WatchTower ticket {ref}. You reviewed "
+        f"an earlier version and rejected it; the planner has filed an amended plan. Your "
+        f"previous session has ended; this is a fresh turn. Do not edit files.\n{base}"
+        f"{objections}{transcript}\nAMENDED PLAN v{version}:\n{plan.get('text', '')}\n\n"
+        f"Check it against the ticket and the real code, then file your verdict on this "
+        f"exact version: `wt plan verdict {ref}{mv} --accept --version {version} --reasons "
+        f"\"why it is sound\"` or `wt plan verdict {ref}{mv} --reject --version {version} "
+        + (f"--section <REF> " if mv else "")
+        + f"--reasons \"what still must change\"`. Reject only for real remaining defects."
+    )
+
+
+def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
+    """Fallback reminders for stalled planner<->reviewer discussions the stage
+    supervisor does not own (github-backed tickets). Supervised tickets are
+    skipped: their turns are sessions the supervisor staffs and kills.
+
+    A reminder goes out only to a peer that is running, over the live-only
+    transport. A dead or unreachable peer blocks the plan for a human at once
+    (nobody to remind). A sent reminder is NOT a delivered one (WT-31 D4): it
+    is noted as pending and the delivery ledger settles it -- the nonce
+    landing counts it toward q.PLAN_DISCUSSION_MAX_NUDGES, a lost/unverified
+    one blocks the plan (``liveness._h_plan``). No second reminder goes out
+    while one is pending. Never spawns. Returns how many discussions this
+    call escalated to a human."""
+    from . import liveness
+    n = 0
+    try:
+        for it in q.list_items(project=queue) or []:
+            if (it.get("plan") or {}).get("status") not in ("discussing", "reviewing"):
+                continue
+            if any(d["key"].startswith("discuss:") for d in stages.desired([it])):
+                continue
+            role = q.plan_discussion_due(it["ref"], stale_s)
+            if not role:
+                continue
+            ref = it["ref"]
+            disc = (it.get("plan") or {}).get("discussion") or {}
+            wid = ((it.get("plan") or {}).get(role) or {}).get("worker_id") or ""
+            nudged = None
+            if not _plan_role_alive(it, role):
+                nudged = q.plan_discussion_record_nudge(
+                    ref, False, f"{role} session is not running (worker {wid or '-'} "
+                                f"exited); no one to deliver to")
+            else:
+                res = _plan_send(it, role,
+                                 f"Reminder: {ref} plan discussion is waiting on you ({role}). "
+                                 f"Objections: {disc.get('objections', '')}. "
+                                 f"See `wt plan show {ref}`.", "reminder")
+                if res.get("ok") and res.get("delivery_id") and \
+                        res.get("state") in ("pending", "unverified"):
+                    # sent: the ledger's handler counts it or escalates it
+                    q.plan_discussion_reminder_sent(ref, str(res["delivery_id"]), role)
+                elif res.get("state") == "failed" and res.get("delivery_id"):
+                    # failed outright: the same handler settles it now, once
+                    # (a failed reminder blocks the plan, like a lost one)
+                    did = str(res["delivery_id"])
+                    q.plan_discussion_reminder_sent(ref, did, role)
+                    if liveness.settle_failed(did) == "escalated":
+                        n += 1
+                    continue
+                elif not res.get("ok"):
+                    nudged = q.plan_discussion_record_nudge(
+                        ref, False,
+                        f"reminder to {role} undelivered (no live transport to worker {wid})")
+            if _block_stalled_plan(ref, nudged):
+                n += 1
+    except Exception:  # noqa: BLE001
+        pass
+    return n
+
+
+def _group_plan_note(item: dict) -> str:
+    """Claim-time instruction for a plan-group member (WT-33): the parent's
+    accepted plan -- shared section + this member's own -- and its siblings."""
+    by_ref = q._refs_index(q.list_items())
+    parent = q.group_parent_of(item, by_ref) or {}
+    pref = q.group_parent_ref(item)
+    plan = parent.get("plan") or {}
+    status = plan.get("status", "")
+    ref = item["ref"]
+    if not q.group_plan_settled(parent):
+        return (f"GROUP PLAN PENDING: {ref} is a member of plan group {pref}; its plan is "
+                f"not accepted yet. Do NOT start building. Run `wt plan wait {pref}`.")
+    if status == "failed":
+        return (f"Group plan for {pref} did not run ({plan.get('reason', '')}); plan your "
+                f"part yourself and keep it compatible with the siblings below.")
+    version = plan.get("accepted_version") or plan.get("version") or plan.get("round", 1)
+    kind = (item.get("group") or {}).get("kind", "member")
+    sibs = [r for r in q.group_children(parent) if r != ref]
+    sib_lines = "\n".join(f"- {r}: {(by_ref.get(r) or {}).get('status', '?')} "
+                          f"{(by_ref.get(r) or {}).get('title') or ''}".rstrip() for r in sibs)
+    if kind == "integration_fix":
+        integ = q.group_integration(parent)
+        cmap = "\n".join(f"- {r}: {c or '(no code)'}"
+                         for r, c in (integ.get("commits") or {}).items())
+        return (f"INTEGRATION FIX for plan group {pref} (plan v{version}). The members "
+                f"are closed; their integration failed:\n{integ.get('findings') or ''}\n"
+                f"Integration commit: {integ.get('sha') or 'none'}\nPer-child commits:\n"
+                f"{cmap}\nFix it in one commit on top of all of them, following the shared "
+                f"plan:\n{q.render_plan(parent, by_ref, sections=None)}")
+    return (f"GROUP PLAN {pref} v{version} (follow it; the shared section binds every "
+            f"member, the section for {ref} is yours):\n{q.render_plan(item, by_ref)}"
+            + (f"\n\nSIBLINGS (built by others; do not do their work):\n{sib_lines}"
+               if sib_lines else "")
+            + f"\n\nAfter every member closes, {pref} runs ONE integration check at a "
+              f"commit containing all of them.")
+
+
+def _plan_note(item: dict) -> str:
+    """Claim-time instruction for the build worker about the plan stage."""
+    if q.group_role(item) == "child":
+        return _group_plan_note(item)
+    if q.plan_gate(item) is None:
+        return ""
+    plan = item.get("plan") or {}
+    status = plan.get("status", "")
+    ref = item["ref"]
+    if status == "accepted":
+        return f"ACCEPTED PLAN (follow it):\n{q.render_plan(item)}"
+    if status == "failed":
+        return f"Plan stage did not run ({plan.get('reason', '')}); plan the work yourself."
+    if status == "blocked":
+        return "Plan stage is blocked awaiting a human decision; do not build yet."
+    if status == "discussing":
+        return (f"PLAN IN DISCUSSION: the planner and reviewer are resolving the "
+                f"reviewer's objections. Do NOT start building. Run `wt plan wait {ref}`.")
+    return (f"PLAN PENDING: a planner and a reviewer are producing the plan. Do NOT "
+            f"start building. Run `wt plan wait {ref}` (blocks until it is accepted "
+            f"and prints it), then follow the accepted plan.")
+
+
+def cmd_plan(args: argparse.Namespace) -> int:
+    """`wt plan submit|verdict|show|wait REF` -- the plan stage (WT-11)."""
+    action, ref = args.plan_cmd, args.ref
+    item = q.get(ref)
+    if not item:
+        print(f"error: no item {ref}", file=sys.stderr)
+        return 1
+    try:
+        if action == "submit":
+            text = args.text or ""
+            if args.file:
+                text = Path(args.file).expanduser().read_text()
+            item = q.plan_submit(ref, text, by=args.by or _default_worker_id(),
+                                 expect_mv=getattr(args, "mv", None))
+            plan = item["plan"]
+            print(f"PLAN FILED: {ref} round {plan['round']} v{plan.get('version')} -> reviewing")
+            if (plan.get("discussion") or {}).get("status") == "active":
+                # The amended plan needs a verdict on this exact version from
+                # a supervised reviewer turn (WT-29); no message to a dead peer.
+                stages.request(ref, "plan discussion: reviewer")
+            else:
+                stages.request(ref, "plan filed")
+        elif action == "verdict":
+            item = q.plan_verdict(ref, bool(args.accept), args.reasons or "",
+                                  by=args.by or _default_worker_id(),
+                                  version_seen=getattr(args, "version", None),
+                                  expect_mv=getattr(args, "mv", None),
+                                  sections=getattr(args, "section", None))
+            status = item["plan"]["status"]
+            print(f"PLAN {'ACCEPTED' if args.accept else 'REJECTED'}: {ref} -> {status}")
+            if status == "accepted":
+                _dispatch_planned(item)
+            if status == "discussing":
+                stages.request(ref, "plan discussion: planner")
+            elif status == "planning":
+                stages.request(ref, "plan rejected")
+            elif status == "blocked":
+                reviews = item["plan"].get("reviews") or []
+                disc = item["plan"].get("discussion") or {}
+                why = (f"Planner/reviewer discussion did not resolve it: {disc['reason']}."
+                       if disc.get("reason") else
+                       f"The planner and plan reviewer still disagree after "
+                       f"{len(reviews)} rounds.")
+                rejected = _rejected_sections(item)
+                group_exit = ""
+                if q.group_role(item) == "parent":
+                    group_exit = (f" Or drop a member whose section cannot be agreed: "
+                                  f"`wt group detach <REF>`"
+                                  + (f" (rejected: {', '.join(rejected)})" if rejected else "")
+                                  + "; the rest goes back to review.")
+                q.block(ref, str(item.get("claimed_session_id") or ""), origin="plan_gate",
+                        question=(f"{why} Last reviewer reasons: "
+                                  f"{reviews[-1].get('reasons', '')}. Decide with "
+                                  f"`wt plan decide {ref}{_mv_flag(item)} --accept|--retry`."
+                                  + group_exit),
+                        progress=f"Plan (round {item['plan'].get('round')}):\n"
+                                 f"{q.render_plan(item)}")
+        elif action == "discuss":
+            item = q.plan_discuss(ref, args.sender, args.text, expect_mv=getattr(args, "mv", None))
+            peer = "reviewer" if args.sender == "planner" else "planner"
+            sent = (_plan_role_alive(item, peer)
+                    and _plan_send(item, peer, f"[{ref} plan discussion, from the "
+                                               f"{args.sender}] {args.text}").get("ok"))
+            print(f"DISCUSSION: {ref} {args.sender} -> {peer} "
+                  + ("(sent live; awaiting its receipt)" if sent else
+                     "(recorded; peer not running / not reachable live, its next turn sees it)"))
+        elif action == "decide":
+            text = args.text or ""
+            if args.file:
+                text = Path(args.file).expanduser().read_text()
+            decision = "accept" if args.accept else "retry"
+            item = q.plan_decide(ref, decision, text, retries=args.retries,
+                                 by=args.by or "human", expect_mv=getattr(args, "mv", None))
+            status = item["plan"]["status"]
+            print(f"PLAN DECISION {decision.upper()}: {ref} -> plan {status}; "
+                  f"human block cleared")
+            if status == "planning":
+                stages.request(ref, "plan retry")
+            elif status == "reviewing":
+                stages.request(ref, "plan review retry")
+            else:
+                _dispatch_planned(item)
+            routed = _route_parked_answer(item)
+            if routed is not None:
+                return routed
+            if item.get("claimed_session_id"):
+                prompt = (f"A human decided the blocked plan on ticket {ref}: "
+                          f"{decision} (plan is now {status}). "
+                          + (f"Follow the accepted plan: `wt plan show {ref}`."
+                             if status == "accepted" else
+                             f"Wait for the revised plan: `wt plan wait {ref}`."))
+                return _deliver_to_blocked_session(item, text or decision, prompt,
+                                                   "", args.by or "")
+        elif action == "show":
+            plan = item.get("plan") or {}
+            if q.group_role(item) == "child":
+                pref = q.group_parent_ref(item)
+                parent = q.get(pref) or {}
+                pplan = parent.get("plan") or {}
+                if args.json:
+                    print(json.dumps({"group_parent": pref, "plan_status": pplan.get("status", ""),
+                                      "plan_version": pplan.get("version", 0),
+                                      "text": q.render_plan(item)}, indent=2))
+                else:
+                    print(f"{ref} is a member of plan group {pref}: plan "
+                          f"{pplan.get('status') or 'none'} (v{pplan.get('version', 0)})")
+                    print(q.render_plan(item))
+                return 0
+            if args.json:
+                print(json.dumps(plan, indent=2))
+            else:
+                print(f"{ref} plan: {plan.get('status', 'none')} (round {plan.get('round', 0)})"
+                      + (f" membership v{q.group_mv(item)}" if q.group_role(item) == "parent"
+                         else ""))
+                if q.group_role(item) == "parent" and (plan.get("text") or plan.get("sections")):
+                    print(q.render_plan(item))
+                    for r, v in (plan.get("section_reviews") or {}).items():
+                        if isinstance(v, dict) and not v.get("accepted"):
+                            print(f"  section {r}: REJECTED v{v.get('version')}")
+                elif plan.get("text"):
+                    print(plan["text"])
+                for r in plan.get("reviews") or []:
+                    print(f"  review r{r['round']}: {'accept' if r['accepted'] else 'reject'}"
+                          f" -- {r.get('reasons', '')}")
+                disc = plan.get("discussion")
+                if disc:
+                    print(f"  discussion: {disc.get('status')} round {disc.get('round')} "
+                          f"awaiting={disc.get('awaiting') or '-'} "
+                          f"{disc.get('reason') or ''}".rstrip())
+                    for m in disc.get("messages") or []:
+                        print(f"    {m['from']}: {m['text']}")
+        elif action == "wait":
+            deadline = time.time() + args.timeout
+            member = item if q.group_role(item) == "child" else None
+            if member is not None:
+                ref = q.group_parent_ref(member)   # a member waits on its group plan
+            while True:
+                item = q.get(ref) or item
+                plan = item.get("plan") or {}
+                if plan.get("status") in ("accepted", "failed", "blocked", ""):
+                    break
+                if time.time() >= deadline:
+                    print(f"TIMEOUT: plan for {ref} still {plan.get('status')}", file=sys.stderr)
+                    return 2
+                time.sleep(5)
+            if member is not None:
+                print(_plan_note(q.get(member["ref"]) or member))
+            else:
+                print(_plan_note(item) or f"{ref} has no plan stage")
+            return 0 if plan.get("status") in ("accepted", "failed") else 1
+    except q.GroupFenced as exc:
+        print(f"SUPERSEDED: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _dispatch_planned(item: dict) -> None:
+    """A plan just settled: wake/staff build workers for the ticket, or for a
+    group parent's open members (WT-33)."""
+    refs = ([r for r in (item.get("group") or {}).get("members") or []]
+            if q.group_role(item) == "parent" else
+            ([item["ref"]] if item.get("status") == "open" else []))
+    for r in refs:
+        try:
+            workers.dispatch_after_enqueue(item.get("project", ""), r)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def cmd_group(args: argparse.Namespace) -> int:
+    """`wt group attach|seal|detach|fix|show` -- plan groups (WT-33)."""
+    action = args.group_cmd
+    try:
+        if action == "attach":
+            parent = q.group_attach(args.parent, list(args.refs), replan=bool(args.replan),
+                                    seal=bool(args.seal))
+            g = parent.get("group") or {}
+            print(f"ATTACHED: {', '.join(args.refs)} -> {parent['ref']} (members "
+                  f"{', '.join(g.get('members') or [])}; membership v{q.group_mv(parent)}"
+                  + ("; sealed" if g.get("sealed") else "") + ")")
+        elif action == "seal":
+            parent = q.group_seal(args.parent)
+            print(f"SEALED: {parent['ref']} membership v{q.group_mv(parent)}; the group plan starts")
+        elif action == "detach":
+            child = q.group_detach(args.ref)
+            print(f"DETACHED: {child['ref']} is a standalone ticket again")
+        elif action == "fix":
+            fix = q.group_fix(args.parent, args.text or "")
+            print(f"FIX FILED: {fix['ref']} for {args.parent} (integration resumes once it closes)")
+            try:
+                workers.dispatch_after_enqueue(fix.get("project", ""), fix["ref"])
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            info = q.group_show(args.ref)
+            if args.json:
+                print(json.dumps(info, indent=2))
+                return 0
+            integ = info["integration"]
+            print(f"{info['ref']} [{info['status']}] {info['title']}")
+            print(f"  membership v{info['membership_version']} "
+                  f"{'sealed' if info['sealed'] else 'UNSEALED'}; plan {info['plan_status'] or 'none'}"
+                  f" v{info['plan_version']}")
+            for k in info["members"] + info["fixes"]:
+                tag = " (fix)" if k["kind"] == "integration_fix" else ""
+                print(f"  - {k['ref']}{tag} [{k['status']}] {k['commit'] or ''} {k['title']}".rstrip())
+            print(f"  integration: {integ.get('state')} cycle {integ.get('cycle', 0)} "
+                  f"fixes {len(info['fixes'])}/{integ.get('allowance')} proof {info['proof']}"
+                  + (f" at {integ.get('sha')[:12]}" if integ.get("sha") else "")
+                  + (f" BLOCKED ({integ.get('blocked')})" if integ.get("blocked") else ""))
+            if info["needs_input"]:
+                print(f"  NEEDS INPUT: {info['block_question']}")
+    except q.GroupFenced as exc:
+        print(f"SUPERSEDED: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_stages(args: argparse.Namespace) -> int:
+    """`wt stages tick|show` -- manual / daemonless stage supervision (WT-24)."""
+    if args.stages_cmd == "tick":
+        from .queue import _FileLock
+        from . import liveness
+        with _FileLock(workers.WORKERS_FILE.parent / "reconcile.lock"):
+            acted = stages.reconcile_stages(only_ref=args.ref or "")
+            backstop = liveness.sweep(only_ref=args.ref or "")   # WT-31 D3
+        for ref, action in acted:
+            print(f"{ref}: {action}")
+        for a in backstop:
+            print(f"{a['ref']}: backstop {a['action']} ({a['result']}) — {a['reason']}")
+        if not acted and not backstop:
+            print("no stage work due")
+        return 0
+    item = q.get(args.ref)
+    if not item:
+        print(f"error: no item {args.ref}", file=sys.stderr)
+        return 1
+    ss = item.get("stage_session") or {}
+    if args.json:
+        print(json.dumps(ss, indent=2))
+        return 0 if ss else 1
+    if not ss:
+        print(f"{item['ref']}: no stage session")
+        return 1
+    print(f"{item['ref']}: {ss.get('role')} key={ss.get('key')} attempt "
+          f"{ss.get('attempt')}/{stages.MAX_ATTEMPTS} worker={ss.get('worker_id') or '-'}"
+          + (" ESCALATED" if ss.get("escalated") else ""))
+    for d in ss.get("deaths") or []:
+        print(f"  death {d.get('at')} attempt {d.get('attempt')}: {d.get('reason')}")
+    return 0
+
+
+def cmd_liveness(args: argparse.Namespace) -> int:
+    """`wt liveness [-q Q] [REF] [--json]` (WT-31): each live ticket's state-table
+    row, owner, proof verdict, idle time and the backstop action it is due.
+    Read-only: nothing is changed."""
+    from . import liveness
+    ref = args.ref or ""
+    if ref:
+        item = q.get(ref)
+        if not item:
+            print(f"error: no item {ref}", file=sys.stderr)
+            return 1
+        ref = str(item.get("ref") or ref)
+    rows = liveness.report(queue=args.queue or "", ref=ref)
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return 0
+    if not rows:
+        print("no live tickets")
+        return 0
+    for r in rows:
+        due = f"  -> {r['action']}: {r['reason']}" if r["action"] else ""
+        idle = f" idle {r['idle_s']}s" if r["idle_s"] else ""
+        print(f"{r['ref']:<14} {r['row']:<24} owner={r['owner'] or '-'} "
+              f"proof={r['proof'] or '-'} {r['verdict'] or '-'}"
+              + (f" ({r['evidence']})" if r["evidence"] else "") + idle + due)
     return 0
 
 
@@ -895,8 +2007,15 @@ def cmd_run(args: argparse.Namespace) -> int:
 cmd_ready = cmd_run  # preferred alias: 'wt ready' reads as "mark this ticket ready for workers"
 
 
-def _resolution_from_args(args: argparse.Namespace) -> Optional[dict]:
+def _resolution_from_args(
+    args: argparse.Namespace, engine: str = "", transcript_path: str = "",
+) -> Optional[dict]:
     """Build a resolution dict from the close-resolution flags.
+
+    ``engine``/``transcript_path`` come from the closing process's own
+    session env vars (see ``cmd_close``) -- ``session_id``/``machine`` are
+    filled in by ``queue._normalize_resolution``'s close-time defaults, so
+    they're not threaded through here.
 
     Returns None when no flag was given (so close stays back-compatible)."""
     res = {
@@ -911,6 +2030,10 @@ def _resolution_from_args(args: argparse.Namespace) -> Optional[dict]:
         res["no_code"] = True
     if not any(res.values()):
         return None
+    if engine:
+        res["engine"] = engine
+    if transcript_path:
+        res["transcript_path"] = transcript_path
     return res
 
 
@@ -955,14 +2078,252 @@ def _verify_close_commit(ref: str, sha: str) -> Tuple[str, str]:
                 "`wt block <ref> --progress \"...\"` instead of closing"
             )
         return "", (
-            f"error: {candidate} is not a commit in {repo} or any other configured "
-            "repo; commit the verified work or use "
+            f"error: {candidate} is not a commit in {repo}, any other configured "
+            f"repo, or the current directory ({os.getcwd()}). If the work lives in "
+            "a different repo, run `wt close` from inside that repo or set the "
+            f"ticket's repo with `wt edit {ref} --repo-path <path>`; otherwise "
+            "commit the verified work or use "
             "`wt block <ref> --progress \"...\"` instead of closing"
         )
     return verified, ""
 
 
+def _assessment_repo_problem(queue: str) -> str:
+    """Why ``queue`` cannot host an assessor (its config repo_path must be a
+    local git checkout), or "" when it can."""
+    path = str(config_mod_repo_path(queue) or "").strip()
+    if not path or path.startswith("host:") or not os.path.isdir(path):
+        return f"set --repo-path first (queue {queue} has no local repo directory)"
+    r = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        return f"--repo-path {path} is not a git checkout; set --repo-path first"
+    return ""
+
+
+def config_mod_repo_path(queue: str) -> str:
+    from . import config
+    return config.repo_path(queue)
+
+
+def _maybe_assess(item: dict) -> None:
+    """Best-effort: if the just-closed ``item`` is due a post-fix assessment,
+    ask the daemon for the assessor (WT-24: never spawned from here). Never
+    changes the exit code."""
+    try:
+        cur = q.get(item["ref"]) or item
+        if (cur.get("assessment") or {}).get("status") != "due":
+            return
+        stages.request(cur["ref"], "assessment due")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _read_json_arg(args: argparse.Namespace):
+    if getattr(args, "json_text", None):
+        return json.loads(args.json_text)
+    path = getattr(args, "file", "") or ""
+    if path:
+        raw = sys.stdin.read() if path == "-" else Path(path).read_text()
+        return json.loads(raw)
+    raise ValueError("give the assessment as --json '<object>' or --file PATH")
+
+
+def cmd_assess(args: argparse.Namespace) -> int:
+    """`wt assess submit|show|run|resume|new` -- post-fix assessment (WT-21)."""
+    action = args.assess_cmd
+    if action == "new":
+        return _assess_new(args)
+    if action == "approve":
+        rc = 0
+        for r in args.refs:
+            try:
+                it = q.assessment_approve(r)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                rc = 1
+                continue
+            if not it:
+                print(f"not found: {r}", file=sys.stderr)
+                rc = 1
+                continue
+            print(f"APPROVED: {it['ref']} is now claimable")
+        return rc
+    item = q.get(args.ref)
+    if not item:
+        print(f"not found: {args.ref}", file=sys.stderr)
+        return 1
+    ref = item["ref"]
+    if action == "show":
+        a = item.get("assessment") or {}
+        if args.json:
+            print(json.dumps(a, indent=2))
+            return 0 if a else 1
+        if not a:
+            print(f"{ref}: no assessment")
+            return 1
+        print(f"{ref}: assessment {a.get('status')} (attempt {a.get('attempt', 0)})"
+              + (f" -- {a['reason']}" if a.get("reason") else ""))
+        for p, v in (a.get("points") or {}).items():
+            print(f"  {p:<11}[{v.get('verdict')}] {v.get('note')}")
+        if a.get("followups"):
+            print(f"  followups: {', '.join(a['followups'])}")
+        if a.get("existing"):
+            print(f"  linked existing: {', '.join(a['existing'])}")
+        return 0
+    if action == "run":
+        if args.dry_run:
+            res = workers.start_assessment(item, force=args.force, dry_run=True)
+            if res["status"] == "failed":
+                print(f"cannot assess {ref}: {res['reason']}", file=sys.stderr)
+                return 1
+            t = res["assessor"]
+            print(f"repo: {res['repo']}\nassessor: {t['engine']}/{t['model'] or '(default)'} "
+                  f"({t['source']}){' BLOCKED' if t['blocked'] else ''}\n\n{res['prompt']}")
+            return 0
+        queued = stages.request_assessment(ref, force=True)
+        if queued is None:
+            print(f"ASSESS SKIPPED: {ref} -- not a closed ticket", file=sys.stderr)
+            return 1
+        print(f"ASSESS QUEUED: {ref} -- the watcher will spawn the assessor")
+        wait = float(getattr(args, "wait", 0) or 0)
+        deadline = time.time() + wait
+        while wait and time.time() < deadline:
+            ss = (q.get(ref) or {}).get("stage_session") or {}
+            if ss.get("worker_id") and ss.get("role") == "assessor":
+                print(f"  assessor spawned: {ss['worker_id']}")
+                break
+            time.sleep(1)
+        return 0
+    if action == "resume":
+        try:
+            q.assessment_run_ops(ref)
+        except q.AssessmentFenced as exc:
+            print(f"ASSESS SUPERSEDED: {ref} -- {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"ASSESS INCOMPLETE: {ref} -- {exc}; resume with wt assess resume {ref}",
+                  file=sys.stderr)
+            return 1
+        print(f"ASSESSED: {ref}")
+        return 0
+    # submit
+    try:
+        payload = _read_json_arg(args)
+    except (ValueError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    token = args.token or ""
+    try:
+        if args.force:
+            token = q.assessment_reserve(ref, force=True) or ""
+        if not token:
+            print("error: --token is required (or --force from a human)", file=sys.stderr)
+            return 2
+        q.assessment_accept_submission(ref, token, payload)
+    except q.AssessmentFenced as exc:
+        print(f"ASSESS SUPERSEDED: {ref} -- {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    try:
+        done = q.assessment_run_ops(ref, token)
+    except q.AssessmentFenced as exc:
+        print(f"ASSESS SUPERSEDED: {ref} -- {exc}; nothing more written", file=sys.stderr)
+        return 1
+    except Exception as exc:  # noqa: BLE001
+        print(f"ASSESS INCOMPLETE: {ref} -- {exc}; resume with wt assess resume {ref}",
+              file=sys.stderr)
+        return 1
+    a = (done or {}).get("assessment") or {}
+    print(f"ASSESSED: {ref} -- {len(a.get('followups') or [])} follow-up(s): "
+          f"{', '.join(a.get('followups') or []) or 'nothing to add'}")
+    return 0
+
+
+def _assess_new(args: argparse.Namespace) -> int:
+    """`wt assess new -q QUEUE --title ... (--commit SHA | --no-code)`: file a
+    bug for something that was fixed without a ticket (e.g. an auditor
+    self-heal) and close it through the normal close path, so gates run and the
+    assessment fires on close/accept exactly as for any bug."""
+    import contextlib
+    import io
+    if bool(args.commit) == bool(args.no_code):
+        print("error: exactly one of --commit <SHA> / --no-code is required", file=sys.stderr)
+        return 2
+    queue = args.queue
+    repo = args.repo_path or config_mod_repo_path(queue)
+    try:
+        item = q.enqueue(note=args.title, title=args.title, text=args.text or args.title,
+                         project=queue, item_type="bug", repo_path=repo or "",
+                         source=args.source)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    ns = argparse.Namespace(
+        ref=item["ref"], worker=args.worker, summary=args.summary or args.title,
+        commit=args.commit, no_code=args.no_code, caveat=None, follow_up=None,
+        unresolved=None, enqueue_follow_ups=False, force=False)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf if args.json else sys.stdout):
+        rc = cmd_close(ns)
+    cur = q.get(item["ref"]) or item
+    a = cur.get("assessment") or {}
+    if args.json:
+        print(json.dumps({"ref": cur["ref"], "status": cur.get("status"),
+                          "assessment": a.get("status", ""), "close_exit": rc}))
+    return rc
+
+
+# A ticket ref inside a follow-up/unresolved entry: BECKY-1625, OPS-12,
+# BECKY-DESIGN-7, or a GitHub-style #1625.
+_TICKET_REF_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:-[A-Z][A-Z0-9]*)*-\d+\b|#\d+\b")
+
+
+def _untracked_carry_items(args: argparse.Namespace) -> List[str]:
+    """Follow-up/unresolved entries that cite no ticket ref.
+
+    A follow-up that lives only in a closing comment is lost: nobody drains it
+    (BECKY-1625 closed with "run the prepared backfill" as a follow-up and the
+    backfill never ran). So every carried item must point at a real ticket,
+    unless --enqueue-follow-ups files one for it."""
+    if getattr(args, "enqueue_follow_ups", False):
+        return []
+    carry = list(getattr(args, "follow_up", None) or []) + list(getattr(args, "unresolved", None) or [])
+    return [s for s in carry if not _TICKET_REF_RE.search(str(s))]
+
+
+def cmd_duplicate(args: argparse.Namespace) -> int:
+    try:
+        item = q.link_duplicate(args.ref, "" if args.clear else args.of)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if item is None:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    print(f"{item['ref']}: {item['status']}" +
+          (f"; follows {item['duplicate_of']}" if item.get("duplicate_of") else "; duplicate link cleared"))
+    stages.request(item["ref"], "duplicate link changed")
+    return 0
+
+
 def cmd_close(args: argparse.Namespace) -> int:
+    if getattr(args, "duplicate_of", ""):
+        if args.commit or not args.no_code:
+            print("error: duplicate close requires --no-code and no --commit", file=sys.stderr)
+            return 1
+        try:
+            item = q.link_duplicate(args.ref, args.duplicate_of, worker=args.worker or _default_worker_id())
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        if item is None:
+            return 1
+        print(f"DUPLICATE: {item['ref']} follows {item['duplicate_of']} ({item['status']})")
+        stages.request(item["ref"], "duplicate linked")
+        return 0
     if not (args.summary or "").strip():
         print(
             "error: --summary is required when closing a ticket\n"
@@ -977,16 +2338,43 @@ def cmd_close(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    untracked = _untracked_carry_items(args)
+    if untracked:
+        listing = "\n".join(f"  - {_oneline(str(s))[:120]}" for s in untracked)
+        print(
+            "error: every --follow-up / --unresolved item must cite the ticket that "
+            "tracks it -- a follow-up that exists only in a closing comment is lost.\n"
+            f"{listing}\n"
+            "  For each item: file a ticket (`wt add -q <QUEUE> --title ... --note ...`; "
+            "environment/tooling/credential blockers go to an OPS ticket), then put its "
+            "ref in the item text, e.g. --unresolved \"run the backfill (BECKY-1700)\".\n"
+            "  Or pass --enqueue-follow-ups to file them in this queue automatically.\n"
+            "  Optional notes that need no action belong in --caveat.\n"
+            "  If the ticket's own task is not done, do not close it: `wt block <ref> "
+            "--question ... --progress ...`.",
+            file=sys.stderr,
+        )
+        return 1
     if args.commit:
         verified, error = _verify_close_commit(args.ref, args.commit)
         if error:
             print(error, file=sys.stderr)
             return 1
         args.commit = verified
+    from . import messages
     worker = args.worker or _default_worker_id()
-    resolution = _resolution_from_args(args)
+    codex_thread_id = os.environ.get("CODEX_THREAD_ID", "").strip()
+    claude_session_id = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    if codex_thread_id:
+        session_uuid, engine = codex_thread_id, "codex"
+    elif claude_session_id:
+        session_uuid, engine = claude_session_id, "claude"
+    else:
+        session_uuid, engine = "", ""
+    transcript_path = messages.locate_transcript(session_uuid, engine) if session_uuid else ""
+    resolution = _resolution_from_args(args, engine=engine, transcript_path=transcript_path)
     try:
-        item = q.close(args.ref, worker, resolution=resolution,
+        item = q.close(args.ref, worker, resolution=resolution, session_uuid=session_uuid,
                        force=getattr(args, "force", False))
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -994,11 +2382,40 @@ def cmd_close(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
+    if item.get("status") == "open":
+        print(f"GATE FAILED: {item['ref']} reopened -- {item.get('gate_feedback', '')}\n"
+              f"  fix it, then run `wt close {item['ref']} ...` again.\n"
+              f"{q.checks_block(item)}", file=sys.stderr)
+        return 1
     res = item.get("resolution") or {}
     summary = res.get("summary", "")
+    if item.get("status") == "in_review":
+        pending = str(item.get("gate_pending") or "review")
+        print(f"IN REVIEW: {item['ref']} -- gates passed; awaiting "
+              f"{q.gate_stage_label(pending)}"
+              + (f" — {summary}" if summary else ""))
+        _rename_claiming_session(item, summary)
+        if pending == "verify":
+            stages.request(item["ref"], "verify")
+        return 0
     print(f"CLOSED: {item['ref']}" + (f" — {summary}" if summary else ""))
+    _print_ticket_usage(item)
 
     _rename_claiming_session(item, summary)
+    _maybe_assess(item)
+    if args.commit:
+        # WT-16: a landed fix reaches the installed tree right away instead of
+        # waiting for the daemon's next sync tick. Best-effort; a dirty tree
+        # or an unpushed commit just leaves it for the daemon.
+        try:
+            from . import deploy
+            res = deploy.sync()
+            if res["action"] == "moved":
+                print(f"DEPLOYED: installed copy {res['was'][:8]} -> {res['head'][:8]}")
+            elif res["action"] == "refused":
+                print(f"WARNING: installed copy not updated: {res['reason']}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
 
     # STRETCH (opt-in): file each follow-up / unresolved item as a new open
     # ticket in the same queue so nothing falls through the cracks.
@@ -1184,8 +2601,10 @@ def cmd_release(args: argparse.Namespace) -> int:
     grabbing it mid-investigation, and turns out better left for the normal
     pool to pick up."""
     worker = args.worker or _default_worker_id()
+    reserve_for = str(getattr(args, "reserve_for", "") or "")
     try:
-        item = q.release(args.ref, session_id=worker, force=args.force)
+        item = q.release(args.ref, session_id=worker, force=args.force,
+                         reserve_for=reserve_for, ttl=args.ttl)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -1200,7 +2619,216 @@ def cmd_release(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
         return 1
-    print(f"RELEASED: {item['ref']} -> open")
+    if reserve_for:
+        print(f"RELEASED: {item['ref']} -> open (reserved for {reserve_for}, {args.ttl:.0f}s)")
+    else:
+        print(f"RELEASED: {item['ref']} -> open")
+    return 0
+
+
+def _verifier_goal(item: dict) -> str:
+    ref = item["ref"]
+    accept = str(item.get("accept") or "").strip()
+    target = accept or (item.get("text") or item.get("note") or item.get("title") or "")
+    res = item.get("resolution") or {}
+    commit = res.get("commit", "") if isinstance(res, dict) else ""
+    return (
+        f"You are an INDEPENDENT verifier for WatchTower ticket {ref}. You did "
+        f"not do the work and must not trust its summary. Check, against the "
+        f"real running app or code"
+        + (f" at commit {commit}" if commit else "")
+        + f", that this acceptance criterion holds:\n\n{target}\n\n"
+        + (f"The build was also required to follow this accepted plan; flag "
+           f"material deviations:\n{q.render_plan(item)}\n\n"
+           if (item.get("plan") or {}).get("status") == "accepted"
+           or q.group_role(item) == "child" and q.render_plan(item) else "")
+        + "Drive a real browser/app where the criterion is user-visible; read the "
+        "code and run it otherwise. Do NOT edit files or fix anything. Do NOT "
+        "execute scripts that call paid APIs, send customer messages, or touch "
+        "production data unless the ticket explicitly says to: importing a "
+        "script can run it, so load only the function you need, or prefer the "
+        "mocks and the test suite. WT_VERIFY=1 is set in your environment; "
+        "never run production side effects. When "
+        f"done, file your verdict on the ticket (not to anyone else): "
+        f"`wt verdict {ref} --pass --findings \"what you checked\"` or "
+        f"`wt verdict {ref} --fail --findings \"what is wrong, with evidence\"`."
+    )
+
+
+def _integration_verifier_goal(item: dict) -> str:
+    """The ONE integration verifier of a plan group (WT-33 D7.3): the whole
+    group at the integration commit, against the shared plan and every
+    member's acceptance line. Per-member criteria were verified per member."""
+    ref = item["ref"]
+    integ = q.group_integration(item)
+    sha = str(integ.get("sha") or "")
+    vc = int(item.get("verify_cycle") or 0)
+    by_ref = q._refs_index(q.list_items())
+    kids = []
+    for r in q.group_children(item):
+        ch = by_ref.get(r) or {}
+        crit = str(ch.get("accept") or "").strip() or str(ch.get("title") or ch.get("note") or "")
+        kids.append(f"- {r} @ {(integ.get('commits') or {}).get(r) or '(no code)'}: {crit[:400]}")
+    accept = str(item.get("accept") or "").strip()
+    return (
+        f"You are the INDEPENDENT INTEGRATION verifier for WatchTower plan group {ref}. "
+        f"Each member was built and verified on its own; your job is the group as a "
+        f"whole at ONE commit, {sha or '(see `wt group show ' + ref + '`)'}, which contains "
+        f"every member's work. Check out that commit (a detached worktree; never "
+        f"move a branch) and check that the members work TOGETHER: the shared plan's "
+        f"contracts hold across them, nothing one member did breaks another, and "
+        + (f"the group's acceptance line holds:\n\n{accept}\n\n" if accept else
+           "the group delivers what its ticket asks:\n\n"
+           f"{item.get('text') or item.get('note') or item.get('title') or ''}\n\n")
+        + "MEMBERS (commit: own acceptance line, already verified per member):\n"
+        + "\n".join(kids)
+        + f"\n\nGROUP PLAN (shared section binds every member):\n{q.render_plan(item, by_ref)}\n\n"
+        "Do NOT edit files or fix anything; run the tests and drive the app where the "
+        "integration is user-visible. Do NOT execute scripts that call paid APIs, send "
+        "customer messages, or touch production data. WT_VERIFY=1 is set in your "
+        "environment. When done, file your verdict on the group (this exact cycle; a "
+        f"stale cycle is refused): `wt verdict {ref} --verify-cycle {vc} --pass --findings "
+        f"\"what you checked\"` or `wt verdict {ref} --verify-cycle {vc} --fail --findings "
+        f"\"what is wrong, with evidence\"`. A fail files an integration-fix ticket."
+    )
+
+
+def _spawn_verifier(item: dict) -> None:
+    """Shim (WT-24): the daemon spawns the verifier for an in_review/verify
+    ticket; this only wakes it."""
+    stages.request(item["ref"], "verify")
+
+
+def cmd_verdict(args: argparse.Namespace) -> int:
+    """File the independent verifier's verdict straight onto the ticket."""
+    try:
+        item = q.verdict(args.ref, bool(args.passed), args.findings or "",
+                         by=args.by or _default_worker_id(),
+                         expect_verify_cycle=getattr(args, "verify_cycle", None))
+    except q.GroupFenced as exc:
+        print(f"SUPERSEDED: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+    else:
+        v = item.get("verifier") or (item.get("verifier_history") or [{}])[-1] or {}
+        via = f" [{v['engine']}{'/' + v['model'] if v.get('model') else ''}]" if v.get("engine") else ""
+        print(f"VERDICT {'PASS' if args.passed else 'FAIL'}{via}: {item['ref']} -> {item.get('status')}")
+    if item.get("status") == "closed":
+        _maybe_assess(item)
+    if not args.passed and item.get("status") == "in_progress" and item.get("claimed_session_id"):
+        return _resume_rejected(item, item.get("gate_feedback") or args.findings or "", args.engine)
+    return 0
+
+
+def _context_requeue_bytes() -> int:
+    try:
+        return int(os.environ.get(
+            "WATCHTOWER_ANSWER_REQUEUE_BYTES",
+            str(2 * int(os.environ.get("WATCHTOWER_CONTEXT_RECYCLE_BYTES", "2500000") or 0)),
+        ) or 0)
+    except (TypeError, ValueError):
+        return 5_000_000
+
+
+def _context_recycle_bytes() -> int:
+    """The claim-time recycle budget (workers.context_budget_exceeded): a session
+    past it is already retired, so a rejection must not resume it (WT-30 D6)."""
+    try:
+        return int(os.environ.get("WATCHTOWER_CONTEXT_RECYCLE_BYTES", "2500000") or 0)
+    except (TypeError, ValueError):
+        return 2_500_000
+
+
+def _log_resume(item: dict, what: str) -> None:
+    """One RESUME line per attempt (WT-30 D7)."""
+    q._log("RESUME", f"{item.get('ref', '?')} — {what}", queue=item.get("project", ""))
+
+
+def _sent_back_minutes_label(item: dict) -> str:
+    from . import config
+    n = config.sent_back_release_min(str(item.get("project") or ""))
+    return f"{n} minutes" if n else "a long while"
+
+
+def _resume_rejected(item: dict, reason: str, engine: str = "") -> int:
+    sid = str(item.get("claimed_session_id") or "")
+    limit = _context_recycle_bytes()
+    if sid and limit > 0:
+        size = workers._claude_transcript_bytes(sid)
+        if size >= limit:
+            # D6: over the context budget -- a fresh worker takes it with the
+            # rejection text (gate_feedback survives the release).
+            q.set_resume_state(item["ref"], sid, "skipped")
+            q.release(item["ref"], session_id=str(item.get("claimed_by") or ""))
+            _log_resume(item, f"skipped: builder session {sid[:8]} over the context "
+                              f"budget ({size} bytes >= {limit})")
+            print(f"RESUME: {item['ref']} — builder session {sid[:8]} is over the "
+                  f"context budget ({size} bytes); released for a fresh worker with "
+                  f"the rejection text.")
+            return 0
+    prompt = (
+        f"Your work on ticket {item['ref']} was sent back: {reason}. Address it "
+        f"before any other ticket, then close again with `wt close "
+        f"{item['ref']} --worker <your-id> --summary \"...\" --commit <SHA>` "
+        f"(or `--no-code`). If you show no progress within "
+        f"{_sent_back_minutes_label(item)} it is released to another worker; "
+        f"a `wt comment {item['ref']}` counts as progress.\n\n"
+        + q.checks_block(item)
+    ).strip()
+    return _deliver_to_blocked_session(item, reason, prompt, engine or "",
+                                       item.get("claimed_by") or "")
+
+
+def cmd_accept(args: argparse.Namespace) -> int:
+    """Accept an in_review ticket (WT-5): it closes and its dependents unblock."""
+    try:
+        # actor: the caller's own session identity, so accepting a review
+        # gate you filed yourself doesn't echo "closed" back (WATCHTOWER-37).
+        item = q.accept(args.ref, by=args.by or "human", force=getattr(args, "force", False),
+                        no_proof=bool(getattr(args, "no_proof", False)),
+                        actor=_default_report_to()[0])
+    except q.GroupFenced as exc:
+        print(f"SUPERSEDED: {exc}", file=sys.stderr)
+        return 1
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        _maybe_assess(item)
+        return 0
+    print(f"ACCEPTED: {item['ref']} -> closed")
+    _maybe_assess(item)
+    return 0
+
+
+def cmd_reject(args: argparse.Namespace) -> int:
+    """Reject an in_review ticket: back to open with the reason attached, and
+    the original worker session resumed through the `wt answer` delivery path."""
+    try:
+        item = q.reject(args.ref, args.reason, by=args.by or "human")
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+    else:
+        print(f"REJECTED: {item['ref']} -> {item.get('status')} — {args.reason}")
+    if item.get("status") == "in_progress" and item.get("claimed_session_id"):
+        return _resume_rejected(item, args.reason, args.engine or "")
     return 0
 
 
@@ -1211,7 +2839,7 @@ def cmd_reopen(args: argparse.Namespace) -> int:
     `wt release` it also applies to closed tickets; unlike `wt ready` it does
     not mark the ticket run_requested or dispatch its queue.
 
-    ``--resume TEXT`` is the re-entry re-bind (SONIA-CHAT-19, same-topic
+    ``--resume TEXT`` is the re-entry re-bind (CLIENT-CHAT-19, same-topic
     routing plan section 3a): instead of the plain reopen-to-open-pool path,
     atomically re-bind the ticket to its OWN preserved ``claimed_session_id``
     (queue.reopen_and_claim) and deliver TEXT to that session through the
@@ -1246,9 +2874,13 @@ def cmd_reopen(args: argparse.Namespace) -> int:
                   f"reopened to the open pool only.")
             return 0
         try:
+            # WT-30 D1: keep the original claimer (worker id) on the re-bind.
             claimed = q.reopen_and_claim(
-                args.ref, str(sid), session_uuid=str(sid),
+                args.ref, str(item.get("claimed_by") or sid), session_uuid=str(sid),
                 reason=args.reason, force=args.force,
+                sent_back_reason=str(args.resume or ""),
+                sent_back_by=str(args.worker or "client"),
+                claim_proc=q._inheritable_proc(item, str(sid)),
             )
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
@@ -1301,6 +2933,7 @@ def cmd_block(args: argparse.Namespace) -> int:
         question=args.question, progress=args.progress,
         kind=getattr(args, "kind", "input"),
         commit=commit,
+        origin="worker",
     )
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
@@ -1309,11 +2942,37 @@ def cmd_block(args: argparse.Namespace) -> int:
         print(json.dumps(item, indent=2))
         return 0
     print(f"BLOCKED: {item['ref']} — {item.get('block_question') or '(no question)'}")
+    if item.get("status") == q.PARKED_STATUS:
+        print("  parked: the ticket left your claim; the human's answer returns to this "
+              "session. You may claim the next ticket now.")
+        return 0
     sid = item.get("claimed_session_id")
     if sid:
         print(f"  session {sid} — resume with: wt discuss {item['ref']}")
     else:
         print("  (no resumable session id recorded; a human can still read progress notes)")
+    return 0
+
+
+def cmd_defer(args: argparse.Namespace) -> int:
+    """Wait for data, not for a human: the ticket leaves your claim and the
+    claim pool until --until, then any worker resumes it from your progress
+    note. For a decision you need from a human, use `wt block`."""
+    try:
+        item = q.defer(args.ref, args.worker or _default_worker_id(), args.until,
+                       args.reason, progress=args.progress)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
+    print(f"DEFERRED: {item['ref']} until {item['deferred_until']} — {item.get('defer_reason')}")
+    print("  the ticket left your claim; it returns to the pool when the window ends. "
+          "You may claim the next ticket now.")
     return 0
 
 
@@ -1332,9 +2991,13 @@ def cmd_blocked(args: argparse.Namespace) -> int:
         return 0
     for it in rows:
         kind = "GATE" if it.get("block_kind") == "rationale" else "input"
-        print(f"{it['ref']:<12} [{kind}] {it.get('block_question') or '(no question)'}")
-        print(f"             session={it.get('claimed_session_id') or '-'}  "
+        print(f"{it['ref']:<12} [{kind}] {it.get('block_question') or '(no question)'}"
+              + ("  (answered, routing)"
+                 if (it.get('pending_answer') or {}).get('state') == 'routing' else ""))
+        print(f"             session={q.answer_session(it) or '-'}  "
               f"repo={it.get('repo_path') or '-'}")
+        if it.get("status") == q.PARKED_STATUS:
+            print(f"             {workers.parked_label(it)}")
         if it.get("block_kind") == "rationale":
             print(f"             decide with: wt ack {it['ref']} [-m ...]  |  "
                   f"wt nack {it['ref']} -m \"why not\" [--close]")
@@ -1362,6 +3025,7 @@ def _resume_session_headless(
         argv = [
             "codex", "exec", "resume",
             "--dangerously-bypass-approvals-and-sandbox",
+            *workers.codex_compact_args(),
             sid, prompt,
         ]
     elif engine == "kimi":
@@ -1369,6 +3033,10 @@ def _resume_session_headless(
         # auto-approves internally in this mode (no permission flag exists).
         argv = ["kimi", "--session", sid, "-p", prompt,
                 "--output-format", "stream-json"]
+    elif engine == "devin":
+        argv = ["devin", "--resume", sid, "-p", prompt,
+                "--permission-mode", "dangerous",
+                "--respect-workspace-trust", "false"]
     else:
         argv = ["claude", "--resume", sid, "-p", prompt,
                 "--permission-mode", "bypassPermissions"]
@@ -1381,7 +3049,7 @@ def _resume_session_headless(
             proc = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=logf,
                 stderr=subprocess.STDOUT, start_new_session=True,
-                cwd=repo or os.getcwd(),
+                cwd=repo or os.getcwd(), env=workers.compact_env(),
             )
         finally:
             logf.close()
@@ -1420,7 +3088,7 @@ def _answer_engine(item: Dict[str, object], requested: Optional[str]) -> str:
             for worker in reversed(known):
                 if str(worker.get(field) or "") == value:
                     engine = str(worker.get("engine") or "")
-                    if engine in ("claude", "codex", "kimi"):
+                    if engine in ("claude", "codex", "kimi", "devin"):
                         return engine
     except (OSError, ValueError):
         pass
@@ -1482,56 +3150,130 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
             )
             return 0
     repo = item.get("repo_path") or os.getcwd()
-    from . import messages
     target = item.get("claimed_session_id") or item.get("claimed_by")
     delivery_engine = _answer_engine(item, engine_arg)
-    # Kimi has no local messages adapter. Without a delegate, parking this in
-    # the outbox would retry the same unsupported adapter chain until dead.
-    # Let the existing headless Kimi resume fallback run immediately instead.
-    queue_on_fail = not (
-        delivery_engine == "kimi" and not messages._delegate_base()
-    )
-    try:
-        sent = messages.deliver_message(
-            str(target),
-            prompt,
-            verb="steer",
-            engine=delivery_engine,
-            on_busy="hold" if queue_on_fail else "reject",
-        )
-    except Exception as e:  # never lose the answer to a delivery-layer crash
-        sent = {"ok": False, "error": str(e)}
-    if sent.get("ok"):
+    # Bind a held answer to this claim: the outbox cancels it once the ticket
+    # closes or changes session instead of retrying it (WT-1).
+    bound = item.get("status") == "in_progress"
+    from . import liveness
+    if delivery_engine not in liveness.RECEIPT_ENGINES:
+        # WT-31 D2.8: no receipt can ever confirm a message to this engine's
+        # session (no readable transcript), so a verified delivery could only
+        # end "lost" while the resumed process still runs. Hand off BEFORE any
+        # resume: the answer/feedback rides the ticket to a fresh worker.
+        why = (f"{delivery_engine} sessions have no receipt source; handed off "
+               f"instead of resumed")
+        _log_resume(item, f"skipped: {why}")
+        _hand_off_blocked_claim(item, answer_text, str(sid), worker, bound, "skipped", why,
+                                "could not be verified-resumed")
+        print(f"ANSWERED: {item['ref']} — {why}; "
+              + ("claim released for a fresh worker with your answer."
+                 if bound else "answer recorded on the ticket for the next worker."))
+        return 0
+    # Verified (WT-31 D4, ``resume:<ref>:<sid>``): steer/outbox first; when
+    # the target is unresolvable (nothing queued) the headless resume fork,
+    # which registers the resume child under the worker id so the orphan sweep
+    # cannot reopen the ticket while the answer is applied. A delivery whose
+    # nonce never lands marks the resume evidence failed (WT-30 then acts).
+    sent = liveness.deliver(
+        str(target), prompt, purpose="resume", dedupe_key=f"resume:{item.get('ref')}:{sid}",
+        ref=str(item.get("ref") or "") if bound else "",
+        queue=str(item.get("project") or ""), worker_id=str(item.get("claimed_by") or ""),
+        session_id=str(sid), engine=delivery_engine, transports=("message", "headless"),
+        message={"verb": "steer", "engine": delivery_engine, "on_busy": "hold",
+                 "ticket_ref": str(item.get("ref") or "") if bound else "",
+                 "ticket_session": str(sid) if bound else ""},
+        headless={"repo": repo, "queue": item.get("project", ""),
+                  "worker_id": item.get("claimed_by", "")})
+    if sent.get("ok") and sent.get("transport") != "headless-resume":
+        if bound:
+            q.set_resume_state(item["ref"], str(sid), "running",
+                               transport=str(sent.get("transport") or ""))
+        _log_resume(item, str(sent.get("transport") or "?"))
         print(f"ANSWERED: {item['ref']} — delivered to session {sid} via "
               f"{sent.get('transport', '?')} to apply your answer and close.")
         return 0
-    if sent.get("queued"):
+    if sent.get("state") in ("queued", "in_flight"):
+        if bound:
+            q.set_resume_state(item["ref"], str(sid), "queued",
+                               outbox_id=str(sent.get("msg_id") or ""))
+        _log_resume(item, "queued")
         # Busy or momentarily unreachable: the durable outbox will deliver once
         # the session goes idle. The answer_grace in requeue_orphaned_tickets
         # keeps the sweep from reopening the ticket in the meantime.
         held = "session is mid-turn" if sent.get("busy") else "delivery deferred"
         print(f"ANSWERED: {item['ref']} — {held}; answer queued for delivery "
-              f"({sent.get('id', '?')}).")
+              f"({sent.get('msg_id') or '?'}).")
         return 0
-    # Unresolvable target (nothing queued): fall back to the headless resume
-    # fork, which registers the resume child under the worker id so the orphan
-    # sweep cannot reopen the ticket while the answer is applied.
-    started = _resume_session_headless(
-        sid,
-        repo,
-        prompt,
-        delivery_engine,
-        queue=item.get("project", ""),
-        worker_id=item.get("claimed_by", ""),
-    )
-    if started:
+    if sent.get("ok"):
+        if bound:
+            q.set_resume_state(item["ref"], str(sid), "headless")
+        _log_resume(item, "headless")
         print(f"ANSWERED: {item['ref']} — resuming session {sid} in {repo} "
               f"to apply your answer and close.")
-    else:
-        print(f"ANSWERED: {item['ref']} — needs_input cleared, but delivery "
-              f"failed ({sent.get('error', 'unknown')}); {delivery_engine} "
-              "resume also failed to stay running. Resume manually: "
-              f"wt discuss {item['ref']} --engine {delivery_engine}")
+        return 0
+    # D7: every transport failed. The failed ledger row is settled by its
+    # handler (resume evidence -> failed) exactly once, now; then release the
+    # claim (the next tick / a fresh worker takes it) instead of leaving it
+    # held by a session that never woke.
+    err = str(sent.get("error") or "unknown")
+    _log_resume(item, f"failed: {err}")
+    settled = liveness.settle_failed(str(sent.get("delivery_id") or ""))
+    if bound:
+        _hand_off_blocked_claim(item, answer_text, str(sid), worker, bound,
+                                "failed" if settled is None else "", err,
+                                "could not be resumed")
+        print(f"ANSWERED: {item['ref']} — delivery failed ({err}) and {delivery_engine} "
+              "resume did not stay running; claim released for a fresh worker.")
+        return 0
+    print(f"ANSWERED: {item['ref']} — needs_input cleared, but delivery "
+          f"failed ({err}); {delivery_engine} "
+          "resume also failed to stay running. Resume manually: "
+          f"wt discuss {item['ref']} --engine {delivery_engine}")
+    return 0
+
+
+def _hand_off_blocked_claim(item: dict, answer_text: str, sid: str, worker: str, bound: bool,
+                            resume_state: str, why: str, could_not: str) -> None:
+    """Give a blocked session's ticket to a fresh worker: the answer rides the
+    ticket text (gate feedback already survives a release), the resume
+    evidence is closed with ``resume_state`` ('' = already recorded), and a
+    bound claim is force-released."""
+    if answer_text and not item.get("gate_feedback"):
+        from datetime import datetime as _dt, timezone as _tz
+        stamp = _dt.now(_tz.utc).strftime("%Y-%m-%d %H:%M UTC")
+        q.update(item["ref"], text=(
+            f"{item.get('text') or item.get('note') or ''}\n\n"
+            f"[ANSWERED while blocked, {stamp}] Q: "
+            f"{item.get('block_question') or '(see history)'}\nA: {answer_text}\n"
+            f"(Original session {sid[:8]} {could_not} — apply this "
+            f"answer fresh.)"))
+    if not bound:
+        return
+    if resume_state:
+        q.set_resume_state(item["ref"], sid, resume_state, error=why)
+    q.release(item["ref"], session_id=str(item.get("claimed_by") or worker or ""),
+              force=True)
+
+
+def cmd_migrate_blocks(args: argparse.Namespace) -> int:
+    """Park tickets blocked the legacy way (WT-28). Idempotent."""
+    refs = q.migrate_legacy_blocks(args.queue, dry_run=args.dry_run)
+    verb = "would park" if args.dry_run else "parked"
+    for r in refs:
+        print(f"{verb}: {r}")
+    print(f"{len(refs)} ticket(s) {verb.replace('would park', 'eligible')}.")
+    return 0
+
+
+def _route_parked_answer(item: dict, tid: bool = False) -> Optional[int]:
+    """WT-28: an answer on a parked ticket is routed back to the session that
+    parked it (affinity / resume / handoff). None for a legacy (held) block."""
+    pa = item.get("pending_answer") or {}
+    if item.get("status") != q.PARKED_STATUS or pa.get("state") != "routing":
+        return None
+    res = answers.route_answer(item["ref"], int(pa["gen"]), tid=tid)
+    print(f"ANSWERED: {item['ref']} — routed: {res.get('route')} ({res.get('reason')}).")
     return 0
 
 
@@ -1549,7 +3291,7 @@ def cmd_answer(args: argparse.Namespace) -> int:
     there; a genuinely unresolvable target still falls back to the headless
     resume fork so the answer is never silently dropped.
 
-    The delivered prompt branches on ``block_kind`` (SONIA-CHAT-17, same-topic
+    The delivered prompt branches on ``block_kind`` (CLIENT-CHAT-17, same-topic
     routing plan section 4): a ticket parked ``awaiting-client`` is a live
     multi-turn conversation topic, not a one-shot blocked question, so
     "answered -> close" is wrong for it. ``--tid`` marks this specific answer
@@ -1560,6 +3302,22 @@ def cmd_answer(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
+    if (item.get("plan") or {}).get("status") == "blocked":
+        print(f"NOTE: {item['ref']} plan gate is STILL BLOCKED; a free-text answer "
+              f"does not accept it. Decide with `wt plan decide {item['ref']} "
+              f"--accept [--text/--file amended plan]` or `--retry [--retries N]`.")
+    ss = item.get("stage_session") or {}
+    if ss.get("retry_at") and ss.get("retry_at") == item.get("answered_at"):
+        # WT-24: an answer on a stage escalation is a retry of that stage, not
+        # a message for the builder session (even when one is retained).
+        role = str(ss.get("role") or "stage")
+        print(f"ANSWERED: {item['ref']} — {role.replace('_', ' ')} retry queued; the "
+              f"watcher will spawn a fresh {role.replace('_', ' ')} (attempt 1, "
+              f"key {ss.get('key')})")
+        return 0
+    routed = _route_parked_answer(item, tid=bool(getattr(args, "tid", False)))
+    if routed is not None:
+        return routed
     sid = item.get("claimed_session_id")
     if not sid:
         print(f"ANSWERED: {item['ref']} — needs_input cleared. "
@@ -1574,7 +3332,9 @@ def cmd_answer(args: argparse.Namespace) -> int:
             f"done with this topic. Push anything still local, then close "
             f"with `wt close {item['ref']} --worker <your-id> --summary "
             f'"..." --commit <SHA>` (or `--no-code` if nothing changed). '
-            f"Append your learnings line. Message the client only if you "
+            f"Append your learnings line to ~/.watchtower/learnings/"
+            f"<your-queue>.pending.md if this turn earned one. Message the "
+            f"client only if you "
             f"actually pushed something."
         )
     elif block_kind == "awaiting-client":
@@ -1617,6 +3377,9 @@ def cmd_gate_ack(args: argparse.Namespace) -> int:
         return 0
     print(f"ACKED: {item['ref']} — product gate approved."
           + (f" Comment: {args.comment}" if args.comment else ""))
+    routed = _route_parked_answer(item)
+    if routed is not None:
+        return routed
     sid = item.get("claimed_session_id")
     if not sid:
         print("  (no resumable session; the next worker to claim it will see "
@@ -1686,6 +3449,30 @@ def _comment_author_is_claimant(item: Dict[str, Any], args: argparse.Namespace) 
     )
 
 
+def _unsessioned_target_warning(target: str) -> str:
+    """Suffix for a queued ``wt comment`` whose target has no session id.
+
+    Every transport except the worker FIFO routes by session id, so a queued
+    message to a sessionless worker cannot land until its id is resolved --
+    and a one-shot engine (``devin -p``) has no FIFO at all. Reporting that as
+    a plain "queued" read as success while the message sat in the outbox
+    forever (WATCHTOWER-32)."""
+    from . import messages
+    try:
+        resolved = messages.resolve_target(target, include_recent=False)
+    except Exception:  # noqa: BLE001 - best-effort hint only
+        return ""
+    if resolved.get("session_id"):
+        return ""
+    engine = str(resolved.get("engine") or "claude")
+    kind = "one-shot " if engine in workers._ONE_SHOT_ENGINES else ""
+    return (
+        f"\n  WARNING: target is a {kind}{engine} worker with no session id; "
+        "nothing can deliver this until its session is resolved "
+        "(check: wt outbox ls)"
+    )
+
+
 def cmd_comment(args: argparse.Namespace) -> int:
     item = q.comment(args.ref, args.text, by=args.by, session_id=args.worker)
     if not item:
@@ -1706,7 +3493,11 @@ def cmd_comment(args: argparse.Namespace) -> int:
             f"{item['ref']}:\n\n{args.text}"
         )
         try:
-            sent = messages.deliver_message(str(target), prompt, verb="steer")
+            sent = messages.deliver_message(
+                str(target), prompt, verb="steer",
+                ticket_ref=str(item.get("ref") or ""),
+                ticket_session=str(item.get("claimed_session_id") or ""),
+            )
         except Exception as e:  # durable ticket comment already succeeded
             delivery = f" — live injection failed ({e})"
         else:
@@ -1716,7 +3507,10 @@ def cmd_comment(args: argparse.Namespace) -> int:
                     f"{sent.get('transport', '?')}"
                 )
             elif sent.get("queued"):
-                delivery = f" — live injection queued as {sent.get('id', '?')}"
+                delivery = (
+                    f" — live injection queued as {sent.get('id', '?')}"
+                    + _unsessioned_target_warning(str(target))
+                )
             else:
                 delivery = (
                     " — live injection unavailable"
@@ -1734,7 +3528,7 @@ def cmd_discuss(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
-    sid = item.get("claimed_session_id")
+    sid = q.answer_session(item)
     if not sid:
         print(f"(no resumable session on {args.ref} — it was never claimed with a "
               f"real session id)", file=sys.stderr)
@@ -1744,6 +3538,8 @@ def cmd_discuss(args: argparse.Namespace) -> int:
         inner = ["codex", "resume", sid]
     elif args.engine == "kimi":
         inner = ["kimi", "--session", sid]
+    elif args.engine == "devin":
+        inner = ["devin", "--resume", sid]
     else:
         inner = ["claude", "--resume", sid]
     cmd = "cd " + shlex.quote(repo) + " && " + " ".join(shlex.quote(c) for c in inner)
@@ -1759,16 +3555,33 @@ def cmd_workers(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(rows, indent=2))
         return 0
+    # The prune above already dropped every dead row it may. What survives dead
+    # is retained on purpose -- rebound tombstones (REBOUND_RETENTION_S guards a
+    # second continuation), recent stage records, rows owed a lifecycle audit --
+    # and a week of rebinds is ~100 rows that read as "stale workers". The
+    # table shows live workers unless --all; --json is unchanged.
+    # A dead-PID row whose resumed session is still writing is shown even
+    # without --all: it is working, just not in its original process (WT-17).
+    active = {id(w): age for w in rows if not w.get("alive")
+              for age in [workers.session_active_age_s(w, rows)] if age is not None}
+    hidden = 0
+    if not getattr(args, "all", False):
+        hidden = sum(1 for w in rows if not w.get("alive") and id(w) not in active)
+        rows = [w for w in rows if w.get("alive") or id(w) in active]
     if not rows:
-        print("(no workers tracked)")
-        return 0
-    print(f"{'WORKER':<22}{'PID':>8}  {'QUEUE':<12}{'ENGINE':<8}{'ALIVE':<6}STARTED")
+        print("(no workers tracked)" if not hidden else "(no live workers)")
+    else:
+        print(f"{'WORKER':<22}{'PID':>8}  {'QUEUE':<12}{'ENGINE':<8}{'ALIVE':<6}STARTED")
     for w in rows:
         print(
             f"{w.get('worker_id',''):<22}{w.get('pid',0):>8}  "
             f"{w.get('queue',''):<12}{w.get('engine',''):<8}"
             f"{'yes' if w.get('alive') else 'no':<6}{w.get('started_at','')}"
+            + (f"  (session active {int(active[id(w)])}s ago)" if id(w) in active else "")
         )
+    if hidden:
+        print(f"({hidden} dead record(s) retained by design -- rebind guard / "
+              "stage forensics; they expire on their own. --all to show)")
     return 0
 
 
@@ -1807,7 +3620,7 @@ def cmd_interrupt(args: argparse.Namespace) -> int:
     the worker currently claiming it — or a worker id directly. Writes claude's
     stream-json ``interrupt`` control request to the worker's stdin FIFO: the
     in-flight tool aborts and the turn ends, but the session (and its warm
-    prompt cache) survives for the next instruction (SONIA-CHAT-5).
+    prompt cache) survives for the next instruction (CLIENT-CHAT-5).
     """
     target = str(args.target or "").strip()
     worker_id = target
@@ -1862,16 +3675,24 @@ def cmd_send(args: argparse.Namespace) -> int:
         # "the complete report text" means text-for-text). Only the single
         # newline every heredoc/echo appends is dropped.
         text = raw.removesuffix("\n")
+    # Steer by default: a live Claude target gets the message over its peer
+    # socket, which injects into a running turn without aborting it, instead
+    # of waiting in the outbox for the turn to end.
     res = messages.send(
         args.target, text, mode=args.mode,
         queue_on_fail=not args.no_queue,
         ttl_s=args.ttl,
+        prefer_uds=True,
+        **({"start_new_if_needed": True}
+           if getattr(args, "start_new_if_needed", False) else {}),
     )
     if args.json:
         print(json.dumps(res, indent=2))
         return 0 if (res.get("ok") or res.get("queued")) else 1
     if res.get("ok"):
         extra = f"  (log: {res['log']})" if res.get("log") else ""
+        if res.get("new_session_id"):
+            extra = f"  (new session: {res['new_session_id']})"
         print(f"SENT: {args.target} via {res.get('transport', '?')}{extra}")
         return 0
     if res.get("queued"):
@@ -1959,11 +3780,25 @@ def _default_report_to() -> Tuple[str, str]:
     resolve_target treats an unknown bare UUID as engine=claude, so delivery
     would try the wrong transport and never land. Registering it in the
     agents registry (engine=codex, deterministic per-thread name, idempotent)
-    makes ``wt send @name`` route via the codex app-server transport."""
+    makes ``wt send @name`` route via the codex app-server transport.
+
+    Devin sets NEITHER env var, so a ``wt add`` from inside a devin session
+    used to file with ``submitter=""`` and silently give up on ever notifying
+    its filer (WATCHTOWER-33). Its session is recovered from our own process
+    ancestry instead; the ``devincli-`` form is what resolve_target and CCC's
+    delegate both address."""
     sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
     if sid:
         return sid, ""
     tid = os.environ.get("CODEX_THREAD_ID", "").strip()
+    if not tid:
+        from . import workers as _w
+        try:
+            devin = _w.current_devin_session_id()
+        except Exception:
+            devin = ""
+        if devin:
+            return devin, ""
     if tid:
         from . import messages
         name = f"codex-thread-{tid.replace('-', '')[:12]}"
@@ -2728,6 +4563,8 @@ def cmd_migrate_store(args: argparse.Namespace) -> int:
 
     try:
         result = q.migrate_store()
+        from . import config
+        settings = config.config_path()
     except Exception as e:  # corrupt JSON source — refuse to shadow it
         print(f"migrate-store: refusing to migrate: {e}", file=sys.stderr)
         return 1
@@ -2736,6 +4573,7 @@ def cmd_migrate_store(args: argparse.Namespace) -> int:
         print(f"migrated {n} item(s) into {result['db']}")
     else:
         print(f"store is already SQLite ({n} item(s)) at {result['db']}")
+    print(f"queue settings: {settings}")
     return 0
 
 
@@ -2839,6 +4677,7 @@ def cmd_set(args: argparse.Namespace) -> int:
                     str(worker.get("worker_id") or "") for worker in released
                 )
             )
+        _warn_queue_floors(args.queue)
     if args.effort is not None:
         config.set_effort(args.queue, args.effort)
         changed.append(f"effort={args.effort or '(engine default)'}")
@@ -2977,6 +4816,9 @@ def cmd_config(args: argparse.Namespace) -> int:
     ``wt set`` and ``wt drain`` are kept as-is; this command is the single-stop
     alternative for the common case of configuring a queue from scratch."""
     from . import config
+    if not args.queue:
+        print(config.config_path())
+        return 0
     if not _validate_queue_worker_settings(args, config):
         return 1
     changed = []
@@ -3033,6 +4875,13 @@ def cmd_config(args: argparse.Namespace) -> int:
     if getattr(args, "github_assignee", None) is not None:
         config.set_github_assignee(args.queue, args.github_assignee)
         changed.append(f"github_assignee={config.github_assignee(args.queue)}")
+    if getattr(args, "queue_label", None) is not None:
+        try:
+            config.set_queue_label(args.queue, args.queue_label)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        changed.append(f"queue_label={config.queue_label(args.queue)}")
     if getattr(args, "workers_local_path", None) is not None:
         expanded_path = os.path.expanduser(args.workers_local_path)
         if not os.path.isdir(expanded_path):
@@ -3050,6 +4899,38 @@ def cmd_config(args: argparse.Namespace) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
         changed.append(f"grace_s={config.grace_s(args.queue)}")
+    for role in config.ROLE_KEYS:
+        r_eng = getattr(args, f"{role}_engine", None)
+        r_model = getattr(args, f"{role}_model", None)
+        if r_eng is None and r_model is None:
+            continue
+        try:
+            config.set_role(args.queue, role, r_eng, r_model)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        r = config.role_override(args.queue, role)
+        changed.append("%s=%s/%s" % (role, r[0] or "(default)", r[1] or "(default)"))
+    if getattr(args, "gate", None) is not None:
+        try:
+            config.set_gates(args.queue, [] if args.gate == ["none"] else args.gate)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        changed.append(f"gates={config.gates(args.queue) or 'none'}")
+    if getattr(args, "gate_worktree", None) is not None:
+        config.set_gate_worktree(args.queue, args.gate_worktree)
+        changed.append(f"gate_worktree={args.gate_worktree}")
+    if getattr(args, "post_fix_assessment", None) is not None:
+        enabled = args.post_fix_assessment == "on"
+        if enabled:
+            why = _assessment_repo_problem(args.queue)
+            if why:
+                print(f"error: cannot enable post-fix assessment on {args.queue}: {why}",
+                      file=sys.stderr)
+                return 2
+        config.set_post_fix_assessment(args.queue, enabled)
+        changed.append(f"post_fix_assessment={'on' if enabled else 'off'}")
     if getattr(args, "product_gate", None) is not None:
         enabled = args.product_gate == "on"
         if enabled and config.backend(args.queue) == "github":
@@ -3058,6 +4939,23 @@ def cmd_config(args: argparse.Namespace) -> int:
                   file=sys.stderr)
         config.set_product_gate(args.queue, enabled)
         changed.append(f"product_gate={'on' if enabled else 'off'}")
+    if getattr(args, "sent_back_release_min", None) is not None:
+        try:
+            config.set_sent_back_release_min(args.queue, args.sent_back_release_min)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 1
+        changed.append(f"sent_back_release_min={args.sent_back_release_min}")
+    if getattr(args, "fallback_to_default_worker", None) is not None:
+        enabled = args.fallback_to_default_worker == "on"
+        config.set_fallback_to_default_worker(args.queue, enabled)
+        changed.append(
+            f"fallback_to_default_worker={'on' if enabled else 'off'}"
+        )
+    if getattr(args, "headroom_dispatch", None) is not None:
+        enabled = args.headroom_dispatch == "on"
+        config.set_headroom_dispatch(args.queue, enabled)
+        changed.append(f"headroom_dispatch={'on' if enabled else 'off'}")
     if getattr(args, "notify_events", None) is not None:
         raw = str(args.notify_events).strip().lower()
         if raw == "default":
@@ -3091,6 +4989,7 @@ def cmd_config(args: argparse.Namespace) -> int:
                     str(worker.get("worker_id") or "") for worker in released
                 )
             )
+        _warn_queue_floors(args.queue)
     if getattr(args, "effort", None) is not None:
         config.set_effort(args.queue, args.effort)
         changed.append(f"effort={args.effort or '(engine default)'}")
@@ -3107,18 +5006,45 @@ def cmd_config(args: argparse.Namespace) -> int:
         # "why did nothing pick up my new ticket for 3 minutes" has to be
         # answerable from the queue's own config output.
         cfg.setdefault("grace_s", config.grace_s(args.queue))
+        cfg.setdefault("sent_back_release_min", config.sent_back_release_min(args.queue))
+        cfg.setdefault("headroom_dispatch", config.headroom_dispatch(args.queue))
+        from . import roles as _roles
+        if getattr(args, "json", False):
+            print(json.dumps({"queue": args.queue, "config": cfg,
+                              "roles": _roles.role_table(args.queue)},
+                             indent=2, sort_keys=True, default=str))
+            return 0
         print(f"{args.queue}: {cfg}")
+        for role, r in _roles.role_table(args.queue).items():
+            print(f"  {role:<13} {r['engine']}/{r['model'] or '(engine default)'}  [{r['source']}]")
+        eng, mdl = config.engine(args.queue), str(cfg.get("model") or "")
+        from . import models as _catalogs
+        if _catalogs.catalog_warning(eng):
+            print(f"warning: {_catalogs.catalog_warning(eng)}", file=sys.stderr)
+        elif not config.is_approved_model(eng, mdl):
+            print(f"warning: {mdl!r} is not an approved {eng} model; "
+                  f"run `wt models --engine {eng}`", file=sys.stderr)
     else:
         print(f"{args.queue}: {', '.join(changed)}")
     return 0
 
 
 def _validate_queue_worker_settings(args: argparse.Namespace, config: Any) -> bool:
-    """Reject incompatible model/effort combinations before queue mutation."""
+    """Reject incompatible model/effort combinations before queue mutation.
+
+    Only a flag that changes the model, engine or effort is validated (WT-12);
+    an unrelated `wt config` call or plain view never errors on a stored pin.
+    """
+    if all(getattr(args, k, None) is None for k in ("engine", "model", "effort")):
+        return True
     engine = getattr(args, "engine", None) or config.engine(args.queue)
     existing = config.get_queue_config(args.queue)
     model_arg = getattr(args, "model", None)
     model = existing.get("model", "") if model_arg is None else model_arg
+    if model:
+        from . import models as _catalogs
+        if _catalogs.catalog_warning(engine):
+            print(f"warning: {_catalogs.catalog_warning(engine)}", file=sys.stderr)
     if not config.is_approved_model(engine, model):
         choices = ", ".join(config.approved_models(engine))
         print(
@@ -3145,7 +5071,14 @@ def cmd_models(args: argparse.Namespace) -> int:
     """List model identifiers WatchTower intentionally supports per engine."""
     from . import config
 
+    if not args.engine:
+        print("error: --engine is required (or use `wt models migrate|unpin`)", file=sys.stderr)
+        return 2
     models = list(config.approved_models(args.engine))
+    from . import models as _catalogs
+    warning = _catalogs.catalog_warning(args.engine)
+    if warning:
+        print(f"warning: {warning}", file=sys.stderr)
     payload = {"engine": args.engine, "models": models}
     if args.json:
         print(json.dumps(payload, indent=2))
@@ -3153,6 +5086,69 @@ def cmd_models(args: argparse.Namespace) -> int:
         print(f"{args.engine} approved models:")
         for model in models:
             print(f"  {model}")
+    return 0
+
+
+def _csv(value: Optional[str]) -> Optional[List[str]]:
+    return [q.strip() for q in value.split(",") if q.strip()] if value else None
+
+
+def cmd_models_migrate(args: argparse.Namespace) -> int:
+    """`wt models migrate`: bulk-move queues (and optionally the host default)."""
+    from . import models_migrate as mm
+
+    try:
+        plan = mm.plan_migrate(args.from_model, args.to_model, queues=_csv(args.queues),
+                               engine=args.to_engine or "",
+                               include_default=args.include_default)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    applied = []
+    if args.apply and not plan["refused"]:
+        applied = mm.apply_migrate(plan)
+    if args.json:
+        print(json.dumps({**plan, "applied": applied, "dry_run": not args.apply}, indent=2))
+    else:
+        print(f"{plan['from']} -> {plan['to']} ({'APPLY' if args.apply else 'dry run'})")
+        print(mm.format_rows(plan["rows"], "action") if plan["rows"]
+              else f"no queues resolve to {plan['from']}")
+        for ch in plan["default_changes"]:
+            print(f"default: {plan['defaults_file']} {ch['key']} {ch['from']} -> {ch['to']}")
+        if args.include_default and not plan["default_changes"]:
+            print(f"default: nothing in {plan['defaults_file']} resolves to {plan['from']}")
+        for w in plan["warnings"]:
+            print(f"warning: {w}")
+        for line in applied:
+            print(f"changed: {line}")
+        if not args.apply:
+            print("dry run: nothing written; re-run with --apply")
+    if plan["refused"]:
+        print(f"error: cross-engine move for {', '.join(plan['refused'])}; "
+              f"pass --engine {plan['engine']} to allow it (nothing written)", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_models_unpin(args: argparse.Namespace) -> int:
+    """`wt models unpin`: clear explicit queue models so they follow the default."""
+    from . import models_migrate as mm
+
+    queues = _csv(args.queues)
+    if not queues and not args.all_matching:
+        print("error: pass --queues A,B or --all-matching <model>", file=sys.stderr)
+        return 2
+    plan = mm.plan_unpin(queues=queues, matching=args.all_matching or "")
+    applied = mm.apply_unpin(plan) if args.apply else []
+    if args.json:
+        print(json.dumps({**plan, "applied": applied, "dry_run": not args.apply}, indent=2))
+    else:
+        print(f"unpin ({'APPLY' if args.apply else 'dry run'})")
+        print(mm.format_rows(plan["rows"], "after") if plan["rows"] else "no pinned queues match")
+        for line in applied:
+            print(f"changed: {line}")
+        if not args.apply:
+            print("dry run: nothing written; re-run with --apply")
     return 0
 
 
@@ -3205,6 +5201,7 @@ def cmd_wait(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+_DEPLOY_SYNC_INTERVAL_S = 30  # installed-tree fast-forward cadence (WT-16)
 _SELF_UPDATE_CHECK_INTERVAL_S = 3600  # how often the running daemon rechecks for new commits
 # How often the running daemon re-heals invalid queue worker settings
 # (config.sanitize_worker_settings). Cheap -- a single-file read that only
@@ -3285,8 +5282,9 @@ def _daemon_loop(args: argparse.Namespace) -> None:
     thread to stop instead of leaking it into every later test in the
     process (it is a ``daemon=True`` thread: nothing else ever joins it)."""
     import threading
-    from . import github_backend
+    from . import dashboard, github_backend
 
+    dashboard.install_stack_dump_handler()  # kill -USR1 <pid> -> all stacks on stderr
     gh_poller_stop = threading.Event()
     threading.Thread(
         target=github_backend.poll_list_caches_forever,
@@ -3303,6 +5301,7 @@ def _daemon_loop(args: argparse.Namespace) -> None:
 def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     _maybe_self_update()  # pick up reconciler fixes on every (re)start; re-execs if HEAD moved
     last_self_update_check = time.time()
+    last_deploy_sync = 0.0
     interval = max(5, args.interval)
     dry_run = getattr(args, "dry_run", False)
     # Always host the HTTP server alongside the watcher.
@@ -3321,13 +5320,17 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     print(f"[watchtower] HTTP server on http://{host}:{port}", flush=True)
     # Log daemon start to activity log.
     try:
-        auto_spawn_status = "auto-spawn on" if getattr(args, "auto_spawn", False) else "auto-spawn off"
+        auto_spawn_status = ("auto-spawn on" if getattr(args, "auto_spawn", False)
+                             else "auto-spawn off (stage sessions NOT supervised)")
         _q._log("DAEMON_START", f"(pid {os.getpid()}) {auto_spawn_status}")
     except Exception:
         pass
     last_config_sanitize = 0.0  # 0 -> the first tick below heals at daemon start
     while True:
-        result = workers.reconcile_once(dry_run=dry_run)
+        # Only a real auto-spawn daemon supervises stage sessions (WT-24).
+        result = workers.reconcile_once(
+            dry_run=dry_run,
+            **({} if getattr(args, "auto_spawn", False) else {"supervise_stages": False}))
         # Drain queued cross-agent messages each tick. Best-effort: a messaging
         # hiccup must never kill the reconcile loop.
         try:
@@ -3342,6 +5345,15 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
             receipts.sweep()
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] receipts sweep failed: {e}", flush=True)
+        # Verified delivery (WT-31 D4): settle ledger rows on those receipts
+        # (nonce landed -> confirmed; lost/missing/late -> lost) and run each
+        # purpose's handler (E9/E10/E13, resend, renotify, ...).
+        if not dry_run:
+            try:
+                from . import liveness
+                liveness.sweep_deliveries(verify=False)
+            except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+                print(f"[watchtower] delivery sweep failed: {e}", flush=True)
         # Resume-child reaper (WT-82): SIGTERM wt-spawned resume children that
         # outlived a completed turn. Ledger-scoped — never touches pids wt did
         # not spawn (CCC keeps its own resume children alive on purpose).
@@ -3381,23 +5393,20 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
                 last_config_sanitize = now
                 from . import config as _config
                 for change in _config.sanitize_worker_settings():
-                    print(
-                        f"[watchtower] queue {change['queue']}: dropped "
-                        f"invalid effort {change['dropped_effort']!r} "
-                        f"(engine {change['engine']}, "
-                        f"model {change['model'] or 'default'})",
-                        flush=True,
+                    note = (
+                        f"effort {change['unapproved_effort']!r} not listed for "
+                        f"model {change['model'] or 'default'} (engine "
+                        f"{change['engine']}); kept, dropped per launch"
                     )
-                    _q._log(
-                        "WARN",
-                        f"self-heal: dropped invalid effort "
-                        f"{change['dropped_effort']!r} (engine "
-                        f"{change['engine']}, model "
-                        f"{change['model'] or 'default'})",
-                        queue=change["queue"],
-                    )
+                    print(f"[watchtower] queue {change['queue']}: {note}", flush=True)
+                    _q._log("WARN", note, queue=change["queue"])
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] config sanitize failed: {e}", flush=True)
+        try:
+            from . import config as _config
+            _config.check_outside_changes()
+        except Exception as e:  # noqa: BLE001 - log and keep the loop alive
+            print(f"[watchtower] config audit failed: {e}", flush=True)
         # Group-chat nudge scheduler: same never-kill-the-loop contract as the
         # outbox drain above. deliver() wraps messages.send so chats.py never
         # touches transports directly; a chats.py bug must not take down
@@ -3412,6 +5421,8 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
             chats.nudge_tick(deliver=_chat_deliver)
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
             print(f"[watchtower] nudge_tick failed: {e}", flush=True)
+        if result.get("stages"):
+            print(f"[watchtower] stages: {result['stages']}", flush=True)
         for rec in result.get("spawned", []):
             tag = " (dry-run)" if rec.get("dry_run") else ""
             eng = rec.get("engine", "claude")
@@ -3476,7 +5487,40 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
         if time.time() - last_self_update_check >= _SELF_UPDATE_CHECK_INTERVAL_S:
             last_self_update_check = time.time()
             _maybe_self_update()
-        time.sleep(interval)
+        # Deploy-only installed tree (WT-16): pick up landed commits within
+        # ~30s; a clean fast-forward re-execs so the new code is what runs.
+        if time.time() - last_deploy_sync >= _DEPLOY_SYNC_INTERVAL_S:
+            last_deploy_sync = time.time()
+            try:
+                from . import deploy
+                res = deploy.sync()
+                if res["action"] == "moved":
+                    print(f"[watchtower] deploy sync {res['was'][:8]} -> {res['head'][:8]}; re-exec", flush=True)
+                    os.execvp(sys.executable, [sys.executable, "-m", "watchtower.cli"] + sys.argv[1:])
+                elif res["action"] == "refused":
+                    print(f"[watchtower] deploy sync refused: {res['reason']}", flush=True)
+            except Exception as e:  # noqa: BLE001 - never kill the loop
+                print(f"[watchtower] deploy sync failed: {e}", flush=True)
+        # WT-24: sleep until the next tick, but wake early when a CLI transition
+        # queued a stage session (the ticket state is the intent; the wake only
+        # cuts latency) and run a stage-only pass.
+        from . import stages as _stages
+        remaining = float(interval)
+        supervising = bool(getattr(args, "auto_spawn", False)) and not dry_run
+        while remaining > 0:
+            slept_from = time.time()
+            if not _stages.sleep_until_wake(remaining, sleep=time.sleep):
+                break
+            if not supervising:     # a dry-run / spawn-less daemon never supervises
+                remaining -= max(0.5, time.time() - slept_from)
+                continue
+            try:
+                acted = workers.reconcile_stages_only()
+                if acted:
+                    print(f"[watchtower] stages: {acted}", flush=True)
+            except Exception as e:  # noqa: BLE001 - never kill the loop
+                print(f"[watchtower] stage pass failed: {e}", flush=True)
+            remaining -= max(0.5, time.time() - slept_from)
 
 
 def cmd_start(args: argparse.Namespace) -> int:
@@ -3524,6 +5568,10 @@ def cmd_start(args: argparse.Namespace) -> int:
         if not dry_run:
             DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
             DAEMON_PID_FILE.write_text(str(os.getpid()))
+            # WT-7: let `stages.request` tell a spawn-less daemon (which never
+            # supervises stage sessions, WT-24) from a supervising one.
+            stages.supervisor_marker_path().write_text(
+                "on" if getattr(args, "auto_spawn", False) else "off")
         try:
             _daemon_loop(args)
         except KeyboardInterrupt:
@@ -3537,6 +5585,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                 except Exception:
                     pass
                 DAEMON_PID_FILE.unlink(missing_ok=True)
+                stages.supervisor_marker_path().unlink(missing_ok=True)
         return 0
     # Re-exec ourselves in the background in foreground-mode. This is the only
     # supervision path on hosts without a supported service manager, so use the
@@ -3583,7 +5632,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     # `systemctl --user disable --now` or `launchctl bootout`. Only fall back to
     # the pidfile+SIGTERM path for a manually-started daemon (dev machines that
     # never ran `wt install`).
-    if _service_installed() and _service_loaded():
+    if _service_installed() and (_use_systemd() or _service_loaded()):
         rc = _service_stop()
         if rc == 0:
             print(f"stopped {_service_kind()} {_service_label()} (will not relaunch)")
@@ -3625,9 +5674,10 @@ def cmd_stop(args: argparse.Namespace) -> int:
 
 
 _LAUNCHAGENT_LABEL = "ai.watchtower.watcher"
-_LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
+_DEFAULT_LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_LAUNCHAGENT_LABEL}.plist"
+_LAUNCHAGENT_PLIST = _DEFAULT_LAUNCHAGENT_PLIST
 
-_SYSTEMD_UNIT_NAME = "ai.watchtower.watcher.service"
+_SYSTEMD_UNIT_NAME = "watchtower.service"
 _SYSTEMD_UNIT = Path.home() / ".config" / "systemd" / "user" / _SYSTEMD_UNIT_NAME
 
 
@@ -3782,6 +5832,14 @@ def _write_launchagent_plist() -> None:
     print(f"wrote {_LAUNCHAGENT_PLIST}")
 
 
+def _systemd_quote(value: str, *, exec_arg: bool = False) -> str:
+    """Quote one unit value, preventing systemd specifier/env expansion."""
+    value = value.replace("%", "%%")
+    if exec_arg:
+        value = value.replace("$", "$$")
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _write_systemd_unit() -> None:
     """Write/refresh the systemd *user* unit (``~/.config/systemd/user``).
 
@@ -3795,15 +5853,17 @@ def _write_systemd_unit() -> None:
     program_args = [sys.executable, "-m", "watchtower.cli",
                     "start", "--foreground", "--auto-spawn"]
     log_path = Path.home() / ".watchtower" / "watcher.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     unit = f"""[Unit]
 Description=WatchTower watcher (queue auto-drain supervisor)
 
 [Service]
-Type=simple
-ExecStart={' '.join(program_args)}
+Type=exec
+KillMode=process
+ExecStart={' '.join(_systemd_quote(arg, exec_arg=True) for arg in program_args)}
 Restart=always
 RestartSec=5
-Environment=PATH={_launchd_path()}
+Environment={_systemd_quote("PATH=" + _launchd_path())}
 StandardOutput=append:{log_path}
 StandardError=append:{log_path}
 
@@ -3900,7 +5960,7 @@ def cmd_install(args: argparse.Namespace) -> int:
     """Write the platform service so WT starts automatically on login.
 
     On Linux with systemd this is a *user* unit at
-    ``~/.config/systemd/user/ai.watchtower.watcher.service``; on macOS it is the
+    ``~/.config/systemd/user/watchtower.service``; on macOS it is the
     LaunchAgent plist. The file is written unconditionally (so it's ready), but
     only activated if at least one queue has auto-drain enabled — otherwise the
     service would start for no reason.
@@ -3932,6 +5992,9 @@ def cmd_install(args: argparse.Namespace) -> int:
 
 def cmd_uninstall(args: argparse.Namespace) -> int:
     """Remove the platform service so WT no longer starts on login."""
+    # Preserve legacy installations before removing their service/hooks.
+    if cmd_migrate_store(args):
+        return 1
     if _service_installed():
         _service_stop()
         svc = _service_file()
@@ -3943,6 +6006,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     from . import skills_sync
     for r in skills_sync.remove():
         print(skills_sync.format_result(r))
+    print("Queue data and settings retained; reinstalling reuses them automatically.")
     return 0
 
 
@@ -4258,9 +6322,17 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Worker protocol", "claim"),
     ("Worker protocol", "release"),
     ("Worker protocol", "reopen"),
+    ("Tickets", "accept"),
+    ("Tickets", "reject"),
+    ("Tickets", "verdict"),
+    ("Tickets", "assess"),
+    ("Tickets", "plan"),
+    ("Tickets", "stages"),
+    ("Tickets", "liveness"),
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
+    ("Worker protocol", "defer"),
 ]
 # `install` is intentionally absent: it's a hidden alias folded into `wt start`
 # (see cmd_start's first-time auto-install), not a command users need to type.
@@ -4274,15 +6346,25 @@ COMMAND_HELP: Dict[str, str] = {
     "edit": "patch fields (title/priority/type/readiness/...) on an existing ticket",
     "claim": "claim next open ticket (smart sort: priority + type + age)",
     "release": "give up a claim without closing it; returns the ticket to open",
+    "accept": "accept an in_review ticket (closes it, unblocks dependents)",
+    "verdict": "file an independent verifier's pass/fail on an in_review ticket",
+    "assess": "post-fix assessment (WT-21): `submit`/`show`/`run`/`resume`, or `new` for a fix with no ticket",
+    "plan": "plan stage (plan gate): `submit` a plan, `verdict` it, `show`/`wait` for it",
+    "group": "plan groups (WT-33): `attach`/`seal`/`detach` members, `fix` a capped integration, `show` it",
+    "stages": "stage-session supervision (planner/verifier/assessor): `tick` one pass, `show` a ticket",
+    "liveness": "who owns each live ticket, is it proven at work, and what the backstop would do (read-only)",
+    "reject": "reject an in_review ticket back to open and resume its worker",
     "reopen": "reopen a closed ticket, returning it to the open pool (no dispatch)",
     "close": "close a ticket (record how you fixed it)",
     "unresolved-ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
     "block": "park a ticket that needs a human decision",
+    "defer": "take a ticket out of the pool until a data window ends (no human needed)",
     "blocked": "list tickets parked for a human",
     "gated": "product-gate pitches awaiting your Ack/Nack",
     "ack": "approve a product-gate pitch (Ack); resolution-caveat acks moved to unresolved-ack",
     "nack": "decline a product-gate pitch: icebox it, or --close to close as Declined",
     "answer": "answer a blocked ticket; auto-resumes its session",
+    "migrate-blocks": "park tickets blocked the legacy way (WT-28)",
     "comment": "append a ticket activity comment",
     "discuss": "attach to a blocked ticket's session (claude --resume)",
     "ready": "mark a ticket ready for workers (dispatch its queue); 'wt run' is an alias",
@@ -4293,7 +6375,8 @@ COMMAND_HELP: Dict[str, str] = {
     "migrate-store": "one-time JSON -> SQLite store migration (idempotent)",
     "export-json": "dump the store as classic {counter, items} JSON",
     "status": "per-queue depth / age / stuck flag",
-    "models": "list WatchTower-approved model identifiers per engine",
+    "deploy": "installed copy vs origin/main; --sync fast-forwards it when clean",
+    "models": "list approved models per engine; `migrate`/`unpin` bulk-move queue models",
     "config": "recommended queue configuration: settings plus auto-drain policy",
     "set": "compatibility alias for basic queue settings; prefer `wt config`",
     "drain": "enable or disable auto-drain for a queue",
@@ -4466,29 +6549,91 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     p.add_argument("--version", action=_VersionAction)
-    sub = p.add_subparsers(dest="command", metavar="<command>", help=argparse.SUPPRESS)
+    sub = p.add_subparsers(prog=p.prog, dest="command", metavar="<command>", help=argparse.SUPPRESS)
 
     s = sub.add_parser("status")
     s.add_argument("-q", "--queue", default=None)
     s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
+    s.add_argument("--all", action="store_true", help="also show archived queues")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_status)
 
+    s = sub.add_parser(
+        "queue",
+        help="retire or restore a queue (archive / unarchive / ls)",
+        description=(
+            "Retire dead queues without deleting history. An archived queue is "
+            "hidden from `wt status`, `wt models migrate/unpin`, the dashboard "
+            "and the reconciler; `wt find <ref>` still reads its tickets."
+        ),
+    )
+    qs = s.add_subparsers(dest="queue_cmd", metavar="<action>")
+    a = qs.add_parser("archive", help="retire a queue (dry run unless --apply)")
+    a.add_argument("name", metavar="QUEUE")
+    a.add_argument("--apply", action="store_true", help="write the change (default: dry run)")
+    a.add_argument("--force", action="store_true",
+                   help="archive even if the queue has open or in-progress tickets")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=cmd_queue_archive)
+    a = qs.add_parser("unarchive", help="restore an archived queue (auto_drain stays off)")
+    a.add_argument("name", metavar="QUEUE")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=cmd_queue_unarchive)
+    a = qs.add_parser("ls", help="list configured queues")
+    a.add_argument("--archived", action="store_true", help="list only archived queues")
+    a.add_argument("--all", action="store_true", help="list active and archived queues")
+    a.add_argument("--json", action="store_true")
+    a.set_defaults(func=cmd_queue_ls)
+    s.set_defaults(func=lambda args: (s.print_help(), 2)[1])
+
+    s = sub.add_parser("deploy")
+    s.add_argument("--sync", action="store_true",
+                   help="fast-forward the installed copy to origin (refuses if dirty)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_deploy)
+
     s = sub.add_parser("models")
-    s.add_argument("--engine", required=True,
-                   choices=["claude", "codex", "kimi", "antigravity"],
+    s.add_argument("--engine", default=None,
+                   choices=["claude", "codex", "kimi", "devin", "antigravity"],
                    help="engine whose supported worker model identifiers to list")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_models)
+    ms = s.add_subparsers(dest="models_cmd")
+    m = ms.add_parser("migrate", help="bulk-move queues (and the default) from one model to another")
+    m.add_argument("--from", required=True, dest="from_model", help="model queues resolve to now")
+    m.add_argument("--to", required=True, dest="to_model", help="approved model to move to")
+    m.add_argument("--queues", default=None, help="comma-separated queues (default: all matching)")
+    m.add_argument("--engine", default=None, dest="to_engine",
+                   help="allow a cross-engine move onto this engine")
+    m.add_argument("--include-default", action="store_true",
+                   help="also update the host worker default in CCC spawn-defaults.json")
+    m.add_argument("--apply", action="store_true", help="write changes (default: dry run)")
+    m.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    m.set_defaults(func=cmd_models_migrate)
+    u = ms.add_parser("unpin", help="clear a queue's explicit model so it follows the default")
+    u.add_argument("--queues", default=None, help="comma-separated queues")
+    u.add_argument("--all-matching", default=None, metavar="MODEL",
+                   help="every queue pinned to MODEL")
+    u.add_argument("--apply", action="store_true", help="write changes (default: dry run)")
+    u.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    u.set_defaults(func=cmd_models_unpin)
+
+    s = sub.add_parser("model", help="managed capability-profile model execution")
+    msub = s.add_subparsers(dest="model_command", required=True)
+    m = msub.add_parser("run", help="read a structured tools:none request from stdin")
+    m.add_argument("--json", action="store_true", required=True)
+    from .model_runner import command as model_run_command
+    m.set_defaults(func=model_run_command)
 
     s = sub.add_parser("ls")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument(
         "--status",
         default="active",
-        choices=["active", "open", "in_progress", "blocked", "closed",
-                 "unresolved", "all"],
-        help="which tickets to show (default: active = open + in_progress; "
+        choices=["active", "open", "in_progress", "in_review", "awaiting_answer",
+                 "blocked", "closed", "unresolved", "all"],
+        help="which tickets to show (default: active = open + in_progress + in_review + "
+             "awaiting_answer; "
              "blocked = parked for human input; unresolved = closed with "
              "unresolved items flagged in the resolution)",
     )
@@ -4526,6 +6671,16 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--text", default="")
         subparser.add_argument("--url", default="")
         subparser.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
+        subparser.add_argument("--depth", default="", choices=list(q.VALID_DEPTHS) + [""],
+                               help="quick (default): fix-and-look work. deep: work you "
+                                    "can't judge by using the product (perf, chronic "
+                                    "regressions) -- the claim carries the deep-work brief: "
+                                    "evidence first, options memo, measured goal, budget + "
+                                    "stop rule. Set by owners and system filers, not by "
+                                    "workers filing follow-ups")
+        subparser.add_argument("--budget-min", type=int, default=0, dest="budget_min",
+                               help=f"deep tickets: working budget in minutes "
+                                    f"(default {q.DEEP_DEFAULT_BUDGET_MIN})")
         subparser.add_argument("--type", default="", choices=["bug", "feature", ""],
                                help="item type: bug or feature")
         subparser.add_argument("--readiness", default="",
@@ -4541,11 +6696,23 @@ def build_parser() -> argparse.ArgumentParser:
                                help="business value: H, M, or L")
         subparser.add_argument("--confidence", default="", choices=["H", "M", "L", ""],
                                help="confidence: H, M, or L")
+        subparser.add_argument("--dedupe-key", default="", help="stable incident key; atomically reuse an existing ticket in this local queue")
         subparser.add_argument("--model-floor", default="", dest="model_floor",
-                               choices=list(q.VALID_MODEL_FLOORS),
                                help="filer's best-guess minimum model this ticket "
                                     "needs (FEAT-NEXT-120); empty is fine, never a "
                                     "blocker at filing time")
+        subparser.add_argument("--builder-model", default="", dest="model_floor",
+                               help="alias of --model-floor: the builder model this "
+                                    "ticket needs (WT-14)")
+        subparser.add_argument("--placement", default="", choices=list(q.VALID_PLACEMENTS) + [""],
+                               help="which machine may run this: mac (waits for the Mac), "
+                                    "cloud (Linux/VM only), any. Default: a Mac filer's "
+                                    "Xcode/iOS/simulator/browser keyword heuristic picks mac, "
+                                    "otherwise unrestricted")
+        subparser.add_argument("--planner-model", default="", dest="planner_model",
+                               help="model that plans this ticket (overrides the queue)")
+        subparser.add_argument("--verifier-model", default="", dest="verifier_model",
+                               help="model that verifies this ticket (overrides the queue)")
         subparser.add_argument("--worker", default="",
                                help="worker/owner id to claim under when --claim is "
                                     "set; defaults to wt-cli-<shell> (stable per "
@@ -4562,9 +6729,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("add")
     _add_common_ticket_args(s)
-    s.add_argument("--claim", action="store_true",
-                   help="immediately claim the new ticket (mark in_progress) so no "
-                        "auto-drain worker picks it up; use when you're already working it")
+    s.add_argument("--after", action="append", default=None, metavar="REF",
+                   help="this ticket is not claimable until REF closes as "
+                        "completed (repeatable)")
+    s.add_argument("--gate", action="append", default=None, metavar="GATE",
+                   help="acceptance gate (repeatable, ordered; overrides the "
+                        "queue's): cmd:<command>, verify, review or "
+                        "review:<target>")
+    s.add_argument("--accept", default=None, metavar="LINE",
+                   help="one plain-language acceptance line the verify gate "
+                        "checks (falls back to the ticket text when empty)")
+    disposition = s.add_mutually_exclusive_group()
+    disposition.add_argument("--claim", action="store_true",
+                             help="immediately claim the new ticket (mark in_progress) so no "
+                                  "auto-drain worker picks it up; use when you're already working it")
+    disposition.add_argument("--run", action="store_true",
+                             help="request a run and dispatch now (like wt run): bypass "
+                                  "grace and auto-drain policy for this ticket; "
+                                  "dependencies, planning and worker capacity still apply")
+    s.add_argument("--group-parent", action="store_true", dest="group_parent",
+                   help="file a plan-group parent (WT-33): one plan for its members, "
+                        "one integration check after they all close; never claimed")
+    s.add_argument("--children", default="", metavar="REF,REF",
+                   help="with --group-parent: attach these open tickets and seal the "
+                        "group (>= 2) in the same write")
+    s.add_argument("--group", default="", metavar="PARENT",
+                   help="file this ticket as a member of the (unsealed) group PARENT")
     s.set_defaults(func=cmd_add)
 
     s = sub.add_parser(
@@ -4612,12 +6802,38 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--confidence", default=None, choices=["H", "M", "L"],
                    help="confidence: H, M, or L")
     s.add_argument("--model-floor", default=None, dest="model_floor",
-                   choices=[m for m in q.VALID_MODEL_FLOORS if m],
                    help="filer's best-guess minimum model this ticket needs "
                         "(FEAT-NEXT-120)")
+    s.add_argument("--builder-model", default=None, dest="model_floor",
+                   help="alias of --model-floor (WT-14)")
+    s.add_argument("--placement", default=None, choices=list(q.VALID_PLACEMENTS) + [""],
+                   help="which machine may run this: mac, cloud, any; empty clears")
+    s.add_argument("--planner-model", default=None, dest="planner_model",
+                   help="model that plans this ticket; empty clears")
+    s.add_argument("--verifier-model", default=None, dest="verifier_model",
+                   help="model that verifies this ticket; empty clears")
     s.add_argument("--selector", default=None)
     s.add_argument("--screenshot-path", default=None, dest="screenshot_path")
     s.add_argument("--repo-path", default=None, dest="repo_path")
+    s.add_argument("--after", action="append", default=None, metavar="REF",
+                   help="add a blocker: this ticket is not claimable until REF "
+                        "closes as completed (repeatable)")
+    s.add_argument("--clear-after", action="store_true", dest="clear_after",
+                   help="remove all blockers from this ticket")
+    s.add_argument("--gate", action="append", default=None, metavar="GATE",
+                   help="per-ticket acceptance gate (repeatable, ordered; "
+                        "overrides the queue's): cmd:<command>, verify, "
+                        "review or review:<target>")
+    s.add_argument("--accept", default=None, metavar="LINE",
+                   help="one plain-language acceptance line the verify gate "
+                        "checks (falls back to the ticket text when empty)")
+    s.add_argument("--clear-gates", action="store_true", dest="clear_gates",
+                   help="drop this ticket's gate override (an empty override "
+                        "= no gates; use --gate to set one)")
+    s.add_argument("--depth", default=None, choices=list(q.VALID_DEPTHS),
+                   help="quick or deep (deep = claim carries the deep-work brief)")
+    s.add_argument("--budget-min", type=int, default=None, dest="budget_min",
+                   help="deep tickets: working budget in minutes")
     s.add_argument("--queue", default=None,
                    help="move the ticket to a different queue in place, "
                         "reassigning its ref (WT-83); file-backed queues only")
@@ -4655,7 +6871,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_ready_args(s)
     s.set_defaults(func=cmd_run)
 
+    s = sub.add_parser("duplicate", help="link a duplicate ticket to its original; share completion without another verifier")
+    s.add_argument("ref")
+    dup = s.add_mutually_exclusive_group(required=True)
+    dup.add_argument("--of", metavar="REF", help="original ticket covering the same incident")
+    dup.add_argument("--clear", action="store_true", help="remove link and reopen for independent work")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_duplicate)
+
     s = sub.add_parser("close")
+    s.add_argument("--duplicate-of", default="", metavar="REF", help="link to the original instead of running another verification (requires --no-code)")
     s.add_argument("ref")
     s.add_argument("--worker", default="")
     s.add_argument("--summary", default="",
@@ -4715,8 +6940,170 @@ def build_parser() -> argparse.ArgumentParser:
                    help="release even if the ticket is blocked (needs_input) -- "
                         "normally refused because it erases the open question; "
                         "prefer `wt answer` to resolve a block")
+    s.add_argument("--reserve-for", default="", metavar="WORKER",
+                   help="release to open but reserve the ticket for this worker/session "
+                        "(WT-28 affinity gate) until --ttl elapses, then it opens up to anyone")
+    s.add_argument("--ttl", type=float, default=300,
+                   help="seconds the --reserve-for reservation holds (default 300)")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_release)
+
+    s = sub.add_parser("accept", help=COMMAND_HELP.get("accept", ""))
+    s.add_argument("ref")
+    s.add_argument("--by", default="", help="who accepted (default: human)")
+    s.add_argument("--force", action="store_true",
+                   help="accept even while the independent verifier's verdict is pending")
+    s.add_argument("--no-proof", action="store_true", dest="no_proof",
+                   help="group parent with --force: close it although no integration "
+                        "commit contains every member (recorded as proof: none)")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_accept)
+
+    s = sub.add_parser("plan", help=COMMAND_HELP.get("plan", ""))
+    ps = s.add_subparsers(dest="plan_cmd", required=True)
+    p1 = ps.add_parser("submit", help="planner: file the plan for a plan-gated ticket")
+    p1.add_argument("ref")
+    p1.add_argument("--text", default="")
+    p1.add_argument("--file", default="")
+    p1.add_argument("--by", default="")
+    p1.add_argument("--mv", type=int, default=None,
+                    help="group parent: the membership version the plan was written for")
+    p2 = ps.add_parser("verdict", help="plan reviewer: accept or reject the plan")
+    p2.add_argument("ref")
+    g = p2.add_mutually_exclusive_group(required=True)
+    g.add_argument("--accept", action="store_true")
+    g.add_argument("--reject", action="store_true")
+    p2.add_argument("--reasons", default="")
+    p2.add_argument("--by", default="")
+    p2.add_argument("--mv", type=int, default=None,
+                    help="group parent: the membership version the verdict is for")
+    p2.add_argument("--section", action="append", default=None, metavar="REF",
+                    help="group parent, with --reject: a member section that must "
+                         "change (repeatable)")
+    p3 = ps.add_parser("show", help="print the ticket's plan state")
+    p3.add_argument("ref")
+    p3.add_argument("--json", action="store_true")
+    p6 = ps.add_parser("discuss", help="planner/reviewer: message the counterpart in the plan discussion")
+    p6.add_argument("ref")
+    p6.add_argument("--from", dest="sender", choices=["planner", "reviewer"], required=True)
+    p6.add_argument("--text", required=True)
+    p6.add_argument("--mv", type=int, default=None,
+                    help="group parent: the membership version")
+    p2.add_argument("--version", type=int, default=None,
+                    help="plan version this verdict is for (rejects a stale verdict)")
+    p5 = ps.add_parser("decide", help="human: settle a plan blocked by exhausted review")
+    p5.add_argument("ref")
+    g = p5.add_mutually_exclusive_group(required=True)
+    g.add_argument("--accept", action="store_true", help="accept the (amended) plan")
+    g.add_argument("--retry", action="store_true", help="resume planning/review")
+    p5.add_argument("--text", default="", help="amended plan text (with --accept)")
+    p5.add_argument("--file", default="")
+    p5.add_argument("--retries", type=int, default=1,
+                    help="review rounds granted by --retry (default 1)")
+    p5.add_argument("--by", default="")
+    p5.add_argument("--mv", type=int, default=None,
+                    help="group parent: the membership version")
+    p4 = ps.add_parser("wait", help="builder: block until the plan is accepted, print it")
+    p4.add_argument("ref")
+    p4.add_argument("--timeout", type=int, default=1800)
+    s.set_defaults(func=cmd_plan)
+
+    s = sub.add_parser("group", help=COMMAND_HELP.get("group", ""))
+    gs = s.add_subparsers(dest="group_cmd", required=True)
+    g1 = gs.add_parser("attach", help="adopt open, unclaimed tickets into an unsealed group")
+    g1.add_argument("parent")
+    g1.add_argument("refs", nargs="+")
+    g1.add_argument("--replan", action="store_true",
+                    help="a ticket with its own plan: move that plan to history")
+    g1.add_argument("--seal", action="store_true", help="seal the group in the same write")
+    g2 = gs.add_parser("seal", help="seal the membership (>= 2) and start the group plan")
+    g2.add_argument("parent")
+    g3 = gs.add_parser("detach", help="take an unclosed member out of its group")
+    g3.add_argument("ref")
+    g4 = gs.add_parser("fix", help="capped integration: file one more integration fix")
+    g4.add_argument("parent")
+    g4.add_argument("--text", default="", help="guidance for the fix")
+    g5 = gs.add_parser("show", help="members, fixes, plan and integration state")
+    g5.add_argument("ref", help="the parent or any member")
+    g5.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_group)
+
+    s = sub.add_parser("stages", help=COMMAND_HELP.get("stages", ""))
+    sg = s.add_subparsers(dest="stages_cmd", required=True)
+    g1 = sg.add_parser("tick", help="run one stage-supervision pass in the foreground")
+    g1.add_argument("--ref", default="")
+    g2 = sg.add_parser("show", help="print a ticket's stage-supervision record")
+    g2.add_argument("ref")
+    g2.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_stages)
+
+    s = sub.add_parser("liveness", help=COMMAND_HELP.get("liveness", ""))
+    s.add_argument("ref", nargs="?", default="")
+    s.add_argument("-q", "--queue", default="")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_liveness)
+
+    s = sub.add_parser("assess", help=COMMAND_HELP.get("assess", ""))
+    ass = s.add_subparsers(dest="assess_cmd", required=True)
+    p1 = ass.add_parser("submit", help="assessor: file the six-point assessment")
+    p1.add_argument("ref")
+    p1.add_argument("--token", default="")
+    p1.add_argument("--json", dest="json_text", default="", metavar="JSON")
+    p1.add_argument("--file", default="", help="JSON file ('-' = stdin)")
+    p1.add_argument("--force", action="store_true",
+                    help="human: reserve a fresh attempt and submit under it")
+    p2 = ass.add_parser("show", help="print the ticket's assessment state")
+    p2.add_argument("ref")
+    p2.add_argument("--json", action="store_true")
+    p3 = ass.add_parser("run", help="(re)start the assessor for a closed bug")
+    p3.add_argument("ref")
+    p3.add_argument("--force", action="store_true")
+    p3.add_argument("--wait", type=float, default=20,
+                    help="seconds to wait for the watcher to spawn the assessor")
+    p3.add_argument("--dry-run", action="store_true", dest="dry_run",
+                    help="print the resolved repo, assessor and prompt; spawn nothing")
+    p4 = ass.add_parser("resume", help="finish filing a half-filed assessment (no LLM)")
+    p4.add_argument("ref")
+    p6 = ass.add_parser("approve", help="approve assessment follow-up(s) so workers can claim them")
+    p6.add_argument("refs", nargs="+", metavar="REF")
+    p5 = ass.add_parser("new", help="file + close a bug fixed without a ticket, then assess it")
+    p5.add_argument("-q", "--queue", required=True)
+    p5.add_argument("--title", required=True)
+    p5.add_argument("--text", default="")
+    p5.add_argument("--summary", default="")
+    p5.add_argument("--commit", default="", metavar="SHA")
+    p5.add_argument("--no-code", action="store_true", dest="no_code")
+    p5.add_argument("--repo-path", default="", dest="repo_path")
+    p5.add_argument("--worker", default="")
+    p5.add_argument("--source", default="wt")
+    p5.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_assess)
+
+    s = sub.add_parser("verdict", help=COMMAND_HELP.get("verdict", ""))
+    s.add_argument("ref")
+    g = s.add_mutually_exclusive_group(required=True)
+    g.add_argument("--pass", dest="passed", action="store_true")
+    g.add_argument("--fail", dest="passed", action="store_false")
+    s.add_argument("--findings", default="", help="what was checked / what is wrong")
+    s.add_argument("--by", default="", help="verifier id (default: your worker id)")
+    s.add_argument("--verify-cycle", type=int, default=None, dest="verify_cycle",
+                   help="group parent: the integration verify cycle this verdict is for")
+    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
+                   help="override the resumed worker's engine (--fail only)")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_verdict)
+
+    s = sub.add_parser("reject", help=COMMAND_HELP.get("reject", ""))
+    s.add_argument("ref")
+    s.add_argument("--reason", required=True, help="what must change")
+    s.add_argument("--by", default="", help="who rejected (default: human)")
+    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
+                   help="override the resumed session's engine")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_reject)
 
     s = sub.add_parser("reopen", help=COMMAND_HELP.get("reopen", ""))
     s.add_argument("ref")
@@ -4726,15 +7113,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--force", action="store_true",
                    help="reopen even if the ticket is blocked (needs_input) -- "
                         "normally refused because it erases the open question; "
-                        "prefer `wt answer` to resolve a block")
+                        "prefer `wt answer` to resolve a block. A closed plan-group "
+                        "member under its group's integration is refused too; "
+                        "--force invalidates that integration (WT-33)")
     s.add_argument("--resume", default=None, metavar="TEXT",
-                   help="re-entry re-bind (SONIA-CHAT-19): atomically reopen "
+                   help="re-entry re-bind (CLIENT-CHAT-19): atomically reopen "
                         "AND claim under the ticket's own preserved session, "
                         "then deliver TEXT to it via the same liveness-aware "
                         "path `wt answer` uses -- steer if live, headless "
                         "resume if dead. Falls back to a plain reopen if the "
                         "ticket has no resumable session.")
-    s.add_argument("--engine", choices=["claude", "codex", "kimi"],
+    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
                    help="override the resumed session's engine (--resume only)")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
@@ -4758,6 +7147,20 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_block)
+
+    s = sub.add_parser("defer", help=COMMAND_HELP.get("defer", ""))
+    s.add_argument("ref")
+    s.add_argument("--worker", default="", help="your session/worker id")
+    s.add_argument("--until", required=True,
+                   help="when the data window ends: +90m, +24h, +2d, or an ISO time "
+                        f"(at most {q.DEFER_MAX_S // 86400} days)")
+    s.add_argument("--reason", required=True,
+                   help="what data you are waiting for and why it is needed")
+    s.add_argument("--progress", default="",
+                   help="what you built and what the resuming worker should analyse")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_defer)
 
     s = sub.add_parser("blocked")
     s.add_argument("-q", "--queue", default=None)
@@ -4794,11 +7197,16 @@ def build_parser() -> argparse.ArgumentParser:
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_gate_nack)
 
+    s = sub.add_parser("migrate-blocks", help="park tickets blocked the legacy way (WT-28)")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("-q", "--queue", default=None, help="limit to one queue")
+    s.set_defaults(func=cmd_migrate_blocks)
+
     s = sub.add_parser("answer")
     s.add_argument("ref")
     s.add_argument("text", help="your answer")
     s.add_argument("--worker", default="")
-    s.add_argument("--engine", choices=["claude", "codex", "kimi"],
+    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
                    help="override the blocked session engine")
     s.add_argument("--tid", action="store_true",
                    help="mark this answer as Topic-Is-Done: on an "
@@ -4817,7 +7225,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("discuss")
     s.add_argument("ref")
-    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi"])
+    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi", "devin"])
     s.add_argument("--print", action="store_true", dest="print",
                    help="print the resume command instead of running it")
     _add_redundant_queue_flag(s)
@@ -4825,13 +7233,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("workers")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--all", action="store_true",
+                   help="also list dead records retained by design (rebind "
+                        "tombstones, recent stage records)")
     s.set_defaults(func=cmd_workers)
     workers_sub = s.add_subparsers(dest="workers_command")
     release_workers_parser = workers_sub.add_parser(
         "release", help="gracefully stop selected workers before their next claim"
     )
     release_workers_parser.add_argument(
-        "--engine", required=True, choices=["claude", "codex", "kimi"],
+        "--engine", required=True, choices=["claude", "codex", "kimi", "devin"],
         help="release live workers running this engine",
     )
     release_workers_parser.add_argument(
@@ -4858,6 +7269,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="fail immediately instead of parking in the outbox")
     s.add_argument("--ttl", type=float, default=None,
                    help="seconds before a queued outbox message expires")
+    s.add_argument("--start-new-if-needed", action="store_true",
+                   dest="start_new_if_needed",
+                   help="if the target is large and cache-cold, start a new "
+                        "continuation session with this message instead of "
+                        "resuming it (avoids a full-context cache miss)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_send)
 
@@ -5062,7 +7478,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="assignee used by GitHub-backed claims (default: @me)")
     s.add_argument("--repo-path", default=None, dest="repo_path",
                    help="default cwd for workers spawned on this queue")
-    s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi"],
+    s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi", "devin"],
                    help=(
                        "agent engine for workers on this queue (default: claude). "
                        "claude: stream-json mode over a FIFO stdin — live, pushable, "
@@ -5129,13 +7545,17 @@ def build_parser() -> argparse.ArgumentParser:
             "from `wt drain`."
         ),
     )
-    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("-q", "--queue",
+                   help="queue to configure; omit to print the live config path")
+    s.add_argument("--json", action="store_true",
+                   help="with no setting flags: print the queue config and "
+                        "role table as JSON")
     s.add_argument("--auto-drain", default=None, choices=["on", "off"],
                    dest="auto_drain",
                    help="on = auto-spawn workers; off = backlog mode")
     s.add_argument("--workers", default=None, type=int,
                    help="number of concurrent workers the reconciler should maintain")
-    s.add_argument("--workers-local-path", default=None, dest="workers_local_path",
+    s.add_argument("--workers-local-path", "--repo-path", default=None, dest="workers_local_path",
                    help="local repo path workers operate in (cwd for spawned workers)")
     s.add_argument("--backend", default=None, choices=["file", "github"],
                    help="queue backing store: file (default) or github")
@@ -5143,7 +7563,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="GitHub repo for --backend github, as OWNER/REPO")
     s.add_argument("--github-assignee", default=None, dest="github_assignee",
                    help="assignee used by GitHub-backed claims (default: @me)")
-    s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi"],
+    s.add_argument("--queue-label", default=None, dest="queue_label",
+                   help="GitHub label that marks an issue as this queue's on a repo "
+                        "shared by 2+ queues (default: watchtower:<QUEUE>; "
+                        "'*' = catch-all for every issue no sibling queue "
+                        "claims; pass '' to reset)")
+    s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi", "devin"],
                    help="agent engine for workers on this queue")
     s.add_argument("--model", default=None,
                    help="model workers are spawned with (e.g. claude-sonnet-5)")
@@ -5162,10 +7587,64 @@ def build_parser() -> argparse.ArgumentParser:
                        "immediately. Gives a human time to label a ticket "
                        "watchtower:no-auto-drain; pressing run ignores it."
                    ))
+    for _role, _what, _default in (
+        ("planner", "the planner", "the builder's engine at its strongest ranked model"),
+        ("plan-reviewer", "the plan reviewer", "a different engine family than the builder"),
+        ("verifier", "the verify gate's verifier", "a different engine family than the builder"),
+        ("assessor", "the post-fix assessor", "a different engine family than the builder"),
+    ):
+        s.add_argument(f"--{_role}-engine", default=None, dest=f"{_role.replace('-', '_')}_engine",
+                       help=f"engine {_what} runs on (default: {_default}); empty string clears")
+        s.add_argument(f"--{_role}-model", default=None, dest=f"{_role.replace('-', '_')}_model",
+                       help=f"model {_what} runs on (default: strongest ranked model of its "
+                            f"engine); empty string clears")
+    s.add_argument("--gate", action="append", default=None, metavar="GATE",
+                   help="queue default acceptance gate (repeatable, ordered): "
+                        "cmd:<command>, verify, review or review:<target>; "
+                        "--gate none clears them. A cmd gate runs in the "
+                        "ticket's repo at the closing commit -- in a detached "
+                        "worktree when that commit is not the checkout's HEAD "
+                        "(see --gate-worktree); env: WT_GATE_COMMIT, "
+                        "WT_TICKET_REF, WT_GATE_REPO (the checkout)")
+    s.add_argument("--gate-worktree", default=None, choices=["fresh", "persistent"],
+                   dest="gate_worktree",
+                   help="where cmd gates run off-HEAD: fresh (default) = a "
+                        "throwaway worktree with no gitignored files, so no "
+                        "node_modules; persistent = one reusable "
+                        "<repo>-wt-wtgate worktree force-reset to the commit "
+                        "that keeps gitignored files (node_modules, caches) "
+                        "between runs -- install deps in the command, e.g. "
+                        "cmd:'[ -d node_modules ] || npm ci; npx vitest run'")
+    s.add_argument("--post-fix-assessment", default=None, choices=["on", "off"],
+                   dest="post_fix_assessment",
+                   help="on = every bug that closes as completed gets an independent "
+                        "six-point post-fix assessment (needs a local --repo-path)")
     s.add_argument("--product-gate", default=None, choices=["on", "off"],
                    dest="product_gate",
                    help="on = workers must get a human Ack (wt ack) after a "
                         "minimal-diagnosis pitch before implementing")
+    s.add_argument("--sent-back-release-min", type=int, default=None,
+                   dest="sent_back_release_min", metavar="N",
+                   help="minutes a verifier-rejected (sent-back) claim may show no "
+                        "progress before it is released to the pool (default 30; "
+                        "0 disables)")
+    s.add_argument("--fallback-to-default-worker", default=None,
+                   choices=["on", "off"], dest="fallback_to_default_worker",
+                   help="revert to CCC default worker if current model is "
+                        "exhausted: on = while this queue's engine keeps "
+                        "failing at launch, spawn workers on the fallback "
+                        "engine (the queue's engine/model setting is never "
+                        "changed); off (default) = park the queue instead")
+    s.add_argument("--headroom-dispatch", default=None,
+                   choices=["on", "off"], dest="headroom_dispatch",
+                   help="on = before launching workers, check CCC quota "
+                        "headroom (/api/headroom) and start them on the "
+                        "engine in this queue's fallback chain whose quota "
+                        "resets soonest, skipping engines under 10%% left "
+                        "(launch-time only; the queue engine is never "
+                        "changed). off = always launch on the queue engine. "
+                        "Unset inherits CCC spawn-defaults "
+                        "worker_headroom_dispatch (default off)")
     s.add_argument("--notify-events", default=None, dest="notify_events",
                    help="comma-separated events a ticket's submitter is "
                         "notified about: claimed,closed,needs_input,"
@@ -5211,7 +7690,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=int, default=30,
                    help="reconciler tick interval in seconds (default 30)")
     s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
-    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi"])
+    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi", "devin"])
     s.add_argument("--auto-spawn", action="store_true",
                    help="auto spawn-worker on a stuck queue with no live workers")
     s.add_argument("--dry-run", action="store_true", dest="dry_run",

@@ -18,6 +18,9 @@ cd watchtower && pip install -e .
 
 It files a ticket, starts `wt wait` in the background, claims and closes the ticket (standing in for a real worker), and shows `wt wait` unblock the instant the queue empties. Read [`examples/quickstart-demo.sh`](examples/quickstart-demo.sh); it is a plain shell script, nothing hidden.
 
+
+See [`docs/post-fix-assessment.md`](docs/post-fix-assessment.md) for the opt-in post-fix assessment (`wt assess`, `wt config --post-fix-assessment`).
+
 ## Quick start (3 steps)
 
 **Requirements:** Python 3.11+, macOS or Linux. An agent CLI, [Claude Code](https://claude.ai/code) or [Codex](https://github.com/openai/codex), is only needed once you want WatchTower to spawn real AI workers instead of draining tickets yourself.
@@ -60,7 +63,7 @@ wt uninstall    # remove the service unit
 There's no separate install step: the first `wt start` (or `wt drain on`,
 which starts the service too) writes and loads a service so the watcher starts
 on every login and restarts on crash — a macOS LaunchAgent, or a systemd
-**user** unit (`~/.config/systemd/user/ai.watchtower.watcher.service`) on Linux
+**user** unit (`~/.config/systemd/user/watchtower.service`) on Linux
 when systemd is present. On Linux without systemd it falls back to a plain
 background process. Re-running `wt start` later just (re)starts the
 already-installed service.
@@ -88,6 +91,10 @@ separate re-sync step. Four skills ship today:
   queue health, file/claim/close tickets.
 - **`wt-triage-queue`**: unstick a queue that's flagged stuck or has aging,
   abandoned, or unclosed claims.
+- **`wt-queue-sweep`**: review a healthy queue's tickets that need a
+  decision: blocked-on-human questions and closes with unresolved items.
+  Auto-resolves mechanical blockers after verifying, and presents product
+  decisions as short proposal/opposing-view/score cards.
 - **`critique`** (`/critique` in any synced harness): spawn two
   cross-family agents that independently critique a plan/design/diff and
   report back via `wt send`. Wraps `wt critique`; the reports arrive
@@ -191,6 +198,34 @@ Each ticket records the resolved source file and line anchor. A stable source
 key makes repeat imports safe: importing the same document again creates no
 duplicates, while newly inferred document tasks create new tickets.
 
+### Repeated incidents and duplicate tickets
+
+For automated filing into a local queue, use a stable incident key:
+
+```bash
+wt add -q MYAPP --title "RSC response invariant" --gate verify --dedupe-key "project:deployment:error-signature"
+```
+
+Concurrent calls and retries reuse the existing ticket, including after it
+closes. Use a new key for a new deployment or incident episode. Append new
+paths and request IDs with `wt comment` so verification sees every affected path.
+
+When two existing tickets cover the same incident, explicitly link them:
+
+```bash
+wt duplicate MYAPP-17 --of MYAPP-15
+# A worker can also declare a duplicate while closing its own claim:
+wt close MYAPP-17 --duplicate-of MYAPP-15 --no-code
+wt duplicate MYAPP-17 --clear  # reopen for independent work
+```
+
+A duplicate stays blocked until its original closes with the required gate
+proof, then inherits that result. A failed verification or reopened original
+keeps its duplicates unresolved. Linked tickets never launch separate stage
+sessions. These links require the same local queue, matching or stronger gates
+on the original, and no plan-group membership; chains and cycles are refused.
+Neither a shared commit nor the words “duplicate of” in a summary create a link.
+
 ### Agent engines
 
 WatchTower supports three agent engines. Set the engine per queue with `wt set`:
@@ -201,7 +236,8 @@ wt set -q MYAPP --engine codex     # OpenAI Codex (one-shot exec)
 wt set -q MYAPP --engine kimi      # Kimi Code (one-shot prompt)
 ```
 
-The engine is stored in `~/.watchtower/queue-config.json` and picked up by the
+The engine is stored in the persistent `queue-config.json` (see
+[Where the queue lives](#where-the-queue-lives)) and picked up by the
 reconciler on the next spawn. Changing a queue's engine or model gracefully
 retires live workers that no longer match: they finish their current ticket,
 then stop before their next claim, allowing the reconciler to replace them with
@@ -282,6 +318,7 @@ gh auth login
 wt set -q MYAPP --backend github --github-repo <OWNER>/<REPO>
 
 wt add -q MYAPP --title "Fix checkout" --text "Steps to reproduce..."
+wt add -q MYAPP --title "Fix checkout now" --run  # file and request immediate dispatch
 wt run MYAPP-123                       # run this issue now (overrides drain/grace)
 wt claim -q MYAPP --worker worker-1
 wt close MYAPP-123 --worker worker-1 --summary "fixed the null state" --commit <SHA>
@@ -310,9 +347,31 @@ work_it         = auto_eligible OR manual_eligible
 So a queue with drain on works every open issue except the ones labelled
 `watchtower:no-auto-drain`, and leaves brand-new issues alone for `grace_s`
 seconds so a human can label them first. `wt run MYAPP-123` overrides all
-three. The old `watchtower:<QUEUE>` label no longer admits anything; it is
+three. `wt add --run` files a ticket and requests the same immediate dispatch
+in one command, for both local and GitHub-backed queues. It preserves queue
+policy for other tickets. Dependencies, readiness, planning gates, model
+requirements and worker capacity still apply, and a new worker needs time to
+start. `--run` cannot be combined with `--claim` or `--group-parent`.
+For an execution wait on a GitHub-backed ticket, use
+`wt edit MYAPP-123 --after RELEASE-45`. Blockers may belong to another
+configured GitHub queue or a local queue. The dependent stays out of
+claimable depth (including explicit claims) until every blocker closes as
+completed; declined or unresolved completion does not release it. Validation
+rejects missing refs and transitive cycles across queues. No worker needs to
+poll the blocker, and no human answer is requested. If the ticket was
+previously marked as needing input, record the dependency first, then use
+`wt reopen MYAPP-123 --force --reason "execution dependency recorded"` to release its
+old claim and clear that input flag; its existing answer history is retained.
+A deployment requirement belongs in the upstream ticket's completion criteria
+and must still be verified from production before the dependent work closes.
+
+The old `watchtower:<QUEUE>` label no longer admits anything; it is
 only still read when two or more queues point at the *same* repo, where it is
-the only way to say which issue belongs to which queue. Turning drain on for a
+the only way to say which issue belongs to which queue. That label defaults to
+`watchtower:<QUEUE>`; override it per queue with
+`wt config -q MYAPP --queue-label team-a` (pass `''` to reset). One queue per repo can instead be the **catch-all**
+(`wt config -q MYAPP --queue-label '*'`): it owns every issue that no other
+queue on that repo claims by label, so it needs no label of its own. Turning drain on for a
 **public** repo prints a warning first — agents will work strangers' issues.
 Claims assign the issue to `@me` by default; override with
 `wt set -q MYAPP --github-assignee USERNAME`.
@@ -426,15 +485,16 @@ active `tickets` and the `closed` array (closed items carry their `resolution`).
 
 A caveat or unresolved item that has been read and accepted — a standing
 limitation, something already handled elsewhere — can be acknowledged instead
-of erased. `wt ack` records who acknowledged which entry and when, alongside
-the original text; the close record itself is never rewritten and no close
-notification is re-fired.
+of erased. `wt unresolved-ack` records who acknowledged which entry and when,
+alongside the original text; the close record itself is never rewritten and no close
+notification is re-fired. `wt ack` is a separate command for approving a
+product-gate pitch; it does not acknowledge resolution notes.
 
 ```bash
-wt ack DEMO-1                      # numbered listing of this ticket's warnings
-wt ack DEMO-1 --unresolved 1       # acknowledge the first unresolved item
-wt ack DEMO-1 --all                # acknowledge every caveat/follow-up/unresolved
-wt ack DEMO-1 --unresolved 1 --undo
+wt unresolved-ack DEMO-1                      # numbered listing of this ticket's warnings
+wt unresolved-ack DEMO-1 --unresolved 1       # acknowledge the first unresolved item
+wt unresolved-ack DEMO-1 --all                # acknowledge every caveat/follow-up/unresolved
+wt unresolved-ack DEMO-1 --unresolved 1 --undo
 ```
 
 Drop the ref for the bulk form, for the case where a queue has accumulated a
@@ -442,20 +502,28 @@ backlog of terminal verdicts ("not-applicable", "guide-only by policy") that
 each keep a row amber forever:
 
 ```bash
-wt ack -q DEMO --all --dry-run                     # list what would be acked
-wt ack -q DEMO --all --matching not-applicable     # only those verdicts
-wt ack -q DEMO --all --matching not-applicable --undo
+wt unresolved-ack -q DEMO --all --dry-run                     # list what would be acked
+wt unresolved-ack -q DEMO --all --matching not-applicable     # only those verdicts
+wt unresolved-ack -q DEMO --all --matching not-applicable --undo
 ```
 
 `--matching` is a case-insensitive substring over the whole resolution — the
 summary as well as each entry. Bulk mode is `--all` only, since a 1-based
 index into one ticket's caveat list means nothing across a hundred tickets.
 
-Indexes are 1-based and match the `wt ack <ref>` listing. An acknowledged chip
-renders dimmed rather than disappearing, and its ✓ toggle on the dashboard
+Indexes are 1-based and match the `wt unresolved-ack <ref>` listing. An
+acknowledged chip renders dimmed rather than disappearing, and its ✓ toggle
+on the dashboard
 does the same thing over `POST /api/ticket/<ref>/ack`
 (`{"field", "index", "undo"}` or `{"all": true}`). Closed `wt ls` rows report
 the tally as e.g. `[2 unresolveds, 1 acked]`.
+
+Acknowledgments are per entry, stored in `resolution.<field>_ack` maps keyed
+by the original zero-based index, with `by` and `at` metadata. Consumers should
+exclude acknowledged unresolved entries from attention badges and sorting,
+while keeping every original note available in ticket details. An acknowledgment
+means "reviewed", not "fixed"; it does not reopen a ticket or satisfy a blocked
+dependency. Undo removes the marker and restores attention.
 
 #### Finding unresolved work
 
@@ -544,21 +612,37 @@ Idle agent sessions lose their prompt cache at the 60-minute cliff, forcing an e
 
 ## Where the queue lives
 
-WatchTower resolves its store *base path* in this order:
+Queues and their settings live outside both applications' installation and
+settings directories, in **`~/.local/share/watchtower/`** by default:
 
-1. `$WATCHTOWER_STORE`: explicit override (used by tests/CI).
-2. The existing CCC store at `~/.claude/command-center/ux-fixes-queue.json`
-   **if it (or its migrated `.db`) already exists** on this machine, so
-   WatchTower drains real work today without migration.
-3. `~/.watchtower/queues.json`: WatchTower's own default, used whenever no CCC
-   store is present. A fresh install with no CCC on the machine always lands
-   here.
+- `queues.db`: tickets, bodies, status, resolution, history, and counters.
+- `queue-config.json`: queue definitions (including empty queues), repository
+  mappings, GitHub backends, worker settings, and drain preferences.
 
-The authoritative store is that path with a `.db` suffix (SQLite, stdlib
-`sqlite3`) once it exists. Legacy JSON stores are imported by the first
-mutation or `wt migrate-store`; JSON remains the interchange format via
-`wt export-json`. See
-`docs/superpowers/specs/2026-08-20-sqlite-store-design.md`.
+Removing CCC, WatchTower, `~/.claude/command-center`, or `~/.watchtower` leaves
+this data intact. Reinstalling automatically reuses it. `wt uninstall` also
+migrates any legacy data first and prints the retained paths.
+
+Set `WATCHTOWER_DATA_DIR` to choose another persistent directory. Otherwise,
+`XDG_DATA_HOME/watchtower` is used when `XDG_DATA_HOME` is an absolute path,
+falling back to `~/.local/share/watchtower`. Keep the same setting on reinstall.
+Explicit `WATCHTOWER_STORE` and `WATCHTOWER_CONFIG_FILE` paths still override
+these defaults; those custom paths must be retained separately.
+
+On first access, existing data is imported automatically: the former CCC
+store (`~/.claude/command-center/ux-fixes-queue.db` or `.json`) takes precedence
+over `~/.watchtower/queues.db` or `.json`, matching previous behavior. Original
+files remain untouched. SQLite migration includes committed WAL data; corrupt
+sources fail migration instead of becoming empty queues. Once the persistent
+store exists, stale legacy files never replace it. Queue settings migrate from
+`~/.watchtower/queue-config.json` independently.
+
+Restart CCC and any running WatchTower daemon together when upgrading to this
+storage layout: older processes still use the legacy paths. To migrate now and
+see the active paths, run `wt migrate-store`. JSON remains the interchange
+format via `wt export-json -o tickets.json`. Back up the persistent directory
+to protect against disk loss or deliberate deletion of that directory; this
+is local persistence, not cloud synchronization.
 
 Tracked workers live in `~/.watchtower/workers.json`; the watcher daemon's
 pidfile is `~/.watchtower/daemon.pid`, and the background dashboard server's is

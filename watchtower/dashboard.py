@@ -48,7 +48,11 @@ import hmac
 import html
 import json
 import os
+import signal
+import sys
+import threading
 import time
+import traceback
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -118,8 +122,12 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     """
     items = q.list_items()
     rows = health.all_status(stuck_minutes=stuck_minutes, items=items)
-    counts = workers.worker_counts()
+    # One roster listing: each list_workers() takes workers.lock exclusively
+    # and probes every pid, so listing it three times per poll starved the
+    # daemon's own tick (WT-4).
     wrows = workers.list_workers(prune=False)
+    counts = workers.worker_counts(rows=wrows)
+    retained = workers.retained_counts(rows=wrows, items=items)
     workers.annotate_activity(wrows, items)
     workers_by_queue: Dict[str, List[Dict[str, Any]]] = {}
     for worker in wrows:
@@ -128,6 +136,7 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
         wc = counts.get(r["queue"], {"total": 0, "live": 0})
         r["workers_total"] = wc["total"]
         r["workers_live"] = wc["live"]
+        r["workers_retained"] = retained.get(r["queue"], 0)
         queue_workers = workers_by_queue.get(r["queue"], [])
         live_workers = [
             worker for worker in queue_workers
@@ -146,10 +155,12 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
             queue_items,
             project=r["queue"],
             item_types=config.claim_types(r["queue"]) or None,
+            all_items=items,
         ))
         r["awaiting_human"] = sum(
             1 for item in queue_items
-            if item.get("status") in ("open", "in_progress") and item.get("needs_input")
+            if item.get("status") in ("open", "in_progress", "awaiting_answer")
+            and item.get("needs_input")
         )
         engine = config.engine(r["queue"])
         model = config.model(r["queue"])
@@ -161,13 +172,118 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     return {"queues": rows, "workers": wrows, "github": health.github_connectivity()}
 
 
+STATUS_CACHE_TTL_S = 5.0
+_status_cache: Dict[str, Any] = {"at": 0.0, "payload": None}
+_status_compute = threading.Lock()
+
+
+def cached_status_payload() -> Dict[str, Any]:
+    """``status_payload()`` with a short-lived shared snapshot (WT-4).
+
+    Concurrent requests used to each recompute the payload, queueing on
+    workers.lock behind the daemon tick. Now one thread recomputes at a time;
+    the rest get the last snapshot immediately. Only the very first request
+    (no snapshot yet) waits for the computation.
+    """
+    snap = _status_cache["payload"]
+    if snap is not None and time.monotonic() - _status_cache["at"] < STATUS_CACHE_TTL_S:
+        return snap
+    if snap is not None:
+        if not _status_compute.acquire(blocking=False):
+            return snap  # someone else is refreshing: serve stale, don't queue
+    else:
+        _status_compute.acquire()
+        snap = _status_cache["payload"]
+        if snap is not None and time.monotonic() - _status_cache["at"] < STATUS_CACHE_TTL_S:
+            _status_compute.release()
+            return snap
+    try:
+        payload = status_payload()
+        _status_cache["payload"] = payload
+        _status_cache["at"] = time.monotonic()
+        return payload
+    finally:
+        _status_compute.release()
+
+
+def format_all_stacks() -> str:
+    """Every live thread's Python stack, formatted like a traceback."""
+    names = {t.ident: t.name for t in threading.enumerate()}
+    out = []
+    for ident, frame in sys._current_frames().items():
+        out.append(f"--- thread {names.get(ident, '?')} ({ident}) ---\n")
+        out.extend(traceback.format_stack(frame))
+    return "".join(out)
+
+
+def _stack_dump_loop(read_fd: int, sig: int) -> None:
+    while True:
+        try:
+            data = os.read(read_fd, 64)
+        except InterruptedError:
+            continue
+        except OSError:
+            return
+        if not data:
+            return
+        if sig in data:
+            try:
+                sys.stderr.write(format_all_stacks())
+                sys.stderr.flush()
+            except Exception:  # noqa: BLE001 -- a diagnostic must never kill the process
+                pass
+
+
+def _stack_dump_signal_handler(signum, frame) -> None:
+    """No-op: installing a Python handler is what makes CPython write the
+    signal to the wakeup fd; the dumper thread does the work."""
+
+
+_stack_dump_signal_handler._wt_stack_dump = True  # type: ignore[attr-defined]
+
+
+def install_stack_dump_handler() -> bool:
+    """Dump every thread's stack to stderr on SIGUSR1 (WT-4): the only way to
+    diagnose a live stall where ptrace/py-spy are unavailable. Main thread only.
+
+    Not faulthandler: its all_threads dump walks other threads' frames from
+    inside the signal handler and segfaulted the daemon under repeated
+    sampling (WT-14). Instead the C-level handler only writes the signal
+    number to a wakeup pipe; a dumper thread reads it and formats
+    ``sys._current_frames()`` as ordinary Python code holding the GIL. The
+    wakeup fd is written even while the main thread is busy, so the dump does
+    not wait for the main thread to reach a safe point."""
+    sig = getattr(signal, "SIGUSR1", None)
+    if sig is None or threading.current_thread() is not threading.main_thread():
+        return False
+    # Process-wide state, not a module global: it must survive a re-import.
+    if getattr(signal.getsignal(sig), "_wt_stack_dump", False):
+        return True
+    prev = signal.set_wakeup_fd(-1)
+    if prev != -1:
+        signal.set_wakeup_fd(prev)
+        return False  # someone else (e.g. asyncio) owns the wakeup fd
+    try:
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(write_fd, False)
+        signal.set_wakeup_fd(write_fd, warn_on_full_buffer=False)
+        signal.signal(sig, _stack_dump_signal_handler)
+    except (OSError, RuntimeError, ValueError, AttributeError):
+        return False
+    threading.Thread(target=_stack_dump_loop, args=(read_fd, int(sig)),
+                     name="wt-stack-dump", daemon=True).start()
+    return True
+
+
 CLOSED_LIMIT = 50  # cap the drill-down's closed section to the most-recent N.
 
 
 def queue_tickets(name: str) -> List[Dict[str, Any]]:
-    """Active (open + in_progress) tickets for one queue, mirroring ``wt ls``."""
+    """Active (open + in_progress + parked awaiting_answer) tickets for one
+    queue, mirroring ``wt ls``."""
     items = q.list_items(project=name)
-    return [it for it in items if it.get("status") in ("open", "in_progress")]
+    return [it for it in items
+            if it.get("status") in ("open", "in_progress", q.PARKED_STATUS)]
 
 
 def closed_tickets(name: str, limit: int = CLOSED_LIMIT) -> List[Dict[str, Any]]:
@@ -1077,7 +1193,10 @@ def _closed_block(closed: List[Dict[str, Any]], total_closed: int) -> str:
     for it in closed:
         ref = html.escape(str(it.get("ref", "")))
         worker = html.escape(
-            str(it.get("closed_by") or it.get("claimed_by") or "—")[:28]
+            q.with_machine(
+                it.get("closed_by") or it.get("claimed_by"),
+                it.get("closed_machine") or it.get("claimed_machine"),
+            )[:28] or "—"
         )
         res = it.get("resolution") or {}
         summary = res.get("summary", "")
@@ -1279,7 +1398,10 @@ def render_queue(
         status = str(it.get("status", ""))
         gated = bool(it.get("needs_input")) and it.get("block_kind") == "rationale"
         worker = html.escape(
-            str(it.get("claimed_by") or it.get("claimed_session_id") or "—")[:28]
+            q.with_machine(
+                it.get("claimed_by") or it.get("claimed_session_id"),
+                it.get("claimed_machine"),
+            )[:28] or "—"
         )
         title = html.escape(str(it.get("title") or it.get("note") or "")[:120])
         action = '<span class="run-spacer"></span>'
@@ -1480,7 +1602,7 @@ class _Handler(BaseHTTPRequestHandler):
                 chat_rows = chats.list_chats(include_archived=False)
             except Exception:
                 chat_rows = []
-            self._html(200, render_index(status_payload(), chat_rows))
+            self._html(200, render_index(cached_status_payload(), chat_rows))
         elif path.startswith("/chat/"):
             from . import chats
             ref = urllib.parse.unquote(path[len("/chat/"):])
@@ -1510,7 +1632,7 @@ class _Handler(BaseHTTPRequestHandler):
                 closed=closed_tickets(norm), total_closed=len(all_closed),
             ))
         elif path == "/api/status":
-            self._json(200, status_payload())
+            self._json(200, cached_status_payload())
         elif path == "/api/queues":
             self._json(200, q.queues())
         elif path.startswith("/api/queue/"):
@@ -1847,6 +1969,8 @@ def serve(
     the foreground path; ``wt dashboard`` normally launches it detached.
     """
     httpd = ThreadingHTTPServer((host, port), _Handler)
+    if not once:
+        install_stack_dump_handler()
     bound_host, bound_port = httpd.server_address[0], httpd.server_address[1]
     if not once:
         print(f"WatchTower dashboard on http://{bound_host}:{bound_port}")

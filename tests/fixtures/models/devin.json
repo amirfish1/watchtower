@@ -1,0 +1,18 @@
+{
+ "families": [
+  {
+   "slug": "swe-2",
+   "variants": [
+    {
+     "model_uid": "swe-2-high"
+    },
+    {
+     "model_uid": "swe-2-medium"
+    },
+    {
+     "model_uid": "swe-2-max"
+    }
+   ]
+  }
+ ]
+}

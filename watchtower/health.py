@@ -27,6 +27,40 @@ from . import queue as q
 # Minutes of no progress (no ticket closed) before an open queue is "stuck".
 STUCK_MINUTES = 10
 
+# History events that count as queue progress besides a close or a claim
+# (WT-31 D5): stage sessions, plan / verify / review / assessment steps,
+# answers and backstop actions. Prefix match on the ``plan`` family.
+PROGRESS_EVENTS = ("stage_spawn", "stage_death", "stage_escalated", "stage_retry",
+                   "verify", "in_review", "assessment", "answer_route", "answer",
+                   "backstop")
+PROGRESS_PREFIXES = ("plan",)
+
+
+def _progress_event(event: Any) -> bool:
+    ev = str(event or "")
+    return ev in PROGRESS_EVENTS or ev.startswith(PROGRESS_PREFIXES)
+
+
+def _last_event_at(it: Dict[str, Any], stage_only: bool = False) -> Optional[str]:
+    """ISO time of the ticket's latest progress event (stage events only when
+    ``stage_only``)."""
+    best: Optional[str] = None
+    for h in it.get("history") or []:
+        if not isinstance(h, dict) or not isinstance(h.get("at"), str):
+            continue
+        ev = h.get("event")
+        if (str(ev or "").startswith("stage_") if stage_only else _progress_event(ev)):
+            if best is None or h["at"] > best:
+                best = h["at"]
+    return best
+
+
+def stage_stuck_after_s(stuck_minutes: int = STUCK_MINUTES) -> float:
+    """A stage-owned ticket with no stage event for this long reads stuck:
+    past the stage idle limit (plus a tick), never sooner than the queue rule."""
+    from . import stages
+    return max(stuck_minutes * 60.0, stages.idle_limit_s() + 120.0)
+
 # Window (minutes) over which the drain rate is measured: tickets closed in the
 # last DRAIN_WINDOW_MINUTES divided by the window gives closes/min, which feeds
 # the ETA estimate. A short window keeps the rate responsive to current pace.
@@ -91,8 +125,14 @@ def queue_status(
     drain_window_minutes: int = DRAIN_WINDOW_MINUTES,
     auto_drain: bool = True,
     claim_types: Optional[List[str]] = None,
+    waiting_refs: Optional[set] = None,
+    worker_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute the status row for a single queue from its items.
+
+    ``waiting_refs``: refs of open tickets held back by an unsatisfied
+    ``blocked_by`` dependency (WT-4). They count toward ``depth`` but not
+    ``claimable_depth``, and are reported separately as ``blocked``.
 
     ``auto_drain`` (the queue's policy) shapes the *display* ``state`` but not
     the raw ``stuck`` ground-truth: a queue that's opted out of auto-drain
@@ -112,28 +152,55 @@ def queue_status(
     ``claimable_depth > 0`` and the reconciler spawns workers that can never
     claim anything, forever."""
     now = now or datetime.now(timezone.utc)
+    now_ts = now.timestamp()
     open_items = [it for it in items if it.get("status") == "open"]
     in_progress = [it for it in items if it.get("status") == "in_progress"]
     closed = [it for it in items if it.get("status") == "closed"]
 
     depth = len(open_items)
+    group_idx = (q._refs_index(q.list_items())
+                 if any(q.group_role(it) for it in open_items) else {})
     claimable_open = [
         it for it in open_items
         if it.get("claimable", True)
         and it.get("readiness", "") not in q.UNCLAIMABLE_READINESS
+        and it.get("ref") not in (waiting_refs or ())
+        # Mirror the remaining claim_next() gates (queue._claim_candidates):
+        # an unsettled plan or a model_floor above the queue's worker model
+        # means the drainer's `wt claim` returns nothing, so it isn't "stuck".
+        and not q.plan_pending(it)
+        # WT-33: a group parent is never claimed; a member waits for its group plan.
+        and not (q.group_role(it) and q.claim_blocked_by_plan(it, group_idx))
+        # WT-28/31: an answer reserved for its parked worker is claimable by
+        # that worker only, so it is not open work for the pool.
+        and not q._affinity_reserved(it, now_ts)
+        # `wt defer`: a ticket inside its data window is out of the pool.
+        and not q.deferred_now(it, now_ts)
+        # Placement: a ticket pinned to the other kind of machine is not open
+        # work for this machine's pool either.
+        and q.placement_allows(it)
+        and (
+            not worker_model
+            or config.model_meets_floor(worker_model, it.get("model_floor") or "")
+        )
     ]
     if claim_types:
-        claimable_depth = sum(
-            1 for it in claimable_open
+        claimable_open = [
+            it for it in claimable_open
             if q.effective_type(it) in claim_types  # untyped == bug, matches claim filter
-        )
-    else:
-        claimable_depth = len(claimable_open)
+        ]
+    claimable_depth = len(claimable_open)
     oldest_created = min(
         (it.get("created_at") for it in open_items if it.get("created_at")),
         default=None,
     )
     oldest_open_age = _age_seconds(oldest_created, now)
+    # Age of the oldest ticket a worker could actually claim: a long-gated
+    # ticket beside a minutes-old claimable one is not "work waiting 6h".
+    oldest_claimable_age = _age_seconds(min(
+        (it.get("created_at") for it in claimable_open if it.get("created_at")),
+        default=None,
+    ), now)
 
     # Most recent progress = most recent close OR claim (a fresh claim means a
     # worker just started on previously-idle work, which resets the clock --
@@ -149,8 +216,26 @@ def queue_status(
         (str(it["claimed_at"]) for it in in_progress if it.get("claimed_at") and isinstance(it.get("claimed_at"), str)),
         default=None,
     )
-    progress_ref = max((r for r in (last_close, last_claim) if r), default=None) or oldest_created
+    # WT-31 D5: stage sessions, plan/verify/assessment steps, answers and the
+    # backstop are progress too.
+    last_event = max((e for e in (_last_event_at(it) for it in items) if e), default=None)
+    progress_ref = max((r for r in (last_close, last_claim, last_event) if r),
+                       default=None) or oldest_created
     since_progress = _age_seconds(progress_ref, now)
+
+    # Stage-owned tickets (planner / reviewer / verifier / assessor due): a
+    # queue whose only live work is a dead stage reads stuck at depth 0.
+    from . import stages
+    owned = stages.desired(items)
+    stage_owned = len(owned)
+    stage_stuck = False
+    if owned:
+        by_ref = {str(it.get("ref")): it for it in items}
+        last_stage = max((_last_event_at(by_ref[d["ref"]], stage_only=True)
+                          or str(by_ref[d["ref"]].get("updated_at") or "")
+                          for d in owned), default="")
+        stage_age = _age_seconds(last_stage, now)
+        stage_stuck = stage_age is not None and stage_age >= stage_stuck_after_s(stuck_minutes)
 
     stuck = bool(
         claimable_depth > 0
@@ -177,7 +262,17 @@ def queue_status(
     eta_human = "empty" if eta_seconds == 0 else _fmt_eta(eta_seconds)
 
     # Display state, derived from raw `stuck` + the queue's auto_drain policy.
-    if depth == 0:
+    # ``stuck`` stays the claimable-work signal (nudges and spawns read it); a
+    # stalled stage sets state=stuck with stuck_reason=stage (health field
+    # only: no alarm banner).
+    stuck_reason = ""
+    if stuck and auto_drain and claimable_depth > 0:
+        stuck_reason = "claimable"
+    elif stage_stuck:
+        stuck_reason = "stage"
+    if stuck_reason == "stage":
+        state = "stuck"
+    elif depth == 0:
         state = "clear"
     elif claimable_depth == 0:
         state = "backlog"   # open items exist but all filtered out by claim_types — parked
@@ -192,13 +287,20 @@ def queue_status(
         "queue": project,
         "depth": depth,
         "claimable_depth": claimable_depth,
+        "blocked": sum(1 for it in open_items if it.get("ref") in (waiting_refs or ())),
         "in_progress": len(in_progress),
+        "in_review": sum(1 for it in items if it.get("status") == "in_review"),
+        "awaiting_answer": sum(1 for it in items if it.get("status") == "awaiting_answer"),
         "closed": len(closed),
         "oldest_open_age_s": oldest_open_age,
         "oldest_open_age": _fmt_age(oldest_open_age),
+        "oldest_claimable_age_s": oldest_claimable_age,
         "since_progress_s": since_progress,
         "since_progress": _fmt_age(since_progress),
         "stuck": stuck,
+        "stage_owned": stage_owned,
+        "stage_stuck": stage_stuck,
+        "stuck_reason": stuck_reason,
         "auto_drain": bool(auto_drain),
         "state": state,
         "drain_rate_per_min": drain_rate,
@@ -214,8 +316,12 @@ def all_status(
     drain_window_minutes: int = DRAIN_WINDOW_MINUTES,
     fresh: bool = False,
     items: Optional[List[Dict[str, Any]]] = None,
+    include_archived: bool = False,
 ) -> List[Dict[str, Any]]:
     """Status rows for every queue (or one, if ``project`` is given).
+
+    Archived queues (``wt queue archive``) are omitted unless
+    ``include_archived``; naming one via ``project`` still shows it.
 
     Empty queues (all closed, depth 0) are still listed so a drained queue
     shows up as healthy rather than vanishing.
@@ -231,7 +337,12 @@ def all_status(
     """
     now = now or datetime.now(timezone.utc)
     by_queue: Dict[str, List[Dict[str, Any]]] = {}
-    configured = config.all_queues()
+    configured = config.all_queues(include_archived=True)
+    hidden = (
+        set() if include_archived
+        else {n for n in configured if config.is_archived(n) and n != project}
+    )
+    configured = {n: v for n, v in configured.items() if n not in hidden}
     if project:
         if project in configured:
             by_queue.setdefault(project, [])
@@ -240,16 +351,33 @@ def all_status(
             by_queue.setdefault(name, [])
     fetched = items if items is not None else q.list_items(project=project, fresh=fresh)
     for it in fetched:
+        if (it.get("project") or "GEN") in hidden:
+            continue
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
+    by_ref = q._refs_index(fetched)
+    # A project-scoped list lacks cross-queue blockers, and blocker_verdict
+    # ignores a missing one, so a ticket waiting on another queue read as
+    # claimable ("stuck") here while the claim path waits (WT-21).
+    if project and any(
+            str(b) not in by_ref for it in fetched
+            if it.get("status") == "open" for b in (it.get("blocked_by") or [])):
+        by_ref = q._refs_index(q.list_items(fresh=fresh))
+    waiting_refs = {
+        str(it.get("ref")) for it in fetched
+        if it.get("status") == "open" and it.get("blocked_by")
+        and q.blocker_verdict(it, by_ref)[0] != "ok"
+    }
     rows = [
         queue_status(
             name,
             items,
+            waiting_refs=waiting_refs,
             now=now,
             stuck_minutes=stuck_minutes,
             drain_window_minutes=drain_window_minutes,
             auto_drain=config.auto_drain(name),
             claim_types=config.claim_types(name),
+            worker_model=config.queue_model_id(name) or None,
         )
         for name, items in by_queue.items()
     ]

@@ -64,25 +64,43 @@ prefix is ever missing.
 
 ## Idle Protocol
 
-Do this when `wt claim` reports the queue is drained (returns nothing) FIRST,
-before ending your turn — AND equally when `wt claim` returns a stop signal
-(`{"stop": true}`, including the `{"reason": "context_budget"}` recycle that
-replaces you with a fresh worker). The stop path is where this matters most: a
-recycled worker is torn down and its successor starts cold, so skipping the
-learnings hand-off on a stop throws away the whole session's wisdom. A Claude
-conversation may later be released from queue staffing, while a Codex worker
-exits immediately after this audit. Either way, the audit is not optional and
-not deferrable to "next time" — run it before you exit on a stop, too.
+Learnings writes are tiered (same-topic-routing plan §8) so a chatty queue
+doesn't pay a full file rewrite every turn:
+
+- **Tier 1 — per turn, append-only.** After each `block`/`close`, append at
+  most one dated line to `~/.watchtower/learnings/{queue}.pending.md`, and
+  only when the turn produced a genuinely new hard-won fact. Append-only —
+  never read-modify-write this file, so concurrent workers can't clobber it.
+- **Tier 2 — consolidate on a forced boundary.** Fold `pending.md` into
+  `{queue}.md` (the audit below) only when `wt claim` returns
+  `{"stop": true}` (recycle or release), or when you have been idle on a
+  drained queue past the floor (~20 min) and `pending.md` is non-empty.
+  After folding, clear `pending.md` of the lines you merged.
+- **Skip rule:** on a merely-drained queue, if `pending.md` is empty and
+  `{queue}.md` was modified within the floor, do nothing — end your turn.
+
+A stop with `reason: context_budget` means a recycle limit tripped (Claude transcript
+bytes, Codex cumulative input tokens, or tickets closed/blocked this run); see
+`docs/worker-lifecycle.md` (Context recycle) for the knobs.
+
+The stop path is where the audit matters most: a recycled worker is torn
+down and its successor starts cold, so skipping the learnings hand-off on a
+stop throws away the whole session's wisdom. Either way, the audit is not
+optional and not deferrable to "next time" — run it before you exit on a
+stop, too.
+
+The audit (Tier 2):
 
 1. Read the queue's learnings file at `~/.watchtower/learnings/{queue}.md`
-   (create it if it doesn't exist).
-2. Update it with anything the next worker should know from this session:
-   infra changes, recurring ticket patterns, gotchas, env quirks. Record
-   VERIFIED facts only. Never record rules that tell future workers to
-   distrust their own worker id or to treat their own commits, closes, or
-   working-tree hunks as another process's — that class of entry is
-   self-amplifying paranoia and has caused workers to destroy their own
-   correct work (CCC-675/676; see Resume Check above).
+   (create it if it doesn't exist) and `{queue}.pending.md`.
+2. Fold the pending lines plus anything else the next worker should know
+   from this session into `{queue}.md`: infra changes, recurring ticket
+   patterns, gotchas, env quirks. Record VERIFIED facts only. Never record
+   rules that tell future workers to distrust their own worker id or to
+   treat their own commits, closes, or working-tree hunks as another
+   process's — that class of entry is self-amplifying paranoia and has
+   caused workers to destroy their own correct work (CCC-675/676; see
+   Resume Check above).
 3. Keep the WHOLE FILE under ~60 lines. This cap is on the whole file, not
    per-edit — read the current file before editing and prune, don't just
    append unboundedly.
@@ -99,6 +117,58 @@ not deferrable to "next time" — run it before you exit on a stop, too.
      and resumes the conversation with full warm context. On a *stop/recycle*
      you have been released — end your turn after the audit; deficit staffing
      spawns a fresh worker to take over, so do not expect to be re-engaged.
-   - **Codex (`codex exec`):** complete this queue's active drain goal (or clear
-     it if the harness has no completion state), then exit immediately. There
+   - **Codex (`codex exec`):** end your turn and exit immediately after the idle audit.
+     Never set, complete, or clear a native Codex thread goal (a goal makes
+     Codex auto-continue after the process dies). There
      is no live stdin channel and no wake message to wait for.
+
+## Definition of done
+
+Applies to every ticket, quick or deep.
+
+- **Done means the reason the ticket was filed has gone away**: the symptom it
+  reports no longer reproduces. Fixing one plausible cause is progress, not done.
+- **Verify the way the problem was seen**: for a quick ticket, a focused check
+  proportionate to the change is enough; for a deep ticket, re-measure under the
+  conditions that produced the problem (cold paths, cache misses, real load).
+- **A follow-up carries separate work, never the ticket's own goal.** If the
+  symptom still reproduces, keep the ticket open (`wt block`, or `wt defer` while
+  data accumulates) instead of closing with the remainder in a follow-up.
+- **Partial is labelled partial**: a close that leaves part of the ask undone
+  starts its `--summary` with `PARTIAL:` and cites the follow-up ref.
+
+## Ticket depth
+
+The filer sets depth; a worker never guesses it. `quick` is the default.
+
+**Quick** is fix-and-look work. The owner uses the product and sees within
+minutes whether a fix is right, so: no design step, verification proportionate
+to the change (no full browser reproduction for a small UI tweak). Several
+related quick tickets can share one verification as a plan group
+(`wt add --group-parent --children ...`). If a quick ticket turns out to be
+structural (no contained fix removes the symptom), `wt block` it asking the
+owner to promote it to deep rather than shipping a token fix.
+
+**Deep** (`wt add --depth deep [--budget-min N]`) is for work whose outcome you
+cannot judge by using the product: performance, chronic regressions,
+multi-step optimisation. Set by owners (the filing UI) and by system filers
+that know what they file (e.g. a perf watchdog), not by workers filing
+follow-ups. A deep claim's JSON carries `deep_brief`; follow it. In short:
+
+1. **Evidence first.** If you lack the data to know the cause, build the
+   logging, ship it, decide how much data and how long, then
+   `wt defer REF --until +24h --reason "..." --progress "..."`. The ticket leaves
+   your claim and the pool, and returns when the window ends.
+2. **Options memo** with 3-5 candidates, at least one a *product* option (cut
+   scope, tier the data, change the UX). Read the queue learnings' *Product
+   constraints* first; if the best option needs an owner decision, `wt block`
+   with the memo. Record the owner's answer as a Product constraints line.
+3. **Budget** (default 90 min). Log each attempt:
+   `wt comment REF "attempt N: <change> -- metric before -> after"`.
+4. **Stop rule**: budget spent, two attempts in a row with no gain, or four
+   attempts without converging. On stop, block with the trajectory and best
+   remaining options; don't close.
+5. **Close** only when the goal is met, with the measurement in the summary.
+
+`wt defer` is not `wt block`: defer waits for *data* (no human involved, the
+ticket returns on its own); block waits for a *decision*.

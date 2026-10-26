@@ -28,6 +28,50 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
+def fixture_model_catalogs(monkeypatch):
+    """Model lists come from fixture catalogs, never this machine's real
+    ~/.codex / CCC files (WT-13)."""
+    d = Path(__file__).parent / "fixtures" / "models"
+    for env, attr, name in (
+        ("WATCHTOWER_CODEX_MODELS_CACHE", "CODEX_MODELS_CACHE", "codex.json"),
+        ("WATCHTOWER_CLAUDE_MODELS_FILE", "CLAUDE_MODELS_FILE", "claude.json"),
+        ("WATCHTOWER_DEVIN_MODELS_FILE", "DEVIN_MODELS_FILE", "devin.json"),
+        ("WATCHTOWER_MODELS_FILE", "USER_MODELS_FILE", "models.json"),
+    ):
+        monkeypatch.setenv(env, str(d / name))
+        if "watchtower.models" in sys.modules:
+            monkeypatch.setattr(sys.modules["watchtower.models"], attr, d / name)
+
+
+@pytest.fixture(autouse=True)
+def hermetic_activity_log(tmp_path, monkeypatch):
+    """WT-8: every test gets its own activity log. Fixtures that only redirect
+    the config file (e.g. test_smoke) otherwise appended config._save's CONFIG
+    audit lines to the real ~/.watchtower/activity.log on every suite run.
+    Tests that set $WATCHTOWER_ACTIVITY_LOG themselves still win."""
+    monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
+
+
+@pytest.fixture(autouse=True)
+def strict_answer_edges(monkeypatch):
+    """WT-31 D2.6g: an undeclared ``pending_answer`` transition raises in
+    tests (production only logs ANSWER_EDGE_UNDECLARED)."""
+    monkeypatch.setenv("WATCHTOWER_STRICT_EDGES", "1")
+
+
+@pytest.fixture(autouse=True)
+def hermetic_session_origins(tmp_path, monkeypatch):
+    """WT-27: the origin ledger and spawn-env markers never touch the real
+    ~/.watchtower, and a suite run from inside a worker session does not make
+    every test look like a worker descendant."""
+    from watchtower import origins
+    monkeypatch.setattr(origins, "ORIGINS_FILE", tmp_path / "session-origins.json")
+    for key in (origins.ENV_WORKER, origins.ENV_SESSION, origins.ENV_REF,
+                origins.ENV_QUEUE, origins.ENV_ROLE):
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
 def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
     """Keep the real outbox, the real delegate and the real caller identity
     out of every test.
@@ -67,6 +111,11 @@ def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
     # ~/.watchtower/gh-quota.log -- the one file an operator reads to decide
     # whether the real burn is under control.
     monkeypatch.setenv("WATCHTOWER_GH_QUOTA_LOG", str(tmp_path / "gh-quota.log"))
+    # Devin session lookup (WATCHTOWER-32) reads devin's own sessions.db; a
+    # devin worker in a test must never resolve against the real one.
+    monkeypatch.setenv(
+        "WATCHTOWER_DEVIN_SESSIONS_DB", str(tmp_path / "devin-sessions.db")
+    )
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
 
@@ -129,6 +178,7 @@ _ENV_FILES = {
     "WATCHTOWER_LAUNCH_FAILURES_FILE": "launch-failures.json",
     "WATCHTOWER_WORKER_SESSIONS_FILE": "worker-sessions.json",
     "WATCHTOWER_WORKER_IDS_FILE": "worker-ids.json",
+    "WATCHTOWER_SESSION_ORIGINS_FILE": "session-origins.json",
     "WATCHTOWER_CODEX_THREAD_REGISTRY": "codex-threads.json",
     "WATCHTOWER_GH_CONNECTIVITY_FILE": "gh-connectivity.json",
     "WATCHTOWER_GH_LIST_CACHE_FILE": "gh-list-cache.json",
@@ -138,6 +188,7 @@ _ENV_FILES = {
     "WATCHTOWER_DASHBOARD_PID": "dashboard.pid",
 }
 _ENV_DIRS = {
+    "WATCHTOWER_DATA_DIR": "persistent-data",
     "WATCHTOWER_STOP_SIGNALS_DIR": "stop-signals",
     "CLAUDE_CONFIG_DIR": "claude-home",
     "WATCHTOWER_GH_CLAIM_LOCKS_DIR": "gh-claim-locks",
@@ -152,6 +203,7 @@ _ENV_CLEAR = (
     "WATCHTOWER_KIMI_BIN",
     "WATCHTOWER_ANTIGRAVITY_BIN",
     "WATCHTOWER_SESSION_ID",
+    "WATCHTOWER_MACHINE",
     "FAKE_GH_STATE",
 )
 
@@ -376,3 +428,38 @@ def no_engines(wt_env, monkeypatch):
         monkeypatch.setenv(var, missing)
     for engine in ("claude", "codex", "kimi"):
         assert not wt_env.workers.engine_available(engine)
+
+
+@pytest.fixture()
+def instant_daemon(monkeypatch, tmp_path):
+    """Emulate a watcher that wakes the instant a stage is requested (WT-24).
+
+    CLI transitions only ``stages.request`` (they never spawn); tests that
+    assert on the resulting planner / verifier / assessor spawn use this so the
+    stage pass runs right after the request. Tests of the no-local-spawn rule
+    itself must NOT use it."""
+    from watchtower import stages, workers
+    real = stages.request
+    real_repo = workers.assessment_repo
+
+    def repo(item):      # tests rarely configure a repo; stage cwd is never the daemon's
+        try:
+            return real_repo(item)
+        except ValueError:
+            return str(tmp_path)
+
+    repo.real = real_repo
+    monkeypatch.setattr(workers, "assessment_repo", repo)
+
+    def request(ref, why=""):
+        out = real(ref, why)
+        stages.reconcile_stages(only_ref=ref)
+        return out
+
+    monkeypatch.setattr(stages, "request", request)
+    return stages
+
+
+@pytest.fixture(autouse=True)
+def no_spawn_stagger(monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_SPAWN_STAGGER_S", "0")

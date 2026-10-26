@@ -82,6 +82,10 @@ def wt(tmp_path, monkeypatch):
     importlib.reload(codex_rpc)
     importlib.reload(codex_registry)
     monkeypatch.setattr(config, "_REGISTRY_FILE", tmp_path / "no-registry.json")
+    # Test transcripts have no real claude process behind them; treat a hot
+    # one as held by a live turn (the busy-hold tests' premise). Tests of the
+    # dormant path override this.
+    monkeypatch.setattr(messages, "_session_has_live_process", lambda sid: True)
 
     class Ns:
         pass
@@ -98,6 +102,9 @@ def wt(tmp_path, monkeypatch):
             os.close(fd)
         except OSError:
             pass
+
+
+from watchtower.messages import _session_has_live_process as _REAL_SESSION_HAS_LIVE_PROCESS  # noqa: E402
 
 
 # --------------------------------------------------------------------- helpers
@@ -149,6 +156,33 @@ def _write_codex_rollout(wt, sid):
     return p
 
 
+def test_locate_transcript_tries_hinted_engine_first(wt):
+    """S8a: `wt close` resolves a session's transcript so CCC can attribute a
+    closed ticket to it. The hint avoids a wasted lookup when the caller
+    already knows the engine (from CLAUDE_CODE_SESSION_ID/CODEX_THREAD_ID)."""
+    claude_path = _write_transcript(wt, SID_A)
+    assert wt.messages.locate_transcript(SID_A, "claude") == str(claude_path)
+
+    codex_path = _write_codex_rollout(wt, SID_D)
+    assert wt.messages.locate_transcript(SID_D, "codex") == str(codex_path)
+
+
+def test_locate_transcript_falls_back_to_the_other_engine(wt):
+    """No hint (or a wrong one) still finds the transcript by trying both
+    finders -- e.g. a coordinator closing a ticket claimed by a different
+    engine's session."""
+    codex_path = _write_codex_rollout(wt, SID_D)
+    assert wt.messages.locate_transcript(SID_D) == str(codex_path)
+    assert wt.messages.locate_transcript(SID_D, "claude") == str(codex_path)
+
+
+def test_locate_transcript_missing_session_returns_empty(wt):
+    """An ephemeral queue-worker sandbox whose transcript never lands on this
+    machine (see S8b's harvest-before-wipe) must not raise."""
+    assert wt.messages.locate_transcript("no-such-session") == ""
+    assert wt.messages.locate_transcript("") == ""
+
+
 def test_delegate_base_accepts_a_url_in_the_ccc_port_file(wt, monkeypatch):
     """CCC's native launcher records its full local base URL, not just a port."""
     ccc_dir = wt.tmp / ".claude" / "command-center"
@@ -177,6 +211,13 @@ class _DelegateHandler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0) or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
         self.server.requests.append((self.path, body))
+        self._respond()
+
+    def do_GET(self):
+        self.server.requests.append((self.path, None))
+        self._respond()
+
+    def _respond(self):
         status, payload = (
             self.server.responses.pop(0)
             if self.server.responses else (200, {"ok": True})
@@ -279,6 +320,66 @@ def test_resolve_full_uuid_unknown_accepted(wt):
     r = wt.messages.resolve_target(SID_B)
     assert r["kind"] == "session" and r["session_id"] == SID_B
     assert r["worker"] is None and r["engine"] == "claude"
+
+
+def test_resolve_devin_cli_session_id(wt):
+    """WATCHTOWER-33: a devin-cli session id is a word slug behind CCC's
+    ``devincli-`` prefix, so it is neither hex nor a UUID and every other
+    branch rejects it -- which left devin sessions unaddressable as a
+    ticket's submitter or a `wt send` target. The prefix names the engine,
+    so no lookup is needed; delivery falls through to the delegate."""
+    r = wt.messages.resolve_target("devincli-glorious-sturgeon")
+
+    assert r["kind"] == "session"
+    assert r["session_id"] == "devincli-glorious-sturgeon"
+    assert r["engine"] == "devin"
+    assert r["worker"] is None
+
+
+def test_resolve_devin_cli_session_does_not_shadow_a_live_worker(wt):
+    """A devin session that IS a live WT worker resolves through its worker
+    record (fifo, cwd, recorded engine) -- the shape branch is the fallback."""
+    _live_worker(wt, "Q", session_id="devincli-patch-macadamia")
+    r = wt.messages.resolve_target("devincli-patch-macadamia")
+    assert r["kind"] == "worker"
+    assert r["worker"] is not None
+
+
+def test_default_report_to_uses_our_devin_session(wt, monkeypatch):
+    """`wt add` from inside a devin session used to file with submitter=""
+    (devin sets neither harness env var), so its filer could never be
+    notified. The session recovered from our ancestry fills it in, and it
+    resolves -- which is what makes the notification deliverable."""
+    import watchtower.cli as cli
+
+    monkeypatch.setattr(
+        wt.workers, "current_devin_session_id",
+        lambda: "devincli-glorious-sturgeon",
+    )
+    target, note = cli._default_report_to()
+
+    assert target == "devincli-glorious-sturgeon" and note == ""
+    assert wt.messages.resolve_target(target)["engine"] == "devin"
+
+
+def test_default_report_to_prefers_the_claude_env_over_devin(wt, monkeypatch):
+    import watchtower.cli as cli
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", SID_A)
+    monkeypatch.setattr(
+        wt.workers, "current_devin_session_id",
+        lambda: pytest.fail("must not probe devin when the env names us"),
+    )
+    assert cli._default_report_to() == (SID_A, "")
+
+
+def test_resolve_bare_devin_slug_still_raises(wt):
+    """Only the prefixed form is an address: a bare slug is indistinguishable
+    from a typo'd agent name, and CCC's delegate does not answer to it."""
+    with pytest.raises(ValueError):
+        wt.messages.resolve_target("glorious-sturgeon")
+    with pytest.raises(ValueError):
+        wt.messages.resolve_target("devincli-")
 
 
 def test_resolve_pruned_kimi_worker_from_session_ledger(wt):
@@ -421,6 +522,22 @@ def test_delegate_delivery_payload(wt, delegate, monkeypatch):
                     "origin": "wt"}
 
 
+def test_delegate_carries_a_devin_session_id_verbatim(wt, delegate, monkeypatch):
+    """WATCHTOWER-33 end to end: WT has no native devin transport, so a devin
+    target must reach the delegate -- and with the ``devincli-`` prefix
+    intact, because that is the id CCC's /api/inject-input answers to (it
+    strips the prefix itself and steers the session over ACP)."""
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+
+    res = wt.messages.send("devincli-glorious-sturgeon", "over http")
+
+    assert res["ok"] is True and res["transport"] == "delegate"
+    path, body = srv.requests[0]
+    assert path == "/api/inject-input"
+    assert body["session_id"] == "devincli-glorious-sturgeon"
+
+
 def test_delegate_500_falls_to_outbox(wt, delegate, monkeypatch):
     srv, url = delegate
     srv.responses.append((500, {"ok": False}))
@@ -484,6 +601,44 @@ def test_per_call_delegate_timeout_beats_the_env_override(wt, monkeypatch):
     monkeypatch.setenv("WATCHTOWER_DELEGATE_TIMEOUT_S", "45")
     assert wt.messages._delegate_timeout_s(5.0) == 5.0
     assert wt.messages._delegate_timeout_s() == 45.0
+
+
+# ============================================================ ccc_forward_target
+# MEMORY-5: CCC (ccc_server/continuation.py) is the one source of truth for
+# "this sid now forwards to that one" -- WT only ever asks, never keeps its
+# own copy.
+
+def test_ccc_forward_target_no_delegate_is_none(wt):
+    assert wt.messages.ccc_forward_target(SID_A) is None
+
+
+def test_ccc_forward_target_empty_sid_is_none(wt, delegate, monkeypatch):
+    _srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    assert wt.messages.ccc_forward_target("") is None
+
+
+def test_ccc_forward_target_follows_ccc_forward(wt, delegate, monkeypatch):
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    srv.responses.append((200, {"ok": True, "session_id": SID_A, "forwarded_to": SID_B}))
+    assert wt.messages.ccc_forward_target(SID_A) == SID_B
+    path, _ = srv.requests[0]
+    assert path == f"/api/session/{SID_A}/forward-target"
+
+
+def test_ccc_forward_target_no_forward_is_none(wt, delegate, monkeypatch):
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    srv.responses.append((200, {"ok": True, "session_id": SID_A, "forwarded_to": None}))
+    assert wt.messages.ccc_forward_target(SID_A) is None
+
+
+def test_ccc_forward_target_transport_error_is_none(wt, delegate, monkeypatch):
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    srv.responses.append((500, {"ok": False}))
+    assert wt.messages.ccc_forward_target(SID_A) is None
 
 
 @pytest.mark.parametrize("override", [0, -1, "not-a-number", None])
@@ -738,24 +893,67 @@ def test_compact_codex_via_app_server(wt, monkeypatch):
     assert res["codex_total_ms"] >= res["codex_resume_ms"]
 
 
-def test_compact_codex_refuses_when_delegate_first_is_configured(wt, delegate, monkeypatch):
-    """CCC's /api/inject-input can only inject chat text, not forward the
-    structural thread/compact/start RPC -- and WT must not open a second,
-    competing app-server against a thread CCC already brokers. So compact
-    mode fails closed here rather than silently doing the wrong thing."""
+def test_compact_codex_uses_configured_owner(wt, delegate, monkeypatch):
     srv, url = delegate
+    srv.responses.append((200, {"ok": True, "status": "compacted",
+                                "compact_result": "success", "backup_path": "/backup"}))
     monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
-    monkeypatch.setenv("WATCHTOWER_CODEX_BIN", str(_write_fake_codex_bin(wt.tmp)))
 
-    def _private_should_not_run(*_args, **_kwargs):
+    def private_should_not_run(*_args, **_kwargs):
         raise AssertionError("private codex app-server should not be used")
 
-    monkeypatch.setattr(wt.codex_rpc, "compact", _private_should_not_run)
-
+    monkeypatch.setattr(wt.codex_rpc, "compact", private_should_not_run)
     res = wt.messages.compact_codex({"session_id": SID_D, "cwd": "/repo"})
 
-    assert res["ok"] is False
-    assert "delegate" in res["error"]
+    assert res["ok"] is True
+    assert res["transport"] == "delegate-compact"
+    assert res["compact_result"] == "success"
+    assert res["backup_path"] == "/backup"
+    assert srv.requests == [("/api/session/compact", {"session_id": SID_D})]
+
+
+@pytest.mark.parametrize("status,payload", [
+    (200, {"ok": False, "code": "busy", "error": "thread busy"}),
+    (200, {}),
+    (500, {"ok": False, "error": "unavailable"}),
+    (404, {}),
+])
+def test_compact_codex_delegate_failure_never_changes_owner(
+    wt, delegate, monkeypatch, status, payload,
+):
+    srv, url = delegate
+    srv.responses.append((status, payload))
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+
+    def private_should_not_run(*_args, **_kwargs):
+        raise AssertionError("private codex app-server should not be used")
+
+    monkeypatch.setattr(wt.codex_rpc, "compact", private_should_not_run)
+    res = wt.messages.compact_codex({"session_id": SID_D})
+    assert res["ok"] is False and res["error"]
+    if payload.get("code"):
+        assert res["code"] == payload["code"]
+    assert srv.requests == [("/api/session/compact", {"session_id": SID_D})]
+
+
+def test_compact_codex_delegate_timeout_never_changes_owner(wt, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "http://127.0.0.1:1")
+
+    def timed_out(url, payload, timeout_s):
+        assert url.endswith("/api/session/compact")
+        assert timeout_s >= 330
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(wt.messages, "_post_json", timed_out)
+    monkeypatch.setattr(wt.codex_rpc, "compact", lambda *a, **k: pytest.fail("private owner"))
+    res = wt.messages.compact_codex({"session_id": SID_D})
+    assert res["ok"] is False and "timed out" in res["error"]
+
+
+def test_compact_codex_requires_session_before_contacting_delegate(wt, delegate, monkeypatch):
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    assert wt.messages.compact_codex({})["ok"] is False
     assert srv.requests == []
 
 
@@ -1081,6 +1279,63 @@ def test_busy_transcript_defers_to_outbox(wt, monkeypatch):
     m = wt.messages.outbox_list(status="pending")[0]
     delay = wt.messages._parse_iso(m["next_attempt_at"]) - t0
     assert 50 <= delay <= 70  # held ~60s out for retry on idle
+
+
+def test_hot_transcript_without_a_live_holder_resumes_now(wt, monkeypatch):
+    """A hot transcript with no process holding the session (a dormant
+    session, or one killed mid-turn) cannot be raced: resume immediately
+    instead of parking the message for a quiet window."""
+    _write_transcript(wt, SID_B, age_s=0)
+    monkeypatch.setattr(wt.messages, "_session_has_live_process", lambda sid: False)
+    calls = []
+    monkeypatch.setattr(wt.messages.subprocess, "Popen", _fake_popen(calls))
+    res = wt.messages.send(SID_B, "wake up")
+    assert res["ok"] is True and res["transport"] == "resume"
+    assert len(calls) == 1
+    assert wt.messages.outbox_list() == []
+
+
+def test_live_holder_scan_ignores_a_shell_that_only_mentions_the_sid(
+        wt, monkeypatch, tmp_path):
+    """A sender's Bash wrapper names the sid next to a ~/.claude path; only
+    the claude binary with the sid as an argument holds the session."""
+    monkeypatch.setattr(wt.messages, "_session_has_live_process",
+                        _REAL_SESSION_HAS_LIVE_PROCESS)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude-home"))
+    monkeypatch.setattr(wt.messages, "live_resume_child", lambda sid: False)
+    proc = tmp_path / "proc"
+    for pid, argv in {
+        "101": ["/bin/bash", "-c",
+                f"source /home/u/.claude/shell-snapshots/x.sh && wt send {SID_B} -"],
+        "102": ["/usr/bin/python3", "wt", "send", SID_B, "-"],
+    }.items():
+        (proc / pid).mkdir(parents=True)
+        (proc / pid / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv))
+    real_path = wt.messages.Path
+    monkeypatch.setattr(
+        wt.messages, "Path",
+        lambda *a: real_path(proc) if a == ("/proc",) else real_path(*a))
+    assert wt.messages._session_has_live_process(SID_B) is False
+    (proc / "103").mkdir()
+    (proc / "103" / "cmdline").write_bytes(
+        b"\0".join([b"/home/u/.local/bin/claude", b"-p", b"--resume", SID_B.encode()]))
+    assert wt.messages._session_has_live_process(SID_B) is True
+
+
+def test_cli_send_prefers_uds_and_parked_rows_keep_it(wt, monkeypatch):
+    """`wt send` steers by default: UDS first, and a parked row retries over
+    UDS first too."""
+    seen = []
+
+    def deliver(resolved, text, mode="send", **kw):
+        seen.append(kw.get("prefer_uds", False))
+        return {"ok": False, "busy": True, "error": "held"}
+    monkeypatch.setattr(wt.messages, "deliver", deliver)
+    from watchtower import cli
+    cli.main(["send", SID_B, "hi"])
+    assert seen == [True]
+    m = wt.messages.outbox_list(status="pending")[0]
+    assert m.get("prefer_uds") is True
 
 
 def test_busy_window_env_override(wt, monkeypatch):
@@ -1592,6 +1847,18 @@ def test_recent_session_title_backfill_appends_custom_title(wt):
     }
 
 
+def test_recent_session_title_backfill_skips_released_ticket(wt):
+    p = _write_transcript(wt, SID_A)
+    item = wt.q.enqueue(project="NAMEQ", title="Released ticket", note="body")
+    wt.q.claim_next("nameq-released", project="NAMEQ")
+    wt.q.backfill_session_id(item["ref"], SID_A)
+    before = p.read_text()
+    wt.q.release(item["ref"], force=True)
+
+    assert wt.workers.backfill_recent_session_titles(hours=24) == []
+    assert p.read_text() == before
+
+
 def test_recent_session_title_backfill_uses_queue_session_when_log_is_gone(wt):
     p = _write_transcript(wt, SID_A)
     item = wt.q.enqueue(project="NAMEQ", title="Log already pruned", note="body")
@@ -1861,3 +2128,199 @@ def test_parked_notice_still_refuses_resume_when_the_daemon_retries(
 
     assert resumed == []
     assert out["delivered"] == [] and out["retried"] == [res["id"]]
+
+
+# ================================== WT-1: ticket-bound outbox rows go stale
+def _claimed_ticket(wt, sid, worker="wt1-deadbeef"):
+    item = wt.q.enqueue(project="WT1", note="blocked work")
+    wt.q.claim_next(worker, project="WT1", session_uuid=sid)
+    return wt.q.get(item["ref"])
+
+
+def _no_delivery(*a, **k):
+    raise AssertionError("a stale ticket message must not be delivered")
+
+
+def test_send_records_ticket_binding_on_parked_outbox_row(wt, monkeypatch):
+    monkeypatch.setattr(
+        wt.messages, "deliver", lambda *a, **k: {"ok": False, "error": "down"}
+    )
+    res = wt.messages.send(SID_B, "your answer", ticket_ref="WT1-1",
+                           ticket_session=SID_B)
+    assert res["queued"] is True
+    m = wt.messages.outbox_list()[0]
+    assert m["ticket"] == "WT1-1" and m["ticket_session"] == SID_B
+
+
+def test_drain_outbox_cancels_message_for_closed_ticket(wt, monkeypatch):
+    """WT-1: an answer parked for a ticket that has since closed used to be
+    retried up to MAX_ATTEMPTS times -- each retry re-injecting it through
+    CCC until the inject circuit breaker tripped (09-15)."""
+    item = _claimed_ticket(wt, SID_B)
+    t0 = time.time()
+    msg = wt.messages.outbox_add(SID_B, "apply the answer", delay_s=0, now=t0,
+                                 ticket_ref=item["ref"], ticket_session=SID_B)
+    wt.q.close(item["ref"], force=True)
+    monkeypatch.setattr(wt.messages, "deliver", _no_delivery)
+
+    out = wt.messages.drain_outbox(now=t0 + 1)
+
+    assert out["cancelled"] == [msg["id"]]
+    assert not out["retried"] and not out["delivered"] and not out["dead"]
+    m = wt.messages.outbox_list()[0]
+    assert m["status"] == "cancelled"
+    assert item["ref"] in m["last_error"] and "closed" in m["last_error"]
+    # Cancelled is terminal: later ticks leave it alone.
+    out = wt.messages.drain_outbox(now=t0 + 10 ** 6)
+    assert out == {"delivered": [], "retried": [], "dead": [], "cancelled": []}
+
+
+def test_drain_outbox_cancels_message_after_ticket_changes_session(wt, monkeypatch):
+    item = _claimed_ticket(wt, SID_B)
+    t0 = time.time()
+    msg = wt.messages.outbox_add(SID_B, "apply the answer", delay_s=0, now=t0,
+                                 ticket_ref=item["ref"], ticket_session=SID_B)
+    wt.q.release(item["ref"], force=True)
+    wt.q.claim_next("wt1-cafef00d", project="WT1", session_uuid=SID_C)
+    monkeypatch.setattr(wt.messages, "deliver", _no_delivery)
+
+    out = wt.messages.drain_outbox(now=t0 + 1)
+
+    assert out["cancelled"] == [msg["id"]]
+    m = wt.messages.outbox_list()[0]
+    assert m["status"] == "cancelled" and "session" in m["last_error"]
+
+
+def test_drain_outbox_cancels_message_after_ticket_released(wt, monkeypatch):
+    item = _claimed_ticket(wt, SID_B)
+    t0 = time.time()
+    msg = wt.messages.outbox_add(SID_B, "apply the answer", delay_s=0, now=t0,
+                                 ticket_ref=item["ref"], ticket_session=SID_B)
+    wt.q.release(item["ref"], force=True)
+    monkeypatch.setattr(wt.messages, "deliver", _no_delivery)
+
+    assert wt.messages.drain_outbox(now=t0 + 1)["cancelled"] == [msg["id"]]
+
+
+def test_drain_outbox_still_delivers_while_ticket_owned_by_same_session(
+    wt, monkeypatch
+):
+    item = _claimed_ticket(wt, SID_B)
+    t0 = time.time()
+    msg = wt.messages.outbox_add(SID_B, "apply the answer", delay_s=0, now=t0,
+                                 ticket_ref=item["ref"], ticket_session=SID_B)
+    monkeypatch.setattr(
+        wt.messages, "deliver",
+        lambda *a, **k: {"ok": True, "transport": "delegate"},
+    )
+
+    out = wt.messages.drain_outbox(now=t0 + 1)
+
+    assert out["delivered"] == [msg["id"]] and out["cancelled"] == []
+
+
+def test_drain_outbox_delivers_ticket_message_when_store_lookup_fails(
+    wt, monkeypatch
+):
+    """A store read error must not silently drop an answer: deliver as before."""
+    t0 = time.time()
+    msg = wt.messages.outbox_add(SID_B, "apply the answer", delay_s=0, now=t0,
+                                 ticket_ref="WT1-1", ticket_session=SID_B)
+
+    def boom(ident):
+        raise OSError("store unreadable")
+
+    monkeypatch.setattr(wt.q, "get", boom)
+    monkeypatch.setattr(
+        wt.messages, "deliver",
+        lambda *a, **k: {"ok": True, "transport": "delegate"},
+    )
+
+    assert wt.messages.drain_outbox(now=t0 + 1)["delivered"] == [msg["id"]]
+
+
+def test_delegate_rejection_preserves_code_and_reason(wt, monkeypatch):
+    monkeypatch.setattr(wt.messages, "_delegate_base", lambda: "http://x")
+    monkeypatch.setattr(
+        wt.messages, "_post_json",
+        lambda *a, **k: {"ok": False, "code": "session_gone", "error": "no such session"},
+    )
+    res = wt.messages._deliver_delegate({"session_id": "s1"}, "hi", "answer")
+    assert res["ok"] is False
+    assert "session_gone" in res["error"] and "no such session" in res["error"]
+
+
+# --- WT-29: live-only transport for plan-discussion traffic -------------------
+
+def _live_only_setup(monkeypatch, messages, uds=None, fifo=None):
+    calls = []
+    monkeypatch.setattr(messages, "resolve_target",
+                        lambda t: {"session_id": "sid-x", "engine": "claude"})
+    monkeypatch.setattr(messages, "_deliver_uds",
+                        uds or (lambda r, t: {"ok": False, "error": "no uds"}))
+    monkeypatch.setattr(messages, "_deliver_fifo",
+                        fifo or (lambda r, t: {"ok": False, "error": "no fifo"}))
+    for name in ("_deliver_resume", "_deliver_gemini_resume", "_deliver_codex_app_server",
+                 "_deliver_antigravity_language_server", "_deliver_delegate"):
+        monkeypatch.setattr(messages, name,
+                            lambda *a, _n=name, **k: calls.append(_n) or {"ok": True, "transport": _n})
+    monkeypatch.setattr(messages.tty_mod, "deliver_tty",
+                        lambda r, t: calls.append("tty") or {"ok": True, "transport": "tty"})
+    return calls
+
+
+def test_live_only_chain_never_resumes_or_delegates(monkeypatch):
+    from watchtower import messages
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", "http://127.0.0.1:1")
+    calls = _live_only_setup(monkeypatch, messages)
+    for qof in (True, False):
+        res = messages.send("w1", "hi", live_only=True, queue_on_fail=qof)
+        assert res["ok"] is False and res["queued"] is False
+        assert "uds" in res["error"] and "fifo" in res["error"]
+    assert calls == []
+    assert messages.outbox_list() == []
+
+
+def test_live_only_succeeds_via_uds_or_fifo(monkeypatch):
+    from watchtower import messages
+    receipts = []
+    from watchtower import receipts as rc
+    monkeypatch.setattr(rc, "record", lambda sid, text, transport, **kw:
+                        receipts.append(transport) or {"id": "r1"})
+    _live_only_setup(monkeypatch, messages, uds=lambda r, t: {"ok": True, "transport": "uds"})
+    res = messages.send("w1", "hi", live_only=True)
+    assert res["ok"] and res["transport"] == "uds"
+    _live_only_setup(monkeypatch, messages, fifo=lambda r, t: {"ok": True, "transport": "fifo"})
+    res = messages.send("w1", "hi", live_only=True)
+    assert res["ok"] and res["transport"] == "fifo"
+    assert receipts == ["uds", "fifo"]
+
+
+def test_send_start_new_if_needed_spawns_continuation(monkeypatch):
+    from watchtower import messages
+    monkeypatch.setattr(messages, "resolve_target", lambda t: {"session_id": "sid-1", "engine": "claude"})
+    monkeypatch.setattr(messages, "_delegate_base", lambda: "http://ccc")
+    monkeypatch.setattr(messages, "_get_json", lambda url, t: {
+        "path": "new", "resolved_session_id": "sid-1", "reason": "cold"})
+    posted = {}
+
+    def _post(url, payload, timeout_s):
+        posted.update(url=url, payload=payload)
+        return {"ok": True, "new_session_id": "sid-2"}
+
+    monkeypatch.setattr(messages, "_post_json", _post)
+    monkeypatch.setattr(messages, "deliver", lambda *a, **k: pytest.fail("must not resume"))
+    res = messages.send("sid-1", "ticket closed", start_new_if_needed=True)
+    assert res["ok"] and res["transport"] == "continuation" and res["new_session_id"] == "sid-2"
+    assert posted["url"].endswith("/api/sessions/spawn-continue-from")
+    assert posted["payload"] == {"continue_from": "sid-1", "prompt": "ticket closed"}
+
+
+def test_send_start_new_if_needed_warm_delivers_normally(monkeypatch):
+    from watchtower import messages
+    monkeypatch.setattr(messages, "resolve_target", lambda t: {"session_id": "sid-1", "engine": "claude"})
+    monkeypatch.setattr(messages, "_delegate_base", lambda: "http://ccc")
+    monkeypatch.setattr(messages, "_get_json", lambda url, t: {"path": "normal"})
+    monkeypatch.setattr(messages, "deliver", lambda *a, **k: {"ok": True, "transport": "uds"})
+    res = messages.send("sid-1", "hi", start_new_if_needed=True)
+    assert res["transport"] == "uds"

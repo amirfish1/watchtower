@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Work only in `/Users/amirfish/Apps/watchtower-wt-doc-to-queue` on `feat/doc-to-queue`.
+- Work only in `~/Apps/watchtower-wt-doc-to-queue` on `feat/doc-to-queue`.
 - Extraction is a reasoning problem; regex and Markdown parsing cannot be the mechanism.
 - Run exactly one reasoning call per import and never retry automatically.
 - Preview by default and require `--apply` for queue mutation.

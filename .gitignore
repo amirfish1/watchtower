@@ -35,4 +35,6 @@ queues.json
 workers.json
 daemon.pid
 .gstack/
+# Hunch is permanently removed; never commit leftovers.
 .hunch/
+.hunch-cache/

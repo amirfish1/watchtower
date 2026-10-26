@@ -1,4 +1,4 @@
-"""SONIA-CHAT-19: `wt reopen --resume` CLI wiring.
+"""CLIENT-CHAT-19: `wt reopen --resume` CLI wiring.
 
 Verifies cmd_reopen's --resume branch: reopen_and_claim then delivery
 through the same liveness-aware path `wt answer` uses (mocked here since
@@ -37,10 +37,10 @@ def wt(tmp_path, monkeypatch):
 
 def test_reopen_resume_rebinds_and_delivers(wt, tmp_path, monkeypatch):
     cli, q, workers = wt
-    worker_id = "sonia-chat-19-cli-worker"
+    worker_id = "client-chat-19-cli-worker"
     sid = "77777777-8888-9999-aaaa-bbbbbbbbbbbb"
-    item = q.enqueue(project="SONIACHAT19CLITEST", note="topic work")
-    claimed = q.claim_next(worker_id, project="SONIACHAT19CLITEST", session_uuid=sid)
+    item = q.enqueue(project="CLIENTCHAT19CLITEST", note="topic work")
+    claimed = q.claim_next(worker_id, project="CLIENTCHAT19CLITEST", session_uuid=sid)
     q.update_status(claimed["ref"], "closed", worker_id, resolution={"summary": "turn done"})
 
     delivered = {}
@@ -72,7 +72,7 @@ def test_reopen_resume_falls_back_to_plain_reopen_without_session(wt, tmp_path, 
     """A ticket that was never claimed with a real session id -- --resume
     must degrade to a plain reopen, not crash or silently drop the text."""
     cli, q, workers = wt
-    item = q.enqueue(project="SONIACHAT19CLITEST", note="never claimed")
+    item = q.enqueue(project="CLIENTCHAT19CLITEST", note="never claimed")
     # Close it directly (no claim_next -> no claimed_session_id).
     q.update_status(item["ref"], "closed", "some-human", resolution={"summary": "done"})
 
@@ -96,9 +96,9 @@ def test_reopen_without_resume_flag_uses_plain_path_unchanged(wt, tmp_path):
     """--resume defaults to None -- omitting it entirely must be
     byte-for-byte today's existing plain reopen behavior."""
     cli, q, workers = wt
-    item = q.enqueue(project="SONIACHAT19CLITEST", note="topic work")
-    worker_id = "sonia-chat-19-plain-worker"
-    q.claim_next(worker_id, project="SONIACHAT19CLITEST")
+    item = q.enqueue(project="CLIENTCHAT19CLITEST", note="topic work")
+    worker_id = "client-chat-19-plain-worker"
+    q.claim_next(worker_id, project="CLIENTCHAT19CLITEST")
     q.update_status(item["ref"], "closed", worker_id, resolution={"summary": "done"})
 
     args = argparse.Namespace(

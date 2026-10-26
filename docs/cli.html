@@ -88,7 +88,7 @@
       <div class="sig">wt config -q QUEUE [--auto-drain {on,off}] [--workers N] [--workers-local-path PATH]
        [--backend {file,github}] [--github-repo REPO] [--github-assignee WHO]
        [--engine {claude,codex,kimi}] [--model MODEL] [--effort {low,medium,high,xhigh,max}]
-       [--type {bug,feature}] [--grace-s N]</div>
+       [--type {bug,feature}] [--grace-s N] [--queue-label LABEL]</div>
       <p>The recommended queue configuration command. It combines the basic settings with auto-drain policy,
          so one call sets the engine, worker count, backend, and whether the queue self-staffs.</p>
       <table class="flags">
@@ -102,6 +102,7 @@
         <tr><td>--model / --effort</td><td>Model identifier and reasoning effort for spawned workers. See <code class="inline-code">wt models</code> for approved ids.</td></tr>
         <tr><td>--type</td><td>Restrict auto-drain workers to a ticket type.</td></tr>
         <tr><td>--grace-s</td><td>Seconds a new ticket is left alone before auto-drain may claim it (default 180); <code>0</code> drains immediately.</td></tr>
+        <tr><td>--queue-label</td><td>GitHub label marking an issue as this queue's when 2+ queues share a repo (default <code>watchtower:&lt;QUEUE&gt;</code>); <code>*</code> makes it the repo's catch-all (every issue no other queue claims; one per repo); <code>''</code> resets.</td></tr>
       </table>
     </div>
     <div class="cli-cmd">
@@ -111,6 +112,18 @@
          <code class="inline-code">wt config --model</code> and <code class="inline-code">wt spawn --model</code> accept.
          <code>antigravity</code> is spawn-only; its Gemini ids carry effort in the suffix, so they take no
          <code class="inline-code">--effort</code>.</p>
+    </div>
+    <div class="cli-cmd">
+      <h3><span class="verb">wt</span> models migrate / unpin</h3>
+      <div class="sig">wt models migrate --from MODEL --to MODEL [--queues A,B] [--engine E] [--include-default] [--apply]
+wt models unpin (--queues A,B | --all-matching MODEL) [--apply]</div>
+      <p>Bulk-move queues from one model to another after a model bump. Dry run by default: lists every queue whose
+         effective model (the resolution <code class="inline-code">wt config</code> uses) equals <code>--from</code>, with engine,
+         auto-drain and open/WIP counts. <code>--to</code> must be approved (exit 1 otherwise); a cross-engine move needs
+         <code>--engine</code>. Only pinned queues are rewritten; queues inheriting the default move with
+         <code>--include-default</code>, which rewrites the matching keys in CCC's <code>spawn-defaults.json</code> and prints which.
+         Warns about open/WIP tickets whose model floor is above the new model and about queues on a policy-blocked model.
+         <code>unpin</code> clears the explicit model so a queue follows the default.</p>
     </div>
     <div class="cli-cmd">
       <h3><span class="verb">wt</span> set</h3>
