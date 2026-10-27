@@ -68,3 +68,24 @@ def test_spawn_adhoc_stage_records_origin_and_survives_prune(wt_env, monkeypatch
     # the ledger is independent of workers.json pruning
     w._save({"workers": []})
     assert origins.get(rec["session_id"])["role"] == "verifier"
+
+
+def test_spawn_adhoc_from_a_user_session_records_it_as_parent(wt_env, monkeypatch):
+    # CCC-231: a reviewer a user's Codex session starts with `wt spawn` must
+    # name that session as its parent, or CCC can't nest it under the idea.
+    from watchtower import workers as w
+    monkeypatch.setattr(w.shutil, "which", lambda b: "/bin/" + b)
+    monkeypatch.setattr(w.subprocess, "Popen", lambda *a, **k: type("P", (), {"pid": 1})())
+    monkeypatch.setenv("CODEX_THREAD_ID", "01a17f55-d65b-76f2-b034-9a81217f303a")
+    rec = w.spawn_adhoc("review", "claude", repo_path=str(wt_env), name="rereview")
+    row = origins.get(rec["session_id"])
+    assert row["role"] == "adhoc"
+    assert row["parent_session_id"] == "01a17f55-d65b-76f2-b034-9a81217f303a"
+    assert not row.get("parent_worker_id")
+    assert rec["parent_session_id"] == row["parent_session_id"]
+
+
+def test_caller_session_id_prefers_worker_session(monkeypatch):
+    assert origins.caller_session_id({}) == ""
+    assert origins.caller_session_id({"CODEX_THREAD_ID": "c"}) == "c"
+    assert origins.caller_session_id({"WT_SESSION_ID": "w", "CODEX_THREAD_ID": "c"}) == "w"

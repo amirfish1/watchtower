@@ -4517,6 +4517,7 @@ def record_worker(
     stage: str = "",
     ticket_queue: str = "",
     exit_file: str = "",
+    parent_session_id: str = "",
 ) -> Dict[str, Any]:
     with _WorkersFileLock():
         data = _load()
@@ -4545,6 +4546,8 @@ def record_worker(
             rec["exit_file"] = exit_file
         if session_id:
             rec["session_id"] = session_id
+        if parent_session_id and parent_session_id != session_id:
+            rec["parent_session_id"] = parent_session_id
         # The worker's own first `wt claim` can win the race against this
         # write and rebind_continued_worker() then appends a stub row for the
         # same worker_id/pid. Merge into it rather than adding a second row:
@@ -4570,7 +4573,7 @@ def record_worker(
         origins.note_spawn(
             rec["session_id"], role=stage or ("adhoc" if kind == "adhoc" else "worker"),
             ref=ref, queue=ticket_queue or queue, worker_id=worker_id, engine=engine,
-            via="record_worker")
+            via="record_worker", parent_session_id=rec.get("parent_session_id", ""))
     _upsert_codex_worker_registry(rec)
     return rec
 
@@ -4629,7 +4632,8 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                         ref=str(w.get("ref") or ""),
                         queue=str(w.get("ticket_queue") or w.get("queue") or ""),
                         worker_id=str(w.get("worker_id") or ""),
-                        engine=str(w.get("engine") or ""), via="log_backfill")
+                        engine=str(w.get("engine") or ""), via="log_backfill",
+                        parent_session_id=str(w.get("parent_session_id") or ""))
                     _upsert_codex_worker_registry(w)
                     # A session means this engine really did launch -- end any
                     # failure streak so the next one starts from the default.
@@ -8210,6 +8214,9 @@ def spawn_adhoc(
         proc.pid, label.upper(), engine, worker_id, repo_path, str(log_path),
         model=model, kind="adhoc", session_id=session_id,
         ref=ticket_ref, stage=stage, ticket_queue=ticket_queue, exit_file=exit_file,
+        # The session running `wt spawn` (worker or a user's agent session) is
+        # the parent, so CCC nests the spawn under it and its idea ticket.
+        parent_session_id=origins.caller_session_id(),
     )
     rec["argv"] = argv
     if stage:

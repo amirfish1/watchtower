@@ -105,13 +105,24 @@ def env_parent(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
     return out
 
 
+def caller_session_id(env: Optional[Dict[str, str]] = None) -> str:
+    """The agent session running this process (worker or not), else ""."""
+    env = os.environ if env is None else env
+    for key in (ENV_SESSION, "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+        val = str(env.get(key) or "").strip()
+        if val:
+            return val
+    return ""
+
+
 def note_spawn(session_id: str, *, role: str = "", ref: str = "", queue: str = "",
                worker_id: str = "", engine: str = "", via: str = "",
-               purpose: str = "") -> Optional[Dict[str, Any]]:
+               purpose: str = "", parent_session_id: str = "") -> Optional[Dict[str, Any]]:
     """Record a session this process just spawned. Explicit args win; parent,
     ticket and queue fall back to the spawner's own env markers. ``worker_id``
     is the session's own worker id (managed spawns); the spawner is always
-    ``parent_worker_id``."""
+    ``parent_worker_id``; ``parent_session_id`` names a non-worker spawner
+    (a user's agent session running `wt spawn`)."""
     parent = env_parent()
     return record(
         session_id,
@@ -120,6 +131,6 @@ def note_spawn(session_id: str, *, role: str = "", ref: str = "", queue: str = "
         queue=queue or parent.get("queue", ""),
         worker_id=worker_id,
         parent_worker_id=parent.get("parent_worker_id", ""),
-        parent_session_id=parent.get("parent_session_id", ""),
+        parent_session_id=parent_session_id or parent.get("parent_session_id", ""),
         engine=engine, via=via, purpose=purpose,
     )
