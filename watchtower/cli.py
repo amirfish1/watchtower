@@ -57,6 +57,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
+from . import sender_envelope as envelope
 from . import answers, deep, health, queue as q, resume_verify, stages, workers
 
 DAEMON_PID_FILE = Path(
@@ -268,10 +269,7 @@ def _caller_identity(args: argparse.Namespace) -> Tuple[str, str]:
     worker = str(getattr(args, "worker", "") or os.environ.get("WT_WORKER", "")).strip()
     if not worker:
         worker = _default_worker_id()
-    session = (
-        os.environ.get("CODEX_THREAD_ID", "").strip()
-        or os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
-    )
+    session = envelope.capture_cli()["author"].get("id", "")
     return worker, session
 
 
@@ -3495,6 +3493,7 @@ def cmd_comment(args: argparse.Namespace) -> int:
         try:
             sent = messages.deliver_message(
                 str(target), prompt, verb="steer",
+                **({"attr": envelope.capture_cli(str(target))} if envelope.enabled("wt") else {}),
                 ticket_ref=str(item.get("ref") or ""),
                 ticket_session=str(item.get("claimed_session_id") or ""),
             )
@@ -3680,6 +3679,8 @@ def cmd_send(args: argparse.Namespace) -> int:
     # of waiting in the outbox for the turn to end.
     res = messages.send(
         args.target, text, mode=args.mode,
+        attr=(getattr(args, "message_attr", None) or envelope.capture_cli(
+                args.target, claimed=getattr(args, "sender", ""))),
         queue_on_fail=not args.no_queue,
         ttl_s=args.ttl,
         prefer_uds=True,
@@ -3713,7 +3714,10 @@ def cmd_ask(args: argparse.Namespace) -> int:
     POSTs {event, target, ok, answer|error} to the webhook."""
     from . import messages
     webhook = getattr(args, "notify_webhook", "") or ""
+    attr = getattr(args, "message_attr", None) or envelope.capture_cli(args.target)
     if webhook and not getattr(args, "_notify_child", False):
+        child_env = envelope.child_env()
+        child_env[envelope.ENV] = json.dumps(attr)
         cmd = [
             sys.executable, "-m", "watchtower.cli", "ask",
             args.target, args.text,
@@ -3721,14 +3725,17 @@ def cmd_ask(args: argparse.Namespace) -> int:
             "--notify-webhook", webhook, "--_notify-child",
         ]
         subprocess.Popen(
-            cmd, start_new_session=True,
+            cmd, start_new_session=True, env=child_env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         print(f"accepted: answer will POST to {webhook}")
         return 0
     res = messages.ask(
-        args.target, args.text, timeout_ms=int(args.timeout * 1000)
+        args.target, args.text, timeout_ms=int(args.timeout * 1000),
+        attr=attr,
     )
+    if envelope.enabled("wt"):
+        res.update(message_id=attr["message_id"], attribution_v=1)
     if webhook:
         payload = {
             "event": "ask-answered" if res.get("ok") else "ask-failed",
@@ -3766,11 +3773,7 @@ def _detect_family() -> str:
     Claude Code sets CLAUDE_CODE_SESSION_ID; Codex sets CODEX_THREAD_ID
     (verified against codex 0.142). Antigravity sets neither that we know of;
     an AGY caller must pass --family. Empty string when nothing matches."""
-    if os.environ.get("CLAUDE_CODE_SESSION_ID"):
-        return "claude"
-    if os.environ.get("CODEX_THREAD_ID"):
-        return "codex"
-    return ""
+    return envelope.capture_cli()["author"].get("engine", "")
 
 
 def _default_report_to() -> Tuple[str, str]:
@@ -3787,10 +3790,11 @@ def _default_report_to() -> Tuple[str, str]:
     its filer (WATCHTOWER-33). Its session is recovered from our own process
     ancestry instead; the ``devincli-`` form is what resolve_target and CCC's
     delegate both address."""
-    sid = os.environ.get("CLAUDE_CODE_SESSION_ID", "").strip()
+    identity = envelope.capture_cli()["author"]
+    sid = identity.get("id", "") if identity.get("engine") == "claude" else ""
     if sid:
         return sid, ""
-    tid = os.environ.get("CODEX_THREAD_ID", "").strip()
+    tid = identity.get("id", "") if identity.get("engine") == "codex" else ""
     if not tid:
         from . import workers as _w
         try:
@@ -4335,7 +4339,7 @@ def cmd_chat_new(args: argparse.Namespace) -> int:
     sent = []
     for part in participants:
         text = chats.build_nudge_text(info["path"], args.topic, "topic", part["session_id"])
-        res = messages.send(part["session_id"], text)
+        res = messages.send(part["session_id"], text, **({"attr": envelope.capture_cli(part["session_id"])} if envelope.enabled("wt") else {}))
         sent.append({"target": part["session_id"], "name": part["name"],
                       "ok": bool(res.get("ok")), "queued": bool(res.get("queued"))})
     if args.json:
@@ -4438,7 +4442,7 @@ def cmd_chat_nudge(args: argparse.Namespace) -> int:
         text = chats.build_nudge_text(
             str(md_path), sidecar.get("topic", ""), sidecar.get("mode", "topic"), sid
         )
-        res = messages.send(sid, text)
+        res = messages.send(sid, text, **({"attr": envelope.capture_cli(sid)} if envelope.enabled("wt") else {}))
         ok += 1 if res.get("ok") else 0
         status = "sent" if res.get("ok") else ("queued" if res.get("queued") else "failed")
         print(f"  nudge -> {sid[:8]}: {status}")
@@ -5416,7 +5420,7 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
 
             def _chat_deliver(sid: str, text: str) -> bool:
                 from . import messages as _messages
-                return bool(_messages.send(sid, text).get("ok"))
+                return bool(_messages.send(sid, text, attr=envelope.service("wt:notify", sid)).get("ok"))
 
             chats.nudge_tick(deliver=_chat_deliver)
         except Exception as e:  # noqa: BLE001 - log and keep the loop alive
@@ -7275,6 +7279,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "continuation session with this message instead of "
                         "resuming it (avoids a full-context cache miss)")
     s.add_argument("--json", action="store_true")
+    s.add_argument("--from", dest="sender", default="", help="claimed sender identity")
     s.set_defaults(func=cmd_send)
 
     s = sub.add_parser("ask")
@@ -7788,7 +7793,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
+    from . import sender_envelope as envelope
+    try:
+        incoming_attr = envelope.consume_env()
+    except (ValueError, TypeError) as exc:
+        parser.error(str(exc))
     args = parser.parse_args(argv)
+    args.message_attr = incoming_attr
     if not getattr(args, "command", None):
         parser.print_help()
         return 0

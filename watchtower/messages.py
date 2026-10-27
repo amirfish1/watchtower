@@ -88,6 +88,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, urlparse
 
+from . import sender_envelope as envelope
 from . import queue as queue_mod
 from . import resume_verify
 from . import tty as tty_mod
@@ -891,6 +892,7 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
                 stdout=logf,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env=envelope.child_env(),
                 cwd=cwd or None,
             )
         finally:
@@ -1414,6 +1416,7 @@ def _deliver_gemini_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any
                 stdout=logf,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
+                env=envelope.child_env(),
             )
     except OSError as e:
         return {"ok": False, "error": f"gemini resume spawn failed: {e}"}
@@ -1558,7 +1561,7 @@ def _deliver_antigravity_language_server(
 
 
 def _delegate_payload(
-    sid: str, text: str, mode: str, force_queue: bool
+    sid: str, text: str, mode: str, force_queue: bool, attr=None
 ) -> Dict[str, Any]:
     """Body for the delegate's /api/inject-input.
 
@@ -1573,6 +1576,9 @@ def _delegate_payload(
     payload: Dict[str, Any] = {
         "session_id": sid, "text": text, "mode": mode, "origin": "wt",
     }
+    attr = attr or envelope.from_text(text)
+    if attr and envelope.enabled("wt"):
+        payload.update(attr=attr, idempotency_key=attr["message_id"])
     if force_queue:
         payload["force_queue"] = True
     return payload
@@ -1592,7 +1598,7 @@ def _deliver_delegate(
     try:
         data = _post_json(
             base + "/api/inject-input",
-            _delegate_payload(sid, text, mode, force_queue),
+            _delegate_payload(sid, text, mode, force_queue, resolved.get("attr")),
             timeout_s=_delegate_timeout_s(delegate_timeout_s),
         )
     except Exception as e:  # noqa: BLE001 - any transport failure means fall through
@@ -1633,13 +1639,16 @@ def _continue_if_cold(resolved: Dict[str, Any], text: str) -> Optional[Dict[str,
         data = _post_json(
             base + "/api/sessions/spawn-continue-from",
             {"continue_from": str(decision.get("resolved_session_id") or sid),
-             "prompt": text},
+             "prompt": text, **({"attr": resolved.get("attr")} if envelope.enabled("wt") else {})},
             timeout_s=_delegate_timeout_s(None),
         )
     except Exception:  # noqa: BLE001 - fall back to the normal chain
         return None
     if not data.get("ok"):
         return None
+    if resolved.get("attr") and data.get("new_session_id"):
+        forwarded = envelope.relay(resolved["attr"], "continuation", delivered=data["new_session_id"])
+        envelope.journal(forwarded, app="wt", event="continuation")
     return {"ok": True, "transport": "continuation",
             "new_session_id": data.get("new_session_id"),
             "reason": decision.get("reason", "")}
@@ -1674,6 +1683,11 @@ def deliver(
     gets its receipt recorded *before* the send (the pre-send offset is what
     makes only a later nonce count); a failed send drops it."""
     sid = str(resolved.get("session_id") or "")
+    attr = resolved.get("attr") or envelope.from_text(text) or envelope.make(sid)
+    attr = envelope.relay(attr, "wt-deliver", delivered=sid)
+    resolved = dict(resolved, attr=attr)
+    text = envelope.carry(text, attr, app="wt")
+    envelope.journal(attr, app="wt", event="attempt")
     pre = _pre_send_receipt(resolved, text) if sid else None
     if live_only:
         result = _deliver_live_only(resolved, text)
@@ -1748,7 +1762,7 @@ def _deliver_uds(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
         return {"ok": False, "error": "uds needs a session_id"}
     try:
         from . import workers
-        result = workers.deliver_via_uds(sid, text, from_name="watchtower")
+        result = workers.deliver_via_uds(sid, text, from_name="watchtower", **({"attr": resolved["attr"]} if envelope.enabled("wt") and resolved.get("attr") else {}))
     except Exception as exc:  # noqa: BLE001 - fall through to legacy transports
         return {"ok": False, "error": f"uds: {exc}"}
     if not result:
@@ -1942,6 +1956,7 @@ def outbox_add(
     dedupe_key: str = "",
     ticket_gen: Optional[int] = None,
     prefer_uds: bool = False,
+    attr=None,
 ) -> Dict[str, Any]:
     """Append a pending message to the durable outbox. Locked + atomic.
 
@@ -1969,6 +1984,8 @@ def outbox_add(
         "last_error": str(error or ""),
         "status": "pending",
     }
+    attr = attr or envelope.from_text(text) or envelope.make(to)
+    msg.update(attr=attr, message_id=attr["message_id"])
     if ttl_s is not None:
         msg["expires_at"] = _iso(now + float(ttl_s))
     if engine:
@@ -2296,6 +2313,8 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             resolved = resolve_target(str(m.get("to") or ""), include_recent=False)
             if m.get("engine"):
                 resolved["engine"] = str(m["engine"])
+            resolved["attr"] = envelope.relay(
+                m.get("attr") or envelope.make(m.get("to", "")), "wt:outbox")
             # `notify` only when it is actually set: `deliver` is
             # monkeypatched by tests with the historical three-argument
             # signature, exactly as in `send`.
@@ -2408,6 +2427,8 @@ def send(
     dedupe_key: str = "",
     ticket_gen: Optional[int] = None,
     start_new_if_needed: bool = False,
+    attr=None,
+    _ledger_owned=False,
 ) -> Dict[str, Any]:
     """Resolve + deliver a message; on total delivery failure, park it in the
     outbox (unless ``queue_on_fail`` is False) for the daemon to retry.
@@ -2429,10 +2450,22 @@ def send(
     ``{"ok": False, "queued": True, "id": ...}`` when parked, and
     ``{"ok": False, "error": ...}`` for unresolvable targets or when queueing
     is disabled."""
+    attr = envelope.validate(attr) if attr is not None else envelope.make(target)
+    text = envelope.carry(text, attr, app="wt")
+    attribution_recorded = envelope.journal(attr, app="wt")
     try:
         resolved = resolve_target(target)
     except ValueError as e:
         return {"ok": False, "error": str(e)}
+    dedupe_key = dedupe_key or attr["message_id"]
+    owns_ledger = envelope.enabled("wt") and not _ledger_owned
+    if owns_ledger:
+        reserved = ledger_reserve(dedupe_key, ref=ticket_ref)
+        if reserved.get("action") == "sent":
+            return {"ok": True, "deduped": True, "transport": "ledger", "message_id": attr["message_id"], "attribution_v": 1}
+        if reserved.get("action") in ("queued", "in_flight"):
+            return {"ok": False, "deduped": True, "queued": reserved["action"] == "queued", "in_flight": reserved["action"] == "in_flight", "id": reserved.get("msg_id"), "message_id": attr["message_id"], "attribution_v": 1}
+    resolved["attr"] = attr
     if engine:
         resolved["engine"] = str(engine)
     # Only pass force_queue when it is actually set: `deliver` is monkeypatched
@@ -2452,7 +2485,7 @@ def send(
     if result is None:
         result = deliver(resolved, text, mode, **extra)
     if result.get("ok"):
-        out = {"ok": True, "transport": result.get("transport", "?")}
+        out = {"ok": True, "transport": result.get("transport", "?"), "message_id": attr["message_id"], "attr": attr, "attribution_v": 1, "attribution_recorded": attribution_recorded}
         if result.get("new_session_id"):
             out["new_session_id"] = result["new_session_id"]
         if result.get("log"):
@@ -2467,8 +2500,12 @@ def send(
         queue_mod._log(
             "SEND", f"{target} via {out['transport']}: {str(text)[:60]}"
         )
+        if owns_ledger:
+            ledger_mark(dedupe_key, "sent")
         return out
     if not queue_on_fail:
+        if owns_ledger:
+            ledger_release(dedupe_key)
         return {"ok": False, "queued": False,
                 "error": str(result.get("error") or "delivery failed")}
     delay = BUSY_HOLD_S if result.get("busy") else float(BACKOFF_BASE_S)
@@ -2478,6 +2515,7 @@ def send(
         error=str(result.get("error") or ""), delay_s=delay, ttl_s=ttl_s,
         engine=engine, notify=notify,
         ticket_ref=ticket_ref, ticket_session=ticket_session,
+        attr=attr,
         **({"prefer_uds": True} if prefer_uds else {}),
         **({"dedupe_key": dedupe_key} if dedupe_key else {}),
         **({"ticket_gen": ticket_gen} if ticket_gen is not None else {}),
@@ -2486,6 +2524,7 @@ def send(
         "ok": False,
         "queued": True,
         "id": msg["id"],
+        "message_id": attr["message_id"], "attribution_v": 1,
         "busy": bool(result.get("busy")),
         "error": str(result.get("error") or "delivery failed"),
     }
@@ -2591,6 +2630,7 @@ def deliver_message(
     ticket_session: str = "",
     dedupe_key: str = "",
     ticket_gen: Optional[int] = None,
+    attr=None,
 ) -> Dict[str, Any]:
     """One delivery entry point for every WT caller (CCC-1000 Phase 3).
 
@@ -2629,6 +2669,8 @@ def deliver_message(
     reservation elsewhere returns ``in_flight`` (try later). ``ticket_gen``
     binds a held row to the ticket's answer generation (R4-4).
     """
+    attr = envelope.validate(attr) if attr is not None else envelope.make(target)
+    dedupe_key = dedupe_key or attr["message_id"]
     verb = str(verb or "engine_default").strip().lower()
     if verb not in DELIVERY_VERBS:
         return {"ok": False, "error": f"unknown delivery verb: {verb!r}"}
@@ -2641,8 +2683,8 @@ def deliver_message(
         _deliver_abort(target)
     if await_reply:
         # ask() owns the reply-correlation protocol; nothing else here does.
-        return ask(target, text, timeout_ms=timeout_ms)
-    send_kwargs: Dict[str, Any] = {}
+        return ask(target, text, timeout_ms=timeout_ms, attr=attr)
+    send_kwargs: Dict[str, Any] = {"attr": attr, "_ledger_owned": True} if envelope.enabled("wt") else {}
     if delegate_timeout_s is not None:
         send_kwargs["delegate_timeout_s"] = delegate_timeout_s
     if ticket_ref:
@@ -2723,13 +2765,16 @@ def _deliver_abort(target: str) -> Dict[str, Any]:
             "aborted": True, "effect": "aborted"}
 
 
-def ask(target: str, text: str, timeout_ms: int = 30000) -> Dict[str, Any]:
+def ask(target: str, text: str, timeout_ms: int = 30000, *, attr=None) -> Dict[str, Any]:
     """Send a question and wait for the answer.
 
     fifo path: snapshot the live worker's log size, deliver over the FIFO,
     tail only the new bytes. resume path: same, tailing the fresh msg-*.log.
     delegate path: pass through to the delegate's ``/api/ask``. On deadline:
     ``{"ok": False, "error": "timeout", "partial": <accumulated text>}``."""
+    attr = envelope.validate(attr) if attr is not None else envelope.make(target)
+    text = envelope.carry(text, attr, app="wt")
+    envelope.journal(attr, app="wt", event="ask")
     try:
         resolved = resolve_target(target)
     except ValueError as e:
@@ -2759,7 +2804,7 @@ def ask(target: str, text: str, timeout_ms: int = 30000) -> Dict[str, Any]:
         try:
             data = _post_json(
                 base + "/api/ask",
-                {"session_id": sid, "text": text, "timeout_ms": timeout_ms},
+                {"session_id": sid, "text": text, "timeout_ms": timeout_ms, **({"attr": attr, "idempotency_key": attr["message_id"]} if envelope.enabled("wt") else {})},
                 timeout_s=timeout_ms / 1000.0 + 5,
             )
         except Exception as e:  # noqa: BLE001 - report, do not raise out of ask

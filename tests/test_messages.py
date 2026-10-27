@@ -2324,3 +2324,55 @@ def test_send_start_new_if_needed_warm_delivers_normally(monkeypatch):
     monkeypatch.setattr(messages, "deliver", lambda *a, **k: {"ok": True, "transport": "uds"})
     res = messages.send("sid-1", "hi", start_new_if_needed=True)
     assert res["transport"] == "uds"
+
+
+@pytest.mark.parametrize('receipt_outcomes,duplicates', [(['held'],1), (['unknown','delivered'],0), (['unknown','unknown'],1)])
+def test_envelope_uds_reconciliation_and_fallback(wt, monkeypatch, receipt_outcomes, duplicates):
+    from watchtower import sender_envelope as attr, peer_uds
+    monkeypatch.setenv('WT_ATTRIBUTION_EMIT','1')
+    monkeypatch.setenv('WT_UDS_RECONCILE_S','0')
+    monkeypatch.setattr(wt.messages,'resolve_target',lambda target,**kw: {'session_id':target,'engine':'claude'})
+    monkeypatch.setattr(wt.workers,'_find_claude_session_row',lambda sid: {'pid':os.getpid()})
+    monkeypatch.setattr(peer_uds,'resolve_target',lambda row: {'ok':True,'pid':os.getpid(),'socket_path':'test.sock'})
+    monkeypatch.setattr(peer_uds,'load_peer_token',lambda *a: '')
+    frames=[]
+    monkeypatch.setattr(peer_uds,'send_lines',lambda sock,lines: frames.extend(json.loads(line) for line in lines) or {'ok':True})
+    monkeypatch.setattr(wt.workers,'_claude_transcript_bytes',lambda sid: 0)
+    outcomes=iter(receipt_outcomes)
+    monkeypatch.setattr(wt.workers,'_uds_delivery_receipt',lambda *a,**k: next(outcomes))
+    fallbacks=[]
+    monkeypatch.setattr(wt.messages,'_deliver_fifo',lambda resolved,text: fallbacks.append((resolved,text)) or {'ok':True,'transport':'fifo'})
+    a=attr.service('wt:reconciler',SID_B)
+    result=wt.messages.send(SID_B,'review',prefer_uds=True,queue_on_fail=False,attr=a)
+    assert result['ok']
+    assert result['message_id']==a['message_id']
+    user=next(frame for frame in frames if frame.get('type')=='user')
+    assert user['msg_id']==a['message_id']
+    assert len(fallbacks)==duplicates
+    if fallbacks:
+        assert attr.from_text(fallbacks[0][1])['message_id']==a['message_id']
+    rows=[json.loads(line) for p in (Path(os.environ['WATCHTOWER_STATE_DIR'])/'attribution').glob('*.jsonl') for line in p.read_text().splitlines()]
+    assert sum(row['event']=='possible_duplicate' for row in rows)==duplicates
+    # Replaying an already successful send never sends another frame.
+    assert wt.messages.send(SID_B,'review',prefer_uds=True,attr=a)['deduped']
+    assert len([f for f in frames if f.get('type')=='user'])==1
+
+
+def test_envelope_park_restart_drain_keeps_logical_id(wt,monkeypatch):
+    from watchtower import sender_envelope as attr
+    monkeypatch.setenv('WT_ATTRIBUTION_EMIT','1')
+    seen=[]
+    monkeypatch.setattr(wt.messages,'resolve_target',lambda target,**kw: {'session_id':target,'engine':'claude'})
+    def deliver(resolved,text,mode='send',**kw):
+        seen.append(resolved['attr']['message_id'])
+        return {'ok':len(seen)>1,'transport':'fifo','error':'offline'}
+    monkeypatch.setattr(wt.messages,'deliver',deliver)
+    a=attr.service('wt:notify',SID_B)
+    parked=wt.messages.send(SID_B,'notice',attr=a)
+    assert parked['queued']
+    row=wt.messages.outbox_list()[0]
+    assert row['id']!=a['message_id'] and row['message_id']==a['message_id']
+    attr._cache.clear() # Simulate a restarted reader: only disk state survives.
+    wt.messages.drain_outbox(now=time.time()+120)
+    assert seen==[a['message_id'],a['message_id']]
+    assert attr.lookup(message_id=a['message_id'])['author']['id']=='wt:notify'

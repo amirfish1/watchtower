@@ -1454,6 +1454,10 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
     command's argument), so it is always ``unverified``."""
     from . import receipts
     from . import workers
+    from . import sender_envelope as envelope
+    attr = envelope.service("wt:" + str(purpose), target, from_name)
+    envelope.journal(attr, app="wt", event="liveness")
+    text = envelope.carry(text, attr, app="wt")
     now = time.time()
     purpose = str(purpose)
     if purpose not in DELIVERY_PURPOSES:
@@ -1463,7 +1467,7 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
     slash = bool(workers._SLASH_COMMAND_RE.match(str(text or "")))
     nonce = "" if slash else receipts.make_nonce(did)
     body = str(text) if slash else receipts.with_nonce(text, nonce)
-    row = {"delivery_id": did, "purpose": purpose, "dedupe_key": str(dedupe_key),
+    row = {"attr": attr, "message_id": attr["message_id"], "delivery_id": did, "purpose": purpose, "dedupe_key": str(dedupe_key),
            "target": str(target or ""), "sid": str(session_id or ""), "engine": engine,
            "ref": str(ref or ""), "queue": str(queue or ""), "worker_id": str(worker_id or ""),
            "nonce": nonce, "receipt_id": "", "sent_at": now, "attempts": int(attempt),
@@ -1500,7 +1504,7 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
             rec = _pre_receipt(sid, engine, body, nonce, did, "uds")
             try:
                 got = (uds_fn(body) if uds_fn is not None
-                       else workers.deliver_via_uds(sid, body, from_name=from_name))
+                       else workers.deliver_via_uds(sid, body, from_name=from_name, **({"attr": attr} if envelope.enabled("wt") else {})))
             except Exception as exc:  # noqa: BLE001 - fall through
                 got, errors = None, errors + [f"uds: {exc}"]
             if got:
@@ -1531,6 +1535,8 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
                 continue
             from . import messages
             kw = dict(message or {})
+            if envelope.enabled("wt"):
+                kw["attr"] = attr
             fn = kw.pop("fn", "deliver_message")
             try:
                 res = (messages.send(target, body, **kw) if fn == "send"

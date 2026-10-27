@@ -162,6 +162,11 @@ def record(
         "status": "pending",
         "verified_at": None,
     }
+    from . import sender_envelope as envelope
+    attr = envelope.from_text(text)
+    if attr:
+        rec.update(attr=attr, message_id=attr["message_id"])
+        envelope.journal(attr, app="wt", event="receipt", receipt_id=rec["id"], nonce=nonce, delivery_id=delivery_id)
     if nonce:
         rec["nonce"] = str(nonce)
         rec["offset"] = int(at_send.get("size") or 0)

@@ -472,3 +472,19 @@ def instant_daemon(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True)
 def no_spawn_stagger(monkeypatch):
     monkeypatch.setenv("WATCHTOWER_SPAWN_STAGGER_S", "0")
+
+
+@pytest.fixture(autouse=True)
+def isolated_attribution_state(tmp_path, monkeypatch):
+    """Legacy transport suites exercise the rollback mode; envelope tests opt in."""
+    monkeypatch.setenv("WATCHTOWER_STATE_DIR", str(tmp_path / "wt-state"))
+    monkeypatch.setenv("CCC_STATE_DIR", str(tmp_path / "ccc-state"))
+    monkeypatch.setenv("WT_ATTRIBUTION_EMIT", "0")
+    monkeypatch.setenv("WT_UDS_RECONCILE_S", "0")
+
+
+@pytest.fixture(autouse=True)
+def isolated_engine_ancestry(monkeypatch):
+    """Synthetic identity tests must not see the developer agent ancestry."""
+    from watchtower import sender_envelope
+    monkeypatch.setattr(sender_envelope, "_nearest_engine", lambda: "")

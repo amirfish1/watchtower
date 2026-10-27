@@ -222,7 +222,7 @@ def _deliver(item: Dict[str, Any], pa: Dict[str, Any]) -> Dict[str, Any]:
 def _wake(item: Dict[str, Any], pa: Dict[str, Any]) -> None:
     """Tell an alive parked worker its answer is waiting. Binds nothing: if it
     is lost, the worker's next claim or the affinity expiry covers it."""
-    from . import messages
+    from . import messages, sender_envelope as envelope
     ref = item["ref"]
     sid = str(pa.get("prior_session_id") or "")
     target = sid or str(pa.get("prior_worker_id") or "")
@@ -233,6 +233,7 @@ def _wake(item: Dict[str, Any], pa: Dict[str, Any]) -> None:
             target,
             f"Answer for {ref} arrived; when done (or now if idle) run "
             f"`wt claim -q {item.get('project', '')} --worker {pa.get('prior_worker_id', '<your-id>')} --json`.",
+            **({"attr": envelope.service("wt:notify", target)} if envelope.enabled("wt") else {}),
             verb="steer", on_busy="hold", expire=affinity_s(),
             dedupe_key=wake_key(ref, pa["gen"]))
     except Exception:  # noqa: BLE001

@@ -1454,7 +1454,9 @@ def _notify_ticket_event(
         except Exception:
             deliver_target = target
         try:
-            messages.send(deliver_target, text, notify=True, start_new_if_needed=True)
+            from . import sender_envelope as envelope
+            messages.send(deliver_target, text, notify=True, start_new_if_needed=True,
+                          **({"attr": envelope.service("wt:notify", deliver_target)} if envelope.enabled("wt") else {}))
         except Exception:
             pass  # best-effort -- a delivery hiccup never fails the transition
 

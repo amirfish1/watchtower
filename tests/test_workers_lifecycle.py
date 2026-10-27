@@ -5387,3 +5387,22 @@ def test_session_active_age_flags_dead_pid_row_whose_session_still_writes(wt, tm
     assert workers.session_active_age_s(row, [row, owner], now=now) is None
     os.utime(t, (now - 3600, now - 3600))
     assert workers.session_active_age_s(row, [row], now=now) is None  # quiet
+
+
+def test_session_liveness_accepts_numeric_and_asctime_tokens(wt,monkeypatch):
+    w=wt.workers
+    pid=os.getpid()
+    token=Path(f'/proc/{pid}/stat').read_text().rsplit(')',1)[1].split()[19]
+    assert w.claude_session_row_liveness({'pid':pid,'procStart':token})[0]=='alive'
+    date=w._pid_start_token(pid,utc=True)
+    assert w.claude_session_row_liveness({'pid':pid,'procStart':date})[0]=='alive'
+    assert w.claude_session_row_liveness({'pid':pid,'procStart':str(int(token)+1)})[0]=='dead'
+    assert w.claude_session_row_liveness({'pid':pid,'procStart':token,'started_at':'2000-01-01T00:00:00Z'})[0]=='dead'
+
+
+def test_spawn_drops_one_shot_envelope(wt,monkeypatch):
+    monkeypatch.setenv('WT_MESSAGE_ENVELOPE','parent-envelope')
+    monkeypatch.setenv('CLAUDE_CODE_SESSION_ID','parent-session')
+    monkeypatch.setenv('CODEX_THREAD_ID','parent-codex')
+    env=wt.workers._spawn_env('new-child')
+    assert not any(k in env for k in ('WT_MESSAGE_ENVELOPE','CLAUDE_CODE_SESSION_ID','CODEX_THREAD_ID'))

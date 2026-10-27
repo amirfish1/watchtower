@@ -1814,7 +1814,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(400, {"error": "to and text are required"})
                 return
             from . import messages
-            res = messages.send(to, text, mode=str(data.get("mode") or "send"))
+            from . import sender_envelope as envelope
+            res = messages.send(to, text, mode=str(data.get("mode") or "send"), **({"attr": envelope.request_attr(data, to)} if envelope.enabled("wt") else {}))
             self._json(200, res)
             return
         # POST /api/ask: {"to", "text", "timeout_ms"} -> messages.ask
@@ -1836,7 +1837,8 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             from . import messages
             timeout_ms = int(data.get("timeout_ms") or 30000)
-            res = messages.ask(to, text, timeout_ms=timeout_ms)
+            from . import sender_envelope as envelope
+            res = messages.ask(to, text, timeout_ms=timeout_ms, **({"attr": envelope.request_attr(data, to)} if envelope.enabled("wt") else {}))
             self._json(200 if res.get("ok") else 504, res)
             return
         # POST /api/chat/create: {"topic", "participants", "include_human"}

@@ -192,7 +192,7 @@ def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "
     # but engines that set neither (devin) inherited the spawner's, so their
     # `wt claim` recorded the spawner's session as claimed_session_id and a
     # later `wt answer` was delivered to the wrong session (CCC-1153).
-    for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID"):
+    for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "WT_MESSAGE_ENVELOPE"):
         env.pop(key, None)
     env["WT_WORKER_COMMIT"] = "1"
     env.pop("WT_VERIFY", None)
@@ -1676,7 +1676,7 @@ _SLASH_COMMAND_RE = re.compile(
 
 
 def deliver_via_uds(
-    session_id: str, text: str, *, from_name: str = "watchtower"
+    session_id: str, text: str, *, from_name: str = "watchtower", attr=None
 ) -> Optional[Dict[str, Any]]:
     """Deliver `text` to a Claude session over its native peer socket.
 
@@ -1719,11 +1719,21 @@ def deliver_via_uds(
     token = peer_uds.load_peer_token(
         claude_home / "sessions", target["pid"], target["socket_path"]
     )
-    msg_id = str(uuid.uuid4())
+    from . import sender_envelope as envelope
+    attr = attr or envelope.from_text(text) or envelope.service("wt:release" if "reconciler" in from_name else "wt:notify", session_id, from_name)
+    attr = envelope.relay(attr, "wt-uds", attested_mode="bypass", delivered=session_id)
+    msg_id = attr["message_id"]
+    from_name = attr["author"].get("name_at_send") or "Unattributed sender"
+    text = envelope.carry(text, attr, app="wt")
+    envelope.journal(attr, app="wt", event="transport", transport_id=msg_id)
+    reply_addr = str((attr.get("reply_to") or {}).get("addr") or "") if envelope.enabled("wt") else ""
+    if not reply_addr.startswith("uds:"):
+        reply_addr = ""
     try:
         lines = peer_uds.build_frame_lines(
-            peer_uds.wrap(text, from_name=from_name, from_mode="bypass"),
+            peer_uds.wrap(text, from_addr=reply_addr, from_name=from_name, from_mode="bypass"),
             token=token,
+            from_addr=reply_addr,
             msg_id=msg_id,
         )
     except ValueError:
@@ -1733,7 +1743,14 @@ def deliver_via_uds(
     if not result.get("ok"):
         return None
     verdict = _uds_delivery_receipt(session_id, msg_id, text, start_offset)
+    if verdict == "unknown":
+        try:
+            window = max(0, min(60, float(os.environ.get("WT_UDS_RECONCILE_S", "30"))))
+        except ValueError:
+            window = 30
+        verdict = _uds_delivery_receipt(session_id, msg_id, text, start_offset, timeout_s=window)
     if verdict not in ("delivered", "queued"):
+        envelope.journal(attr, app="wt", event="possible_duplicate", reason=verdict, transport_id=msg_id)
         print(
             f"[watchtower] uds send to {session_id} reported ok but "
             f"receipt verdict={verdict!r} -- falling back",
@@ -4166,8 +4183,16 @@ def claude_session_row_liveness(row: Dict[str, Any]) -> Tuple[str, str]:
     pid = int((row or {}).get("pid") or 0)
     if not pid or not _pid_alive(pid):
         return "dead", "registry pid gone"
+    if started_before_boot(row):
+        return "dead", "registry row predates current boot"
     proc_start = " ".join(str(row.get("procStart") or "").split())
-    if proc_start:
+    if proc_start.isdigit() and sys.platform.startswith("linux"):
+        try:
+            # /proc starttime is field 22; comm may itself contain spaces.
+            cur = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        except (OSError, IndexError):
+            cur = ""
+    elif proc_start:
         cur = " ".join(_pid_start_token(pid, utc=True).split())
     else:
         proc_start = " ".join(str(row.get("pid_started") or "").split())
