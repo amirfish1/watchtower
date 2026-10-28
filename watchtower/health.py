@@ -55,6 +55,38 @@ def _last_event_at(it: Dict[str, Any], stage_only: bool = False) -> Optional[str
     return best
 
 
+# History events that cannot put a ticket back into the claim pool, so they
+# don't restart its claimable clock (WT-22). ``filed`` is ``created_at``.
+_NOT_READINESS_EVENTS = ("filed", "comment", "possible_duplicate", "duplicate_link",
+                         "duplicate_result", "duplicate_clear")
+
+
+def _fmt_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _claimable_since(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
+                     now_ts: float) -> Optional[str]:
+    """ISO time a currently claimable ticket entered the claim pool (WT-22):
+    the latest of its filing, an expired defer or answer-affinity window, a
+    blocker's close, and any history event that could release it (reopen,
+    answer, release, edit, plan step). A ticket waking from a defer is not
+    "work waiting since it was filed"."""
+    stamps = [it.get("created_at")]
+    for until in (it.get("deferred_until"),
+                  (it.get("pending_answer") or {}).get("affinity_until")):
+        if until and 0 < q._iso_ts(until) <= now_ts:
+            stamps.append(_fmt_iso(q._iso_ts(until)))
+    for b in it.get("blocked_by") or []:
+        stamps.append((by_ref.get(str(b)) or {}).get("closed_at"))
+    for h in it.get("history") or []:
+        if (isinstance(h, dict) and isinstance(h.get("at"), str)
+                and h.get("event") not in _NOT_READINESS_EVENTS):
+            stamps.append(h["at"])
+    return max((s for s in stamps if isinstance(s, str) and _parse_iso(s)),
+               default=None)
+
+
 def stage_stuck_after_s(stuck_minutes: int = STUCK_MINUTES) -> float:
     """A stage-owned ticket with no stage event for this long reads stuck:
     past the stage idle limit (plus a tick), never sooner than the queue rule."""
@@ -127,8 +159,12 @@ def queue_status(
     claim_types: Optional[List[str]] = None,
     waiting_refs: Optional[set] = None,
     worker_model: Optional[str] = None,
+    by_ref: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Compute the status row for a single queue from its items.
+
+    ``by_ref``: every ticket by ref (all queues), so a cross-queue blocker's
+    close time can date when its dependant became claimable (WT-22).
 
     ``waiting_refs``: refs of open tickets held back by an unsatisfied
     ``blocked_by`` dependency (WT-4). They count toward ``depth`` but not
@@ -195,10 +231,13 @@ def queue_status(
         default=None,
     )
     oldest_open_age = _age_seconds(oldest_created, now)
-    # Age of the oldest ticket a worker could actually claim: a long-gated
-    # ticket beside a minutes-old claimable one is not "work waiting 6h".
+    # Age of the oldest ticket a worker could actually claim, measured from
+    # when it became claimable: a long-gated ticket beside a minutes-old
+    # claimable one is not "work waiting 6h", and neither is a ticket whose
+    # defer expired a minute ago (WT-22).
+    refs = by_ref if by_ref is not None else q._refs_index(items)
     oldest_claimable_age = _age_seconds(min(
-        (it.get("created_at") for it in claimable_open if it.get("created_at")),
+        (s for s in (_claimable_since(it, refs, now_ts) for it in claimable_open) if s),
         default=None,
     ), now)
 
@@ -237,10 +276,16 @@ def queue_status(
         stage_age = _age_seconds(last_stage, now)
         stage_stuck = stage_age is not None and stage_age >= stage_stuck_after_s(stuck_minutes)
 
+    # WT-22: since_progress is queue-wide, so a quiet queue read stuck the
+    # instant a ticket woke from a defer or was filed. The oldest claimable
+    # ticket must also have waited the whole window (undated tickets fall
+    # back to the queue-wide rule).
     stuck = bool(
         claimable_depth > 0
         and since_progress is not None
         and since_progress >= stuck_minutes * 60
+        and (oldest_claimable_age is None
+             or oldest_claimable_age >= stuck_minutes * 60)
     )
 
     # Drain rate: closes within the recent window / window minutes => closes/min.
@@ -378,6 +423,7 @@ def all_status(
             auto_drain=config.auto_drain(name),
             claim_types=config.claim_types(name),
             worker_model=config.queue_model_id(name) or None,
+            by_ref=by_ref,
         )
         for name, items in by_queue.items()
     ]

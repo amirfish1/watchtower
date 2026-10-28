@@ -154,3 +154,45 @@ def test_deferred_ticket_is_claimable_only_after_its_window():
     assert row["stuck"] is False
     row = health.queue_status("Q", [dict(waiting, deferred_until=earlier)])
     assert row["claimable_depth"] == 1
+
+
+def _stamp(now, delta):
+    return (now - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_expired_defer_inside_window_is_not_stuck():
+    """WT-22: a ticket whose defer expired seconds ago, in a queue quiet for
+    27m, has not been claimable long enough to call the queue stuck."""
+    now = datetime.now(timezone.utc)
+    it = _item(created_at=_stamp(now, timedelta(hours=2)))
+    it["deferred_until"] = _stamp(now, timedelta(seconds=14))
+    it["history"] = [{"event": "defer", "at": _stamp(now, timedelta(minutes=27))}]
+    row = health.queue_status("Q", [it], now=now)
+    assert row["claimable_depth"] == 1
+    assert row["since_progress_s"] >= 27 * 60
+    assert row["oldest_claimable_age_s"] == 14
+    assert row["stuck"] is False
+    assert row["state"] == "active"
+    # Once it has waited the whole window, the alarm is real again.
+    later = now + timedelta(minutes=health.STUCK_MINUTES)
+    assert health.queue_status("Q", [it], now=later)["stuck"] is True
+
+
+def test_ticket_released_by_cross_queue_blocker_close_is_not_stuck():
+    now = datetime.now(timezone.utc)
+    it = _item(created_at=_stamp(now, timedelta(hours=1)))
+    it["ref"], it["blocked_by"] = "Q-2", ["OTHER-1"]
+    blocker = {"ref": "OTHER-1", "status": "closed",
+               "closed_at": _stamp(now, timedelta(minutes=1))}
+    row = health.queue_status("Q", [it], now=now, by_ref={"OTHER-1": blocker})
+    assert row["stuck"] is False
+    assert row["oldest_claimable_age_s"] == 60
+
+
+def test_reopen_restarts_claimable_clock_but_comment_does_not():
+    now = datetime.now(timezone.utc)
+    it = _item(created_at=_stamp(now, timedelta(hours=1)))
+    it["history"] = [{"event": "comment", "at": _stamp(now, timedelta(minutes=1))}]
+    assert health.queue_status("Q", [it], now=now)["stuck"] is True
+    it["history"].append({"event": "reopen", "at": _stamp(now, timedelta(minutes=2))})
+    assert health.queue_status("Q", [it], now=now)["stuck"] is False
