@@ -12,6 +12,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import select
 import stat
 import sys
 import threading
@@ -123,9 +124,17 @@ def _live_worker(wt, queue, *, session_id=""):
 
 
 def _read_fifo_msg(wt):
-    """Read one stream-json user line back off the most recent worker FIFO."""
-    data = os.read(wt._readers[-1], 65536).decode()
-    return json.loads(data.strip().splitlines()[-1])
+    """Read complete newline-framed JSON, even when an OS read is partial."""
+    data = bytearray()
+    deadline = time.monotonic() + 5
+    while not data.endswith(b"\n"):
+        remaining = deadline - time.monotonic()
+        assert remaining > 0, "FIFO frame did not complete"
+        assert select.select([wt._readers[-1]], [], [], remaining)[0], "FIFO read timed out"
+        chunk = os.read(wt._readers[-1], 65536)
+        assert chunk, "FIFO closed before completing the frame"
+        data.extend(chunk)
+    return json.loads(data.decode().strip().splitlines()[-1])
 
 
 def _disable_resume(wt, monkeypatch):
@@ -2376,3 +2385,31 @@ def test_envelope_park_restart_drain_keeps_logical_id(wt,monkeypatch):
     wt.messages.drain_outbox(now=time.time()+120)
     assert seen==[a['message_id'],a['message_id']]
     assert attr.lookup(message_id=a['message_id'])['author']['id']=='wt:notify'
+
+
+def test_concurrent_large_fifo_frames_remain_distinct(wt):
+    """Short-write retries must not interleave two newline-framed messages."""
+    from concurrent.futures import ThreadPoolExecutor
+    import fcntl
+
+    recipient = _live_worker(wt, "SUB")
+    fd = wt._readers[-1]
+    if hasattr(fcntl, "F_SETPIPE_SZ"):
+        fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, 4096)
+    texts = ["a" * 20000, "b" * 20000]
+
+    def read_frames():
+        data = bytearray()
+        deadline = time.monotonic() + 5
+        while data.count(b"\n") < 2:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0
+            assert select.select([fd], [], [], remaining)[0]
+            data.extend(os.read(fd, 65536))
+        return [json.loads(line)["message"]["content"][0]["text"] for line in data.splitlines()]
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        received = pool.submit(read_frames)
+        sent = [pool.submit(wt.workers.write_to_worker_fifo, recipient["fifo"], text) for text in texts]
+        assert all(result.result(timeout=6) for result in sent)
+        assert sorted(received.result(timeout=6)) == texts

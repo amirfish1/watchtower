@@ -22,6 +22,7 @@ import glob as _glob
 import hashlib
 import os
 import re
+import select
 import shlex
 import shutil
 import stat
@@ -797,18 +798,45 @@ def worker_turn_open(w: Dict[str, Any]) -> bool:
 
 
 def _write_fifo_frame(fifo_path: str, line: bytes) -> bool:
-    """Write one raw stream-json frame to a live worker's FIFO. Returns True on
-    delivery, False if the worker isn't listening (no reader / closed)."""
-    fd = _open_fifo_writer(fifo_path)
-    if fd is None:
+    """Write a complete frame, serializing writers and bounding backpressure."""
+    if not fifo_path:
         return False
+    fd = lock_fd = None
+    deadline = time.monotonic() + 1.0
     try:
-        os.write(fd, line)
+        # macOS cannot flock a FIFO itself. A sibling file serializes complete
+        # frames across processes, including frames larger than PIPE_BUF.
+        lock_fd = os.open(f"{fifo_path}.write.lock", os.O_CREAT | os.O_WRONLY | os.O_CLOEXEC, 0o600)
+        if fcntl is not None:
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return False
+                    time.sleep(0.01)
+        fd = _open_fifo_writer(fifo_path)
+        if fd is None:
+            return False
+        remaining = memoryview(line)
+        while remaining:
+            if time.monotonic() >= deadline:
+                return False
+            try:
+                written = os.write(fd, remaining)
+            except BlockingIOError:
+                select.select([], [fd], [], max(0, deadline - time.monotonic()))
+                continue
+            if written <= 0:
+                return False
+            remaining = remaining[written:]
         return True
     except OSError:
         return False
     finally:
         _close_fd_quiet(fd)
+        _close_fd_quiet(lock_fd)
 
 
 def write_to_worker_fifo(fifo_path: str, text: str, engine: str = "claude") -> bool:

@@ -5389,6 +5389,7 @@ def test_session_active_age_flags_dead_pid_row_whose_session_still_writes(wt, tm
     assert workers.session_active_age_s(row, [row], now=now) is None  # quiet
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="numeric process tokens require Linux /proc")
 def test_session_liveness_accepts_numeric_and_asctime_tokens(wt,monkeypatch):
     w=wt.workers
     pid=os.getpid()

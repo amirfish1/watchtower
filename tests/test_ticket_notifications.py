@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -161,22 +162,26 @@ def test_long_actionable_notice_arrives_intact_over_real_fifo(
     monkeypatch.setattr(wt.messages, "ccc_forward_target", lambda target: target)
     item = wt.q.enqueue(project="SUB", note="long notice", submitter=recipient["worker_id"])
     wt.q.claim_by_ref(item["ref"], "worker-a")
-    # Original BYM-FUTURE-2419 decision, recovered from its worker log.
     detail = (
-        'Owner approval needed before spending tokens (the ticket requires it). OK to run: '
-        '(1) becky:eval before/after on 39b18cf90/f523b830b with '
-        '--model=openrouter:openai/gpt-6-luna (Luna replies plus one Sonnet grader call per '
-        'finding); (2) about 7 sibling replays via replay-fixture.ts; (3) 5 repeats of the '
-        "'\\$816 or \\$812?' run? Reply 'go' (and any token or cost cap) and the worker will "
-        'run them, fix the prompt if the question recurs, and report the score change.'
+        'Approval needed before running the evaluation. Compare the two builds '
+        'with --model=example-model; replay seven fixtures and repeat the '
+        "'\\$816 or \\$812?' case five times. Reply 'go' with a cost cap and "
+        'the worker will run the checks and report the score change.'
     )
     if long_unicode:
         detail = "אפשרות א: לשמור את ההיסטוריה.\n" * 100
-    if event == "needs_input":
-        wt.q.block(item["ref"], session_id="worker-a", question=detail)
-    else:
-        wt.q.close(item["ref"], "worker-a", resolution={"summary": detail})
-    received = _read_fifo_msg(wt)["message"]["content"][0]["text"]
+    # Real workers drain concurrently. A small Linux pipe also exercises the
+    # short writes that naturally occur with macOS's smaller FIFO capacity.
+    import fcntl
+    if hasattr(fcntl, "F_SETPIPE_SZ"):
+        fcntl.fcntl(wt._readers[-1], fcntl.F_SETPIPE_SZ, 4096)
+    with ThreadPoolExecutor(max_workers=1) as reader:
+        frame = reader.submit(_read_fifo_msg, wt)
+        if event == "needs_input":
+            wt.q.block(item["ref"], session_id="worker-a", question=detail)
+        else:
+            wt.q.close(item["ref"], "worker-a", resolution={"summary": detail})
+        received = frame.result(timeout=6)["message"]["content"][0]["text"]
     assert received == f"[watchtower] {item['ref']} {wt.q._NOTIFY_VERBS[event]} — {detail}"
 
 

@@ -101,8 +101,13 @@ if ! gh auth status >/dev/null 2>&1; then
   [ "$DRY_RUN" = 1 ] && warn "gh is not authenticated (fine for --dry-run)" || die "gh not authenticated"
 fi
 
-# ── 1. Version bump (lockstep) ──────────────────────────────────────────────
-step "1/5  Bump version in pyproject.toml + watchtower/__init__.py"
+# ── 1. Tests ────────────────────────────────────────────────────────────────
+# A tag is permanent; a red suite at tag time is not worth the five minutes saved.
+step "1/5  Run the test suite"
+run "python3 -m pytest -q"
+
+# ── 2. Version bump (lockstep) ──────────────────────────────────────────────
+step "2/5  Bump version in pyproject.toml + watchtower/__init__.py"
 run "sed_i 's/^version = \".*\"/version = \"${VERSION}\"/' pyproject.toml"
 run "sed_i 's/^__version__ = \".*\"/__version__ = \"${VERSION}\"/' watchtower/__init__.py"
 if [ "$DRY_RUN" = 0 ]; then
@@ -110,11 +115,6 @@ if [ "$DRY_RUN" = 0 ]; then
     && grep -q "^__version__ = \"${VERSION}\"" watchtower/__init__.py \
     || die "version bump verification failed — pyproject.toml and __init__.py disagree"
 fi
-
-# ── 2. Tests ────────────────────────────────────────────────────────────────
-# A tag is permanent; a red suite at tag time is not worth the five minutes saved.
-step "2/5  Run the test suite"
-run "python3 -m pytest -q"
 
 # ── 3. Commit ───────────────────────────────────────────────────────────────
 step "3/5  Commit the version bump"
