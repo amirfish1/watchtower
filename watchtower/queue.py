@@ -2958,6 +2958,18 @@ def backfill_session_id(ident: Any, session_id: str) -> Optional[Dict[str, Any]]
     return None
 
 
+def claim_expect_holds(item: Dict[str, Any], expect: Any) -> bool:
+    """WT-39: may a write fenced on ``expect`` go ahead against ``item`` (the
+    fresh read)? Only if ``expect`` is a dict naming a claim (a claimer or a
+    session) and every field still matches. A malformed or identity-less
+    fence cannot tell one claim from another, so it refuses."""
+    if not isinstance(expect, dict):
+        return False
+    if not (expect.get("claimed_by") or expect.get("claimed_session_id")):
+        return False
+    return all(item.get(k) == v for k, v in expect.items())
+
+
 def update_status(
     ident: Any,
     status: str,
@@ -2975,8 +2987,16 @@ def update_status(
     orphan: Optional[Dict[str, str]] = None,
     close_owner: str = "",
     group_force: bool = False,
+    expect: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """``group_force`` (WT-33 D9): taking a closed group child out of
+    """``expect`` (WT-39): fields the current item must still carry, checked
+    alongside ``require_status`` (on GitHub, against the fresh read under the
+    body lock); a mismatch, or a fence naming no claimer and no session
+    (``claim_expect_holds``), makes the write a no-op returning None. The orphan
+    sweep passes the claim identity it judged dead, so a claim taken over
+    since -- e.g. by a live worker on another host -- is never reopened.
+
+    ``group_force`` (WT-33 D9): taking a closed group child out of
     ``closed`` while its parent integrates raises ``GroupChildLocked`` unless
     set, which invalidates that integration in the same write. A group parent
     never moves through here (its plan and integration own its status); a
@@ -3043,6 +3063,7 @@ def update_status(
             reason=reason,
             expect_owner=expect_owner,
             require_status=require_status,
+            expect=expect,
         )
         if item:
             verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
@@ -3067,6 +3088,8 @@ def update_status(
         for it in data["items"]:
             if _matches(it, ident):
                 if require_status is not None and it.get("status") != require_status:
+                    return None
+                if expect is not None and not claim_expect_holds(it, expect):
                     return None
                 # Ownership guard for close (see expect_owner docstring). Runs
                 # inside the lock against the fresh item, so it's race-free with
@@ -7464,8 +7487,8 @@ def recover_claim(ident: Any, *, expect: Dict[str, Any], action: str, reason: st
     ``mark`` (record only; the caller acts). Every applied action writes
     ``backstop = {state, action, count, at, fingerprint}`` (the post-write
     fingerprint the loop guard compares) and a ``backstop`` history event in
-    the same step. Local store only (a GitHub-backed ticket escalates through
-    ``block``)."""
+    the same step. Local store only (a GitHub-backed claim is routed to an
+    explicit recovery request, ``liveness._route_owner_host``, WT-39)."""
     if action not in RECOVER_ACTIONS:
         raise ValueError(f"action must be one of {RECOVER_ACTIONS}")
     if _github_backend_for_project(_project_from_ident(ident)) is not None:
