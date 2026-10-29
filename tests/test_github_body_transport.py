@@ -182,9 +182,12 @@ def test_body_over_the_single_argument_limit_reaches_gh_byte_exact(gh, backend, 
                                 "--repo", REPO, "--title", "T é"]
 
 
-def test_edit_body_round_trip_keeps_extra_args_and_full_history(gh, backend):
+def test_edit_body_round_trip_keeps_extra_args_and_full_history(gh, backend, monkeypatch):
     """The exact production path: `_edit_body` writes, re-reads via view, and
     finds nothing to re-apply because every byte landed."""
+    # Transport only: this body is past GitHub's own cap, which WT-44's
+    # guard enforces before writing (tests/test_github_body_capacity.py).
+    monkeypatch.setattr(github_backend, "_ISSUE_BODY_MAX_BYTES", 1 << 30)
     history = _tricky(3 * _arg_limit())
     item = {"number": 12, "_github_body": "", "text": ""}
     conflicts = backend._edit_body(item, history, {"status": "open"}, "--title", "New")

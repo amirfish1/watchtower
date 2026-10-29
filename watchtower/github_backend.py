@@ -1348,6 +1348,119 @@ def _append_history(meta: Dict[str, Any], event: str, **fields: Any) -> None:
     meta["history"] = hist
 
 
+# Issue-body capacity (WT-44). GitHub rejects an issue body past 262,144 bytes
+# with "GraphQL: Body is too long (updateIssue)": BECKY-2966's 256,520-byte body
+# took a short answer and refused a 6.5 KB one, 248 KB of it answer/comment
+# history carrying each text in full. Those texts are also posted as issue
+# comments, so the history keeps a bounded excerpt plus the comment's
+# reference and the full text's sha256/length; the comment is the durable copy.
+_ISSUE_BODY_MAX_BYTES = 262144
+# Writes stop short of the hard cap: a concurrent writer's re-apply
+# (_merge_body_write) appends its own entries on top of ours.
+_ISSUE_BODY_BUDGET_BYTES = 250000
+_COMMENT_MAX_CHARS = 65536
+_HISTORY_TEXT_INLINE_MAX = 1000
+_COMMENTED_EVENTS = ("answer", "comment")
+_ENTRY_MARKER = "\n\n<!-- watchtower-entry: {} -->"
+_ENTRY_MARKER_RE = re.compile(r"\n\n<!-- watchtower-entry: ([0-9a-f]{16}) -->\s*$")
+_TEXT_REF_KEYS = ("text", "text_len", "text_sha256", "text_ref")
+
+
+def _text_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _body_bytes(raw: str) -> int:
+    return len(raw.encode("utf-8"))
+
+
+def _strip_entry_marker(body: str) -> "tuple[str, str]":
+    """(comment text without its WT-44 entry marker, marker key or "")."""
+    match = _ENTRY_MARKER_RE.search(body or "")
+    if not match:
+        return body or "", ""
+    return body[:match.start()], match.group(1)
+
+
+def _comment_ref(comment: Dict[str, Any]) -> str:
+    return str(comment.get("url") or comment.get("id") or "").strip()
+
+
+def _entry_key(number: str, event: str, meta: Dict[str, Any], text: str) -> str:
+    """Idempotency key for one answer/comment write. A retry after a failed
+    body edit sees the same history length and block generation, so it finds
+    and adopts the comment the failed attempt already posted instead of
+    posting it twice; once the entry lands, the next write gets a new key."""
+    hist = meta.get("history") if isinstance(meta.get("history"), list) else []
+    raw = f"{number}|{event}|{len(hist)}|{meta.get('blocked_at') or ''}|{text}"
+    return _text_sha256(raw)[:16]
+
+
+def _referenced_text(entry: Dict[str, Any], text: str, ref: str) -> None:
+    """Store ``text`` on a history entry by reference when it is long: the
+    excerpt says how long the full text is and where it lives, and the
+    sha256 lets a reader verify the comment it points at."""
+    if not text:
+        return
+    if len(text) <= _HISTORY_TEXT_INLINE_MAX or not ref:
+        entry["text"] = text
+        return
+    head = text[:_HISTORY_TEXT_INLINE_MAX].rstrip()
+    entry["text"] = f"{head} ... [{len(text)} chars; full text: {ref}]"
+    entry["text_len"] = len(text)
+    entry["text_sha256"] = _text_sha256(text)
+    entry["text_ref"] = ref
+
+
+def _history_id(entry: Any) -> str:
+    """Identity of a history entry that survives `_referenced_text`: the same
+    event before and after its text moved to a comment compares equal."""
+    if not isinstance(entry, dict):
+        return json.dumps(entry, sort_keys=True, default=str)
+    digest = entry.get("text_sha256") or (
+        _text_sha256(str(entry["text"])) if "text" in entry else "")
+    rest = {k: v for k, v in entry.items() if k not in _TEXT_REF_KEYS}
+    return json.dumps([rest, digest], sort_keys=True, default=str)
+
+
+def _compact_history(meta: Dict[str, Any], comments: List[Dict[str, Any]],
+                     human_body: str) -> int:
+    """Move long answer/comment texts already posted as issue comments out of
+    the body, oldest first, until it fits the budget. Lossless: an entry moves
+    only when an issue comment holds exactly its text. Returns entries moved."""
+    hist = meta.get("history")
+    if not isinstance(hist, list):
+        return 0
+    by_text: Dict[str, str] = {}
+    for c in comments or []:
+        if not isinstance(c, dict):
+            continue
+        text, _key = _strip_entry_marker(str(c.get("body") or ""))
+        ref = _comment_ref(c)
+        if ref:
+            by_text.setdefault(text.strip(), ref)
+    moved = 0
+    size = _body_bytes(_body_with_metadata(human_body, meta))
+    for i, entry in enumerate(hist):
+        if size <= _ISSUE_BODY_BUDGET_BYTES:
+            break
+        if (not isinstance(entry, dict) or entry.get("event") not in _COMMENTED_EVENTS
+                or entry.get("text_ref")):
+            continue
+        text = str(entry.get("text") or "")
+        ref = by_text.get(text.strip())
+        if len(text) <= _HISTORY_TEXT_INLINE_MAX or not ref:
+            continue
+        compact = {k: v for k, v in entry.items() if k != "text"}
+        _referenced_text(compact, text, ref)
+        # The metadata line is ASCII JSON (ensure_ascii), so the entry's
+        # serialized length change is the body's byte change.
+        size -= len(json.dumps(entry)) - len(json.dumps(compact))
+        hist[i] = compact
+        moved += 1
+    return moved
+
+
 def _http_status(raw: str) -> Optional[int]:
     """Status code from ``gh api -i`` output, whose first line is the status
     line. Returns None when the output does not look like an HTTP response."""
@@ -1594,9 +1707,16 @@ def _merge_body_write(base_raw: str, ours_raw: str,
         if key == "history" and isinstance(o, list):
             have = f if isinstance(f, list) else []
             old = b if isinstance(b, list) else []
-            add = [e for e in o if e not in old and e not in have]
-            if add:
-                merged_m["history"] = list(have) + add
+            # Compare by _history_id: an entry ours moved to a comment
+            # (WT-44) is the same entry, not a new one to append twice.
+            seen = {_history_id(e) for e in old} | {_history_id(e) for e in have}
+            add = [e for e in o if _history_id(e) not in seen]
+            moved = {_history_id(e): e for e in o
+                     if isinstance(e, dict) and e.get("text_ref")}
+            kept = [e if isinstance(e, dict) and e.get("text_ref")
+                    else moved.get(_history_id(e), e) for e in have]
+            if add or kept != have:
+                merged_m["history"] = kept + add
                 dirty = True
         elif f == b:
             if o is _UNSET:
@@ -1669,7 +1789,7 @@ def _issue_comments_text(raw: Any) -> str:
     comments: List[str] = []
     for comment in raw:
         if isinstance(comment, dict):
-            body = str(comment.get("body") or "").strip()
+            body = _strip_entry_marker(str(comment.get("body") or ""))[0].strip()
             author = comment.get("author")
             login = str(author.get("login") or "").strip() if isinstance(author, dict) else ""
         else:
@@ -2854,6 +2974,73 @@ class GitHubIssuesBackend:
                 f"gh issue view {number} returned unknown state {state!r}")
         return state
 
+    def _fit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any]) -> str:
+        """The issue body for ``body``+``meta``, kept under GitHub's size cap
+        (WT-44). Over budget, long answer/comment texts that issue comments
+        already hold move out of the body (`_compact_history`); if it still
+        does not fit under the hard cap, raise before writing anything rather
+        than let GitHub refuse it mid-operation: nothing is truncated,
+        and the caller's write stays undone and safe to retry."""
+        ours = _body_with_metadata(body, meta)
+        if _body_bytes(ours) <= _ISSUE_BODY_BUDGET_BYTES:
+            return ours
+        hist = meta.get("history") if isinstance(meta.get("history"), list) else []
+        movable = any(isinstance(e, dict) and e.get("event") in _COMMENTED_EVENTS
+                      and not e.get("text_ref")
+                      and len(str(e.get("text") or "")) > _HISTORY_TEXT_INLINE_MAX
+                      for e in hist)
+        moved = 0
+        if movable:
+            comments = item.get("_github_comments")
+            if not comments:
+                fresh = self.get(item["number"])  # list-produced items carry no comments
+                comments = (fresh or {}).get("_github_comments") or []
+            moved = _compact_history(meta, comments, body)
+            ours = _body_with_metadata(body, meta)
+        size = _body_bytes(ours)
+        if size > _ISSUE_BODY_MAX_BYTES:
+            raise GitHubBackendError(
+                f"{self.repo}#{item['number']} issue body would be {size} bytes; GitHub "
+                f"refuses more than {_ISSUE_BODY_MAX_BYTES}. Moved {moved} answer/comment "
+                f"history text(s) to their issue comments and it still does not fit. "
+                f"Nothing was written; the change is safe to retry once it fits.")
+        if moved:
+            try:
+                from . import queue as _q
+                _q._log("GH-COMPACT", f"{self.repo}#{item['number']} moved {moved} "
+                        f"answer/comment history text(s) to their issue comments "
+                        f"({size} bytes)")
+            except Exception:  # noqa: BLE001 - logging never breaks a write
+                pass
+        return ours
+
+    def _post_entry_comment(self, item: Dict[str, Any], body: str,
+                            meta: Dict[str, Any], event: str, text: str) -> str:
+        """Post ``text`` as an issue comment tagged with an entry key and
+        return its reference (URL). A comment already carrying the key --
+        posted by an attempt whose body edit then failed -- is adopted, not
+        reposted. Refuses up front, posting nothing, when the text exceeds a
+        comment or its history entry could never fit the body."""
+        if len(text) > _COMMENT_MAX_CHARS - 64:
+            raise GitHubBackendError(
+                f"text is {len(text)} chars; a GitHub comment holds at most "
+                f"{_COMMENT_MAX_CHARS - 64} here. Nothing was written: shorten it "
+                f"or put the full text in a file and reference it.")
+        key = _entry_key(str(item["number"]), event, meta, text)
+        projected = copy.deepcopy(meta)
+        _append_history(projected, event)
+        _referenced_text(projected["history"][-1], text, f"{item.get('url', '')}#issuecomment-0")
+        self._fit_body(item, body, projected)
+        for c in item.get("_github_comments") or []:
+            if isinstance(c, dict):
+                _text, found = _strip_entry_marker(str(c.get("body") or ""))
+                if found == key:
+                    return _comment_ref(c) or f"comment:{key}"
+        out = self._run(["issue", "comment", str(item["number"]), *self._repo_args()],
+                        body=text + _ENTRY_MARKER.format(key))
+        url = (out or "").strip().splitlines()[-1:] or [""]
+        return url[0] if url[0].startswith("http") else f"comment:{key}"
+
     def _edit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
                    *extra: str) -> List[str]:
         """Write ``body``+``meta`` over ``item``'s issue, then re-read and
@@ -2864,7 +3051,7 @@ class GitHubIssuesBackend:
         precondition on issue edits, so this narrows the window only."""
         number = str(item["number"])
         base = item.get("_github_body") or item.get("text", "")
-        ours = _body_with_metadata(body, meta)
+        ours = self._fit_body(item, body, meta)
         self._run(["issue", "edit", number, *self._repo_args(), *extra], body=ours)
         conflicts: List[str] = []
         for _ in range(_BODY_WRITE_RETRIES):
@@ -2878,6 +3065,8 @@ class GitHubIssuesBackend:
             if merged is None:
                 return conflicts
             _log_body_reapply(self.repo, number, conflicts)
+            merged_h, merged_m = _split_body(merged)
+            merged = self._fit_body(item, merged_h, merged_m)
             self._run(["issue", "edit", number, *self._repo_args()], body=merged)
             base, ours = fresh, merged
         return conflicts
@@ -3581,7 +3770,16 @@ class GitHubIssuesBackend:
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         now = _now_iso()
-        answer_text = _clip(text, 24000)
+        answer_text = str(text or "")
+        text_ref = source_comment_key
+        if post_comment:
+            # WT-44: the comment is posted FIRST and is the durable full copy;
+            # the body history below keeps a bounded excerpt pointing at it.
+            # If the body edit then fails, the answer stays undelivered
+            # (needs_input set) and a retry adopts this comment by its key.
+            text_ref = self._post_entry_comment(item, body, meta, "answer", answer_text)
+        elif not text_ref:
+            answer_text = _clip(answer_text, 24000)
         if item.get("status") == "awaiting_answer" and item.get("parked"):
             # WT-40: a parked ticket routes the answer through the sidecar. Written
             # BEFORE the issue edit: a crash in between re-routes (the owner-answer
@@ -3608,9 +3806,9 @@ class GitHubIssuesBackend:
             "answer",
             kind=kind if kind in ("human", "system", "worker") else "human",
             worker=str(session_id or ""),
-            text=answer_text,
             source="github-owner-comment" if source_comment_key else "",
         )
+        _referenced_text(meta["history"][-1], answer_text, text_ref)
         releasing = bool(
             item.get("status") == "in_progress"
             and not item.get("claimed_session_id")
@@ -3637,15 +3835,6 @@ class GitHubIssuesBackend:
                 "--remove-label", self.in_progress_label,
             ])
             self._run(["issue", "reopen", number, *self._repo_args()], check=False)
-        # Post the answer as a real GitHub issue comment so it is visible in
-        # the issue discussion and the worker session can resume from it. Skipped
-        # for owner-answer ingestion, where the answer already IS an issue
-        # comment and re-posting it would duplicate the discussion.
-        if post_comment:
-            self._run([
-                "issue", "comment", number,
-                *self._repo_args(),
-            ], body=answer_text)
         return self.get(ident)
 
     def _repo_owner(self) -> str:
@@ -3746,22 +3935,20 @@ class GitHubIssuesBackend:
         item = self.get(ident)
         if item is None:
             return None
-        number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         actor_kind = by if by in ("worker", "human", "system") else "human"
-        comment_text = _clip(text, 24000)
+        comment_text = str(text or "")
+        # WT-44: comment first (the durable full copy, adopted on retry), then
+        # a bounded history entry that references it.
+        ref = self._post_entry_comment(item, body, meta, "comment", comment_text)
         _append_history(
             meta,
             "comment",
             kind=actor_kind,
             worker=str(session_id or ""),
-            text=comment_text,
         )
+        _referenced_text(meta["history"][-1], comment_text, ref)
         self._edit_body(item, body, meta)
-        self._run([
-            "issue", "comment", number,
-            *self._repo_args(),
-        ], body=comment_text)
         return self.get(ident)
 
     @_serialized_body_write
