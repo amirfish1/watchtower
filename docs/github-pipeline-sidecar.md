@@ -80,12 +80,14 @@ marker via `backend.update` → **re-read the issue and require our marker**
 loser fails with no sidecar entry; GitHub down ⇒ edit fails, nothing local
 written) → write sidecar entry.
 
-Reader check (OPS-203): a `wt` older than the hold would claim a plan-pending
-ticket. Every GitHub claim now stamps `pipeline: <PIPELINE_PROTO>` (2 since OPS-215) on its history event, and
-gating is refused while any other machine's latest claim on the queue in the
-last 14 days lacks it. The error names the host and its last claim. Once that
-host runs this version, its next claim clears the check. A retired host ages
-out after 14 days. Crash
+Reader check (OPS-203, relaxed OPS-221): every GitHub claim stamps
+`pipeline: <PIPELINE_PROTO>` (2 since OPS-215) on its history event. Gating is
+refused while any other machine's latest claim on the queue in the last 14 days
+lacks `READER_MIN_PROTO` (1: OPS-203 onward, when protective defers began).
+Every protocol 1+ host honours the issue-level `deferred_until` hold (OPS-215),
+so only an unstamped (protocol 0) pre-OPS-203 claim blocks gating. The error
+names the host and its last claim. Once that host runs OPS-203 or later, its
+next claim clears the check. A retired host ages out after 14 days. Crash
 between the two ⇒ marker without entry ⇒ fail-closed `pipeline_missing`, never
 an unplanned build. Gating a ticket a builder already holds is **refused**
 (the claim is left untouched): the hold only excludes new claims, so a running

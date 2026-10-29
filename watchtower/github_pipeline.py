@@ -27,10 +27,12 @@ _CACHE: Dict[str, Any] = {"sig": None, "data": None}
 _OWNER: Dict[str, str] = {}
 
 # Stamped on every GitHub claim this code makes. Gating a ticket requires every
-# machine that claimed the queue within READER_WINDOW_S to have stamped it, so
-# a host whose `wt` would ignore the plan hold cannot be claiming there (OPS-203).
-# 2 (OPS-215): reads the issue-level hold (``pipeline_hold``) this code writes.
+# machine that claimed the queue within READER_WINDOW_S to have stamped it at
+# READER_MIN_PROTO or later, so a host that cannot read the protective hold
+# cannot be claiming there (OPS-203). 1+ (OPS-203 onward) honours the defer.
+# 2 (OPS-215): writes the issue-level hold (``pipeline_hold``) that all 1+ readers respect.
 PIPELINE_PROTO = 2
+READER_MIN_PROTO = 1
 READER_WINDOW_S = 14 * 86400
 
 
@@ -100,7 +102,7 @@ def _owner_fields(item: Dict[str, Any], marker: str) -> None:
 
 def stale_readers(items: List[Dict[str, Any]], now: Optional[float] = None) -> Dict[str, str]:
     """Machines (other than this one) whose latest claim in the window was made
-    by a `wt` that does not stamp PIPELINE_PROTO, mapped to that claim's time."""
+    by a `wt` that does not stamp READER_MIN_PROTO or later, mapped to that claim's time."""
     from . import queue as q
     cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                            time.gmtime((now or time.time()) - READER_WINDOW_S))
@@ -113,7 +115,7 @@ def stale_readers(items: List[Dict[str, Any]], now: Optional[float] = None) -> D
             if machine not in latest or at > latest[machine][0]:
                 latest[machine] = (at, h.get("pipeline"))
     return {m: at for m, (at, proto) in latest.items()
-            if m != q.machine_tag() and int(proto or 0) < PIPELINE_PROTO}
+            if m != q.machine_tag() and int(proto or 0) < READER_MIN_PROTO}
 
 
 def _read_strict() -> Dict[str, Any]:
