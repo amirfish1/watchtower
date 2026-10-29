@@ -1,0 +1,9 @@
+# Public asset manifest. Exactly these files (plus this one) are published.
+# Anything not listed here must not live in site/. scripts/snapshot-site.js
+# fails when site/ and this list disagree. The Pages workflow uploads only site/.
+.nojekyll
+CNAME
+cli.html
+index.html
+integration.html
+styles.css

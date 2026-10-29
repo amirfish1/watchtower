@@ -1,11 +1,16 @@
 // Headless render verification for the WatchTower static site.
 // Adapted from the CCC snapshot.js puppeteer pattern. Serves docs/ over a
 // throwaway localhost http server, then captures every page at desktop (1440)
-// and mobile (390) widths. Reuses CCC's bundled puppeteer + Chrome resolution.
+// and mobile (390) widths. Uses puppeteer or puppeteer-core from NODE_PATH, else
+// CCC's bundled copy. Set CHROME_PATH to pick a browser.
 //
-//   node docs/snapshot-site.js            (run from repo root or docs/)
+//   node scripts/snapshot-site.js                       (serve site/ locally)
+//   SITE_URL=https://watchtower.amirfish.ai node scripts/snapshot-site.js
+//                                                       (check a live URL)
 //
-// Output: docs/shots/<page>-<width>.png
+// Output: docs/site-proof/shots/<page>-<width>.png (internal proof, not published)
+// Also fails on: a file in site/ not listed in site/MANIFEST.txt, em-dashes in
+// public copy, and broken same-site links.
 
 const fs = require('fs');
 const http = require('http');
@@ -13,10 +18,14 @@ const path = require('path');
 const os = require('os');
 
 const CCC = process.env.CCC_DIR || path.join(os.homedir(), 'Apps', 'claude-command-center');
-const puppeteer = require(path.join(CCC, 'require-puppeteer.js'));
+let puppeteer;
+for (const mod of ['puppeteer', 'puppeteer-core']) {
+  try { puppeteer = require(mod); break; } catch (_) {}
+}
+if (!puppeteer) puppeteer = require(path.join(CCC, 'require-puppeteer.js'));
 
-const DOCS_DIR = path.resolve(__dirname);
-const OUT_DIR = path.join(DOCS_DIR, 'shots');
+const DOCS_DIR = path.resolve(__dirname, '..', 'site');
+const OUT_DIR = path.resolve(__dirname, '..', 'docs', 'site-proof', 'shots');
 
 const PAGES = ['index.html', 'cli.html', 'integration.html'];
 const WIDTHS = [1440, 390];
@@ -27,6 +36,7 @@ const MIME = {
 };
 
 function findChromePath() {
+  if (process.env.CHROME_PATH) return process.env.CHROME_PATH;
   const macs = [
     '/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta',
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
@@ -57,8 +67,21 @@ function startServer() {
 
 (async () => {
   fs.mkdirSync(OUT_DIR, { recursive: true });
-  const { server, port } = await startServer();
-  const base = `http://127.0.0.1:${port}`;
+  // Manifest guard: site/ must contain exactly the files in MANIFEST.txt.
+  const listed = fs.readFileSync(path.join(DOCS_DIR, 'MANIFEST.txt'), 'utf8')
+    .split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('#')).sort();
+  const actual = fs.readdirSync(DOCS_DIR).filter((f) => f !== 'MANIFEST.txt').sort();
+  if (JSON.stringify(listed) !== JSON.stringify(actual)) {
+    throw new Error(`site/ does not match MANIFEST.txt\n listed: ${listed}\n actual: ${actual}`);
+  }
+  for (const f of listed) {
+    if (/[\u2014\u2013]/.test(fs.readFileSync(path.join(DOCS_DIR, f), 'utf8'))) {
+      throw new Error(`em/en-dash found in public file ${f}`);
+    }
+  }
+  const live = process.env.SITE_URL ? process.env.SITE_URL.replace(/\/$/, '') : null;
+  const { server, port } = live ? { server: { close() {} }, port: 0 } : await startServer();
+  const base = live || `http://127.0.0.1:${port}`;
   console.log(`[snapshot] serving ${DOCS_DIR} at ${base}`);
 
   const chromePath = findChromePath();
@@ -73,10 +96,22 @@ function startServer() {
         const url = `${base}/${pageName}`;
         await page.goto(url, { waitUntil: 'load', timeout: 30000 });
         await page.waitForNetworkIdle({ idleTime: 500, timeout: 3000 }).catch(() => {});
+        const bad = await page.evaluate(async () => {
+          const out = [];
+          for (const a of document.querySelectorAll('a[href]')) {
+            const u = new URL(a.href);
+            if (u.origin !== location.origin) continue;
+            const r = await fetch(u.pathname).catch(() => null);
+            if (!r || !r.ok) out.push(a.getAttribute('href'));
+            else if (u.hash && !document.getElementById(u.hash.slice(1)) && u.pathname === location.pathname) out.push(a.getAttribute('href'));
+          }
+          return out;
+        });
+        if (bad.length) throw new Error(`broken links on ${pageName}: ${bad.join(', ')}`);
         const outName = `${pageName.replace('.html', '')}-${width}.png`;
         const outPath = path.join(OUT_DIR, outName);
         await page.screenshot({ path: outPath, fullPage: true });
-        console.log(`[snapshot] wrote shots/${outName}  (${url})`);
+        console.log(`[snapshot] wrote ${outName}  (${url})`);
         await page.close();
       }
     }
