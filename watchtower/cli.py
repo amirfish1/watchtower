@@ -2648,6 +2648,8 @@ def _verifier_goal(item: dict) -> str:
     target = accept or (item.get("text") or item.get("note") or item.get("title") or "")
     res = item.get("resolution") or {}
     commit = res.get("commit", "") if isinstance(res, dict) else ""
+    # OPS-204: a GitHub verdict is fenced on its cycle (a stale one is refused).
+    cyc = f" --verify-cycle {int(item.get('verify_cycle') or 0)}" if item.get("review_hold") else ""
     return (
         f"You are an INDEPENDENT verifier for WatchTower ticket {ref}. You did "
         f"not do the work and must not trust its summary. Check, against the "
@@ -2666,8 +2668,8 @@ def _verifier_goal(item: dict) -> str:
         "mocks and the test suite. WT_VERIFY=1 is set in your environment; "
         "never run production side effects. When "
         f"done, file your verdict on the ticket (not to anyone else): "
-        f"`wt verdict {ref} --pass --findings \"what you checked\"` or "
-        f"`wt verdict {ref} --fail --findings \"what is wrong, with evidence\"`."
+        f"`wt verdict {ref}{cyc} --pass --findings \"what you checked\"` or "
+        f"`wt verdict {ref}{cyc} --fail --findings \"what is wrong, with evidence\"`."
     )
 
 

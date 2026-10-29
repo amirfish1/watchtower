@@ -288,8 +288,9 @@ wt dedup   [-q QUEUE] [--apply]</div>
     <div class="cli-cmd">
       <h3><span class="verb">wt</span> wait</h3>
       <div class="sig">wt wait -q QUEUE [--timeout SECONDS] [--interval SECONDS] [--cmd CMD] [--notify-webhook URL]</div>
-      <p>Block until the queue has zero open tickets, then optionally run a command. This is how you gate any
-         script on a fleet of agents actually finishing, instead of guessing or polling by hand.</p>
+      <p>Block until no tickets remain in <code>open</code> status, then optionally run a command.
+         In-progress, in-review, and awaiting-answer tickets do not keep it waiting. Check those states
+         separately before deploying or treating all work as complete.</p>
       <table class="flags">
         <tr><td>-q, --queue</td><td>Queue to wait on. Required.</td></tr>
         <tr><td>--timeout</td><td>Maximum seconds to block. <code>0</code> means forever.</td></tr>
@@ -524,7 +525,7 @@ wt export-json [-o OUT]</div>
 <span class="cmd">wt claim  -q DEMO DEMO-1</span>       <span class="cm"># or claim a specific ticket by ref (--oldest = FIFO;</span>
                                <span class="cm">#   --type / --readiness filter what you'll take)</span>
 <span class="cmd">wt close  DEMO-1 --summary "fixed the overlap" --commit &lt;SHA&gt; \</span>
-<span class="cmd">          --caveat "only tested on iOS" --follow-up "add a regression test"</span>
+<span class="cmd">          --caveat "only tested on iOS" --follow-up "DEMO-2 tracks regression coverage"</span>
 <span class="cmd">wt release DEMO-1</span>              <span class="cm"># give up a claim without closing; returns it to open</span>
                                <span class="cm">#   (--reserve-for WORKER holds it for that worker for --ttl seconds)</span>
 <span class="cmd">wt reopen DEMO-1 --reason "regressed"</span>  <span class="cm"># reopen a closed ticket back to open (no dispatch)</span>
@@ -538,7 +539,8 @@ wt export-json [-o OUT]</div>
       <b>Closes carry how it was fixed.</b> <code class="inline-code">wt close</code> requires <code>--summary</code>
       and either a verified <code>--commit &lt;SHA&gt;</code> or explicit <code>--no-code</code>, plus optional
       <code>--caveat</code>, <code>--follow-up</code>, and <code>--unresolved</code>. Pass
-      <code>--enqueue-follow-ups</code> to auto-file the follow-ups as new tickets. A blocked ticket comes back
+      <code>--enqueue-follow-ups</code> to auto-file the follow-ups as new tickets. Otherwise, each follow-up or unresolved item
+      must cite a ticket ref. A blocked ticket comes back
       through <code class="inline-code">wt answer</code>; releasing a blocked claim is refused without
       <code>--force</code> so the open question is not erased.
     </div>
