@@ -36,20 +36,31 @@ args = sys.argv[1:]
 tag = str(os.getpid())
 with open(os.path.join(out, tag + ".json"), "w") as fh:
     json.dump({"argv": args}, fh)
-# gh's option grammar for these commands: value flags consume the next
-# token whatever it looks like ("--title --body" is a title); "--" ends options.
-VALUE = {"--repo", "--title", "--body", "--body-file", "-F", "--label",
-         "--add-label", "--remove-label", "--json", "--comment"}
-opts, i = {}, 0
+# gh's (pflag's) option grammar for these commands: a value flag consumes
+# the next token whatever it looks like ("--title --body" is a title, and
+# "--label --" is a label); --flag=value is one token; a bare "--" that no
+# flag consumed ends options.
+VALUE = {"--repo", "-R", "--title", "-t", "--body", "-b", "--body-file", "-F",
+         "--label", "-l", "--add-label", "--remove-label", "--assignee", "-a",
+         "--add-assignee", "--remove-assignee", "--json", "--comment", "-c"}
+opts, positional, i = {}, [], 0
 while i < len(args):
     a = args[i]
+    name, eq, val = a.partition("=")
     if a == "--":
+        positional.extend(args[i + 1:])
         break
-    if a in VALUE and i + 1 < len(args):
+    if a.startswith("--") and eq and name in VALUE:
+        opts.setdefault(name, []).append(val)
+        i += 1
+    elif a in VALUE and i + 1 < len(args):
         opts.setdefault(a, []).append(args[i + 1])
         i += 2
     else:
+        if not a.startswith("-") or a == "-":
+            positional.append(a)
         i += 1
+opts["_positional"] = positional[2:]  # after the `issue <verb>` command path
 with open(os.path.join(out, tag + ".opts.json"), "w") as fh:
     json.dump(opts, fh)
 if mode == "hang":
@@ -167,8 +178,8 @@ def test_body_over_the_single_argument_limit_reaches_gh_byte_exact(gh, backend, 
         (call,) = gh.calls()
         assert call["body"] == big.encode("utf-8"), verb
         assert big not in call["argv"]
-        assert call["argv"] == [*verb, "--repo", REPO, "--title", "T é",
-                                "--body-file", "-"]
+        assert call["argv"] == [*verb[:2], "--body-file", "-", *verb[2:],
+                                "--repo", REPO, "--title", "T é"]
 
 
 def test_edit_body_round_trip_keeps_extra_args_and_full_history(gh, backend):
@@ -183,15 +194,15 @@ def test_edit_body_round_trip_keeps_extra_args_and_full_history(gh, backend):
     sent = edits[0]["body"].decode("utf-8")
     assert sent == github_backend._body_with_metadata(history, {"status": "open"})
     assert history.rstrip() in sent  # _body_with_metadata trims the tail itself
-    assert edits[0]["argv"] == ["issue", "edit", "12", "--repo", REPO,
-                                "--title", "New", "--body-file", "-"]
+    assert edits[0]["argv"] == ["issue", "edit", "--body-file", "-", "12",
+                                "--repo", REPO, "--title", "New"]
 
 
 def test_short_body_uses_the_same_transport(gh, backend):
     backend._run(["issue", "comment", "3", "--repo", REPO], body="ok")
     (call,) = gh.calls()
     assert call["body"] == b"ok"
-    assert call["argv"] == ["issue", "comment", "3", "--repo", REPO, "--body-file", "-"]
+    assert call["argv"] == ["issue", "comment", "--body-file", "-", "3", "--repo", REPO]
 
 
 def test_empty_body_is_sent_not_dropped(gh, backend):
@@ -225,7 +236,7 @@ def test_concurrent_writes_each_deliver_their_own_body(gh, backend):
     for t in threads:
         t.join(30)
     assert not errors
-    got = {c["argv"][2]: c["body"] for c in gh.calls()}
+    got = {c["opts"]["_positional"][0]: c["body"] for c in gh.calls()}
     assert got == {str(i): b.encode("utf-8") for i, b in enumerate(bodies)}
 
 
@@ -292,15 +303,125 @@ _FLAG_SHAPED = ["--body", "--body-file", "-F", "-b", "--body=x", "--", "-", "--r
 _SENTINEL = "PRIVATE-BODY-SENTINEL"
 
 
-def test_body_flags_on_argv_are_refused_not_rewritten(gh, backend):
-    """The body is a separate parameter: no argv token is searched for or
-    rewritten, and a caller that puts a body flag on argv is refused."""
-    for bad in (["issue", "edit", "1", "--body", "x"], ["issue", "edit", "1", "-F", "f"],
-                ["issue", "edit", "1", "--body=x"], ["issue", "edit", "1", "--"]):
+def test_flag_shaped_values_reach_gh_verbatim_after_the_body_flag(gh, backend):
+    """No argv token is inspected or rewritten: --body-file - sits right after
+    `issue <verb>`, where no caller value can consume it, and every caller
+    token follows unchanged in its original position (WT-40 verify:4/5)."""
+    for value in _FLAG_SHAPED:
+        for f in gh.out_dir.iterdir():
+            f.unlink()
+        args = ["issue", "edit", "1", "--repo", REPO, "--title", value,
+                "--add-label", value, "--remove-label", value,
+                "--add-assignee", value, f"--add-label={value}"]
+        backend._run(args, body=_SENTINEL)
+        (call,) = gh.calls()
+        assert call["argv"] == ["issue", "edit", "--body-file", "-", *args[2:]], value
+        assert call["body"] == _SENTINEL.encode()
+        assert call["opts"]["--body-file"] == ["-"]
+        assert call["opts"]["--title"] == [value]
+        assert call["opts"]["--add-label"] == [value, value]
+        assert call["opts"]["--remove-label"] == [value]
+        assert call["opts"]["--add-assignee"] == [value]
+        assert call["opts"]["_positional"] == ["1"]
+        assert not any(_SENTINEL in a for a in call["argv"])
+
+
+def test_body_on_a_non_body_command_is_refused_before_gh(gh, backend):
+    """The transport fixes its own position from the two leading tokens only;
+    a body handed to any other command is a caller bug, refused unspawned."""
+    for args in (["issue", "close", "1"], ["issue", "view", "1"], ["label", "create", "x"],
+                 ["issue"], []):
         with pytest.raises(github_backend.GitHubBackendError) as exc:
-            backend._run(bad, body=_SENTINEL)
+            backend._run(args, body=_SENTINEL)
         assert _SENTINEL not in str(exc.value)
-    assert gh.calls() == [], "refused before gh was spawned"
+    assert gh.calls() == []
+
+
+def test_no_body_writer_builds_a_body_flag_on_argv():
+    """Bodies reach gh only through body=; no production argv literal names a
+    body flag (the structural half of the invariant)."""
+    import ast
+    tree = ast.parse(Path(github_backend.__file__).read_text())
+    flags = {"--body", "-b", "--body-file", "-F"}
+    # _body_argv is the one place --body-file - is placed; nothing else may.
+    owner = next(n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "_body_argv")
+    sanctioned = {id(n) for n in ast.walk(owner)}
+    offenders = [
+        (node.lineno, elt.value) for node in ast.walk(tree)
+        if id(node) not in sanctioned
+        if isinstance(node, ast.List)
+        for elt in node.elts
+        if isinstance(elt, ast.Constant) and elt.value in flags
+    ]
+    assert offenders == []
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+             and getattr(n.func, "attr", "") in ("_run", "_run_raw")
+             and any(k.arg == "body" for k in n.keywords)]
+    assert len(calls) >= 7, "every body writer passes body= explicitly"
+
+
+_LABELS = ["--body", "--body-file", "-b", "-F", "--", "--body=x"]
+
+
+@pytest.mark.parametrize("label", _LABELS + ["-l", "--title", "-", "bug", "queue:é"])
+@pytest.mark.parametrize("size", ["empty", "short", "oversized"])
+def test_enqueue_with_flag_shaped_queue_label_reaches_gh(gh, monkeypatch, label, size):
+    """Verifier witness (WT-40 verify:5): a valid configured queue label equal
+    to a body flag or "--" was refused before gh spawned. It must reach gh as
+    the --label value, the title unchanged, the body exactly on stdin."""
+    backend = github_backend.GitHubIssuesBackend("BODY", repo=REPO, queue_label=label)
+    assert backend.queue_label == label and not backend.catch_all
+    monkeypatch.setattr(backend, "_ensure_labels", lambda: None)
+    monkeypatch.setattr(backend, "get", lambda ident: {"number": 7})
+    text = {"empty": "", "short": f"{_SENTINEL} t \"q\"\r\n",
+            "oversized": _SENTINEL + "\U0001F600" * 23000}[size]
+    note = f"{_SENTINEL} n" if size != "oversized" else _SENTINEL + "\U0001F600" * 3970
+
+    backend.enqueue(title="--label", note=note, text=text)
+
+    (call,) = gh.calls()
+    assert call["argv"] == ["issue", "create", "--body-file", "-", "--repo", REPO,
+                            "--title", "--label", "--label", label]
+    assert call["opts"]["--label"] == [label]
+    assert call["opts"]["--title"] == ["--label"]
+    assert call["opts"]["--body-file"] == ["-"]
+    sent = call["body"].decode("utf-8")
+    assert sent == github_backend._body_with_metadata(text or note, _sent_meta(sent))
+    assert not any(_SENTINEL in a for a in call["argv"])
+    if size == "oversized":
+        assert len(call["body"]) > _arg_limit()
+
+
+@pytest.mark.parametrize("label", _LABELS)
+def test_flag_shaped_label_failure_diagnostics_stay_private(gh, monkeypatch, label):
+    backend = github_backend.GitHubIssuesBackend("BODY", repo=REPO, queue_label=label)
+    monkeypatch.setattr(backend, "_ensure_labels", lambda: None)
+    monkeypatch.setenv("FAKE_GH_MODE", "fail")
+    with pytest.raises(github_backend.GitHubBackendError) as exc:
+        backend.enqueue(title=_SENTINEL, note=f"{_SENTINEL} note", text=f"{_SENTINEL} body")
+    msg = str(exc.value)
+    assert "HTTP 422" in msg and "--body-file -" in msg
+    assert f"--label {label}" in msg
+    assert _SENTINEL not in msg
+    (call,) = gh.calls()
+    assert call["opts"]["--label"] == [label]
+
+
+@pytest.mark.parametrize("label", _LABELS)
+def test_edit_body_and_claim_extras_keep_flag_shaped_values(gh, backend, label):
+    """_edit_body's extra args (claim's --add-assignee/--add-label, release's
+    --remove-label) carry values gh must see verbatim."""
+    item = {"number": 12, "_github_body": "", "text": ""}
+    backend._edit_body(item, "body é", {}, "--add-assignee", label,
+                       "--add-label", label, "--remove-label", label)
+    edit = next(c for c in gh.calls() if c["argv"][:2] == ["issue", "edit"])
+    assert edit["argv"] == ["issue", "edit", "--body-file", "-", "12", "--repo", REPO,
+                            "--add-assignee", label, "--add-label", label,
+                            "--remove-label", label]
+    assert edit["opts"]["--add-label"] == [label]
+    assert edit["opts"]["_positional"] == ["12"]
+    assert edit["body"].decode("utf-8") == github_backend._body_with_metadata("body é", {})
 
 
 @pytest.mark.parametrize("title", _FLAG_SHAPED + ["normal title é"])

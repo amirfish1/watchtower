@@ -915,9 +915,8 @@ class _Text(str):
     __slots__ = ()
 
 
-# Raw argv tokens that would put an issue body on the command line. Bodies
-# travel as `_run(..., body=...)` on stdin; a caller passing one here is a bug.
-_BODY_FLAGS = ("--body", "-b", "--body-file", "-F")
+# `gh issue <verb>` commands that take a body (`--body-file -`, read from stdin).
+_BODY_VERBS = frozenset({"create", "edit", "comment"})
 
 
 def _render_argv(args: List[str]) -> str:
@@ -929,17 +928,18 @@ def _render_argv(args: List[str]) -> str:
 
 
 def _body_argv(args: List[str]) -> List[str]:
-    """``args`` plus ``--body-file -``, refusing argv shapes where that flag
-    or a body would not mean what we intend."""
-    for a in args:
-        if isinstance(a, _Text):
-            continue
-        if a == "--" or a in _BODY_FLAGS or a.startswith(("--body=", "--body-file=")):
-            raise GitHubBackendError(
-                f"refusing gh {_render_argv(args)}: issue bodies go on stdin via "
-                "body=, and --body-file must not follow an end-of-options marker"
-            )
-    return [*args, "--body-file", "-"]
+    """``args`` with ``--body-file -`` placed right after ``issue <verb>``.
+
+    Only those two fixed tokens precede it, so no caller value can consume
+    it as an option argument or end options before it, and no caller token
+    is ever inspected: a title or label of ``--body``, ``-F`` or ``--``
+    reaches gh exactly as given (WT-40).
+    """
+    if len(args) < 2 or args[0] != "issue" or args[1] not in _BODY_VERBS:
+        raise GitHubBackendError(
+            "gh body transport supports only `issue create|edit|comment`"
+        )
+    return [args[0], args[1], "--body-file", "-", *args[2:]]
 
 
 def _gh_hosts_file() -> Path:
