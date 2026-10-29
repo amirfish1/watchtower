@@ -3351,10 +3351,35 @@ def cmd_answer(args: argparse.Namespace) -> int:
     as the client saying the topic itself is over (Topic-Is-Done, plan section
     3b) rather than just the next turn in an ongoing exchange.
     """
-    item = q.answer(args.ref, args.text, session_id=args.worker)
+    return _answer_and_deliver(args)[0]
+
+
+def deliver_dependency_answer(ref: str, text: str, block_at: str) -> Optional[dict]:
+    """WT-37: the reconciler's answer for a ticket whose ``--wait-on
+    dependency`` ref closed. Same path as `wt answer` (record, then route to
+    the parked session or steer/resume the held one), attributed to the
+    system, and a compare-and-swap on the block generation ``block_at`` so a
+    re-block (or a human answer) in between makes it a no-op. Returns the
+    answered item, or None when nothing was written."""
+    args = argparse.Namespace(ref=ref, text=text, worker="watchtower-reconciler",
+                              engine=None, tid=False)
+    return _answer_and_deliver(args, by_kind="system", expect_wait_block_at=block_at)[1]
+
+
+def _answer_and_deliver(args: argparse.Namespace, by_kind: str = "human",
+                        expect_wait_block_at: Optional[str] = None
+                        ) -> Tuple[int, Optional[dict]]:
+    """`wt answer`'s body: ``(exit code, answered item or None)``."""
+    item = q.answer(args.ref, args.text, session_id=args.worker, by_kind=by_kind,
+                    expect_wait_block_at=expect_wait_block_at)
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
-        return 1
+        if expect_wait_block_at is None:
+            print(f"(no item {args.ref})", file=sys.stderr)
+        return 1, None
+    return _deliver_answer(args, item, by_kind), item
+
+
+def _deliver_answer(args: argparse.Namespace, item: dict, by_kind: str) -> int:
     if (item.get("plan") or {}).get("status") == "blocked":
         print(f"NOTE: {item['ref']} plan gate is STILL BLOCKED; a free-text answer "
               f"does not accept it. Decide with `wt plan decide {item['ref']} "
@@ -3396,6 +3421,15 @@ def cmd_answer(args: argparse.Namespace) -> int:
             f"this turn, then park again with `wt block {item['ref']} "
             f"--worker <your-id> --kind awaiting-client` unless the topic is "
             f"finished, in which case close it instead."
+        )
+    elif by_kind == "system":
+        prompt = (
+            f"WatchTower: the dependency your block on ticket {item['ref']} was "
+            f"waiting on has completed ({args.text}). Re-check what you were "
+            f"waiting for, then finish the ticket and close it with `wt close "
+            f"{item['ref']} --worker <your-id> --summary \"...\" --commit <SHA>` "
+            f"(or `--no-code` if no code changed). If it still cannot be "
+            f"resolved, run `wt block` again with the new open question."
         )
     else:
         prompt = (

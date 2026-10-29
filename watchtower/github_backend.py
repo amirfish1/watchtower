@@ -3400,9 +3400,11 @@ class GitHubIssuesBackend:
         *,
         post_comment: bool = True,
         source_comment_key: str = "",
+        kind: str = "human",
     ) -> Optional[Dict[str, Any]]:
         """Record a human answer on a blocked GitHub-backed ticket and post it
-        as an issue comment.
+        as an issue comment. ``kind`` attributes it (``system`` for the
+        reconciler's dependency-closed answer, WT-37).
 
         Clears ``needs_input``. When the ticket has no resumable session, the
         claim is released so the worker pool can pick the answer back up —
@@ -3434,7 +3436,7 @@ class GitHubIssuesBackend:
         _append_history(
             meta,
             "answer",
-            kind="human",
+            kind=kind if kind in ("human", "system", "worker") else "human",
             worker=str(session_id or ""),
             text=answer_text,
             source="github-owner-comment" if source_comment_key else "",
@@ -3453,7 +3455,7 @@ class GitHubIssuesBackend:
             _append_history(
                 meta,
                 "reopen",
-                kind="human",
+                kind=kind if kind in ("human", "system", "worker") else "human",
                 worker=str(session_id or ""),
                 reason="answered_without_resumable_session",
             )

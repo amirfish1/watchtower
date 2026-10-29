@@ -8095,15 +8095,33 @@ def set_wait(ident: Any, on: str, actor: str = "", ref: str = "", note: str = ""
     return None
 
 
-def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, Any]]:
+def _wait_gen_matches(it: Dict[str, Any], block_at: str) -> bool:
+    """CAS for a system answer (WT-37): ``it`` is still blocked on the SAME
+    dependency-wait generation (``blocked_at``) the caller observed."""
+    w = current_wait(it)
+    return bool(w and w.get("on") == "dependency"
+                and str(it.get("blocked_at") or "") == str(block_at or ""))
+
+
+def answer(ident: Any, text: str, session_id: str = "", *, by_kind: str = "human",
+           expect_wait_block_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Record a human answer on a blocked ticket and clear ``needs_input`` so the
     resumed session can continue. Answers are append-only, preserving a
     back-and-forth. A ticket with a resumable worker stays ``in_progress``;
     without one it reopens so the worker pool can claim it instead of leaving
-    the answer stranded behind an unreclaimable claim."""
+    the answer stranded behind an unreclaimable claim.
+
+    ``by_kind`` attributes the answer (``system`` for the reconciler's
+    dependency-closed answer, WT-37). ``expect_wait_block_at`` makes it a
+    compare-and-swap: answer only while the ticket is still blocked on that
+    dependency-wait generation, else return None without writing."""
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
-        item = backend.answer(ident, text, session_id=session_id)
+        if expect_wait_block_at is not None:
+            cur = backend.get(ident)
+            if not cur or not _wait_gen_matches(cur, expect_wait_block_at):
+                return None
+        item = backend.answer(ident, text, session_id=session_id, kind=by_kind)
         if item and (item.get("stage_session") or {}).get("escalated"):
             # OPS-201: the stage retry lives in the pipeline sidecar.
             from . import github_pipeline
@@ -8122,12 +8140,15 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
+                if expect_wait_block_at is not None and not _wait_gen_matches(
+                        it, expect_wait_block_at):
+                    return None
                 now = _now_iso()
                 integ = group_integration(it) if group_role(it) == "parent" else {}
                 if integ.get("state") == "capped" and not integ.get("blocked"):
                     # WT-33 D7.5: the answer is the guidance for one more fix
                     # (raises at GROUP_MAX_FIXES before anything is written).
-                    _append_history(it, "answer", by=_by("human", str(session_id or "")),
+                    _append_history(it, "answer", by=_by(by_kind, str(session_id or "")),
                                     at=now, text=_clip(text, 24000))
                     it["answered_at"] = now
                     _group_fix_unlocked(data, it, text)
@@ -8142,13 +8163,13 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                 _append_history(
                     it,
                     "answer",
-                    by=_by("human", str(session_id or "")),
+                    by=_by(by_kind, str(session_id or "")),
                     at=now,
                     text=_clip(text, 24000),
                 )
                 if integ.get("blocked"):
                     # WT-33 D7.1: one answer = one integration retry.
-                    _append_history(it, "group_integration_retry", by=_by("human"), at=now,
+                    _append_history(it, "group_integration_retry", by=_by(by_kind), at=now,
                                     kind=integ.get("blocked"))
                     _integration(it)["blocked"] = ""
                     _group_clear_block(it)
@@ -8174,7 +8195,7 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
                     _append_history(
                         it,
                         "reopen",
-                        by=_by("human", str(session_id or "")),
+                        by=_by(by_kind, str(session_id or "")),
                         at=now,
                         reason="answered_without_resumable_session",
                     )

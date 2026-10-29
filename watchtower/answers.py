@@ -433,6 +433,59 @@ def route_pending_answers(now: Optional[float] = None) -> List[str]:
     return acted
 
 
+def dependency_answer_text(dep: Dict[str, Any]) -> str:
+    """The system answer for a closed dependency (WT-37): says it is not a
+    human, names the ref, and carries the first line of its resolution."""
+    res = dep.get("resolution") if isinstance(dep.get("resolution"), dict) else {}
+    first = next((ln.strip() for ln in str(res.get("summary") or "").splitlines()
+                  if ln.strip()), "")
+    return (f"WatchTower (system, not a human): dependency {dep.get('ref')} closed"
+            + (f": {q._clip(first, 300)}" if first else "."))
+
+
+def resume_dependency_waits(items: Optional[List[Dict[str, Any]]] = None) -> List[str]:
+    """Reconciler pass (WT-37): answer every ticket blocked ``--wait-on
+    dependency --wait-ref X`` once X has completed, through the same path
+    `wt answer` uses, attributed to the system.
+
+    "Completed" is ``q._blocker_state == "satisfied"`` -- the one predicate the
+    claim gate uses: a dependency closed declined or with unresolved items is
+    ``stuck`` and stays a human decision, like any stuck blocker. Owner,
+    external and worker waits are never touched. Once per block generation:
+    the answer clears ``needs_input`` (so ``current_wait`` is gone), and it is
+    a compare-and-swap on ``blocked_at``, so a re-block or a human answer in
+    between makes it a no-op. Indexes every queue (local and GitHub), since a
+    dependency may live in another queue."""
+    acted: List[str] = []
+    if items is None:
+        try:
+            items = q.list_items()
+        except Exception:  # noqa: BLE001
+            return acted
+    by_ref = {str(it.get("ref") or "").upper(): it for it in items if it.get("ref")}
+    for it in items:
+        try:
+            if it.get("status") == "closed" or q.group_role(it) == "parent":
+                continue
+            w = q.current_wait(it)
+            if not w or w.get("on") != "dependency":
+                continue
+            dep_ref = str(w.get("ref") or "").strip().upper()
+            dep = by_ref.get(dep_ref)
+            if dep is None or q._blocker_state(dep) != "satisfied":
+                continue
+            ref = str(it.get("ref") or "")
+            from . import cli as _cli
+            if _cli.deliver_dependency_answer(ref, dependency_answer_text(dep),
+                                              str(it.get("blocked_at") or "")):
+                q._log("DEP-RESUME", f"{ref} — dependency {dep_ref} closed; answered",
+                       queue=str(it.get("project") or ""))
+                acted.append(f"{ref}:{dep_ref}")
+        except Exception:  # noqa: BLE001 - one ticket never stops the pass
+            continue
+    return acted
+
+
 def _still_bound(it: Dict[str, Any], pa: Dict[str, Any]) -> bool:
     return (it.get("status") == "in_progress"
             and str(it.get("claimed_session_id") or "") == str(pa.get("prior_session_id") or ""))

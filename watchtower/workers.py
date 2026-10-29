@@ -6746,6 +6746,8 @@ def _reconcile_once_locked(dry_run: bool = False,
             try:
                 from . import answers as _answers, queue as _qpa
                 _qpa.migrate_legacy_blocks()
+                # WT-37: a closed --wait-on dependency answers its blocked ticket.
+                result["dependency_resumed"] = _answers.resume_dependency_waits()
                 result["answers_routed"] = _answers.route_pending_answers(time.time())
                 expire_parked_retention()
             except Exception:

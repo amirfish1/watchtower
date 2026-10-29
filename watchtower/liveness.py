@@ -1294,7 +1294,7 @@ FAILED_SETTLE_GRACE_S = 30.0
 VERIFIED_SENDERS = frozenset({
     "answers._deliver", "cli._deliver_to_blocked_session", "workers._nudge_one",
     "workers._deliver_release_instruction", "cli._plan_send", "queue._notify_review", "cli.cmd_plan", "cli._resume_rejected", "cli.cmd_reopen",
-    "cli.cmd_answer", "cli.cmd_gate_ack",
+    "cli._deliver_answer", "cli.cmd_gate_ack",
 })
 ADVISORY_SENDERS = frozenset({
     "answers._wake", "queue._notify_ticket_event", "cli.cmd_comment", "cli.cmd_send",
