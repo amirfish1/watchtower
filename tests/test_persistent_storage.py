@@ -178,3 +178,44 @@ def test_uninstall_migrates_and_keeps_queue_data(home, monkeypatch, capsys):
     assert "Queue data and settings retained" in capsys.readouterr().out
     assert queue.store_path() == storage.data_dir() / "queues.db"
     assert queue.get("KEEP-1") is not None
+
+
+@pytest.mark.parametrize("legacy", ["ccc", "wt"])
+def test_empty_legacy_db_beside_json_migrates_the_json(home, legacy):
+    # WATCHTOWER-41: a 0-byte queues.db sidecar (no tables) made the first
+    # run crash with "no such table: meta" instead of importing the JSON.
+    source = queue._CCC_LEGACY_STORE if legacy == "ccc" else queue._WT_DEFAULT_STORE
+    seed(source)
+    source.with_suffix(".db").write_bytes(b"")
+    assert queue.get("KEEP-1")["resolution"]["summary"] == "all done"
+    assert queue.store_path() == storage.data_dir() / "queues.db"
+
+
+def test_empty_ccc_db_does_not_shadow_the_wt_json_store(home):
+    seed(queue._WT_DEFAULT_STORE)
+    ccc_db = queue._CCC_LEGACY_STORE.with_suffix(".db")
+    ccc_db.parent.mkdir(parents=True)
+    ccc_db.write_bytes(b"")
+    assert queue.get("KEEP-1") is not None
+
+
+def test_lone_empty_legacy_db_starts_an_empty_store(home):
+    db = queue._WT_DEFAULT_STORE.with_suffix(".db")
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"")
+    assert queue.export_data() == {"counter": 0, "items": []}
+    assert queue.enqueue(project="NEW", note="first")["ref"] == "NEW-1"
+    assert db.read_bytes() == b""  # legacy files are never modified
+
+
+def test_legacy_db_without_meta_table_keeps_its_items(home):
+    data = seed(queue._WT_DEFAULT_STORE)
+    db = queue._WT_DEFAULT_STORE.with_suffix(".db")
+    queue._create_db(db, data)
+    queue._WT_DEFAULT_STORE.unlink()
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TABLE meta")
+    conn.commit()
+    conn.close()
+    assert queue.get("KEEP-1")["resolution"]["summary"] == "all done"
+    assert queue.enqueue(project="KEEP", note="next")["number"] == 8

@@ -303,13 +303,13 @@ def _resolve_store_path() -> Path:
             # Match the previous resolver's precedence. The unused legacy
             # store is left intact, as are the files we import.
             source = next((p for p in (_CCC_LEGACY_STORE, _WT_DEFAULT_STORE)
-                           if p.exists() or p.with_suffix(".db").exists()), None)
+                           if p.exists() or _is_store_db(p.with_suffix(".db"))), None)
             if source == base:
                 return base
             if source is not None:
                 with storage.file_lock(source.with_suffix(".lock")):
                     source_db = source.with_suffix(".db")
-                    if source_db.exists():
+                    if _is_store_db(source_db):
                         # SQLite backup includes committed WAL pages. A raw
                         # copy of the main file can silently lose tickets.
                         with storage.atomic_destination(db) as temporary:
@@ -702,8 +702,37 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
 
 def _meta_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
-    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        # A store whose meta table never got written (WATCHTOWER-41) still
+        # has authoritative items; counter/revision fall back to defaults and
+        # the counter is re-derived from the highest item number.
+        if "no such table" not in str(exc):
+            raise
+        return default
     return row[0] if row else default
+
+
+def _is_store_db(path: Path) -> bool:
+    """True when ``path`` holds a WatchTower store (it has an ``items`` table).
+
+    A 0-byte or table-less ``.db`` sidecar (an ad-hoc ``sqlite3.connect``, an
+    interrupted first run) is not a store and must not shadow the JSON beside
+    it (WATCHTOWER-41). Unreadable files count as stores so a corrupt source
+    still fails closed in the migration's backup + quick_check."""
+    if not path.exists():
+        return False
+    try:
+        conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+        try:
+            return conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'items'"
+            ).fetchone() is not None
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return True
 
 
 def _canon(it: Dict[str, Any]) -> str:
