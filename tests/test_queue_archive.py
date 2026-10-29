@@ -23,7 +23,7 @@ def env(tmp_path, monkeypatch):
     for name in ("LIVE", "DEAD"):
         config.set_engine(name, "claude")
         config.set_model(name, "claude-sonnet-5")
-    config.set_auto_drain("DEAD", True)
+    config.set_auto_drain("LIVE", True)
     return items
 
 
@@ -41,14 +41,25 @@ def _item(ref, status, project="DEAD"):
 def test_dry_run_changes_nothing(env, capsys):
     assert cli.cmd_queue_archive(_ns()) == 0
     assert "would archive" in capsys.readouterr().out
-    assert not config.is_archived("DEAD") and config.auto_drain("DEAD")
+    assert not config.is_archived("DEAD")
 
 
-def test_apply_archives_and_disables_drain(env):
+def test_apply_archives(env):
     assert cli.cmd_queue_archive(_ns(apply=True)) == 0
     assert config.is_archived("DEAD") and not config.auto_drain("DEAD")
     assert "DEAD" not in config.all_queues()
     assert "DEAD" in config.all_queues(include_archived=True)
+
+
+def test_refuses_drain_on_queue_even_with_force(env, capsys):
+    """OPS-248: an empty drain-on queue may be an automation target; archiving
+    it would silently turn its staffing off. Only an explicit drain off clears it."""
+    assert cli.cmd_queue_archive(_ns(name="LIVE", apply=True, force=True)) == 1
+    assert "wt drain off LIVE" in capsys.readouterr().err
+    assert not config.is_archived("LIVE") and config.auto_drain("LIVE")
+    config.set_auto_drain("LIVE", False)
+    assert cli.cmd_queue_archive(_ns(name="LIVE", apply=True)) == 0
+    assert config.is_archived("LIVE")
 
 
 @pytest.mark.parametrize("status", ["awaiting_answer", "in_review", "in_progress"])

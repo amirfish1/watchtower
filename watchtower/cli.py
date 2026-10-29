@@ -450,6 +450,19 @@ def cmd_queue_archive(args: argparse.Namespace) -> int:
                 print(f"  {it.get('ref')}  [{it.get('status')}]  {it.get('title', '')}", file=sys.stderr)
             print("close/move them first, or pass --force", file=sys.stderr)
         return 1
+    # A drain-on queue is staffed on purpose: it may be an automation target
+    # (BYMOPS, ADS) that is merely empty right now. Archiving flips drain off,
+    # stranding its next ticket silently (OPS-248), so stopping staffing must
+    # be its own explicit step; --force does not cover it.
+    if config.auto_drain(name):
+        if args.json:
+            print(json.dumps({"queue": name, "archived": False,
+                              "blocked_by_auto_drain": True}, indent=2))
+        else:
+            print(f"{name}: refusing to archive, auto_drain is on (empty now is not dead; "
+                  f"automation may file here). If it really is retired, run "
+                  f"`wt drain off {name}` first", file=sys.stderr)
+        return 1
     if not args.apply:
         if args.json:
             print(json.dumps({"queue": name, "archived": False, "dry_run": True,
@@ -6733,7 +6746,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("name", metavar="QUEUE")
     a.add_argument("--apply", action="store_true", help="write the change (default: dry run)")
     a.add_argument("--force", action="store_true",
-                   help="archive even if the queue has open or in-progress tickets")
+                   help="archive even if the queue has open or in-progress tickets "
+                        "(never overrides auto_drain on: `wt drain off` first)")
     a.add_argument("--json", action="store_true")
     a.set_defaults(func=cmd_queue_archive)
     a = qs.add_parser("unarchive", help="restore an archived queue (auto_drain stays off)")
