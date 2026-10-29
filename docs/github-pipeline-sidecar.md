@@ -81,7 +81,7 @@ loser fails with no sidecar entry; GitHub down ⇒ edit fails, nothing local
 written) → write sidecar entry.
 
 Reader check (OPS-203): a `wt` older than the hold would claim a plan-pending
-ticket. Every GitHub claim now stamps `pipeline: 1` on its history event, and
+ticket. Every GitHub claim now stamps `pipeline: <PIPELINE_PROTO>` (2 since OPS-215) on its history event, and
 gating is refused while any other machine's latest claim on the queue in the
 last 14 days lacks it. The error names the host and its last claim. Once that
 host runs this version, its next claim clears the check. A retired host ages
@@ -157,13 +157,21 @@ CAS reopen after the sidecar write.
 
 ## Cross-host limits (honest remainder)
 
-- The reader check runs **at gate time only** (OPS-203 caveat). A host that
-  is downgraded below OPS-201, or claims this queue for the first time,
-  *after* a ticket was gated ignores `pipeline_host` and the hold, and could
-  claim a plan-pending ticket or reopen/claim a held in_review issue (the
-  issue itself is open + in-progress during review). Not fenced here; the
-  follow-up is a claim-time fence that every claim path enforces from the
-  issue alone.
+- **Issue-level hold (OPS-215).** While a ticket is plan-pending or held in
+  review, the owner also writes `pipeline_hold: {why, prev_defer, prev_reason}`
+  and `deferred_until: 2099-12-31T00:00:00Z` into the issue meta. The hold
+  rides on the marker write at gate time, and every pipeline mutation resyncs
+  it afterwards. Every `wt` since OPS-100 keeps a deferred ticket out of
+  `claim_next`, `claim_by_ref` and `wt run`, so a host that cannot read the
+  sidecar is refused from the issue alone. That includes a host older than
+  OPS-201, a downgraded host, or one first claiming after the ticket was gated.
+  A held in_review issue that is reopened stays deferred too. A `wt` at
+  `PIPELINE_PROTO` 2 or later sees through the sentinel to the saved human
+  defer and lets the overlay decide. Lifting the hold restores that defer;
+  a `wt defer` made during the hold is kept. Limits:
+  - a `wt` older than OPS-100 (2026-10-25) is not fenced;
+  - a crash between the sidecar write and the issue write leaves the issue
+    fence one step behind until the next mutation.
 - A current `wt` on another host fails closed: the marker makes the ticket
   `pipeline_foreign` (no claim, no stage). Its orphan sweep may still reopen
   a held issue whose builder is gone; the owning host keeps showing it
@@ -190,10 +198,9 @@ Codex review scored the doc-only contract 3/10. Disposition:
   a `desired()` recheck (#10/#11); `plan_decide` reopens the issue (#6);
   generation tombstone + retired-worker fence (#12).
 - Closed by OPS-203 (#3/#4): per-store owner UUID in the marker, verified
-  marker write (lost race = not gated), and the reader check above. What
-  remains: a host that is downgraded, or a new host that claims for the
-  first time, *after* a ticket was gated is not fenced. The check runs at
-  gate time only. GitHub duplicate links (Mac OPS-1456) need verify/review
+  marker write (lost race = not gated), and the reader check above. The
+  claim-time remainder (a host downgraded, or claiming for the first time,
+  after gating) is closed by OPS-215's issue-level hold. GitHub duplicate links (Mac OPS-1456) need verify/review
   proof on GitHub first, so they follow OPS-204.
 
 ## Activation / resume procedure

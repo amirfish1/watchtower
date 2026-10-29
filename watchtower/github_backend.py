@@ -1157,6 +1157,49 @@ def _defer_live(until: Any) -> bool:
     return parsed is not None and parsed.timestamp() > time.time()
 
 
+# OPS-215: while a gated ticket is plan-pending or in review, its issue carries
+# this defer window. Every wt since OPS-100 keeps a deferred ticket out of
+# claim_next / claim_by_ref / `wt run`, so a host that cannot read the pipeline
+# (older than OPS-201, or no sidecar) is fenced by the issue alone. A wt that
+# knows ``pipeline_hold`` reads the human defer it saved instead and lets the
+# sidecar overlay decide the hold.
+PIPELINE_HOLD_UNTIL = "2099-12-31T00:00:00Z"
+
+
+def _effective_defer(meta: Dict[str, Any]) -> str:
+    until = str(meta.get("deferred_until") or "")
+    hold = meta.get("pipeline_hold")
+    if isinstance(hold, dict) and until == PIPELINE_HOLD_UNTIL:
+        return str(hold.get("prev_defer") or "")
+    return until
+
+
+def _set_pipeline_hold(meta: Dict[str, Any], why: str) -> None:
+    """Write (``why`` = plan|review) or lift the issue-level pipeline hold. A
+    human defer is kept in the hold and restored when it lifts; one set during
+    the hold (it replaced the sentinel) is re-saved on the next write."""
+    hold = meta.get("pipeline_hold")
+    if why:
+        if not isinstance(hold, dict) or meta.get("deferred_until") != PIPELINE_HOLD_UNTIL:
+            hold = {"prev_defer": str(meta.get("deferred_until") or ""),
+                    "prev_reason": str(meta.get("defer_reason") or "")}
+        meta["pipeline_hold"] = dict(hold, why=why)
+        meta["deferred_until"] = PIPELINE_HOLD_UNTIL
+        meta["defer_reason"] = (f"pipeline hold ({why}): it settles on the host that "
+                                f"owns its gates; a wt without that pipeline must not claim it")
+        return
+    if not isinstance(hold, dict):
+        return
+    meta.pop("pipeline_hold", None)
+    if meta.get("deferred_until") == PIPELINE_HOLD_UNTIL:
+        if hold.get("prev_defer"):
+            meta["deferred_until"] = hold["prev_defer"]
+            meta["defer_reason"] = hold.get("prev_reason") or ""
+        else:
+            meta.pop("deferred_until", None)
+            meta.pop("defer_reason", None)
+
+
 _DEFER_MARKER_RE = re.compile(r'^deferred_until:\s*"([^"]+)"', re.MULTILINE)
 
 
@@ -1942,7 +1985,7 @@ class GitHubIssuesBackend:
         #   work_it         = auto_eligible OR manual_eligible
         no_auto_drain = self.no_auto_drain_label in labels
         run_requested = self.run_requested_label in labels
-        deferred_until = str(meta.get("deferred_until") or "")
+        deferred_until = _effective_defer(meta)
         # `wt defer`: inside its data window a ticket is out of the pool for
         # claims and spawn depth alike, ▶ included (queue._claim_candidates).
         deferred = _defer_live(deferred_until)
@@ -2054,6 +2097,10 @@ class GitHubIssuesBackend:
         if deferred_until:
             item["deferred_until"] = deferred_until
             item["defer_reason"] = str(meta.get("defer_reason") or "")
+            if isinstance(meta.get("pipeline_hold"), dict) and deferred_until != meta.get("deferred_until"):
+                item["defer_reason"] = str(meta["pipeline_hold"].get("prev_reason") or "")
+        if isinstance(meta.get("pipeline_hold"), dict):
+            item["pipeline_hold"] = dict(meta["pipeline_hold"])
         if isinstance(meta.get("wait"), dict):
             item["wait"] = dict(meta["wait"])
         history = meta.get("history")
@@ -3590,6 +3637,8 @@ class GitHubIssuesBackend:
                     meta["pipeline_host"] = str(value)
                 else:
                     meta.pop("pipeline_host", None)
+            elif key == "pipeline_hold":
+                _set_pipeline_hold(meta, str(value or ""))
         self._edit_body(item, body, meta, "--title", title)
         return self.get(ident)
 
