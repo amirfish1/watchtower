@@ -29,7 +29,8 @@ _OWNER: Dict[str, str] = {}
 # Stamped on every GitHub claim this code makes. Gating a ticket requires every
 # machine that claimed the queue within READER_WINDOW_S to have stamped it, so
 # a host whose `wt` would ignore the plan hold cannot be claiming there (OPS-203).
-PIPELINE_PROTO = 1
+# 2 (OPS-215): reads the issue-level hold (``pipeline_hold``) this code writes.
+PIPELINE_PROTO = 2
 READER_WINDOW_S = 14 * 86400
 
 
@@ -285,6 +286,7 @@ def mutate(ident: Any, fn: Callable[[Dict[str, Any]], Any],
         if fn(it) == "skip":
             if healed:
                 _write(data)
+                _sync_hold(backend, ident, it)
             return it if skip_returns_item else None
         new_hist = (it.get("history") or [])[before_len:]
         for f in PIPELINE_FIELDS:
@@ -305,7 +307,29 @@ def mutate(ident: Any, fn: Callable[[Dict[str, Any]], Any],
                                  require_status="in_progress") is None:
             q._log("PIPELINE", f"{it.get('ref')}: issue moved before the plan stage's "
                    f"reopen landed; left as is", queue=str(it.get("project") or ""))
+    _sync_hold(backend, ident, it)
     return it
+
+
+def _hold_reason(it: Dict[str, Any]) -> str:
+    from . import queue as q
+    if it.get("review_hold"):
+        return "review"
+    return "plan" if q.plan_pending(it) else ""
+
+
+def _sync_hold(backend: Any, ident: Any, it: Dict[str, Any]) -> None:
+    """Mirror the sidecar hold onto the issue (OPS-215) so a host that cannot
+    read this sidecar still cannot claim the ticket. Runs after the sidecar
+    write: a crash in between leaves the issue fence one step behind, which
+    the overlay already covers for every wt that knows ``pipeline_host``."""
+    want = _hold_reason(it)
+    if want != str((it.get("pipeline_hold") or {}).get("why") or ""):
+        backend.update(ident, pipeline_hold=want)
+        if want:
+            it["pipeline_hold"] = dict(it.get("pipeline_hold") or {}, why=want)
+        else:
+            it.pop("pipeline_hold", None)
 
 
 def _settle(entry: Dict[str, Any], hold: Dict[str, Any]) -> None:
@@ -533,7 +557,10 @@ def set_gates(ident: Any, gates: List[str]) -> Optional[Dict[str, Any]]:
                     f"with a wt that ignores the pipeline hold: "
                     + ", ".join(f"{m} (last claim {at})" for m, at in sorted(stale.items()))
                     + ". Update them; a fresh claim from each clears this.")
-            backend.update(ident, pipeline_host=marker)
+            # The hold rides on the marker write: no window where a wt that
+            # cannot read the sidecar sees a plan-gated ticket unheld.
+            backend.update(ident, pipeline_host=marker,
+                           pipeline_hold="plan" if q.plan_gate({"gates": gates}) else "")
             # No CAS on issue edits: trust the persisted marker, not our write.
             # A racing host that wrote last owns it; we write no sidecar entry.
             persisted = backend.get(ident) or {}
@@ -558,6 +585,9 @@ def set_gates(ident: Any, gates: List[str]) -> Optional[Dict[str, Any]]:
             entry["rev"] = int(entry.get("rev") or 0) + 1
             entry["updated_at"] = q._now_iso()
             _write(data)
+        fresh = backend.get(ident)
+        if fresh is not None:
+            _sync_hold(backend, ident, fresh)
     else:
         with q._FileLock(q._lock_path()):
             data = _read_strict()
@@ -571,6 +601,6 @@ def set_gates(ident: Any, gates: List[str]) -> Optional[Dict[str, Any]]:
                                               | set(_stage_workers(entry))),
                     "rev": int(entry.get("rev") or 0) + 1, "updated_at": q._now_iso()}
                 _write(data)
-        if item.get("pipeline_host"):
-            backend.update(ident, pipeline_host="")
+        if item.get("pipeline_host") or item.get("pipeline_hold"):
+            backend.update(ident, pipeline_host="", pipeline_hold="")
     return backend.get(ident)

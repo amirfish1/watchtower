@@ -1,6 +1,7 @@
 """OPS-201 (owner decision C): the plan gate on a GitHub-backed queue. The issue
 stays canonical; pipeline state lives in the local sidecar
 (docs/github-pipeline-sidecar.md). These pin the contract, not the storage."""
+import contextlib
 import importlib
 import json
 import threading
@@ -385,7 +386,7 @@ def test_gating_waits_until_every_claiming_host_honors_the_hold(tmp_path, monkey
     q._MACHINE_TAG_CACHE = None
     data = json.loads(state.read_text())
     for issue in data["issues"]:
-        issue["body"] = issue["body"].replace('"pipeline": 1', '"pipeline": 0')
+        issue["body"] = issue["body"].replace('"pipeline": 2', '"pipeline": 1')
     state.write_text(json.dumps(data))
 
     with pytest.raises(ValueError, match="ami"):
@@ -399,3 +400,54 @@ def test_gating_waits_until_every_claiming_host_honors_the_hold(tmp_path, monkey
     q._MACHINE_TAG_CACHE = None
     q.update(ref, gates=["plan"])
     assert q.get(ref)["gates"] == ["plan"]
+
+
+@contextlib.contextmanager
+def _other_host(monkeypatch, q, sidecar):
+    """Another machine running a wt from before OPS-215: it ignores
+    ``pipeline_hold`` and honors a defer literally (OPS-100 on). Without the
+    sidecar it predates OPS-201 too and ignores ``pipeline_host``."""
+    from watchtower import github_backend, github_pipeline
+    with monkeypatch.context() as m:
+        m.setattr(github_backend, "_effective_defer",
+                  lambda meta: str(meta.get("deferred_until") or ""), raising=False)
+        if not sidecar:
+            m.setattr(github_pipeline, "overlay", lambda item: item)
+        q._MACHINE_TAG_CACHE = "ami"
+        try:
+            yield
+        finally:
+            q._MACHINE_TAG_CACHE = None
+
+
+def _fenced(monkeypatch, q, ref):
+    for sidecar in (False, True):
+        with _other_host(monkeypatch, q, sidecar):
+            backend = q._github_backend_for_project("GHI")
+            if q.get(ref)["status"] == "in_progress":   # a manual release on that host
+                backend.update_status(ref, "open", reason="released")
+            assert q.claim_next("ami-worker", project="GHI") is None
+            with pytest.raises(ValueError):
+                q.claim_by_ref(ref, "ami-worker")
+
+
+def test_a_host_that_cannot_read_the_pipeline_cannot_claim_a_held_ticket(tmp_path, monkeypatch):
+    """OPS-215: the hold is on the issue itself, so a host without the sidecar
+    (or one older than OPS-201) cannot claim a plan-pending ticket or a held
+    in_review one, even reopened, and the owning host still settles both."""
+    state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    q.update(ref, gates=["plan", "verify"])
+    _fenced(monkeypatch, q, ref)
+
+    q.plan_start(ref)
+    q.plan_submit(ref, "1. do it")
+    q.plan_verdict(ref, True, "fine")
+    assert "pipeline_hold" not in _body(state) and q.get(ref)["work_it"]
+    held = _closed_by_verify(q, ref)
+    assert held["status"] == "in_review" and "pipeline_hold" in _body(state)
+    _fenced(monkeypatch, q, ref)
+
+    assert q.get(ref)["status"] == "in_review"
+    done = q.verdict(ref, True, "checked", by="v1", expect_verify_cycle=1)
+    assert done["status"] == "closed" and _issue_state(state) == "CLOSED"
+    assert "pipeline_hold" not in _body(state) and "deferred_until" not in _body(state)
