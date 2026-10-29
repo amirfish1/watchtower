@@ -20,7 +20,14 @@ from typing import Any, Callable, Dict, List, Optional
 # ``review_hold`` is set the issue stays open and the overlay shows in_review.
 REVIEW_FIELDS = ("gate_pending", "gate_stages", "gate_results", "verify_cycle",
                  "verifier", "gate_feedback", "gate_accepted_by", "review_hold")
-PIPELINE_FIELDS = ("gates", "plan", "stage_session", "stage_retired") + REVIEW_FIELDS
+# WT-32a: a worker block parks the ticket (``parked`` = where the answer goes,
+# ``pending_answer`` = the routed answer, ``last_answer_gen`` = the newest
+# answer generation already consumed). Nothing writes them yet (WT-32b+).
+PARK_FIELDS = ("parked", "pending_answer", "last_answer_gen")
+PIPELINE_FIELDS = (("gates", "plan", "stage_session", "stage_retired")
+                   + REVIEW_FIELDS + PARK_FIELDS)
+_CLAIM_FIELDS = ("claimed_by", "claimed_session_id", "claimed_machine",
+                 "claimed_at", "claim_proc")
 _HOLD_KEYS = ("work_it", "auto_eligible", "manual_eligible", "claimable")
 
 _CACHE: Dict[str, Any] = {"sig": None, "data": None}
@@ -199,7 +206,7 @@ def overlay(item: Dict[str, Any]) -> Dict[str, Any]:
     _apply(item, entry)
     item["pipeline_local"] = True   # this host's stage tick owns the pipeline
     from . import queue as q
-    if q.plan_pending(item) or item.get("status") == "in_review":
+    if (q.plan_pending(item) or item.get("status") in ("in_review", "awaiting_answer")):
         _hold(item)
     return item
 
@@ -227,6 +234,11 @@ def _apply(item: Dict[str, Any], entry: Dict[str, Any]) -> None:
         item["closed_at"] = None
         if hold.get("resolution"):   # the close's resolution, held with the issue open
             item["resolution"] = copy.deepcopy(hold["resolution"])
+    parked = entry.get("parked")
+    if parked and str(item["issue_status"] or "") != "closed":
+        item["status"] = "awaiting_answer"   # WT-32a: the claim is released while parked
+        for f in _CLAIM_FIELDS:
+            item[f] = None
     extra = entry.get("history") or []
     if extra:
         item["history"] = sorted(list(item.get("history") or []) + copy.deepcopy(extra),

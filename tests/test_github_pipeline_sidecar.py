@@ -451,3 +451,76 @@ def test_a_host_that_cannot_read_the_pipeline_cannot_claim_a_held_ticket(tmp_pat
     done = q.verdict(ref, True, "checked", by="v1", expect_verify_cycle=1)
     assert done["status"] == "closed" and _issue_state(state) == "CLOSED"
     assert "pipeline_hold" not in _body(state) and "deferred_until" not in _body(state)
+
+
+def _park_in_sidecar(q, ref, **extra):
+    """Write park state straight into the sidecar entry (nothing writes it yet, WT-32a)."""
+    p = _sidecar(q)
+    data = json.loads(p.read_text())
+    (entry,) = data["items"].values()
+    entry["parked"] = {"worker_id": "w1", "session_id": "s1", "at": "2026-01-01T00:00:00Z"}
+    entry.update(extra)
+    p.write_text(json.dumps(data))
+
+
+def _claimed_gated(tmp_path, monkeypatch):
+    _state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    q.update(ref, gates=["plan"])
+    q.plan_start(ref)
+    q.plan_submit(ref, "1. do it")
+    q.plan_verdict(ref, True, "fine")
+    assert q.claim_next("w1", project="GHI")["ref"] == ref
+    assert q.get(ref)["status"] == "in_progress"
+    return q, ref
+
+
+def test_parked_sidecar_overlays_awaiting_answer_and_clears_the_claim(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    _park_in_sidecar(q, ref, pending_answer={"state": "routing"}, last_answer_gen=3)
+
+    item = q.get(ref)
+    assert item["status"] == "awaiting_answer" and item["issue_status"] == "in_progress"
+    assert item["parked"]["worker_id"] == "w1" and item["last_answer_gen"] == 3
+    assert item["pending_answer"] == {"state": "routing"}
+    for f in ("claimed_by", "claimed_session_id", "claimed_machine", "claimed_at", "claim_proc"):
+        assert item.get(f) is None
+    assert not item["work_it"]
+    assert q.claim_next("w2", project="GHI") is None
+
+
+def test_no_park_state_changes_nothing(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    item = q.get(ref)
+    assert item["status"] == "in_progress" and item["claimed_by"] == "w1"
+    assert "parked" not in item
+
+
+def test_park_on_a_closed_issue_is_moot(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    _park_in_sidecar(q, ref)
+    backend = q._github_backend_for_project("GHI")
+    backend.update_status(ref, "closed", reason="x")
+    assert q.get(ref)["status"] == "closed"
+
+
+def test_parked_foreign_or_missing_sidecar_fails_closed(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    _park_in_sidecar(q, ref)
+    q._github_backend_for_project("GHI").update(ref, pipeline_host="mac")
+    item = q.get(ref)
+    assert item["pipeline_foreign"] and item["status"] != "awaiting_answer"
+    assert not item["work_it"] and "parked" not in item
+
+    q._github_backend_for_project("GHI").update(ref, pipeline_host="her")
+    _sidecar(q).unlink()
+    item = q.get(ref)
+    assert item["pipeline_missing"] and not item["work_it"]
+
+
+def test_parked_with_corrupt_sidecar_fails_closed(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    _park_in_sidecar(q, ref)
+    _sidecar(q).write_text("{not json")
+    item = q.get(ref)
+    assert item["pipeline_missing"] and not item["work_it"]
+    assert q.claim_next("w2", project="GHI") is None
