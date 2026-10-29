@@ -727,6 +727,38 @@ def _engine_checks(cp: Dict[str, Any], sid: str, died_at: float,
     return ""
 
 
+def _bound_session_working(item: Dict[str, Any], ctx: ResolverContext) -> str:
+    """Proof source when a claim with no ``claim_proc`` (a GitHub-backed claim,
+    or a legacy local one) is held by a native session bound to this exact
+    claim and working now, else ''. The binding is the claim's own
+    (``claimed_by``, ``claimed_session_id``) pair: a hosted Codex thread whose
+    registry entry names that worker (it outlives its ``codex exec`` PID), or a
+    WT worker record carrying both. Working = that session's transcript was
+    written within RECENT_SESSION_S, so a quiet session still reaches recovery.
+    A claim held on another host is never proven from here (WT-38)."""
+    wid = str(item.get("claimed_by") or "")
+    sid = str(item.get("claimed_session_id") or "")
+    if not wid or not sid:
+        return ""
+    machine = str(item.get("claimed_machine") or "")
+    if machine and machine != q.machine_tag():
+        return ""
+    if q._hosted_codex_thread_owns_worker(wid, sid):
+        source, engine = "hosted_codex_thread", "codex"
+    else:
+        rec = next((w for w in reversed(ctx.rows())
+                    if str(w.get("worker_id") or "") == wid
+                    and str(w.get("session_id") or "") == sid), None)
+        if not rec:
+            return ""
+        source, engine = "wt_record_session", str(rec.get("engine") or "claude")
+    try:
+        mt = _transcript_mtime(engine, sid)
+    except Exception:  # noqa: BLE001 - a failed probe is not proof of life
+        return ""
+    return source if mt and ctx.now - mt < RECENT_SESSION_S else ""
+
+
 def claim_owner(item: Dict[str, Any], ctx: Optional[ResolverContext] = None) -> Verdict:
     """Is the process bound to this claim alive? ``alive`` on any live source;
     ``dead`` = death evidence + engine checks + no live source; else
@@ -737,6 +769,10 @@ def claim_owner(item: Dict[str, Any], ctx: Optional[ResolverContext] = None) -> 
     if cp is None and item.get("status") != q.PARKED_STATUS:
         cp = _legacy_proc(item, ctx)
     if cp is None:
+        source = _bound_session_working(item, ctx) \
+            if item.get("status") != q.PARKED_STATUS else ""
+        if source:
+            return Verdict("alive", source, "", None)
         return Verdict("unproven", "", "no claim_proc (legacy claim)", None)
     sid = str(cp.get("session_id") or item.get("claimed_session_id") or "")
     if sid and _registry_alive(sid):

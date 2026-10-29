@@ -215,6 +215,123 @@ def test_github_claim_escalates_through_block(lv, monkeypatch):
     assert [a["action"] for a in acted] == ["escalate"] and blocked == ["GH-1"]
 
 
+# WT-38: a GitHub-backed claim stores no claim_proc. A native session bound to
+# that exact claim and writing now is the owner at work, not "legacy unproven".
+def _gh_legacy(lv, monkeypatch, wid="becky-1", sid=SID2, **over):
+    item = {"ref": "GH-1", "project": "GH", "status": "in_progress", "claimed_by": wid,
+            "claimed_session_id": sid, "claimed_machine": lv.q.machine_tag(),
+            "claimed_at": "2000-01-01T00:00:00Z", "updated_at": "2000-01-01T00:00:00Z",
+            "history": []}
+    item.update(over)
+    blocked = []
+    monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
+    reopened = []
+    monkeypatch.setattr(lv.q, "recover_claim",
+                        lambda ref, **k: reopened.append((ref, k.get("action"))) or None)
+    return item, blocked, reopened
+
+
+def _hosted_thread(lv, monkeypatch, wid, sid, age_s, now):
+    """A hosted Codex thread registered to ``wid`` whose rollout was last
+    written ``age_s`` before ``now`` (its codex exec PID is long gone)."""
+    monkeypatch.setenv("CODEX_HOME", str(lv.tmp / "codex"))
+    monkeypatch.setenv("WATCHTOWER_CODEX_THREAD_REGISTRY", str(lv.tmp / "codex-registry.json"))
+    from watchtower import codex_registry
+    codex_registry.upsert(sid, worker_id=wid, queue="GH", wt={"worker_id": wid})
+    rollout = lv.tmp / "codex/sessions/2026/10/29" / f"rollout-{sid}.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    rollout.write_text('{"type":"response_item"}\n')
+    os.utime(rollout, (now - age_s, now - age_s))
+    return rollout
+
+
+def _owner(lv, item, now):
+    return lv.liveness.claim_owner(item, lv.liveness.ResolverContext(now))
+
+
+def test_github_legacy_claim_with_bound_hosted_thread_is_alive(lv, monkeypatch):
+    item, blocked, reopened = _gh_legacy(lv, monkeypatch)
+    now = time.time() + LATER
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
+    v = _owner(lv, item, now)
+    assert (v.verdict, v.source) == ("alive", "hosted_codex_thread")
+    a = lv.liveness.assess(item, {}, lv.liveness.ResolverContext(now))
+    assert (a["verdict"], a["action"]) == ("alive", "")
+    assert _sweep(lv) == [] and blocked == [] and reopened == []
+
+
+def test_github_legacy_claim_with_quiet_bound_thread_still_escalates(lv, monkeypatch):
+    item, blocked, reopened = _gh_legacy(lv, monkeypatch)
+    now = time.time() + LATER
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, LATER, now)    # stale rollout
+    assert _owner(lv, item, now).verdict == "unproven"
+    acted = _sweep(lv)
+    assert [a["action"] for a in acted] == ["escalate"] and blocked == ["GH-1"]
+    assert reopened == []
+
+
+def test_github_legacy_claim_unrelated_session_does_not_veto(lv, monkeypatch):
+    """A fresh thread of the same worker under another session id, or a fresh
+    rollout for the claim's session registered to another worker, is not the
+    claim's owner at work."""
+    item, blocked, _ = _gh_legacy(lv, monkeypatch)
+    now = time.time() + LATER
+    _hosted_thread(lv, monkeypatch, "becky-1", SID, 30, now)       # other session
+    assert _owner(lv, item, now).verdict == "unproven"
+    assert [a["action"] for a in _sweep(lv)] == ["escalate"] and blocked == ["GH-1"]
+    _hosted_thread(lv, monkeypatch, "someone-else", SID2, 30, now)  # other worker
+    v = _owner(lv, item, now)
+    assert (v.verdict, v.evidence) == ("unproven", "no claim_proc (legacy claim)")
+
+
+def test_github_legacy_claim_held_on_another_host_is_not_proven_here(lv, monkeypatch):
+    item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine="zz9")
+    now = time.time() + LATER
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
+    assert _owner(lv, item, now).verdict == "unproven"
+
+
+def test_github_legacy_claim_lookup_failure_escalates_not_recovers(lv, monkeypatch):
+    item, blocked, reopened = _gh_legacy(lv, monkeypatch)
+    now = time.time() + LATER
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
+
+    def boom(*a, **k):
+        raise OSError("probe failed")
+    monkeypatch.setattr(lv.liveness, "_transcript_mtime", boom)
+    assert _owner(lv, item, now).verdict == "unproven"
+    acted = _sweep(lv)
+    assert [a["action"] for a in acted] == ["escalate"] and blocked == ["GH-1"]
+    assert reopened == []
+
+
+def test_local_legacy_claim_with_bound_resumed_session(lv):
+    """A local claim with no claim_proc whose worker record (started after the
+    claim, so ``_legacy_proc`` declines it) carries the claim's exact session:
+    a fresh transcript is the owner at work; a quiet one is recoverable."""
+    ref = _claimed(lv)
+    _patch(lv, ref, claim_proc=None)
+    lv.worker()
+    data = lv.workers._load()
+    data["workers"][-1]["started_at"] = _iso(time.time() + 60)
+    lv.workers._save(data)
+    lv.kill()
+    proj = lv.tmp / "claude-home" / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    transcript = proj / f"{SID}.jsonl"
+    transcript.write_text("{}\n")
+    now = time.time() + LATER
+    os.utime(transcript, (now - 30, now - 30))
+    v = _owner(lv, lv.q.get(ref), now)
+    assert (v.verdict, v.source) == ("alive", "wt_record_session")
+    assert _sweep(lv) == [] and lv.q.get(ref)["status"] == "in_progress"
+    os.utime(transcript, (now - LATER, now - LATER))
+    assert _owner(lv, lv.q.get(ref), now).verdict == "unproven"
+    assert [a["action"] for a in _sweep(lv)] == ["escalate"]
+
+
 def test_unowned_in_progress_is_reopened_after_stall(lv):
     """``update_status(in_progress, worker='')`` leaves a non-terminal ticket
     with no claimer, no live owner and no human block (``work.unowned``). The
