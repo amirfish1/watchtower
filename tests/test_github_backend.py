@@ -3820,3 +3820,304 @@ def test_cross_queue_after_does_not_wake_for_unresolved_completion(tmp_path, mon
     assert q.claim_next("downstream", project="GHI") is None
     with pytest.raises(ValueError, match="stuck"):
         q.claim_by_ref(dep, "downstream")
+
+
+def test_claim_heartbeat_renews_only_the_same_claim_held_here(tmp_path, monkeypatch):
+    """WT-39: the owning host stamps ``claim_heartbeat`` on its own claim; a
+    renewal for another worker/session writes nothing; a system (backstop)
+    block records the writing host."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="long build")
+    q.claim_by_ref(item["ref"], "worker-1", session_uuid="sess-1")
+    backend = q._github_backend_for_project("GHI")
+    assert backend.renew_claim_heartbeat("GHI-1", claimed_by="worker-1",
+                                         session_id="other") is False
+    assert backend.renew_claim_heartbeat("GHI-1", claimed_by="worker-2",
+                                         session_id="sess-1") is False
+    assert q.get("GHI-1")["claim_heartbeat"] is None
+    assert backend.renew_claim_heartbeat("GHI-1", claimed_by="worker-1",
+                                         session_id="sess-1") is True
+    hb = q.get("GHI-1")["claim_heartbeat"]
+    assert hb["machine"] == q.machine_tag() and hb["claimed_by"] == "worker-1"
+    assert hb["session_id"] == "sess-1" and hb["at"]
+    q.block("GHI-1", "", question="backstop question", origin="system")
+    block = [h for h in q.get("GHI-1")["history"] if h["event"] == "block"][-1]
+    assert block["machine"] == q.machine_tag()
+    assert "claim_heartbeat" in json.loads(state.read_text())["issues"][0]["body"]
+
+
+def test_block_expect_fence_rechecks_claim_under_the_body_lock(tmp_path, monkeypatch):
+    """WT-39: a backstop block carries the claim it decided on; a claim that
+    changed (renewed heartbeat, rebound session) by the time the block re-reads
+    the issue writes nothing -- no metadata, no issue comment."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="long build")
+    q.claim_by_ref(item["ref"], "worker-1", session_uuid="sess-1")
+    decided = q.get("GHI-1")
+    expect = {k: decided.get(k) for k in ("status", "claimed_by", "claimed_session_id",
+                                          "claimed_machine", "needs_input", "claim_heartbeat")}
+    # Between the decision and the write, the owning host renews its claim.
+    backend = q._github_backend_for_project("GHI")
+    assert backend.renew_claim_heartbeat("GHI-1", claimed_by="worker-1", session_id="sess-1")
+    before = json.loads(state.read_text())["issues"][0]
+    assert q.block("GHI-1", "", question="backstop?", origin="system", expect=expect) is None
+    after = json.loads(state.read_text())["issues"][0]
+    assert after["body"] == before["body"] and after["comments"] == before["comments"]
+    assert q.get("GHI-1")["needs_input"] is False
+    # The unchanged claim (re-decided on the fresh read) is blocked as before.
+    fresh = q.get("GHI-1")
+    expect = {k: fresh.get(k) for k in expect}
+    assert q.block("GHI-1", "", question="backstop?", origin="system", expect=expect)
+    assert q.get("GHI-1")["needs_input"] is True
+
+
+
+def _orphan_snapshot(tmp_path, monkeypatch):
+    """A GHI claim by dead-local/old-sess on this host, and the orphan sweep's
+    snapshot fence (``liveness._CLAIM_KEYS``) taken from it."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="long build")
+    q.claim_by_ref(item["ref"], "dead-local", session_uuid="old-sess")
+    from watchtower import liveness
+    snap = q.get("GHI-1")
+    return state, q, snap, {k: snap.get(k) for k in liveness._CLAIM_KEYS}
+
+
+def _rewrite_claim(state, snap, **new):
+    """Another writer changes the claim on the issue after the snapshot."""
+    data = json.loads(state.read_text())
+    issue = data["issues"][0]
+    for key, old in (("claimed_by", snap["claimed_by"]),
+                     ("claimed_session_id", snap["claimed_session_id"]),
+                     ("claimed_machine", snap["claimed_machine"])):
+        if key in new:
+            issue["body"] = issue["body"].replace(str(old), new[key])
+    state.write_text(json.dumps(data))
+
+
+@pytest.mark.parametrize("change", [
+    # The verifier's replay: stale local snapshot, live claim on another host.
+    {"claimed_by": "live-remote", "claimed_session_id": "live-sess",
+     "claimed_machine": "owner-host"},
+    {"claimed_session_id": "new-sess"},          # same host, worker resumed
+    {"claimed_by": "new-worker"},                # same host, new claimer
+])
+def test_orphan_reopen_fence_spares_a_claim_changed_since(tmp_path, monkeypatch, change):
+    """WT-39: the orphan sweep reopens from a list snapshot naming its dead
+    worker; when the fresh read under the body lock names another claimer,
+    session or host, the reopen writes nothing at all (body, labels, state,
+    comments) and the claim stays exactly as its holder left it."""
+    state, q, snap, expect = _orphan_snapshot(tmp_path, monkeypatch)
+    _rewrite_claim(state, snap, **change)
+    fresh = q.get("GHI-1")
+    assert all(fresh[k] == v for k, v in change.items())
+    before = json.loads(state.read_text())["issues"][0]
+    assert q.update_status("GHI-1", "open", quiet=True, require_status="in_progress",
+                           expect=expect) is None
+    assert json.loads(state.read_text())["issues"][0] == before
+    assert q.get("GHI-1")["status"] == "in_progress"
+
+
+@pytest.mark.parametrize("expect", [
+    {}, "dead-local", ["claimed_by"],
+    {"status": "in_progress", "claimed_by": None, "claimed_session_id": ""},
+])
+def test_orphan_reopen_fence_refuses_missing_or_malformed_identity(
+        tmp_path, monkeypatch, expect):
+    """A fence that names no claim (or is not a dict) cannot tell the dead
+    claim from a live one, so it refuses rather than reopening blind."""
+    state, q, _, _ = _orphan_snapshot(tmp_path, monkeypatch)
+    before = json.loads(state.read_text())["issues"][0]
+    assert q.update_status("GHI-1", "open", quiet=True, require_status="in_progress",
+                           expect=expect) is None
+    assert json.loads(state.read_text())["issues"][0] == before
+
+
+def test_orphan_reopen_fence_still_reopens_the_unchanged_dead_claim(tmp_path, monkeypatch):
+    state, q, snap, expect = _orphan_snapshot(tmp_path, monkeypatch)
+    assert expect["claimed_by"] == "dead-local" and expect["claimed_session_id"] == "old-sess"
+    assert q.update_status("GHI-1", "open", quiet=True, require_status="in_progress",
+                           expect=expect)
+    after = q.get("GHI-1")
+    assert after["status"] == "open" and not after.get("claimed_by")
+
+
+@pytest.mark.parametrize("taken_since", [None, "before_sweep", "in_flight"])
+def test_orphan_sweep_real_path_never_reopens_a_github_claim(
+        tmp_path, monkeypatch, taken_since):
+    """WT-39 verify:3 replay on the real path (workers.requeue_orphaned_tickets
+    with the real queue and GitHubIssuesBackend over fake gh). The sweep's
+    list snapshot shows this host's dead worker. ``in_flight`` is the
+    verifier's witness: another host takes the claim over after every read
+    the sweep makes, right before it would write. GitHub edits take no
+    precondition, so the sweep makes no write at all on a GitHub claim: the
+    ORIGINAL _edit_body is never reached, the issue keeps whatever claim it
+    holds, and one bounded recovery request goes to this host's OPS lane."""
+    import subprocess
+
+    import watchtower.workers as workers
+    from watchtower import github_backend
+
+    state, q, snap, _ = _orphan_snapshot(tmp_path, monkeypatch)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    workers.record_worker(dead.pid, "GHI", "codex", "dead-local",
+                          repo_path=str(tmp_path), session_id="old-sess")
+    stale = q.list_items()
+    real_list = q.list_items
+    monkeypatch.setattr(q, "list_items", lambda *a, **k: [dict(i) for i in stale])
+    edits = []
+    original = github_backend.GitHubIssuesBackend._edit_body
+
+    def spy(self, item, body, meta, *extra):
+        # The verifier's exact witness: the takeover lands right before the
+        # original whole-body write, after every read and fence.
+        if taken_since == "in_flight":
+            _rewrite_claim(state, snap, **takeover)
+        edits.append((item.get("ref"), extra))
+        return original(self, item, body, meta, *extra)
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_edit_body", spy)
+    takeover = dict(claimed_by="live-remote", claimed_session_id="live-sess",
+                    claimed_machine="owner-host")
+    if taken_since == "before_sweep":
+        _rewrite_claim(state, snap, **takeover)
+    real_enqueue = q.enqueue
+    filed = []
+
+    def enqueue(**kw):
+        if taken_since == "in_flight":       # or while the request is filed
+            _rewrite_claim(state, snap, **takeover)
+        filed.append(kw)
+        return real_enqueue(**kw)
+    monkeypatch.setattr(q, "enqueue", enqueue)
+    before = json.loads(state.read_text())
+    reopened = workers.requeue_orphaned_tickets(grace_s=0)
+    after = json.loads(state.read_text())
+
+    assert reopened == [] and edits == []
+    assert not [c for c in after["commands"][len(before["commands"]):]
+                if c[:2] in (["issue", "edit"], ["issue", "comment"],
+                             ["issue", "reopen"], ["issue", "close"])]
+    fresh = q.get("GHI-1")
+    holder = (("live-remote", "live-sess", "owner-host") if taken_since
+              else ("dead-local", "old-sess", snap["claimed_machine"]))
+    assert fresh["status"] == "in_progress" and not fresh.get("needs_input")
+    assert (fresh["claimed_by"], fresh["claimed_session_id"], fresh["claimed_machine"]) == holder
+    assert after["issues"][0]["labels"] == before["issues"][0]["labels"]
+    assert any("in-progress" in label for label in after["issues"][0]["labels"])
+    # The snapshot decided on is the dead local claim; its request is filed
+    # once (the OPS lane is local, so it dedupes) and points at `wt release`.
+    assert len(filed) == 1 and filed[0]["dedupe_key"].endswith(":dead-local:old-sess:"
+                                                                 + str(snap["claimed_at"]) + "#1")
+    assert "wt release GHI-1`" in filed[0]["text"]
+    monkeypatch.setattr(q, "list_items", lambda *a, **k: [dict(i) for i in stale]
+                        + [i for i in real_list(project="OPS")])
+    assert workers.requeue_orphaned_tickets(grace_s=0) == [] and len(filed) == 1
+
+
+def test_backstop_real_path_never_blocks_an_unowned_github_issue(tmp_path, monkeypatch):
+    """WT-39 verify:4 replay on the real path (liveness.sweep -> assess ->
+    _apply over the real queue and GitHubIssuesBackend, fake gh): an
+    in_progress issue with no claimer, aged past the stall window. A spy on
+    the ORIGINAL _edit_body injects a live foreign claim right before any
+    write (the verifier's witness), and so does the recovery filing. The
+    sweep writes nothing on the issue -- no edit, no question comment -- the
+    foreign claim survives exactly, and one bounded request goes to OPS."""
+    import time
+
+    from watchtower import github_backend, liveness
+
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="half-claimed")
+    q.claim_by_ref(item["ref"], "gone", session_uuid="gone-sess")
+    snap = q.get("GHI-1")
+    data = json.loads(state.read_text())     # strip the claim: work.unowned
+    body = data["issues"][0]["body"]
+    for key in ("claimed_by", "claimed_session_id", "claimed_machine"):
+        body = body.replace(str(snap[key]), "")
+    data["issues"][0]["body"] = body
+    data["issues"][0]["assignees"] = []      # the verifier's "no assignees"
+    state.write_text(json.dumps(data))
+    unowned = q.get("GHI-1")
+    assert unowned["status"] == "in_progress" and not unowned.get("claimed_by")
+    assert liveness.row_of(unowned).id == "work.unowned"
+
+    def take_over():
+        data = json.loads(state.read_text())
+        issue = data["issues"][0]
+        _b, meta = github_backend._split_body(issue["body"])
+        meta.update(claimed_by="live-remote", claimed_session_id="live-sess",
+                    claimed_machine="owner-host")
+        issue["body"] = github_backend._body_with_metadata(_b, meta)
+        state.write_text(json.dumps(data))
+    edits = []
+    original = github_backend.GitHubIssuesBackend._edit_body
+
+    def spy(self, item, body, meta, *extra):
+        take_over()
+        edits.append(item.get("ref"))
+        return original(self, item, body, meta, *extra)
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_edit_body", spy)
+    real_enqueue, filed = q.enqueue, []
+
+    def enqueue(**kw):
+        take_over()
+        filed.append(kw)
+        return real_enqueue(**kw)
+    monkeypatch.setattr(q, "enqueue", enqueue)
+    before = json.loads(state.read_text())
+    later = time.time() + 10 * liveness.stall_s()
+    acted = liveness.sweep(now=later)
+    after = json.loads(state.read_text())
+
+    assert [(a["row"], a["action"], a["result"]) for a in acted] == \
+        [("work.unowned", "route_owner_host", "done")]
+    assert edits == []
+    assert not [c for c in after["commands"][len(before["commands"]):]
+                if c[:2] in (["issue", "edit"], ["issue", "comment"],
+                             ["issue", "reopen"], ["issue", "close"])]
+    fresh = q.get("GHI-1")
+    assert (fresh["status"], fresh["claimed_by"], fresh["claimed_session_id"],
+            fresh["claimed_machine"], bool(fresh.get("needs_input"))) == \
+        ("in_progress", "live-remote", "live-sess", "owner-host", False)
+    assert after["issues"][0]["labels"] == before["issues"][0]["labels"]
+    assert len(filed) == 1 and filed[0]["project"] == "OPS"
+    # One open request at a time: the claim is now live-remote's on
+    # owner-host, so nothing more is filed for the old unowned identity.
+    assert len([a for a in liveness.sweep(now=later) if a["action"] == "route_owner_host"
+                and a["ref"] == "GHI-1" and "unowned" in a["row"]]) == 0
+
+
+def test_update_status_expect_fence_on_a_local_queue(tmp_path, monkeypatch):
+    """The same ``expect`` contract holds for the file-backed store."""
+    _config, q = _reload_isolated(tmp_path, monkeypatch)
+    item = q.enqueue(project="LOC", note="local work")
+    q.claim_by_ref(item["ref"], "w-1", session_uuid="s-1")
+    snap = q.get(item["ref"])
+    stale = {"status": "in_progress", "claimed_by": "w-0",
+             "claimed_session_id": snap.get("claimed_session_id")}
+    assert q.update_status(item["ref"], "open", require_status="in_progress",
+                           expect=stale) is None
+    assert q.update_status(item["ref"], "open", require_status="in_progress",
+                           expect={}) is None
+    assert q.get(item["ref"])["status"] == "in_progress"
+    assert q.update_status(item["ref"], "open", require_status="in_progress",
+                           expect={"claimed_by": snap["claimed_by"],
+                                   "claimed_session_id": snap.get("claimed_session_id")})
+    assert q.get(item["ref"])["status"] == "open"

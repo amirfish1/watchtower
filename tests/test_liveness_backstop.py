@@ -204,15 +204,158 @@ def test_unproven_owner_escalates_then_stays_human(lv):
     assert _sweep(lv) == []
 
 
-def test_github_claim_escalates_through_block(lv, monkeypatch):
-    blocked = []
+def test_github_claim_routes_recovery_never_blocks(lv, monkeypatch):
+    """WT-39: an unproven GitHub claim (no host recorded) is never blocked or
+    reopened automatically: GitHub edits take no precondition. It routes one
+    bounded recovery request; a second sweep files nothing more."""
+    blocked, routes = [], []
     item = {"ref": "GH-1", "project": "GH", "status": "in_progress", "claimed_by": "x",
             "claimed_session_id": SID2, "updated_at": "2000-01-01T00:00:00Z", "history": []}
     monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
-    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)] + [dict(r) for r in routes])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))      # the fresh read
     monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
+    monkeypatch.setattr(lv.q, "enqueue", lambda **k: routes.append(
+        {"ref": f"OPS-{len(routes) + 1}", "status": "open", "project": "OPS",
+         "dedupe_key": k["dedupe_key"], "text": k["text"]}) or routes[-1])
     acted = _sweep(lv)
-    assert [a["action"] for a in acted] == ["escalate"] and blocked == ["GH-1"]
+    assert [(a["action"], a["result"]) for a in acted] == [("route_owner_host", "done")]
+    assert blocked == [] and len(routes) == 1
+    assert "wt release GH-1`" in routes[0]["text"]
+    assert _sweep(lv) == [] and len(routes) == 1       # one open request at a time
+
+
+# WT-38: a GitHub-backed claim stores no claim_proc. A native session bound to
+# that exact claim and writing now is the owner at work, not "legacy unproven".
+def _gh_legacy(lv, monkeypatch, wid="becky-1", sid=SID2, **over):
+    item = {"ref": "GH-1", "project": "GH", "status": "in_progress", "claimed_by": wid,
+            "claimed_session_id": sid, "claimed_machine": lv.q.machine_tag(),
+            "claimed_at": "2000-01-01T00:00:00Z", "updated_at": "2000-01-01T00:00:00Z",
+            "history": []}
+    item.update(over)
+    blocked = []
+    monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))      # the fresh read
+    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
+    reopened = []
+    monkeypatch.setattr(lv.q, "recover_claim",
+                        lambda ref, **k: reopened.append((ref, k.get("action"))) or None)
+    lv.routes = []      # owner-host recovery requests (WT-38): enqueue kwargs
+    monkeypatch.setattr(lv.q, "enqueue", lambda **k: lv.routes.append(k) or
+                        {"ref": f"OPS-{len(lv.routes)}", "dedupe_key": k.get("dedupe_key")})
+    return item, blocked, reopened
+
+
+def _hosted_thread(lv, monkeypatch, wid, sid, age_s, now):
+    """A hosted Codex thread registered to ``wid`` whose rollout was last
+    written ``age_s`` before ``now`` (its codex exec PID is long gone)."""
+    monkeypatch.setenv("CODEX_HOME", str(lv.tmp / "codex"))
+    monkeypatch.setenv("WATCHTOWER_CODEX_THREAD_REGISTRY", str(lv.tmp / "codex-registry.json"))
+    from watchtower import codex_registry
+    codex_registry.upsert(sid, worker_id=wid, queue="GH", wt={"worker_id": wid})
+    rollout = lv.tmp / "codex/sessions/2026/10/29" / f"rollout-{sid}.jsonl"
+    rollout.parent.mkdir(parents=True, exist_ok=True)
+    rollout.write_text('{"type":"response_item"}\n')
+    os.utime(rollout, (now - age_s, now - age_s))
+    return rollout
+
+
+def _owner(lv, item, now):
+    return lv.liveness.claim_owner(item, lv.liveness.ResolverContext(now))
+
+
+def test_github_legacy_claim_with_bound_hosted_thread_is_alive(lv, monkeypatch):
+    item, blocked, reopened = _gh_legacy(lv, monkeypatch)
+    now = time.time() + LATER
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
+    v = _owner(lv, item, now)
+    assert (v.verdict, v.source) == ("alive", "hosted_codex_thread")
+    a = lv.liveness.assess(item, {}, lv.liveness.ResolverContext(now))
+    assert (a["verdict"], a["action"]) == ("alive", "")
+    assert _sweep(lv) == [] and blocked == [] and reopened == []
+
+
+def test_github_legacy_claim_with_quiet_bound_thread_still_routes(lv, monkeypatch):
+    item, blocked, reopened = _gh_legacy(lv, monkeypatch)
+    now = time.time() + LATER
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, LATER, now)    # stale rollout
+    assert _owner(lv, item, now).verdict == "unproven"
+    acted = _sweep(lv)
+    assert [a["action"] for a in acted] == ["route_owner_host"] and blocked == []
+    assert len(lv.routes) == 1
+    assert reopened == []
+
+
+def test_github_legacy_claim_unrelated_session_does_not_veto(lv, monkeypatch):
+    """A fresh thread of the same worker under another session id, or a fresh
+    rollout for the claim's session registered to another worker, is not the
+    claim's owner at work."""
+    item, blocked, _ = _gh_legacy(lv, monkeypatch)
+    now = time.time() + LATER
+    _hosted_thread(lv, monkeypatch, "becky-1", SID, 30, now)       # other session
+    assert _owner(lv, item, now).verdict == "unproven"
+    assert [a["action"] for a in _sweep(lv)] == ["route_owner_host"] and blocked == []
+    _hosted_thread(lv, monkeypatch, "someone-else", SID2, 30, now)  # other worker
+    v = _owner(lv, item, now)
+    assert (v.verdict, v.evidence) == ("unproven", "no claim_proc (legacy claim)")
+
+
+def test_github_legacy_claim_held_on_another_host_is_not_proven_here(lv, monkeypatch):
+    """A fresh local rollout for the claim's session is not proof for a claim
+    held on another host, and with no owning-host heartbeat the full
+    assess -> sweep -> apply path routes it to the owning host: no block, no
+    recovery, nothing written on the claimed issue (WT-38)."""
+    item, blocked, reopened = _gh_legacy(lv, monkeypatch, claimed_machine="zz9")
+    now = time.time() + LATER
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
+    assert _owner(lv, item, now).verdict == "unproven"
+    a = lv.liveness.assess(item, {}, lv.liveness.ResolverContext(now))
+    assert (a["verdict"], a["action"]) == ("unobserved", "route_owner_host")
+    assert "held on zz9; no owning-host heartbeat" in a["evidence"]
+    acted = _sweep(lv)
+    assert [(x["action"], x["result"]) for x in acted] == [("route_owner_host", "done")]
+    assert blocked == [] and reopened == [] and len(lv.routes) == 1
+
+
+def test_github_legacy_claim_lookup_failure_routes_not_recovers(lv, monkeypatch):
+    item, blocked, reopened = _gh_legacy(lv, monkeypatch)
+    now = time.time() + LATER
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
+
+    def boom(*a, **k):
+        raise OSError("probe failed")
+    monkeypatch.setattr(lv.liveness, "_transcript_mtime", boom)
+    assert _owner(lv, item, now).verdict == "unproven"
+    acted = _sweep(lv)
+    assert [a["action"] for a in acted] == ["route_owner_host"] and blocked == []
+    assert len(lv.routes) == 1
+    assert reopened == []
+
+
+def test_local_legacy_claim_with_bound_resumed_session(lv):
+    """A local claim with no claim_proc whose worker record (started after the
+    claim, so ``_legacy_proc`` declines it) carries the claim's exact session:
+    a fresh transcript is the owner at work; a quiet one is recoverable."""
+    ref = _claimed(lv)
+    _patch(lv, ref, claim_proc=None)
+    lv.worker()
+    data = lv.workers._load()
+    data["workers"][-1]["started_at"] = _iso(time.time() + 60)
+    lv.workers._save(data)
+    lv.kill()
+    proj = lv.tmp / "claude-home" / "projects" / "-repo"
+    proj.mkdir(parents=True)
+    transcript = proj / f"{SID}.jsonl"
+    transcript.write_text("{}\n")
+    now = time.time() + LATER
+    os.utime(transcript, (now - 30, now - 30))
+    v = _owner(lv, lv.q.get(ref), now)
+    assert (v.verdict, v.source) == ("alive", "wt_record_session")
+    assert _sweep(lv) == [] and lv.q.get(ref)["status"] == "in_progress"
+    os.utime(transcript, (now - LATER, now - LATER))
+    assert _owner(lv, lv.q.get(ref), now).verdict == "unproven"
+    assert [a["action"] for a in _sweep(lv)] == ["escalate"]
 
 
 def test_unowned_in_progress_is_reopened_after_stall(lv):
@@ -253,16 +396,41 @@ def test_unowned_with_a_live_bound_session_is_left_alone(lv, monkeypatch):
     assert lv.q.get(ref)["status"] == "in_progress"
 
 
-def test_github_unowned_escalates_through_block(lv, monkeypatch):
-    blocked = []
+def test_github_unowned_routes_never_blocks(lv, monkeypatch):
+    """WT-39 verify:4: no claimer on the read does not mean no claim can be
+    lost at write time, so GitHub work.unowned routes one bounded recovery
+    request instead of a q.block; the next sweep files nothing more."""
+    blocked, routes = [], []
     item = {"ref": "GH-2", "project": "GH", "status": "in_progress", "claimed_by": None,
             "updated_at": "2000-01-01T00:00:00Z", "history": []}
     monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
-    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)] + [dict(r) for r in routes])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))      # the fresh read
     monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
+    monkeypatch.setattr(lv.q, "enqueue", lambda **k: routes.append(
+        {"ref": f"OPS-{len(routes) + 1}", "status": "open", "project": "OPS",
+         "dedupe_key": k["dedupe_key"]}) or routes[-1])
     acted = _sweep(lv)
-    assert [(a["row"], a["action"]) for a in acted] == [("work.unowned", "escalate")]
-    assert blocked == ["GH-2"]
+    assert [(a["row"], a["action"], a["result"]) for a in acted] == \
+        [("work.unowned", "route_owner_host", "done")]
+    assert blocked == [] and len(routes) == 1
+    assert _sweep(lv) == [] and len(routes) == 1
+
+
+def test_apply_refuses_any_automated_github_block(lv, monkeypatch):
+    """Defence in depth: whatever row decides ``escalate`` or
+    ``unblocked_plan`` on a GitHub ticket, _apply never calls q.block."""
+    blocked = []
+    item = {"ref": "GH-3", "project": "GH", "status": "in_progress", "claimed_by": "x",
+            "updated_at": "2000-01-01T00:00:00Z", "history": []}
+    monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))
+    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
+    for action in ("escalate", "unblocked_plan"):
+        a = {"ref": "GH-3", "queue": "GH", "action": action, "reason": "r", "verdict": "unproven",
+             "evidence": "e", "row": "work.claimed", "idle_s": 9999}
+        assert lv.liveness._apply(dict(item), a, {}, set()).startswith("refused")
+    assert blocked == []
 
 
 def test_live_sent_back_claim_is_left_to_its_release_window(lv):
@@ -656,9 +824,10 @@ def test_requeue_preserves_github_claim_while_resumed_transcript_advances(lv, mo
     ref = _claimed(lv)
     lv.kill()
     monkeypatch.setattr(lv.liveness, "_github", lambda project: True)
-    reopened = []
+    reopened, routes = [], []
     monkeypatch.setattr(lv.q, "update_status",
                         lambda r, status, **kw: reopened.append(r) or {"ref": r})
+    monkeypatch.setattr(lv.q, "enqueue", lambda **k: routes.append(k) or {"ref": "OPS-1"})
     base = time.time()
     monkeypatch.setattr(time, "time", lambda: base + 600)
     rollout = lv.tmp / "codex/sessions/2026/10/25" / f"rollout-{SID}.jsonl"
@@ -666,7 +835,471 @@ def test_requeue_preserves_github_claim_while_resumed_transcript_advances(lv, mo
     rollout.write_text('{"type":"response_item"}\n')
     os.utime(rollout, (base + 590, base + 590))
 
-    assert lv.workers.requeue_orphaned_tickets() == [] and reopened == []
-    # A quiet transcript still lets the dead claim recover.
+    assert lv.workers.requeue_orphaned_tickets() == [] and reopened == [] and routes == []
+    # A quiet transcript routes an explicit recovery request; a GitHub claim
+    # is never reopened automatically (WT-39).
     os.utime(rollout, (base - 3600, base - 3600))
-    assert [it["ref"] for it in lv.workers.requeue_orphaned_tickets()] == [ref]
+    assert lv.workers.requeue_orphaned_tickets() == [] and reopened == []
+    assert len(routes) == 1 and f"wt release {ref}`" in routes[0]["text"]
+
+
+# WT-39: a GitHub claim held on another host. This host defers only to the
+# owning host's renewal of exactly this claim (claim_heartbeat), fresh within
+# the stall window; anything else routes one recovery request to the owning
+# host and never blocks the claim (WT-38).
+FOREIGN = "zz9"
+
+
+def _hb(now, age_s, machine=FOREIGN, wid="becky-1", sid=SID2):
+    return {"machine": machine, "at": _iso(now - age_s), "claimed_by": wid,
+            "session_id": sid}
+
+
+def _foreign(lv, monkeypatch, now, hb_age=None, **hb):
+    over = {"claimed_machine": FOREIGN}
+    if hb_age is not None:
+        over["claim_heartbeat"] = _hb(now, hb_age, **hb)
+    return _gh_legacy(lv, monkeypatch, **over)
+
+
+def _decide(lv, item, now):
+    a = lv.liveness.assess(item, {}, lv.liveness.ResolverContext(now))
+    return a["verdict"], a["action"], a["evidence"]
+
+
+def test_foreign_claim_with_fresh_owner_heartbeat_takes_no_action(lv, monkeypatch):
+    now = time.time() + LATER
+    item, blocked, reopened = _foreign(lv, monkeypatch, now, hb_age=120)
+    verdict, action, evidence = _decide(lv, item, now)
+    assert (verdict, action) == ("remote", "")
+    assert evidence == "held on zz9; owning host renewed it 120s ago"
+    assert _sweep(lv) == [] and blocked == [] and reopened == []
+
+
+def test_foreign_claim_with_expired_owner_heartbeat_routes_to_owner(lv, monkeypatch):
+    now = time.time() + LATER
+    stall = lv.liveness.stall_s()
+    item, blocked, reopened = _foreign(lv, monkeypatch, now, hb_age=stall + 60)
+    verdict, action, evidence = _decide(lv, item, now)
+    assert (verdict, action) == ("unproven", "route_owner_host")
+    assert f"owning-host heartbeat {int(stall + 60)}s old" in evidence
+    assert [a["action"] for a in _sweep(lv)] == ["route_owner_host"]
+    assert blocked == [] and reopened == []
+    (route,) = lv.routes
+    assert route["project"] == "OPS" and "GH-1" in route["title"] and "zz9" in route["title"]
+    assert f"heartbeat age {int(stall + 60)}s" in route["text"]
+    assert f"Observed by host {lv.q.machine_tag()}" in route["text"]   # producer named
+
+
+@pytest.mark.parametrize("bad", [{"machine": "her2"}, {"wid": "becky-2"}, {"sid": SID}])
+def test_foreign_claim_heartbeat_for_another_claim_is_not_proof(lv, monkeypatch, bad):
+    """A stamp from another host, an earlier claimer or another session (a
+    rebound claim) proves nothing about the current claim."""
+    now = time.time() + LATER
+    item, blocked, _ = _foreign(lv, monkeypatch, now, hb_age=30, **bad)
+    assert _decide(lv, item, now)[:2] == ("unobserved", "route_owner_host")
+    assert [a["action"] for a in _sweep(lv)] == ["route_owner_host"] and blocked == []
+
+
+def test_foreign_claim_heartbeat_clock_skew(lv, monkeypatch):
+    """A stamp slightly ahead (skew within CLOCK_SKEW_S) counts as fresh; one
+    far in the future is not proof, so no host can buy immunity by its clock."""
+    now = time.time() + LATER
+    item, _, _ = _foreign(lv, monkeypatch, now, hb_age=-60)
+    assert _decide(lv, item, now)[:2] == ("remote", "")
+    item["claim_heartbeat"] = _hb(now, -(lv.liveness.CLOCK_SKEW_S + 3600))
+    assert _decide(lv, item, now)[:2] == ("unobserved", "route_owner_host")
+
+
+def test_local_claim_ignores_its_own_heartbeat(lv, monkeypatch):
+    """On the owning host the stamp is never proof: a quiet local session
+    with a fresh-looking heartbeat is still judged on local evidence (and
+    routed, since a GitHub claim is never blocked automatically, WT-39)."""
+    now = time.time() + LATER
+    item, blocked, _ = _gh_legacy(lv, monkeypatch)
+    item["claim_heartbeat"] = _hb(now, 30, machine=lv.q.machine_tag())
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, LATER, now)   # quiet
+    assert _decide(lv, item, now)[:2] == ("unproven", "route_owner_host")
+
+
+def test_missing_claimed_machine_keeps_local_judgement(lv, monkeypatch):
+    now = time.time() + LATER
+    item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine=None)
+    item["claim_heartbeat"] = _hb(now, 30)
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
+    assert _decide(lv, item, now)[:2] == ("alive", "")
+
+
+def _stale_snapshot(lv, monkeypatch, now, fresh):
+    """Sweep from a snapshot with no heartbeat while the live issue is ``fresh``."""
+    item, blocked, reopened = _foreign(lv, monkeypatch, now)
+    monkeypatch.setattr(lv.q, "get", fresh if callable(fresh) else (lambda ref: fresh))
+    return item, blocked, reopened
+
+
+def test_stale_snapshot_rechecked_against_fresh_issue_before_routing(lv, monkeypatch):
+    """The 09:47:56Z shape: the sweep's list snapshot lags the shared issue.
+    A fresh read showing a fresh owner heartbeat, a changed claim, a terminal
+    state or an already-posted question posts nothing."""
+    now = time.time() + LATER
+    item, blocked, reopened = _foreign(lv, monkeypatch, now)
+    cases = {
+        "heartbeat": dict(item, claim_heartbeat=_hb(now, 60)),
+        "rebound": dict(item, claimed_session_id=SID),
+        "closed": dict(item, status="closed"),
+        "asked": dict(item, needs_input=True),
+    }
+    for name, fresh in cases.items():
+        monkeypatch.setattr(lv.q, "get", lambda ref, f=fresh: dict(f))
+        acted = _sweep(lv)
+        assert [a["result"].split(" ")[0] for a in acted] == ["race"], name
+    assert blocked == [] and reopened == [] and lv.routes == []
+
+
+def test_failed_fresh_read_posts_nothing_and_retries(lv, monkeypatch):
+    now = time.time() + LATER
+
+    def boom(ref):
+        raise OSError("gh unavailable")
+    item, blocked, reopened = _stale_snapshot(lv, monkeypatch, now, boom)
+    acted = _sweep(lv)
+    assert [a["result"] for a in acted] == ["fresh read failed: gh unavailable"]
+    assert blocked == [] and reopened == [] and lv.routes == []
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))      # read recovers
+    assert [a["result"] for a in _sweep(lv)] == ["done"] and len(lv.routes) == 1
+    assert blocked == []
+
+
+class _HeartbeatBackend:
+    def __init__(self):
+        self.calls = []
+
+    def renew_claim_heartbeat(self, ref, *, claimed_by, session_id):
+        self.calls.append((ref, claimed_by, session_id))
+        return True
+
+
+def test_owning_host_renews_heartbeat_only_while_locally_alive(lv, monkeypatch):
+    now = time.time() + LATER
+    item, blocked, _ = _gh_legacy(lv, monkeypatch)
+    backend = _HeartbeatBackend()
+    monkeypatch.setattr(lv.q, "_github_backend_for_project",
+                        lambda p: backend if str(p).upper().startswith("GH") else None)
+    rollout = _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
+    assert _sweep(lv) == [] and backend.calls == [("GH-1", "becky-1", SID2)]
+    # A recent renewal is not rewritten every tick.
+    item["claim_heartbeat"] = _hb(now, 60, machine=lv.q.machine_tag())
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    assert _sweep(lv) == [] and len(backend.calls) == 1
+    # A quiet session is not renewed: the stamp ages out for other hosts.
+    item.pop("claim_heartbeat")
+    os.utime(rollout, (now - LATER, now - LATER))
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))
+    assert [a["action"] for a in _sweep(lv)] == ["route_owner_host"] and len(backend.calls) == 1
+    assert blocked == []
+
+
+def test_foreign_host_never_renews_heartbeat(lv, monkeypatch):
+    now = time.time() + LATER
+    item, _, _ = _foreign(lv, monkeypatch, now, hb_age=60)
+    backend = _HeartbeatBackend()
+    monkeypatch.setattr(lv.q, "_github_backend_for_project",
+                        lambda p: backend if str(p).upper().startswith("GH") else None)
+    assert _sweep(lv) == [] and backend.calls == []
+
+
+def test_orphan_requeue_leaves_foreign_github_claim_alone(lv, monkeypatch):
+    """A dead builder id known here never licenses an automatic reopen of a
+    GitHub claim: a foreign one is the owning host's (the backstop routes it
+    after its stall rules); a local one gets one bounded recovery request on
+    this host's OPS lane, and nothing is written on the claim (WT-39)."""
+    lv.worker(wid="becky-1", sid=SID2)
+    lv.kill()
+    item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine=FOREIGN,
+                            claimed_at="2000-01-01T00:00:00Z")
+    reopened, fences = [], []
+    monkeypatch.setattr(lv.q, "update_status",
+                        lambda ref, st, **k: reopened.append((ref, st)) or
+                        fences.append(k.get("expect")) or dict(item, status=st))
+    assert lv.workers.requeue_orphaned_tickets(grace_s=0) == [] and reopened == []
+    local = dict(item, claimed_machine=lv.q.machine_tag())
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(local)])
+    assert lv.liveness._owner_route_key(local) != lv.liveness._owner_route_key(item)
+    assert lv.workers.requeue_orphaned_tickets(grace_s=0) == []
+    assert reopened == [] and fences == [] and len(lv.routes) == 1
+    route = lv.routes[0]
+    assert route["project"] == "OPS" and "Claim recovery: GH-1" in route["title"]
+    assert route["dedupe_key"] == lv.liveness._owner_route_key(local) + "#1"
+    assert "wt release GH-1`" in route["text"] and "becky-1" in route["text"]
+    # One open request per claim: the next sweep files nothing more.
+    opened = {"ref": "OPS-1", "project": "OPS", "status": "open",
+              "dedupe_key": route["dedupe_key"]}
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(local), dict(opened)])
+    assert lv.workers.requeue_orphaned_tickets(grace_s=0) == [] and len(lv.routes) == 1
+
+
+def test_foreign_claim_without_any_heartbeat_never_asks_a_human(lv, monkeypatch):
+    """No stamp at all (the owning host predates WT-39, or never got a renewal
+    through) is not evidence the host died: nothing at one or three stall
+    windows of store idle; past UNOBSERVED_STALL_FACTOR windows it routes one
+    recovery request to the owning host -- still no question on the claim,
+    no reopen, and no second request on the next sweep."""
+    stall = lv.liveness.stall_s()
+    factor = lv.liveness.UNOBSERVED_STALL_FACTOR
+    t0 = time.time()
+    item, blocked, reopened = _foreign(lv, monkeypatch, t0)
+    item["updated_at"] = item["claimed_at"] = _iso(t0)
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))
+    for windows in (1.2, factor - 0.5):
+        assert _decide(lv, item, t0 + windows * stall)[:2] == ("unobserved", "")
+        assert _sweep(lv, off=windows * stall) == []
+    late = (factor + 0.1) * stall
+    assert _decide(lv, item, t0 + late)[:2] == ("unobserved", "route_owner_host")
+    assert [a["action"] for a in _sweep(lv, off=late)] == ["route_owner_host"]
+    assert blocked == [] and reopened == [] and len(lv.routes) == 1
+    routed = {"ref": "OPS-1", "project": "OPS", "status": "open",
+              "dedupe_key": lv.routes[0]["dedupe_key"]}
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item), dict(routed)])
+    for off in (late, 10 * late):
+        assert _sweep(lv, off=off) == []
+    a = lv.liveness.assess(item, {"OPS-1": routed}, lv.liveness.ResolverContext(t0 + late))
+    assert a["action"] == "" and "recovery routed to OPS-1" in a["evidence"]
+    assert blocked == [] and len(lv.routes) == 1
+
+
+def test_fresh_heartbeat_beats_an_old_ticket_clock(lv, monkeypatch):
+    """A long-running owner never touches the issue; its host's renewal alone
+    keeps a foreign observer quiet, however old the ticket's own clock."""
+    now = time.time() + 10 * LATER
+    item, blocked, _ = _foreign(lv, monkeypatch, now, hb_age=lv.liveness.stall_s() - 5)
+    assert _decide(lv, item, now)[:2] == ("remote", "")
+    assert _sweep(lv, off=10 * LATER) == [] and blocked == []
+
+
+def _local_quiet(lv, monkeypatch, now):
+    """A GitHub claim held HERE whose bound session went quiet."""
+    item = _gh_legacy(lv, monkeypatch)[0]
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, LATER, now)
+    return item
+
+
+def test_local_quiet_github_claim_routes_and_never_blocks(lv, monkeypatch):
+    """WT-39: even on the owning host the backstop does not block a GitHub
+    claim (a block is a whole-body write GitHub cannot condition on the claim
+    it read); it routes one recovery request and writes nothing on the claim."""
+    now = time.time() + LATER
+    item = _local_quiet(lv, monkeypatch, now)
+    blocks = []
+    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocks.append(k) or {"ref": ref})
+    acted = _sweep(lv)
+    assert [(a["action"], a["result"]) for a in acted] == [("route_owner_host", "done")]
+    assert blocks == [] and len(lv.routes) == 1
+    assert lv.routes[0]["dedupe_key"] == lv.liveness._owner_route_key(item) + "#1"
+
+
+def test_local_route_rechecks_the_fresh_issue_first(lv, monkeypatch):
+    now = time.time() + LATER
+    item = _local_quiet(lv, monkeypatch, now)
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item, claimed_by="someone-else"))
+    assert [a["result"].split(" ")[0] for a in _sweep(lv)] == ["race"]
+    assert lv.routes == []
+
+
+INCIDENT_NOW = 1793267276.0   # 2026-10-29T09:47:56Z, BECKY-2966's false escalation
+
+
+def test_incident_replay_foreign_live_claim_is_not_escalated(lv, monkeypatch):
+    """WT-38 replay: BECKY-2966 shape (exact worker/session, no claim_proc,
+    store activity 09:36:30Z) seen from a host that is not its owner and has
+    none of its session files. Neither at the incident instant nor one hour
+    later (two stall windows idle) does assess or sweep ask a human."""
+    item, blocked, reopened = _gh_legacy(lv, monkeypatch, claimed_machine="zz9",
+                                         updated_at="2026-10-29T09:36:30Z",
+                                         claimed_at="2026-10-29T06:40:10Z")
+    for now in (INCIDENT_NOW, INCIDENT_NOW + 3600):
+        a = lv.liveness.assess(item, {}, lv.liveness.ResolverContext(now))
+        assert (a["row"], a["action"]) == ("work.claimed", "")
+        assert "held on zz9" in a["evidence"]
+        assert lv.liveness.sweep(now=now) == []
+    assert blocked == [] and reopened == []
+
+
+VERIFY_NOW = 1793271600.0   # 2026-10-29T11:00:00Z, WT-39 verifier replay
+
+
+@pytest.mark.parametrize("hb_age, action", [
+    (None, "route_owner_host"),     # no stamp, store idle 3h (> 4 windows)
+    (2400, "route_owner_host"),     # expired stamp from 10:20Z
+    (60, ""),                       # fresh stamp from 10:59Z
+])
+def test_verifier_replay_foreign_claim_never_blocks(lv, monkeypatch, hb_age, action):
+    """WT-39 verifier replay through assess -> sweep -> _apply: a foreign
+    claim idle since 08:00Z, unchanged worker/session, seen at 11:00Z. Absent
+    or expired owning-host evidence routes one request to the owner; it never
+    posts a question, reopens, or otherwise writes the claimed issue."""
+    item, _, _ = _foreign(lv, monkeypatch, VERIFY_NOW, hb_age=hb_age)
+    item.update(updated_at="2026-10-29T08:00:00Z", claimed_at="2026-10-29T08:00:00Z")
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))
+    _no_claim_writes(lv, monkeypatch)
+    acted = lv.liveness.sweep(now=VERIFY_NOW)
+    assert [a["action"] for a in acted] == ([action] if action else [])
+    assert [a["result"] for a in acted] == (["done"] if action else [])
+    assert len(lv.routes) == (1 if action else 0)
+
+
+def test_foreign_claim_fresh_local_files_do_not_reset_its_clock(lv, monkeypatch):
+    """A same-named session file on this host is not the remote session: past
+    the migration bound a foreign claim with no stamp is still routed to its
+    owner, even when a local rollout for its session id was just written."""
+    item, blocked, reopened = _gh_legacy(lv, monkeypatch, claimed_machine="zz9",
+                                         updated_at="2026-10-29T09:36:30Z")
+    later = INCIDENT_NOW + (lv.liveness.UNOBSERVED_STALL_FACTOR + 1) * lv.liveness.stall_s()
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, later)
+    assert [a["action"] for a in lv.liveness.sweep(now=later)] == ["route_owner_host"]
+    assert blocked == [] and reopened == [] and len(lv.routes) == 1
+
+
+def _no_claim_writes(lv, monkeypatch):
+    """Any write to the claimed ticket fails the test."""
+    def write(*a, **k):
+        raise AssertionError(f"foreign observer wrote the claim: {a} {k}")
+    for name in ("block", "recover_claim", "update_status", "release", "answer"):
+        if hasattr(lv.q, name):
+            monkeypatch.setattr(lv.q, name, write)
+
+
+def test_fresh_concurrent_owner_answer_routes_nothing_and_writes_nothing(lv, monkeypatch):
+    """Boundary: the snapshot is old and stampless (past the bound), but the
+    fresh read shows the owner answered / worked moments ago. Nothing is
+    routed, and at no point does the observer write the claimed issue."""
+    item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine="zz9",
+                            updated_at="2026-10-29T09:36:30Z")
+    later = INCIDENT_NOW + (lv.liveness.UNOBSERVED_STALL_FACTOR + 1) * lv.liveness.stall_s()
+    _no_claim_writes(lv, monkeypatch)
+    answered = dict(item, updated_at=_iso(later - 5), history=[
+        {"ts": _iso(later - 5), "event": "answered", "by": "becky-1"}])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(answered))
+    acted = lv.liveness.sweep(now=later)
+    assert [a["result"].split(" ")[0] for a in acted] == ["race"] and lv.routes == []
+    # The owner's question is open on the fresh read: still hands off.
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item, needs_input=True))
+    acted = lv.liveness.sweep(now=later)
+    assert [a["result"].split(" ")[0] for a in acted] == ["race"] and lv.routes == []
+
+
+def test_owner_route_failure_is_reported_and_retried(lv, monkeypatch):
+    item, blocked, _ = _gh_legacy(lv, monkeypatch, claimed_machine="zz9",
+                                  updated_at="2026-10-29T09:36:30Z")
+    later = INCIDENT_NOW + (lv.liveness.UNOBSERVED_STALL_FACTOR + 1) * lv.liveness.stall_s()
+    _no_claim_writes(lv, monkeypatch)
+
+    def down(**k):
+        raise ValueError("dedupe keys currently require a local queue")
+    monkeypatch.setattr(lv.q, "enqueue", down)
+    acted = lv.liveness.sweep(now=later)
+    assert [a["result"] for a in acted] == [
+        "route failed: dedupe keys currently require a local queue"]
+    monkeypatch.setattr(lv.q, "enqueue", lambda **k: lv.routes.append(k) or {"ref": "OPS-9"})
+    assert [a["result"] for a in lv.liveness.sweep(now=later)] == ["done"]
+
+
+def test_a_new_claim_gets_its_own_owner_route(lv, monkeypatch):
+    """The dedupe key is the claim identity: a rebound claim is a new request."""
+    item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine="zz9")
+    k1 = lv.liveness._owner_route_key(item)
+    assert k1 != lv.liveness._owner_route_key(dict(item, claimed_session_id=SID))
+    assert k1 != lv.liveness._owner_route_key(dict(item, claimed_at="2001-01-01T00:00:00Z"))
+
+
+def test_owner_route_lifecycle_closed_request_is_not_recovery_proof(lv, monkeypatch):
+    """Route once -> the request closes when the heartbeat comes back -> the
+    SAME claim loses its signal later -> a new bounded request, one at a
+    time, never sooner than a stall window after the close, at most
+    OWNER_ROUTE_MAX in all; the claimed issue is never written."""
+    stall = lv.liveness.stall_s()
+    t0 = time.time()
+    item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine="zz9",
+                            updated_at=_iso(t0 - 10 * stall))
+    _no_claim_writes(lv, monkeypatch)
+    store = [dict(item)]
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(i) for i in store])
+
+    def enqueue(**k):
+        lv.routes.append(k)
+        row = {"ref": f"OPS-{len(lv.routes)}", "project": "OPS", "status": "open",
+               "dedupe_key": k["dedupe_key"]}
+        store.append(row)
+        return dict(row)
+    monkeypatch.setattr(lv.q, "enqueue", enqueue)
+
+    def close_last(at):
+        store[-1].update(status="closed", closed_at=_iso(at))
+
+    assert [a["result"] for a in lv.liveness.sweep(now=t0)] == ["done"]
+    assert lv.liveness.sweep(now=t0 + 60) == [] and len(lv.routes) == 1  # open: no storm
+    # Heartbeat renewed: the claim is quiet, the request is resolved.
+    store[0]["claim_heartbeat"] = _hb(t0 + 120, 0)
+    close_last(t0 + 120)
+    assert lv.liveness.sweep(now=t0 + 180) == []
+    # The same claim loses its signal again (stamp expires).
+    later = t0 + 120 + stall + 60
+    assert lv.liveness.sweep(now=later)[0]["result"] == "done" and len(lv.routes) == 2
+    assert lv.routes[1]["dedupe_key"].endswith("#2")
+    assert "OPS-1" in lv.routes[1]["text"]
+    # Closed while the claim is still unresolved: re-routed, but only after
+    # a stall window, and never beyond OWNER_ROUTE_MAX.
+    close_last(later + 10)
+    assert lv.liveness.sweep(now=later + 20) == [] and len(lv.routes) == 2
+    t = later + 10 + stall + 1
+    assert lv.liveness.sweep(now=t)[0]["result"] == "done" and len(lv.routes) == 3
+    assert "last request" in lv.routes[2]["text"]
+    close_last(t + 10)
+    for off in (stall + 20, 20 * stall):
+        assert lv.liveness.sweep(now=t + off) == []
+    a = lv.liveness.assess(store[0], lv.q._refs_index(store),
+                           lv.liveness.ResolverContext(t + 2 * stall))
+    assert a["action"] == "" and "routing exhausted, still unrecovered" in a["evidence"]
+    assert "`wt liveness GH-1` on zz9" in a["evidence"]
+    assert len(lv.routes) == lv.liveness.OWNER_ROUTE_MAX
+
+
+def test_owner_route_request_states_checks_and_safe_stop(lv, monkeypatch):
+    """The auto-filed request is self-contained and grants no destructive
+    authority: identity, evidence, recheck-first, explicit safe stop."""
+    item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine="zz9",
+                            updated_at="2026-10-29T09:36:30Z")
+    later = INCIDENT_NOW + (lv.liveness.UNOBSERVED_STALL_FACTOR + 1) * lv.liveness.stall_s()
+    lv.liveness.sweep(now=later)
+    (r,) = lv.routes
+    text = r["text"]
+    for want in ("becky-1", SID2, "host zz9", f"Observed by host {lv.q.machine_tag()}",
+                 "Re-read GH-1 first", "does not authorize `wt release --force`",
+                 "budget", "deadline", "grant", "proves the claimed", "Done when:",
+                 "an external wait, not a", "`wt defer`", "--unresolved",
+                 "never for\n   reachability alone"):
+        assert want in text, want
+    assert "block this request on" not in text      # unreachable is not a question
+    assert r["readiness"] == "ready"
+    assert r["accept_line"] and r["dedupe_key"].endswith("#1")
+
+
+def test_owner_route_files_a_real_local_ops_request_once(lv, monkeypatch):
+    """Through the real local store: the request lands in OPS with its
+    acceptance line, and the same episode key never files a second row."""
+    item = {"ref": "GH-1", "project": "GH", "status": "in_progress",
+            "claimed_by": "becky-1", "claimed_session_id": SID2,
+            "claimed_machine": "zz9", "claimed_at": "2026-10-29T06:40:10Z"}
+    a = {"ref": "GH-1", "queue": "GH", "evidence": "held on zz9; no owning-host heartbeat",
+         "idle_s": 9000}
+    r1 = lv.liveness._route_owner_host(item, a, {}, INCIDENT_NOW)
+    r2 = lv.liveness._route_owner_host(item, a, {}, INCIDENT_NOW)
+    assert r1 and r1 == r2
+    row = lv.q.get(r1)
+    assert row["project"] == "OPS" and row.get("accept")
+    # Filed ready to work, not as a question: no needs-you state moves to OPS.
+    assert (row["status"], row.get("readiness")) == ("open", "ready")
+    assert not row.get("needs_input") and not row.get("wait")
+    assert "`wt defer`" in row["text"] and "wt block" in row["text"]
+    assert row["dedupe_key"] == lv.liveness._owner_route_key(item) + "#1"

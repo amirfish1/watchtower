@@ -183,7 +183,9 @@ def wait_record(on: str, actor: str = "", ref: str = "", note: str = "",
     on = str(on or "").strip().lower()
     if on not in WAIT_ON:
         raise ValueError(f"wait-on must be one of {', '.join(WAIT_ON)}, not {on!r}")
-    rec: Dict[str, Any] = {"on": on, "at": _now_iso(), "block_at": str(block_at or "")}
+    rec: Dict[str, Any] = {"on": on, "at": _now_iso(), "block_at": str(block_at or ""),
+                           # A local-queue ref means a ticket on THIS host (OPS-230).
+                           "host": machine_tag()}
     if actor:
         rec["actor"] = _clip(str(actor).strip(), 120)
     if ref:
@@ -2966,6 +2968,18 @@ def backfill_session_id(ident: Any, session_id: str) -> Optional[Dict[str, Any]]
     return None
 
 
+def claim_expect_holds(item: Dict[str, Any], expect: Any) -> bool:
+    """WT-39: may a write fenced on ``expect`` go ahead against ``item`` (the
+    fresh read)? Only if ``expect`` is a dict naming a claim (a claimer or a
+    session) and every field still matches. A malformed or identity-less
+    fence cannot tell one claim from another, so it refuses."""
+    if not isinstance(expect, dict):
+        return False
+    if not (expect.get("claimed_by") or expect.get("claimed_session_id")):
+        return False
+    return all(item.get(k) == v for k, v in expect.items())
+
+
 def update_status(
     ident: Any,
     status: str,
@@ -2983,8 +2997,16 @@ def update_status(
     orphan: Optional[Dict[str, str]] = None,
     close_owner: str = "",
     group_force: bool = False,
+    expect: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """``group_force`` (WT-33 D9): taking a closed group child out of
+    """``expect`` (WT-39): fields the current item must still carry, checked
+    alongside ``require_status`` (on GitHub, against the fresh read under the
+    body lock); a mismatch, or a fence naming no claimer and no session
+    (``claim_expect_holds``), makes the write a no-op returning None. The orphan
+    sweep passes the claim identity it judged dead, so a claim taken over
+    since -- e.g. by a live worker on another host -- is never reopened.
+
+    ``group_force`` (WT-33 D9): taking a closed group child out of
     ``closed`` while its parent integrates raises ``GroupChildLocked`` unless
     set, which invalidates that integration in the same write. A group parent
     never moves through here (its plan and integration own its status); a
@@ -3051,6 +3073,7 @@ def update_status(
             reason=reason,
             expect_owner=expect_owner,
             require_status=require_status,
+            expect=expect,
         )
         if item:
             verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
@@ -3075,6 +3098,8 @@ def update_status(
         for it in data["items"]:
             if _matches(it, ident):
                 if require_status is not None and it.get("status") != require_status:
+                    return None
+                if expect is not None and not claim_expect_holds(it, expect):
                     return None
                 # Ownership guard for close (see expect_owner docstring). Runs
                 # inside the lock against the fresh item, so it's race-free with
@@ -3760,6 +3785,145 @@ def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
             it["block_commit"] = ""
             _append_history(it, "reopen", by=who, at=now,
                             reason="plan_decision_without_resumable_session")
+    return _plan_update(ident, _do)
+
+
+def plan_restore(ident: Any, by: str = "human",
+                 session_id: str = "") -> Optional[Dict[str, Any]]:
+    """Human repair of an ACCEPTED plan that a stage failure flipped to
+    ``failed`` (OPS-240: before 8626be4 an unspawnable supplement reviewer
+    called plan_fail on the accepted plan). Restores ``accepted`` with the
+    accepted text/version untouched, so an open supplement gets its review on
+    the next stage tick. The build's claim and any block are left alone: the
+    restore is not an answer to the builder."""
+    current = get(ident)
+    if current is None:
+        return None
+
+    def _check(plan, ref):
+        if plan.get("status") != "failed" or not plan.get("accepted_version"):
+            raise ValueError(f"{ref} has no failed plan that was accepted "
+                             f"(plan status {plan.get('status') or 'none'}, "
+                             f"accepted_version {plan.get('accepted_version')})")
+
+    _check(current.get("plan") or {}, current.get("ref", ident))
+    now = _now_iso()
+    who = _by("human", str(by or ""), str(session_id or ""))
+
+    def _do(it, plan):
+        _check(plan, it.get("ref", ident))   # #9: recheck in the lock
+        reason = str(plan.pop("reason", "") or "")
+        plan["status"] = "accepted"
+        plan["decisions"] = list(plan.get("decisions") or []) + [
+            {"decision": "restore", "round": int(plan.get("round") or 1),
+             "by": str(by or "human"), "at": now, "text": _clip(reason, 3000)}]
+        _append_history(it, "plan_decision", by=who, at=now, decision="restore",
+                        text=_clip(f"restored accepted v{plan['accepted_version']} "
+                                   f"after: {reason}", 4000),
+                        round=int(plan.get("round") or 1))
+    return _plan_update(ident, _do)
+
+
+# OPS-232: a supplement is reviewed AFTER acceptance without reopening the
+# plan. ``plan["supplements"]`` holds ``{n, text, by, at, base_version,
+# status: reviewing|accepted|rejected|failed, review, reviewer}``; the plan's
+# status, text, accepted_version and the build claim are never touched, so the
+# implementation stays exactly as claimable as before.
+
+
+def plan_open_supplement(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The supplement awaiting an independent verdict, if any."""
+    for s in reversed((item.get("plan") or {}).get("supplements") or []):
+        if isinstance(s, dict) and s.get("status") == "reviewing":
+            return s
+    return None
+
+
+def plan_supplement_submit(ident: Any, text: str, by: str = "") -> Optional[Dict[str, Any]]:
+    """File a review-only supplement to an ACCEPTED plan (one open at a time)."""
+    text = str(text or "").strip()
+    if not text:
+        raise ValueError("supplement text is empty")
+    if len(text) > PLAN_TEXT_MAX:
+        raise ValueError(f"supplement text is {len(text)} chars, over the {PLAN_TEXT_MAX} "
+                         f"limit; condense it and resubmit")
+    current = get(ident)
+    if current is None:
+        return None
+    if group_role(current):
+        raise ValueError("plan supplements are not supported for plan groups")
+
+    def _do(it, plan):
+        if plan.get("status") != "accepted":
+            raise ValueError(f"{it.get('ref', ident)} has no accepted plan to supplement "
+                             f"(plan status {plan.get('status') or 'none'})")
+        owner = str(it.get("claimed_by") or "")
+        if it.get("status") == "in_progress" and owner and str(by) != owner:
+            raise ValueError(f"{it.get('ref', ident)} is claimed by {owner}; only the "
+                             f"claimant may file a supplement (you are {by or 'unnamed'})")
+        open_sup = plan_open_supplement(it)
+        if open_sup and open_sup.get("text") == text and open_sup.get("by") == str(by):
+            return "skip"   # idempotent re-submit of the supplement already under review
+        if open_sup:
+            raise ValueError(f"{it.get('ref', ident)} already has supplement "
+                             f"s{open_sup['n']} under review")
+        if it.get("pipeline_local"):
+            from . import github_pipeline
+            github_pipeline.fence_stale_stage(it, str(by))
+        sups = list(plan.get("supplements") or [])
+        n = len(sups) + 1
+        now = _now_iso()
+        sups.append({"n": n, "text": text, "by": str(by), "at": now, "status": "reviewing",
+                     "base_version": int(plan.get("accepted_version") or plan.get("version") or 1)})
+        plan["supplements"] = sups
+        _append_history(it, "plan_supplement", by=_by("system"), at=now, n=n,
+                        text=_clip(text, 1000), submitter=str(by))
+    return _plan_update(ident, _do) or get(ident)
+
+
+def plan_supplement_set_reviewer(ident: Any, n: int, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _do(it, plan):
+        for s in plan.get("supplements") or []:
+            if int(s.get("n") or 0) == int(n):
+                s["reviewer"] = dict(info)
+                return
+        return "skip"
+    return _plan_update(ident, _do)
+
+
+def plan_supplement_verdict(ident: Any, accepted: bool, reasons: str = "", by: str = "",
+                            n: Optional[int] = None,
+                            status: str = "") -> Optional[Dict[str, Any]]:
+    """An independent verdict on the open supplement. The submitter and the
+    ticket's build claimant may not judge it. ``status="failed"`` is the
+    stage supervisor giving up (no verdict)."""
+    current = get(ident)
+    if current is None:
+        return None
+
+    def _do(it, plan):
+        sup = plan_open_supplement(dict(it, plan=plan))
+        if sup is None:
+            raise ValueError(f"{it.get('ref', ident)} has no plan supplement under review")
+        if n is not None and int(n) != int(sup["n"]):
+            raise ValueError(f"verdict is for supplement s{n} but s{sup['n']} is under review")
+        if status != "failed":
+            who = str(by or "")
+            if not who:
+                raise ValueError("a supplement verdict needs --by <reviewer id>")
+            if who in (str(sup.get("by") or ""), str(it.get("claimed_by") or "")):
+                raise ValueError(f"{who} submitted the supplement or holds the build claim; "
+                                 f"the verdict must come from an independent reviewer")
+            if it.get("pipeline_local"):
+                from . import github_pipeline
+                github_pipeline.fence_stale_stage(it, who)
+        now = _now_iso()
+        sup["status"] = status or ("accepted" if accepted else "rejected")
+        sup["review"] = {"accepted": bool(accepted) and not status, "reasons": _clip(reasons, 3000),
+                         "by": str(by or "system"), "at": now}
+        _append_history(it, "plan_supplement_review", by=_by("system"), at=now, n=sup["n"],
+                        passed=sup["status"] == "accepted", outcome=sup["status"],
+                        text=_clip(reasons, 1000))
     return _plan_update(ident, _do)
 
 
@@ -5894,7 +6058,12 @@ def render_plan(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]
                            if sections == "all" else sections)
     plan = item.get("plan") or {}
     if role != "parent":
-        return str(plan.get("text") or "")
+        text = str(plan.get("text") or "")
+        for s in plan.get("supplements") or []:
+            if isinstance(s, dict) and s.get("status") == "accepted":
+                text += (f"\n\n## Accepted supplement s{s.get('n')} (reviewed after "
+                         f"v{s.get('base_version')} was accepted)\n{s.get('text', '')}")
+        return text
     out = [f"## Shared\n{str(plan.get('text') or '').strip()}"]
     secs = dict(plan.get("sections") or {})
     members = list((item.get("group") or {}).get("members") or [])
@@ -7364,8 +7533,8 @@ def recover_claim(ident: Any, *, expect: Dict[str, Any], action: str, reason: st
     ``mark`` (record only; the caller acts). Every applied action writes
     ``backstop = {state, action, count, at, fingerprint}`` (the post-write
     fingerprint the loop guard compares) and a ``backstop`` history event in
-    the same step. Local store only (a GitHub-backed ticket escalates through
-    ``block``)."""
+    the same step. Local store only (a GitHub-backed claim is routed to an
+    explicit recovery request, ``liveness._route_owner_host``, WT-39)."""
     if action not in RECOVER_ACTIONS:
         raise ValueError(f"action must be one of {RECOVER_ACTIONS}")
     if _github_backend_for_project(_project_from_ident(ident)) is not None:
@@ -7936,8 +8105,12 @@ def block(
     wait_actor: str = "",
     wait_ref: str = "",
     force: bool = False,
+    expect: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Park a ticket that needs a human decision.
+
+    ``expect`` (GitHub only, WT-39): item fields the issue must still carry
+    when re-read under the body lock, else nothing is written (``None``).
 
     A worker-origin block of an ``in_progress`` ticket claimed by a DIFFERENT
     worker (and a different session) raises ``ValueError`` unless ``force``
@@ -7974,6 +8147,7 @@ def block(
         item = backend.block(
             ident, session_id=session_id, question=question, progress=progress,
             kind=kind, wait_on=wait_on, wait_actor=wait_actor, wait_ref=wait_ref,
+            expect=expect,
         )
         if item:
             if origin == "worker":

@@ -913,3 +913,48 @@ def test_provider_refusals_swap_engine_on_first_failure(wt_env, reason, swaps):
     503 still has to repeat first."""
     rec = {"reason": reason, "consecutive": 1}
     assert wt_env.workers._warrants_engine_swap(rec) is swaps
+
+
+# --------------------------------------------------------------------------- #
+# 1c. A usage-limit cooldown pinned days out by the provider's reset time
+# (OPS-247). Only a session on the same queue+engine cleared it, and the
+# cooldown prevents that session, so an account swap left queues parked.
+# --------------------------------------------------------------------------- #
+def _usage_limited(wt_env, tmp_path, retry_in_s):
+    log = tmp_path / "limit.log"
+    log.write_text("ERROR: You've hit your usage limit.")
+    wt_env.workers._record_launch_failure(
+        queue=QUEUE, engine="codex", worker_id="w1", pid=0, log_path=log,
+        reason="engine usage limit", retry_at=time.time() + retry_in_s,
+    )
+    return wt_env.workers.active_launch_failure_cooldown(QUEUE, "codex")
+
+
+def _headroom(monkeypatch, tmp_path, **row):
+    f = tmp_path / "headroom.json"
+    f.write_text(json.dumps({"ok": True, "rows": [
+        {"engine": "codex", "account": "default", "available": True,
+         "stale": False, "unlimited": False, **row}]}))
+    monkeypatch.setenv("WATCHTOWER_HEADROOM_FILE", str(f))
+
+
+def test_usage_limit_cooldown_lifts_when_headroom_shows_a_new_quota_window(
+    wt_env, tmp_path, monkeypatch
+):
+    rec = _usage_limited(wt_env, tmp_path, retry_in_s=6 * 86400)
+    assert rec is not None
+    _headroom(monkeypatch, tmp_path, percent_left=92.0,
+              resets_at=rec["cooldown_until"] + 11 * 3600)
+    assert wt_env.workers.active_launch_failure_cooldown(QUEUE, "codex") is None
+
+
+@pytest.mark.parametrize("left,reset_shift_s", [(92.0, 60), (0.0, 11 * 3600)])
+def test_usage_limit_cooldown_holds_while_the_limited_window_is_still_current(
+    wt_env, tmp_path, monkeypatch, left, reset_shift_s
+):
+    """Same window (a pre-limit reading) or no quota left: lifting would only
+    respawn straight back into the limit."""
+    rec = _usage_limited(wt_env, tmp_path, retry_in_s=6 * 86400)
+    _headroom(monkeypatch, tmp_path, percent_left=left,
+              resets_at=rec["cooldown_until"] + reset_shift_s)
+    assert wt_env.workers.active_launch_failure_cooldown(QUEUE, "codex") is not None

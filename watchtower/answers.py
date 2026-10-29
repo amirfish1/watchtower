@@ -443,6 +443,30 @@ def dependency_answer_text(dep: Dict[str, Any]) -> str:
             + (f": {q._clip(first, 300)}" if first else "."))
 
 
+def _wait_host(it: Dict[str, Any], w: Dict[str, Any]) -> str:
+    """The machine that recorded the wait; older records carry it only on the
+    block event."""
+    if w.get("host"):
+        return str(w["host"])
+    for h in reversed(it.get("history") or []):
+        if h.get("event") == "block":
+            by = h.get("by") if isinstance(h.get("by"), dict) else {}
+            return str(h.get("machine") or by.get("machine") or "")
+    return ""
+
+
+def _foreign_local_ref(it: Dict[str, Any], dep: Dict[str, Any], w: Dict[str, Any]) -> bool:
+    """OPS-230: local queues are per host, so OPS-202 here and OPS-202 on the Mac
+    are different tickets. A shared (GitHub) ticket waiting on a local ref is
+    only resolvable on the host that recorded the wait."""
+    from . import config
+    if config.backend(q._norm_project(dep.get("project"))) == "github":
+        return False
+    if config.backend(q._norm_project(it.get("project"))) != "github":
+        return False
+    return _wait_host(it, w) != q.machine_tag()
+
+
 def resume_dependency_waits(items: Optional[List[Dict[str, Any]]] = None) -> List[str]:
     """Reconciler pass (WT-37): answer every ticket blocked ``--wait-on
     dependency --wait-ref X`` once X has completed, through the same path
@@ -472,7 +496,7 @@ def resume_dependency_waits(items: Optional[List[Dict[str, Any]]] = None) -> Lis
                 continue
             dep_ref = str(w.get("ref") or "").strip().upper()
             dep = by_ref.get(dep_ref)
-            if dep is None or q._blocker_state(dep) != "satisfied":
+            if dep is None or _foreign_local_ref(it, dep, w) or q._blocker_state(dep) != "satisfied":
                 continue
             ref = str(it.get("ref") or "")
             from . import cli as _cli

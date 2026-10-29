@@ -376,6 +376,7 @@ def test_spawn_worker_queue_model(store):
         spawned = workers.spawn_workers("DEMO", n=1, engine="claude", dry_run=True)
         argv = spawned[0]["argv"]
         assert argv[argv.index("--model") + 1] == "claude-sonnet-5"
+        config.set_codex_transport("DEMO", "exec")
         codex_argv = workers.build_drain_command(
             "DEMO", "codex", "demo-w1", model="gpt-5.5")
         assert codex_argv[:3] == [
@@ -387,6 +388,7 @@ def test_spawn_worker_queue_model(store):
         assert "--model" not in spawned[0]["argv"]
     finally:
         config.set_model("DEMO", "")
+        config.set_codex_transport("DEMO", "")
 
 
 def test_queue_effort_reaches_codex_and_claude_workers(store):
@@ -402,6 +404,7 @@ def test_queue_effort_reaches_codex_and_claude_workers(store):
         )[0]["argv"]
         assert claude_argv[claude_argv.index("--effort") + 1] == "high"
 
+        config.set_codex_transport("DEMO", "exec")
         codex_argv = workers.spawn_workers(
             "DEMO", n=1, engine="codex", dry_run=True,
         )[0]["argv"]
@@ -410,6 +413,7 @@ def test_queue_effort_reaches_codex_and_claude_workers(store):
         )
     finally:
         config.set_effort("DEMO", "")
+        config.set_codex_transport("DEMO", "")
 
 
 def test_spawn_worker_kimi_one_shot(store):

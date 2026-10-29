@@ -450,6 +450,19 @@ def cmd_queue_archive(args: argparse.Namespace) -> int:
                 print(f"  {it.get('ref')}  [{it.get('status')}]  {it.get('title', '')}", file=sys.stderr)
             print("close/move them first, or pass --force", file=sys.stderr)
         return 1
+    # A drain-on queue is staffed on purpose: it may be an automation target
+    # (BYMOPS, ADS) that is merely empty right now. Archiving flips drain off,
+    # stranding its next ticket silently (OPS-248), so stopping staffing must
+    # be its own explicit step; --force does not cover it.
+    if config.auto_drain(name):
+        if args.json:
+            print(json.dumps({"queue": name, "archived": False,
+                              "blocked_by_auto_drain": True}, indent=2))
+        else:
+            print(f"{name}: refusing to archive, auto_drain is on (empty now is not dead; "
+                  f"automation may file here). If it really is retired, run "
+                  f"`wt drain off {name}` first", file=sys.stderr)
+        return 1
     if not args.apply:
         if args.json:
             print(json.dumps({"queue": name, "archived": False, "dry_run": True,
@@ -1420,6 +1433,29 @@ def _plan_review_goal(item: dict) -> str:
     )
 
 
+def _plan_supplement_review_goal(item: dict) -> str:
+    """OPS-232: an independent review of a supplement filed after acceptance."""
+    ref = item["ref"]
+    plan = item.get("plan") or {}
+    sup = q.plan_open_supplement(item) or {}
+    return (
+        f"You are an independent PLAN REVIEWER for WatchTower ticket {ref}. Its plan "
+        f"v{plan.get('accepted_version') or plan.get('version')} is ALREADY ACCEPTED and "
+        f"stays accepted; you review only supplement s{sup.get('n')} that "
+        f"{sup.get('by') or 'a worker'} filed afterwards. You did not write it. Do not "
+        f"edit files. Check it against the ticket, the accepted plan and the real code: "
+        f"is it sound, consistent with the accepted plan, and are its claims true?\n\n"
+        f"TICKET:\n{item.get('text') or item.get('note') or item.get('title') or ''}\n"
+        + (f"\nACCEPT LINE: {item['accept']}\n" if item.get("accept") else "")
+        + f"\nACCEPTED PLAN:\n{q.render_plan(item)}\n\n"
+        f"SUPPLEMENT s{sup.get('n')} UNDER REVIEW:\n{sup.get('text', '')}\n\n"
+        f"File your verdict: `wt plan supplement verdict {ref} --n {sup.get('n')} --accept "
+        f"--reasons \"why it is sound\"` or `... --reject --reasons \"what is wrong\"`. "
+        f"Your verdict never changes the accepted plan or the ticket's claim; an accepted "
+        f"supplement is appended to the plan builders and verifiers read."
+    )
+
+
 def _spawn_plan_role(item: dict, role: str, goal: str = "", name: str = "") -> bool:
     """Shim (WT-24): the daemon spawns planner / reviewer sessions. The ticket's
     plan state is the intent; this only wakes the daemon."""
@@ -1664,7 +1700,10 @@ def _plan_note(item: dict) -> str:
     status = plan.get("status", "")
     ref = item["ref"]
     if status == "accepted":
-        return f"ACCEPTED PLAN (follow it):\n{q.render_plan(item)}"
+        sup = q.plan_open_supplement(item)
+        return (f"ACCEPTED PLAN (follow it):\n{q.render_plan(item)}"
+                + (f"\n\nSupplement s{sup['n']} is under independent review and is NOT "
+                   f"binding yet (`wt plan show {ref}`)." if sup else ""))
     if status == "failed":
         return f"Plan stage did not run ({plan.get('reason', '')}); plan the work yourself."
     if status == "blocked":
@@ -1734,6 +1773,22 @@ def cmd_plan(args: argparse.Namespace) -> int:
                                   + group_exit),
                         progress=f"Plan (round {item['plan'].get('round')}):\n"
                                  f"{q.render_plan(item)}")
+        elif action == "supplement":
+            if args.sup_cmd == "submit":
+                text = args.text or ""
+                if args.file:
+                    text = Path(args.file).expanduser().read_text()
+                item = q.plan_supplement_submit(ref, text, by=args.by or _default_worker_id())
+                sup = q.plan_open_supplement(item) or {}
+                print(f"SUPPLEMENT FILED: {ref} s{sup.get('n')} -> independent review "
+                      f"(plan stays accepted v{item['plan'].get('accepted_version')})")
+                stages.request(ref, "plan supplement filed")
+            else:
+                item = q.plan_supplement_verdict(ref, bool(args.accept), args.reasons or "",
+                                                 by=args.by or _default_worker_id(), n=args.n)
+                sup = (item["plan"].get("supplements") or [{}])[-1]
+                print(f"SUPPLEMENT {sup.get('status', '').upper()}: {ref} s{sup.get('n')}; "
+                      f"plan still {item['plan'].get('status')}")
         elif action == "discuss":
             item = q.plan_discuss(ref, args.sender, args.text, expect_mv=getattr(args, "mv", None))
             peer = "reviewer" if args.sender == "planner" else "planner"
@@ -1748,6 +1803,19 @@ def cmd_plan(args: argparse.Namespace) -> int:
             if args.file:
                 text = Path(args.file).expanduser().read_text()
             decision = "accept" if args.accept else "retry"
+            plan = item.get("plan") or {}
+            if args.accept and plan.get("status") == "failed" and plan.get("accepted_version"):
+                if text:
+                    raise ValueError("a restored plan keeps its accepted text; "
+                                     "drop --text/--file")
+                item = q.plan_restore(ref, by=args.by or "human")
+                sup = q.plan_open_supplement(item)
+                print(f"PLAN RESTORED: {ref} -> plan accepted "
+                      f"v{item['plan'].get('accepted_version')}; claim and block untouched"
+                      + (f"; supplement s{sup.get('n')} reviews on the next stage tick"
+                         if sup else ""))
+                stages.request(ref, "plan restored")
+                return 0
             item = q.plan_decide(ref, decision, text, retries=args.retries,
                                  by=args.by or "human", expect_mv=getattr(args, "mv", None))
             status = item["plan"]["status"]
@@ -1801,6 +1869,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 for r in plan.get("reviews") or []:
                     print(f"  review r{r['round']}: {'accept' if r['accepted'] else 'reject'}"
                           f" -- {r.get('reasons', '')}")
+                for sp in plan.get("supplements") or []:
+                    rv = sp.get("review") or {}
+                    print(f"  supplement s{sp.get('n')} by {sp.get('by') or '?'}: "
+                          f"{sp.get('status')}"
+                          + (f" ({rv.get('by')}) -- {rv.get('reasons', '')}" if rv else ""))
+                    if sp.get("status") == "reviewing":
+                        print(sp.get("text", ""))
                 disc = plan.get("discussion")
                 if disc:
                     print(f"  discussion: {disc.get('status')} round {disc.get('round')} "
@@ -6447,7 +6522,8 @@ COMMAND_HELP: Dict[str, str] = {
     "accept": "accept an in_review ticket (closes it, unblocks dependents)",
     "verdict": "file an independent verifier's pass/fail on an in_review ticket",
     "assess": "post-fix assessment (WT-21): `submit`/`show`/`run`/`resume`, or `new` for a fix with no ticket",
-    "plan": "plan stage (plan gate): `submit` a plan, `verdict` it, `show`/`wait` for it",
+    "plan": "plan stage (plan gate): `submit` a plan, `verdict` it, `show`/`wait` for it; "
+            "`supplement submit|verdict` reviews an addendum to an accepted plan",
     "group": "plan groups (WT-33): `attach`/`seal`/`detach` members, `fix` a capped integration, `show` it",
     "stages": "stage-session supervision (planner/verifier/assessor): `tick` one pass, `show` a ticket",
     "liveness": "who owns each live ticket, is it proven at work, and what the backstop would do (read-only)",
@@ -6671,7 +6747,8 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("name", metavar="QUEUE")
     a.add_argument("--apply", action="store_true", help="write the change (default: dry run)")
     a.add_argument("--force", action="store_true",
-                   help="archive even if the queue has open or in-progress tickets")
+                   help="archive even if the queue has open or in-progress tickets "
+                        "(never overrides auto_drain on: `wt drain off` first)")
     a.add_argument("--json", action="store_true")
     a.set_defaults(func=cmd_queue_archive)
     a = qs.add_parser("unarchive", help="restore an archived queue (auto_drain stays off)")
@@ -7102,7 +7179,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="group parent: the membership version")
     p2.add_argument("--version", type=int, default=None,
                     help="plan version this verdict is for (rejects a stale verdict)")
-    p5 = ps.add_parser("decide", help="human: settle a plan blocked by exhausted review")
+    p5 = ps.add_parser("decide", help="human: settle a plan blocked by exhausted review, or "
+                       "--accept a failed plan that was accepted to restore it")
     p5.add_argument("ref")
     g = p5.add_mutually_exclusive_group(required=True)
     g.add_argument("--accept", action="store_true", help="accept the (amended) plan")
@@ -7114,6 +7192,22 @@ def build_parser() -> argparse.ArgumentParser:
     p5.add_argument("--by", default="")
     p5.add_argument("--mv", type=int, default=None,
                     help="group parent: the membership version")
+    p7 = ps.add_parser("supplement", help="review-only supplement to an accepted plan "
+                       "(plan stays accepted, claim untouched)")
+    ss7 = p7.add_subparsers(dest="sup_cmd", required=True)
+    p7a = ss7.add_parser("submit", help="file a supplement for independent review")
+    p7a.add_argument("ref")
+    p7a.add_argument("--text", default="")
+    p7a.add_argument("--file", default="")
+    p7a.add_argument("--by", default="")
+    p7b = ss7.add_parser("verdict", help="independent reviewer: accept or reject the supplement")
+    p7b.add_argument("ref")
+    g = p7b.add_mutually_exclusive_group(required=True)
+    g.add_argument("--accept", action="store_true")
+    g.add_argument("--reject", action="store_true")
+    p7b.add_argument("--reasons", default="")
+    p7b.add_argument("--by", default="")
+    p7b.add_argument("--n", type=int, default=None, help="supplement number being judged")
     p4 = ps.add_parser("wait", help="builder: block until the plan is accepted, print it")
     p4.add_argument("ref")
     p4.add_argument("--timeout", type=int, default=1800)
@@ -7717,9 +7811,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--codex-transport", default=None, dest="codex_transport",
                    choices=["exec", "app-server", ""],
                    help=(
-                       "how codex workers run: exec (default, one-shot `codex "
-                       "exec`) or app-server (pilot: steerable while working). "
-                       "Empty string clears the pin."
+                       "how codex workers run: app-server (default: steerable "
+                       "while working) or exec (one-shot `codex exec`). Empty "
+                       "string clears the pin."
                    ))
     s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
                    help="restrict auto-drain to these ticket types (requires --auto-drain on)")

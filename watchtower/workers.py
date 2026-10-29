@@ -3887,11 +3887,49 @@ def active_launch_failure_cooldown(
     except (TypeError, ValueError):
         until = 0
     if until > now:
-        return rec
+        if not _quota_cooldown_lifted(rec, until):
+            return rec
+        data.pop(key, None)
+        _save_launch_failures(data)
+        return None
     if not _recent_failure_streak(rec, now):
         data.pop(key, None)
         _save_launch_failures(data)
     return None
+
+
+# A usage-limit cooldown is lifted early only when CCC reports this much quota
+# left in a window whose reset differs from the one the cooldown was pinned to.
+_QUOTA_LIFT_MIN_PERCENT_LEFT = 5.0
+_QUOTA_LIFT_RESET_DRIFT_S = 3600.0
+
+
+def _quota_cooldown_lifted(rec: Dict[str, Any], until: float) -> bool:
+    """Whether CCC headroom proves a usage-limit cooldown's quota is back.
+
+    A usage-limit cooldown is pinned to the provider's named reset time, which
+    can be days out. An account swap or early reset makes it stale, and nothing
+    else clears it: ``_clear_launch_failure`` needs a session on this
+    queue+engine, which the cooldown itself prevents (OPS-247: WT/CCC codex
+    verifiers parked until Nov 4 after quota came back on Oct 29). The quota is
+    per account, not per queue, so the account's live headroom is the evidence.
+    The different-reset check keeps a stale pre-limit reading of the SAME
+    window from lifting the cooldown into a respawn loop."""
+    if rec.get("reason") != "engine usage limit":
+        return False
+    from . import headroom
+    engine = str(rec.get("engine") or "claude")
+    for row in headroom.read_rows() or []:
+        if (row.get("engine") != engine or row.get("available") is False
+                or row.get("stale") or row.get("unlimited")):
+            continue
+        left = headroom._num(row.get("percent_left"))
+        resets_at = headroom._num(row.get("resets_at"))
+        if (left is not None and left >= _QUOTA_LIFT_MIN_PERCENT_LEFT
+                and resets_at is not None
+                and abs(resets_at - until) > _QUOTA_LIFT_RESET_DRIFT_S):
+            return True
+    return False
 
 
 def _wait_for_immediate_launch_failure(
@@ -5252,7 +5290,9 @@ def build_drain_command(
         # workers ran to ~780K context (model_context_window=1M) before compact.
         argv += codex_compact_args()
         goal = goal or drain_goal(queue, worker_id, repo_path, engine=engine)
-        if config.codex_transport(queue) == "app-server":
+        # An unresolvable codex keeps the exec argv so Popen itself fails and
+        # the spawn reports "engine executable unavailable", not a wrapper death.
+        if config.codex_transport(queue) == "app-server" and _resolve_engine_bin("codex"):
             return codex_app_worker_command(argv, worker_id, repo_path, goal)
         argv.append(goal)
         return argv
@@ -5689,6 +5729,11 @@ def requeue_orphaned_tickets(
     (OPS-104). Those ids are left alone; if the claiming session really did
     die, the ticket just stays in_progress like a `wt block`ed one already does.
 
+    A GitHub-backed claim is never reopened here (WT-39): issue edits take no
+    precondition, so the reopen could overwrite a claim another host wrote
+    after this sweep's reads. An orphaned one gets a bounded recovery request
+    instead (``liveness.route_github_recovery``).
+
     Returns the list of reopened items."""
     from . import queue as _q
     import time as _time
@@ -5727,6 +5772,11 @@ def requeue_orphaned_tickets(
         # resumes the original session. Reopening would hand it to a different
         # worker that lacks the original context.
         if it.get("needs_input"):
+            continue
+        # A GitHub claim held on another host is that host's to recover: none
+        # of its processes are visible here. A dead owning host surfaces via
+        # the backstop's bounded escalation instead (WT-39).
+        if github_of(it) and _liveness._foreign_host(it):
             continue
         # Skip a ticket whose answer is still being applied. `wt answer` delivers
         # via the liveness-aware messaging primitive, so the original worker can
@@ -5823,10 +5873,15 @@ def requeue_orphaned_tickets(
                        f"{wid or str(it.get('claimed_session_id') or '')[:8]} dead)")
             sid_d = str(it.get("claimed_session_id") or "")
             if github_of(it):
-                item = _q.update_status(
-                    ref, "open", quiet=True, require_status="in_progress", reason=why,
-                    orphan=({"session_id": sid_d, "claimed_by": claimer}
-                            if (sid_d or claimer) else None))
+                # WT-39: never reopen a GitHub claim automatically. Issue
+                # edits take no precondition, so any fence checked on a read
+                # can still overwrite a claim written after it (another
+                # host's takeover). Route a bounded recovery request instead;
+                # the claim, labels and comments stay untouched.
+                _liveness.route_github_recovery(
+                    it, by_ref, now, f"orphan sweep: {why} (claimer {claimer or '-'} "
+                    f"not alive here)")
+                continue
             else:
                 # CAS on the snapshot this decision was made from (claim
                 # fields, claim_proc, state fingerprint); records the backstop.
@@ -8071,6 +8126,12 @@ def spawn_run_once_worker(
 # same delivery path (and outbox fallback) every other WT message uses.
 
 ADHOC_ENGINES = ("claude", "codex", "antigravity", "kimi")
+# Linux caps ONE argv string at MAX_ARG_STRLEN (128 KiB): a stage goal that
+# inlines a ticket + accepted plan + supplements outgrew it and Popen died with
+# E2BIG (OPS-239). Bigger prompts go through a file: on stdin for the engines
+# that read their prompt there, as a pointer for the rest.
+ADHOC_ARGV_PROMPT_MAX = 96 * 1024
+ADHOC_STDIN_ENGINES = ("claude", "codex")
 
 # The footer pipes the report over stdin via a quoted heredoc: a report is
 # multi-paragraph markdown full of double quotes, $variables, and `backticks`,
@@ -8139,13 +8200,16 @@ def codex_compact_args() -> List[str]:
 
 def build_adhoc_command(
     engine: str, prompt: str, *, model: str = "", repo_path: str = "",
-    log_path: str = "", session_id: str = "",
+    log_path: str = "", session_id: str = "", prompt_stdin: bool = False,
 ) -> List[str]:
     """Argv for a one-shot ad-hoc agent. All engines run in print/exec mode
     with the goal in argv -- no FIFO, no drain loop; the process exits when
-    the goal is done. Raises ValueError for an engine we can't build, and for
-    an engine whose CLI binary isn't installed -- a clean error here beats a
-    FileNotFoundError out of Popen."""
+    the goal is done. ``prompt_stdin`` (claude/codex only) leaves the goal out
+    of argv so the caller feeds it on stdin. Raises ValueError for an engine we
+    can't build, and for an engine whose CLI binary isn't installed -- a clean
+    error here beats a FileNotFoundError out of Popen."""
+    if prompt_stdin and engine not in ADHOC_STDIN_ENGINES:
+        raise ValueError(f"{engine} cannot read its prompt from stdin")
     if engine == "codex":
         if not shutil.which(_ENGINE_BIN["codex"]):
             raise ValueError("codex CLI not found on PATH")
@@ -8159,7 +8223,7 @@ def build_adhoc_command(
         if model:
             argv += ["--model", model]
         argv += codex_compact_args()
-        argv.append(prompt)
+        argv.append("-" if prompt_stdin else prompt)
         return argv
     if engine == "antigravity":
         bin_path = _resolve_antigravity_bin()
@@ -8199,7 +8263,8 @@ def build_adhoc_command(
             # Plain `-p` text output never names the session, so the log
             # backfill can't ledger it; pin the id instead (CCC-1241).
             argv += ["--session-id", session_id]
-        argv.append(prompt)
+        if not prompt_stdin:
+            argv.append(prompt)
         return argv
     if engine == "kimi":
         bin_path = _resolve_engine_bin("kimi")
@@ -8274,9 +8339,19 @@ def spawn_adhoc(
     # id, so mint it here: the ledger then knows the planner/reviewer/verifier
     # session at spawn time and CCC files it under Workers (CCC-1241).
     session_id = str(uuid.uuid4()) if engine == "claude" else ""
+    prompt_file = ""
+    prompt_stdin = False
+    if len(prompt.encode("utf-8")) > ADHOC_ARGV_PROMPT_MAX:
+        prompt_file = f"{log_path}.prompt.md"
+        prompt_stdin = engine in ADHOC_STDIN_ENGINES
+        full_prompt = prompt
+        if not prompt_stdin:
+            prompt = (f"Your full instructions are in the file {prompt_file} "
+                      f"({len(full_prompt)} chars). Read ALL of it before doing "
+                      f"anything else; it is your goal, verbatim.")
     argv = build_adhoc_command(
         engine, prompt, model=model, repo_path=repo_path, log_path=str(log_path),
-        session_id=session_id,
+        session_id=session_id, prompt_stdin=prompt_stdin,
     )
     if dry_run:
         rec = {
@@ -8288,8 +8363,13 @@ def spawn_adhoc(
             rec["session_id"] = session_id
         if model:
             rec["model"] = model
+        if prompt_file:
+            rec["prompt_file"] = prompt_file
+            rec["prompt_stdin"] = prompt_stdin
         return rec
     log_dir.mkdir(parents=True, exist_ok=True)
+    if prompt_file:
+        Path(prompt_file).write_text(full_prompt, encoding="utf-8")
     exit_file = ""
     if stage:
         exit_file = f"{log_path}.exit"
@@ -8297,10 +8377,11 @@ def spawn_adhoc(
                 "--exit-file", exit_file, "--"] + list(argv)
         _spawn_gate(engine)
     logf = open(log_path, "ab")
+    stdin = open(prompt_file, "rb") if prompt_stdin else subprocess.DEVNULL
     try:
         proc = subprocess.Popen(
             argv,
-            stdin=subprocess.DEVNULL,
+            stdin=stdin,
             stdout=logf,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -8311,6 +8392,8 @@ def spawn_adhoc(
         )
     finally:
         logf.close()
+        if prompt_stdin:
+            stdin.close()
     rec = record_worker(
         proc.pid, label.upper(), engine, worker_id, repo_path, str(log_path),
         model=model, kind="adhoc", session_id=session_id,

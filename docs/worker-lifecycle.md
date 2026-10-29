@@ -312,6 +312,20 @@ otherwise it spawns a fresh session that same tick, seeded with the ticket, the
 plan, the objections and the last discussion messages. Dying twice escalates
 like any stage (`wt answer REF retry` restarts the turn).
 
+### Supplements to an accepted plan (OPS-232)
+
+`wt plan submit` refuses once the plan is `accepted`. A builder that needs an
+addendum reviewed runs `wt plan supplement submit REF --file F` (the claimant
+only; one open at a time; an identical re-submit is a no-op). The plan's
+status, text, `accepted_version`, review history and the claim are never
+touched. The daemon spawns an independent `plan_reviewer` on key
+`supplement:s<n>` (even while the build is human-blocked), which files
+`wt plan supplement verdict REF --n N --accept|--reject`. The submitter and
+the claimant cannot judge it. Only an ACCEPTED supplement is appended to
+`render_plan`, the text that builders and verifiers read. A rejected one can
+be revised as `s<n+1>`. A reviewer that dies twice marks the supplement
+`failed` and never blocks the plan or the ticket.
+
 Plan messages (`wt plan discuss`, fallback reminders) use the live-only
 transport (`messages.send(..., live_only=True)`: UDS, then WT stdin FIFO; never
 the delegate, a resume, or the outbox). A send result is never taken as
@@ -887,8 +901,8 @@ before its caller blocks the ticket.
 |---|---|---|
 | stage (`plan.*`, `review.verify`, `assess.*`) | `stage_session` worker alive, or a launch cooldown | `stage`: `reconcile_stages(only_ref)` |
 | `assess.filing` | idle | `assessment_run_ops` (the idempotent op replay) |
-| claim (`work.claimed`, sent-back) | `claim_owner` | dead: `resume` if resume-first applies, else `reopen`; unproven or GitHub: `escalate`; alive: none |
-| `work.unowned` (in_progress, no claimer, e.g. `update_status(in_progress, worker='')`) | owner `reconciler`; only a bound session `claim_owner` proves alive vetoes | `reopen` to the pool (no claimer to protect); GitHub: `escalate` |
+| claim (`work.claimed`, sent-back) | `claim_owner` | dead: `resume` if resume-first applies, else `reopen`; unproven: `escalate`; GitHub (any verdict but alive, either host): `route_owner_host`; alive: none |
+| `work.unowned` (in_progress, no claimer, e.g. `update_status(in_progress, worker='')`) | owner `reconciler`; only a bound session `claim_owner` proves alive vetoes | `reopen` to the pool; GitHub: `route_owner_host` (never a block, WT-39) |
 | `work.open` (staffing) | a live, unreleased queue worker | `spawn` one worker (auto_drain on, no launch-failure cooldown; one per queue per sweep) |
 | `dep.stuck` | stuck blocker not yet escalated | `escalate_stuck_blockers`; `BACKSTOP_NO_ESCALATION` if it still is not flagged |
 | `plan.blocked` | idle one tick | `BACKSTOP_UNBLOCKED_PLAN`, escalate to a human |
@@ -917,8 +931,42 @@ settled answer by E14, recording `orphan`/`displaced_*`), `resume` (stamps
 `claim_proc.resumed_at`), `escalate` (a system `needs_input` block, E17
 supersession) and `mark` (before a stage/spawn/assessment action). Every write
 appends a `backstop` history event and sets `backstop = {state, action, count,
-at, fingerprint}`. GitHub tickets are refused (the sweep escalates them with
-`q.block`).
+at, fingerprint}`. GitHub tickets are refused.
+
+**GitHub claims are never reopened or blocked automatically (WT-39).** GitHub
+issue edits take no precondition, so a fence checked on any read (the expect
+CAS, the body lock, a re-read) cannot stop a whole-body write from overwriting
+a claim another host wrote after that read. Neither the backstop nor
+`requeue_orphaned_tickets` writes to a GitHub claim. Both file a recovery
+request on this host's OPS lane through `liveness._route_owner_host`, deduped
+per claim identity and capped at `OWNER_ROUTE_MAX` (one open at a time, the next
+no sooner than a stall window after the last closes). A foreign claim's request
+goes to the owning host. A local claim's request asks for `wt release <ref>
+--force` once the claimed session is proven dead. The claim, its labels,
+comments and any question stay untouched. That includes `work.unowned`. "No
+claimer" on the read is no promise at write time, because a foreign claim can
+land before an unconditional write. `_apply` also refuses any `escalate` or
+`unblocked_plan` on a GitHub ticket, so no future row can bring the block back.
+
+Automated writers inventory (WT-39). A writer counts if it infers recovery or a
+question from absent or stale ownership evidence:
+
+| Writer | GitHub handling |
+|---|---|
+| `requeue_orphaned_tickets` (dead worker) | `route_github_recovery`, no write |
+| backstop `work.claimed` (`claim_owner` not alive, either host) | `route_owner_host`, no write |
+| backstop `work.unowned` | `route_owner_host`, no write |
+| backstop `_apply` `escalate` / `unblocked_plan` | refused on GitHub (`BACKSTOP_SKIP`) |
+| backstop `reopen` / `resume` / `mark` (stage, spawn, assessment ops) | `recover_claim` is local-only: no-op (`race`) |
+| `dep.stuck` -> `escalate_stuck_blockers` | local store only |
+| `release_stalled_sent_back` | local store only |
+| answer rows (`answer.*`), parking, plan groups, plan stages | unreachable on GitHub (`UNREACHABLE` table) |
+| owner-host `claim_heartbeat` renewal | the owning host's own claim (authentic, not inferred) |
+| stage blocks (`stages._escalate`, spawn failure), review-delivery block, model-floor reopen | act on `in_review`/closed/blocked tickets from stage or delivery failures, not ownership inference; `claim_next` never claims those statuses |
+
+Explicit human or owner actions (`wt release`, `wt answer`, a worker's own
+close or block) still write GitHub bodies. Without CAS they keep a narrowed
+window. They are authorized acts, not inferences.
 
 **Loop guard.** If a ticket is still in the same row with the fingerprint the
 backstop recorded (nothing moved since its last action), a prior `resume`
