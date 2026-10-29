@@ -5251,7 +5251,10 @@ def build_drain_command(
         # Codex ignores CCC's CLAUDE_CODE_AUTO_COMPACT_WINDOW; without this
         # workers ran to ~780K context (model_context_window=1M) before compact.
         argv += codex_compact_args()
-        argv.append(goal or drain_goal(queue, worker_id, repo_path, engine=engine))
+        goal = goal or drain_goal(queue, worker_id, repo_path, engine=engine)
+        if config.codex_transport(queue) == "app-server":
+            return codex_app_worker_command(argv, worker_id, repo_path, goal)
+        argv.append(goal)
         return argv
     if engine == "kimi":
         # One-shot print mode, like codex exec: the goal rides in argv, stdin
@@ -8079,6 +8082,36 @@ def compact_env() -> Dict[str, str]:
     if compact > 0:
         env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(compact))
     return env
+
+
+def codex_app_worker_command(
+    exec_argv: List[str], worker_id: str, repo_path: str, goal: str,
+) -> List[str]:
+    """Re-express a ``codex exec`` argv as a steerable app-server worker.
+
+    Same model/effort/compact settings: ``--model`` and every ``-c``/``--config``
+    override carry over; the exec-only sandbox bypass becomes the thread's
+    ``danger-full-access`` sandbox + ``never`` approvals inside the worker."""
+    resolved = _resolve_engine_bin("codex") or exec_argv[0]
+    # -c with an explicit sys.path entry: the worker's cwd is the queue repo,
+    # and `-m` would import a `watchtower` package found there instead.
+    pkg_parent = str(Path(__file__).resolve().parent.parent)
+    argv = [sys.executable, "-c",
+            "import sys; sys.path.insert(0, sys.argv.pop(1)); "
+            "from watchtower.codex_app_worker import main; sys.exit(main())",
+            pkg_parent, "run", "--codex-bin", resolved, "--worker-id", worker_id]
+    if repo_path:
+        argv += ["--cwd", repo_path]
+    rest = exec_argv[2:]
+    i = 0
+    while i < len(rest):
+        flag = rest[i]
+        if flag in ("--model", "-c", "--config") and i + 1 < len(rest):
+            argv += ["--model" if flag == "--model" else "-c", rest[i + 1]]
+            i += 2
+            continue
+        i += 1
+    return argv + [goal]
 
 
 def codex_compact_args() -> List[str]:

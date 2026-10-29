@@ -630,6 +630,21 @@ def _print_ticket_usage(item: dict) -> None:
         print("  " + usage.render(item).replace("\n", "\n  "))
 
 
+def cmd_codex_app(args: argparse.Namespace) -> int:
+    """JSON out. steer reads the text from stdin. Exit 0 ok, 2 when no live
+    app-server worker hosts the thread (fall through), 1 when it refused."""
+    from . import codex_app_worker
+    if args.action == "find":
+        rec = codex_app_worker.find_worker(args.thread_id)
+        print(json.dumps(rec or {}))
+        return 0 if rec else 2
+    result = codex_app_worker.steer(args.thread_id, sys.stdin.read(), timeout=args.timeout)
+    print(json.dumps(result))
+    if result.get("ok"):
+        return 0
+    return 2 if result.get("code") == "no_app_worker" else 1
+
+
 def cmd_find(args: argparse.Namespace) -> int:
     """Look up one ticket by ref or number, searching every queue -- the CLI
     surface for queue.get(), which already matches globally. No -q needed,
@@ -4997,6 +5012,9 @@ def cmd_config(args: argparse.Namespace) -> int:
     if getattr(args, "effort", None) is not None:
         config.set_effort(args.queue, args.effort)
         changed.append(f"effort={args.effort or '(engine default)'}")
+    if getattr(args, "codex_transport", None) is not None:
+        config.set_codex_transport(args.queue, args.codex_transport)
+        changed.append(f"codex_transport={config.codex_transport(args.queue)} (next spawn)")
     if getattr(args, "workers", None) is not None:
         try:
             config.set_desired_workers(args.queue, args.workers)
@@ -6647,6 +6665,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_ls)
 
+    s = sub.add_parser(
+        "codex-app",
+        help="steer a codex worker hosted on its own app-server (codex_transport=app-server)",
+    )
+    s.add_argument("action", choices=["steer", "find"])
+    s.add_argument("thread_id", help="codex thread/session id of the worker")
+    s.add_argument("--timeout", type=float, default=15.0)
+    s.set_defaults(func=cmd_codex_app)
+
     s = sub.add_parser("unresolved",
                        help="closed tickets whose resolution flagged unresolved work")
     s.add_argument("-q", "--queue", default="",
@@ -7582,6 +7609,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help=(
                        "reasoning effort for queue workers; omit for the engine "
                        "default. Empty string clears an override, like --model."
+                   ))
+    s.add_argument("--codex-transport", default=None, dest="codex_transport",
+                   choices=["exec", "app-server", ""],
+                   help=(
+                       "how codex workers run: exec (default, one-shot `codex "
+                       "exec`) or app-server (pilot: steerable while working). "
+                       "Empty string clears the pin."
                    ))
     s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
                    help="restrict auto-drain to these ticket types (requires --auto-drain on)")

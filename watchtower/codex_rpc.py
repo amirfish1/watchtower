@@ -424,6 +424,17 @@ def deliver(
     failure all come back as a plain failed result so ``messages.deliver`` can
     fall through to the next adapter (delegate or outbox)."""
     total_start = time.monotonic()
+    # A thread hosted by a WT app-server worker is reachable only through that
+    # worker's own server: resuming it here would be a second writer (-32600).
+    from . import codex_app_worker
+    hosted = codex_app_worker.steer(thread_id, text, timeout=timeout)
+    if hosted.get("code") != "no_app_worker":
+        hosted["latency_ms"] = _elapsed_ms(total_start)
+        if hosted.get("ok"):
+            hosted["via"] = "steer"
+        else:
+            hosted["stage"] = "app-worker/turn/steer"
+        return hosted
     app_server_warm = is_running()
     if not is_available():
         return {

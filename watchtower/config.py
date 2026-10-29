@@ -1317,6 +1317,33 @@ def effort(queue: str) -> str:
     return inherited
 
 
+CODEX_TRANSPORTS = ("exec", "app-server")
+
+
+def set_codex_transport(queue: str, value: str) -> Dict[str, Any]:
+    """Pin how codex workers on ``queue`` run (CODEX-CCC-WT-10 pilot).
+
+    "exec" (the default; "" clears the pin) keeps one-shot ``codex exec``;
+    "app-server" hosts the worker's thread on its own app-server so it can be
+    steered while it works (``watchtower.codex_app_worker``)."""
+    transport = str(value or "").strip().lower()
+    if transport and transport not in CODEX_TRANSPORTS:
+        raise ValueError(f"codex transport must be one of {CODEX_TRANSPORTS}")
+    data = _load()
+    q = data.setdefault(queue, {})
+    if transport and transport != "exec":
+        q["codex_transport"] = transport
+    else:
+        q.pop("codex_transport", None)
+    _save(data)
+    return q
+
+
+def codex_transport(queue: str) -> str:
+    value = str(_queue_entry(queue).get("codex_transport") or "").strip().lower()
+    return value if value in CODEX_TRANSPORTS else "exec"
+
+
 def canonical_model(eng: str, model_value: str) -> str:
     """Resolve a supported alias to the canonical model id for ``eng``.
 
