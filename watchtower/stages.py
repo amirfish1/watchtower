@@ -242,7 +242,10 @@ def desired(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             if not _github_backed(it):
                 entry = ("assessor", f"assess:{int((it.get('assessment') or {}).get('cycle') or 1)}")
         elif (status in ("open", "in_progress") and q.plan_gate(it) is not None
-                and not it.get("needs_input") and not _github_backed(it)):
+                and not it.get("needs_input")
+                and (it.get("pipeline_local") or not _github_backed(it))):
+            # OPS-201: a GitHub ticket plans only from this host's sidecar
+            # gates (overlay); queue-config gates never start one.
             pst = str(plan.get("status") or "")
             rnd = int(plan.get("round") or 1)
             mv = q.group_mv_suffix(it)   # WT-33: a membership change is a new key

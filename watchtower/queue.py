@@ -1984,6 +1984,13 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
             if current is None:
                 return None
             fields["depth_fields"] = _depth_edit(current, want_depth, want_budget)
+        if "gates" in fields:
+            # OPS-201: gates live in the local pipeline sidecar, not the issue.
+            fields = dict(fields)
+            from . import github_pipeline
+            out = github_pipeline.set_gates(ident, list(fields.pop("gates") or []))
+            if not fields or out is None:
+                return out
         return backend.update(ident, **fields)
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
@@ -3281,6 +3288,15 @@ def plan_pending(item: Dict[str, Any]) -> bool:
 def _plan_update(ident: Any, fn) -> Optional[Dict[str, Any]]:
     """Run ``fn(item, plan)`` under the store lock; one save. ``fn`` returning
     ``"skip"`` leaves the store untouched and returns None (a failed CAS)."""
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        from . import github_pipeline
+
+        def _gh(it):
+            plan = dict(it.get("plan") or {})
+            if fn(it, plan) == "skip":
+                return "skip"
+            it["plan"] = plan
+        return github_pipeline.mutate(ident, _gh)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -3938,6 +3954,15 @@ def _role_target(item: Dict[str, Any], role: str) -> Dict[str, Any]:
 def stage_session_update(ident: Any, fn) -> Optional[Dict[str, Any]]:
     """Run ``fn(item, stage_session_dict)`` under the store lock (WT-24); one
     save. ``fn`` returning ``"skip"`` leaves the store untouched."""
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        from . import github_pipeline
+
+        def _gh(it):
+            ss = dict(it.get("stage_session") or {})
+            if fn(it, ss) == "skip":
+                return "skip"
+            it["stage_session"] = ss
+        return github_pipeline.mutate(ident, _gh, skip_returns_item=True)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -4896,6 +4921,22 @@ def stage_retired_ids(item: Dict[str, Any]) -> set:
 def stage_retired_done(ident: Any, worker_id: str, outcome: str) -> Optional[Dict[str, Any]]:
     """The kill pass handled one retired session: drop its entry and record
     ``stage_retired`` (killed | already_gone | token_mismatch)."""
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        from . import github_pipeline
+
+        def _gh(it):
+            entries = [e for e in (it.get("stage_retired") or []) if isinstance(e, dict)]
+            hit = [e for e in entries if str(e.get("worker_id")) == str(worker_id)]
+            if not hit:
+                return "skip"
+            it["stage_retired"] = [e for e in entries if str(e.get("worker_id")) != str(worker_id)]
+            if not it["stage_retired"]:
+                it.pop("stage_retired")
+            _append_history(it, "stage_retired", by=_by("system"), at=_now_iso(),
+                            worker_id=str(worker_id), outcome=str(outcome),
+                            role=hit[0].get("role"), key=hit[0].get("key"),
+                            reason=hit[0].get("reason"))
+        return github_pipeline.mutate(ident, _gh)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -7900,6 +7941,13 @@ def answer(ident: Any, text: str, session_id: str = "") -> Optional[Dict[str, An
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         item = backend.answer(ident, text, session_id=session_id)
+        if item and (item.get("stage_session") or {}).get("escalated"):
+            # OPS-201: the stage retry lives in the pipeline sidecar.
+            from . import github_pipeline
+            now = _now_iso()
+            item = github_pipeline.mutate(
+                ident, lambda it: None if _stage_retry_reset(it, text, now) else "skip",
+                skip_returns_item=True) or item
         if item:
             _log(
                 "ANSWER",

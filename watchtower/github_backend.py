@@ -1911,7 +1911,8 @@ class GitHubIssuesBackend:
                 item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
                 usage.attach(item)
                 item.pop("_usage_namespace", None)
-                return item
+                from . import github_pipeline
+                return github_pipeline.overlay(item)
         # meta is read-only here: the two containers that reach the item are
         # copied below, so the memoized parse can be shared across queues.
         body, meta = _split_body_shared(str(issue.get("body") or ""))
@@ -2012,6 +2013,8 @@ class GitHubIssuesBackend:
             "created_at": created_at or _now_iso(),
             "updated_at": issue.get("updatedAt") or created_at or _now_iso(),
             "github_repo": self.repo,
+            # OPS-201: host whose local sidecar owns this ticket's gate pipeline.
+            "pipeline_host": str(meta.get("pipeline_host") or ""),
             "github_labels": labels,
             "github_assignees": assignees,
             # The issue's GitHub author -- "who opened it" for synced tickets
@@ -2066,7 +2069,8 @@ class GitHubIssuesBackend:
         item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
         usage.attach(item)
         item.pop("_usage_namespace", None)
-        return item
+        from . import github_pipeline
+        return github_pipeline.overlay(item)
 
     def _list_probe_path(self, state: str) -> str:
         """REST path the change detector polls.
@@ -2559,8 +2563,10 @@ class GitHubIssuesBackend:
         # issue lists (WT-16). Reuse the converted result while the raw lists
         # are the same objects (the memo holds them, so identity is safe),
         # no usage ledger was written, and no issue crossed a time boundary.
+        from . import github_pipeline
         memo_key = (
-            self._memo_config(), status, lane,
+            # OPS-201: a sidecar-only transition changes eligibility too.
+            self._memo_config(), status, lane, github_pipeline.signature(),
         )
         ledger_stamp = None if strict else usage.ledger_dir_stamp()
         now = time.time()
@@ -3576,6 +3582,11 @@ class GitHubIssuesBackend:
                 "needs_input", "block_question",
             }:
                 meta[key] = value
+            elif key == "pipeline_host":
+                if value:
+                    meta["pipeline_host"] = str(value)
+                else:
+                    meta.pop("pipeline_host", None)
         self._edit_body(item, body, meta, "--title", title)
         return self.get(ident)
 

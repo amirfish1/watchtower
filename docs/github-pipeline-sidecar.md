@@ -1,0 +1,144 @@
+# GitHub pipeline sidecar (OPS-201, owner decision Q477 = C)
+
+GitHub-backed queues (BECKY, …) keep the GitHub issue as the **canonical
+ticket**. The gate pipeline (plan → plan review → build, later verify) has no
+storage on GitHub, so its state lives in a **local sidecar** keyed by the
+issue's canonical GitHub identity. This doc is the ownership and
+state-transition contract; tests in `tests/test_github_pipeline_sidecar.py`
+pin it.
+
+## Ownership split
+
+| Owned by the GitHub issue (unchanged)                  | Owned by the sidecar                         |
+|---------------------------------------------------------|----------------------------------------------|
+| title, body, note, status (open/closed), claim fields, close + resolution, defer, history of ticket events, labels | `gates`, `plan` (status/round/text/reviews/discussion/planner/reviewer), `stage_session`, pipeline history events |
+
+- The sidecar never stores ticket state; GitHub never stores pipeline state.
+- **One GitHub write** belongs to the pipeline: the meta key
+  `pipeline_host: <machine_tag>`, written when gates are set (and removed when
+  they are cleared). It is the federation fence (below).
+
+## Identity and storage
+
+- Key: `"<owner>/<repo>#<number>"` — survives a queue rename; the ref
+  (`BECKY-2332`) is derived for display only.
+- File: `github-pipeline.json` next to the queue DB, JSON
+  `{"version": 1, "items": {key: entry}}`, written atomically (tmp + `os.replace`).
+- Every mutation runs under the queue store's `_FileLock(_lock_path())` — the
+  same single lock local pipeline writes use, so no new lock ordering exists.
+  Network I/O (the GitHub base read) happens **before** taking the lock.
+- Readers (overlay) read without the lock; atomic replace makes that safe.
+
+## Overlay (read path)
+
+`GitHubIssueBackend._issue_to_item` applies the sidecar on every item it
+returns (memo hit or miss, after the memo so the memo stays pure GitHub):
+copies `gates`/`plan`/`stage_session`, merges pipeline history into
+`history` (sorted by `at`), then:
+
+- `plan_pending(item)` ⇒ `work_it = auto_eligible = manual_eligible =
+  claimable = False`. This one point covers `claim_next`, `claim_by_ref`,
+  `peek_next`, `count_claimable`, `count_manual_eligible` (all read work_it).
+- **Foreign host**: meta `pipeline_host` ≠ this `machine_tag()` ⇒
+  `pipeline_foreign = True`, not claimable, `stages.desired()` skips it,
+  `wt edit --gate` refuses. A host without the state never builds a gated
+  ticket unplanned.
+- **Missing state**: meta `pipeline_host` == this host but no sidecar entry
+  (lost/corrupt file) ⇒ `pipeline_missing = True`, not claimable, fail-closed
+  (surfaced by `wt find`); recovery = re-run `wt edit <ref> --gate …`.
+
+## Mutation path
+
+`queue._plan_update` and `queue.stage_session_update` route GitHub refs to
+`github_pipeline.update(ident, attr, fn)`:
+
+1. `base = backend.get(ident)` (fresh, outside the lock). GitHub unreachable ⇒
+   exception propagates, **sidecar untouched**; the stage tick retries.
+2. Under `_FileLock`: load sidecar, overlay entry onto a copy of `base`, run
+   `fn(it, state)` — unchanged functions, same `"skip"` CAS contract.
+3. Persist `state` into the entry plus any history events `fn` appended;
+   bump `rev`; atomic write.
+
+Plan transitions are serialized by the lock and keyed on local state, so two
+concurrent `plan_start` calls yield one fresh round. `fn` may read a
+GitHub-derived field (status, claim) that is seconds stale; the only
+consequence is one extra tick (the next tick re-reads, `desired()` stops on a
+closed/answered ticket).
+
+## Write path for gates
+
+`wt edit <ref> --gate plan[:model]` on a GitHub ref:
+validate → refuse if foreign host → write `pipeline_host` marker via
+`backend.update` (existing body CAS/merge handles write conflicts; GitHub
+down ⇒ edit fails, nothing local written) → write sidecar entry. Crash
+between the two ⇒ marker without entry ⇒ fail-closed `pipeline_missing`, never
+an unplanned build. Gating a ticket a builder already holds is **refused**
+(the claim is left untouched): the hold only excludes new claims, so a running
+builder would not pause for the planner. Gate it once it is released.
+
+## Milestone 1 scope (this change)
+
+Supported on GitHub: `plan`, `plan:<model>` gates via `wt edit`; the full plan
+lifecycle (start, submit, review verdict, discussion, decide, fail); claim
+exclusion; federation fence; restart (state is on disk, `stage_session`
+reattaches as for local tickets).
+
+Refused with an explicit error until milestone 2 (no silent drop, no bypass):
+`verify`, `review*`, `cmd:` gates and `--gate` on `wt add` for GitHub queues.
+
+## Milestone 2 (not in this change)
+
+`verify` on GitHub: `wt close` with a pending verify gate keeps the issue
+open and records `in_review` + `gate_pending` + `verify_cycle` + the proposed
+resolution in the sidecar; `wt verdict` pass closes the issue with that
+resolution, fail clears the hold; `verify_cycle` fences stale verdicts.
+`wt add --gate` writes the sidecar inside the grace window. A
+`wt pipeline adopt <ref>` to move ownership between hosts.
+
+## Independent review (wt critique, 2026-10-29) and disposition
+
+Codex review scored the doc-only contract 3/10. Disposition:
+
+- Fixed in this slice: implementation + tests exist (#1); every pipeline field
+  a callback touches is persisted in one transaction, not just one attr (#7);
+  GitHub `wt answer` on a stage escalation runs `_stage_retry_reset` in the
+  sidecar (#8); the list-items memo keys on the sidecar signature (#5);
+  `pipeline_host` is an explicit backend.update key (#3, partly); gating a
+  running build is refused (#13); queue-config gates never start a GitHub
+  planner or hold a GitHub ticket (#14); clear deletes the entry before the
+  marker, so a crash fails closed (#12, partly); `plan_decide` clears the
+  canonical block on the issue after the sidecar write (#6, partly).
+- Parity with local queues, not new risk: `plan_fail` releases the ticket
+  ("failed" builds loudly) (#2); status prechecks outside the lock in
+  plan_submit/verdict/decide (#9); spawn-before-record (#11) and no
+  desired() recheck right before spawn (#10). The sidecar inherits these.
+- **Open, blocks activation on a multi-host queue** (#3/#4): the marker is
+  not a distributed lock. Two hosts can race to gate the same issue, and a
+  host running a `wt` older than this change ignores the hold entirely and
+  will claim a plan-pending ticket. `machine_tag()` is 3 chars and can
+  collide. BECKY is claimed from `her` and `ami`, so BECKY activation needs
+  every claiming host on this version first (OPS-203, which also carries
+  the Mac-side duplicate_of gate inheritance, OPS-1456/1457 there).
+- Open, follow-up: `plan_decide` on GitHub does not reopen an
+  `in_progress` ticket without a resumable session (#6); no gate
+  generation/tombstone fences an old worker across clear → re-enable (#12).
+  Both in OPS-204 with verify on GitHub.
+
+## Activation / resume procedure
+
+0. Preconditions: every host that claims the queue runs a `wt` with this
+   change (`wt version` / repo at or after the OPS-201 commit); the ticket is
+   unclaimed, or gated by its own claimant (`WT_WORKER_ID` == claimed_by), which
+   then waits for the plan. Another worker's live claim is refused.
+0b. The stage tick runs in the reconciler: it plans GitHub tickets only once
+   the reconciler process has been restarted onto this change (until then
+   `wt plan show` stays `none`). That restart is the release step; it is not
+   automatic.
+1. On the owning host (`her`): `wt edit BECKY-2332 --gate plan`.
+2. `wt find BECKY-2332 --json` shows `gates: ["plan"]`, `plan: {}` and the
+   ticket is not claimable for a new builder.
+3. The reconciler's stage tick spawns the planner (`STAGE_SPAWN … planner`);
+   follow with `wt plan show BECKY-2332`.
+4. After a restart nothing is needed: the sidecar is on disk and the stage
+   tick resumes from `plan.status` / `stage_session`.
+5. To abandon: `wt edit BECKY-2332 --gate ''` (clears entry and marker).
