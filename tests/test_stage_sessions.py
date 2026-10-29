@@ -988,3 +988,34 @@ def test_supplement_reviewer_dying_twice_fails_only_the_supplement(stg):
     assert it["plan"]["supplements"][0]["status"] == "failed"
     assert it["plan"]["status"] == "accepted" and not it["needs_input"]
     assert it["status"] == "in_progress" and it["claimed_by"] == "builder-1"
+
+
+def test_unspawnable_supplement_review_fails_only_the_supplement(stg, monkeypatch):
+    """OPS-239: s13's reviewer hit E2BIG at spawn; plan_fail flipped the ACCEPTED
+    plan to failed, s13 stayed reviewing, and the stage session for key
+    supplement:s13 still carried s12's dead pid/log."""
+    ref = _plan_ticket(stg)
+    stg.q.plan_start(ref)
+    stg.q.plan_submit(ref, "the plan")
+    stg.q.plan_verdict(ref, True, "ok", by="rev-1")
+    assert stg.q.claim_by_ref(ref, "builder-1")
+    stg.q.plan_supplement_submit(ref, "addendum one", by="builder-1")
+    _tick(stg)
+    s1 = _ss(stg, ref)
+    assert s1["key"] == "supplement:s1" and s1.get("pid")
+    stg.q.plan_supplement_verdict(ref, True, "sound", by="rev-2", n=1)
+    stg.q.plan_supplement_submit(ref, "addendum two", by="builder-1")
+
+    def e2big(*a, **k):
+        raise OSError(7, "Argument list too long", sys.executable)
+    monkeypatch.setattr(stg.workers, "spawn_adhoc", e2big)
+    _tick(stg)
+    it = stg.q.get(ref)
+    assert it["plan"]["status"] == "accepted"
+    assert [s["status"] for s in it["plan"]["supplements"]] == ["accepted", "failed"]
+    ss = it.get("stage_session") or {}
+    assert ss.get("key") == "supplement:s2"
+    assert ss.get("pid") != s1["pid"] and ss.get("log") != s1["log"]
+    assert it["status"] == "in_progress" and it["claimed_by"] == "builder-1"
+    _tick(stg)
+    assert stg.q.get(ref)["plan"]["status"] == "accepted"

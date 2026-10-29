@@ -5409,3 +5409,31 @@ def test_spawn_drops_one_shot_envelope(wt,monkeypatch):
     monkeypatch.setenv('CODEX_THREAD_ID','parent-codex')
     env=wt.workers._spawn_env('new-child')
     assert not any(k in env for k in ('WT_MESSAGE_ENVELOPE','CLAUDE_CODE_SESSION_ID','CODEX_THREAD_ID'))
+
+
+@pytest.mark.parametrize("engine", ["claude", "codex"])
+def test_spawn_adhoc_stage_delivers_a_prompt_over_the_argv_string_limit(wt, monkeypatch, engine):
+    """OPS-239: a supplement review goal (ticket + accepted plan + supplements)
+    passed Linux's 128 KiB per-argument cap and Popen raised E2BIG. The real
+    spawn path (_exitwrap included) must hand the engine the whole goal."""
+    out = wt.tmp / "received.json"
+    fake = wt.tmp / f"fake-{engine}"
+    fake.write_text(
+        "#!" + sys.executable + "\n"
+        "import json, os, sys\n"
+        f"json.dump({{'argv': sys.argv[1:], 'stdin': sys.stdin.read()}}, open({str(out)!r} + '.tmp', 'w'))\n"
+        f"os.replace({str(out)!r} + '.tmp', {str(out)!r})\n")
+    fake.chmod(0o755)
+    monkeypatch.setitem(wt.workers._ENGINE_BIN, engine, str(fake))
+    monkeypatch.setenv("WATCHTOWER_SPAWN_STAGGER_S", "0")
+    monkeypatch.setenv("WATCHTOWER_STAGE_LAUNCH_GRACE_S", "0")
+    monkeypatch.setattr(wt.workers, "WORKERS_FILE", wt.tmp / "workers.json")
+    prompt = "REVIEW THIS\n" + "x" * (200 * 1024) + "\nEND-OF-GOAL"
+    wt.workers.spawn_adhoc(prompt, engine, repo_path=str(wt.tmp),
+                           name="plan-supplement-review-x-1-s1", stage="plan_reviewer",
+                           ticket_ref="X-1", ticket_queue="X")
+    deadline = time.time() + 20
+    while not out.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    got = json.loads(out.read_text())
+    assert prompt in [got["stdin"]] + got["argv"]

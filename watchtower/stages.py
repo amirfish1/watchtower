@@ -523,6 +523,13 @@ def _ss_set(ref: str, **fields: Any) -> Optional[Dict[str, Any]]:
     return q.stage_session_update(ref, _do)
 
 
+def _ss_replace(ref: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _do(it, ss):
+        ss.clear()
+        ss.update(fields)
+    return q.stage_session_update(ref, _do)
+
+
 def _record_death(ref: str, project: str, role: str, key: str, reason: str,
                   extra: Dict[str, Any], rec: Optional[Dict[str, Any]],
                   refunded: bool = False, unspawned: bool = False) -> Dict[str, Any]:
@@ -762,6 +769,13 @@ def _spawn_error(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
         _record_death(ref, project, role, str(key), reason, {"rc": None}, None,
                       refunded=refunded, unspawned=True)
         return "launch_failed"
+    if key.startswith("supplement:"):
+        # OPS-239: like a dead supplement review (OPS-232), an unspawnable one
+        # fails the supplement only; plan_fail would flip the ACCEPTED plan.
+        q.plan_supplement_verdict(ref, False, f"could not spawn the supplement reviewer: {exc}",
+                                  status="failed")
+        _log("STAGE_BLOCK", f"{ref} {role} {key}: {exc}", queue=project)
+        return "failed"
     if role in ("planner", "plan_reviewer"):
         q.plan_fail(ref, f"could not spawn the {role}: {exc}")
         return "failed"
@@ -831,7 +845,9 @@ def _supervise(d: Dict[str, Any], rows: List[Dict[str, Any]], budget: _Budget) -
             for carry in ("retry_note", "retry_at"):   # a human retry moved the key (assess:N+1)
                 if ss_old.get(carry):
                     ss[carry] = ss_old[carry]
-            _ss_set(ref, **ss)
+            # Replace, not merge: a merge kept the previous key's pid/log/
+            # exit_file attached to the new key (OPS-239, s13 -> dead s12).
+            _ss_replace(ref, ss)
     elif not ss.get("role"):
         ss["role"] = role
 

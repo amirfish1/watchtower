@@ -8088,6 +8088,12 @@ def spawn_run_once_worker(
 # same delivery path (and outbox fallback) every other WT message uses.
 
 ADHOC_ENGINES = ("claude", "codex", "antigravity", "kimi")
+# Linux caps ONE argv string at MAX_ARG_STRLEN (128 KiB): a stage goal that
+# inlines a ticket + accepted plan + supplements outgrew it and Popen died with
+# E2BIG (OPS-239). Bigger prompts go through a file: on stdin for the engines
+# that read their prompt there, as a pointer for the rest.
+ADHOC_ARGV_PROMPT_MAX = 96 * 1024
+ADHOC_STDIN_ENGINES = ("claude", "codex")
 
 # The footer pipes the report over stdin via a quoted heredoc: a report is
 # multi-paragraph markdown full of double quotes, $variables, and `backticks`,
@@ -8156,13 +8162,16 @@ def codex_compact_args() -> List[str]:
 
 def build_adhoc_command(
     engine: str, prompt: str, *, model: str = "", repo_path: str = "",
-    log_path: str = "", session_id: str = "",
+    log_path: str = "", session_id: str = "", prompt_stdin: bool = False,
 ) -> List[str]:
     """Argv for a one-shot ad-hoc agent. All engines run in print/exec mode
     with the goal in argv -- no FIFO, no drain loop; the process exits when
-    the goal is done. Raises ValueError for an engine we can't build, and for
-    an engine whose CLI binary isn't installed -- a clean error here beats a
-    FileNotFoundError out of Popen."""
+    the goal is done. ``prompt_stdin`` (claude/codex only) leaves the goal out
+    of argv so the caller feeds it on stdin. Raises ValueError for an engine we
+    can't build, and for an engine whose CLI binary isn't installed -- a clean
+    error here beats a FileNotFoundError out of Popen."""
+    if prompt_stdin and engine not in ADHOC_STDIN_ENGINES:
+        raise ValueError(f"{engine} cannot read its prompt from stdin")
     if engine == "codex":
         if not shutil.which(_ENGINE_BIN["codex"]):
             raise ValueError("codex CLI not found on PATH")
@@ -8176,7 +8185,7 @@ def build_adhoc_command(
         if model:
             argv += ["--model", model]
         argv += codex_compact_args()
-        argv.append(prompt)
+        argv.append("-" if prompt_stdin else prompt)
         return argv
     if engine == "antigravity":
         bin_path = _resolve_antigravity_bin()
@@ -8216,7 +8225,8 @@ def build_adhoc_command(
             # Plain `-p` text output never names the session, so the log
             # backfill can't ledger it; pin the id instead (CCC-1241).
             argv += ["--session-id", session_id]
-        argv.append(prompt)
+        if not prompt_stdin:
+            argv.append(prompt)
         return argv
     if engine == "kimi":
         bin_path = _resolve_engine_bin("kimi")
@@ -8291,9 +8301,19 @@ def spawn_adhoc(
     # id, so mint it here: the ledger then knows the planner/reviewer/verifier
     # session at spawn time and CCC files it under Workers (CCC-1241).
     session_id = str(uuid.uuid4()) if engine == "claude" else ""
+    prompt_file = ""
+    prompt_stdin = False
+    if len(prompt.encode("utf-8")) > ADHOC_ARGV_PROMPT_MAX:
+        prompt_file = f"{log_path}.prompt.md"
+        prompt_stdin = engine in ADHOC_STDIN_ENGINES
+        full_prompt = prompt
+        if not prompt_stdin:
+            prompt = (f"Your full instructions are in the file {prompt_file} "
+                      f"({len(full_prompt)} chars). Read ALL of it before doing "
+                      f"anything else; it is your goal, verbatim.")
     argv = build_adhoc_command(
         engine, prompt, model=model, repo_path=repo_path, log_path=str(log_path),
-        session_id=session_id,
+        session_id=session_id, prompt_stdin=prompt_stdin,
     )
     if dry_run:
         rec = {
@@ -8305,8 +8325,13 @@ def spawn_adhoc(
             rec["session_id"] = session_id
         if model:
             rec["model"] = model
+        if prompt_file:
+            rec["prompt_file"] = prompt_file
+            rec["prompt_stdin"] = prompt_stdin
         return rec
     log_dir.mkdir(parents=True, exist_ok=True)
+    if prompt_file:
+        Path(prompt_file).write_text(full_prompt, encoding="utf-8")
     exit_file = ""
     if stage:
         exit_file = f"{log_path}.exit"
@@ -8314,10 +8339,11 @@ def spawn_adhoc(
                 "--exit-file", exit_file, "--"] + list(argv)
         _spawn_gate(engine)
     logf = open(log_path, "ab")
+    stdin = open(prompt_file, "rb") if prompt_stdin else subprocess.DEVNULL
     try:
         proc = subprocess.Popen(
             argv,
-            stdin=subprocess.DEVNULL,
+            stdin=stdin,
             stdout=logf,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -8328,6 +8354,8 @@ def spawn_adhoc(
         )
     finally:
         logf.close()
+        if prompt_stdin:
+            stdin.close()
     rec = record_worker(
         proc.pid, label.upper(), engine, worker_id, repo_path, str(log_path),
         model=model, kind="adhoc", session_id=session_id,
