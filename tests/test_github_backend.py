@@ -93,6 +93,13 @@ def project_fields(issue):
 
 data = load()
 args = sys.argv[1:]
+if "--body-file" in args:
+    # Real gh reads the body from the file ("-" is stdin); fold it back into
+    # `--body` so the handlers and recorded commands below see one shape.
+    i = args.index("--body-file")
+    src = args[i + 1]
+    raw = sys.stdin.buffer.read() if src == "-" else Path(src).read_bytes()
+    args = [*args[:i], "--body", raw.decode("utf-8"), *args[i + 2:]]
 data["commands"].append(args)
 
 if args[:2] == ["label", "create"]:

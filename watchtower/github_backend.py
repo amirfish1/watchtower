@@ -909,6 +909,29 @@ def _is_auth_error(error: Any) -> bool:
     return bool(_AUTH_ERROR_RE.search(str(error or "")))
 
 
+# `gh issue <verb>` commands whose --body may be read from a file instead.
+_BODY_FILE_VERBS = frozenset({"create", "edit", "comment"})
+
+
+def _body_via_stdin(args: List[str]) -> "tuple[List[str], Optional[str]]":
+    """Move an issue ``--body VALUE`` off argv: return the argv with
+    ``--body-file -`` in its place, plus VALUE to feed on stdin.
+
+    Every body write takes this path, whatever its length, so a short body
+    and a 200 KB issue history share one transport. Anything else (no body,
+    a non-issue command) comes back unchanged with ``None``.
+    """
+    if len(args) < 2 or args[0] != "issue" or args[1] not in _BODY_FILE_VERBS:
+        return list(args), None
+    try:
+        i = args.index("--body")
+    except ValueError:
+        return list(args), None
+    if i + 1 >= len(args):
+        return list(args), None
+    return [*args[:i], "--body-file", "-", *args[i + 2:]], args[i + 1]
+
+
 def _gh_hosts_file() -> Path:
     env = os.environ.get("GH_CONFIG_DIR")
     if env:
@@ -1791,22 +1814,32 @@ class GitHubIssuesBackend:
         Split out of ``_run`` because the ETag probe has to read the exit code
         and stderr itself: ``gh api`` exits 1 on a 304, which is a success for
         us, and ``_run``'s exit-code-means-failure rule cannot express that.
+
+        An issue ``--body`` travels on stdin (``--body-file -``), never argv:
+        a long issue history exceeds the kernel's per-argument limit and
+        ``exec`` fails with E2BIG before gh even starts (WT-40).
         """
+        argv, body = _body_via_stdin(args)
+        extra: Dict[str, Any] = {}
+        if body is not None:
+            # gh reads the file as raw UTF-8; pin it instead of the locale.
+            extra = {"input": body, "encoding": "utf-8"}
         try:
             return subprocess.run(
-                ["gh", *args],
+                ["gh", *argv],
                 cwd=self.repo_path or None,
                 capture_output=True,
                 text=True,
                 timeout=60,
                 env=_gh_child_env(),
+                **extra,
             )
         except FileNotFoundError as exc:
             raise GitHubBackendError(
                 "GitHub backend requires the gh CLI to be installed and on PATH"
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise GitHubBackendError(f"gh {' '.join(args)} timed out") from exc
+            raise GitHubBackendError(f"gh {' '.join(argv)} timed out") from exc
 
     def _run(self, args: List[str], *, check: bool = True) -> str:
         proc = self._run_raw(args)
@@ -1833,7 +1866,7 @@ class GitHubIssuesBackend:
                 # the token.
                 _record_gh_auth_broken(detail)
             raise GitHubBackendError(
-                f"gh {' '.join(args)} failed"
+                f"gh {' '.join(_body_via_stdin(args)[0])} failed"
                 + (f": {detail}" if detail else "")
             )
         if (
