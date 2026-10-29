@@ -1,9 +1,9 @@
 # WatchTower site (site/) - notes and deploy record
 
 Standalone static marketing/docs site. Self-contained HTML/CSS, no build step, no
-framework, mobile-clean. GitHub Pages deployment is live at
-https://amirfish1.github.io/watchtower/. Custom domain https://watchtower.amirfish.ai
-is configured in Pages but is not yet reachable (DNS setup pending, OPS-1476).
+framework, mobile-clean. Published at https://watchtower.amirfish.ai with a valid
+TLS certificate and HTTPS enforcement. Live desktop/mobile verification passed
+on 2026-10-29 (SIDE-32).
 
 ## Layout: what is public and what is not
 
@@ -44,10 +44,10 @@ update the version in the eyebrow, the footer and the meta description. Last ref
 ## Hosting
 
 GitHub Pages, source "GitHub Actions" (not a branch folder, so `docs/` is never a
-candidate). DNS for amirfish.ai is at Spaceship; the intended record is
-`watchtower CNAME amirfish1.github.io`. At 2026-10-29
-04:55 UTC, authoritative `launch1.spaceship.net` had no record for `watchtower`.
-Spaceship login requires the owner's TOTP challenge before it can be added (OPS-1476). Copy rules: no
+candidate). DNS for amirfish.ai is at Spaceship; the authoritative record is
+`watchtower CNAME amirfish1.github.io` (OPS-1476 resolved). GitHub Pages has
+`https_enforced: true` and an approved certificate for `watchtower.amirfish.ai`.
+Copy rules: no
 em-dashes, no new licence or commercial terms (the footer restates the README's
 licence line), no promises about GitHub workflows beyond what the CLI flags show.
 
@@ -57,12 +57,26 @@ licence line), no promises about GitHub workflows beyond what the CLI flags show
 - All 56 documented top-level commands return successful `--help` output on wt 0.8.3.
 - `wt wait` reads open-only health depth (`health.py`, `cmd_wait`); it does not
   wait for in-progress/review/blocked tickets. Site copy now states that limit.
-- Default screenshot dependency fallback fails on this host (OPS-1477). Working
-  dependency: `NODE_PATH=/Users/amirfish/.cache/bym-worktree-deps/ff166a8a00aede75/tree/node_modules`.
-- Live Chromium checks failed with ERR_NAME_NOT_RESOLVED even for the working
-  GitHub Pages hostname; local rendering remains available. Do not claim live
-  browser verification until that check and the custom domain both pass.
+- Initial screenshot dependency/browser DNS failures were recorded in OPS-1477.
+  The current default script now resolves its dependency and passes against the
+  live HTTPS custom domain without overrides.
 - Independent local browser review passed all three pages at 1440 and 390 widths,
   same-site links and the manifest; mobile screenshots had no visible cutoff.
 - Focused health tests: 12 passed; documented command signatures match current
   CLI help (nested model commands checked at their own help level).
+
+## Completed public delivery (SIDE-32, 2026-10-29 22:58 UTC)
+
+- DNS is authoritative and correct. The initially absent certificate was recovered
+  by removing/readding the same custom domain using GitHub's documented procedure
+  (OPS-1497); no DNS targets, account scope or licence terms were changed.
+- Valid TLS certificate for `watchtower.amirfish.ai` expires 2027-01-27. Pages
+  HTTPS enforcement is enabled; an uncached HTTP path returns a 301 to HTTPS.
+  Existing HTTP responses can remain in the edge cache for their 600-second TTL.
+- `SITE_URL=https://watchtower.amirfish.ai node scripts/snapshot-site.js` passed
+  all three live pages at 1440/390 and their same-site links/manifest checks.
+- Independent live browser review confirmed viewport/scroll widths of 1440/1440
+  and 390/390 on each page after layout settled. Screenshots:
+  `/tmp/side32-live-{index,cli,integration}-{1440,390}.png`.
+- Public HTML/CSS bytes match `site/`. Internal `/docs/site-notes.md`,
+  `/docs/worker-runbook.md` and `/README.md` return 404; licence link preserved.
