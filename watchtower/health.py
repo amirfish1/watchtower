@@ -4,11 +4,14 @@
 
 """Queue health: depth, oldest-open age, and the stuck flag.
 
-Pure queue ground-truth. WatchTower decides a queue is *stuck* from the queue
-file alone — it does NOT depend on any external liveness signal (no CCC, no
-process probing). A queue is stuck when:
+Queue ground-truth. WatchTower decides a queue is *stuck* from the queue
+file alone (no CCC), probing claim liveness only to clear the flag (WT-33).
+A queue is stuck when:
 
     open > 0  AND  no worker progress (no ticket closed) in the last N minutes.
+
+Once that fires, a queue at its staffing cap whose every claim is proven alive
+and recently active reads ``busy`` instead: a worker on a long ticket.
 
 "No progress" is measured from the most recent ``closed_at`` (or, if nothing
 has ever been closed, from the oldest open item's ``created_at``). That makes a
@@ -19,7 +22,7 @@ whole point of WatchTower.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from . import config
 from . import queue as q
@@ -85,6 +88,19 @@ def _claimable_since(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
             stamps.append(h["at"])
     return max((s for s in stamps if isinstance(s, str) and _parse_iso(s)),
                default=None)
+
+
+def _claim_working(it: Dict[str, Any], ctx: Any) -> bool:
+    """WT-33: the claim's process is proven alive and the claim (store or
+    transcript) moved within the backstop's stall window, so a long ticket
+    is a busy worker, not a stall. Any probe failure reads not working."""
+    from . import liveness
+    try:
+        if liveness.claim_owner(it, ctx).verdict != "alive":
+            return False
+        return ctx.now - liveness.last_activity(it, ctx) < liveness.stall_s()
+    except Exception:  # noqa: BLE001 - health must never raise on a probe
+        return False
 
 
 def stage_stuck_after_s(stuck_minutes: int = STUCK_MINUTES) -> float:
@@ -160,8 +176,16 @@ def queue_status(
     waiting_refs: Optional[set] = None,
     worker_model: Optional[str] = None,
     by_ref: Optional[Dict[str, Dict[str, Any]]] = None,
+    claim_working: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    worker_cap: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Compute the status row for a single queue from its items.
+
+    ``claim_working`` / ``worker_cap`` (WT-33): when the stuck rule fires but
+    the queue holds at least ``worker_cap`` (default: its desired_workers)
+    in-progress claims and ``claim_working`` (default: live process + recent
+    activity, see ``_claim_working``) holds for every one, the queue is a
+    serial worker busy on a long ticket: ``busy`` is set and it is not stuck.
 
     ``by_ref``: every ticket by ref (all queues), so a cross-queue blocker's
     close time can date when its dependant became claimable (WT-22).
@@ -287,6 +311,21 @@ def queue_status(
         and (oldest_claimable_age is None
              or oldest_claimable_age >= stuck_minutes * 60)
     )
+    # WT-33: claims and closes are the only worker progress the queue sees,
+    # so one worker spending >10m on a ticket read stuck while a batch
+    # waited. At the staffing cap with every claim alive and moving, more
+    # workers can't be spawned and nudging the busy ones helps nobody. Probed
+    # only once the cheap rule fires.
+    busy = False
+    if stuck and in_progress:
+        cap = worker_cap if worker_cap is not None else config.desired_workers(project)
+        if len(in_progress) >= max(1, cap):
+            if claim_working is None:
+                from . import liveness
+                ctx = liveness.ResolverContext(now=now_ts)
+                claim_working = lambda it: _claim_working(it, ctx)  # noqa: E731
+            busy = all(claim_working(it) for it in in_progress)
+    stuck = stuck and not busy
 
     # Drain rate: closes within the recent window / window minutes => closes/min.
     window_start = now - timedelta(minutes=drain_window_minutes)
@@ -343,6 +382,7 @@ def queue_status(
         "since_progress_s": since_progress,
         "since_progress": _fmt_age(since_progress),
         "stuck": stuck,
+        "busy": busy,
         "stage_owned": stage_owned,
         "stage_stuck": stage_stuck,
         "stuck_reason": stuck_reason,

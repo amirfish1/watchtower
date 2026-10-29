@@ -196,3 +196,45 @@ def test_reopen_restarts_claimable_clock_but_comment_does_not():
     assert health.queue_status("Q", [it], now=now)["stuck"] is True
     it["history"].append({"event": "reopen", "at": _stamp(now, timedelta(minutes=2))})
     assert health.queue_status("Q", [it], now=now)["stuck"] is False
+
+
+def test_live_busy_worker_at_cap_is_not_stuck():
+    """WT-33: one worker 25m into a ticket while a batch waits is a busy
+    queue, not a stalled one -- but only at the staffing cap and only while
+    every claim is alive and moving."""
+    now = datetime.now(timezone.utc)
+    waiting = _item(created_at=_stamp(now, timedelta(hours=2)))
+    claim = _item(status="in_progress", created_at=_stamp(now, timedelta(hours=3)),
+                  claimed_at=_stamp(now, timedelta(minutes=25)))
+    items = [waiting, claim]
+    row = health.queue_status("Q", items, now=now, worker_cap=1,
+                              claim_working=lambda it: True)
+    assert row["stuck"] is False and row["busy"] is True
+    assert row["state"] == "active"
+    # A hung or dead claimant is still an alarm.
+    row = health.queue_status("Q", items, now=now, worker_cap=1,
+                              claim_working=lambda it: False)
+    assert row["stuck"] is True and row["busy"] is False
+    # Below the cap a worker could be spawned, so idle claimable work is stuck.
+    row = health.queue_status("Q", items, now=now, worker_cap=2,
+                              claim_working=lambda it: True)
+    assert row["stuck"] is True
+
+
+def test_claim_working_needs_live_owner_and_recent_activity(monkeypatch):
+    from watchtower import liveness
+    now = datetime.now(timezone.utc)
+    ctx = liveness.ResolverContext(now=now.timestamp())
+    it = _item(status="in_progress", claimed_at=_stamp(now, timedelta(minutes=25)))
+    verdict = {"v": "alive"}
+    monkeypatch.setattr(liveness, "claim_owner",
+                        lambda item, c=None: liveness.Verdict(verdict["v"], "", "", None))
+    monkeypatch.setattr(liveness, "last_activity",
+                        lambda item, c=None: now.timestamp() - 300)
+    assert health._claim_working(it, ctx) is True
+    verdict["v"] = "unproven"
+    assert health._claim_working(it, ctx) is False
+    verdict["v"] = "alive"
+    monkeypatch.setattr(liveness, "last_activity",
+                        lambda item, c=None: now.timestamp() - liveness.stall_s() - 1)
+    assert health._claim_working(it, ctx) is False
