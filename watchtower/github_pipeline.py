@@ -362,6 +362,7 @@ def _stage_workers(entry: Dict[str, Any]) -> List[str]:
     infos = [plan.get("planner"), plan.get("reviewer"), entry.get("verifier"),
              entry.get("stage_session")]
     infos += list(plan.get("role_history") or []) + list(entry.get("stage_retired") or [])
+    infos += [s.get("reviewer") for s in plan.get("supplements") or [] if isinstance(s, dict)]
     return sorted({str(i.get("worker_id")) for i in infos
                    if isinstance(i, dict) and i.get("worker_id")})
 

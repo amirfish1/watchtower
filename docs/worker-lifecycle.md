@@ -312,6 +312,20 @@ otherwise it spawns a fresh session that same tick, seeded with the ticket, the
 plan, the objections and the last discussion messages. Dying twice escalates
 like any stage (`wt answer REF retry` restarts the turn).
 
+### Supplements to an accepted plan (OPS-232)
+
+`wt plan submit` refuses once the plan is `accepted`. A builder that needs an
+addendum reviewed runs `wt plan supplement submit REF --file F` (the claimant
+only; one open at a time; an identical re-submit is a no-op). The plan's
+status, text, `accepted_version`, review history and the claim are never
+touched. The daemon spawns an independent `plan_reviewer` on key
+`supplement:s<n>` (even while the build is human-blocked), which files
+`wt plan supplement verdict REF --n N --accept|--reject`. The submitter and
+the claimant cannot judge it. Only an ACCEPTED supplement is appended to
+`render_plan`, the text that builders and verifiers read. A rejected one can
+be revised as `s<n+1>`. A reviewer that dies twice marks the supplement
+`failed` and never blocks the plan or the ticket.
+
 Plan messages (`wt plan discuss`, fallback reminders) use the live-only
 transport (`messages.send(..., live_only=True)`: UDS, then WT stdin FIFO; never
 the delegate, a resume, or the outbox). A send result is never taken as

@@ -963,3 +963,28 @@ def test_request_flags_a_spawn_less_watcher(stg):
     assert stg.stages.request(ref, "test")["supervised"]
     stg.stages.supervisor_marker_path().unlink()
     assert stg.stages.request(ref, "test")["supervised"]  # older daemon: no marker
+
+
+def test_supplement_reviewer_dying_twice_fails_only_the_supplement(stg):
+    """OPS-232: a review-only stage never blocks the accepted plan or the build."""
+    ref = _plan_ticket(stg)
+    stg.q.plan_start(ref)
+    stg.q.plan_submit(ref, "the plan")
+    stg.q.plan_verdict(ref, True, "ok", by="rev-1")
+    assert stg.q.claim_by_ref(ref, "builder-1")
+    stg.q.plan_supplement_submit(ref, "the addendum", by="builder-1")
+    _tick(stg)
+    ss = _ss(stg, ref)
+    assert ss["role"] == "plan_reviewer" and ss["key"] == "supplement:s1"
+    assert "plan supplement verdict" in stg.spawned[-1]["prompt"]
+    sup = stg.q.get(ref)["plan"]["supplements"][0]
+    assert sup["reviewer"]["stage_key"] == "supplement:s1"
+    assert "reviewer" not in stg.q.get(ref)["plan"]    # v1 reviewer metadata not clobbered
+    _kill(stg, ref)
+    _tick(stg)
+    _kill(stg, ref)
+    _tick(stg)
+    it = stg.q.get(ref)
+    assert it["plan"]["supplements"][0]["status"] == "failed"
+    assert it["plan"]["status"] == "accepted" and not it["needs_input"]
+    assert it["status"] == "in_progress" and it["claimed_by"] == "builder-1"

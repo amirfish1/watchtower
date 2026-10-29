@@ -235,7 +235,12 @@ def desired(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         status = str(it.get("status") or "")
         plan = it.get("plan") or {}
         entry: Optional[Tuple[str, str]] = None
-        if (status == "in_review" and it.get("gate_pending") == "verify"
+        sup = q.plan_open_supplement(it)
+        if (sup and status in ("open", "in_progress") and plan.get("status") == "accepted"
+                and (it.get("pipeline_local") or not _github_backed(it))):
+            # OPS-232: review-only, so a human block on the build does not hold it.
+            entry = ("plan_reviewer", f"supplement:s{int(sup.get('n') or 1)}")
+        elif (status == "in_review" and it.get("gate_pending") == "verify"
                 and not it.get("needs_input")
                 and (it.get("pipeline_local") or not _github_backed(it))):
             entry = ("verifier", f"verify:{int(it.get('verify_cycle') or 0)}")
@@ -449,7 +454,9 @@ def _role_target(item: Dict[str, Any], role: str) -> Dict[str, Any]:
 def _goal(item: Dict[str, Any], role: str, *, token: str, respawn: bool,
           note: str, key: str = "", nonce: str = "") -> str:
     from . import cli
-    if key.startswith("discuss:") and role in ("planner", "plan_reviewer"):
+    if key.startswith("supplement:"):
+        goal = cli._plan_supplement_review_goal(item)
+    elif key.startswith("discuss:") and role in ("planner", "plan_reviewer"):
         goal = cli._plan_discussion_goal(item, "planner" if role == "planner" else "reviewer")
     elif role == "planner":
         plan = item.get("plan") or {}
@@ -563,6 +570,15 @@ def _escalate(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any]) -> 
     question = (f"The {role.replace('_', ' ')} {'discussion turn' if key.startswith('discuss:') else 'stage'} ({key}) died twice: {reasons}."
                 + (f" Logs: {logs}." if logs else "") + f" Decide: {exits}.")
     plan_status = (item.get("plan") or {}).get("status", "")
+    if key.startswith("supplement:"):
+        # OPS-232: a dead supplement review fails the supplement only; the
+        # accepted plan and the build ticket are left exactly as they were.
+        q.stage_session_update(ref, lambda it, s: s.update(escalated=True,
+                                                           escalated_from=plan_status))
+        q.plan_supplement_verdict(ref, False, f"supplement reviewer died twice: {reasons}",
+                                  status="failed")
+        _log("STAGE_BLOCK", f"{ref} {role} {key}: {reasons}", queue=project)
+        return
 
     def _do(it, s):
         s["escalated"] = True
@@ -623,7 +639,9 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
         name = {"planner": f"plan-{ref}-r{plan_now.get('round', 1)}",
                 "plan_reviewer": f"plan-review-{ref}",
                 "verifier": f"verify-{ref}", "assessor": f"assess-{ref}"}[role]
-        if key.startswith("discuss:"):
+        if key.startswith("supplement:"):
+            name = f"plan-supplement-review-{ref}-{key.split(':')[1]}"
+        elif key.startswith("discuss:"):
             name = (f"plan-{ref}-r{plan_now.get('round', 1)}-d"
                     f"{(plan_now.get('discussion') or {}).get('round', 1)}"
                     if role == "planner"
@@ -650,7 +668,9 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
             pass
     info = {"engine": engine, "model": target["model"], "source": target["source"],
             "worker_id": rec.get("worker_id", ""), "stage_key": key}
-    if role == "planner":
+    if key.startswith("supplement:"):
+        q.plan_supplement_set_reviewer(ref, int(key.split(":s")[1]), info)
+    elif role == "planner":
         q.plan_set_role(ref, "planner", info)
     elif role == "plan_reviewer":
         q.plan_set_role(ref, "reviewer", info)

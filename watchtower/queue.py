@@ -3755,6 +3755,109 @@ def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
     return _plan_update(ident, _do)
 
 
+# OPS-232: a supplement is reviewed AFTER acceptance without reopening the
+# plan. ``plan["supplements"]`` holds ``{n, text, by, at, base_version,
+# status: reviewing|accepted|rejected|failed, review, reviewer}``; the plan's
+# status, text, accepted_version and the build claim are never touched, so the
+# implementation stays exactly as claimable as before.
+
+
+def plan_open_supplement(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The supplement awaiting an independent verdict, if any."""
+    for s in reversed((item.get("plan") or {}).get("supplements") or []):
+        if isinstance(s, dict) and s.get("status") == "reviewing":
+            return s
+    return None
+
+
+def plan_supplement_submit(ident: Any, text: str, by: str = "") -> Optional[Dict[str, Any]]:
+    """File a review-only supplement to an ACCEPTED plan (one open at a time)."""
+    text = str(text or "").strip()
+    if not text:
+        raise ValueError("supplement text is empty")
+    if len(text) > PLAN_TEXT_MAX:
+        raise ValueError(f"supplement text is {len(text)} chars, over the {PLAN_TEXT_MAX} "
+                         f"limit; condense it and resubmit")
+    current = get(ident)
+    if current is None:
+        return None
+    if group_role(current):
+        raise ValueError("plan supplements are not supported for plan groups")
+
+    def _do(it, plan):
+        if plan.get("status") != "accepted":
+            raise ValueError(f"{it.get('ref', ident)} has no accepted plan to supplement "
+                             f"(plan status {plan.get('status') or 'none'})")
+        owner = str(it.get("claimed_by") or "")
+        if it.get("status") == "in_progress" and owner and str(by) != owner:
+            raise ValueError(f"{it.get('ref', ident)} is claimed by {owner}; only the "
+                             f"claimant may file a supplement (you are {by or 'unnamed'})")
+        open_sup = plan_open_supplement(it)
+        if open_sup and open_sup.get("text") == text and open_sup.get("by") == str(by):
+            return "skip"   # idempotent re-submit of the supplement already under review
+        if open_sup:
+            raise ValueError(f"{it.get('ref', ident)} already has supplement "
+                             f"s{open_sup['n']} under review")
+        if it.get("pipeline_local"):
+            from . import github_pipeline
+            github_pipeline.fence_stale_stage(it, str(by))
+        sups = list(plan.get("supplements") or [])
+        n = len(sups) + 1
+        now = _now_iso()
+        sups.append({"n": n, "text": text, "by": str(by), "at": now, "status": "reviewing",
+                     "base_version": int(plan.get("accepted_version") or plan.get("version") or 1)})
+        plan["supplements"] = sups
+        _append_history(it, "plan_supplement", by=_by("system"), at=now, n=n,
+                        text=_clip(text, 1000), submitter=str(by))
+    return _plan_update(ident, _do) or get(ident)
+
+
+def plan_supplement_set_reviewer(ident: Any, n: int, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _do(it, plan):
+        for s in plan.get("supplements") or []:
+            if int(s.get("n") or 0) == int(n):
+                s["reviewer"] = dict(info)
+                return
+        return "skip"
+    return _plan_update(ident, _do)
+
+
+def plan_supplement_verdict(ident: Any, accepted: bool, reasons: str = "", by: str = "",
+                            n: Optional[int] = None,
+                            status: str = "") -> Optional[Dict[str, Any]]:
+    """An independent verdict on the open supplement. The submitter and the
+    ticket's build claimant may not judge it. ``status="failed"`` is the
+    stage supervisor giving up (no verdict)."""
+    current = get(ident)
+    if current is None:
+        return None
+
+    def _do(it, plan):
+        sup = plan_open_supplement(dict(it, plan=plan))
+        if sup is None:
+            raise ValueError(f"{it.get('ref', ident)} has no plan supplement under review")
+        if n is not None and int(n) != int(sup["n"]):
+            raise ValueError(f"verdict is for supplement s{n} but s{sup['n']} is under review")
+        if status != "failed":
+            who = str(by or "")
+            if not who:
+                raise ValueError("a supplement verdict needs --by <reviewer id>")
+            if who in (str(sup.get("by") or ""), str(it.get("claimed_by") or "")):
+                raise ValueError(f"{who} submitted the supplement or holds the build claim; "
+                                 f"the verdict must come from an independent reviewer")
+            if it.get("pipeline_local"):
+                from . import github_pipeline
+                github_pipeline.fence_stale_stage(it, who)
+        now = _now_iso()
+        sup["status"] = status or ("accepted" if accepted else "rejected")
+        sup["review"] = {"accepted": bool(accepted) and not status, "reasons": _clip(reasons, 3000),
+                         "by": str(by or "system"), "at": now}
+        _append_history(it, "plan_supplement_review", by=_by("system"), at=now, n=sup["n"],
+                        passed=sup["status"] == "accepted", outcome=sup["status"],
+                        text=_clip(reasons, 1000))
+    return _plan_update(ident, _do)
+
+
 def _pinned_setup_failed(command: str, commit: str, why: str, started: float) -> Dict[str, Any]:
     return {"gate": "cmd:" + command, "passed": False, "exit_code": -1,
             "output_tail": f"gate setup failed: {why}"[-GATE_OUTPUT_TAIL:],
@@ -5886,7 +5989,12 @@ def render_plan(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]
                            if sections == "all" else sections)
     plan = item.get("plan") or {}
     if role != "parent":
-        return str(plan.get("text") or "")
+        text = str(plan.get("text") or "")
+        for s in plan.get("supplements") or []:
+            if isinstance(s, dict) and s.get("status") == "accepted":
+                text += (f"\n\n## Accepted supplement s{s.get('n')} (reviewed after "
+                         f"v{s.get('base_version')} was accepted)\n{s.get('text', '')}")
+        return text
     out = [f"## Shared\n{str(plan.get('text') or '').strip()}"]
     secs = dict(plan.get("sections") or {})
     members = list((item.get("group") or {}).get("members") or [])
