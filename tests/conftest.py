@@ -62,6 +62,14 @@ def hermetic_activity_log(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def hermetic_headroom(tmp_path, monkeypatch):
+    """No test reads the live CCC quota headroom: an absent file reads as "no
+    data". Live headroom lifts usage-limit cooldowns (OPS-247), so without this
+    cooldown tests pass or fail with this machine's real quota."""
+    monkeypatch.setenv("WATCHTOWER_HEADROOM_FILE", str(tmp_path / "no-headroom.json"))
+
+
+@pytest.fixture(autouse=True)
 def strict_answer_edges(monkeypatch):
     """WT-31 D2.6g: an undeclared ``pending_answer`` transition raises in
     tests (production only logs ANSWER_EDGE_UNDECLARED)."""

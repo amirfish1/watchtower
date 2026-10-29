@@ -3887,11 +3887,49 @@ def active_launch_failure_cooldown(
     except (TypeError, ValueError):
         until = 0
     if until > now:
-        return rec
+        if not _quota_cooldown_lifted(rec, until):
+            return rec
+        data.pop(key, None)
+        _save_launch_failures(data)
+        return None
     if not _recent_failure_streak(rec, now):
         data.pop(key, None)
         _save_launch_failures(data)
     return None
+
+
+# A usage-limit cooldown is lifted early only when CCC reports this much quota
+# left in a window whose reset differs from the one the cooldown was pinned to.
+_QUOTA_LIFT_MIN_PERCENT_LEFT = 5.0
+_QUOTA_LIFT_RESET_DRIFT_S = 3600.0
+
+
+def _quota_cooldown_lifted(rec: Dict[str, Any], until: float) -> bool:
+    """Whether CCC headroom proves a usage-limit cooldown's quota is back.
+
+    A usage-limit cooldown is pinned to the provider's named reset time, which
+    can be days out. An account swap or early reset makes it stale, and nothing
+    else clears it: ``_clear_launch_failure`` needs a session on this
+    queue+engine, which the cooldown itself prevents (OPS-247: WT/CCC codex
+    verifiers parked until Nov 4 after quota came back on Oct 29). The quota is
+    per account, not per queue, so the account's live headroom is the evidence.
+    The different-reset check keeps a stale pre-limit reading of the SAME
+    window from lifting the cooldown into a respawn loop."""
+    if rec.get("reason") != "engine usage limit":
+        return False
+    from . import headroom
+    engine = str(rec.get("engine") or "claude")
+    for row in headroom.read_rows() or []:
+        if (row.get("engine") != engine or row.get("available") is False
+                or row.get("stale") or row.get("unlimited")):
+            continue
+        left = headroom._num(row.get("percent_left"))
+        resets_at = headroom._num(row.get("resets_at"))
+        if (left is not None and left >= _QUOTA_LIFT_MIN_PERCENT_LEFT
+                and resets_at is not None
+                and abs(resets_at - until) > _QUOTA_LIFT_RESET_DRIFT_S):
+            return True
+    return False
 
 
 def _wait_for_immediate_launch_failure(
