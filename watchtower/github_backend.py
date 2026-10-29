@@ -3196,11 +3196,16 @@ class GitHubIssuesBackend:
                          worker=str(session_id or meta.get("closed_by") or ""),
                          resolution=norm)
         self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
+        # `gh issue close --comment` takes the text on argv only (no file or
+        # stdin form), and a resolution with long caveats can pass the
+        # per-argument limit (WT-40). gh itself posts the comment and then
+        # closes, so this is the same two writes, with the comment on stdin.
         self._run([
-            "issue", "close", number,
+            "issue", "comment", number,
             *self._repo_args(),
-            "--comment", _resolution_comment(norm),
+            "--body", _resolution_comment(norm),
         ])
+        self._run(["issue", "close", number, *self._repo_args()])
         closed = self.get(ident)
         if closed:
             closed["closed_by"] = str(session_id or closed.get("claimed_by") or "")
