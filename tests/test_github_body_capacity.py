@@ -285,3 +285,92 @@ def test_owner_ingested_long_answer_references_the_owner_comment(tmp_path, monke
     assert entry["text_ref"].endswith("#issuecomment-77")
     assert entry["text_sha256"] == _sha(text) and entry["text_len"] == len(text)
     assert len(_issue(state)["comments"]) == comments_before
+
+
+@pytest.mark.parametrize("event", ["answer", "comment"])
+def test_retry_adopts_its_comment_after_an_unrelated_write_landed(tmp_path, monkeypatch, event):
+    """Verifier repro (WT-44 send-back): a near-limit answer whose body edit
+    failed, then an unrelated comment lands, then the identical retry. The
+    retry must adopt the first attempt's comment, not post a second one."""
+    state, q, gb = _blocked(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_GH_BODY_MAX", str(GITHUB_CAP))
+    _seed_legacy(state, gb, target=256520)
+    text = _grant(6463)
+    write = ((lambda: q.answer("GHI-1", text, session_id="human-1")) if event == "answer"
+             else (lambda: q.comment("GHI-1", text, by="worker", session_id="worker-1")))
+
+    monkeypatch.setenv("FAKE_GH_FAIL", "issue edit=fail")
+    with pytest.raises(gb.GitHubBackendError):
+        write()
+    monkeypatch.delenv("FAKE_GH_FAIL")
+    assert len(_comments_with(state, gb, text)) == 1
+    q.comment("GHI-1", "unrelated note", by="worker", session_id="worker-1")
+    write()
+
+    (comment,) = _comments_with(state, gb, text)
+    hist = _meta(gb, state)["history"]
+    mine = [e for e in hist if e.get("text_sha256") == _sha(text)]
+    assert len(mine) == 1 and mine[0]["event"] == event
+    assert mine[0]["text_ref"] == comment["url"]
+    assert len(_issue(state)["body"].encode()) <= gb._ISSUE_BODY_BUDGET_BYTES
+    if event == "answer":
+        assert _meta(gb, state)["needs_input"] is False
+
+
+def test_repeated_identical_comment_gets_its_own_comment_and_entry(tmp_path, monkeypatch):
+    state, q, gb = _blocked(tmp_path, monkeypatch)
+    for _ in range(2):
+        q.comment("GHI-1", "same words", by="worker", session_id="worker-1")
+    assert len(_comments_with(state, gb, "same words")) == 2
+    keys = [e["entry_key"] for e in _meta(gb, state)["history"] if e["event"] == "comment"]
+    assert len(keys) == 2 and len(set(keys)) == 2
+
+
+@pytest.mark.parametrize("variant", ["trailing", "leading", "inner"])
+def test_compaction_requires_exact_comment_text(monkeypatch, variant):
+    """Verifier repro: a comment differing from the entry only in whitespace
+    is not that text; moving to it would lose the original. Stay inline."""
+    import watchtower.github_backend as gb
+    base = _grant(5000)
+    text, comment = {
+        "trailing": (base + "     ", base),
+        "leading": (base, " " + base),
+        "inner": (base, base.replace("\n", "\n ", 1)),
+    }[variant]
+    entry = {"event": "answer", "at": "2026-10-01T00:00:00Z", "kind": "human", "text": text}
+    meta = {"history": [dict(entry)]}
+    monkeypatch.setattr(gb, "_ISSUE_BODY_BUDGET_BYTES", 0)  # move anything movable
+
+    moved = gb._compact_history(meta, [{"body": comment, "url": "u#1"}], "h")
+
+    assert moved == 0
+    assert meta["history"] == [entry]
+
+
+def test_near_limit_whitespace_mismatch_stays_inline_or_refuses(tmp_path, monkeypatch):
+    """End to end: legacy entries whose comments differ only in trailing
+    whitespace never move. Every moved entry's hash matches its comment;
+    every other legacy entry is still complete inline."""
+    state, q, gb = _blocked(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_GH_BODY_MAX", str(GITHUB_CAP))
+    _seed_legacy(state, gb, target=256520)
+    data = json.loads(state.read_text())
+    issue = data["issues"][0]
+    human, meta = gb._split_body(issue["body"])
+    # The oldest legacy entries carry 5 trailing spaces their comments lack.
+    for i in range(5):
+        meta["history"][i]["text"] += "     "
+    issue["body"] = gb._body_with_metadata(human, meta)
+    state.write_text(json.dumps(data))
+    originals = [dict(e) for e in meta["history"]]
+
+    q.answer("GHI-1", _grant(6463), session_id="human-1")
+
+    after = _meta(gb, state)["history"]
+    comments = {c["url"]: gb._strip_entry_marker(c["body"])[0] for c in _issue(state)["comments"]}
+    for orig, now in zip(originals, after):
+        if now.get("text_ref"):
+            assert _sha(comments[now["text_ref"]]) == now["text_sha256"] == _sha(orig["text"])
+        else:
+            assert now == orig
+    assert all(after[i] == originals[i] for i in range(5))

@@ -1387,13 +1387,19 @@ def _comment_ref(comment: Dict[str, Any]) -> str:
 
 
 def _entry_key(number: str, event: str, meta: Dict[str, Any], text: str) -> str:
-    """Idempotency key for one answer/comment write. A retry after a failed
-    body edit sees the same history length and block generation, so it finds
-    and adopts the comment the failed attempt already posted instead of
-    posting it twice; once the entry lands, the next write gets a new key."""
+    """Idempotency key for one answer/comment write, recorded on its history
+    entry as ``entry_key``. It depends only on this write (issue, event,
+    block generation, text) and on how many entries already carry the same
+    write, never on unrelated history: a retry after a failed body edit gets
+    the same key even if other entries landed in between, finds the comment
+    the failed attempt posted and adopts it; once the entry lands, the same
+    words again get the next key and a comment of their own."""
+    raw = f"{number}|{event}|{meta.get('blocked_at') or ''}|{text}"
+    base = _text_sha256(raw)[:12]
     hist = meta.get("history") if isinstance(meta.get("history"), list) else []
-    raw = f"{number}|{event}|{len(hist)}|{meta.get('blocked_at') or ''}|{text}"
-    return _text_sha256(raw)[:16]
+    seen = sum(1 for e in hist
+               if isinstance(e, dict) and str(e.get("entry_key") or "").startswith(base))
+    return f"{base}{seen:04x}"
 
 
 def _referenced_text(entry: Dict[str, Any], text: str, ref: str) -> None:
@@ -1438,7 +1444,7 @@ def _compact_history(meta: Dict[str, Any], comments: List[Dict[str, Any]],
         text, _key = _strip_entry_marker(str(c.get("body") or ""))
         ref = _comment_ref(c)
         if ref:
-            by_text.setdefault(text.strip(), ref)
+            by_text.setdefault(text, ref)
     moved = 0
     size = _body_bytes(_body_with_metadata(human_body, meta))
     for i, entry in enumerate(hist):
@@ -1448,7 +1454,7 @@ def _compact_history(meta: Dict[str, Any], comments: List[Dict[str, Any]],
                 or entry.get("text_ref")):
             continue
         text = str(entry.get("text") or "")
-        ref = by_text.get(text.strip())
+        ref = by_text.get(text)  # exact: a comment that differs at all is not this text
         if len(text) <= _HISTORY_TEXT_INLINE_MAX or not ref:
             continue
         compact = {k: v for k, v in entry.items() if k != "text"}
@@ -3016,10 +3022,9 @@ class GitHubIssuesBackend:
 
     def _post_entry_comment(self, item: Dict[str, Any], body: str,
                             meta: Dict[str, Any], event: str, text: str) -> str:
-        """Post ``text`` as an issue comment tagged with an entry key and
-        return its reference (URL). A comment already carrying the key --
+        """Post ``text`` as an issue comment tagged with an entry key. A comment already carrying the key --
         posted by an attempt whose body edit then failed -- is adopted, not
-        reposted. Refuses up front, posting nothing, when the text exceeds a
+        reposted. Returns (entry key, reference). Refuses up front, posting nothing, when the text exceeds a
         comment or its history entry could never fit the body."""
         if len(text) > _COMMENT_MAX_CHARS - 64:
             raise GitHubBackendError(
@@ -3028,18 +3033,18 @@ class GitHubIssuesBackend:
                 f"or put the full text in a file and reference it.")
         key = _entry_key(str(item["number"]), event, meta, text)
         projected = copy.deepcopy(meta)
-        _append_history(projected, event)
+        _append_history(projected, event, entry_key=key)
         _referenced_text(projected["history"][-1], text, f"{item.get('url', '')}#issuecomment-0")
         self._fit_body(item, body, projected)
         for c in item.get("_github_comments") or []:
             if isinstance(c, dict):
-                _text, found = _strip_entry_marker(str(c.get("body") or ""))
-                if found == key:
-                    return _comment_ref(c) or f"comment:{key}"
+                found_text, found = _strip_entry_marker(str(c.get("body") or ""))
+                if found == key and found_text == text:
+                    return key, _comment_ref(c) or f"comment:{key}"
         out = self._run(["issue", "comment", str(item["number"]), *self._repo_args()],
                         body=text + _ENTRY_MARKER.format(key))
         url = (out or "").strip().splitlines()[-1:] or [""]
-        return url[0] if url[0].startswith("http") else f"comment:{key}"
+        return key, url[0] if url[0].startswith("http") else f"comment:{key}"
 
     def _edit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
                    *extra: str) -> List[str]:
@@ -3771,13 +3776,13 @@ class GitHubIssuesBackend:
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         now = _now_iso()
         answer_text = str(text or "")
-        text_ref = source_comment_key
+        text_ref, entry_key = source_comment_key, ""
         if post_comment:
             # WT-44: the comment is posted FIRST and is the durable full copy;
             # the body history below keeps a bounded excerpt pointing at it.
             # If the body edit then fails, the answer stays undelivered
             # (needs_input set) and a retry adopts this comment by its key.
-            text_ref = self._post_entry_comment(item, body, meta, "answer", answer_text)
+            entry_key, text_ref = self._post_entry_comment(item, body, meta, "answer", answer_text)
         elif not text_ref:
             answer_text = _clip(answer_text, 24000)
         if item.get("status") == "awaiting_answer" and item.get("parked"):
@@ -3807,6 +3812,7 @@ class GitHubIssuesBackend:
             kind=kind if kind in ("human", "system", "worker") else "human",
             worker=str(session_id or ""),
             source="github-owner-comment" if source_comment_key else "",
+            entry_key=entry_key,
         )
         _referenced_text(meta["history"][-1], answer_text, text_ref)
         releasing = bool(
@@ -3940,12 +3946,13 @@ class GitHubIssuesBackend:
         comment_text = str(text or "")
         # WT-44: comment first (the durable full copy, adopted on retry), then
         # a bounded history entry that references it.
-        ref = self._post_entry_comment(item, body, meta, "comment", comment_text)
+        entry_key, ref = self._post_entry_comment(item, body, meta, "comment", comment_text)
         _append_history(
             meta,
             "comment",
             kind=actor_kind,
             worker=str(session_id or ""),
+            entry_key=entry_key,
         )
         _referenced_text(meta["history"][-1], comment_text, ref)
         self._edit_body(item, body, meta)
