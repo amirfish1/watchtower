@@ -5728,6 +5728,11 @@ def requeue_orphaned_tickets(
         # worker that lacks the original context.
         if it.get("needs_input"):
             continue
+        # A GitHub claim held on another host is that host's to recover: none
+        # of its processes are visible here. A dead owning host surfaces via
+        # the backstop's bounded escalation instead (WT-39).
+        if github_of(it) and _liveness._foreign_host(it):
+            continue
         # Skip a ticket whose answer is still being applied. `wt answer` delivers
         # via the liveness-aware messaging primitive, so the original worker can
         # look dead here while the resumed/steered session works the answer;

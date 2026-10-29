@@ -8036,8 +8036,12 @@ def block(
     wait_actor: str = "",
     wait_ref: str = "",
     force: bool = False,
+    expect: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Park a ticket that needs a human decision.
+
+    ``expect`` (GitHub only, WT-39): item fields the issue must still carry
+    when re-read under the body lock, else nothing is written (``None``).
 
     A worker-origin block of an ``in_progress`` ticket claimed by a DIFFERENT
     worker (and a different session) raises ``ValueError`` unless ``force``
@@ -8074,6 +8078,7 @@ def block(
         item = backend.block(
             ident, session_id=session_id, question=question, progress=progress,
             kind=kind, wait_on=wait_on, wait_actor=wait_actor, wait_ref=wait_ref,
+            expect=expect,
         )
         if item:
             if origin == "worker":

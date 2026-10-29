@@ -210,6 +210,7 @@ def test_github_claim_escalates_through_block(lv, monkeypatch):
             "claimed_session_id": SID2, "updated_at": "2000-01-01T00:00:00Z", "history": []}
     monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
     monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))      # the fresh read
     monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
     acted = _sweep(lv)
     assert [a["action"] for a in acted] == ["escalate"] and blocked == ["GH-1"]
@@ -226,6 +227,7 @@ def _gh_legacy(lv, monkeypatch, wid="becky-1", sid=SID2, **over):
     blocked = []
     monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
     monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))      # the fresh read
     monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
     reopened = []
     monkeypatch.setattr(lv.q, "recover_claim",
@@ -287,10 +289,19 @@ def test_github_legacy_claim_unrelated_session_does_not_veto(lv, monkeypatch):
 
 
 def test_github_legacy_claim_held_on_another_host_is_not_proven_here(lv, monkeypatch):
-    item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine="zz9")
+    """A fresh local rollout for the claim's session is not proof for a claim
+    held on another host, and with no owning-host heartbeat the full
+    assess -> sweep -> apply path still escalates (never recovers)."""
+    item, blocked, reopened = _gh_legacy(lv, monkeypatch, claimed_machine="zz9")
     now = time.time() + LATER
     _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
     assert _owner(lv, item, now).verdict == "unproven"
+    a = lv.liveness.assess(item, {}, lv.liveness.ResolverContext(now))
+    assert (a["verdict"], a["action"]) == ("unobserved", "escalate")
+    assert "held on zz9; no owning-host heartbeat" in a["evidence"]
+    acted = _sweep(lv)
+    assert [(x["action"], x["result"]) for x in acted] == [("escalate", "done")]
+    assert blocked == ["GH-1"] and reopened == []
 
 
 def test_github_legacy_claim_lookup_failure_escalates_not_recovers(lv, monkeypatch):
@@ -376,6 +387,7 @@ def test_github_unowned_escalates_through_block(lv, monkeypatch):
             "updated_at": "2000-01-01T00:00:00Z", "history": []}
     monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
     monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))      # the fresh read
     monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
     acted = _sweep(lv)
     assert [(a["row"], a["action"]) for a in acted] == [("work.unowned", "escalate")]
@@ -787,3 +799,227 @@ def test_requeue_preserves_github_claim_while_resumed_transcript_advances(lv, mo
     # A quiet transcript still lets the dead claim recover.
     os.utime(rollout, (base - 3600, base - 3600))
     assert [it["ref"] for it in lv.workers.requeue_orphaned_tickets()] == [ref]
+
+
+# WT-39: a GitHub claim held on another host. This host defers only to the
+# owning host's renewal of exactly this claim (claim_heartbeat), fresh within
+# the stall window; anything else keeps the bounded escalation.
+FOREIGN = "zz9"
+
+
+def _hb(now, age_s, machine=FOREIGN, wid="becky-1", sid=SID2):
+    return {"machine": machine, "at": _iso(now - age_s), "claimed_by": wid,
+            "session_id": sid}
+
+
+def _foreign(lv, monkeypatch, now, hb_age=None, **hb):
+    over = {"claimed_machine": FOREIGN}
+    if hb_age is not None:
+        over["claim_heartbeat"] = _hb(now, hb_age, **hb)
+    return _gh_legacy(lv, monkeypatch, **over)
+
+
+def _decide(lv, item, now):
+    a = lv.liveness.assess(item, {}, lv.liveness.ResolverContext(now))
+    return a["verdict"], a["action"], a["evidence"]
+
+
+def test_foreign_claim_with_fresh_owner_heartbeat_takes_no_action(lv, monkeypatch):
+    now = time.time() + LATER
+    item, blocked, reopened = _foreign(lv, monkeypatch, now, hb_age=120)
+    verdict, action, evidence = _decide(lv, item, now)
+    assert (verdict, action) == ("remote", "")
+    assert evidence == "held on zz9; owning host renewed it 120s ago"
+    assert _sweep(lv) == [] and blocked == [] and reopened == []
+
+
+def test_foreign_claim_with_expired_owner_heartbeat_escalates(lv, monkeypatch):
+    now = time.time() + LATER
+    stall = lv.liveness.stall_s()
+    item, blocked, reopened = _foreign(lv, monkeypatch, now, hb_age=stall + 60)
+    verdict, action, evidence = _decide(lv, item, now)
+    assert (verdict, action) == ("unproven", "escalate")
+    assert f"owning-host heartbeat {int(stall + 60)}s old" in evidence
+    assert [a["action"] for a in _sweep(lv)] == ["escalate"]
+    assert blocked == ["GH-1"] and reopened == []
+
+
+@pytest.mark.parametrize("bad", [{"machine": "her2"}, {"wid": "becky-2"}, {"sid": SID}])
+def test_foreign_claim_heartbeat_for_another_claim_is_not_proof(lv, monkeypatch, bad):
+    """A stamp from another host, an earlier claimer or another session (a
+    rebound claim) proves nothing about the current claim."""
+    now = time.time() + LATER
+    item, blocked, _ = _foreign(lv, monkeypatch, now, hb_age=30, **bad)
+    assert _decide(lv, item, now)[:2] == ("unobserved", "escalate")
+    assert [a["action"] for a in _sweep(lv)] == ["escalate"] and blocked == ["GH-1"]
+
+
+def test_foreign_claim_heartbeat_clock_skew(lv, monkeypatch):
+    """A stamp slightly ahead (skew within CLOCK_SKEW_S) counts as fresh; one
+    far in the future is not proof, so no host can buy immunity by its clock."""
+    now = time.time() + LATER
+    item, _, _ = _foreign(lv, monkeypatch, now, hb_age=-60)
+    assert _decide(lv, item, now)[:2] == ("remote", "")
+    item["claim_heartbeat"] = _hb(now, -(lv.liveness.CLOCK_SKEW_S + 3600))
+    assert _decide(lv, item, now)[:2] == ("unobserved", "escalate")
+
+
+def test_local_claim_ignores_its_own_heartbeat(lv, monkeypatch):
+    """On the owning host the stamp is never proof: a quiet local session
+    with a fresh-looking heartbeat still escalates on local evidence."""
+    now = time.time() + LATER
+    item, blocked, _ = _gh_legacy(lv, monkeypatch)
+    item["claim_heartbeat"] = _hb(now, 30, machine=lv.q.machine_tag())
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, LATER, now)   # quiet
+    assert _decide(lv, item, now)[:2] == ("unproven", "escalate")
+
+
+def test_missing_claimed_machine_keeps_local_judgement(lv, monkeypatch):
+    now = time.time() + LATER
+    item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine=None)
+    item["claim_heartbeat"] = _hb(now, 30)
+    _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
+    assert _decide(lv, item, now)[:2] == ("alive", "")
+
+
+def _stale_snapshot(lv, monkeypatch, now, fresh):
+    """Sweep from a snapshot with no heartbeat while the live issue is ``fresh``."""
+    item, blocked, reopened = _foreign(lv, monkeypatch, now)
+    monkeypatch.setattr(lv.q, "get", fresh if callable(fresh) else (lambda ref: fresh))
+    return item, blocked, reopened
+
+
+def test_stale_snapshot_rechecked_against_fresh_issue_before_blocking(lv, monkeypatch):
+    """The 09:47:56Z shape: the sweep's list snapshot lags the shared issue.
+    A fresh read showing a fresh owner heartbeat, a changed claim, a terminal
+    state or an already-posted question posts nothing."""
+    now = time.time() + LATER
+    item, blocked, reopened = _foreign(lv, monkeypatch, now)
+    cases = {
+        "heartbeat": dict(item, claim_heartbeat=_hb(now, 60)),
+        "rebound": dict(item, claimed_session_id=SID),
+        "closed": dict(item, status="closed"),
+        "asked": dict(item, needs_input=True),
+    }
+    for name, fresh in cases.items():
+        monkeypatch.setattr(lv.q, "get", lambda ref, f=fresh: dict(f))
+        acted = _sweep(lv)
+        assert [a["result"].split(" ")[0] for a in acted] == ["race"], name
+    assert blocked == [] and reopened == []
+
+
+def test_failed_fresh_read_posts_nothing_and_retries(lv, monkeypatch):
+    now = time.time() + LATER
+
+    def boom(ref):
+        raise OSError("gh unavailable")
+    item, blocked, reopened = _stale_snapshot(lv, monkeypatch, now, boom)
+    acted = _sweep(lv)
+    assert [a["result"] for a in acted] == ["fresh read failed: gh unavailable"]
+    assert blocked == [] and reopened == []
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))      # read recovers
+    assert [a["result"] for a in _sweep(lv)] == ["done"] and blocked == ["GH-1"]
+
+
+class _HeartbeatBackend:
+    def __init__(self):
+        self.calls = []
+
+    def renew_claim_heartbeat(self, ref, *, claimed_by, session_id):
+        self.calls.append((ref, claimed_by, session_id))
+        return True
+
+
+def test_owning_host_renews_heartbeat_only_while_locally_alive(lv, monkeypatch):
+    now = time.time() + LATER
+    item, blocked, _ = _gh_legacy(lv, monkeypatch)
+    backend = _HeartbeatBackend()
+    monkeypatch.setattr(lv.q, "_github_backend_for_project",
+                        lambda p: backend if str(p).upper().startswith("GH") else None)
+    rollout = _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
+    assert _sweep(lv) == [] and backend.calls == [("GH-1", "becky-1", SID2)]
+    # A recent renewal is not rewritten every tick.
+    item["claim_heartbeat"] = _hb(now, 60, machine=lv.q.machine_tag())
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    assert _sweep(lv) == [] and len(backend.calls) == 1
+    # A quiet session is not renewed: the stamp ages out for other hosts.
+    item.pop("claim_heartbeat")
+    os.utime(rollout, (now - LATER, now - LATER))
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))
+    assert [a["action"] for a in _sweep(lv)] == ["escalate"] and len(backend.calls) == 1
+
+
+def test_foreign_host_never_renews_heartbeat(lv, monkeypatch):
+    now = time.time() + LATER
+    item, _, _ = _foreign(lv, monkeypatch, now, hb_age=60)
+    backend = _HeartbeatBackend()
+    monkeypatch.setattr(lv.q, "_github_backend_for_project",
+                        lambda p: backend if str(p).upper().startswith("GH") else None)
+    assert _sweep(lv) == [] and backend.calls == []
+
+
+def test_orphan_requeue_leaves_foreign_github_claim_alone(lv, monkeypatch):
+    """A dead builder id known here does not license this host to reopen a
+    GitHub claim recorded on another host; a local one is still reopened."""
+    lv.worker(wid="becky-1", sid=SID2)
+    lv.kill()
+    item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine=FOREIGN,
+                            claimed_at="2000-01-01T00:00:00Z")
+    reopened = []
+    monkeypatch.setattr(lv.q, "update_status",
+                        lambda ref, st, **k: reopened.append((ref, st)) or dict(item, status=st))
+    assert lv.workers.requeue_orphaned_tickets(grace_s=0) == [] and reopened == []
+    local = dict(item, claimed_machine=lv.q.machine_tag())
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(local)])
+    lv.workers.requeue_orphaned_tickets(grace_s=0)
+    assert reopened == [("GH-1", "open")]
+
+
+def test_foreign_claim_without_any_heartbeat_waits_the_migration_bound(lv, monkeypatch):
+    """No stamp at all (the owning host predates WT-39, or never got a renewal
+    through) is not evidence the host died: no question at one or three stall
+    windows of store idle; the bounded fallback asks (never reopens) only
+    after UNOBSERVED_STALL_FACTOR windows."""
+    stall = lv.liveness.stall_s()
+    factor = lv.liveness.UNOBSERVED_STALL_FACTOR
+    t0 = time.time()
+    item, blocked, reopened = _foreign(lv, monkeypatch, t0)
+    item["updated_at"] = item["claimed_at"] = _iso(t0)
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))
+    for windows in (1.2, factor - 0.5):
+        assert _decide(lv, item, t0 + windows * stall)[:2] == ("unobserved", "")
+        assert _sweep(lv, off=windows * stall) == []
+    assert _decide(lv, item, t0 + (factor + 0.1) * stall)[:2] == ("unobserved", "escalate")
+    assert [a["action"] for a in _sweep(lv, off=(factor + 0.1) * stall)] == ["escalate"]
+    assert blocked == ["GH-1"] and reopened == []
+
+
+def test_fresh_heartbeat_beats_an_old_ticket_clock(lv, monkeypatch):
+    """A long-running owner never touches the issue; its host's renewal alone
+    keeps a foreign observer quiet, however old the ticket's own clock."""
+    now = time.time() + 10 * LATER
+    item, blocked, _ = _foreign(lv, monkeypatch, now, hb_age=lv.liveness.stall_s() - 5)
+    assert _decide(lv, item, now)[:2] == ("remote", "")
+    assert _sweep(lv, off=10 * LATER) == [] and blocked == []
+
+
+def test_block_carries_the_fresh_read_as_its_write_fence(lv, monkeypatch):
+    """The fresh read's claim fields go to q.block as ``expect``, so the
+    backend re-checks them under its body lock right before writing."""
+    now = time.time() + LATER
+    item, _, _ = _foreign(lv, monkeypatch, now)
+    seen = []
+    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: seen.append(k) or {"ref": ref})
+    assert [a["result"] for a in _sweep(lv)] == ["done"]
+    exp = seen[0]["expect"]
+    assert exp["claimed_by"] == "becky-1" and exp["claimed_session_id"] == SID2
+    assert exp["claimed_machine"] == FOREIGN and exp["claim_heartbeat"] is None
+    assert exp["status"] == "in_progress" and not exp.get("needs_input")
+
+
+def test_block_race_at_the_write_is_reported_not_retried_as_done(lv, monkeypatch):
+    now = time.time() + LATER
+    item, _, _ = _foreign(lv, monkeypatch, now)
+    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: None)   # fence tripped
+    assert [a["result"] for a in _sweep(lv)] == ["race"]

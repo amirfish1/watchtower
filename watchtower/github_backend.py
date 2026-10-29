@@ -2058,6 +2058,9 @@ class GitHubIssuesBackend:
             "closed_at": issue.get("closedAt") or meta.get("closed_at"),
             "claimed_session_id": meta.get("claimed_session_id"),
             "claimed_machine": meta.get("claimed_machine"),
+            # WT-39: the owning host's renewal of this claim, read by others.
+            "claim_heartbeat": meta.get("claim_heartbeat")
+            if isinstance(meta.get("claim_heartbeat"), dict) else None,
             "created_at": created_at or _now_iso(),
             "updated_at": issue.get("updatedAt") or created_at or _now_iso(),
             "github_repo": self.repo,
@@ -3314,16 +3317,27 @@ class GitHubIssuesBackend:
         wait_on: str = "",
         wait_actor: str = "",
         wait_ref: str = "",
+        expect: Optional[Dict[str, Any]] = None,
         **_ignored: Any,
     ) -> Optional[Dict[str, Any]]:
         """Record a worker's request for input on a GitHub-backed ticket.
         ``origin`` is accepted and ignored: GitHub queues keep the legacy
         hold-while-blocked behaviour (WT-28b). ``kind`` and the ``wait_*``
         fields persist in the body metadata like the file backend's, so an
-        external wait survives a reload (CCC-244)."""
+        external wait survives a reload (CCC-244).
+
+        ``expect`` (WT-39, the backstop's escalation): fields the issue must
+        still carry on this re-read, taken under the per-repo body lock, else
+        nothing is written. The lock serializes writers on THIS host only;
+        another host's renewal or reassignment landing after this read is
+        not fenced (GitHub has no compare-and-swap) -- `_edit_body`'s
+        three-way merge keeps that writer's claim fields, but the question
+        is still posted. The window is one read-to-edit round trip."""
         from . import queue as _q
         item = self.get(ident)
         if item is None:
+            return None
+        if expect and any(item.get(k) != v for k, v in expect.items()):
             return None
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
@@ -3343,9 +3357,10 @@ class GitHubIssuesBackend:
                 meta["claimed_machine"] = machine_tag()
         if progress:
             _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
+        # The writing host, so a system (backstop) block is attributable (WT-39).
         self._usage_history(meta, number, "block", worker=str(session_id), question=_clip(question, 4000),
                             kind=meta["block_kind"], wait_on=wait_on, wait_actor=wait_actor,
-                            wait_ref=wait_ref)
+                            wait_ref=wait_ref, machine=machine_tag())
         self._edit_body(item, body, meta)
         # Mirror the question onto the issue discussion (WT-37): the metadata
         # block is invisible to anyone reading the issue on GitHub. Best-effort,
@@ -3360,6 +3375,25 @@ class GitHubIssuesBackend:
                 "--body", f"[watchtower] Needs input from {session_id or 'worker'}:\n\n{shown}",
             ], check=False)
         return self.get(ident)
+
+    @_serialized_body_write
+    def renew_claim_heartbeat(self, ident: Any, *, claimed_by: str,
+                              session_id: str) -> bool:
+        """WT-39: stamp ``claim_heartbeat`` (this machine, now) on a claim this
+        host holds, so another host's backstop can tell the owner is observed.
+        Re-reads the issue first and writes only while it is still the same
+        in-progress claim held here; returns whether it wrote."""
+        item = self.get(ident)
+        if (item is None or item.get("status") != "in_progress"
+                or str(item.get("claimed_by") or "") != claimed_by or not claimed_by
+                or str(item.get("claimed_session_id") or "") != session_id
+                or str(item.get("claimed_machine") or "") != machine_tag()):
+            return False
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        meta["claim_heartbeat"] = {"machine": machine_tag(), "at": _now_iso(),
+                                   "claimed_by": claimed_by, "session_id": session_id}
+        self._edit_body(item, body, meta)
+        return True
 
     @_serialized_body_write
     def set_wait(

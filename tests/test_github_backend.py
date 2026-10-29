@@ -3820,3 +3820,60 @@ def test_cross_queue_after_does_not_wake_for_unresolved_completion(tmp_path, mon
     assert q.claim_next("downstream", project="GHI") is None
     with pytest.raises(ValueError, match="stuck"):
         q.claim_by_ref(dep, "downstream")
+
+
+def test_claim_heartbeat_renews_only_the_same_claim_held_here(tmp_path, monkeypatch):
+    """WT-39: the owning host stamps ``claim_heartbeat`` on its own claim; a
+    renewal for another worker/session writes nothing; a system (backstop)
+    block records the writing host."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="long build")
+    q.claim_by_ref(item["ref"], "worker-1", session_uuid="sess-1")
+    backend = q._github_backend_for_project("GHI")
+    assert backend.renew_claim_heartbeat("GHI-1", claimed_by="worker-1",
+                                         session_id="other") is False
+    assert backend.renew_claim_heartbeat("GHI-1", claimed_by="worker-2",
+                                         session_id="sess-1") is False
+    assert q.get("GHI-1")["claim_heartbeat"] is None
+    assert backend.renew_claim_heartbeat("GHI-1", claimed_by="worker-1",
+                                         session_id="sess-1") is True
+    hb = q.get("GHI-1")["claim_heartbeat"]
+    assert hb["machine"] == q.machine_tag() and hb["claimed_by"] == "worker-1"
+    assert hb["session_id"] == "sess-1" and hb["at"]
+    q.block("GHI-1", "", question="backstop question", origin="system")
+    block = [h for h in q.get("GHI-1")["history"] if h["event"] == "block"][-1]
+    assert block["machine"] == q.machine_tag()
+    assert "claim_heartbeat" in json.loads(state.read_text())["issues"][0]["body"]
+
+
+def test_block_expect_fence_rechecks_claim_under_the_body_lock(tmp_path, monkeypatch):
+    """WT-39: a backstop block carries the claim it decided on; a claim that
+    changed (renewed heartbeat, rebound session) by the time the block re-reads
+    the issue writes nothing -- no metadata, no issue comment."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="long build")
+    q.claim_by_ref(item["ref"], "worker-1", session_uuid="sess-1")
+    decided = q.get("GHI-1")
+    expect = {k: decided.get(k) for k in ("status", "claimed_by", "claimed_session_id",
+                                          "claimed_machine", "needs_input", "claim_heartbeat")}
+    # Between the decision and the write, the owning host renews its claim.
+    backend = q._github_backend_for_project("GHI")
+    assert backend.renew_claim_heartbeat("GHI-1", claimed_by="worker-1", session_id="sess-1")
+    before = json.loads(state.read_text())["issues"][0]
+    assert q.block("GHI-1", "", question="backstop?", origin="system", expect=expect) is None
+    after = json.loads(state.read_text())["issues"][0]
+    assert after["body"] == before["body"] and after["comments"] == before["comments"]
+    assert q.get("GHI-1")["needs_input"] is False
+    # The unchanged claim (re-decided on the fresh read) is blocked as before.
+    fresh = q.get("GHI-1")
+    expect = {k: fresh.get(k) for k in expect}
+    assert q.block("GHI-1", "", question="backstop?", origin="system", expect=expect)
+    assert q.get("GHI-1")["needs_input"] is True

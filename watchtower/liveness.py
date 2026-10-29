@@ -759,6 +759,88 @@ def _bound_session_working(item: Dict[str, Any], ctx: ResolverContext) -> str:
     return source if mt and ctx.now - mt < RECENT_SESSION_S else ""
 
 
+# WT-39: a GitHub claim held on another host. This host sees none of the
+# owner's processes, transcripts or registries, so their absence here is not
+# evidence. The owning host's sweep renews ``claim_heartbeat`` on the shared
+# issue while its local proof reads alive (``_renew_claim_heartbeat``); a
+# foreign observer defers only to a renewal of exactly this claim (same
+# machine, worker and session) younger than the stall window. Anything else
+# -- no stamp, an expired one, a stamp from an earlier claim, or one dated
+# more than CLOCK_SKEW_S in the future -- leaves the bounded escalation.
+CLOCK_SKEW_S = 300.0
+
+
+def _foreign_host(item: Dict[str, Any]) -> str:
+    """The claim's host when it is recorded and is not this one, else ''."""
+    machine = str(item.get("claimed_machine") or "")
+    return machine if machine and machine != q.machine_tag() else ""
+
+
+def claim_heartbeat_age(item: Dict[str, Any], now: float) -> Optional[float]:
+    """Seconds since the owning host renewed exactly this claim, or None."""
+    hb = item.get("claim_heartbeat")
+    if not isinstance(hb, dict) or not item.get("claimed_by"):
+        return None
+    for key, field in (("machine", "claimed_machine"), ("claimed_by", "claimed_by"),
+                       ("session_id", "claimed_session_id")):
+        if str(hb.get(key) or "") != str(item.get(field) or ""):
+            return None
+    at = q._iso_ts(hb.get("at"))
+    if not at or at - now > CLOCK_SKEW_S:
+        return None
+    return max(0.0, now - at)
+
+
+def _foreign_claim(item: Dict[str, Any], now: float,
+                   stall: float) -> Tuple[str, str, float]:
+    """(verdict, evidence, min_idle) for a GitHub claim held on another host.
+
+    * a valid stamp younger than ``stall``: ``remote``, no action;
+    * a valid stamp that aged out: the owning host was renewing this claim
+      and stopped (host down, session quiet, or writes failing for three
+      renewals in a row), so escalate after the usual ``stall`` of store idle;
+    * no valid stamp: nothing is known either way -- the owning host may
+      predate WT-39, or never got a renewal through -- so escalate only after
+      UNOBSERVED_STALL_FACTOR stall windows of store idle. That bound is the
+      migration fallback, not proof of death: it only ever asks a human,
+      and never releases or reopens the claim."""
+    host = _foreign_host(item)
+    age = claim_heartbeat_age(item, now)
+    if age is not None and age < stall:
+        return "remote", f"held on {host}; owning host renewed it {int(age)}s ago", stall
+    if age is not None:
+        return "unproven", f"held on {host}; owning-host heartbeat {int(age)}s old", stall
+    return ("unobserved", f"held on {host}; no owning-host heartbeat",
+            stall * UNOBSERVED_STALL_FACTOR)
+
+
+UNOBSERVED_STALL_FACTOR = 4.0
+
+
+HEARTBEAT_RENEW_S = 600.0
+
+
+def _renew_claim_heartbeat(item: Dict[str, Any], now: float) -> str:
+    """Owning-host side: renew the shared claim heartbeat of a GitHub claim
+    held here whose local proof reads alive, at most every HEARTBEAT_RENEW_S.
+    The backend re-reads the issue and writes only if the claim is unchanged."""
+    if _foreign_host(item) or not item.get("claimed_machine"):
+        return ""
+    age = claim_heartbeat_age(item, now)
+    if age is not None and age < HEARTBEAT_RENEW_S:
+        return ""
+    backend = q._github_backend_for_project(str(item.get("project") or ""))
+    if backend is None or not hasattr(backend, "renew_claim_heartbeat"):
+        return ""
+    try:
+        ok = backend.renew_claim_heartbeat(
+            item.get("ref"), claimed_by=str(item.get("claimed_by") or ""),
+            session_id=str(item.get("claimed_session_id") or ""))
+    except Exception as exc:  # noqa: BLE001 - the next sweep retries
+        return f"failed: {exc}"
+    return "renewed" if ok else "claim changed"
+
+
 def claim_owner(item: Dict[str, Any], ctx: Optional[ResolverContext] = None) -> Verdict:
     """Is the process bound to this claim alive? ``alive`` on any live source;
     ``dead`` = death evidence + engine checks + no live source; else
@@ -1055,6 +1137,10 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
                 action, reason = "escalate", "in_progress with no claimer (GitHub)"
             else:
                 action, reason = "reopen", "in_progress with no claimer and no live owner"
+    elif proof["kind"] == "claim_owner" and github and _foreign_host(item):
+        verdict, evidence, min_idle = _foreign_claim(item, now, stall)
+        if verdict != "remote":
+            action, reason = "escalate", f"claim owner {verdict} ({evidence})"
     elif proof["kind"] == "claim_owner":
         v = claim_owner(item, ctx)
         verdict, evidence = v.verdict, v.evidence or v.source
@@ -1086,7 +1172,8 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
                 action, reason = "spawn", "open work, no effective worker"
     if action and min_idle is not None:
         idle = now - _store_activity(item)
-        if idle >= min_idle:
+        # A foreign claim's session files are not on this host (WT-39).
+        if idle >= min_idle and not (github and _foreign_host(item)):
             idle = now - max(_store_activity(item), _file_activity(item, ctx))
         out["idle_s"] = int(max(0.0, idle))
         if idle < min_idle:
@@ -1161,8 +1248,39 @@ def _log_backstop(a: Dict[str, Any], result: str) -> None:
            + ("" if result == "done" else f" ({result})"), queue=a["queue"])
 
 
+_CLAIM_KEYS = ("status", "claimed_by", "claimed_session_id", "claimed_machine",
+               "needs_input")
+_BLOCK_EXPECT = _CLAIM_KEYS + ("claim_heartbeat",)
+
+
+def _github_snapshot_stale(item: Dict[str, Any], a: Dict[str, Any],
+                           by_ref: Dict[str, Dict[str, Any]],
+                           now: Optional[float]) -> Tuple[str, Dict[str, Any]]:
+    """('', expect) when a fresh read of the issue still calls for this
+    escalation, else (why not, {}) (WT-39). The sweep decides from a list snapshot that can lag
+    the shared issue (a cached list, another host's writes) and GitHub has no
+    compare-and-swap, so re-read the claim and re-decide before asking a
+    human. A failed read posts nothing; the next sweep retries. ``expect`` is
+    what the block re-checks under the backend's body lock right before it
+    writes (see ``GitHubIssuesBackend.block``)."""
+    try:
+        fresh = q.get(a["ref"])
+    except Exception as exc:  # noqa: BLE001 - transient lookup is not a decision
+        return f"fresh read failed: {exc}", {}
+    if not fresh:
+        return "race (issue not found)", {}
+    changed = [k for k in _CLAIM_KEYS if fresh.get(k) != item.get(k)]
+    if changed:
+        return f"race (claim changed: {','.join(changed)})", {}
+    again = assess(fresh, by_ref, ResolverContext(now))
+    if again["action"] != a["action"]:
+        return (f"race (fresh read: {again['verdict'] or '-'} "
+                f"{again['evidence'] or ''})".rstrip(), {})
+    return "", {k: fresh.get(k) for k in _BLOCK_EXPECT}
+
+
 def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
-           spawned: set) -> str:
+           spawned: set, now: Optional[float] = None) -> str:
     """Carry out one decided action; returns ``done`` or why it did not."""
     ref, action, reason = a["ref"], a["action"], a["reason"]
     evidence = f"{a['verdict']}: {a['evidence']}"
@@ -1193,7 +1311,11 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
             q._log("BACKSTOP_UNBLOCKED_PLAN", f"{ref} plan blocked with no open question",
                    queue=a["queue"])
         if _github(a["queue"]):
-            return "done" if q.block(ref, "", question=question, origin="system") else "race"
+            stale, expect = _github_snapshot_stale(item, a, by_ref, now)
+            if stale:
+                return stale
+            return "done" if q.block(ref, "", question=question, origin="system",
+                                     expect=expect) else "race"
         if a["row"] == "assess.run.file":
             asmt = item.get("assessment") or {}
             q.assessment_fail(ref, str(asmt.get("token") or ""), a["reason"])
@@ -1289,8 +1411,12 @@ def sweep(now: Optional[float] = None, only_ref: str = "") -> List[Dict[str, Any
         try:
             a = assess(it, by_ref, ctx)
             if not a["action"]:
+                if a["verdict"] == "alive" and _github(a["queue"]):
+                    hb = _renew_claim_heartbeat(it, ctx.now)
+                    if hb.startswith("failed"):
+                        q._log("CLAIM_HEARTBEAT", f"{a['ref']} {hb}", queue=a["queue"])
                 continue
-            result = _apply(it, a, by_ref, spawned)
+            result = _apply(it, a, by_ref, spawned, ctx.now)
             _log_backstop(a, result)
             acted.append(dict(a, result=result))
         except Exception as exc:  # noqa: BLE001 - one ticket never stops the sweep
