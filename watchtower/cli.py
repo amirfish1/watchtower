@@ -6682,7 +6682,7 @@ def build_parser() -> argparse.ArgumentParser:
     from .model_runner import command as model_run_command
     m.set_defaults(func=model_run_command)
 
-    s = sub.add_parser("ls")
+    s = sub.add_parser("ls", aliases=["list"])  # `wt list` is a common first guess
     s.add_argument("-q", "--queue", required=True)
     s.add_argument(
         "--status",
