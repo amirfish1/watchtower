@@ -148,6 +148,20 @@ def test_ambient_claim_is_never_dead(wt, procs):
     assert v.verdict == "unproven" and "ambient" in v.evidence
 
 
+def test_ambient_claim_with_recent_transcript_is_alive(wt, procs, monkeypatch):
+    """OPS-1487: an ambient claim whose session wrote a transcript recently is
+    proven working; a quiet one stays unproven."""
+    ref = _file(wt)
+    wt.q.claim_by_ref(ref, "someone", session_uuid=SID2)
+    monkeypatch.setattr(wt.liveness, "_transcript_mtime",
+                        lambda engine, sid: time.time() - 30 if engine == "codex" else 0.0)
+    v = _owner(wt, ref)
+    assert v.verdict == "alive" and v.source == "session_transcript"
+    monkeypatch.setattr(wt.liveness, "_transcript_mtime",
+                        lambda engine, sid: time.time() - 7200)
+    assert _owner(wt, ref).verdict == "unproven"
+
+
 def test_legacy_claim_without_proc_is_unproven(wt):
     ref = _file(wt)
     wt.q.claim_by_ref(ref, "w1", session_uuid=SID)
