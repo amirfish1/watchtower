@@ -51,6 +51,19 @@ def test_apply_archives_and_disables_drain(env):
     assert "DEAD" in config.all_queues(include_archived=True)
 
 
+@pytest.mark.parametrize("status", ["awaiting_answer", "in_review", "in_progress"])
+def test_refuses_with_waiting_or_review_tickets(env, capsys, status):
+    """WT-36: an owner-blocked or in-review ticket must not be hidden by archiving."""
+    env.append(_item("DEAD-2", status))
+    assert cli.cmd_queue_archive(_ns(apply=True)) == 1
+    assert "DEAD-2" in capsys.readouterr().err and not config.is_archived("DEAD")
+
+
+def test_closed_tickets_do_not_block_archive(env):
+    env.append(_item("DEAD-3", "closed"))
+    assert cli.cmd_queue_archive(_ns(apply=True)) == 0
+
+
 def test_refuses_with_open_tickets_unless_force(env, capsys):
     env.append(_item("DEAD-1", "open"))
     assert cli.cmd_queue_archive(_ns(apply=True)) == 1

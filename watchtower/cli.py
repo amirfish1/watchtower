@@ -436,14 +436,16 @@ def cmd_queue_archive(args: argparse.Namespace) -> int:
     if config.is_archived(name):
         print(f"{name}: already archived")
         return 0
+    # Anything not closed is still live: awaiting_answer/in_review tickets
+    # (blocked on an owner answer or a verifier) would vanish from status (WT-36).
     live = [it for it in q.list_items(project=name, fresh=True)
-            if it.get("status") in ("open", "in_progress")]
+            if it.get("status") != "closed"]
     if live and not args.force:
         if args.json:
             print(json.dumps({"queue": name, "archived": False,
                               "blocked_by_tickets": [it.get("ref") for it in live]}, indent=2))
         else:
-            print(f"{name}: refusing to archive, {len(live)} open/WIP ticket(s):", file=sys.stderr)
+            print(f"{name}: refusing to archive, {len(live)} unclosed ticket(s):", file=sys.stderr)
             for it in live:
                 print(f"  {it.get('ref')}  [{it.get('status')}]  {it.get('title', '')}", file=sys.stderr)
             print("close/move them first, or pass --force", file=sys.stderr)
