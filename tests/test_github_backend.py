@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,27 +43,69 @@ def load():
 
 
 def save(data):
-    state_path.write_text(json.dumps(data, indent=2))
+    # Atomic: concurrent fake gh processes must never read a half-written
+    # file (an empty read crashed a concurrent-planner test's thread).
+    tmp = state_path.with_name(f"{state_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, state_path)
+
+
+# The option grammar real gh (cobra/pflag) applies to the commands WatchTower
+# runs: these flags take a value (the next token, or --flag=value) whatever
+# that value looks like, so a title of "--body" is a title; "--" ends options.
+VALUE_FLAGS = {
+    "--repo", "-R", "--title", "--body", "-b", "--body-file", "-F",
+    "--label", "-l", "--add-label", "--remove-label", "--add-assignee",
+    "--remove-assignee", "--assignee", "-a", "--json", "--state", "-s",
+    "--comment", "-c", "--reason", "-r", "--limit", "-L", "--search", "-S",
+    "--jq", "-q", "-H", "--header", "-f", "--field", "--raw-field", "-X",
+    "--method", "--duplicate-of",
+}
+
+
+def parse(args):
+    """[(flag, value, start_index, token_count)] plus positionals."""
+    flags, positional, i = [], [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            positional.extend(args[i + 1:])
+            break
+        name, eq, val = a.partition("=")
+        if a.startswith("-") and eq and name in VALUE_FLAGS:
+            flags.append((name, val, i, 1))
+            i += 1
+        elif a in VALUE_FLAGS and i + 1 < len(args):
+            flags.append((a, args[i + 1], i, 2))
+            i += 2
+        elif a.startswith("-") and len(a) > 1:
+            flags.append((a, None, i, 1))
+            i += 1
+        else:
+            positional.append(a)
+            i += 1
+    return flags, positional
+
+
+def has(args, name):
+    return any(f == name for f, _, _, _ in parse(args)[0])
 
 
 def opt(args, name, default=""):
-    if name in args:
-        i = args.index(name)
-        if i + 1 < len(args):
-            return args[i + 1]
+    for f, v, _, _ in parse(args)[0]:
+        if f == name and v is not None:
+            return v
     return default
 
 
+def target(args):
+    # The issue number is gh's first positional after `issue <verb>`; flags
+    # may precede it (`issue edit --body-file - 7 ...`), as cobra allows.
+    return parse(args)[1][2]
+
+
 def opts(args, name):
-    out = []
-    i = 0
-    while i < len(args):
-        if args[i] == name and i + 1 < len(args):
-            out.append(args[i + 1])
-            i += 2
-        else:
-            i += 1
-    return out
+    return [v for f, v, _, _ in parse(args)[0] if f == name and v is not None]
 
 
 def issue_by_number(data, number):
@@ -93,7 +136,50 @@ def project_fields(issue):
 
 data = load()
 args = sys.argv[1:]
+for _f, _src, _i, _n in parse(args)[0]:
+    if _f in ("--body-file", "-F"):
+        # Real gh reads the body from the file ("-" is stdin); fold it back
+        # into `--body` so the handlers and recorded commands see one shape.
+        raw = sys.stdin.buffer.read() if _src == "-" else Path(_src).read_bytes()
+        args = [*args[:_i], "--body", raw.decode("utf-8"), *args[_i + _n:]]
+        break
 data["commands"].append(args)
+
+# FAKE_GH_FAIL="issue comment=fail|ratelimit|auth_once|hang|lost|unknown"
+# makes one verb misbehave the way real gh does; FAKE_GH_FAIL_ARG narrows it
+# to calls carrying that exact argv element. Every other command runs normally.
+_verb, _, _mode = os.environ.get("FAKE_GH_FAIL", "").partition("=")
+_lost = False
+if (_verb and " ".join(args[:2]) == _verb
+        and os.environ.get("FAKE_GH_FAIL_ARG", args[0]) in args):
+    save(data)
+    _lost = _mode == "lost"  # the write lands, then the response is lost
+    if _mode == "unknown":
+        print(json.dumps({"state": "UNKNOWN"}))
+        sys.exit(0)
+    if _mode == "hang":
+        time.sleep(30)
+    if _mode == "fail":
+        if args[:2] == ["issue", "close"] and has(args, "--comment"):
+            # Real gh posts --comment on an OPEN issue BEFORE the close
+            # mutation, so a failed close leaves the comment behind.
+            issue = issue_by_number(data, target(args))
+            if issue["state"] == "OPEN":
+                issue["comments"].append(
+                    {"author": {"login": "watchtower"}, "body": opt(args, "--comment")})
+                save(data)
+        print("HTTP 422: Validation Failed", file=sys.stderr)
+        sys.exit(1)
+    if _mode == "ratelimit":
+        print("API rate limit exceeded for user ID 1", file=sys.stderr)
+        sys.exit(1)
+    if _mode == "auth_once":
+        flag = state_path.with_suffix(".auth-once")
+        if not flag.exists():
+            flag.touch()
+            print("To get started with GitHub CLI, please run:  gh auth login",
+                  file=sys.stderr)
+            sys.exit(4)
 
 if args[:2] == ["label", "create"]:
     save(data)
@@ -165,13 +251,13 @@ if args[:2] == ["issue", "list"]:
     sys.exit(0)
 
 if args[:2] == ["issue", "view"]:
-    issue = issue_by_number(data, args[2])
+    issue = issue_by_number(data, target(args))
     save(data)
     print(json.dumps(project_fields(issue)))
     sys.exit(0)
 
 if args[:2] == ["issue", "edit"]:
-    issue = issue_by_number(data, args[2])
+    issue = issue_by_number(data, target(args))
     for assignee in opts(args, "--add-assignee"):
         if assignee not in issue["assignees"]:
             issue["assignees"].append(assignee)
@@ -181,28 +267,39 @@ if args[:2] == ["issue", "edit"]:
     for label in opts(args, "--remove-label"):
         if label in issue["labels"]:
             issue["labels"].remove(label)
-    if "--title" in args:
+    if has(args, "--title"):
         issue["title"] = opt(args, "--title")
-    if "--body" in args:
+    if has(args, "--body"):
         issue["body"] = opt(args, "--body")
     issue["updatedAt"] = now()
     save(data)
     sys.exit(0)
 
 if args[:2] == ["issue", "close"]:
-    issue = issue_by_number(data, args[2])
+    issue = issue_by_number(data, target(args))
+    if issue["state"] == "CLOSED":
+        # Real gh (2.101 close.go:103-110) fetches the state first and returns
+        # here, BEFORE posting any --comment.
+        save(data)
+        print(f"! Issue #{issue['number']} ({issue['title']}) is already closed",
+              file=sys.stderr)
+        sys.exit(0)
     issue["state"] = "CLOSED"
     issue["closedAt"] = now()
     issue["updatedAt"] = issue["closedAt"]
     comment = opt(args, "--comment")
     if comment:
-        issue["comments"].append(comment)
+        issue["comments"].append({"author": {"login": "watchtower"}, "body": comment})
     save(data)
+    if _lost:
+        print("Post \"https://api.github.com/graphql\": connection reset by peer",
+              file=sys.stderr)
+        sys.exit(1)
     print(f"Closed issue #{issue['number']}")
     sys.exit(0)
 
 if args[:2] == ["issue", "comment"]:
-    issue = issue_by_number(data, args[2])
+    issue = issue_by_number(data, target(args))
     body = opt(args, "--body")
     if body:
         issue["comments"].append({"author": {"login": "watchtower"}, "body": body})
@@ -219,7 +316,7 @@ if args[:2] == ["repo", "view"]:
     sys.exit(0)
 
 if args[:2] == ["issue", "reopen"]:
-    issue = issue_by_number(data, args[2])
+    issue = issue_by_number(data, target(args))
     issue["state"] = "OPEN"
     issue["closedAt"] = None
     issue["updatedAt"] = now()
@@ -231,6 +328,15 @@ print("unsupported fake gh command: " + " ".join(args), file=sys.stderr)
 save(data)
 sys.exit(2)
 '''
+
+
+_FAKE_NS: dict = {}
+exec(FAKE_GH[FAKE_GH.index("VALUE_FLAGS"):FAKE_GH.index("def issue_by_number")], _FAKE_NS)
+
+
+def _fake_opt(args, name):
+    """Read a recorded fake-gh command with the fake's own gh option parser."""
+    return _FAKE_NS["opt"](args, name)
 
 
 @pytest.fixture(autouse=True)
@@ -457,7 +563,7 @@ def test_github_backend_enqueue_claim_close_round_trip(tmp_path, monkeypatch):
     issue = gh_state["issues"][0]
     assert issue["state"] == "CLOSED"
     assert "@me" in issue["assignees"]
-    assert any("fixed it" in c for c in issue["comments"])
+    assert any("fixed it" in c["body"] for c in issue["comments"])
 
 
 def test_github_backend_close_records_session_and_machine(tmp_path, monkeypatch):
@@ -1301,7 +1407,13 @@ def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys)
     gh_state = json.loads(state.read_text())
     commands = [" ".join(c) for c in gh_state["commands"]]
     assert any(c.startswith("issue create") for c in commands)
-    assert any(c.startswith("issue edit 1") and "--add-assignee @me" in c for c in commands)
+    # gh takes flags before the positional, and the body transport puts
+    # --body-file - (recorded as --body) right after `issue edit` (WT-40).
+    assert any(
+        c[:2] == ["issue", "edit"] and c[4] == "1"
+        and " --add-assignee @me" in " ".join(c[5:])
+        for c in gh_state["commands"]
+    )
     assert any(c.startswith("issue close 1") for c in commands)
 
 
@@ -3706,6 +3818,291 @@ def test_reconcile_skip_reason_names_readiness_when_readiness_is_the_gate(
     assert "grace" not in reason, reason
 
 
+_SENTINEL = "CAVEAT-SENTINEL"
+# Two witnesses past Linux MAX_ARG_STRLEN (128 KiB) once normalized into the
+# close comment: 40 x 4000 ASCII (~160 KB) and 12 x 4000 emoji (~192 KB UTF-8).
+_OVERSIZED_CAVEATS = {
+    "ascii": [f"{_SENTINEL} {i}: \"q\" 'q'\\\n" + "a" * 4000 for i in range(40)],
+    "unicode": [f"{_SENTINEL} {i}: é中 \"q\"\r\n" + "\U0001F600" * 4000
+                for i in range(12)],
+}
+
+
+def _oversized_close_setup(tmp_path, monkeypatch, kind="unicode"):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    q.enqueue(project="GHI", title="long close", note="n", text="b")
+    q.claim_next("worker-1", project="GHI")
+    import watchtower.github_backend as github_backend
+    return state, q, github_backend, {"summary": "done", "caveats": _OVERSIZED_CAVEATS[kind]}
+
+
+def _cmds(state, verb):
+    return [c for c in json.loads(state.read_text())["commands"] if c[:2] == ["issue", verb]]
+
+
+def _assert_no_content_leak(tmp_path, state, text):
+    """Only the fake GitHub state may hold the resolution text: no error,
+    log, cache or connectivity file the backend wrote may echo it."""
+    assert _SENTINEL not in text
+    for f in tmp_path.rglob("*"):
+        if f.is_file() and f != state and f.suffix != ".py" and f.name != "gh":
+            assert _SENTINEL not in f.read_text(errors="replace"), f
+
+
+@pytest.mark.parametrize("kind", ["ascii", "unicode"])
+def test_github_close_with_oversized_resolution_posts_comment_via_stdin(tmp_path, monkeypatch, kind):
+    """WT-40 verify: `gh issue close --comment` has no file/stdin form, so a
+    resolution past the per-argument limit died with E2BIG. The close comment
+    now goes through `issue comment --body-file -`, then a bare close."""
+    state, q, github_backend, resolution = _oversized_close_setup(tmp_path, monkeypatch, kind)
+
+    closed = q.close("GHI-1", "worker-1", resolution=resolution)
+
+    assert closed["status"] == "closed"
+    data = json.loads(state.read_text())
+    issue = data["issues"][0]
+    assert issue["state"] == "CLOSED"
+    expected = github_backend._resolution_comment(closed["resolution"])
+    assert len(expected.encode("utf-8")) > 32 * os.sysconf("SC_PAGE_SIZE")
+    # The pre-existing normalization clips each caveat; the transport must
+    # then carry every normalized caveat whole.
+    assert len(closed["resolution"]["caveats"]) == len(_OVERSIZED_CAVEATS[kind])
+    assert all(f"- {c}" in expected for c in closed["resolution"]["caveats"])
+    assert [c["body"] for c in issue["comments"]] == [expected]
+    cmds = [c[:2] for c in data["commands"]]
+    assert cmds.count(["issue", "comment"]) == 1 and cmds.count(["issue", "close"]) == 1
+    assert cmds.index(["issue", "comment"]) < cmds.index(["issue", "close"])
+    assert _cmds(state, "close")[0] == ["issue", "close", "1", "--repo", "test-owner/test-repo"]
+    _assert_no_content_leak(tmp_path, state, "")
+
+
+@pytest.mark.parametrize("mode", ["fail", "ratelimit"])
+def test_github_close_resolution_comment_failure_does_not_close(tmp_path, monkeypatch, mode):
+    state, q, github_backend, resolution = _oversized_close_setup(tmp_path, monkeypatch)
+    limited = []
+    monkeypatch.setattr(github_backend, "_record_gh_rate_limited", limited.append)
+    monkeypatch.setenv("FAKE_GH_FAIL", f"issue comment={mode}")
+
+    with pytest.raises(github_backend.GitHubBackendError) as exc:
+        q.close("GHI-1", "worker-1", resolution=resolution)
+
+    assert _cmds(state, "close") == [], "no close when the resolution was not posted"
+    assert len(_cmds(state, "comment")) == 1, "no retry beyond existing semantics"
+    assert json.loads(state.read_text())["issues"][0]["state"] == "OPEN"
+    assert "--body-file -" in str(exc.value)
+    assert bool(limited) == (mode == "ratelimit"), "quota errors are still recorded"
+    _assert_no_content_leak(tmp_path, state, str(exc.value))
+
+
+def test_github_close_resolution_comment_timeout_does_not_close(tmp_path, monkeypatch):
+    state, q, github_backend, resolution = _oversized_close_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_GH_FAIL", "issue comment=hang")
+    real_run = github_backend.subprocess.run
+    bounds = []
+
+    def short_run(cmd, *a, **k):
+        if cmd[:3] == ["gh", "issue", "comment"]:
+            bounds.append(k.get("timeout"))
+            k["timeout"] = 2
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(github_backend.subprocess, "run", short_run)
+    with pytest.raises(github_backend.GitHubBackendError) as exc:
+        q.close("GHI-1", "worker-1", resolution=resolution)
+
+    assert bounds == [60], "the production timeout bound is unchanged"
+    assert "timed out" in str(exc.value)
+    assert _cmds(state, "close") == []
+    assert json.loads(state.read_text())["issues"][0]["state"] == "OPEN"
+    _assert_no_content_leak(tmp_path, state, str(exc.value))
+
+
+def test_github_close_resolution_auth_heal_resends_then_closes(tmp_path, monkeypatch):
+    state, q, github_backend, resolution = _oversized_close_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_GH_FAIL", "issue comment=auth_once")
+    monkeypatch.setattr(github_backend, "_attempt_auth_self_heal", lambda: True)
+
+    closed = q.close("GHI-1", "worker-1", resolution=resolution)
+
+    expected = github_backend._resolution_comment(closed["resolution"])
+    comments = _cmds(state, "comment")
+    assert len(comments) == 2, "one auth-heal retry, as before"
+    assert [_fake_opt(c, "--body") for c in comments] == [expected, expected]
+    issue = json.loads(state.read_text())["issues"][0]
+    assert [c["body"] for c in issue["comments"]] == [expected]
+    assert issue["state"] == "CLOSED"
+
+
+def test_github_close_failure_after_resolution_posted_raises(tmp_path, monkeypatch):
+    """Same two writes gh's own `close --comment` makes: if the close itself
+    fails, the comment has landed and the error still surfaces (no swallow)."""
+    state, q, github_backend, resolution = _oversized_close_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_GH_FAIL", "issue close=fail")
+
+    with pytest.raises(github_backend.GitHubBackendError) as exc:
+        q.close("GHI-1", "worker-1", resolution=resolution)
+
+    assert len(_cmds(state, "comment")) == 1 and len(_cmds(state, "close")) == 1
+    assert json.loads(state.read_text())["issues"][0]["state"] == "OPEN"
+    _assert_no_content_leak(tmp_path, state, str(exc.value))
+
+
+_SMALL_RESOLUTION = {"summary": "done é \"q\"", "caveats": ["short \U0001F600\r\nline"]}
+
+
+def _close_backend(github_backend):
+    return github_backend.GitHubIssuesBackend("GHI", repo="test-owner/test-repo")
+
+
+def _resolution(kind):
+    if kind == "small":
+        return dict(_SMALL_RESOLUTION)
+    return {"summary": "done", "caveats": _OVERSIZED_CAVEATS[kind]}
+
+
+def _issue(state):
+    return json.loads(state.read_text())["issues"][0]
+
+
+# Every close below runs the real update_status -> _run -> subprocess path.
+# "small" stays under the argv limit so the same checks run on the original
+# `gh issue close --comment` transport too (the idempotency baseline); the
+# oversized kinds are the WT-40 witnesses.
+_CLOSE_KINDS = ["small", "ascii", "unicode"]
+
+
+@pytest.mark.parametrize("kind", _CLOSE_KINDS)
+def test_github_close_of_already_closed_issue_posts_no_resolution(tmp_path, monkeypatch, kind):
+    """gh 2.101 returns early on CLOSED before posting --comment; we match it."""
+    state, q, github_backend, _ = _oversized_close_setup(tmp_path, monkeypatch)
+    data = json.loads(state.read_text())
+    data["issues"][0]["state"] = "CLOSED"
+    state.write_text(json.dumps(data))
+
+    closed = _close_backend(github_backend).update_status(
+        "GHI-1", "closed", session_id="worker-1", resolution=_resolution(kind))
+
+    assert closed["status"] == "closed"
+    assert _issue(state)["comments"] == []
+    assert _cmds(state, "comment") == []
+
+
+@pytest.mark.parametrize("kind", _CLOSE_KINDS)
+def test_github_repeated_close_posts_resolution_once(tmp_path, monkeypatch, kind):
+    state, q, github_backend, _ = _oversized_close_setup(tmp_path, monkeypatch)
+    backend = _close_backend(github_backend)
+
+    for _ in range(2):
+        closed = backend.update_status("GHI-1", "closed", session_id="worker-1",
+                                       resolution=_resolution(kind))
+        assert closed["status"] == "closed"
+
+    expected = github_backend._resolution_comment(closed["resolution"])
+    assert [c["body"] for c in _issue(state)["comments"]] == [expected]
+
+
+@pytest.mark.parametrize("kind", _CLOSE_KINDS)
+def test_github_close_retry_after_lost_close_response_posts_once(tmp_path, monkeypatch, kind):
+    """The server accepted the close but the response was lost: the caller
+    sees an error and retries, and the retry must not re-post."""
+    state, q, github_backend, _ = _oversized_close_setup(tmp_path, monkeypatch)
+    backend = _close_backend(github_backend)
+    monkeypatch.setenv("FAKE_GH_FAIL", "issue close=lost")
+    with pytest.raises(github_backend.GitHubBackendError) as exc:
+        backend.update_status("GHI-1", "closed", session_id="worker-1",
+                              resolution=_resolution(kind))
+    assert _issue(state)["state"] == "CLOSED"
+    _assert_no_content_leak(tmp_path, state, str(exc.value))
+
+    monkeypatch.delenv("FAKE_GH_FAIL")
+    closed = backend.update_status("GHI-1", "closed", session_id="worker-1",
+                                   resolution=_resolution(kind))
+
+    assert closed["status"] == "closed"
+    assert len(_issue(state)["comments"]) == 1
+
+
+@pytest.mark.parametrize("kind", _CLOSE_KINDS)
+def test_github_close_failure_while_open_retries_like_gh(tmp_path, monkeypatch, kind):
+    """A close that failed while the issue stayed OPEN is not recorded as
+    success, and a retry re-runs gh's full sequence: the issue is OPEN, so
+    the resolution is posted again, as `gh issue close --comment` would."""
+    state, q, github_backend, _ = _oversized_close_setup(tmp_path, monkeypatch)
+    backend = _close_backend(github_backend)
+    monkeypatch.setenv("FAKE_GH_FAIL", "issue close=fail")
+    with pytest.raises(github_backend.GitHubBackendError):
+        backend.update_status("GHI-1", "closed", session_id="worker-1",
+                              resolution=_resolution(kind))
+    assert _issue(state)["state"] == "OPEN"
+
+    monkeypatch.delenv("FAKE_GH_FAIL")
+    closed = backend.update_status("GHI-1", "closed", session_id="worker-1",
+                                   resolution=_resolution(kind))
+
+    assert closed["status"] == "closed"
+    assert _issue(state)["state"] == "CLOSED"
+    assert len(_issue(state)["comments"]) == 2
+
+
+@pytest.mark.parametrize("mode", ["fail", "ratelimit", "unknown", "hang"])
+def test_github_close_state_read_failure_neither_comments_nor_closes(tmp_path, monkeypatch, mode):
+    """An unknown state is an error, never a guess: no comment, no close."""
+    state, q, github_backend, resolution = _oversized_close_setup(tmp_path, monkeypatch)
+    limited = []
+    monkeypatch.setattr(github_backend, "_record_gh_rate_limited", limited.append)
+    monkeypatch.setenv("FAKE_GH_FAIL", f"issue view={mode}")
+    monkeypatch.setenv("FAKE_GH_FAIL_ARG", "state")
+    real_run = github_backend.subprocess.run
+
+    def short_run(cmd, *a, **k):
+        if cmd[:3] == ["gh", "issue", "view"] and "state" in cmd:
+            k["timeout"] = 2
+        return real_run(cmd, *a, **k)
+
+    monkeypatch.setattr(github_backend.subprocess, "run", short_run)
+    with pytest.raises(github_backend.GitHubBackendError) as exc:
+        _close_backend(github_backend).update_status(
+            "GHI-1", "closed", session_id="worker-1", resolution=resolution)
+
+    assert _cmds(state, "comment") == [] and _cmds(state, "close") == []
+    assert _issue(state)["state"] == "OPEN"
+    assert bool(limited) == (mode == "ratelimit")
+    _assert_no_content_leak(tmp_path, state, str(exc.value))
+
+
+def test_github_close_state_read_auth_heal_then_closes_once(tmp_path, monkeypatch):
+    state, q, github_backend, resolution = _oversized_close_setup(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_GH_FAIL", "issue view=auth_once")
+    monkeypatch.setenv("FAKE_GH_FAIL_ARG", "state")
+    monkeypatch.setattr(github_backend, "_attempt_auth_self_heal", lambda: True)
+
+    closed = _close_backend(github_backend).update_status(
+        "GHI-1", "closed", session_id="worker-1", resolution=resolution)
+
+    assert closed["status"] == "closed"
+    cmds = [c[:2] for c in json.loads(state.read_text())["commands"]]
+    assert cmds.count(["issue", "comment"]) == 1 and cmds.count(["issue", "close"]) == 1
+    assert len(_issue(state)["comments"]) == 1
+
+
+def test_github_reopen_then_close_posts_a_fresh_resolution(tmp_path, monkeypatch):
+    """Reopen semantics are untouched: a reopened issue is OPEN again, so its
+    next close posts its own resolution."""
+    state, q, github_backend, resolution = _oversized_close_setup(tmp_path, monkeypatch)
+    backend = _close_backend(github_backend)
+    backend.update_status("GHI-1", "closed", session_id="worker-1", resolution=resolution)
+    backend.update_status("GHI-1", "open", reason="again")
+    assert _issue(state)["state"] == "OPEN"
+    backend.update_status("GHI-1", "closed", session_id="worker-1",
+                          resolution={"summary": "second"})
+    assert len(_issue(state)["comments"]) == 2
+    assert _issue(state)["comments"][-1]["body"].startswith("WatchTower resolution: second")
+
+
 def test_github_backend_records_fix_commit_on_the_issue(tmp_path, monkeypatch):
     """BYM BECKY-1651: the verified --commit SHA must survive onto the issue.
 
@@ -3730,7 +4127,7 @@ def test_github_backend_records_fix_commit_on_the_issue(tmp_path, monkeypatch):
     assert q.get("GHI-1")["resolution"]["commit"] == sha
     issue = json.loads(state.read_text())["issues"][0]
     assert f'resolution_commit: "{sha}"' in issue["body"]
-    assert any(c.rstrip().endswith(f"Fix-Commit: {sha}") for c in issue["comments"])
+    assert any(c["body"].rstrip().endswith(f"Fix-Commit: {sha}") for c in issue["comments"])
 
     # A no-code re-close must not leave the earlier close's SHA vouching for it.
     q.update_status("GHI-1", "open", reason="redo")

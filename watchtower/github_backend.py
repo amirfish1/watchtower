@@ -911,6 +911,39 @@ def _is_auth_error(error: Any) -> bool:
     return bool(_AUTH_ERROR_RE.search(str(error or "")))
 
 
+class _Text(str):
+    """A free-text argv value (an issue title). gh receives it verbatim; error
+    and log rendering print only its length, never its contents (WT-40)."""
+    __slots__ = ()
+
+
+# `gh issue <verb>` commands that take a body (`--body-file -`, read from stdin).
+_BODY_VERBS = frozenset({"create", "edit", "comment"})
+
+
+def _render_argv(args: List[str]) -> str:
+    """``args`` for an error message, with every ``_Text`` value elided.
+    Bodies never reach argv, so nothing else here is free text."""
+    return " ".join(
+        f"<text:{len(a)} chars>" if isinstance(a, _Text) else str(a) for a in args
+    )
+
+
+def _body_argv(args: List[str]) -> List[str]:
+    """``args`` with ``--body-file -`` placed right after ``issue <verb>``.
+
+    Only those two fixed tokens precede it, so no caller value can consume
+    it as an option argument or end options before it, and no caller token
+    is ever inspected: a title or label of ``--body``, ``-F`` or ``--``
+    reaches gh exactly as given (WT-40).
+    """
+    if len(args) < 2 or args[0] != "issue" or args[1] not in _BODY_VERBS:
+        raise GitHubBackendError(
+            "gh body transport supports only `issue create|edit|comment`"
+        )
+    return [args[0], args[1], "--body-file", "-", *args[2:]]
+
+
 def _gh_hosts_file() -> Path:
     env = os.environ.get("GH_CONFIG_DIR")
     if env:
@@ -1805,31 +1838,49 @@ class GitHubIssuesBackend:
             )
         return ["--repo", self.repo]
 
-    def _run_raw(self, args: List[str]) -> "subprocess.CompletedProcess[str]":
+    def _run_raw(self, args: List[str], *,
+                 body: Optional[str] = None) -> "subprocess.CompletedProcess[str]":
         """Run ``gh`` and hand back the whole result.
 
         Split out of ``_run`` because the ETag probe has to read the exit code
         and stderr itself: ``gh api`` exits 1 on a 304, which is a success for
         us, and ``_run``'s exit-code-means-failure rule cannot express that.
+
+        An issue ``body`` travels on stdin (``--body-file -``), never argv:
+        a long issue history exceeds the kernel's per-argument limit and
+        ``exec`` fails with E2BIG before gh even starts (WT-40). It is passed
+        separately, never found by scanning argv, so an option VALUE that
+        looks like a flag (a title of ``--body``) keeps its meaning.
         """
+        argv = list(args)
+        extra: Dict[str, Any] = {}
+        if body is not None:
+            argv = _body_argv(argv)
+            # gh reads the file as raw UTF-8; pin it instead of the locale.
+            extra = {"input": body, "encoding": "utf-8"}
         try:
             return subprocess.run(
-                ["gh", *args],
+                ["gh", *argv],
                 cwd=self.repo_path or None,
                 capture_output=True,
                 text=True,
                 timeout=60,
                 env=_gh_child_env(),
+                **extra,
             )
         except FileNotFoundError as exc:
             raise GitHubBackendError(
                 "GitHub backend requires the gh CLI to be installed and on PATH"
             ) from exc
         except subprocess.TimeoutExpired as exc:
-            raise GitHubBackendError(f"gh {' '.join(args)} timed out") from exc
+            raise GitHubBackendError(f"gh {_render_argv(argv)} timed out") from exc
 
-    def _run(self, args: List[str], *, check: bool = True) -> str:
-        proc = self._run_raw(args)
+    def _run(self, args: List[str], *, check: bool = True,
+             body: Optional[str] = None) -> str:
+        # Body-less calls keep the one-argument form older stubs replace.
+        raw = (lambda: self._run_raw(args)) if body is None else (
+            lambda: self._run_raw(args, body=body))
+        proc = raw()
         if (
             check
             and proc.returncode != 0
@@ -1839,7 +1890,7 @@ class GitHubIssuesBackend:
             # The heal proved gh's auth is usable (transient read, or a
             # masking env token now latched out of the child env): the
             # original command earns exactly one retry before we believe it.
-            proc = self._run_raw(args)
+            proc = raw()
         if check and proc.returncode != 0:
             detail = (proc.stderr or proc.stdout or "").strip()
             if _is_rate_limit_error(detail):
@@ -1853,7 +1904,7 @@ class GitHubIssuesBackend:
                 # the token.
                 _record_gh_auth_broken(detail)
             raise GitHubBackendError(
-                f"gh {' '.join(args)} failed"
+                f"gh {_render_argv(args if body is None else _body_argv(args))} failed"
                 + (f": {detail}" if detail else "")
             )
         if (
@@ -2602,11 +2653,10 @@ class GitHubIssuesBackend:
         out = self._run([
             "issue", "create",
             *self._repo_args(),
-            "--title", issue_title,
-            "--body", body,
+            "--title", _Text(issue_title),
             # The catch-all owns unlabelled issues, so it files without one.
             *([] if self.catch_all else ["--label", self.queue_label]),
-        ])
+        ], body=body)
         match = _ISSUE_URL_RE.search(out.strip())
         if not match:
             raise GitHubBackendError("gh issue create did not print an issue URL")
@@ -2789,6 +2839,21 @@ class GitHubIssuesBackend:
             finally:
                 held.discard(path)
 
+    def _fresh_issue_state(self, number: str) -> str:
+        """The issue's live ``OPEN``/``CLOSED`` state, read just before a
+        state-dependent write. Anything else (a failed read, unparsable JSON,
+        an unknown state) raises: the caller must not guess."""
+        raw = self._run(["issue", "view", number, *self._repo_args(), "--json", "state"])
+        try:
+            state = str((json.loads(raw or "{}") or {}).get("state") or "").upper()
+        except (json.JSONDecodeError, AttributeError) as exc:
+            raise GitHubBackendError(
+                f"gh issue view {number} --json state returned invalid JSON") from exc
+        if state not in ("OPEN", "CLOSED"):
+            raise GitHubBackendError(
+                f"gh issue view {number} returned unknown state {state!r}")
+        return state
+
     def _edit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
                    *extra: str) -> List[str]:
         """Write ``body``+``meta`` over ``item``'s issue, then re-read and
@@ -2800,7 +2865,7 @@ class GitHubIssuesBackend:
         number = str(item["number"])
         base = item.get("_github_body") or item.get("text", "")
         ours = _body_with_metadata(body, meta)
-        self._run(["issue", "edit", number, *self._repo_args(), "--body", ours, *extra])
+        self._run(["issue", "edit", number, *self._repo_args(), *extra], body=ours)
         conflicts: List[str] = []
         for _ in range(_BODY_WRITE_RETRIES):
             try:
@@ -2813,7 +2878,7 @@ class GitHubIssuesBackend:
             if merged is None:
                 return conflicts
             _log_body_reapply(self.repo, number, conflicts)
-            self._run(["issue", "edit", number, *self._repo_args(), "--body", merged])
+            self._run(["issue", "edit", number, *self._repo_args()], body=merged)
             base, ours = fresh, merged
         return conflicts
 
@@ -3212,11 +3277,19 @@ class GitHubIssuesBackend:
                          worker=str(session_id or meta.get("closed_by") or ""),
                          resolution=norm)
         self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
-        self._run([
-            "issue", "close", number,
-            *self._repo_args(),
-            "--comment", _resolution_comment(norm),
-        ])
+        # `gh issue close --comment` takes the text on argv only (no file or
+        # stdin form), and a resolution with long caveats can pass the
+        # per-argument limit (WT-40). So we make gh's own steps ourselves:
+        # fetch the state, return early on CLOSED without commenting (gh
+        # 2.101 close.go), else post the comment (on stdin), then close. The
+        # race window between that read and the writes is gh's own; GitHub
+        # offers no precondition on either.
+        if self._fresh_issue_state(number) == "OPEN":
+            self._run([
+                "issue", "comment", number,
+                *self._repo_args(),
+            ], body=_resolution_comment(norm))
+        self._run(["issue", "close", number, *self._repo_args()])
         closed = self.get(ident)
         if closed:
             closed["closed_by"] = str(session_id or closed.get("claimed_by") or "")
@@ -3423,8 +3496,8 @@ class GitHubIssuesBackend:
             self._run([
                 "issue", "comment", number,
                 *self._repo_args(),
-                "--body", f"[watchtower] Needs input from {session_id or 'worker'}:\n\n{shown}",
-            ], check=False)
+            ], check=False,
+                body=f"[watchtower] Needs input from {session_id or 'worker'}:\n\n{shown}")
         return self.get(ident)
 
     @_serialized_body_write
@@ -3572,8 +3645,7 @@ class GitHubIssuesBackend:
             self._run([
                 "issue", "comment", number,
                 *self._repo_args(),
-                "--body", answer_text,
-            ])
+            ], body=answer_text)
         return self.get(ident)
 
     def _repo_owner(self) -> str:
@@ -3655,8 +3727,7 @@ class GitHubIssuesBackend:
         self._run([
             "issue", "comment", str(item["number"]),
             *self._repo_args(),
-            "--body", f"[watchtower] Ingested owner answer ({key}); {outcome}.",
-        ], check=False)
+        ], check=False, body=f"[watchtower] Ingested owner answer ({key}); {outcome}.")
         return updated
 
     @_serialized_body_write
@@ -3690,8 +3761,7 @@ class GitHubIssuesBackend:
         self._run([
             "issue", "comment", number,
             *self._repo_args(),
-            "--body", comment_text,
-        ])
+        ], body=comment_text)
         return self.get(ident)
 
     @_serialized_body_write
@@ -3764,7 +3834,7 @@ class GitHubIssuesBackend:
             elif key == "_history":
                 event, extra = value
                 _append_history(meta, event, **extra)
-        self._edit_body(item, body, meta, "--title", title)
+        self._edit_body(item, body, meta, "--title", _Text(title))
         return self.get(ident)
 
     def peek_next(
