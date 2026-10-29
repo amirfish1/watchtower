@@ -101,6 +101,14 @@ def test_status_hides_archived_but_all_shows_it(env):
     assert "DEAD" in {r["queue"] for r in health.all_status(project="DEAD", items=list(env))}
 
 
+def test_status_shows_archived_queue_that_gets_a_new_ticket(env):
+    """OPS-248: a ticket filed into an archived queue must not strand unseen."""
+    env.append(_item("DEAD-1", "closed"))
+    cli.cmd_queue_archive(_ns(apply=True))
+    env.append(_item("DEAD-2", "open"))
+    assert "DEAD" in {r["queue"] for r in health.all_status(items=list(env))}
+
+
 def test_models_migrate_skips_archived(env):
     assert {r["queue"] for r in mm.plan_migrate("sonnet-5", "sonnet-5-5")["rows"]} == {"LIVE", "DEAD"}
     cli.cmd_queue_archive(_ns(apply=True))

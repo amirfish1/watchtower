@@ -423,9 +423,14 @@ def all_status(
     now = now or datetime.now(timezone.utc)
     by_queue: Dict[str, List[Dict[str, Any]]] = {}
     configured = config.all_queues(include_archived=True)
+    fetched = items if items is not None else q.list_items(project=project, fresh=fresh)
+    # Archiving hides a dead queue, but a ticket filed into it afterwards
+    # (automation, a stray `wt add`) must stay visible, not strand unseen (OPS-248).
+    unclosed = {it.get("project") or "GEN" for it in fetched if it.get("status") != "closed"}
     hidden = (
         set() if include_archived
-        else {n for n in configured if config.is_archived(n) and n != project}
+        else {n for n in configured
+              if config.is_archived(n) and n != project and n not in unclosed}
     )
     configured = {n: v for n, v in configured.items() if n not in hidden}
     if project:
@@ -434,7 +439,6 @@ def all_status(
     else:
         for name in configured:
             by_queue.setdefault(name, [])
-    fetched = items if items is not None else q.list_items(project=project, fresh=fresh)
     for it in fetched:
         if (it.get("project") or "GEN") in hidden:
             continue
