@@ -98,6 +98,12 @@ def opt(args, name, default=""):
     return default
 
 
+def target(args):
+    # The issue number is gh's first positional after `issue <verb>`; flags
+    # may precede it (`issue edit --body-file - 7 ...`), as cobra allows.
+    return parse(args)[1][2]
+
+
 def opts(args, name):
     return [v for f, v, _, _ in parse(args)[0] if f == name and v is not None]
 
@@ -157,7 +163,7 @@ if (_verb and " ".join(args[:2]) == _verb
         if args[:2] == ["issue", "close"] and has(args, "--comment"):
             # Real gh posts --comment on an OPEN issue BEFORE the close
             # mutation, so a failed close leaves the comment behind.
-            issue = issue_by_number(data, args[2])
+            issue = issue_by_number(data, target(args))
             if issue["state"] == "OPEN":
                 issue["comments"].append(
                     {"author": {"login": "watchtower"}, "body": opt(args, "--comment")})
@@ -245,13 +251,13 @@ if args[:2] == ["issue", "list"]:
     sys.exit(0)
 
 if args[:2] == ["issue", "view"]:
-    issue = issue_by_number(data, args[2])
+    issue = issue_by_number(data, target(args))
     save(data)
     print(json.dumps(project_fields(issue)))
     sys.exit(0)
 
 if args[:2] == ["issue", "edit"]:
-    issue = issue_by_number(data, args[2])
+    issue = issue_by_number(data, target(args))
     for assignee in opts(args, "--add-assignee"):
         if assignee not in issue["assignees"]:
             issue["assignees"].append(assignee)
@@ -270,7 +276,7 @@ if args[:2] == ["issue", "edit"]:
     sys.exit(0)
 
 if args[:2] == ["issue", "close"]:
-    issue = issue_by_number(data, args[2])
+    issue = issue_by_number(data, target(args))
     if issue["state"] == "CLOSED":
         # Real gh (2.101 close.go:103-110) fetches the state first and returns
         # here, BEFORE posting any --comment.
@@ -293,7 +299,7 @@ if args[:2] == ["issue", "close"]:
     sys.exit(0)
 
 if args[:2] == ["issue", "comment"]:
-    issue = issue_by_number(data, args[2])
+    issue = issue_by_number(data, target(args))
     body = opt(args, "--body")
     if body:
         issue["comments"].append({"author": {"login": "watchtower"}, "body": body})
@@ -310,7 +316,7 @@ if args[:2] == ["repo", "view"]:
     sys.exit(0)
 
 if args[:2] == ["issue", "reopen"]:
-    issue = issue_by_number(data, args[2])
+    issue = issue_by_number(data, target(args))
     issue["state"] = "OPEN"
     issue["closedAt"] = None
     issue["updatedAt"] = now()
@@ -1401,7 +1407,13 @@ def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys)
     gh_state = json.loads(state.read_text())
     commands = [" ".join(c) for c in gh_state["commands"]]
     assert any(c.startswith("issue create") for c in commands)
-    assert any(c.startswith("issue edit 1") and "--add-assignee @me" in c for c in commands)
+    # gh takes flags before the positional, and the body transport puts
+    # --body-file - (recorded as --body) right after `issue edit` (WT-40).
+    assert any(
+        c[:2] == ["issue", "edit"] and c[4] == "1"
+        and " --add-assignee @me" in " ".join(c[5:])
+        for c in gh_state["commands"]
+    )
     assert any(c.startswith("issue close 1") for c in commands)
 
 
