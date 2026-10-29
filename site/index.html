@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>WatchTower - run fleets of AI coding agents unattended</title>
-<meta name="description" content="WatchTower is a CLI-first queue and fleet manager for AI coding agents. Drop work into named queues, workers drain them, and wt wait blocks until the queue is empty. Standalone, zero-dependency, local-first.">
+<meta name="description" content="WatchTower is a CLI-first queue and fleet manager for AI coding agents. Drop work into named queues, workers drain them, and wt wait blocks until no tickets remain in open status. Standalone, zero-dependency, local-first.">
 <link rel="stylesheet" href="styles.css">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='38' fill='%23f6b545'/></svg>">
 </head>
@@ -32,8 +32,8 @@
     <p class="lede">
       WatchTower is a CLI-first queue and fleet manager. You drop work into named queues.
       Workers drain them one ticket at a time: claim, fix, verify, commit, next. One command,
-      <code class="inline-code">wt wait</code>, blocks until a queue is empty, so you can gate any
-      script on a fleet of agents actually finishing.
+      <code class="inline-code">wt wait</code>, blocks until the open backlog is empty.
+      Check active tickets separately before deploying.
     </p>
     <div class="cta-row">
       <a class="btn btn-primary" href="#quickstart">Get started &rarr;</a>
@@ -43,18 +43,18 @@
     <!-- signature move: wt wait -->
     <div style="margin-top:40px">
       <div class="term">
-        <div class="term-bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>the signature move: gate a script on a fleet finishing</span></div>
+        <div class="term-bar"><i class="r"></i><i class="y"></i><i class="g"></i><span>wait for the open backlog to drain</span></div>
         <div class="term-body"><pre><span class="cmd">wt add -q LAUNCH --title "ship the release notes" --type feature</span>
 <span class="out">filed LAUNCH-42</span>
 
-<span class="cmd">wt wait -q LAUNCH --timeout 1800 --cmd "./deploy.sh"</span>
-<span class="cm"># blocks here while workers claim, fix, verify, commit...</span>
+<span class="cmd">wt wait -q LAUNCH --timeout 1800</span>
+<span class="cm"># waits until no tickets remain in open status</span>
 <span class="out">LAUNCH: 3 open  -&gt; 1 open  -&gt; </span><span class="ok">0 open, drained.</span>
-<span class="ok">&#10003; queue empty, running: ./deploy.sh</span></pre></div>
+<span class="ok">&#10003; open backlog drained; check work in progress before deploying</span></pre></div>
       </div>
       <p class="lede" style="margin-top:16px;font-size:16px">
-        No polling loop, no babysitting terminals. The queue is the ground truth: when it hits
-        zero open tickets, the work is done and your next step runs.
+        <code class="inline-code">wt wait</code> checks open tickets only. Tickets already claimed, awaiting review,
+        or blocked for an answer do not keep it waiting. Inspect those states before treating work as complete.
       </p>
     </div>
 
@@ -161,8 +161,8 @@
       <div class="step">
         <div>
           <h3>Watch it empty itself</h3>
-          <p>Glance at the strip: green means draining, red means stuck. Open the dashboard, or gate a
-             script on the queue reaching zero.</p>
+          <p>Glance at the strip: green means draining, red means stuck. Open the dashboard, or wait for the
+             open backlog to reach zero.</p>
           <div class="term">
             <div class="term-body"><pre><span class="cmd">wt status</span>
 <span class="ok">MYAPP   1 open   draining   LIVE</span>
@@ -174,7 +174,7 @@
     </div>
     <p class="lede" style="margin-top:22px">
       That is the whole loop: <b style="color:var(--text-strong)">file work, a worker drains it, the watcher
-      guarantees it.</b> You do not manage agents. You manage a queue, and watch it empty itself.
+      reports queue health.</b> You do not manage agents. You manage a queue, and watch it empty itself.
     </p>
     <div class="cta-row">
       <a class="btn btn-primary" href="cli.html">Full CLI reference &rarr;</a>
