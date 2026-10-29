@@ -242,3 +242,29 @@ def test_release_idle_workers_does_not_release_awaiting_client_worker(
     released = workers.release_idle_workers(queue="Q")
     assert released == []
     assert not (workers.STOP_SIGNALS_DIR / rec["worker_id"]).exists()
+
+
+# ------------------------------------------------- OPS-1482: block ownership
+
+def test_block_by_non_owner_is_rejected_and_leaves_claim_intact(wt, capsys):
+    item = wt.q.enqueue(project="Q", note="claimed ticket", source="test")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    assert wt.cli.main([
+        "block", item["ref"], "--worker", "worker-b", "--question", "stale block",
+    ]) == 1
+    assert "claimed by worker-a" in capsys.readouterr().err
+    found = wt.q.get(item["ref"])
+    assert found["claimed_by"] == "worker-a"
+    assert found["status"] == "in_progress"
+    assert not found.get("needs_input")
+
+
+def test_block_by_non_owner_force_overrides(wt):
+    item = wt.q.enqueue(project="Q", note="claimed ticket", source="test")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+
+    assert wt.cli.main([
+        "block", item["ref"], "--worker", "worker-b", "--question", "deliberate",
+        "--force",
+    ]) == 0

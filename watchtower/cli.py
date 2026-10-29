@@ -2946,16 +2946,21 @@ def cmd_block(args: argparse.Namespace) -> int:
             print(error, file=sys.stderr)
             return 1
         commit = verified
-    item = q.block(
-        args.ref, session_id=args.worker,
-        question=args.question, progress=args.progress,
-        kind=getattr(args, "kind", "input"),
-        commit=commit,
-        origin="worker",
-        wait_on=getattr(args, "wait_on", "") or "",
-        wait_actor=getattr(args, "wait_actor", "") or "",
-        wait_ref=getattr(args, "wait_ref", "") or "",
-    )
+    try:
+        item = q.block(
+            args.ref, session_id=args.worker,
+            question=args.question, progress=args.progress,
+            kind=getattr(args, "kind", "input"),
+            commit=commit,
+            origin="worker",
+            wait_on=getattr(args, "wait_on", "") or "",
+            wait_actor=getattr(args, "wait_actor", "") or "",
+            wait_ref=getattr(args, "wait_ref", "") or "",
+            force=bool(getattr(args, "force", False)),
+        )
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
@@ -7210,6 +7215,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--commit", default="", metavar="SHA",
                    help="verified commit SHA recording what this turn did, "
                         "same local `git rev-parse` proof as `wt close --commit`")
+    s.add_argument("--force", action="store_true",
+                   help="block even though another worker holds the claim")
     s.add_argument("--wait-on", dest="wait_on", default="", choices=list(q.WAIT_ON),
                    help="who this block waits on: owner = a decision only the owner "
                         "can make (red 'needs you'); external = a client/studio/vendor "
