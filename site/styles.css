@@ -311,3 +311,13 @@ footer {
   table.matrix { font-size: 13.5px; }
   table.matrix th:nth-child(3), table.matrix td:nth-child(3) { display: none; }
 }
+
+/* Mobile overflow fixes: let grid children shrink so code blocks scroll
+   inside their own box, and wrap long flag names in reference tables. */
+.step > div, .grid > *, .wrap { min-width: 0; }
+table.flags td { overflow-wrap: anywhere; }
+@media (max-width: 640px) {
+  table.flags, table.flags tbody, table.flags tr, table.flags td { display: block; width: auto; }
+  table.flags tr { border-top: 1px solid var(--border-soft); padding: 6px 0; }
+  table.flags td, table.flags td:first-child { border-top: 0; padding: 2px 10px; width: auto; white-space: normal; }
+}

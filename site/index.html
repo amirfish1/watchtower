@@ -80,7 +80,7 @@
     <h2>A list that empties itself, and turns red when something is wrong.</h2>
     <p class="lede">
       WatchTower makes background agent work legible. No new IDE to live in, no habits to learn.
-      The engine is a single durable JSON queue: append-only, file-locked, stdlib-only Python, zero
+      The engine is a durable local queue: file-locked, stdlib-only Python, zero
       runtime dependencies.
     </p>
     <div class="grid g3">
@@ -120,7 +120,7 @@
       <div class="term-body"><pre><span class="cmd">git clone https://github.com/amirfish1/watchtower.git</span>
 <span class="cmd">cd watchtower &amp;&amp; pip install -e .</span>
 <span class="cmd">wt --version</span>
-<span class="out">wt 0.1.0</span></pre></div>
+<span class="out">wt 0.8.3</span></pre></div>
     </div>
     <div class="note green">
       <b>Prefer to see it first?</b> <code class="inline-code">./examples/quickstart-demo.sh</code> files a ticket,
@@ -143,8 +143,7 @@
           <p>Create the queue and tell it which repo and engine to use. Turning auto-drain on
              also starts the background service.</p>
           <div class="term">
-            <div class="term-body"><pre><span class="cmd">wt config -q MYAPP --engine claude --auto-drain on</span>
-<span class="cmd">wt set -q MYAPP --repo-path /path/to/your/repo</span></pre></div>
+            <div class="term-body"><pre><span class="cmd">wt config -q MYAPP --engine claude --repo-path /path/to/your/repo --auto-drain on</span></pre></div>
           </div>
         </div>
       </div>
@@ -201,7 +200,7 @@
           Named queues and a durable ledger. Autonomous claim/fix/verify/commit workers.
           The queue-health watcher and auto-nudge. <code class="inline-code">wt wait</code> gating.
           Document import into tickets. Cross-agent messaging (send, ask, group chats).
-          A local dashboard on 127.0.0.1. Claude and Codex engines.
+          A local dashboard on 127.0.0.1. Claude, Codex, Kimi and Devin worker engines.
         </p>
       </div>
       <div class="card">
@@ -239,7 +238,7 @@
   <div class="wrap foot-inner">
     <div>
       <div class="brand" style="margin-bottom:8px"><span class="beacon"></span>WatchTower</div>
-      <div>CLI-first queue and fleet manager for AI coding agents. MIT licensed.</div>
+      <div>CLI-first queue and fleet manager for AI coding agents. Source-available under the <a href="https://github.com/amirfish1/watchtower/blob/main/LICENSE">WatchTower Software License</a>: free for non-commercial use, commercial use requires permission.</div>
     </div>
     <div class="foot-links">
       <a href="#install">Install</a>
