@@ -386,7 +386,7 @@ def test_gating_waits_until_every_claiming_host_honors_the_hold(tmp_path, monkey
     q._MACHINE_TAG_CACHE = None
     data = json.loads(state.read_text())
     for issue in data["issues"]:
-        issue["body"] = issue["body"].replace('"pipeline": 2', '"pipeline": 1')
+        issue["body"] = issue["body"].replace('"pipeline": 2', '"pipeline": 0')
     state.write_text(json.dumps(data))
 
     with pytest.raises(ValueError, match="ami"):
