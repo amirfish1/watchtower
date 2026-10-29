@@ -10,6 +10,8 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -18,6 +20,13 @@ PIPELINE_FIELDS = ("gates", "plan", "stage_session", "stage_retired")
 _HOLD_KEYS = ("work_it", "auto_eligible", "manual_eligible", "claimable")
 
 _CACHE: Dict[str, Any] = {"sig": None, "data": None}
+_OWNER: Dict[str, str] = {}
+
+# Stamped on every GitHub claim this code makes. Gating a ticket requires every
+# machine that claimed the queue within READER_WINDOW_S to have stamped it, so
+# a host whose `wt` would ignore the plan hold cannot be claiming there (OPS-203).
+PIPELINE_PROTO = 1
+READER_WINDOW_S = 14 * 86400
 
 
 class SidecarCorrupt(RuntimeError):
@@ -31,6 +40,75 @@ def path() -> Path:
 
 def key(item: Dict[str, Any]) -> str:
     return f"{item.get('github_repo') or ''}#{item.get('number')}"
+
+
+def owner_id() -> str:
+    """This store's persistent pipeline owner id. ``machine_tag()`` is three
+    characters and can collide across hosts, so ownership keys on a UUID made
+    once per store (O_EXCL, so concurrent first calls agree)."""
+    p = path().with_name("pipeline-owner.json")
+    if str(p) in _OWNER:
+        return _OWNER[str(p)]
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError:
+        oid = ""
+        for _ in range(50):  # a concurrent creator may not have written yet
+            try:
+                oid = str(json.loads(p.read_text()).get("id") or "")
+            except json.JSONDecodeError:
+                oid = ""
+            if oid:
+                break
+            time.sleep(0.02)
+        if not oid:
+            raise SidecarCorrupt(f"{p} has no owner id; refusing to guess one")
+    else:
+        oid = uuid.uuid4().hex
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"id": oid, "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}, fh)
+    _OWNER[str(p)] = oid
+    return oid
+
+
+def owner_marker() -> str:
+    """The ``pipeline_host`` value this store writes: ``<machine_tag>/<owner id>``."""
+    from . import queue as q
+    return f"{q.machine_tag()}/{owner_id()}"
+
+
+def _mine(marker: str) -> bool:
+    """A bare tag is the OPS-201 marker format; it stays ours while it equals
+    our tag, and the next gate write upgrades it to the owner-id form."""
+    from . import queue as q
+    if "/" in marker:
+        return marker == owner_marker()
+    return marker == q.machine_tag()
+
+
+def _owner_fields(item: Dict[str, Any], marker: str) -> None:
+    host, _, oid = marker.partition("/")
+    item["pipeline_owner_host"] = host
+    item["pipeline_owner_id"] = oid
+
+
+def stale_readers(items: List[Dict[str, Any]], now: Optional[float] = None) -> Dict[str, str]:
+    """Machines (other than this one) whose latest claim in the window was made
+    by a `wt` that does not stamp PIPELINE_PROTO, mapped to that claim's time."""
+    from . import queue as q
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                           time.gmtime((now or time.time()) - READER_WINDOW_S))
+    latest: Dict[str, Any] = {}
+    for it in items:
+        for h in it.get("history") or []:
+            at, machine = str(h.get("at") or ""), str(h.get("machine") or "")
+            if h.get("event") != "claim" or not machine or at < cutoff:
+                continue
+            if machine not in latest or at > latest[machine][0]:
+                latest[machine] = (at, h.get("pipeline"))
+    return {m: at for m, (at, proto) in latest.items()
+            if m != q.machine_tag() and int(proto or 0) < PIPELINE_PROTO}
 
 
 def _read_strict() -> Dict[str, Any]:
@@ -90,9 +168,10 @@ def _hold(item: Dict[str, Any]) -> None:
 
 def overlay(item: Dict[str, Any]) -> Dict[str, Any]:
     """Apply sidecar state to a freshly built GitHub item (in place)."""
-    from . import queue as q
     host = str(item.get("pipeline_host") or "")
-    if host and host != q.machine_tag():
+    if host:
+        _owner_fields(item, host)
+    if host and not _mine(host):
         item["pipeline_foreign"] = True
         _hold(item)
         return item
@@ -106,6 +185,7 @@ def overlay(item: Dict[str, Any]) -> Dict[str, Any]:
         return item
     _apply(item, entry)
     item["pipeline_local"] = True   # this host's stage tick owns the pipeline
+    from . import queue as q
     if q.plan_pending(item):
         _hold(item)
     return item
@@ -130,7 +210,9 @@ def _fence(item: Dict[str, Any]) -> None:
     from . import queue as q
     if item.get("pipeline_foreign"):
         raise ValueError(f"{item.get('ref')}: its pipeline is owned by host "
-                         f"{item.get('pipeline_host')!r}, not {q.machine_tag()!r}")
+                         f"{item.get('pipeline_owner_host')!r} (owner id "
+                         f"{item.get('pipeline_owner_id') or 'legacy'}), not this store "
+                         f"({owner_marker()}); inspect it there with `wt plan show {item.get('ref')}`")
     if item.get("pipeline_missing"):
         raise ValueError(f"{item.get('ref')}: marked for this host's pipeline but the "
                          f"sidecar entry is missing; re-run `wt edit {item.get('ref')} --gate ...`")
@@ -198,7 +280,6 @@ def set_gates(ident: Any, gates: List[str]) -> Optional[Dict[str, Any]]:
         return None
     if item.get("pipeline_foreign"):
         _fence(item)
-    tag = q.machine_tag()
     k = key(item)
     if (gates and item.get("claimed_by") and item.get("plan") is None
             and item.get("claimed_by") != os.environ.get("WT_WORKER_ID")):
@@ -208,14 +289,30 @@ def set_gates(ident: Any, gates: List[str]) -> Optional[Dict[str, Any]]:
         raise ValueError(f"{item.get('ref')} is claimed by {item.get('claimed_by')}; a plan "
                          f"gate cannot pause a running build. Gate it once released.")
     if gates:
-        if item.get("pipeline_host") != tag:
-            backend.update(ident, pipeline_host=tag)
+        marker = owner_marker()
+        if item.get("pipeline_host") != marker:
+            stale = stale_readers(backend.list_items(None))
+            if stale:
+                raise ValueError(
+                    f"{item.get('ref')}: cannot gate yet; these hosts claimed this queue "
+                    f"with a wt that ignores the plan hold: "
+                    + ", ".join(f"{m} (last claim {at})" for m, at in sorted(stale.items()))
+                    + ". Update them; a fresh claim from each clears this.")
+            backend.update(ident, pipeline_host=marker)
+            # No CAS on issue edits: trust the persisted marker, not our write.
+            # A racing host that wrote last owns it; we write no sidecar entry.
+            persisted = backend.get(ident) or {}
+            if persisted.get("pipeline_host") != marker:
+                raise ValueError(f"{item.get('ref')}: pipeline marker write lost to "
+                                 f"{persisted.get('pipeline_host') or 'a concurrent clear'!r}; "
+                                 f"not gated")
         with q._FileLock(q._lock_path()):
             data = _read_strict()
             entry = data["items"].setdefault(k, {"plan": {}, "history": [], "rev": 0})
             entry["gates"] = list(gates)
             entry["ref"] = item.get("ref")
-            entry["host"] = tag
+            entry["host"] = q.machine_tag()
+            entry["owner"] = marker
             entry["rev"] = int(entry.get("rev") or 0) + 1
             entry["updated_at"] = q._now_iso()
             _write(data)

@@ -41,7 +41,7 @@ def test_plan_gate_holds_github_ticket_until_plan_accepted(tmp_path, monkeypatch
     q.update(ref, gates=["plan"])
 
     item = q.get(ref)
-    assert item["gates"] == ["plan"] and item["pipeline_host"] == "her"
+    assert item["gates"] == ["plan"] and item["pipeline_owner_host"] == "her"
     assert "pipeline_host" in _body(state)
     assert q.count_claimable(project="GHI") == 0
     assert q.claim_next("builder-1", project="GHI") is None
@@ -207,3 +207,60 @@ def test_the_claimant_may_gate_its_own_build(tmp_path, monkeypatch):
     assert item["claimed_by"] == "becky-worker" and item["gates"] == ["plan"]
     from watchtower import stages
     assert [d["role"] for d in stages.desired([item])] == ["planner"]
+
+
+def test_ownership_keys_on_the_store_not_the_machine_tag(tmp_path, monkeypatch):
+    """OPS-203: two stores whose hosts share a tag must not both own an issue,
+    and a marker write that a racing host overwrote must not gate."""
+    _state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    backend = q._github_backend_for_project("GHI")
+    backend.update(ref, pipeline_host="her/0123456789abcdef0123456789abcdef")
+
+    item = q.get(ref)
+    assert item["pipeline_foreign"] and not item["work_it"]
+    assert item["pipeline_owner_host"] == "her"
+    with pytest.raises(ValueError, match="owned by host 'her'"):
+        q.update(ref, gates=["plan"])
+
+    backend.update(ref, pipeline_host="")
+    real_update = type(backend).update
+
+    def racing_update(self, ident, **fields):
+        out = real_update(self, ident, **fields)
+        if fields.get("pipeline_host"):
+            real_update(self, ident, pipeline_host="ami/fedcba9876543210fedcba9876543210")
+        return out
+
+    monkeypatch.setattr(type(backend), "update", racing_update)
+    with pytest.raises(ValueError, match="marker write lost"):
+        q.update(ref, gates=["plan"])
+    from watchtower import github_pipeline
+    assert not _sidecar(q).exists() or github_pipeline.key(item) not in json.loads(
+        _sidecar(q).read_text())["items"]
+    assert q.get(ref)["pipeline_foreign"]
+
+
+def test_gating_waits_until_every_claiming_host_honors_the_hold(tmp_path, monkeypatch):
+    """OPS-203: a host whose wt predates the plan hold would claim a gated
+    ticket, so gating is refused while one claimed the queue recently."""
+    state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    other = q.enqueue(project="GHI", note="mac work", text="body")["ref"]
+    q._MACHINE_TAG_CACHE = "ami"
+    assert q.claim_by_ref(other, "ami-worker")
+    q._MACHINE_TAG_CACHE = None
+    data = json.loads(state.read_text())
+    for issue in data["issues"]:
+        issue["body"] = issue["body"].replace('"pipeline": 1', '"pipeline": 0')
+    state.write_text(json.dumps(data))
+
+    with pytest.raises(ValueError, match="ami"):
+        q.update(ref, gates=["plan"])
+    assert "pipeline_host" not in json.loads(state.read_text())["issues"][0]["body"]
+
+    q.close(other)
+    third = q.enqueue(project="GHI", note="more mac work", text="body")["ref"]
+    q._MACHINE_TAG_CACHE = "ami"
+    assert q.claim_by_ref(third, "ami-worker")
+    q._MACHINE_TAG_CACHE = None
+    q.update(ref, gates=["plan"])
+    assert q.get(ref)["gates"] == ["plan"]

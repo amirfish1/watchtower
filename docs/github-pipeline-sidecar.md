@@ -15,8 +15,12 @@ pin it.
 
 - The sidecar never stores ticket state; GitHub never stores pipeline state.
 - **One GitHub write** belongs to the pipeline: the meta key
-  `pipeline_host: <machine_tag>`, written when gates are set (and removed when
-  they are cleared). It is the federation fence (below).
+  `pipeline_host: <machine_tag>/<owner id>`, written when gates are set (and
+  removed when they are cleared). It is the federation fence (below). The
+  owner id is a UUID made once per store in `pipeline-owner.json` beside the
+  sidecar (OPS-203): `machine_tag()` is 3 chars and can collide, the UUID
+  cannot. A bare `<machine_tag>` marker (OPS-201 format) still counts as this
+  host's; the next `wt edit --gate` upgrades it.
 
 ## Identity and storage
 
@@ -39,10 +43,12 @@ copies `gates`/`plan`/`stage_session`, merges pipeline history into
 - `plan_pending(item)` ⇒ `work_it = auto_eligible = manual_eligible =
   claimable = False`. This one point covers `claim_next`, `claim_by_ref`,
   `peek_next`, `count_claimable`, `count_manual_eligible` (all read work_it).
-- **Foreign host**: meta `pipeline_host` ≠ this `machine_tag()` ⇒
+- **Foreign host**: meta `pipeline_host` ≠ this store's marker ⇒
   `pipeline_foreign = True`, not claimable, `stages.desired()` skips it,
   `wt edit --gate` refuses. A host without the state never builds a gated
-  ticket unplanned.
+  ticket unplanned. Every marked item carries `pipeline_owner_host` /
+  `pipeline_owner_id` (`wt find --json`), and the fence error names the
+  owning host to run `wt plan show` on.
 - **Missing state**: meta `pipeline_host` == this host but no sidecar entry
   (lost/corrupt file) ⇒ `pipeline_missing = True`, not claimable, fail-closed
   (surfaced by `wt find`); recovery = re-run `wt edit <ref> --gate …`.
@@ -68,9 +74,18 @@ closed/answered ticket).
 ## Write path for gates
 
 `wt edit <ref> --gate plan[:model]` on a GitHub ref:
-validate → refuse if foreign host → write `pipeline_host` marker via
-`backend.update` (existing body CAS/merge handles write conflicts; GitHub
-down ⇒ edit fails, nothing local written) → write sidecar entry. Crash
+validate → refuse if foreign host → **reader check** → write `pipeline_host`
+marker via `backend.update` → **re-read the issue and require our marker**
+(GitHub has no CAS on issue edits: a host that wrote last owns it, and the
+loser fails with no sidecar entry; GitHub down ⇒ edit fails, nothing local
+written) → write sidecar entry.
+
+Reader check (OPS-203): a `wt` older than the hold would claim a plan-pending
+ticket. Every GitHub claim now stamps `pipeline: 1` on its history event, and
+gating is refused while any other machine's latest claim on the queue in the
+last 14 days lacks it. The error names the host and its last claim. Once that
+host runs this version, its next claim clears the check. A retired host ages
+out after 14 days. Crash
 between the two ⇒ marker without entry ⇒ fail-closed `pipeline_missing`, never
 an unplanned build. Gating a ticket a builder already holds is **refused**
 (the claim is left untouched): the hold only excludes new claims, so a running
@@ -112,13 +127,12 @@ Codex review scored the doc-only contract 3/10. Disposition:
   ("failed" builds loudly) (#2); status prechecks outside the lock in
   plan_submit/verdict/decide (#9); spawn-before-record (#11) and no
   desired() recheck right before spawn (#10). The sidecar inherits these.
-- **Open, blocks activation on a multi-host queue** (#3/#4): the marker is
-  not a distributed lock. Two hosts can race to gate the same issue, and a
-  host running a `wt` older than this change ignores the hold entirely and
-  will claim a plan-pending ticket. `machine_tag()` is 3 chars and can
-  collide. BECKY is claimed from `her` and `ami`, so BECKY activation needs
-  every claiming host on this version first (OPS-203, which also carries
-  the Mac-side duplicate_of gate inheritance, OPS-1456/1457 there).
+- Closed by OPS-203 (#3/#4): per-store owner UUID in the marker, verified
+  marker write (lost race = not gated), and the reader check above. What
+  remains: a host that is downgraded, or a new host that claims for the
+  first time, *after* a ticket was gated is not fenced. The check runs at
+  gate time only. GitHub duplicate links (Mac OPS-1456) need verify/review
+  proof on GitHub first, so they follow OPS-204.
 - Open, follow-up: `plan_decide` on GitHub does not reopen an
   `in_progress` ticket without a resumable session (#6); no gate
   generation/tombstone fences an old worker across clear → re-enable (#12).
@@ -126,8 +140,10 @@ Codex review scored the doc-only contract 3/10. Disposition:
 
 ## Activation / resume procedure
 
-0. Preconditions: every host that claims the queue runs a `wt` with this
-   change (`wt version` / repo at or after the OPS-201 commit); the ticket is
+0. Preconditions: every host that claims the queue runs a `wt` at or after
+   the OPS-203 commit (git -C <its wt checkout> merge-base --is-ancestor; on
+   the Mac that checkout is `~/.ccc/watchtower`, see the `~/.local/bin/wt`
+   shim). `wt edit --gate` enforces this from claim stamps; the ticket is
    unclaimed, or gated by its own claimant (`WT_WORKER_ID` == claimed_by), which
    then waits for the plan. Another worker's live claim is refused.
 0b. The stage tick runs in the reconciler: it plans GitHub tickets only once

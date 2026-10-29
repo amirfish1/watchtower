@@ -2963,7 +2963,10 @@ class GitHubIssuesBackend:
             })
             if session_uuid:
                 meta["claimed_session_id"] = str(session_uuid)
-            self._usage_history(meta, number, "claim", session_id=str(session_uuid or ""), worker=str(session_id))
+            from .github_pipeline import PIPELINE_PROTO
+            # Tells gating hosts this claimant honors the plan hold (OPS-203).
+            self._usage_history(meta, number, "claim", session_id=str(session_uuid or ""),
+                                worker=str(session_id), pipeline=PIPELINE_PROTO)
             self._ensure_labels()
             self._edit_body(item, body, meta,
                             "--add-assignee", self.assignee,
