@@ -1185,8 +1185,11 @@ def _set_pipeline_hold(meta: Dict[str, Any], why: str) -> None:
                     "prev_reason": str(meta.get("defer_reason") or "")}
         meta["pipeline_hold"] = dict(hold, why=why)
         meta["deferred_until"] = PIPELINE_HOLD_UNTIL
-        meta["defer_reason"] = (f"pipeline hold ({why}): it settles on the host that "
-                                f"owns its gates; a wt without that pipeline must not claim it")
+        meta["defer_reason"] = (
+            f"duplicate hold: it completes with {meta.get('duplicate_of') or 'its original'}"
+            if why == "duplicate" else
+            f"pipeline hold ({why}): it settles on the host that "
+            f"owns its gates; a wt without that pipeline must not claim it")
         return
     if not isinstance(hold, dict):
         return
@@ -1989,7 +1992,9 @@ class GitHubIssuesBackend:
         # `wt defer`: inside its data window a ticket is out of the pool for
         # claims and spawn depth alike, ▶ included (queue._claim_candidates).
         deferred = _defer_live(deferred_until)
-        workable = queue_member and status == "open" and not deferred
+        # A duplicate follower waits on its original (OPS-208), whatever the defer says.
+        workable = (queue_member and status == "open" and not deferred
+                    and not meta.get("duplicate_of"))
         auto_eligible = bool(
             workable
             and self.auto_drain
@@ -2103,6 +2108,11 @@ class GitHubIssuesBackend:
             item["pipeline_hold"] = dict(meta["pipeline_hold"])
         if isinstance(meta.get("wait"), dict):
             item["wait"] = dict(meta["wait"])
+        if meta.get("duplicate_of"):
+            item["duplicate_of"] = str(meta["duplicate_of"])
+            item["duplicate_gen"] = int(meta.get("duplicate_gen") or 0)
+            if isinstance(meta.get("duplicate_result"), dict):
+                item["duplicate_result"] = dict(meta["duplicate_result"])
         history = meta.get("history")
         if isinstance(history, list):
             item["history"] = list(history)
@@ -3639,6 +3649,22 @@ class GitHubIssuesBackend:
                     meta.pop("pipeline_host", None)
             elif key == "pipeline_hold":
                 _set_pipeline_hold(meta, str(value or ""))
+            elif key in ("duplicate_of", "duplicate_gen", "duplicate_result"):
+                # OPS-208: the link is a ticket relationship every host reads.
+                if value:
+                    meta[key] = value
+                else:
+                    meta.pop(key, None)
+                if key == "duplicate_of" and not value:
+                    _append_history(meta, "duplicate_clear", by={"kind": "human"})
+                if key == "duplicate_result" and isinstance(value, dict):
+                    _append_history(meta, "duplicate_result", by={"kind": "system"},
+                                    original=value.get("ref"), passed=value.get("complete"),
+                                    original_status=value.get("status"),
+                                    stale=value.get("stale"))
+            elif key == "_history":
+                event, extra = value
+                _append_history(meta, event, **extra)
         self._edit_body(item, body, meta, "--title", title)
         return self.get(ident)
 

@@ -943,6 +943,12 @@ def reconcile_stages(only_ref: str = "") -> List[Tuple[str, str]]:
         _log("INTEGRATE", f"group sweep error: {exc}")
     items = q.list_items() or []
     try:
+        from . import github_duplicates
+        for ref in github_duplicates.sweep(items, only_ref):
+            budget.acted.append((ref, "duplicate:synced"))
+    except Exception as exc:  # noqa: BLE001 - one follower never stops the pass
+        _log("DUPLICATE", f"duplicate sweep error: {exc}")
+    try:
         budget.acted.extend(_retire_pass(items, only_ref))
     except Exception as exc:  # noqa: BLE001
         _log("STAGE_RETIRED", f"retire pass error: {exc}")

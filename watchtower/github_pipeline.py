@@ -319,6 +319,8 @@ def mutate(ident: Any, fn: Callable[[Dict[str, Any]], Any],
 
 def _hold_reason(it: Dict[str, Any]) -> str:
     from . import queue as q
+    if it.get("duplicate_of"):
+        return "duplicate"   # OPS-208: the follower waits on its original
     if it.get("review_hold"):
         return "review"
     return "plan" if q.plan_pending(it) else ""
@@ -437,7 +439,24 @@ def _finalize(ident: Any, it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         cur.pop("gate_stages", None)
         if final == "open":
             cur["gate_feedback"] = str(hold.get("reason") or "")
-    return mutate(ident, _clear, skip_returns_item=True) or q.get(ident)
+    out = mutate(ident, _clear, skip_returns_item=True) or q.get(ident)
+    if final == "close":
+        _sync_followers(ident)
+    return out
+
+
+def _sync_followers(ident: Any) -> None:
+    """An original just settled: its duplicates inherit now, not a tick later
+    (OPS-208). The stage tick retries anything this misses."""
+    from . import github_duplicates, queue as q
+    ref = str((q.get(ident) or {}).get("ref") or ident)
+    for f in _backend_for(ident).list_items(None, fresh=True):
+        if f.get("duplicate_of") == ref:
+            try:
+                github_duplicates.sync(str(f["ref"]))
+            except Exception as exc:  # noqa: BLE001 - the tick retries
+                q._log("DUPLICATE", f"{f.get('ref')}: sync after {ref} settled failed: {exc}",
+                       queue=str(f.get("project") or ""))
 
 
 def _decide(ident: Any, check: Callable[[Dict[str, Any]], Optional[str]],

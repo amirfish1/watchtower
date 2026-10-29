@@ -4533,12 +4533,13 @@ def _sync_duplicates_unlocked(data: Dict[str, Any]) -> None:
 def link_duplicate(ident: Any, original_ref: str, worker: str = "") -> Optional[Dict[str, Any]]:
     """Explicitly declare the same incident; wait for its original, never spawn.
 
-    Both tickets must be local, in the same queue, outside plan groups. Refuse
+    Both tickets must be in the same queue, outside plan groups. Refuse
     chains/cycles and weaker original gates. Clearing the link reopens the
-    follower for independent work.
+    follower for independent work. GitHub refs: github_duplicates (OPS-208).
     """
     if _github_backend_for_project(_project_from_ident(ident)) is not None:
-        raise ValueError("duplicate links currently require a local queue")
+        from . import github_duplicates
+        return github_duplicates.link(ident, original_ref, worker)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         it = next((i for i in data["items"] if _matches(i, ident)), None)
@@ -4651,10 +4652,10 @@ def close(
     ``expect_owner``). Callers that close by ref without asserting ownership
     (e.g. dedup-close) pass no ``session_id`` and are unaffected. ``force=True``
     bypasses the guard for a human deliberately force-closing someone's ticket."""
+    cur = get(ident)
+    if cur is not None and cur.get("duplicate_of"):
+        raise ValueError(f"{cur.get('ref', ident)} follows duplicate original {cur['duplicate_of']}; clear the link before independent work")
     if _github_backend_for_project(_project_from_ident(ident)) is None:
-        cur = get(ident)
-        if cur is not None and cur.get("duplicate_of"):
-            raise ValueError(f"{cur.get('ref', ident)} follows duplicate original {cur['duplicate_of']}; clear the link before independent work")
         if cur is not None and group_role(cur) == "parent":
             raise ValueError(f"{cur.get('ref', ident)} is a group parent: it closes through its "
                              f"integration once every member is closed (`wt group show "
