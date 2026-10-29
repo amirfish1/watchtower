@@ -744,6 +744,15 @@ def claim_owner(item: Dict[str, Any], ctx: Optional[ResolverContext] = None) -> 
     if sid and any(w.get("alive") and str(w.get("session_id") or "") == sid
                    and workers.record_liveness(w)[0] == "alive" for w in ctx.rows()):
         return Verdict("alive", "wt_record", "", cp)
+    if (cp.get("bound") == "ambient" or not cp.get("pid")) and sid:
+        # An ambient claim has no process to probe, but a session whose
+        # transcript/rollout was written recently is demonstrably working
+        # (OPS-1487): any engine, since an ambient claim records none.
+        engines = [cp["engine"]] if cp.get("engine") else _TRANSCRIPT_ENGINES
+        for engine in engines:
+            mt = _transcript_mtime(str(engine), sid)
+            if mt and ctx.now - mt < RECENT_SESSION_S:
+                return Verdict("alive", "session_transcript", "", cp)
     if cp.get("bound") == "ambient" or not cp.get("pid"):
         return Verdict("unproven", "", "ambient claim (no bound process)"
                        if cp.get("bound") == "ambient" else "no pid recorded", cp)
