@@ -5831,7 +5831,11 @@ def requeue_orphaned_tickets(
                 item = _q.update_status(
                     ref, "open", quiet=True, require_status="in_progress", reason=why,
                     orphan=({"session_id": sid_d, "claimed_by": claimer}
-                            if (sid_d or claimer) else None))
+                            if (sid_d or claimer) else None),
+                    # WT-39: reopen only the claim judged dead from this
+                    # snapshot; a fresh read naming another claimer, session
+                    # or host (or a parked question) leaves it alone.
+                    expect={k: it.get(k) for k in _liveness._CLAIM_KEYS})
             else:
                 # CAS on the snapshot this decision was made from (claim
                 # fields, claim_proc, state fingerprint); records the backstop.

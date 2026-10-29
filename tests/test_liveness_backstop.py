@@ -975,14 +975,21 @@ def test_orphan_requeue_leaves_foreign_github_claim_alone(lv, monkeypatch):
     lv.kill()
     item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine=FOREIGN,
                             claimed_at="2000-01-01T00:00:00Z")
-    reopened = []
+    reopened, fences = [], []
     monkeypatch.setattr(lv.q, "update_status",
-                        lambda ref, st, **k: reopened.append((ref, st)) or dict(item, status=st))
+                        lambda ref, st, **k: reopened.append((ref, st)) or
+                        fences.append(k.get("expect")) or dict(item, status=st))
     assert lv.workers.requeue_orphaned_tickets(grace_s=0) == [] and reopened == []
     local = dict(item, claimed_machine=lv.q.machine_tag())
     monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(local)])
     lv.workers.requeue_orphaned_tickets(grace_s=0)
     assert reopened == [("GH-1", "open")]
+    # The reopen is fenced on the snapshot's claim identity, so a fresh read
+    # naming another claimer/session/host (the backend checks it under the
+    # body lock) leaves the claim alone.
+    assert fences == [{k: local.get(k) for k in lv.liveness._CLAIM_KEYS}]
+    assert fences[0]["claimed_by"] == "becky-1" and \
+        fences[0]["claimed_machine"] == lv.q.machine_tag()
 
 
 def test_foreign_claim_without_any_heartbeat_never_asks_a_human(lv, monkeypatch):

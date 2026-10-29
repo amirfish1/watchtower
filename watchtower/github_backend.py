@@ -3057,6 +3057,7 @@ class GitHubIssuesBackend:
         reason: str = "",
         expect_owner: str = "",
         require_status: Optional[str] = None,
+        expect: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if status not in ("open", "in_progress", "closed"):
             raise ValueError("status must be one of ('open', 'in_progress', 'closed')")
@@ -3075,6 +3076,13 @@ class GitHubIssuesBackend:
         # closed ticket and the worker had to close it twice).
         if require_status is not None and item.get("status") != require_status:
             return None
+        # WT-39: the claim identity the caller decided on (the orphan sweep's
+        # dead local worker) must still be the one on the fresh read, else a
+        # live claim taken since -- possibly on another host -- is cleared.
+        if expect is not None:
+            from . import queue as _q
+            if not _q.claim_expect_holds(item, expect):
+                return None
         # No queue-label guard on close: the label admitted nothing to begin
         # with, and refusing to close an issue a worker just finished because
         # of a missing label only ever stranded finished work.
