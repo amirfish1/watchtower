@@ -5836,6 +5836,9 @@ def requeue_orphaned_tickets(
                     state="work.claimed")
             if item:
                 reopened.append(dict(item, requeue_reason=why))
+                if sid_d:
+                    from . import messages
+                    messages.stop_displaced_successor(str(ref), sid_d)  # WT-23
         except Exception:
             pass
     return reopened

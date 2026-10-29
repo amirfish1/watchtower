@@ -3153,6 +3153,8 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
     sid = item.get("claimed_session_id")
     if not sid:
         return 0
+    prompt += answers.ownership_check(str(item.get("ref") or ""),
+                                      str(item.get("claimed_by") or ""))  # WT-23
     # Context-budget escalation for the answer-resume path. Resuming the
     # original session is normally right (its investigation context makes the
     # answer land), so the threshold here is intentionally HIGHER than the

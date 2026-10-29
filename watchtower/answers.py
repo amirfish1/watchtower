@@ -138,7 +138,29 @@ def _carried_text(pa: Dict[str, Any], item: Dict[str, Any]) -> str:
         f"(to: {r.get('question', '')})" for r in rows)
 
 
+def ownership_check(ref: str, worker_id: str) -> str:
+    """Sentence telling a resumed session to re-check the claim before acting.
+
+    The answer may be delivered to a CCC lineage successor of the parked
+    session, or the ticket may be reopened for another worker while the
+    resumed session is still working (WT-23, BECKY-2970). Naming the claimed
+    worker id makes ``claimed_by_you`` answer by worker id, so the check works
+    from a successor whose own session id never held the claim. Empty when
+    the worker id is unknown: a session-id check would then wrongly fail for
+    a legitimate successor."""
+    if not worker_id:
+        return ""
+    return (f" Before each edit, commit, or close, run `wt find {ref} --json --worker "
+            f"{worker_id}`: unless it reports `claimed_by_you: true`, {ref} was reassigned, "
+            f"so stop, change nothing more, and do not commit or close it.")
+
+
 def answer_prompt(item: Dict[str, Any], pa: Dict[str, Any]) -> str:
+    return _answer_prompt(item, pa) + ownership_check(
+        str(item["ref"]), str(pa.get("prior_worker_id") or ""))
+
+
+def _answer_prompt(item: Dict[str, Any], pa: Dict[str, Any]) -> str:
     ref, gen, text = item["ref"], pa.get("gen"), pa.get("answer", "")
     tag = (f"[answer {ref}#{gen}; ignore a repeat of a tag you already applied] ")
     kind = str(item.get("block_kind") or "")

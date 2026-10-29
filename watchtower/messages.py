@@ -1268,6 +1268,38 @@ def ccc_forward_target(sid: str, timeout_s: float = 1.5) -> Optional[str]:
     return forwarded if forwarded and forwarded != sid else None
 
 
+def stop_displaced_successor(ref: str, sid: str) -> Optional[Dict[str, Any]]:
+    """Tell the CCC lineage successor of ``sid`` that ``ref`` was taken away.
+
+    ``_stale_claim_stop_prefix`` only guards messages addressed to the
+    displaced session itself. When CCC forwarded the answer-resume to a
+    successor (WT-23: codex parker 01a1732e -> claude a5b71f4a on BECKY-2970),
+    that successor never held the claim, so nothing told it to stop and it
+    kept editing and committing after the ticket moved on. Sent as a steer and
+    held (1 h TTL) when the successor cannot take it now; deliberately not
+    bound to the ticket, since the outbox would cancel it on the very claim
+    change it reports. None when ``sid`` has no forward. Best-effort."""
+    try:
+        fwd = ccc_forward_target(sid)
+    except Exception:
+        return None
+    if not fwd:
+        return None
+    text = (
+        f"[WATCHTOWER] STOP work on ticket {ref} now. CCC forwarded session "
+        f"{sid[:8]}'s resume to you, but WatchTower has reopened {ref} and it "
+        f"belongs to another worker. Do NOT edit, commit, push, reset, or close "
+        f"anything for {ref}; leave the working tree as it is, report what you "
+        f"had in progress, and end your turn. `wt find {ref} --json` shows the "
+        f"current owner."
+    )
+    try:
+        return deliver_message(fwd, text, verb="steer", on_busy="hold", expire=3600,
+                               dedupe_key=f"stop-displaced:{ref}:{sid}:{fwd}")
+    except Exception:
+        return None
+
+
 def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     """Standalone codex fallback: native delivery via WT's private app-server.
 
