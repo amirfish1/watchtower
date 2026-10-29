@@ -374,3 +374,78 @@ def test_near_limit_whitespace_mismatch_stays_inline_or_refuses(tmp_path, monkey
         else:
             assert now == orig
     assert all(after[i] == originals[i] for i in range(5))
+
+
+def _parked_near_limit(tmp_path, monkeypatch):
+    """A plan-gated ticket whose worker parked on a block (sidecar route),
+    with its issue body grown to the BECKY-2966 size."""
+    from tests.test_github_pipeline_sidecar import _block_parks, _setup
+    state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    q.update(ref, gates=["plan"])
+    q.plan_start(ref)
+    q.plan_submit(ref, "1. do it")
+    q.plan_verdict(ref, True, "fine")
+    assert q.claim_next("w1", project="GHI")["ref"] == ref
+    assert _block_parks(q, ref)["status"] == "awaiting_answer"
+    import watchtower.github_backend as gb
+    monkeypatch.setenv("FAKE_GH_BODY_MAX", str(GITHUB_CAP))
+    _seed_legacy(state, gb, target=256520)
+    return state, q, gb, ref
+
+
+def test_parked_long_answer_reaches_the_worker_whole(tmp_path, monkeypatch):
+    """Send-back 2 (1): the sidecar copy is the parked worker's prompt; it
+    must not be clipped below what the durable comment holds."""
+    from watchtower import answers
+    state, q, gb, ref = _parked_near_limit(tmp_path, monkeypatch)
+    text = _grant(40000, salt="long ")
+
+    q.answer(ref, text)
+
+    item = q.get(ref)
+    pa = item["pending_answer"]
+    assert pa["gen"] == 1 and pa["state"] == "routing"
+    assert pa["answer"] == text
+    assert text in answers._answer_prompt(item, pa)
+    entry = [e for e in _meta(gb, state)["history"] if e["event"] == "answer"][-1]
+    _assert_referenced(state, gb, entry, text)
+
+
+@pytest.mark.parametrize("size", [6463, 40000])
+def test_parked_answer_retry_after_failed_edit_keeps_its_generation(
+        tmp_path, monkeypatch, size):
+    """Send-back 2 (2): the route is written before the issue edit; when the
+    edit fails, the retry must not route a second generation, or the worker
+    resuming the first one is rejected."""
+    state, q, gb, ref = _parked_near_limit(tmp_path, monkeypatch)
+    text = _grant(size, salt="retry ")
+
+    monkeypatch.setenv("FAKE_GH_FAIL", "issue edit=fail")
+    with pytest.raises(Exception):
+        q.answer(ref, text)
+    monkeypatch.delenv("FAKE_GH_FAIL")
+    assert q.get(ref)["needs_input"]
+    assert q.get(ref)["pending_answer"]["gen"] == 1
+
+    q.answer(ref, text)
+
+    item = q.get(ref)
+    assert item["pending_answer"]["gen"] == 1 and item["pending_answer"]["answer"] == text
+    assert not item["needs_input"]
+    assert len(_comments_with(state, gb, text)) == 1
+    answers_ = [e for e in _meta(gb, state)["history"]
+                if e["event"] == "answer" and e.get("text_sha256", _sha(e.get("text", ""))) == _sha(text)]
+    assert len(answers_) == 1
+    got = q.resume_claim(ref, 1)
+    assert got and got["status"] == "in_progress" and got["claimed_by"] == "w1"
+
+
+def test_parked_second_distinct_answer_still_supersedes(tmp_path, monkeypatch):
+    """The retry dedupe is keyed to the write: a new answer is a new gen."""
+    _state, q, _gb, ref = _parked_near_limit(tmp_path, monkeypatch)
+    q.answer(ref, "use postgres")
+    q.answer(ref, "actually mysql")
+    pa = q.get(ref)["pending_answer"]
+    assert pa["gen"] == 2 and pa["answer"] == "actually mysql"
+    assert q.resume_claim(ref, 1) is None
+    assert q.resume_claim(ref, 2)["claimed_by"] == "w1"

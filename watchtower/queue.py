@@ -7886,8 +7886,13 @@ def _park_unlocked(it: Dict[str, Any], worker_id: str, session_id: str, machine:
 
 def _write_pending_answer_unlocked(it: Dict[str, Any], text: str, now: str, *,
                                    reserve_for: str = "", reserve_session: str = "",
-                                   affinity_until: str = "") -> Dict[str, Any]:
+                                   affinity_until: str = "",
+                                   clip: int = 24000) -> Dict[str, Any]:
     """Answer on a parked ticket: persist ``pending_answer`` (state routing).
+
+    ``clip`` bounds the stored answer; the GitHub backend passes its comment
+    limit, having already refused anything longer (WT-44), so a long answer
+    reaches the parked worker whole.
 
     ``reserve_for`` (OPS-1332/E18): instead write a fresh reservation
     straight into state ``affinity`` -- a released ``in_progress`` ticket
@@ -7908,7 +7913,7 @@ def _write_pending_answer_unlocked(it: Dict[str, Any], text: str, now: str, *,
     parked = it.get("parked") or {}
     it["pending_answer"] = {
         "gen": gen, "state": "routing", "question": it.get("block_question", ""),
-        "answer": _clip(text, 24000), "prior_worker_id": parked.get("worker_id", ""),
+        "answer": _clip(text, clip), "prior_worker_id": parked.get("worker_id", ""),
         "prior_session_id": parked.get("session_id", ""),
         "prior_engine": parked.get("engine", ""),
         "transcript_path": parked.get("transcript_path", ""),

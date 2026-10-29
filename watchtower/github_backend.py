@@ -3788,13 +3788,22 @@ class GitHubIssuesBackend:
         if item.get("status") == "awaiting_answer" and item.get("parked"):
             # WT-40: a parked ticket routes the answer through the sidecar. Written
             # BEFORE the issue edit: a crash in between re-routes (the owner-answer
-            # key is not recorded yet) instead of losing the answer.
+            # key is not recorded yet) instead of losing the answer. WT-44: the
+            # route records this write's key, so the retry of a write whose body
+            # edit failed keeps the generation it already routed (no gen bump
+            # that would orphan a resume_claim of it) instead of routing again.
             from . import github_pipeline, queue as _q
+            route_key = entry_key or source_comment_key
 
             def _route(it: Dict[str, Any]) -> Any:
                 if it.get("status") != "awaiting_answer" or not it.get("parked"):
                     return "skip"
-                _q._write_pending_answer_unlocked(it, answer_text, now)
+                if route_key and (it.get("pending_answer") or {}).get("entry_key") == route_key:
+                    return "skip"
+                pa = _q._write_pending_answer_unlocked(it, answer_text, now,
+                                                       clip=_COMMENT_MAX_CHARS)
+                if route_key:
+                    pa["entry_key"] = route_key
                 return None
             github_pipeline.mutate(ident, _route)
         meta["needs_input"] = False
