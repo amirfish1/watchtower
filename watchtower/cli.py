@@ -210,6 +210,9 @@ def _event_summary(event: dict) -> str:
         return f"claimed by {actor}"
     if name == "block":
         return f"blocked: {event.get('question') or ''}".rstrip()
+    if name == "wait":
+        who = event.get("wait_actor") or event.get("wait_ref") or ""
+        return f"waiting on {event.get('wait_on') or '?'}{(' (' + who + ')') if who else ''}".rstrip()
     if name == "defer":
         return f"deferred until {event.get('until') or '?'}: {event.get('reason') or ''}".rstrip()
     if name in ("answer", "comment", "progress"):
@@ -2947,6 +2950,9 @@ def cmd_block(args: argparse.Namespace) -> int:
         kind=getattr(args, "kind", "input"),
         commit=commit,
         origin="worker",
+        wait_on=getattr(args, "wait_on", "") or "",
+        wait_actor=getattr(args, "wait_actor", "") or "",
+        wait_ref=getattr(args, "wait_ref", "") or "",
     )
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
@@ -2964,6 +2970,29 @@ def cmd_block(args: argparse.Namespace) -> int:
         print(f"  session {sid} — resume with: wt discuss {item['ref']}")
     else:
         print("  (no resumable session id recorded; a human can still read progress notes)")
+    return 0
+
+
+def cmd_wait_on(args: argparse.Namespace) -> int:
+    """Say who a blocked ticket is waiting on, without re-blocking (CCC-244):
+    the owner, an external actor (client, studio owner, vendor), another
+    ticket/handoff, or a worker that already has its decision. Corrects a
+    legacy block in place; history keeps every earlier record."""
+    try:
+        item = q.set_wait(args.ref, args.on, actor=args.actor, ref=args.wait_ref,
+                          note=args.note, by=args.worker)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(item, indent=2))
+        return 0
+    w = item.get("wait") or {}
+    who = w.get("actor") or w.get("ref") or ""
+    print(f"WAITING: {item['ref']} on {w.get('on')}{(' — ' + who) if who else ''}")
     return 0
 
 
@@ -6354,6 +6383,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Worker protocol", "close"),
     ("Worker protocol", "unresolved-ack"),
     ("Worker protocol", "block"),
+    ("Worker protocol", "wait-on"),
     ("Worker protocol", "defer"),
 ]
 # `install` is intentionally absent: it's a hidden alias folded into `wt start`
@@ -6381,6 +6411,7 @@ COMMAND_HELP: Dict[str, str] = {
     "unresolved-ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
     "block": "park a ticket that needs a human decision",
     "defer": "take a ticket out of the pool until a data window ends (no human needed)",
+    "wait-on": "say who a blocked ticket waits on: owner, external actor, dependency or worker",
     "blocked": "list tickets parked for a human",
     "gated": "product-gate pitches awaiting your Ack/Nack",
     "ack": "approve a product-gate pitch (Ack); resolution-caveat acks moved to unresolved-ack",
@@ -7175,9 +7206,32 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--commit", default="", metavar="SHA",
                    help="verified commit SHA recording what this turn did, "
                         "same local `git rev-parse` proof as `wt close --commit`")
+    s.add_argument("--wait-on", dest="wait_on", default="", choices=list(q.WAIT_ON),
+                   help="who this block waits on: owner = a decision only the owner "
+                        "can make (red 'needs you'); external = a client/studio/vendor "
+                        "(name it with --wait-actor); dependency = another ticket or "
+                        "handoff (--wait-ref); worker = decision made, awaiting a worker. "
+                        "Unset reads as owner.")
+    s.add_argument("--wait-actor", dest="wait_actor", default="",
+                   help="who, for --wait-on external (e.g. the client's name)")
+    s.add_argument("--wait-ref", dest="wait_ref", default="",
+                   help="the blocking ticket ref for --wait-on dependency (e.g. OPS-167)")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_block)
+
+    s = sub.add_parser("wait-on", help=COMMAND_HELP.get("wait-on", ""))
+    s.add_argument("ref")
+    s.add_argument("--on", required=True, choices=list(q.WAIT_ON),
+                   help="owner | external | dependency | worker")
+    s.add_argument("--actor", default="", help="who, for an external wait")
+    s.add_argument("--ref", dest="wait_ref", default="",
+                   help="blocking ticket/handoff ref, for a dependency wait")
+    s.add_argument("--note", default="", help="why / what evidence")
+    s.add_argument("--worker", default="", help="your worker id (blank = human)")
+    s.add_argument("--json", action="store_true")
+    _add_redundant_queue_flag(s)
+    s.set_defaults(func=cmd_wait_on)
 
     s = sub.add_parser("defer", help=COMMAND_HELP.get("defer", ""))
     s.add_argument("ref")

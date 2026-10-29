@@ -168,6 +168,41 @@ DISC_AWAITING = ("none", "planner", "reviewer")
 GATE_KINDS = ("none", "verify", "review")
 ASSESSMENT_STATUSES = ("none", "due", "running", "filing", "done", "failed")
 BLOCK_KINDS = ("input", "rationale", "awaiting-client")
+# Who a blocked ticket is waiting on (CCC-244). ``owner`` = a decision only
+# the queue owner can make (the red "needs you" state); ``external`` = a named
+# outside actor (a client, a studio owner, a vendor); ``dependency`` = another
+# ticket or handoff (``ref``); ``worker`` = the decision is already made and
+# the work is waiting on a worker. Stored as ``item["wait"]`` and stamped with
+# the ``blocked_at`` it describes, so a newer block generation always wins.
+WAIT_ON = ("owner", "external", "dependency", "worker")
+
+
+def wait_record(on: str, actor: str = "", ref: str = "", note: str = "",
+                block_at: str = "", by: str = "") -> Dict[str, Any]:
+    """Validated ``wait`` metadata for one block generation (CCC-244)."""
+    on = str(on or "").strip().lower()
+    if on not in WAIT_ON:
+        raise ValueError(f"wait-on must be one of {', '.join(WAIT_ON)}, not {on!r}")
+    rec: Dict[str, Any] = {"on": on, "at": _now_iso(), "block_at": str(block_at or "")}
+    if actor:
+        rec["actor"] = _clip(str(actor).strip(), 120)
+    if ref:
+        rec["ref"] = _clip(str(ref).strip(), 80)
+    if note:
+        rec["note"] = _clip(str(note).strip(), 2000)
+    if by:
+        rec["by"] = _clip(str(by), 120)
+    return rec
+
+
+def current_wait(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The item's wait record if it describes the CURRENT block, else None."""
+    w = item.get("wait") if isinstance(item, dict) else None
+    if not item.get("needs_input") or not isinstance(w, dict) or w.get("on") not in WAIT_ON:
+        return None
+    if str(w.get("block_at") or "") != str(item.get("blocked_at") or ""):
+        return None
+    return w
 DEP_VERDICTS = ("ok", "waiting", "stuck")
 # ``pending_answer.state`` (WT-28). ``none`` = no record; ``affinity_expired``
 # is projection-only (``affinity`` past its reservation), never stored.
@@ -7686,6 +7721,9 @@ def block(
     kind: str = "input",
     commit: str = "",
     origin: str = "system",
+    wait_on: str = "",
+    wait_actor: str = "",
+    wait_ref: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Park a ticket that needs a human decision.
 
@@ -7712,10 +7750,13 @@ def block(
     requiring the ticket to close -- the point of `--kind awaiting-client`.
     """
     kind = kind if kind in ("input", "rationale", "awaiting-client") else "input"
+    if wait_on:
+        wait_record(wait_on)   # validate before any write
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         item = backend.block(
             ident, session_id=session_id, question=question, progress=progress,
+            kind=kind, wait_on=wait_on, wait_actor=wait_actor, wait_ref=wait_ref,
         )
         if item:
             if origin == "worker":
@@ -7749,6 +7790,11 @@ def block(
                 it["block_kind"] = kind
                 it["blocked_at"] = now
                 it["updated_at"] = now
+                if wait_on:
+                    it["wait"] = wait_record(wait_on, wait_actor, wait_ref,
+                                             block_at=now, by=str(session_id or ""))
+                else:
+                    it.pop("wait", None)
                 if commit:
                     it["block_commit"] = commit
                 it.pop("resume", None)
@@ -7770,6 +7816,8 @@ def block(
                     it, "block", by=actor, at=now,
                     question=_clip(question, 4000), kind=kind,
                     commit=commit,
+                    **({"wait_on": wait_on, "wait_actor": wait_actor, "wait_ref": wait_ref}
+                       if wait_on else {}),
                 )
                 if park:
                     _park_unlocked(it, park_worker, park_sid, park_machine, now, actor)
@@ -7794,6 +7842,46 @@ def block(
                 )
                 if origin == "worker":
                     _note_worker_ticket_done(session_id)
+                return it
+    return None
+
+
+def set_wait(ident: Any, on: str, actor: str = "", ref: str = "", note: str = "",
+             by: str = "") -> Optional[Dict[str, Any]]:
+    """Say who the CURRENT block is waiting on, without re-blocking (CCC-244).
+
+    Corrects a legacy or mis-labelled block in place: ``needs_input``, the
+    question and the claim are untouched, a ``wait`` history event records the
+    change (history is append-only), and the record is stamped with the
+    current ``blocked_at`` so a later block generation supersedes it. Raises
+    ValueError when the ticket is not blocked or ``on`` is invalid.
+    """
+    wait_record(on)
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        item = backend.set_wait(ident, on, actor=actor, ref=ref, note=note, by=by)
+        if item:
+            _log("WAIT", f"{item.get('ref', ident)} — on {on} {actor or ref}".rstrip(),
+                 queue=item.get("project", ""))
+        return item
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                if not it.get("needs_input") or it.get("status") == "closed":
+                    raise ValueError(f"{it.get('ref', ident)} is not blocked; nothing is waiting")
+                now = _now_iso()
+                it["wait"] = wait_record(on, actor, ref, note,
+                                         block_at=str(it.get("blocked_at") or ""), by=by)
+                it["updated_at"] = now
+                _append_history(
+                    it, "wait", by=_by("worker" if by else "human", str(by or "")), at=now,
+                    wait_on=it["wait"]["on"], wait_actor=it["wait"].get("actor", ""),
+                    wait_ref=it["wait"].get("ref", ""), text=it["wait"].get("note", ""),
+                )
+                _save_unlocked(data)
+                _log("WAIT", f"{it.get('ref', '?')} — on {on} {actor or ref}".rstrip(),
+                     queue=it.get("project", ""))
                 return it
     return None
 

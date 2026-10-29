@@ -172,3 +172,20 @@ follow-ups. A deep claim's JSON carries `deep_brief`; follow it. In short:
 
 `wt defer` is not `wt block`: defer waits for *data* (no human involved, the
 ticket returns on its own); block waits for a *decision*.
+
+### Say who a block waits on
+
+The dashboard paints a blocked ticket red ("needs you") unless the block says
+otherwise, so name the actor whenever the owner is not the one who must act:
+
+- `wt block REF --worker ID --question "..." --wait-on external --wait-actor "Sonia"`:
+  waiting on a client, studio owner or vendor (blue).
+- `--wait-on dependency --wait-ref OPS-167`: waiting on another ticket or
+  handoff (neutral).
+- `--wait-on worker`: the decision is already made and only worker time is
+  missing (amber).
+- `--wait-on owner` (or no flag): a decision only the owner can make (red).
+
+`wt wait-on REF --on external --actor "Sonia" --note "..."` corrects the
+current block in place (no new question, history kept). A later `wt block`
+without `--wait-on` resets the ticket to an owner wait.

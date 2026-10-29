@@ -1989,6 +1989,8 @@ class GitHubIssuesBackend:
             "confidence": _norm_choice(meta.get("confidence", ""), VALID_CONFIDENCES),
             "needs_input": bool(meta.get("needs_input", False)),
             "block_question": str(meta.get("block_question") or ""),
+            "block_kind": str(meta.get("block_kind") or ""),
+            "blocked_at": str(meta.get("blocked_at") or ""),
             "blocked_by": [str(r) for r in (meta.get("blocked_by") or []) if r]
             if isinstance(meta.get("blocked_by"), list) else [],
             "submitter": str(meta.get("submitter") or ""),
@@ -2043,6 +2045,8 @@ class GitHubIssuesBackend:
         if deferred_until:
             item["deferred_until"] = deferred_until
             item["defer_reason"] = str(meta.get("defer_reason") or "")
+        if isinstance(meta.get("wait"), dict):
+            item["wait"] = dict(meta["wait"])
         history = meta.get("history")
         if isinstance(history, list):
             item["history"] = list(history)
@@ -3234,11 +3238,18 @@ class GitHubIssuesBackend:
         question: str = "",
         progress: str = "",
         origin: str = "system",
+        kind: str = "input",
+        wait_on: str = "",
+        wait_actor: str = "",
+        wait_ref: str = "",
         **_ignored: Any,
     ) -> Optional[Dict[str, Any]]:
         """Record a worker's request for input on a GitHub-backed ticket.
         ``origin`` is accepted and ignored: GitHub queues keep the legacy
-        hold-while-blocked behaviour (WT-28b)."""
+        hold-while-blocked behaviour (WT-28b). ``kind`` and the ``wait_*``
+        fields persist in the body metadata like the file backend's, so an
+        external wait survives a reload (CCC-244)."""
+        from . import queue as _q
         item = self.get(ident)
         if item is None:
             return None
@@ -3248,13 +3259,21 @@ class GitHubIssuesBackend:
         meta["needs_input"] = True
         meta["block_question"] = _clip(question, 4000)
         meta["blocked_at"] = now
+        meta["block_kind"] = kind if kind in _q.BLOCK_KINDS else "input"
+        if wait_on:
+            meta["wait"] = _q.wait_record(wait_on, wait_actor, wait_ref,
+                                          block_at=now, by=str(session_id or ""))
+        else:
+            meta.pop("wait", None)
         if session_id:
             if not meta.get("claimed_by"):
                 meta["claimed_by"] = str(session_id)
                 meta["claimed_machine"] = machine_tag()
         if progress:
             _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
-        self._usage_history(meta, number, "block", worker=str(session_id), question=_clip(question, 4000))
+        self._usage_history(meta, number, "block", worker=str(session_id), question=_clip(question, 4000),
+                            kind=meta["block_kind"], wait_on=wait_on, wait_actor=wait_actor,
+                            wait_ref=wait_ref)
         self._edit_body(item, body, meta)
         # Mirror the question onto the issue discussion (WT-37): the metadata
         # block is invisible to anyone reading the issue on GitHub. Best-effort,
@@ -3268,6 +3287,36 @@ class GitHubIssuesBackend:
                 *self._repo_args(),
                 "--body", f"[watchtower] Needs input from {session_id or 'worker'}:\n\n{shown}",
             ], check=False)
+        return self.get(ident)
+
+    @_serialized_body_write
+    def set_wait(
+        self,
+        ident: Any,
+        on: str,
+        *,
+        actor: str = "",
+        ref: str = "",
+        note: str = "",
+        by: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """Say who the current block waits on, without re-blocking (CCC-244).
+        Body metadata only: no issue comment, the question stays as asked."""
+        from . import queue as _q
+        item = self.get(ident)
+        if item is None:
+            return None
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        if not meta.get("needs_input") or item.get("status") == "closed":
+            raise ValueError(f"{item.get('ref', ident)} is not blocked; nothing is waiting")
+        meta["wait"] = _q.wait_record(on, actor, ref, note,
+                                      block_at=str(meta.get("blocked_at") or ""), by=by)
+        _append_history(
+            meta, "wait", kind="worker" if by else "human", worker=str(by or ""),
+            wait_on=meta["wait"]["on"], wait_actor=meta["wait"].get("actor", ""),
+            wait_ref=meta["wait"].get("ref", ""), text=meta["wait"].get("note", ""),
+        )
+        self._edit_body(item, body, meta)
         return self.get(ident)
 
     @_serialized_body_write
