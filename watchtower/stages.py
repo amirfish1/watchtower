@@ -236,7 +236,8 @@ def desired(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         plan = it.get("plan") or {}
         entry: Optional[Tuple[str, str]] = None
         if (status == "in_review" and it.get("gate_pending") == "verify"
-                and not it.get("needs_input")):
+                and not it.get("needs_input")
+                and (it.get("pipeline_local") or not _github_backed(it))):
             entry = ("verifier", f"verify:{int(it.get('verify_cycle') or 0)}")
         elif status == "closed" and (it.get("assessment") or {}).get("status") in ("due", "running"):
             if not _github_backed(it):
@@ -268,7 +269,11 @@ def desired(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                         entry = ("plan_reviewer",
                                  f"discuss:r{rnd}:v{int(plan.get('version') or rnd)}:reviewer{mv}")
         if entry:
-            out.append({"ref": ref, "role": entry[0], "key": entry[1], "project": project})
+            # OPS-204: a re-gated GitHub ticket is a new pipeline generation;
+            # its keys never adopt the cleared generation's sessions.
+            gen = int(it.get("pipeline_gen") or 0)
+            k = f"{entry[1]}:g{gen}" if gen > 1 else entry[1]
+            out.append({"ref": ref, "role": entry[0], "key": k, "project": project})
     return out
 
 
@@ -609,6 +614,8 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
             if not token:
                 return "skip"
             item = q.get(ref) or item
+        if not _reserve(ref, role, key, attempt):
+            return "skip"
         did, nonce = _stage_answer_nonce(item)
         goal = _goal(item, role, token=token, respawn=cause in ("respawn", "adopted"),
                      note=str(ss.get("retry_note") or ""), key=key, nonce=nonce)
@@ -625,6 +632,7 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
                                   name=name, report_to="", verify=(role == "verifier"),
                                   stage=role, ticket_ref=ref, ticket_queue=project)
     except Exception as exc:  # noqa: BLE001
+        _unreserve(ref, key)
         return _spawn_error(item, role, key, ss, exc, engine=engine)
     if nonce and not rec.get("launch_failure"):
         # WT-31 D4: the hand-off is confirmed (E13) only when this nonce lands
@@ -660,6 +668,7 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
         s.pop("retry_note", None)
         s.pop("retry_at", None)
         s.pop("lost", None)
+        s.pop("reserved", None)
         q._append_history(it, "stage_spawn", by=q._by("system"), at=q._now_iso(),
                           role=role, key=key, attempt=attempt, cause=cause,
                           worker_id=rec.get("worker_id", ""))
@@ -677,6 +686,43 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
                       {"rc": failure.get("exit_code")}, rec, refunded=refunded)
         return "launch_failed"
     return "spawned"
+
+
+RESERVE_TTL_S = 300
+
+
+def _reserve(ref: str, role: str, key: str, attempt: int) -> bool:
+    """Reserve this attempt in the store BEFORE spawning (OPS-204 #10/#11):
+    re-check, under the lock, that the ticket still wants this stage (a verdict
+    or gate clear may have landed since the tick read it) and that no other
+    tick already reserved or spawned the attempt. A reservation that never
+    became a spawn (crash) expires after RESERVE_TTL_S."""
+    ok: List[bool] = []
+
+    def _do(it, s):
+        if not [x for x in desired([it]) if x["role"] == role and x["key"] == key]:
+            return "skip"
+        if s.get("key") == key and int(s.get("attempt") or 0) >= attempt:
+            return "skip"   # another tick spawned this attempt already
+        r = s.get("reserved") or {}
+        if (r.get("key") == key and int(r.get("attempt") or 0) == attempt
+                and time.time() - float(r.get("ts") or 0) < RESERVE_TTL_S):
+            return "skip"
+        s["reserved"] = {"key": key, "attempt": attempt, "ts": time.time(), "pid": os.getpid()}
+        ok.append(True)
+    q.stage_session_update(ref, _do)
+    return bool(ok)
+
+
+def _unreserve(ref: str, key: str) -> None:
+    def _do(it, s):
+        if (s.get("reserved") or {}).get("key") != key:
+            return "skip"
+        s.pop("reserved", None)
+    try:
+        q.stage_session_update(ref, _do)
+    except Exception:  # noqa: BLE001 - an unreleased reservation expires anyway
+        pass
 
 
 def _spawn_error(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],

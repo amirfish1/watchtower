@@ -1721,11 +1721,12 @@ def enqueue(
         if group_parent:
             gates = _parent_gates(gates)
     if backend is not None:
-        if gates or str(accept_line or "").strip() or str(planner_model or "").strip() \
+        if str(accept_line or "").strip() or str(planner_model or "").strip() \
                 or str(verifier_model or "").strip():
             # OPS-201: the issue metadata cannot carry them; refuse, don't drop.
-            raise ValueError("gates, --accept, --planner-model and --verifier-model need a "
-                             "local queue (GitHub-backed queues have no gate/plan/verify pipeline)")
+            raise ValueError("--accept, --planner-model and --verifier-model need a local "
+                             "queue (GitHub-backed gates live in this host's pipeline sidecar)")
+        gates = validate_gates(gates) if gates else None
         saved = backend.enqueue(
             note=note,
             text=text,
@@ -1747,6 +1748,14 @@ def enqueue(
             blocked_by=blocked_by,
             depth_fields=_depth_fields(depth, budget_min),
         )
+        if gates:
+            # OPS-204: the gates go to this host's sidecar once the issue exists.
+            from . import github_pipeline
+            try:
+                saved = github_pipeline.set_gates(saved.get("ref"), list(gates)) or saved
+            except (ValueError, github_pipeline.SidecarCorrupt) as exc:
+                raise ValueError(f"{saved.get('ref')} was filed but NOT gated: {exc}; "
+                                 f"retry with `wt edit {saved.get('ref')} --gate ...`") from exc
         _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
         return saved
     with _FileLock(_lock_path()):
@@ -3390,6 +3399,12 @@ def plan_submit(ident: Any, text: str, by: str = "planner",
                          f"(plan status {(current.get('plan') or {}).get('status') or 'none'})")
 
     def _do(it, plan):
+        if plan.get("status") not in ("planning", "discussing"):   # #9: recheck in the lock
+            raise ValueError(f"{it.get('ref', ident)} is not waiting for a plan "
+                             f"(plan status {plan.get('status') or 'none'})")
+        if it.get("pipeline_local"):
+            from . import github_pipeline
+            github_pipeline.fence_stale_stage(it, str(by))
         stored = _clip(text, 24000)
         if is_parent:
             _group_fence_mv(it, expect_mv)
@@ -3456,6 +3471,12 @@ def plan_verdict(ident: Any, accepted: bool, reasons: str = "",
 
     def _do(it, plan):
         _group_fence_mv(it, expect_mv)
+        if plan.get("status") != "reviewing":   # #9: recheck in the lock
+            raise ValueError(f"{it.get('ref', ident)} has no plan under review "
+                             f"(plan status {plan.get('status') or 'none'})")
+        if it.get("pipeline_local"):
+            from . import github_pipeline
+            github_pipeline.fence_stale_stage(it, str(by))
         rnd = int(plan.get("round") or 1)
         version = int(plan.get("version") or rnd)
         if version_seen is not None and int(version_seen) != version:
@@ -3664,6 +3685,9 @@ def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
 
     def _do(it, plan):
         _group_fence_mv(it, expect_mv)
+        if plan.get("status") != "blocked":   # #9: recheck in the lock
+            raise ValueError(f"{it.get('ref', ident)} has no blocked plan "
+                             f"(plan status {plan.get('status') or 'none'})")
         rnd = int(plan.get("round") or 1)
         if decision == "accept":
             if text and group_role(it) == "parent":
@@ -4012,6 +4036,9 @@ def _stage_retry_reset(it: Dict[str, Any], text: str, now: str) -> bool:
 
 def set_verifier_info(ident: Any, info: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Record which verifier (engine/model/worker) was spawned for a ticket."""
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        from . import github_pipeline
+        return github_pipeline.set_verifier(ident, info)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -4142,6 +4169,18 @@ def accept(ident: Any, by: str = "human", force: bool = False,
     ``_group_close_unlocked``; ``force`` also applies to an ``open`` parent
     once every child is closed, and ``no_proof`` is required when no
     integration commit contains every member."""
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        from . import github_pipeline
+        cur = get(ident)
+        if cur is None:
+            return None
+        if not cur.get("review_hold"):
+            raise ValueError(f"{cur.get('ref', ident)} is {cur.get('status')}, "
+                             "not in_review -- nothing to accept")
+        item = github_pipeline.accept(ident, str(by), force)
+        if item is not None and item.get("status") == "closed":
+            _after_accept(item, by, actor)
+        return item
     refused = ""
     with _FileLock(_lock_path()):
         data = _load_unlocked()
@@ -4180,13 +4219,18 @@ def accept(ident: Any, by: str = "human", force: bool = False,
     if group_role(item) == "parent":
         _after_group_close(item, str(by), actors)
         return get(item.get("ref") or ident) or item
+    _after_accept(item, by, actor)
+    return get(item.get("ref") or ident) or item
+
+
+def _after_accept(item: Dict[str, Any], by: str, actor: Any) -> None:
+    actors = [by] + (list(actor) if isinstance(actor, (list, tuple, set)) else [actor])
     _group_wake([str(p.get("ref")) for p in _group_due_for(item)], "integration")
     _log("ACCEPT", f"{item.get('ref', '?')}", queue=item.get("project", ""))
     res = item.get("resolution") or {}
     _notify_ticket_event(item, "closed", detail=res.get("summary", "") if isinstance(res, dict) else "",
                          actor=actors)
-    assessment_mark_due(item.get("ref") or ident)
-    return get(item.get("ref") or ident) or item
+    assessment_mark_due(item.get("ref") or "")
 
 
 def verdict(ident: Any, passed: bool, findings: str = "", by: str = "verifier",
@@ -4201,6 +4245,14 @@ def verdict(ident: Any, passed: bool, findings: str = "", by: str = "verifier",
         return None
     if group_role(current) == "parent":   # WT-33: one locked write, fenced
         return _group_verdict(ident, passed, findings, by, expect_verify_cycle)
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        from . import github_pipeline   # OPS-204: cycle-fenced, one issue write
+        item = github_pipeline.verdict(ident, passed, findings, str(by), expect_verify_cycle)
+        if item is not None and item.get("_next_stage"):
+            _notify_review(item, item["_next_stage"], by)
+        elif item is not None and item.get("status") == "closed":
+            _after_accept(item, f"verifier:{by}", None)
+        return item
     if current.get("status") != "in_review" or current.get("gate_pending") != "verify":
         raise ValueError(f"{current.get('ref', ident)} is not waiting on a verifier "
                          f"(status {current.get('status')})")
@@ -4244,6 +4296,9 @@ def reject_with(ident: Any, why: str, by_label: str = "human",
     current = get(ident)
     if current is None:
         return None
+    if current.get("review_hold"):   # OPS-204: a GitHub review hold
+        from . import github_pipeline
+        return github_pipeline.reject(ident, why)
     sid = str(current.get("claimed_session_id") or "")
     deferred = ""
     rebind = bool(sid) and _github_backend_for_project(_project_from_ident(ident)) is None
@@ -4501,6 +4556,53 @@ def link_duplicate(ident: Any, original_ref: str, worker: str = "") -> Optional[
         return it
 
 
+def _github_gated_close(ident: Any, session_id: str, session_uuid: str, resolution: Any,
+                        force: bool) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Gates of a GitHub ticket (OPS-204). Only this host's sidecar gates
+    count (``pipeline_local``); queue-config gates never gate a GitHub close.
+    Returns ``(item, [])`` when the close was handled here (reopened by a
+    failed cmd gate, or held for review with the issue left open), else
+    ``(None, cmd_results)`` for the caller's ordinary close."""
+    from . import github_pipeline
+    current = get(ident)
+    if current is None:
+        return None, []
+    if current.get("review_hold") and current.get("status") == "in_review":
+        raise ValueError(f"{current.get('ref', ident)} is in review "
+                         f"({current.get('gate_pending')}); it closes through "
+                         f"wt verdict / wt accept, not wt close")
+    if force or not current.get("pipeline_local") or current.get("status") == "closed":
+        return None, []
+    gates = [g for g in (current.get("gates") or []) if not (g == "plan" or g.startswith("plan:"))]
+    if not gates:
+        return None, []
+    norm = _normalize_resolution(resolution) or {}
+    results, stages = evaluate_gates(current, str(norm.get("commit") or ""))
+    failed = [r for r in results if not r["passed"]]
+    if failed:
+        f = failed[0]
+        why = (f"gate {f['gate']} failed (exit {f['exit_code']}): "
+               f"{f['output_tail'][-600:].strip()}")
+        item = update_status(ident, "open", session_id, session_uuid=session_uuid,
+                             reason=why, expect_owner=str(session_id or ""),
+                             require_status=current.get("status"))
+        if item is None:
+            now_it = get(ident) or {}
+            raise ValueError(
+                f"{current.get('ref', ident)} changed while its gates ran "
+                f"(was {current.get('status')}, now {now_it.get('status')}); "
+                "nothing was written. Re-check with "
+                f"`wt find {current.get('ref', ident)}` before closing again.")
+        return github_pipeline.record_results(ident, results, _clip(why, 4000)) or item, []
+    if not stages:
+        return None, results
+    item = github_pipeline.hold_review(ident, resolution, str(session_id or ""),
+                                       str(session_uuid or ""), results, stages)
+    if item is not None:
+        _notify_review(item, stages[0], session_id)
+    return item, []
+
+
 def close(
     ident: Any, session_id: str = "", resolution: Any = None, force: bool = False,
     declined: bool = False, session_uuid: str = "",
@@ -4550,7 +4652,12 @@ def close(
                     f"deliberately.)"
                 )
     hold_review, extras = "", None
-    if not force and _github_backend_for_project(_project_from_ident(ident)) is None:
+    gh_results: List[Dict[str, Any]] = []
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        gh, gh_results = _github_gated_close(ident, session_id, session_uuid, resolution, force)
+        if gh is not None:
+            return gh
+    elif not force:
         current = get(ident)
         if current is not None and current.get("status") != "closed" and effective_gates(current):
             norm = _normalize_resolution(resolution) or {}
@@ -4585,6 +4692,9 @@ def close(
     if item and item.get("status") == "in_review":
         _notify_review(item, hold_review, session_id)
         return item
+    if item and item.get("status") == "closed" and gh_results:
+        from . import github_pipeline
+        item = github_pipeline.record_results(ident, gh_results) or item
     if item and item.get("status") == "closed":
         _note_worker_ticket_done(session_id)
         try:

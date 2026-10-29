@@ -1332,34 +1332,32 @@ def test_cli_edit_text_replaces_github_issue_body_and_preserves_metadata(
     assert "original body" not in issue_body
 
 
-def test_cli_edit_refuses_gates_on_github_queue_instead_of_dropping_them(
+def test_cli_edit_gates_on_github_queue_are_kept_not_dropped(
     tmp_path, monkeypatch, capsys,
 ):
     """Regression for OPS-201: `wt edit --gate` printed EDITED while the issue
-    metadata kept no gates, so a plan-gated workflow silently never started."""
-    state = _install_fake_gh(tmp_path, monkeypatch)
+    metadata kept no gates, so a plan-gated workflow silently never started.
+    Since OPS-204 every gate is kept (sidecar); EDITED must mean it was."""
+    _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "test-owner/test-repo")
     item = q.enqueue(project="GHI", note="short summary", text="body")
-    body_before = json.loads(state.read_text())["issues"][0]["body"]
     from watchtower.cli import main
 
-    assert main(["edit", item["ref"], "--gate", "plan", "--gate", "verify"]) == 1
-    out = capsys.readouterr()
-    assert "EDITED" not in out.out
-    assert "gates" in out.err
-    assert json.loads(state.read_text())["issues"][0]["body"] == body_before
+    assert main(["edit", item["ref"], "--gate", "plan", "--gate", "verify"]) == 0
+    assert "EDITED" in capsys.readouterr().out
+    assert q.get(item["ref"])["gates"] == ["plan", "verify"]
 
 
-def test_enqueue_refuses_gates_on_github_queue(tmp_path, monkeypatch):
+def test_enqueue_refuses_unstorable_fields_on_github_queue(tmp_path, monkeypatch):
     _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "test-owner/test-repo")
 
     with pytest.raises(ValueError, match="local queue"):
-        q.enqueue(project="GHI", note="gated", gates=["plan"])
+        q.enqueue(project="GHI", note="gated", gates=["verify"], accept_line="X holds")
     assert q.list_items(project="GHI") == []
 
 

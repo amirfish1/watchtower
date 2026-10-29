@@ -11,7 +11,7 @@ pin it.
 
 | Owned by the GitHub issue (unchanged)                  | Owned by the sidecar                         |
 |---------------------------------------------------------|----------------------------------------------|
-| title, body, note, status (open/closed), claim fields, close + resolution, defer, history of ticket events, labels | `gates`, `plan` (status/round/text/reviews/discussion/planner/reviewer), `stage_session`, pipeline history events |
+| title, body, note, status (open/closed), claim fields, close + resolution, defer, history of ticket events, labels | `gates`, `plan` (status/round/text/reviews/discussion/planner/reviewer), `stage_session`, the review hold (`review_hold`, `gate_pending`, `gate_stages`, `gate_results`, `verify_cycle`, `verifier`, `gate_feedback`, `gate_accepted_by`), `gen`, pipeline history events |
 
 - The sidecar never stores ticket state; GitHub never stores pipeline state.
 - **One GitHub write** belongs to the pipeline: the meta key
@@ -91,24 +91,85 @@ an unplanned build. Gating a ticket a builder already holds is **refused**
 (the claim is left untouched): the hold only excludes new claims, so a running
 builder would not pause for the planner. Gate it once it is released.
 
-## Milestone 1 scope (this change)
+## Scope
 
-Supported on GitHub: `plan`, `plan:<model>` gates via `wt edit`; the full plan
-lifecycle (start, submit, review verdict, discussion, decide, fail); claim
-exclusion; federation fence; restart (state is on disk, `stage_session`
-reattaches as for local tickets).
+Milestone 1 (OPS-201): `plan`, `plan:<model>` gates via `wt edit`; the full
+plan lifecycle (start, submit, review verdict, discussion, decide, fail);
+claim exclusion; federation fence; restart.
 
-Refused with an explicit error until milestone 2 (no silent drop, no bypass):
-`verify`, `review*`, `cmd:` gates and `--gate` on `wt add` for GitHub queues.
+Milestone 2 (OPS-204): `verify`, `review*`, `cmd:` gates and `wt add --gate`
+on GitHub refs (`--accept`, `--planner-model`, `--verifier-model` stay
+refused: the verifier checks the ticket text).
 
-## Milestone 2 (not in this change)
+## Review hold (OPS-204)
 
-`verify` on GitHub: `wt close` with a pending verify gate keeps the issue
-open and records `in_review` + `gate_pending` + `verify_cycle` + the proposed
-resolution in the sidecar; `wt verdict` pass closes the issue with that
-resolution, fail clears the hold; `verify_cycle` fences stale verdicts.
-`wt add --gate` writes the sidecar inside the grace window. A
-`wt pipeline adopt <ref>` to move ownership between hosts.
+`wt close` on a ticket with this host's sidecar gates (`pipeline_local`;
+queue-config gates never gate a GitHub close) runs the `cmd:` gates first:
+
+- a failed cmd gate reopens the issue (CAS on the pre-gate status, owner
+  checked) and records `gate_results` + `gate_feedback` in the sidecar;
+- with `verify` / `review*` owed, the issue is **not closed**: the sidecar
+  gets `review_hold = {resolution, session_id, session_uuid, at}`,
+  `gate_pending`, `gate_stages`, `gate_results` and, for verify,
+  `verify_cycle + 1`. The overlay shows `status = in_review`, the held
+  resolution, and holds the ticket (not claimable). `wt close` on it is
+  refused (it settles through `wt verdict` / `wt accept` / `wt reject`).
+- cmd gates only, all passed: an ordinary issue close; results recorded.
+
+Settling (`verdict` / `accept` / `reject`) is two steps:
+
+1. Under the store lock: check status, stage, generation and cycle, then
+   either advance to the next stage (verify pass with a review owed: no issue
+   write) or record the outcome as `review_hold.final = close|open`.
+2. The ONE canonical issue write: close with the held resolution (attributed
+   to the original worker), or reopen with the reason. Then the hold is
+   dropped (`gate_feedback` kept on a reopen).
+
+A failed step 2 (GitHub down) leaves `final` set and the ticket in_review;
+`wt accept` retries the write. If step 2 landed but the drop did not, the
+next mutation sees the issue already reflects `final` and drops the hold.
+
+**Stale verdicts:** a GitHub `wt verdict` requires `--verify-cycle <n>` (the
+verifier prompt carries it); any other cycle raises the `SUPERSEDED` fence
+(`GroupFenced`), and nothing is written. After a settle the ticket is no
+longer waiting on a verifier, so a late verdict is refused too.
+
+**Generations:** clearing gates (`--gate ''`) leaves a tombstone
+`{gen, verify_cycle, retired_workers}` (every planner/reviewer/verifier/stage
+worker id of the entry) instead of deleting it. A re-gate starts generation
+`gen + 1`: verify cycles keep counting (never reused), stage keys get a
+`:g<gen>` suffix (no adoption of the old generation's sessions), and
+`plan_submit` / `plan_verdict` / `verdict` from a retired worker id are
+refused. Gates cannot change while the ticket is in review.
+
+**Prechecks in the lock (#9):** plan_submit / plan_verdict / plan_decide
+re-check the plan status inside the locked callback (local and GitHub).
+
+**Reserve before spawn (#10/#11):** before `spawn_adhoc`, the stage tick
+reserves `{key, attempt}` in `stage_session` under the lock after re-running
+`desired()` on the fresh item. A stage that settled since the tick read it,
+an attempt already spawned, or a live reservation (< 300 s) makes the spawn
+a no-op. A spawn error releases the reservation; a crash lets it expire.
+
+**plan_decide (#6):** a callback that moves the item `in_progress → open`
+(releasing a build with no resumable session) is written to the issue as a
+CAS reopen after the sidecar write.
+
+## Cross-host limits (honest remainder)
+
+- The reader check runs **at gate time only** (OPS-203 caveat). A host that
+  is downgraded below OPS-201, or claims this queue for the first time,
+  *after* a ticket was gated ignores `pipeline_host` and the hold, and could
+  claim a plan-pending ticket or reopen/claim a held in_review issue (the
+  issue itself is open + in-progress during review). Not fenced here; the
+  follow-up is a claim-time fence that every claim path enforces from the
+  issue alone.
+- A current `wt` on another host fails closed: the marker makes the ticket
+  `pipeline_foreign` (no claim, no stage). Its orphan sweep may still reopen
+  a held issue whose builder is gone; the owning host keeps showing it
+  in_review (the hold stays live until `final` lands), so the review still
+  settles it there.
+- Ownership never moves between hosts (no `wt pipeline adopt` yet).
 
 ## Independent review (wt critique, 2026-10-29) and disposition
 
@@ -124,19 +185,16 @@ Codex review scored the doc-only contract 3/10. Disposition:
   marker, so a crash fails closed (#12, partly); `plan_decide` clears the
   canonical block on the issue after the sidecar write (#6, partly).
 - Parity with local queues, not new risk: `plan_fail` releases the ticket
-  ("failed" builds loudly) (#2); status prechecks outside the lock in
-  plan_submit/verdict/decide (#9); spawn-before-record (#11) and no
-  desired() recheck right before spawn (#10). The sidecar inherits these.
+  ("failed" builds loudly) (#2).
+- Fixed in OPS-204: in-lock status prechecks (#9); reserve-before-spawn with
+  a `desired()` recheck (#10/#11); `plan_decide` reopens the issue (#6);
+  generation tombstone + retired-worker fence (#12).
 - Closed by OPS-203 (#3/#4): per-store owner UUID in the marker, verified
   marker write (lost race = not gated), and the reader check above. What
   remains: a host that is downgraded, or a new host that claims for the
   first time, *after* a ticket was gated is not fenced. The check runs at
   gate time only. GitHub duplicate links (Mac OPS-1456) need verify/review
   proof on GitHub first, so they follow OPS-204.
-- Open, follow-up: `plan_decide` on GitHub does not reopen an
-  `in_progress` ticket without a resumable session (#6); no gate
-  generation/tombstone fences an old worker across clear → re-enable (#12).
-  Both in OPS-204 with verify on GitHub.
 
 ## Activation / resume procedure
 
@@ -157,4 +215,11 @@ Codex review scored the doc-only contract 3/10. Disposition:
    follow with `wt plan show BECKY-2332`.
 4. After a restart nothing is needed: the sidecar is on disk and the stage
    tick resumes from `plan.status` / `stage_session`.
-5. To abandon: `wt edit BECKY-2332 --gate ''` (clears entry and marker).
+5. To abandon: `wt edit BECKY-2332 --gate ''` (tombstones the entry, clears
+   the marker).
+6. Verify/review (OPS-204): `wt edit <ref> --gate plan --gate verify` (or
+   `wt add ... --gate verify`). After the builder's `wt close` the issue
+   stays open and `wt find` shows `in_review`; the reconciler spawns the
+   verifier (`verify:<cycle>`), whose `wt verdict <ref> --verify-cycle <n>`
+   closes or reopens the issue. A review gate settles with `wt accept` /
+   `wt reject`. Requires the reconciler restart of step 0b onto OPS-204.

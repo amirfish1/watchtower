@@ -145,12 +145,147 @@ def test_only_sidecar_gates_start_a_github_planner(tmp_path, monkeypatch):
     assert stages.desired([q.get(ref)]) == []
 
 
-def test_unsupported_github_gates_are_refused_without_writes(tmp_path, monkeypatch):
+def _issue_state(state):
+    return json.loads(state.read_text())["issues"][0]["state"]
+
+
+def _closed_by_verify(q, ref, worker="builder-1"):
+    assert q.claim_by_ref(ref, worker)
+    return q.close(ref, worker, resolution={"summary": "did it", "commit": "abc123"})
+
+
+def test_verify_gate_holds_the_issue_open_until_a_current_verdict(tmp_path, monkeypatch):
+    """OPS-204: a gated GitHub close is held for review with the issue open;
+    only a verdict for the CURRENT cycle settles it, in one issue write."""
     state, _config, q, ref = _setup(tmp_path, monkeypatch)
-    before = _body(state)
-    with pytest.raises(ValueError, match="milestone 2"):
-        q.update(ref, gates=["plan", "verify"])
-    assert _body(state) == before and not _sidecar(q).exists()
+    q.update(ref, gates=["verify"])
+    held = _closed_by_verify(q, ref)
+
+    assert held["status"] == "in_review" and _issue_state(state) == "OPEN"
+    item = q.get(ref)
+    assert item["status"] == "in_review" and not item["work_it"]
+    assert item["resolution"]["summary"] == "did it"
+    assert q.claim_next("builder-2", project="GHI") is None
+    from watchtower import stages
+    assert [(d["role"], d["key"]) for d in stages.desired([item])] == [("verifier", "verify:1")]
+    with pytest.raises(ValueError, match="wt verdict"):
+        q.close(ref, "builder-1", resolution="bypass")
+    with pytest.raises(ValueError, match="--verify-cycle"):
+        q.verdict(ref, True, "ok", by="v1")
+    with pytest.raises(q.GroupFenced, match="cycle 0"):
+        q.verdict(ref, True, "ok", by="v1", expect_verify_cycle=0)
+    assert _issue_state(state) == "OPEN"
+
+    done = q.verdict(ref, True, "checked", by="v1", expect_verify_cycle=1)
+    assert done["status"] == "closed" and _issue_state(state) == "CLOSED"
+    final = q.get(ref)
+    assert final["resolution"]["summary"] == "did it" and not final.get("review_hold")
+    assert [r["passed"] for r in final["gate_results"]] == [True]
+    with pytest.raises(ValueError):
+        q.verdict(ref, False, "late", by="v0", expect_verify_cycle=1)
+    assert _issue_state(state) == "CLOSED"
+
+
+def test_failed_verdict_reopens_with_feedback_and_review_gates_settle(tmp_path, monkeypatch):
+    state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    q.update(ref, gates=["verify", "review"])
+    _closed_by_verify(q, ref)
+    out = q.verdict(ref, False, "test X fails", by="v1", expect_verify_cycle=1)
+
+    assert out["status"] == "open" and _issue_state(state) == "OPEN"
+    item = q.get(ref)
+    assert "test X fails" in item["gate_feedback"] and item["work_it"]
+
+    held = _closed_by_verify(q, ref, "builder-2")
+    assert held["verify_cycle"] == 2
+    with pytest.raises(q.GroupFenced):
+        q.verdict(ref, True, "stale", by="v1", expect_verify_cycle=1)
+    nxt = q.verdict(ref, True, "ok", by="v2", expect_verify_cycle=2)
+    assert nxt["status"] == "in_review" and nxt["gate_pending"] == "review"
+    assert _issue_state(state) == "OPEN"
+    q.reject(ref, "not what I asked", by="amir")
+    assert q.get(ref)["status"] == "open" and "not what I asked" in q.get(ref)["gate_feedback"]
+
+    _closed_by_verify(q, ref, "builder-3")
+    q.verdict(ref, True, "ok", by="v3", expect_verify_cycle=3)
+    assert q.accept(ref, by="amir")["status"] == "closed" and _issue_state(state) == "CLOSED"
+
+
+def test_a_failed_final_issue_write_stays_in_review_and_accept_retries(tmp_path, monkeypatch):
+    state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    q.update(ref, gates=["review"])
+    _closed_by_verify(q, ref)
+    from watchtower.github_backend import GitHubBackendError
+    backend_cls = type(q._github_backend_for_project("GHI"))
+    real = backend_cls.update_status
+
+    def _down(self, ident, status, *a, **kw):
+        if status == "closed":
+            raise GitHubBackendError("gh: connection refused")
+        return real(self, ident, status, *a, **kw)
+    monkeypatch.setattr(backend_cls, "update_status", _down)
+    with pytest.raises(GitHubBackendError):
+        q.accept(ref, by="amir")
+    assert q.get(ref)["status"] == "in_review" and _issue_state(state) == "OPEN"
+
+    monkeypatch.setattr(backend_cls, "update_status", real)
+    assert q.accept(ref, by="amir")["status"] == "closed" and _issue_state(state) == "CLOSED"
+
+
+def test_a_regate_is_a_new_generation_old_stage_writers_are_fenced(tmp_path, monkeypatch):
+    """Clear + re-gate keeps a tombstone: cycles keep counting, stage keys
+    change, and the cleared generation's planner/verifier cannot write."""
+    _state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    q.update(ref, gates=["plan"])
+    q.plan_start(ref)
+    q.plan_set_role(ref, "planner", {"worker_id": "old-planner"})
+    q.update(ref, gates=[])
+    assert q.get(ref).get("gates") is None and q.get(ref)["work_it"]
+
+    q.update(ref, gates=["plan", "verify"])
+    q.plan_start(ref)
+    from watchtower import stages
+    item = q.get(ref)
+    assert [d["key"] for d in stages.desired([item])] == ["plan:r1:g2"]
+    with pytest.raises(q.GroupFenced, match="cleared pipeline generation"):
+        q.plan_submit(ref, "1. stale plan", by="old-planner")
+    q.plan_submit(ref, "1. fresh plan", by="new-planner")
+    assert q.get(ref)["plan"]["text"] == "1. fresh plan"
+
+
+def test_reservation_rechecks_the_stage_before_a_spawn(tmp_path, monkeypatch):
+    """#10/#11: a spawn reserves its attempt in the store first; a stage that
+    settled since the tick read it, or a second tick, never spawns."""
+    _state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    q.update(ref, gates=["review", "verify"])
+    _closed_by_verify(q, ref)
+    from watchtower import stages
+    assert stages._reserve(ref, "verifier", "verify:1", 1)
+    assert not stages._reserve(ref, "verifier", "verify:1", 1)
+    q.verdict(ref, True, "ok", by="v1", expect_verify_cycle=1)
+    assert not stages._reserve(ref, "verifier", "verify:1", 2)
+
+
+def test_add_with_gates_gates_the_new_issue(tmp_path, monkeypatch):
+    _state, _config, q, _ref = _setup(tmp_path, monkeypatch)
+    ref = q.enqueue(project="GHI", note="gated at birth", text="b", gates=["verify"])["ref"]
+    assert q.get(ref)["gates"] == ["verify"] and q.get(ref)["pipeline_local"]
+
+
+def test_plan_decide_release_reopens_the_issue(tmp_path, monkeypatch):
+    """#6: plan_decide releasing a claim with no resumable session must
+    release it on the issue, not only in the sidecar view."""
+    state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    assert q.claim_by_ref(ref, "builder-1")
+    monkeypatch.setenv("WT_WORKER_ID", "builder-1")
+    q.update(ref, gates=["plan"])
+    monkeypatch.delenv("WT_WORKER_ID")
+    q.plan_start(ref)
+    q._plan_update(ref, lambda it, plan: plan.update(status="blocked"))
+    q.plan_decide(ref, "accept", text="1. go")
+    item = q.get(ref)
+    assert item["status"] == "open" and not item.get("claimed_by")
+    assert "in-progress" not in json.dumps(json.loads(state.read_text())["issues"][0].get("labels"))
 
 
 def test_clearing_gates_releases_the_ticket(tmp_path, monkeypatch):
