@@ -610,3 +610,75 @@ def test_handoff_reopens_the_issue_from_awaiting_answer(tmp_path, monkeypatch):
     item = q.get(ref)
     assert item["status"] == "open" and not item.get("claimed_by")
     assert item["pending_answer"]["state"] == "handed_off" and "parked" not in item
+
+
+def _block_parks(q, ref, who="w1"):
+    return q.block(ref, session_id=who, question="which db?", origin="worker")
+
+
+def test_worker_block_parks_a_sidecar_ticket_and_frees_the_worker(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    assert _block_parks(q, ref)["status"] == "awaiting_answer"
+    item = q.get(ref)
+    assert item["status"] == "awaiting_answer" and item["parked"]["worker_id"] == "w1"
+    assert item["claimed_by"] is None and item["needs_input"]
+    assert q.claim_next("w2", project="GHI") is None
+    assert [h["event"] for h in item["history"] if h["event"] == "park"] == ["park"]
+
+
+def test_answer_routes_through_the_sidecar_and_resumes_the_parked_worker(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    _block_parks(q, ref)
+    q.answer(ref, "use postgres")
+    pa = q.get(ref)["pending_answer"]
+    assert pa["state"] == "routing" and pa["answer"] == "use postgres" and pa["gen"] == 1
+    assert pa["question"] == "which db?" and pa["prior_worker_id"] == "w1"
+    assert q.get(ref)["status"] == "awaiting_answer"
+
+    q.answer(ref, "actually mysql")   # a second answer supersedes: newest gen wins
+    assert q.get(ref)["pending_answer"]["gen"] == 2
+    assert q.resume_claim(ref, 1) is None
+    got = q.resume_claim(ref, 2)
+    assert got["status"] == "in_progress" and got["claimed_by"] == "w1"
+    assert q.get(ref)["pending_answer"]["state"] == "delivering"
+
+
+def test_handoff_then_a_fresh_claim_settles_the_answer_as_delivered(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    _block_parks(q, ref)
+    q.answer(ref, "use postgres")
+    assert q.pa_transition(ref, 1, "routing", "handed_off", from_status="awaiting_answer",
+                           reopen=True, route="reopen", reason="gone")
+    assert q.get(ref)["status"] == "open"
+    claimed = q.claim_next("w2", project="GHI")
+    assert claimed["ref"] == ref and claimed["claimed_by"] == "w2"
+    pa = q.get(ref)["pending_answer"]
+    assert pa["state"] == "delivered" and pa["claimed_by"] == "w2" and pa["route"] == "claim"
+
+
+def test_affinity_reservation_holds_the_ticket_for_the_parked_worker(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    _block_parks(q, ref)
+    q.answer(ref, "use postgres")
+    until = "2999-01-01T00:00:00Z"
+    assert q.pa_transition(ref, 1, "routing", "affinity", from_status="awaiting_answer",
+                           reopen=True, route="affinity", fields={"affinity_until": until})
+    assert q.claim_next("w2", project="GHI") is None
+    assert q.count_claimable(project="GHI") == 0
+    assert q.claim_next("w1", project="GHI")["ref"] == ref
+    assert q.get(ref)["pending_answer"]["state"] == "delivered"
+
+
+def test_stale_worker_cannot_block_another_workers_claim(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="claimed by w1"):
+        q.block(ref, session_id="w2", question="mine?", origin="worker")
+    assert q.get(ref)["status"] == "in_progress" and not q.get(ref)["needs_input"]
+
+
+def test_a_block_without_a_pipeline_keeps_the_legacy_hold(tmp_path, monkeypatch):
+    _state, _config, q, ref = _setup(tmp_path, monkeypatch)
+    assert q.claim_next("w1", project="GHI")["ref"] == ref
+    _block_parks(q, ref)
+    item = q.get(ref)
+    assert item["status"] == "in_progress" and item["needs_input"] and not item.get("parked")

@@ -639,7 +639,9 @@ def poll_owner_answers_once() -> None:
             if dedup_key in seen_targets:
                 continue
             seen_targets.add(dedup_key)
-            for item in backend.list_items(status="in_progress"):
+            parked = [it for it in backend.list_items(status="awaiting_answer")   # WT-40
+                      if it.get("parked")]
+            for item in backend.list_items(status="in_progress") + parked:
                 if not item.get("needs_input"):
                     continue
                 ident = item.get("ref") or item.get("number")
@@ -2888,6 +2890,7 @@ class GitHubIssuesBackend:
         manual_only: bool = False,
         fresh: bool = True,
         requested_only: bool = False,
+        claimer: Optional[tuple] = None,
     ) -> List[Dict[str, Any]]:
         """Tickets a worker could claim right now, in claim order.
 
@@ -2917,6 +2920,13 @@ class GitHubIssuesBackend:
             it for it in self.list_items(status="open", lane=lane, fresh=fresh)
             if it.get(eligibility, False)
         ]
+        from . import queue as _q
+        now_ts = time.time()
+        # WT-40: an answer reserved for its parked worker (affinity) is claimable
+        # only by that worker until the reservation expires.
+        candidates = [it for it in candidates
+                      if not _q._affinity_reserved(it, now_ts)
+                      or (claimer is not None and _q._affinity_owner(it, *claimer))]
         if any(it.get("blocked_by") for it in candidates):
             # Dependencies (WT-36): a ticket with an open (or declined /
             # unresolved) blocker is not claimable and not spawn-worthy depth.
@@ -2981,6 +2991,7 @@ class GitHubIssuesBackend:
             item_types=item_types,
             readiness_filters=readiness_filters,
             requested_only=requested_only,
+            claimer=(session_id, session_uuid),
         )
         if has_stop_signal:
             try:
@@ -3498,6 +3509,18 @@ class GitHubIssuesBackend:
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         now = _now_iso()
         answer_text = _clip(text, 24000)
+        if item.get("status") == "awaiting_answer" and item.get("parked"):
+            # WT-40: a parked ticket routes the answer through the sidecar. Written
+            # BEFORE the issue edit: a crash in between re-routes (the owner-answer
+            # key is not recorded yet) instead of losing the answer.
+            from . import github_pipeline, queue as _q
+
+            def _route(it: Dict[str, Any]) -> Any:
+                if it.get("status") != "awaiting_answer" or not it.get("parked"):
+                    return "skip"
+                _q._write_pending_answer_unlocked(it, answer_text, now)
+                return None
+            github_pipeline.mutate(ident, _route)
         meta["needs_input"] = False
         meta["answered_at"] = now
         if source_comment_key:

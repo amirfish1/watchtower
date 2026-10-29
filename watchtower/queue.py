@@ -2537,6 +2537,24 @@ def _verify_worker_live(session_id: str, session_uuid: str = "") -> None:
         pass  # import/I/O failure → do not block the claim
 
 
+def _github_bind_answer(item: Dict[str, Any], worker_id: str, real_sid: str) -> Optional[Dict[str, Any]]:
+    """WT-40 (E12): a successful claim of a sidecar-owned ticket carrying an
+    answer settles it as delivered, exactly like the local claim does."""
+    from . import github_pipeline
+    gen = (item.get("pending_answer") or {}).get("gen")
+
+    def _fn(it: Dict[str, Any]) -> Any:
+        pa = it.get("pending_answer")
+        if not pa or pa.get("gen") != gen or pa.get("state") not in ("affinity", "handed_off"):
+            return "skip"
+        _bind_pending_unlocked(it, worker_id, real_sid, _now_iso())
+        return None
+    try:
+        return github_pipeline.mutate(item.get("ref"), _fn)
+    except (ValueError, github_pipeline.SidecarCorrupt):
+        return None
+
+
 def claim_next(
     session_id: str,
     lane: Optional[str] = None,
@@ -2680,6 +2698,9 @@ def claim_next(
             readiness_filters=readiness_filters,
             requested_only=requested_only,
         )
+        if item and not item.get("stop") and (item.get("pending_answer") or {}).get("state") in (
+                "affinity", "handed_off"):
+            item = _github_bind_answer(item, str(session_id), str(session_uuid or "")) or item
         if item and not item.get("stop"):
             _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
             _notify_ticket_event(
@@ -8104,6 +8125,36 @@ def _block_owner_guard_unlocked(it: Dict[str, Any], ident: Any, caller: str) -> 
     )
 
 
+def _github_park(ident: Any, session_id: str, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """WT-40: park a sidecar-owned GitHub ticket after the worker's block was
+    written to the issue. ``parked`` lives in the sidecar (the issue keeps its
+    in_progress claim, which ``github_pipeline.resume_claim`` checks); any
+    failure leaves the legacy hold-while-blocked state, which is safe."""
+    from . import github_pipeline
+    now = _now_iso()
+
+    def _fn(it: Dict[str, Any]) -> Any:
+        worker = str(it.get("claimed_by") or session_id or "")
+        if (it.get("status") != "in_progress" or not worker or _plan_active_unlocked(it)
+                or (it.get("stage_session") or {}).get("escalated")):
+            return "skip"
+        _supersede_pending_unlocked(it, now)
+        sid = str(it.get("claimed_session_id") or _coerce_session_uuid(session_id) or "")
+        actor = _by("worker", session_id, str(_coerce_session_uuid(session_id) or ""))
+        _park_unlocked(it, worker, sid, str(it.get("claimed_machine") or machine_tag()),
+                       now, actor)
+        return None
+    try:
+        parked = github_pipeline.mutate(ident, _fn)
+    except (ValueError, github_pipeline.SidecarCorrupt) as exc:
+        _log("PIPELINE", f"{ident}: park refused, left blocked in place: {exc}",
+             queue=_project_from_ident(ident))
+        return None
+    if parked:
+        _supersede_outbox(parked.get("ref"))
+    return parked
+
+
 def block(
     ident: Any,
     session_id: str = "",
@@ -8155,11 +8206,17 @@ def block(
         wait_record(wait_on)   # validate before any write
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
+        if origin == "worker" and session_id and not force:
+            cur = backend.get(ident)   # WT-40: sidecar-owned tickets get the local owner guard
+            if cur and cur.get("pipeline_local"):
+                _block_owner_guard_unlocked(cur, ident, str(session_id))
         item = backend.block(
             ident, session_id=session_id, question=question, progress=progress,
             kind=kind, wait_on=wait_on, wait_actor=wait_actor, wait_ref=wait_ref,
             expect=expect,
         )
+        if item and origin == "worker" and item.get("pipeline_local"):
+            item = _github_park(ident, str(session_id), item) or item
         if item:
             if origin == "worker":
                 _note_worker_ticket_done(session_id)
