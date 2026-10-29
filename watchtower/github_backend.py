@@ -2797,6 +2797,21 @@ class GitHubIssuesBackend:
             finally:
                 held.discard(path)
 
+    def _fresh_issue_state(self, number: str) -> str:
+        """The issue's live ``OPEN``/``CLOSED`` state, read just before a
+        state-dependent write. Anything else (a failed read, unparsable JSON,
+        an unknown state) raises: the caller must not guess."""
+        raw = self._run(["issue", "view", number, *self._repo_args(), "--json", "state"])
+        try:
+            state = str((json.loads(raw or "{}") or {}).get("state") or "").upper()
+        except (json.JSONDecodeError, AttributeError) as exc:
+            raise GitHubBackendError(
+                f"gh issue view {number} --json state returned invalid JSON") from exc
+        if state not in ("OPEN", "CLOSED"):
+            raise GitHubBackendError(
+                f"gh issue view {number} returned unknown state {state!r}")
+        return state
+
     def _edit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
                    *extra: str) -> List[str]:
         """Write ``body``+``meta`` over ``item``'s issue, then re-read and
@@ -3198,13 +3213,17 @@ class GitHubIssuesBackend:
         self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
         # `gh issue close --comment` takes the text on argv only (no file or
         # stdin form), and a resolution with long caveats can pass the
-        # per-argument limit (WT-40). gh itself posts the comment and then
-        # closes, so this is the same two writes, with the comment on stdin.
-        self._run([
-            "issue", "comment", number,
-            *self._repo_args(),
-            "--body", _resolution_comment(norm),
-        ])
+        # per-argument limit (WT-40). So we make gh's own steps ourselves:
+        # fetch the state, return early on CLOSED without commenting (gh
+        # 2.101 close.go), else post the comment (on stdin), then close. The
+        # race window between that read and the writes is gh's own; GitHub
+        # offers no precondition on either.
+        if self._fresh_issue_state(number) == "OPEN":
+            self._run([
+                "issue", "comment", number,
+                *self._repo_args(),
+                "--body", _resolution_comment(norm),
+            ])
         self._run(["issue", "close", number, *self._repo_args()])
         closed = self.get(ident)
         if closed:
