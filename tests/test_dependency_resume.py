@@ -143,3 +143,40 @@ def test_github_dependency_wait_is_answered(tmp_path, monkeypatch):
     ans = [h for h in cur["history"] if h.get("event") == "answer"]
     assert ans and ans[-1]["kind"] == "system"  # GitHub rows are flat
     assert answers.resume_dependency_waits() == []
+
+
+def test_local_ref_resolves_only_on_the_host_that_recorded_the_wait(tmp_path, monkeypatch):
+    """OPS-230: local queues are per host, so a shared GitHub ticket waiting on
+    local OPS-202 must not be answered by another host's unrelated OPS-202 --
+    with the host stamped on the wait, or only on the block event (legacy)."""
+    from tests.test_github_backend import (
+        _drainable, _install_fake_gh, _reload_isolated,
+    )
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    import watchtower.answers as answers
+    import watchtower.cli as cli
+    importlib.reload(answers)
+    importlib.reload(cli)
+    dep = q.enqueue(project="PK", note="local dependency on her", source="test")
+    q.claim_by_ref(dep["ref"], "worker-2")
+    q.update_status(dep["ref"], "closed", session_id="worker-2",
+                    resolution={"summary": "landed"})
+    for legacy in (False, True):
+        a = q.enqueue(project="GHI", note="shared dependent")
+        monkeypatch.setattr(q, "_MACHINE_TAG_CACHE", "her")
+        q.claim_by_ref(a["ref"], "worker-1")
+        q.block(a["ref"], session_id="worker-1", question="wait",
+                wait_on="dependency", wait_ref=dep["ref"])
+        if legacy:
+            q._github_backend_for_project("GHI").update(
+                a["ref"], wait={k: v for k, v in q.get(a["ref"])["wait"].items() if k != "host"})
+        monkeypatch.setattr(q, "_MACHINE_TAG_CACHE", "ami")   # another host, same ref
+        assert answers.resume_dependency_waits() == []
+        assert q.get(a["ref"]).get("needs_input")
+        monkeypatch.setattr(q, "_MACHINE_TAG_CACHE", "her")
+        assert answers.resume_dependency_waits() == [f"{a['ref']}:{dep['ref']}"]
+        assert not q.get(a["ref"]).get("needs_input")

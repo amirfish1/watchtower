@@ -183,7 +183,9 @@ def wait_record(on: str, actor: str = "", ref: str = "", note: str = "",
     on = str(on or "").strip().lower()
     if on not in WAIT_ON:
         raise ValueError(f"wait-on must be one of {', '.join(WAIT_ON)}, not {on!r}")
-    rec: Dict[str, Any] = {"on": on, "at": _now_iso(), "block_at": str(block_at or "")}
+    rec: Dict[str, Any] = {"on": on, "at": _now_iso(), "block_at": str(block_at or ""),
+                           # A local-queue ref means a ticket on THIS host (OPS-230).
+                           "host": machine_tag()}
     if actor:
         rec["actor"] = _clip(str(actor).strip(), 120)
     if ref:
