@@ -98,6 +98,8 @@ def synth(s: Any, i: int, now: float) -> Dict[str, Any]:
         plan["discussion"] = disc
     if plan:
         it["plan"] = plan
+    if s.backend == "github" and s.status == "in_review":
+        it["pipeline_local"] = True   # OPS-204: only this host's sidecar overlay shows in_review
     if s.gate_pending == "verify":
         it["gate_pending"] = "verify"
     elif s.gate_pending == "review":
