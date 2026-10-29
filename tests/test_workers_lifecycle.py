@@ -2768,6 +2768,7 @@ def test_build_codex_passes_auto_compact_limit(wt, tmp_path, monkeypatch):
     f = tmp_path / "sd.json"
     f.write_text('{"worker_auto_compact_k": 200}')
     monkeypatch.setattr(wt.config, "CCC_SPAWN_DEFAULTS_FILE", f)
+    wt.config.set_codex_transport("Q", "exec")
     argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")
     assert argv[argv.index("-c") + 1] == "model_auto_compact_token_limit=200000"
     f.write_text("{}")
@@ -2776,6 +2777,7 @@ def test_build_codex_passes_auto_compact_limit(wt, tmp_path, monkeypatch):
 
 
 def test_build_codex_has_goal_in_argv(wt):
+    wt.config.set_codex_transport("Q", "exec")
     argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")
     assert argv[:2] == ["codex", "exec"]
     assert "--dangerously-bypass-approvals-and-sandbox" in argv

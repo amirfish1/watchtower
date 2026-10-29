@@ -1,7 +1,7 @@
 """Steerable Codex workers hosted on their own app-server (CODEX-CCC-WT-10).
 
 Regression for OPS-155: a `codex exec` worker cannot be steered by anyone, so
-opt-in queues host the worker thread on a private `codex app-server --listen
+queues (the default since OPS-237) host the worker thread on a private `codex app-server --listen
 unix://` that other processes reach as extra clients.
 """
 
@@ -70,14 +70,18 @@ FAKE_CODEX = textwrap.dedent(r'''
 ''')
 
 
-def test_app_server_transport_is_opt_in_and_keeps_exec_settings(wt_env):
+def test_app_server_is_default_transport_and_exec_pin_keeps_settings(wt_env):
+    """OPS-237: an unconfigured (e.g. newly created) codex queue spawns
+    steerable app-server workers; an explicit exec pin survives and spawns
+    exec with the same settings; clearing the pin restores the default."""
     wt = wt_env
-    exec_argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo", model="gpt-x", effort="high")
-    assert exec_argv[:2] == ["codex", "exec"]
-
-    wt.config.set_codex_transport("Q", "app-server")
     argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo", model="gpt-x", effort="high")
     assert "watchtower.codex_app_worker" in " ".join(argv) and "exec" not in argv
+
+    wt.config.set_codex_transport("Q", "exec")
+    assert wt.config._queue_entry("Q").get("codex_transport") == "exec"
+    exec_argv = wt.workers.build_drain_command("Q", "codex", "q-1", "/repo", model="gpt-x", effort="high")
+    assert exec_argv[:2] == ["codex", "exec"]
     exec_overrides = [exec_argv[i + 1] for i, a in enumerate(exec_argv) if a in ("-c", "--config")]
     app_overrides = [argv[i + 1] for i, a in enumerate(argv) if a == "-c" and i > 2]
     assert exec_overrides and app_overrides == exec_overrides
@@ -87,7 +91,7 @@ def test_app_server_transport_is_opt_in_and_keeps_exec_settings(wt_env):
     assert argv[-1] == exec_argv[-1]
 
     wt.config.set_codex_transport("Q", "")
-    assert wt.workers.build_drain_command("Q", "codex", "q-1", "/repo")[:2] == ["codex", "exec"]
+    assert "watchtower.codex_app_worker" in " ".join(wt.workers.build_drain_command("Q", "codex", "q-1", "/repo"))
 
 
 def test_second_process_steers_hosted_worker_through_its_own_server(wt_env):

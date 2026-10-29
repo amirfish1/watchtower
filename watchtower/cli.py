@@ -7780,9 +7780,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--codex-transport", default=None, dest="codex_transport",
                    choices=["exec", "app-server", ""],
                    help=(
-                       "how codex workers run: exec (default, one-shot `codex "
-                       "exec`) or app-server (pilot: steerable while working). "
-                       "Empty string clears the pin."
+                       "how codex workers run: app-server (default: steerable "
+                       "while working) or exec (one-shot `codex exec`). Empty "
+                       "string clears the pin."
                    ))
     s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
                    help="restrict auto-drain to these ticket types (requires --auto-drain on)")

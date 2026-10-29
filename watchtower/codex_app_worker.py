@@ -20,8 +20,8 @@ stdout is the worker log (the first line carries ``session_id`` for
 is written by the app-server as usual (activity clock + token telemetry), and
 the exit code reports the turn outcome.
 
-Opt-in per queue (``wt config -q Q --codex-transport app-server``); the default
-stays ``codex exec``. A live worker advertises itself at
+The default codex transport (OPS-237); ``wt config -q Q --codex-transport exec``
+pins a queue back to one-shot ``codex exec``. A live worker advertises itself at
 ``~/.watchtower/codex-app/<thread_id>.json`` so steerers can find its socket.
 """
 
@@ -385,8 +385,15 @@ def run(argv: Optional[List[str]] = None) -> int:
     try:
         deadline = time.monotonic() + _SOCKET_WAIT_S
         while not os.path.exists(sock):
-            if server.poll() is not None or time.monotonic() > deadline:
-                _emit({"type": "error", "error": f"app-server did not open {sock} (exit {server.poll()})"})
+            code = server.poll()
+            if code is not None:
+                # The server's own stderr is already in the log and names the
+                # cause (auth, bad flag, broken install); keep it the newest
+                # error line and mirror its exit code, as `codex exec` would.
+                _emit({"type": "app-server.exited", "before": "socket", "exit": code})
+                return code
+            if time.monotonic() > deadline:
+                _emit({"type": "error", "error": f"app-server did not open {sock} within {_SOCKET_WAIT_S:.0f}s"})
                 return 1
             time.sleep(0.1)
         client = _Client(sock, on_note=on_note)

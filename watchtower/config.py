@@ -1321,17 +1321,20 @@ CODEX_TRANSPORTS = ("exec", "app-server")
 
 
 def set_codex_transport(queue: str, value: str) -> Dict[str, Any]:
-    """Pin how codex workers on ``queue`` run (CODEX-CCC-WT-10 pilot).
+    """Pin how codex workers on ``queue`` run.
 
-    "exec" (the default; "" clears the pin) keeps one-shot ``codex exec``;
-    "app-server" hosts the worker's thread on its own app-server so it can be
-    steered while it works (``watchtower.codex_app_worker``)."""
+    "app-server" (the default; "" clears the pin) hosts the worker's thread on
+    its own app-server so it can be steered while it works
+    (``watchtower.codex_app_worker``); "exec" pins one-shot ``codex exec``.
+    The default flipped from exec in OPS-237 ([Q463]): queues created after a
+    per-queue rollout silently got exec and their workers were unsteerable, so
+    an explicit "exec" pin is now stored rather than dropped."""
     transport = str(value or "").strip().lower()
     if transport and transport not in CODEX_TRANSPORTS:
         raise ValueError(f"codex transport must be one of {CODEX_TRANSPORTS}")
     data = _load()
     q = data.setdefault(queue, {})
-    if transport and transport != "exec":
+    if transport:
         q["codex_transport"] = transport
     else:
         q.pop("codex_transport", None)
@@ -1339,9 +1342,12 @@ def set_codex_transport(queue: str, value: str) -> Dict[str, Any]:
     return q
 
 
+DEFAULT_CODEX_TRANSPORT = "app-server"
+
+
 def codex_transport(queue: str) -> str:
     value = str(_queue_entry(queue).get("codex_transport") or "").strip().lower()
-    return value if value in CODEX_TRANSPORTS else "exec"
+    return value if value in CODEX_TRANSPORTS else DEFAULT_CODEX_TRANSPORT
 
 
 def canonical_model(eng: str, model_value: str) -> str:

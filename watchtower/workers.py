@@ -5252,7 +5252,9 @@ def build_drain_command(
         # workers ran to ~780K context (model_context_window=1M) before compact.
         argv += codex_compact_args()
         goal = goal or drain_goal(queue, worker_id, repo_path, engine=engine)
-        if config.codex_transport(queue) == "app-server":
+        # An unresolvable codex keeps the exec argv so Popen itself fails and
+        # the spawn reports "engine executable unavailable", not a wrapper death.
+        if config.codex_transport(queue) == "app-server" and _resolve_engine_bin("codex"):
             return codex_app_worker_command(argv, worker_id, repo_path, goal)
         argv.append(goal)
         return argv
