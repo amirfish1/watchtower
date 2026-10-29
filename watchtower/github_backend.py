@@ -3591,7 +3591,7 @@ class GitHubIssuesBackend:
             def _route(it: Dict[str, Any]) -> Any:
                 if it.get("status") != "awaiting_answer" or not it.get("parked"):
                     return "skip"
-                _q._write_pending_answer_unlocked(it, answer_text, now)
+                _q._write_pending_answer_unlocked(it, answer_text, now, by_kind=kind)
                 return None
             github_pipeline.mutate(ident, _route)
         meta["needs_input"] = False

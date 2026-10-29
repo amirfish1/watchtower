@@ -707,3 +707,16 @@ def test_liveness_classifies_the_parked_github_lifecycle(tmp_path, monkeypatch):
     assert st.answer == "delivering" and rid == "answer.delivering"
     ids = {u.id for u in lv.UNREACHABLE}
     assert not ids & {"github_parked", "github_answer"}
+
+
+def test_sidecar_answer_keeps_the_sender_kind(tmp_path, monkeypatch):
+    """WT-46: a parked GitHub ticket's routed answer carries by_kind, and the
+    issue history records the same label."""
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    _block_parks(q, ref)
+    q.answer(ref, "use postgres", session_id="wt-root", by_kind="worker")
+    item = q.get(ref)
+    assert item["pending_answer"]["by_kind"] == "worker"
+    answer = [h for h in item["history"] if h["event"] == "answer"][-1]
+    # GitHub history entries carry the label flat (kind=), not under by.
+    assert answer["kind"] == "worker"

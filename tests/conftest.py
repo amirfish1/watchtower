@@ -135,6 +135,11 @@ def hermetic_outbox_and_caller_identity(tmp_path, monkeypatch):
     )
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.delenv("CODEX_THREAD_ID", raising=False)
+    # A spawned worker running pytest exports these; `wt answer` reads them to
+    # attribute an answer to an agent (WT-46), so leaving them in turned every
+    # test answer into kind=worker.
+    monkeypatch.delenv("WT_WORKER_ID", raising=False)
+    monkeypatch.delenv("WT_WORKER", raising=False)
 
 
 # The GraphQL quota probe `gh` answers here. `_list_issues` reads the real

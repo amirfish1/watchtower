@@ -49,7 +49,7 @@ prevents agents from using it as a comfortable parking lot for hard tickets.
 | Release | `wt release <ref>` | Worker | Give up a claim without closing it -- back to `open` for the pool. No-op if the ticket isn't `in_progress`. |
 | Reopen | `wt reopen <ref> --reason "..."` | Human | Reopen a closed (or in-progress) ticket -- back to `open` for the pool, without marking it run_requested or dispatching. Refused on blocked tickets unless `--force` (same guard as release). |
 | Block | `wt block <ref>` | Worker | Park a ticket that needs a human decision. Sets `needs_input` + `block_question`. |
-| Answer | `wt answer <ref> "..."` | Human | Provide input to unblock a blocked ticket. Clears `needs_input`. |
+| Answer | `wt answer <ref> "..." [--by human\|worker\|system]` | Human or agent | Provide input to unblock a blocked ticket. Clears `needs_input`. Recorded as `by.kind`: `--by`, else `worker` inside an agent session (Claude/Codex env, `WT_WORKER_ID`), else `human`. The resumed worker's prompt names the sender (WT-46). |
 | Discuss | `wt discuss <ref>` | Human | Resume the blocked ticket's worker session (`claude --resume <sid>`). |
 | Close | `wt close <ref>` | Worker | Mark a ticket done. `--summary` is required; `--caveat/--follow-up/--unresolved` optional. |
 

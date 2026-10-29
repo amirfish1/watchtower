@@ -7898,7 +7898,8 @@ def _park_unlocked(it: Dict[str, Any], worker_id: str, session_id: str, machine:
 
 def _write_pending_answer_unlocked(it: Dict[str, Any], text: str, now: str, *,
                                    reserve_for: str = "", reserve_session: str = "",
-                                   affinity_until: str = "") -> Dict[str, Any]:
+                                   affinity_until: str = "",
+                                   by_kind: str = "human") -> Dict[str, Any]:
     """Answer on a parked ticket: persist ``pending_answer`` (state routing).
 
     ``reserve_for`` (OPS-1332/E18): instead write a fresh reservation
@@ -7926,6 +7927,7 @@ def _write_pending_answer_unlocked(it: Dict[str, Any], text: str, now: str, *,
         "transcript_path": parked.get("transcript_path", ""),
         "repo_path": parked.get("repo_path", ""),
         "route": "", "reason": "", "attempts": 0, "state_at": now,
+        "by_kind": by_kind,
     }
     return it["pending_answer"]
 
@@ -8445,7 +8447,7 @@ def answer(ident: Any, text: str, session_id: str = "", *, by_kind: str = "human
                 stage_retry = _stage_retry_reset(it, text, now)
                 if (it.get("status") == PARKED_STATUS and it.get("parked")
                         and not stage_retry):
-                    _write_pending_answer_unlocked(it, text, now)
+                    _write_pending_answer_unlocked(it, text, now, by_kind=by_kind)
                 elif it.get("status") == "in_progress" and not it.get("claimed_session_id"):
                     it["status"] = "open"
                     it["claimed_by"] = None

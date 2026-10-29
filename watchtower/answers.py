@@ -160,6 +160,21 @@ def answer_prompt(item: Dict[str, Any], pa: Dict[str, Any]) -> str:
         str(item["ref"]), str(pa.get("prior_worker_id") or ""))
 
 
+def answer_sender(by_kind: Any) -> str:
+    """Who sent an answer, for the prompt the parked worker reads (WT-46).
+
+    ``wt answer --by worker`` (an agent session, e.g. a root-delegated
+    answer) must not read as an owner's words, and an owner answer must not
+    read as an agent's. Records written before WT-46 carry no kind and were
+    always labelled human."""
+    kind = str(by_kind or "human")
+    if kind == "worker":
+        return "An agent session (not a human)"
+    if kind == "system":
+        return "WatchTower (automated)"
+    return "A human"
+
+
 def _answer_prompt(item: Dict[str, Any], pa: Dict[str, Any]) -> str:
     ref, gen, text = item["ref"], pa.get("gen"), pa.get("answer", "")
     tag = (f"[answer {ref}#{gen}; ignore a repeat of a tag you already applied] ")
@@ -179,11 +194,17 @@ def _answer_prompt(item: Dict[str, Any], pa: Dict[str, Any]) -> str:
                 f"again with `wt block {ref} --worker <your-id> --kind awaiting-client` "
                 f"unless the topic is finished, in which case close it instead."
                 f"{_carried_text(pa, item)}")
-    return (tag + f"A human answered your blocked question on ticket {ref}. Their answer: "
+    return (tag + f"{answer_sender(pa.get('by_kind'))} answered your blocked question on "
+            f"ticket {ref}. The answer: "
             f"{text}.{_carried_text(pa, item)} Apply it, finish the ticket, and close it with "
             f"`wt close {ref} --worker <your-id> --summary \"...\" --commit <SHA>` (or "
             f"`--no-code` if no code changed). If it still cannot be resolved, run `wt block` "
             f"again with the new open question.")
+
+
+def _answered_label(pa: Dict[str, Any]) -> str:
+    return {"worker": "Agent answered", "system": "WatchTower answered"}.get(
+        str(pa.get("by_kind") or ""), "Human answered")
 
 
 def claim_brief(item: Dict[str, Any], worker_id: str = "", session_id: str = "") -> str:
@@ -196,10 +217,10 @@ def claim_brief(item: Dict[str, Any], worker_id: str = "", session_id: str = "")
     extra = _carried_text(pa, item)
     if owner:
         return (f"Your question: {pa.get('question', '')}\n"
-                f"Human answered: {pa.get('answer', '')}{extra}")
+                f"{_answered_label(pa)}: {pa.get('answer', '')}{extra}")
     where = f"; prior transcript at {pa['transcript_path']}" if pa.get("transcript_path") else ""
     return (f"Prior worker asked: {pa.get('question', '')}\n"
-            f"Human answered: {pa.get('answer', '')}{extra}{where}")
+            f"{_answered_label(pa)}: {pa.get('answer', '')}{extra}{where}")
 
 
 # --------------------------------------------------------------- delivery

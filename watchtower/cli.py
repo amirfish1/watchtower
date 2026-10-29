@@ -3427,7 +3427,25 @@ def cmd_answer(args: argparse.Namespace) -> int:
     as the client saying the topic itself is over (Topic-Is-Done, plan section
     3b) rather than just the next turn in an ongoing exchange.
     """
-    return _answer_and_deliver(args)[0]
+    return _answer_and_deliver(args, by_kind=_answer_by_kind(args))[0]
+
+
+def _answer_by_kind(args: argparse.Namespace) -> str:
+    """WT-46: the ``by.kind`` a `wt answer` is recorded under.
+
+    An explicit ``--by`` wins. Otherwise an answer typed inside an agent
+    harness (Claude/Codex session env, or a spawned worker's ``WT_WORKER_ID``) is an
+    agent's, so it records ``worker``. Everything else records ``human``:
+    the dashboard, the iMessage/Discord routers and the client-intake
+    bridges run as services without that env. ``--worker`` alone proves
+    nothing, because the intake bridges pass it on real client replies."""
+    by = str(getattr(args, "by", "") or "")
+    if by:
+        return by
+    if any(os.environ.get(v) for v in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID",
+                                        "WT_WORKER_ID", "WT_WORKER")):
+        return "worker"
+    return "human"
 
 
 def deliver_dependency_answer(ref: str, text: str, block_at: str) -> Optional[dict]:
@@ -3509,8 +3527,8 @@ def _deliver_answer(args: argparse.Namespace, item: dict, by_kind: str) -> int:
         )
     else:
         prompt = (
-            f"A human answered your blocked question on ticket {item['ref']}. "
-            f"Their answer: {args.text}. Apply it, finish the ticket, and close it "
+            f"{answers.answer_sender(by_kind)} answered your blocked question on "
+            f"ticket {item['ref']}. The answer: {args.text}. Apply it, finish the ticket, and close it "
             f"with `wt close {item['ref']} --worker <your-id> --summary \"...\" "
             "--commit <SHA>` (or `--no-code` if no code changed). "
             f"If it still cannot be resolved, run `wt block` again with the new "
@@ -7437,6 +7455,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--worker", default="")
     s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
                    help="override the blocked session engine")
+    s.add_argument("--by", default=None, choices=["human", "worker", "system"],
+                   help="who is answering (recorded as by.kind and named in "
+                        "the delivered prompt). Default: worker when run "
+                        "inside an agent session, else human")
     s.add_argument("--tid", action="store_true",
                    help="mark this answer as Topic-Is-Done: on an "
                         "awaiting-client blocked ticket, tells the worker "
