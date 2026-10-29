@@ -3332,7 +3332,9 @@ class GitHubIssuesBackend:
         another host's renewal or reassignment landing after this read is
         not fenced (GitHub has no compare-and-swap) -- `_edit_body`'s
         three-way merge keeps that writer's claim fields, but the question
-        is still posted. The window is one read-to-edit round trip."""
+        is still posted. The window is one read-to-edit round trip, so the
+        backstop only asks this for a claim held on this host; a claim held
+        elsewhere is routed to its owner, never blocked (WT-38)."""
         from . import queue as _q
         item = self.get(ident)
         if item is None:

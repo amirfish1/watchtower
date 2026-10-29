@@ -766,7 +766,9 @@ def _bound_session_working(item: Dict[str, Any], ctx: ResolverContext) -> str:
 # foreign observer defers only to a renewal of exactly this claim (same
 # machine, worker and session) younger than the stall window. Anything else
 # -- no stamp, an expired one, a stamp from an earlier claim, or one dated
-# more than CLOCK_SKEW_S in the future -- leaves the bounded escalation.
+# more than CLOCK_SKEW_S in the future -- is not proof of death either
+# (WT-38): the observer stays read-only on the issue and routes one recovery
+# request to the owning host (``route_owner_host``), never a block.
 CLOCK_SKEW_S = 300.0
 
 
@@ -798,12 +800,14 @@ def _foreign_claim(item: Dict[str, Any], now: float,
     * a valid stamp younger than ``stall``: ``remote``, no action;
     * a valid stamp that aged out: the owning host was renewing this claim
       and stopped (host down, session quiet, or writes failing for three
-      renewals in a row), so escalate after the usual ``stall`` of store idle;
+      renewals in a row), so route after the usual ``stall`` of store idle;
     * no valid stamp: nothing is known either way -- the owning host may
-      predate WT-39, or never got a renewal through -- so escalate only after
-      UNOBSERVED_STALL_FACTOR stall windows of store idle. That bound is the
-      migration fallback, not proof of death: it only ever asks a human,
-      and never releases or reopens the claim."""
+      predate WT-39, or never got a renewal through -- so route only after
+      UNOBSERVED_STALL_FACTOR stall windows of store idle.
+
+    Either way the result is a request to the owning host (``_route_owner_host``),
+    never a block or a human question on the claim: only that host can tell
+    a quiet live worker from a dead one."""
     host = _foreign_host(item)
     age = claim_heartbeat_age(item, now)
     if age is not None and age < stall:
@@ -815,6 +819,111 @@ def _foreign_claim(item: Dict[str, Any], now: float,
 
 
 UNOBSERVED_STALL_FACTOR = 4.0
+# Where a foreign observer routes recovery of a claim it cannot judge: this
+# host's OPS lane (``workers._alert_launch_failure_queue``), which must be a
+# local queue so the request dedupes per claim.
+OWNER_ROUTE_QUEUE = "OPS"
+# Recovery requests per claim. One is open at a time; once it closes and the
+# claim still has no owning-host signal, the next is filed no sooner than one
+# stall window after that close, and after the last nothing more is filed
+# (``wt liveness`` shows the exhausted routes).
+OWNER_ROUTE_MAX = 3
+
+
+def _owner_route_key(item: Dict[str, Any]) -> str:
+    """The claim identity a recovery request is filed under: a new claim of
+    the ticket routes anew. Each request appends ``#<n>``."""
+    return "owner-host:" + ":".join(str(item.get(k) or "") for k in (
+        "ref", "claimed_machine", "claimed_by", "claimed_session_id", "claimed_at"))
+
+
+def _owner_routes(item: Dict[str, Any],
+                  by_ref: Dict[str, Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """This claim's recovery requests, oldest first."""
+    key = _owner_route_key(item) + "#"
+    rows = [i for i in by_ref.values() if str(i.get("dedupe_key") or "").startswith(key)]
+    return sorted(rows, key=lambda i: int(str(i["dedupe_key"]).rsplit("#", 1)[1] or 0))
+
+
+def _owner_route_due(item: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
+                     now: float, stall: float) -> Tuple[bool, str]:
+    """(file a request now?, evidence). An open request is the recovery in
+    progress; a closed one is history, not proof the claim recovered."""
+    routes = _owner_routes(item, by_ref)
+    if not routes:
+        return True, ""
+    last = routes[-1]
+    if last.get("status") != "closed":
+        return False, f"recovery routed to {last.get('ref')}"
+    if len(routes) >= OWNER_ROUTE_MAX:
+        return False, (f"{len(routes)} recovery requests closed without a signal "
+                       f"(last {last.get('ref')}); routing exhausted, still unrecovered: "
+                       f"next step is `wt liveness {item.get('ref')}` on "
+                       f"{_foreign_host(item)}")
+    closed = q._iso_ts(last.get("closed_at")) or 0.0
+    if now - closed < stall:
+        return False, f"recovery request {last.get('ref')} closed {int(now - closed)}s ago"
+    return True, f"recovery request {last.get('ref')} closed; signal still missing"
+
+
+def _route_owner_host(item: Dict[str, Any], a: Dict[str, Any],
+                      by_ref: Dict[str, Dict[str, Any]], now: float) -> str:
+    """File the next owning-host recovery request for a foreign claim;
+    returns its ref. Touches nothing on the claimed ticket: the claim, any
+    open question and any answer stay exactly as the owner left them."""
+    from . import workers
+    ref, host = a["ref"], _foreign_host(item)
+    routes = _owner_routes(item, by_ref)
+    n = len(routes) + 1
+    age = claim_heartbeat_age(item, now)
+    prior = (f"Earlier requests for this claim: "
+             f"{', '.join(str(r.get('ref')) for r in routes)} (closed, yet the claim "
+             f"still has no owning-host signal). " if routes else "")
+    last = " This is the last request the backstop files for this claim." \
+        if n >= OWNER_ROUTE_MAX else ""
+    text = f"""\
+Observed by host {q.machine_tag()} (WatchTower backstop, read-only on {ref}).
+
+Claim: {ref} ({a['queue']}) status in_progress, claimed by {item.get('claimed_by')}
+session {item.get('claimed_session_id') or '-'} on host {host}
+since {item.get('claimed_at') or '?'}.
+Evidence: {a['evidence']}; heartbeat age {'none' if age is None else f'{int(age)}s'};
+{a['idle_s']}s of store idle. {prior}This host cannot see {host}'s processes, so
+none of this shows the worker is dead.
+
+Steps (request {n} of at most {OWNER_ROUTE_MAX}):
+1. Re-read {ref} first (`wt find {ref} --json`). If the claim changed (other
+   worker/session/host), it closed, its heartbeat is fresh, or it has an open
+   question, close this request: nothing to recover.
+2. On {host}: `wt liveness {ref}`, and check the session/process named above.
+   - Alive: make sure {host} runs a WatchTower with the claim heartbeat
+     (WT-39; `wt deploy --json`, then `wt deploy --sync`), so its sweep renews
+     it. Close this request once a fresh heartbeat shows on {ref}.
+   - Dead: {host}'s own backstop recovers it. Close this request once it has.
+3. {host} unreachable (ssh or `wt` there fails): an external wait, not a
+   question. `wt defer` this request `--until +2h --reason "{host} unreachable:
+   <error>"` and redo steps 1-2 when it returns. After 3 such defers, close it
+   with `--unresolved "{host} unreachable since <first attempt>"`; the backstop
+   files the next request a stall window later.{last} Ask a human (`wt block`)
+   only for a credential or device you established is missing, never for
+   reachability alone.
+
+Safe stop. This request does not authorize `wt release --force`, closing or
+editing {ref}, stopping its worker, or resetting or extending any budget,
+review, deadline or grant. Hand {ref} back only when {host} proves the claimed
+session dead, or its owner says so in writing on {ref}.
+
+Done when: {ref}'s claim carries a heartbeat from {host} younger than the stall
+window, or {ref} was recovered or released through {host} as described above.
+"""
+    item_ = q.enqueue(
+        note=f"Recover {ref}: claim held on {host} has no live owning-host signal",
+        title=f"Owner-host recovery: {ref} on {host} (#{n})",
+        text=text, accept_line=f"{ref} renewed from {host}, or recovered or released through {host}",
+        project=workers._alert_launch_failure_queue(OWNER_ROUTE_QUEUE),
+        source="wt", item_type="bug", priority="p2", readiness="ready",
+        dedupe_key=f"{_owner_route_key(item)}#{n}")
+    return str(item_.get("ref") or "")
 
 
 HEARTBEAT_RENEW_S = 600.0
@@ -1140,7 +1249,10 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
     elif proof["kind"] == "claim_owner" and github and _foreign_host(item):
         verdict, evidence, min_idle = _foreign_claim(item, now, stall)
         if verdict != "remote":
-            action, reason = "escalate", f"claim owner {verdict} ({evidence})"
+            due, routed = _owner_route_due(item, by_ref, now, stall)
+            evidence += f"; {routed}" if routed else ""
+            if due:
+                action, reason = "route_owner_host", f"claim owner {verdict} ({evidence})"
     elif proof["kind"] == "claim_owner":
         v = claim_owner(item, ctx)
         verdict, evidence = v.verdict, v.evidence or v.source
@@ -1302,6 +1414,17 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
                    "escalation did not flag it", queue=a["queue"])
             return "no_escalation"
         return "done"
+    if action == "route_owner_host":
+        stale, _ = _github_snapshot_stale(item, a, by_ref, now)
+        if stale:
+            return stale
+        try:
+            routed = _route_owner_host(item, a, by_ref, time.time() if now is None else now)
+        except Exception as exc:  # noqa: BLE001 - the next sweep retries
+            return f"route failed: {exc}"
+        q._log("BACKSTOP_OWNER_ROUTE", f"{ref} held on {_foreign_host(item)}: {reason}; "
+               f"routed to {routed or '?'}", queue=a["queue"])
+        return "done" if routed else "route failed: no ref"
     if action == "escalate" or action == "unblocked_plan":
         question = _escalation_question(item, a)
         if action == "unblocked_plan":
