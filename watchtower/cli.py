@@ -1132,6 +1132,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 item_types=getattr(args, "type", None) or [],
                 readiness_filters=getattr(args, "readiness", None) or [],
                 worker_model=workers.worker_model(worker, args.queue),
+                requested_only=getattr(args, "requested_only", False),
             )
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
@@ -6960,6 +6961,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--readiness", action="append", default=None,
                    choices=["ready", "needs-shaping", "needs-spec"],
                    help="only claim items with this readiness (repeatable)")
+    s.add_argument("--requested-only", action="store_true",
+                   help="only claim tickets a human marked run-requested (▶ / `wt ready`)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_claim)
 

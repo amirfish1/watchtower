@@ -2312,6 +2312,7 @@ def _claim_candidates(
     worker_model: Optional[str] = None,
     claimer: Optional[Tuple[str, str]] = None,
     machine: Optional[str] = None,
+    requested_only: bool = False,
 ) -> List[Dict[str, Any]]:
     """Return ``items`` filtered + sorted exactly as claim_next() would pick
     from them — the single source of truth for "is this ticket claimable
@@ -2331,6 +2332,10 @@ def _claim_candidates(
     always-on VM only ever takes what it can actually run.
     """
     candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of")]
+    if requested_only:
+        # OPS-1492: a dispatcher on a manually drained queue only wants what
+        # a human pressed ▶ on (``run_requested``), not the whole open pool.
+        candidates = [it for it in candidates if it.get("run_requested", False)]
     if any(it.get("placement") for it in candidates):
         _m = machine or machine_placement()
         candidates = [it for it in candidates if placement_allows(it, _m)]
@@ -2540,6 +2545,7 @@ def claim_next(
     item_types: Optional[List[str]] = None,
     readiness_filters: Optional[List[str]] = None,
     worker_model: Optional[str] = None,
+    requested_only: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Atomically move the next ``open`` item to ``in_progress`` and return it.
 
@@ -2548,6 +2554,8 @@ def claim_next(
     oldest within tier. Pass ``oldest=True`` for pure FIFO regardless of priority.
 
     ``item_types``: if non-empty, only claim items whose type is in the list.
+    ``requested_only``: only claim tickets a human marked ``run_requested``
+      (▶ / `wt ready`); everything else stays open (OPS-1492).
     ``worker_model``: canonical model id of the claiming worker; tickets with a
       higher ``model_floor`` are skipped (WT-10). None = no floor filtering.
     ``readiness_filters``: if non-empty, only claim items whose readiness is in
@@ -2668,6 +2676,7 @@ def claim_next(
             oldest=oldest,
             item_types=item_types,
             readiness_filters=readiness_filters,
+            requested_only=requested_only,
         )
         if item and not item.get("stop"):
             _log("CLAIM", f"{item.get('ref', '?')} by {session_id[:16]} — {item.get('title') or item.get('note', '')[:60]}", queue=item.get('project', ''))
@@ -2698,6 +2707,7 @@ def claim_next(
             data["items"], project=proj, lane=lane, shaping=shaping, oldest=oldest,
             item_types=item_types, readiness_filters=readiness_filters,
             worker_model=worker_model, claimer=(str(session_id), str(real_sid or "")),
+            requested_only=requested_only,
         )
         if not candidates:
             return None

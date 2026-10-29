@@ -116,3 +116,21 @@ def test_add_run_waits_for_existing_preconditions(wt_env, run_cli, monkeypatch, 
     assert wt_env.queue.count_manual_eligible(project="Q") == 0
     assert spawned == []
     assert planned == (["Q"] if gate == "plan" else [])
+
+
+def test_claim_requested_only_skips_unrequested_higher_priority(wt_env, run_cli):
+    """OPS-1492: a requested-only dispatcher must not get unrequested work."""
+    wt_env.config.set_repo_path("Q", str(wt_env.tmp))
+    asked = wt_env.queue.enqueue(project="Q", note="asked for", priority="p3")
+    other = wt_env.queue.enqueue(project="Q", note="not asked", priority="p0")
+    wt_env.queue.request_run(asked["ref"]) if hasattr(wt_env.queue, "request_run") else \
+        wt_env.queue._set_run_requested(asked["ref"], True, "run_requested")
+
+    result = run_cli("claim", "-q", "Q", "--worker", "w1", "--requested-only", "--json")
+    assert result.code == 0, result.output
+    assert asked["ref"] in result.out
+    assert other["ref"] not in result.out
+
+    result = run_cli("claim", "-q", "Q", "--worker", "w2", "--requested-only", "--json")
+    assert other["ref"] not in result.out
+    assert not wt_env.queue.get(other["ref"]).get("claimed_by")

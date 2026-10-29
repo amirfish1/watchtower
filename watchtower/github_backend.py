@@ -2861,6 +2861,7 @@ class GitHubIssuesBackend:
         auto_only: bool = False,
         manual_only: bool = False,
         fresh: bool = True,
+        requested_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """Tickets a worker could claim right now, in claim order.
 
@@ -2884,7 +2885,7 @@ class GitHubIssuesBackend:
         eligibility = "work_it"
         if auto_only:
             eligibility = "auto_eligible"
-        elif manual_only:
+        elif manual_only or requested_only:
             eligibility = "manual_eligible"
         candidates = [
             it for it in self.list_items(status="open", lane=lane, fresh=fresh)
@@ -2941,6 +2942,7 @@ class GitHubIssuesBackend:
         oldest: bool = False,
         item_types: Optional[List[str]] = None,
         readiness_filters: Optional[List[str]] = None,
+        requested_only: bool = False,
     ) -> Optional[Dict[str, Any]]:
         if not session_id:
             raise ValueError("session_id is required")
@@ -2952,6 +2954,7 @@ class GitHubIssuesBackend:
             oldest=oldest,
             item_types=item_types,
             readiness_filters=readiness_filters,
+            requested_only=requested_only,
         )
         if has_stop_signal:
             try:
