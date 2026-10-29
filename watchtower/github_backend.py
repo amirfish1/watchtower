@@ -92,6 +92,10 @@ def _list_limit() -> int:
 _ISSUE_URL_RE = re.compile(r"/issues/(\d+)(?:\D*)?$")
 _META_START = "<!-- watchtower"
 _META_END = "-->"
+# `wt edit` fields the issue metadata never round-trips (OPS-201).
+_LOCAL_ONLY_EDIT_FIELDS = frozenset({
+    "gates", "accept", "planner_model", "verifier_model", "model_floor", "placement",
+})
 # Old close metadata sometimes embedded terminal output as JSON without
 # escaping its literal backslashes (for example ``\^[[0m``).  Preserve the
 # original terminal text by escaping only sequences JSON cannot decode.
@@ -3527,6 +3531,13 @@ class GitHubIssuesBackend:
 
     @_serialized_body_write
     def update(self, ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
+        # The stage pipeline (gates, plan, verify) lives only in the local
+        # store; dropping these silently printed EDITED for a no-op (OPS-201).
+        unsupported = sorted(set(fields) & _LOCAL_ONLY_EDIT_FIELDS)
+        if unsupported:
+            raise ValueError(
+                f"{', '.join(unsupported)} cannot be stored on a GitHub-backed queue "
+                f"(the gate/plan/verify pipeline needs a local queue); nothing was changed")
         item = self.get(ident)
         if item is None:
             return None

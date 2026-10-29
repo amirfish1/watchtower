@@ -1332,6 +1332,37 @@ def test_cli_edit_text_replaces_github_issue_body_and_preserves_metadata(
     assert "original body" not in issue_body
 
 
+def test_cli_edit_refuses_gates_on_github_queue_instead_of_dropping_them(
+    tmp_path, monkeypatch, capsys,
+):
+    """Regression for OPS-201: `wt edit --gate` printed EDITED while the issue
+    metadata kept no gates, so a plan-gated workflow silently never started."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    item = q.enqueue(project="GHI", note="short summary", text="body")
+    body_before = json.loads(state.read_text())["issues"][0]["body"]
+    from watchtower.cli import main
+
+    assert main(["edit", item["ref"], "--gate", "plan", "--gate", "verify"]) == 1
+    out = capsys.readouterr()
+    assert "EDITED" not in out.out
+    assert "gates" in out.err
+    assert json.loads(state.read_text())["issues"][0]["body"] == body_before
+
+
+def test_enqueue_refuses_gates_on_github_queue(tmp_path, monkeypatch):
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+
+    with pytest.raises(ValueError, match="local queue"):
+        q.enqueue(project="GHI", note="gated", gates=["plan"])
+    assert q.list_items(project="GHI") == []
+
+
 def test_github_backend_ignores_legacy_queue_label_for_a_single_queue_repo(tmp_path, monkeypatch):
     """The `watchtower:<QUEUE>` whitelist is inert: with one queue on a repo,
     a plain issue nobody labelled is as workable as a labelled one."""

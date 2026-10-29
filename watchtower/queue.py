@@ -1721,6 +1721,11 @@ def enqueue(
         if group_parent:
             gates = _parent_gates(gates)
     if backend is not None:
+        if gates or str(accept_line or "").strip() or str(planner_model or "").strip() \
+                or str(verifier_model or "").strip():
+            # OPS-201: the issue metadata cannot carry them; refuse, don't drop.
+            raise ValueError("gates, --accept, --planner-model and --verifier-model need a "
+                             "local queue (GitHub-backed queues have no gate/plan/verify pipeline)")
         saved = backend.enqueue(
             note=note,
             text=text,
