@@ -1789,6 +1789,19 @@ def cmd_plan(args: argparse.Namespace) -> int:
             if args.file:
                 text = Path(args.file).expanduser().read_text()
             decision = "accept" if args.accept else "retry"
+            plan = item.get("plan") or {}
+            if args.accept and plan.get("status") == "failed" and plan.get("accepted_version"):
+                if text:
+                    raise ValueError("a restored plan keeps its accepted text; "
+                                     "drop --text/--file")
+                item = q.plan_restore(ref, by=args.by or "human")
+                sup = q.plan_open_supplement(item)
+                print(f"PLAN RESTORED: {ref} -> plan accepted "
+                      f"v{item['plan'].get('accepted_version')}; claim and block untouched"
+                      + (f"; supplement s{sup.get('n')} reviews on the next stage tick"
+                         if sup else ""))
+                stages.request(ref, "plan restored")
+                return 0
             item = q.plan_decide(ref, decision, text, retries=args.retries,
                                  by=args.by or "human", expect_mv=getattr(args, "mv", None))
             status = item["plan"]["status"]
@@ -7149,7 +7162,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="group parent: the membership version")
     p2.add_argument("--version", type=int, default=None,
                     help="plan version this verdict is for (rejects a stale verdict)")
-    p5 = ps.add_parser("decide", help="human: settle a plan blocked by exhausted review")
+    p5 = ps.add_parser("decide", help="human: settle a plan blocked by exhausted review, or "
+                       "--accept a failed plan that was accepted to restore it")
     p5.add_argument("ref")
     g = p5.add_mutually_exclusive_group(required=True)
     g.add_argument("--accept", action="store_true", help="accept the (amended) plan")

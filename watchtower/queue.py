@@ -3778,6 +3778,42 @@ def plan_decide(ident: Any, decision: str, text: str = "", retries: int = 1,
     return _plan_update(ident, _do)
 
 
+def plan_restore(ident: Any, by: str = "human",
+                 session_id: str = "") -> Optional[Dict[str, Any]]:
+    """Human repair of an ACCEPTED plan that a stage failure flipped to
+    ``failed`` (OPS-240: before 8626be4 an unspawnable supplement reviewer
+    called plan_fail on the accepted plan). Restores ``accepted`` with the
+    accepted text/version untouched, so an open supplement gets its review on
+    the next stage tick. The build's claim and any block are left alone: the
+    restore is not an answer to the builder."""
+    current = get(ident)
+    if current is None:
+        return None
+
+    def _check(plan, ref):
+        if plan.get("status") != "failed" or not plan.get("accepted_version"):
+            raise ValueError(f"{ref} has no failed plan that was accepted "
+                             f"(plan status {plan.get('status') or 'none'}, "
+                             f"accepted_version {plan.get('accepted_version')})")
+
+    _check(current.get("plan") or {}, current.get("ref", ident))
+    now = _now_iso()
+    who = _by("human", str(by or ""), str(session_id or ""))
+
+    def _do(it, plan):
+        _check(plan, it.get("ref", ident))   # #9: recheck in the lock
+        reason = str(plan.pop("reason", "") or "")
+        plan["status"] = "accepted"
+        plan["decisions"] = list(plan.get("decisions") or []) + [
+            {"decision": "restore", "round": int(plan.get("round") or 1),
+             "by": str(by or "human"), "at": now, "text": _clip(reason, 3000)}]
+        _append_history(it, "plan_decision", by=who, at=now, decision="restore",
+                        text=_clip(f"restored accepted v{plan['accepted_version']} "
+                                   f"after: {reason}", 4000),
+                        round=int(plan.get("round") or 1))
+    return _plan_update(ident, _do)
+
+
 # OPS-232: a supplement is reviewed AFTER acceptance without reopening the
 # plan. ``plan["supplements"]`` holds ``{n, text, by, at, base_version,
 # status: reviewing|accepted|rejected|failed, review, reviewer}``; the plan's

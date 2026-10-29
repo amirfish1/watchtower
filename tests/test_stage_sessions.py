@@ -1019,3 +1019,47 @@ def test_unspawnable_supplement_review_fails_only_the_supplement(stg, monkeypatc
     assert it["status"] == "in_progress" and it["claimed_by"] == "builder-1"
     _tick(stg)
     assert stg.q.get(ref)["plan"]["status"] == "accepted"
+
+
+def test_restore_of_a_wrongly_failed_accepted_plan_reviews_the_open_supplement_once(stg):
+    """OPS-240: tickets damaged before 8626be4 (BECKY-2331) sit with the
+    accepted plan flipped to failed, the supplement still reviewing with no
+    reviewer, and the supplement's stage key holding the previous key's dead
+    pid/log. `wt plan decide --accept` restores the accepted plan without
+    touching the build's claim or block, and the open supplement gets exactly
+    one fresh review."""
+    import argparse
+    ref = _plan_ticket(stg)
+    stg.q.plan_start(ref)
+    stg.q.plan_submit(ref, "the plan")
+    stg.q.plan_verdict(ref, True, "ok", by="rev-1")
+    assert stg.q.claim_by_ref(ref, "builder-1")
+    stg.q.plan_supplement_submit(ref, "addendum one", by="builder-1")
+    _tick(stg)
+    s1 = _ss(stg, ref)
+    stg.q.plan_supplement_verdict(ref, True, "sound", by="rev-2", n=1)
+    stg.q.plan_supplement_submit(ref, "addendum two", by="builder-1")
+    # The pre-fix damage, exactly as BECKY-2331 carries it.
+    stg.q.plan_fail(ref, "could not spawn the plan_reviewer: [Errno 7] Argument list too long")
+    stg.q.stage_session_update(ref, lambda it, s: s.update(key="supplement:s2", worker_id=""))
+    stg.q.block(ref, "builder-1", "root: scope the s2 resume")
+    spawned = len(stg.spawned)
+    _tick(stg)
+    assert len(stg.spawned) == spawned          # failed plan: nothing spawns on its own
+    assert stg.q.get(ref)["plan"]["status"] == "failed"
+
+    ns = argparse.Namespace(plan_cmd="decide", ref=ref, accept=True, retry=False, text="",
+                            file="", retries=1, by="root", json=False)
+    assert stg.cli.cmd_plan(ns) == 0
+    it = stg.q.get(ref)
+    assert it["plan"]["status"] == "accepted" and it["plan"]["accepted_version"] == 1
+    assert it["plan"]["text"] == "the plan" and "reason" not in it["plan"]
+    assert it["status"] == "in_progress" and it["claimed_by"] == "builder-1"
+    assert it["needs_input"] and it["block_question"] == "root: scope the s2 resume"
+    _tick(stg)
+    _tick(stg)
+    assert len(stg.spawned) == spawned + 1      # ONE review of s2
+    ss = _ss(stg, ref)
+    assert ss["key"] == "supplement:s2" and ss.get("pid") != s1["pid"]
+    assert ss.get("log") != s1["log"]
+    assert stg.cli.cmd_plan(ns) == 1            # nothing left to restore
