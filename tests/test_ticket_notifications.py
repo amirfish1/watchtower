@@ -556,6 +556,48 @@ def test_the_actionable_events_still_reach_the_submitter_by_default(
     assert [t for t, _ in calls] == ["worker-sub"]
 
 
+@pytest.mark.parametrize("wait_on", ["owner", "external"])
+def test_a_block_waiting_on_someone_else_skips_the_auto_submitter(
+    wt, monkeypatch, wait_on
+):
+    """IDEAS-101: a question for the owner (or an outside party) gives the
+    filing session nothing to do; waking it only burns a turn. It still hears
+    the close."""
+    item = wt.q.enqueue(project="SUB", note="owner question", submitter="worker-sub")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.block(item["ref"], session_id="worker-a", question="unlock the phone?",
+               wait_on=wait_on)
+    assert calls == []
+
+    wt.q.close(item["ref"], "worker-a", resolution={"summary": "done"})
+    assert [t for t, _ in calls] == ["worker-sub"]
+
+
+@pytest.mark.parametrize("wait_on", ["dependency", "worker"])
+def test_a_block_waiting_on_work_still_reaches_the_submitter(wt, monkeypatch, wait_on):
+    item = wt.q.enqueue(project="SUB", note="dep wait", submitter="worker-sub")
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.block(item["ref"], session_id="worker-a", question="waiting", wait_on=wait_on)
+
+    assert [t for t, _ in calls] == ["worker-sub"]
+
+
+def test_an_owner_wait_still_reaches_an_explicit_submitter_and_subscribers(wt, monkeypatch):
+    wt.config.add_subscriber("SUB", "watcher-1")
+    item = wt.q.enqueue(project="SUB", note="watched", submitter="worker-sub",
+                        submitter_explicit=True)
+    wt.q.claim_by_ref(item["ref"], "worker-a")
+    calls = _record_sends(monkeypatch, wt.messages)
+
+    wt.q.block(item["ref"], session_id="worker-a", question="ok?", wait_on="owner")
+
+    assert sorted(t for t, _ in calls) == ["watcher-1", "worker-sub"]
+
+
 def test_awaits_decision_still_reaches_the_submitter_by_default(wt, monkeypatch):
     """The product gate's ask is needs_input's sibling: muting it would leave
     a worker waiting on a decision nobody was told to make."""

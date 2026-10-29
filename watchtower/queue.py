@@ -1413,11 +1413,23 @@ def _submitter_wants(item: Dict[str, Any], event: str, _config: Any) -> bool:
       (rather than being recorded as filer by ``_default_report_to``), so it
       is treated as watching and gets everything.
 
+    A ``needs_input``/``awaits_decision`` whose current wait is ``owner`` or
+    ``external`` skips the automatic submitter: that question is not its to
+    answer (IDEAS-101).
+
     Subscribers are not filtered here at all -- ``wt subscribe`` is itself the
     explicit opt-in, and ``wt unsubscribe`` is its off switch.
     """
     if item.get("submitter_explicit") or item.get("pre_ack"):
         return True
+    # A block waiting on the owner or an outside party asks the filer nothing:
+    # waking it just spends a turn re-reading a question it cannot answer
+    # (IDEAS-101: drain workers woken for hours by their filed OPS tickets).
+    # It still hears ``closed``.
+    if event in ("needs_input", "awaits_decision"):
+        wait = current_wait(item)
+        if wait and wait.get("on") in ("owner", "external"):
+            return False
     try:
         return event in _config.notify_events(str(item.get("project") or ""))
     except Exception:
