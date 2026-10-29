@@ -6711,6 +6711,11 @@ def _reconcile_once_locked(dry_run: bool = False,
             result["stop_signals_swept"] = sweep_orphan_stop_signals()
         except Exception:
             pass
+        try:
+            from . import codex_app_worker
+            result["codex_app_orphans_retired"] = codex_app_worker.sweep_orphans()
+        except Exception:
+            pass
         # Release tickets stranded in_progress by a dead/reaped/crashed worker so
         # the spawn pass below re-drains them. Without this a queue reads depth=0
         # ("Ready") while work is unfinished. Must run BEFORE the depth read.

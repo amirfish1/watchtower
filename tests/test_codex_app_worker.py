@@ -21,6 +21,8 @@ from pathlib import Path
 FAKE_CODEX = textwrap.dedent(r'''
     import base64, hashlib, json, os, socket, struct, sys, threading
     sock_path = sys.argv[sys.argv.index("--listen") + 1][len("unix://"):]
+    # Real codex outlives a SIGKILLed host mid-turn despite PR_SET_PDEATHSIG.
+    import ctypes; ctypes.CDLL(None).prctl(1, 0)
     srv = socket.socket(socket.AF_UNIX); srv.bind(sock_path); srv.listen(8)
     owner = {}
     def frame(obj):
@@ -123,3 +125,45 @@ def test_second_process_steers_hosted_worker_through_its_own_server(wt_env):
     completed = [e for e in events if e.get("method") == "turn/completed"]
     assert completed and completed[0]["params"]["turn"]["steered"] == "STEER-TOKEN-7"
     assert codex_app_worker.find_worker(thread_id) is None
+
+
+def test_server_orphaned_by_a_killed_host_is_stopped_by_the_sweep(wt_env):
+    """SIGKILL of the host mid-turn skips all its cleanup; the reconcile-tick
+    sweep must still stop the server so no hidden writer keeps working."""
+    import signal
+    wt = wt_env
+    fake = wt.bin / "codex"
+    fake.write_text(f"#!{sys.executable}\n" + FAKE_CODEX)
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    from watchtower import codex_app_worker
+
+    wt.config.set_codex_transport("Q", "app-server")
+    argv = wt.workers.build_drain_command("Q", "codex", "q-2", str(wt.tmp))
+    argv[argv.index("--codex-bin") + 1] = str(fake)
+    proc = subprocess.Popen(argv, cwd=wt.tmp, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True)
+    thread_id = "11111111-2222-7333-8444-555555555555"
+    deadline = time.monotonic() + 30
+    while codex_app_worker.find_worker(thread_id) is None:
+        assert time.monotonic() < deadline and proc.poll() is None
+        time.sleep(0.05)
+    server_pid = codex_app_worker.find_worker(thread_id)["server_pid"]
+    try:
+        proc.send_signal(signal.SIGKILL)
+        proc.wait(10)
+        time.sleep(0.5)
+        assert Path(f"/proc/{server_pid}").exists(), "fake should outlive its host, like codex"
+
+        assert codex_app_worker.sweep_orphans() == 1
+        deadline = time.monotonic() + 10
+        while Path(f"/proc/{server_pid}").exists() and \
+                Path(f"/proc/{server_pid}/stat").read_text().split(")")[1].split()[0] != "Z":
+            assert time.monotonic() < deadline, "orphaned server still running"
+            time.sleep(0.05)
+        assert codex_app_worker.find_worker(thread_id) is None
+        assert codex_app_worker.sweep_orphans() == 0
+    finally:
+        try:
+            os.kill(server_pid, signal.SIGKILL)
+        except OSError:
+            pass

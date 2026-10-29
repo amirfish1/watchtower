@@ -66,11 +66,46 @@ def _pid_alive(pid: Any) -> bool:
     return True
 
 
-def find_worker(thread_id: str) -> Optional[Dict[str, Any]]:
-    """The live app-server worker hosting ``thread_id``, or None.
+def _is_our_server(pid: Any, sock: str) -> bool:
+    """True when ``pid`` is the app-server listening on ``sock``: the FULL
+    ``--listen unix://<sock>`` argument must match (sock paths are unique per
+    worker), so a recycled pid is never signalled."""
+    try:
+        argv = Path(f"/proc/{int(pid)}/cmdline").read_bytes().split(b"\0")
+    except (OSError, TypeError, ValueError):
+        return False
+    want = f"unix://{sock}".encode()
+    return b"app-server" in argv and any(
+        arg == want and i > 0 and argv[i - 1] == b"--listen" for i, arg in enumerate(argv)
+    )
 
-    A record whose worker pid is gone is stale (SIGKILL skips cleanup) and is
-    removed so later lookups stay cheap."""
+
+def _retire(path: Path, rec: Dict[str, Any]) -> None:
+    """Drop a dead worker's record and stop its orphaned app-server.
+
+    Codex does not honour PR_SET_PDEATHSIG while a turn runs: a host killed
+    with SIGKILL mid-turn left its server working the ticket as a hidden
+    writer (OPS-155 pilot 3). WT's own kill path signals the whole process
+    group, which covers the server; this catches everything else."""
+    sock = str(rec.get("sock") or "")
+    server_pid = rec.get("server_pid")
+    if sock and _is_our_server(server_pid, sock):
+        try:
+            os.kill(int(server_pid), signal.SIGTERM)
+        except OSError:
+            pass
+    for stale in (path, Path(sock) if sock else None):
+        if stale is None:
+            continue
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def find_worker(thread_id: str) -> Optional[Dict[str, Any]]:
+    """The live app-server worker hosting ``thread_id``, or None (a dead
+    worker's record is retired on the way)."""
     thread_id = str(thread_id or "").strip()
     if not thread_id or "/" in thread_id:
         return None
@@ -79,13 +114,32 @@ def find_worker(thread_id: str) -> Optional[Dict[str, Any]]:
         rec = json.loads(path.read_text())
     except (OSError, ValueError):
         return None
-    if not isinstance(rec, dict) or not _pid_alive(rec.get("pid")) or not os.path.exists(str(rec.get("sock") or "")):
-        try:
-            path.unlink()
-        except OSError:
-            pass
+    if not isinstance(rec, dict):
+        rec = {}
+    if not _pid_alive(rec.get("pid")) or not os.path.exists(str(rec.get("sock") or "")):
+        _retire(path, rec)
         return None
     return rec
+
+
+def sweep_orphans() -> int:
+    """Retire every record whose worker process is gone; returns the count.
+    Runs each reconcile tick so an orphaned server stops within one tick even
+    when nobody tries to steer its thread."""
+    retired = 0
+    try:
+        paths = list(registry_dir().glob("*.json"))
+    except OSError:
+        return 0
+    for path in paths:
+        try:
+            rec = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(rec, dict) and not _pid_alive(rec.get("pid")):
+            _retire(path, rec)
+            retired += 1
+    return retired
 
 
 class UnixWebSocket:
@@ -270,7 +324,8 @@ def steer(thread_id: str, text: str, timeout: float = STEER_TIMEOUT_S) -> Dict[s
 
 
 def _pdeathsig() -> None:
-    """Linux: take the app-server down with the worker even on SIGKILL."""
+    """Linux: ask for the app-server to die with the worker. Codex only honours
+    it while idle (see ``_retire`` for the mid-turn case)."""
     if not sys.platform.startswith("linux"):
         return
     try:
