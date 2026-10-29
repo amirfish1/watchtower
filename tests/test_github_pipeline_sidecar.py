@@ -682,3 +682,28 @@ def test_a_block_without_a_pipeline_keeps_the_legacy_hold(tmp_path, monkeypatch)
     _block_parks(q, ref)
     item = q.get(ref)
     assert item["status"] == "in_progress" and item["needs_input"] and not item.get("parked")
+
+
+def test_liveness_classifies_the_parked_github_lifecycle(tmp_path, monkeypatch):
+    """WT-41: awaiting_answer x github is a table row, not UNREACHABLE."""
+    from watchtower import liveness as lv
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+
+    def row():
+        item = q.get(ref)
+        st = lv.project(item)
+        assert st.backend == "github"
+        return st, lv.classify(st).id
+    assert row()[1] == "work.claimed"
+    _block_parks(q, ref)
+    st, rid = row()
+    assert st.status == "awaiting_answer" and st.parked and rid == "answer.await_human"
+    q.answer(ref, "use postgres")
+    st, rid = row()
+    assert st.answer == "routing" and not st.claimed and rid == "answer.routing"
+    assert lv.prove(q.get(ref), lv.classify(st))["kind"] == "lease"
+    assert q.resume_claim(ref, 1)
+    st, rid = row()
+    assert st.answer == "delivering" and rid == "answer.delivering"
+    ids = {u.id for u in lv.UNREACHABLE}
+    assert not ids & {"github_parked", "github_answer"}

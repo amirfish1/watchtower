@@ -960,7 +960,8 @@ question from absent or stale ownership evidence:
 | backstop `reopen` / `resume` / `mark` (stage, spawn, assessment ops) | `recover_claim` is local-only: no-op (`race`) |
 | `dep.stuck` -> `escalate_stuck_blockers` | local store only |
 | `release_stalled_sent_back` | local store only |
-| answer rows (`answer.*`), parking, plan groups, plan stages | unreachable on GitHub (`UNREACHABLE` table) |
+| answer rows (`answer.*`), parking | sidecar-owned tickets only (WT-32, docs/github-pipeline-sidecar.md); other GitHub tickets keep hold-while-blocked |
+| plan groups, plan stages | unreachable on GitHub (`UNREACHABLE` table) |
 | owner-host `claim_heartbeat` renewal | the owning host's own claim (authentic, not inferred) |
 | stage blocks (`stages._escalate`, spawn failure), review-delivery block, model-floor reopen | act on `in_review`/closed/blocked tickets from stage or delivery failures, not ownership inference; `claim_next` never claims those statuses |
 

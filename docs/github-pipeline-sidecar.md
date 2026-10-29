@@ -235,3 +235,37 @@ Codex review scored the doc-only contract 3/10. Disposition:
    verifier (`verify:<cycle>`), whose `wt verdict <ref> --verify-cycle <n>`
    closes or reopens the issue. A review gate settles with `wt accept` /
    `wt reject`. Requires the reconciler restart of step 0b onto OPS-204.
+
+## Parking and answer routing (WT-32)
+
+A worker `wt block` on a sidecar-owned GitHub ticket (one with a sidecar
+entry, i.e. gated) parks it instead of holding it `in_progress`:
+
+- The sidecar entry carries `parked`, `pending_answer` and `last_answer_gen`
+  (`github_pipeline.PARK_FIELDS`). The overlay shows `status=awaiting_answer`
+  with the claim fields cleared, and the ticket is not claimable. The GitHub
+  issue stays canonical: it keeps its `in_progress` label and the parked
+  worker's `claimed_by`, and the question is mirrored as an issue comment.
+- Writers: `queue.block` -> `_github_park` (after the issue write; a failure
+  leaves the legacy hold-while-blocked state), `github_backend.answer`
+  (writes `pending_answer` in the sidecar BEFORE the issue edit, so a crash
+  re-routes instead of losing the answer), `queue._pa_cas`/`pa_transition`
+  and `queue.resume_claim` -> `github_pipeline.pa_cas`/`resume_claim`, and the
+  claim path (`_github_bind_answer`, edge E12).
+- Every step is a compare-and-swap under the store lock behind the owner
+  fence. A foreign host, a missing or corrupt sidecar, a stale gen/state/
+  status all return None and nothing is delivered. `resume_claim` also
+  refuses when the issue's claim is no longer the parked worker's or that
+  worker already holds another ticket.
+- A handoff (`reopen`) reopens the issue from `awaiting_answer`; an `affinity`
+  reservation keeps the ticket for the parked worker until it expires.
+- The owner-comment answer sweep includes parked tickets.
+- Tickets with no sidecar entry keep the legacy hold-while-blocked behaviour.
+- Liveness: `awaiting_answer` x github is covered by the `answer.*` rows;
+  `github_parked` / `github_answer` are gone from `UNREACHABLE`.
+
+Activation: same preconditions as the gate (every claiming host at or after
+OPS-203) plus the reconciler restart of step 0b, so the router that drives
+`answers.route_answer` runs this code. A host on an older `wt` reads a parked
+ticket as `in_progress` + `needs_input` (the issue is unchanged), so it cannot
+claim it; it just does not route the answer, which the owning host does.

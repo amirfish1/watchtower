@@ -309,10 +309,6 @@ UNREACHABLE: Tuple[Unreachable, ...] = (
                               "status": _not("status", "open")}),
     _unreach("terminal_answer", "close / hold_review clears the record", "E16",
              {"status": ("closed", "in_review"), "answer": _not("answer", "none")}),
-    _unreach("github_parked", "parking is local-store only", "queue.block",
-             {"status": "awaiting_answer", "backend": "github"}),
-    _unreach("github_answer", "no GitHub-backed writer of pending_answer",
-             "answers.route_pending_answers", {"backend": "github", "answer": _not("answer", "none")}),
     _unreach("review_no_gate", "hold_review always writes gate_pending; accept/reject "
              "pop it with the status change", "queue.update_status(hold_review)",
              {"status": "in_review", "gate_pending": "none"}),
