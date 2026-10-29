@@ -524,3 +524,89 @@ def test_parked_with_corrupt_sidecar_fails_closed(tmp_path, monkeypatch):
     item = q.get(ref)
     assert item["pipeline_missing"] and not item["work_it"]
     assert q.claim_next("w2", project="GHI") is None
+
+
+def _routing(gen=1):
+    return {"gen": gen, "state": "routing", "question": "q?", "answer": "a", "attempts": 0,
+            "prior_worker_id": "w1", "prior_session_id": "s1", "state_at": "2026-01-01T00:00:00Z"}
+
+
+def _parked_routing(tmp_path, monkeypatch):
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    _park_in_sidecar(q, ref, pending_answer=_routing(), last_answer_gen=1)
+    return q, ref
+
+
+def _entry(q):
+    (entry,) = json.loads(_sidecar(q).read_text())["items"].values()
+    return entry
+
+
+def test_resume_claim_binds_the_parked_worker_in_the_sidecar(tmp_path, monkeypatch):
+    q, ref = _parked_routing(tmp_path, monkeypatch)
+    assert q.get(ref)["status"] == "awaiting_answer"
+    got = q.resume_claim(ref, 1)
+    assert got and got["status"] == "in_progress" and got["claimed_by"] == "w1"
+    assert "parked" not in _entry(q) and _entry(q)["pending_answer"]["state"] == "delivering"
+    item = q.get(ref)
+    assert item["status"] == "in_progress" and item["claimed_by"] == "w1"
+    assert item["pending_answer"]["route"] == "resume"
+
+
+def test_concurrent_resume_has_one_winner(tmp_path, monkeypatch):
+    q, ref = _parked_routing(tmp_path, monkeypatch)
+    out, barrier = [], threading.Barrier(2)
+
+    def _go():
+        barrier.wait()
+        out.append(q.resume_claim(ref, 1))
+    threads = [threading.Thread(target=_go) for _ in range(2)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert sorted(bool(r) for r in out) == [False, True]
+    assert _entry(q)["pending_answer"]["state"] == "delivering"
+
+
+def test_restart_mid_transition_keeps_the_cas_state(tmp_path, monkeypatch):
+    q, ref = _parked_routing(tmp_path, monkeypatch)
+    assert q.resume_claim(ref, 1)
+
+    import watchtower.queue as fresh_q
+    importlib.reload(fresh_q)
+    fresh_q._MACHINE_TAG_CACHE = None
+    assert fresh_q.resume_claim(ref, 1) is None   # already moved on
+    done = fresh_q.pa_transition(ref, 1, "delivering", "delivered", from_status="in_progress")
+    assert done and done["pending_answer"]["state"] == "delivered"
+    assert fresh_q.pa_transition(ref, 1, "delivering", "delivered",
+                                 from_status="in_progress") is None
+
+
+def test_lost_cas_stops_without_writing(tmp_path, monkeypatch):
+    q, ref = _parked_routing(tmp_path, monkeypatch)
+    before = _sidecar(q).read_bytes()
+    assert q.resume_claim(ref, 2) is None                      # stale gen
+    assert q.pa_transition(ref, 1, "queued", "delivered", from_status="awaiting_answer") is None
+    assert q.pa_transition(ref, 1, "routing", "handed_off", from_status="in_progress") is None
+    assert _sidecar(q).read_bytes() == before
+
+
+def test_cas_fences_foreign_and_corrupt_sidecar(tmp_path, monkeypatch):
+    q, ref = _parked_routing(tmp_path, monkeypatch)
+    before = _sidecar(q).read_bytes()
+    q._github_backend_for_project("GHI").update(ref, pipeline_host="mac")
+    assert q.resume_claim(ref, 1) is None
+    q._github_backend_for_project("GHI").update(ref, pipeline_host="her")
+    _sidecar(q).write_text("{not json")
+    assert q.resume_claim(ref, 1) is None
+    assert _sidecar(q).read_text() == "{not json"
+    _sidecar(q).write_bytes(before)
+
+
+def test_handoff_reopens_the_issue_from_awaiting_answer(tmp_path, monkeypatch):
+    q, ref = _parked_routing(tmp_path, monkeypatch)
+    done = q.pa_transition(ref, 1, "routing", "handed_off", from_status="awaiting_answer",
+                           reopen=True, route="pool", reason="worker gone")
+    assert done and done["status"] == "open"
+    item = q.get(ref)
+    assert item["status"] == "open" and not item.get("claimed_by")
+    assert item["pending_answer"]["state"] == "handed_off" and "parked" not in item

@@ -237,6 +237,8 @@ def _apply(item: Dict[str, Any], entry: Dict[str, Any]) -> None:
     parked = entry.get("parked")
     if parked and str(item["issue_status"] or "") != "closed":
         item["status"] = "awaiting_answer"   # WT-32a: the claim is released while parked
+        if "_issue_claim" not in item:   # the overlay can run twice on one item
+            item["_issue_claim"] = {f: item.get(f) for f in _CLAIM_FIELDS}   # resume_claim checks it
         for f in _CLAIM_FIELDS:
             item[f] = None
     extra = entry.get("history") or []
@@ -320,13 +322,86 @@ def mutate(ident: Any, fn: Callable[[Dict[str, Any]], Any],
     if before_input[0] and not after_input[0]:
         # plan_decide clears the human block; that block lives on the issue.
         backend.update(ident, needs_input=False, block_question="")
-    if before_status == "in_progress" and it.get("status") == "open":
+    if before_status in ("in_progress", "awaiting_answer") and it.get("status") == "open":
         if backend.update_status(ident, "open", reason="released by the plan stage",
                                  require_status="in_progress") is None:
             q._log("PIPELINE", f"{it.get('ref')}: issue moved before the plan stage's "
                    f"reopen landed; left as is", queue=str(it.get("project") or ""))
     _sync_hold(backend, ident, it)
     return it
+
+
+def pa_cas(ident: Any, gen: int, expect_state: Any, expect_status: Any,
+           mutate_fn: Callable[[Dict[str, Any], Dict[str, Any]], Any]) -> Optional[Dict[str, Any]]:
+    """Sidecar twin of ``queue._pa_cas`` (WT-32b): inside the store lock, apply
+    ``mutate_fn(item, pa)`` only while ``pending_answer`` still has this ``gen``,
+    one of ``expect_state`` and one of ``expect_status`` (the overlaid status).
+    None when the CAS lost, the ticket has no sidecar entry, or the owner fence
+    / a corrupt sidecar refuses: the caller stops without delivering."""
+    from . import queue as q
+    states = (expect_state,) if isinstance(expect_state, str) else tuple(expect_state)
+    statuses = (expect_status,) if isinstance(expect_status, str) else tuple(expect_status)
+
+    def _fn(it: Dict[str, Any]) -> Any:
+        pa = it.get("pending_answer")
+        if (not pa or int(pa.get("gen") or -1) != int(gen)
+                or pa.get("state") not in states or it.get("status") not in statuses):
+            return "skip"
+        old = (str(pa.get("state")), str(it.get("status")))
+        mutate_fn(it, pa)
+        new_pa = it.get("pending_answer")
+        q._check_answer_edge(it, (old[0], str((new_pa or {}).get("state") or "none"),
+                                  old[1], str(it.get("status"))))
+        return None
+    try:
+        return mutate(ident, _fn)
+    except (ValueError, SidecarCorrupt) as exc:
+        q._log("PIPELINE", f"{ident}: answer CAS refused: {exc}",
+               queue=q._project_from_ident(ident))
+        return None
+
+
+def resume_claim(ident: Any, gen: int, held: Callable[[str, str], bool]) -> Optional[Dict[str, Any]]:
+    """Sidecar twin of ``queue.resume_claim`` (WT-32b): ``awaiting_answer`` ->
+    ``in_progress`` bound to the parked worker/session (state ``delivering``).
+    The issue itself never left ``in_progress`` while parked, so nothing is
+    written to it; it must still carry the parked worker's claim, else another
+    host took it and the resume refuses. ``held(worker_id, session_id)`` is the
+    caller's no-double-claim probe (a GitHub read, so it runs before the lock)."""
+    from . import queue as q
+    try:
+        base = _backend_for(ident).get(ident)
+    except Exception:  # noqa: BLE001  (unreachable GitHub: stop, deliver nothing)
+        return None
+    parked = ((base or {}).get("parked") or {})
+    if held(str(parked.get("worker_id") or ""), str(parked.get("session_id") or "")):
+        return None
+
+    def _mut(it: Dict[str, Any], pa: Dict[str, Any]) -> None:
+        pk = it.get("parked") or {}
+        owner = str((it.get("_issue_claim") or {}).get("claimed_by") or "")
+        if not pk or q._plan_active_unlocked(it) or owner != str(pk.get("worker_id") or ""):
+            raise _NoResume()
+        now = q._now_iso()
+        it["status"] = "in_progress"
+        it["claimed_by"] = pk.get("worker_id") or None
+        it["claimed_session_id"] = pk.get("session_id") or None
+        it["claimed_machine"] = pk.get("machine") or q.machine_tag()
+        it["claimed_at"] = now
+        it.pop("parked", None)
+        it.pop("_issue_claim", None)
+        q._pa_set_state(it, pa, "delivering", now)
+        pa["route"] = "resume"
+        q._append_history(it, "answer_route", by=q._by("system"), at=now, gen=gen,
+                          route="resume", reason="parked session resumed")
+    try:
+        return pa_cas(ident, gen, "routing", "awaiting_answer", _mut)
+    except _NoResume:
+        return None
+
+
+class _NoResume(Exception):
+    pass
 
 
 def _hold_reason(it: Dict[str, Any]) -> str:

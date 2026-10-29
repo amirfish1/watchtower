@@ -7905,6 +7905,9 @@ def _pa_cas(ident: Any, gen: int, expect_state: Any, expect_status: Any, mutate)
     no write)."""
     states = (expect_state,) if isinstance(expect_state, str) else tuple(expect_state)
     statuses = (expect_status,) if isinstance(expect_status, str) else tuple(expect_status)
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        from . import github_pipeline   # WT-32b: GitHub tickets CAS in the sidecar
+        return github_pipeline.pa_cas(ident, gen, states, statuses, mutate)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -7945,6 +7948,14 @@ def resume_claim(ident: Any, gen: int) -> Optional[Dict[str, Any]]:
     and session (state ``delivering``). Refuses, in the same lock, when that
     worker or session already holds an active claim (no double claim) or the
     plan gate is active (the answer goes to the plan stage instead)."""
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        from . import github_pipeline   # WT-32b: sidecar-owned GitHub ticket
+
+        def _held(worker_id: str, session_id: str) -> bool:
+            return bool(_held_unlocked(backend.list_items(fresh=True), worker_id, session_id,
+                                       _project_from_ident(ident)))
+        return github_pipeline.resume_claim(ident, gen, _held)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
