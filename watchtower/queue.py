@@ -7898,6 +7898,21 @@ def migrate_legacy_blocks(queue: Optional[str] = None, dry_run: bool = False) ->
     return picked
 
 
+def _block_owner_guard_unlocked(it: Dict[str, Any], ident: Any, caller: str) -> None:
+    """Reject a worker block of a live claim held by someone else (OPS-1482)."""
+    holder = str(it.get("claimed_by") or "")
+    if it.get("status") != "in_progress" or not holder or holder == caller:
+        return
+    real = _coerce_session_uuid(caller)
+    if real and str(it.get("claimed_session_id") or "") == real:
+        return
+    raise ValueError(
+        f"{it.get('ref', ident)} is claimed by {holder}; you are {caller}. "
+        "Only the claiming worker may block an in-progress ticket. "
+        "Pass --force to override deliberately."
+    )
+
+
 def block(
     ident: Any,
     session_id: str = "",
@@ -7909,8 +7924,14 @@ def block(
     wait_on: str = "",
     wait_actor: str = "",
     wait_ref: str = "",
+    force: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Park a ticket that needs a human decision.
+
+    A worker-origin block of an ``in_progress`` ticket claimed by a DIFFERENT
+    worker (and a different session) raises ``ValueError`` unless ``force``
+    (OPS-1482): a stale worker must not overwrite a live claim. ``wt find``'s
+    worker-or-session match is honoured, as in the close-ownership guard.
 
     ``origin`` (WT-28): ``"worker"`` (``wt block``) on the local store PARKS
     the ticket -- status ``awaiting_answer``, claim released, ``parked``
@@ -7954,6 +7975,8 @@ def block(
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
+                if origin == "worker" and session_id and not force:
+                    _block_owner_guard_unlocked(it, ident, str(session_id))
                 now = _now_iso()
                 was_parked = it.get("status") == PARKED_STATUS
                 edge_from = _pa_edge_start(it)
