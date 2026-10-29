@@ -882,6 +882,34 @@ def test_github_backend_answer_posts_comment_and_keeps_claim_with_session(
     )
 
 
+def test_github_answer_grace_holds_off_the_orphan_sweep(tmp_path, monkeypatch):
+    """OPS-200: a fresh answer on a GitHub-backed ticket must get the same
+    answer grace as a file-backed one, or the sweep hands the ticket to a
+    second worker while the resumed session applies the answer."""
+    import subprocess
+
+    import watchtower.workers as workers
+
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="needs a decision")
+    q.claim_by_ref(item["ref"], "worker-1", session_uuid="session-abc")
+    q.block(item["ref"], session_id="worker-1", question="A or B?")
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    workers.record_worker(dead.pid, "GHI", "codex", "worker-1",
+                          repo_path=str(tmp_path), session_id="session-abc")
+
+    answered = q.answer(item["ref"], "Go with A", session_id="human-1")
+
+    assert answered["answered_at"]
+    assert workers.requeue_orphaned_tickets(grace_s=0, answer_grace_s=300) == []
+    assert q.get(item["ref"])["status"] == "in_progress"
+
+
 def test_github_backend_answer_releases_claim_without_session(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)

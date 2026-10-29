@@ -449,6 +449,30 @@ def test_answered_ticket_not_reopened_while_answer_in_flight(wt, tmp_path):
     assert q.get(item["ref"])["status"] == "open"
 
 
+def test_answer_in_flight_follows_the_ccc_lineage_successor(wt, tmp_path, monkeypatch):
+    """OPS-200: CCC delivered the answer to a lineage successor of the parked
+    codex session. While that successor is busy past the grace, the sweep must
+    not reopen the ticket for a second worker."""
+    cli, q, workers = wt
+    import watchtower.messages as messages
+    sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    successor = "ffffffff-0000-1111-2222-333333333333"
+    item = _blocked_codex_ticket(q, workers, tmp_path, worker_id="w-1", sid=sid)
+    q.answer(item["ref"], "A", session_id="human")
+    monkeypatch.setattr(messages, "ccc_forward_target",
+                        lambda s, **k: successor if s == sid else None)
+    busy = {successor}
+    monkeypatch.setattr(messages, "session_state",
+                        lambda s, **k: "busy" if s in busy else "idle")
+
+    assert workers.requeue_orphaned_tickets(grace_s=0, answer_grace_s=0) == []
+    assert q.get(item["ref"])["status"] == "in_progress"
+
+    busy.clear()
+    reopened = workers.requeue_orphaned_tickets(grace_s=0, answer_grace_s=0)
+    assert [r["ref"] for r in reopened] == [item["ref"]]
+
+
 def _park_everything(monkeypatch, tmp_path):
     """Sandbox the outbox and make every transport fail so send() parks."""
     import watchtower.messages as messages

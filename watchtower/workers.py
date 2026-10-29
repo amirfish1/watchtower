@@ -5441,11 +5441,16 @@ def _answer_in_flight(
         return True
     # Beyond the grace, still protect a session that is demonstrably working the
     # answer (hot transcript). Codex sessions have no wt-visible transcript, so
-    # this only helps claude; codex relies on the grace window above.
+    # this only helps claude; codex relies on the grace window above. CCC may
+    # deliver the answer to a lineage successor of ``sid``; that session is the
+    # one working it (OPS-200: a codex parker forwarded to a claude session).
     if sid:
         try:
             from . import messages
             if messages.session_state(str(sid)) == "busy":
+                return True
+            fwd = messages.ccc_forward_target(str(sid))
+            if fwd and messages.session_state(fwd) == "busy":
                 return True
         except Exception:
             pass

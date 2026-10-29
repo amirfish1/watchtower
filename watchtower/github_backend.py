@@ -1991,6 +1991,8 @@ class GitHubIssuesBackend:
             "block_question": str(meta.get("block_question") or ""),
             "block_kind": str(meta.get("block_kind") or ""),
             "blocked_at": str(meta.get("blocked_at") or ""),
+            # The orphan sweep's answer grace keys on this (OPS-200).
+            "answered_at": meta.get("answered_at"),
             "blocked_by": [str(r) for r in (meta.get("blocked_by") or []) if r]
             if isinstance(meta.get("blocked_by"), list) else [],
             "submitter": str(meta.get("submitter") or ""),
