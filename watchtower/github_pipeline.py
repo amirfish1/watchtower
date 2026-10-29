@@ -100,10 +100,14 @@ def _owner_fields(item: Dict[str, Any], marker: str) -> None:
     item["pipeline_owner_id"] = oid
 
 
-def stale_readers(items: List[Dict[str, Any]], now: Optional[float] = None) -> Dict[str, str]:
+def stale_readers(items: List[Dict[str, Any]], now: Optional[float] = None,
+                  require_proto_2: bool = False) -> Dict[str, str]:
     """Machines (other than this one) whose latest claim in the window was made
-    by a `wt` that does not stamp READER_MIN_PROTO or later, mapped to that claim's time."""
+    by a `wt` that does not stamp the required protocol, mapped to that claim's time.
+    With require_proto_2=False (plan gates): READER_MIN_PROTO (1) is acceptable.
+    With require_proto_2=True (non-plan gates): PIPELINE_PROTO (2) is required."""
     from . import queue as q
+    min_proto = PIPELINE_PROTO if require_proto_2 else READER_MIN_PROTO
     cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                            time.gmtime((now or time.time()) - READER_WINDOW_S))
     latest: Dict[str, Any] = {}
@@ -115,7 +119,7 @@ def stale_readers(items: List[Dict[str, Any]], now: Optional[float] = None) -> D
             if machine not in latest or at > latest[machine][0]:
                 latest[machine] = (at, h.get("pipeline"))
     return {m: at for m, (at, proto) in latest.items()
-            if m != q.machine_tag() and int(proto or 0) < READER_MIN_PROTO}
+            if m != q.machine_tag() and int(proto or 0) < min_proto}
 
 
 def _read_strict() -> Dict[str, Any]:
@@ -552,7 +556,8 @@ def set_gates(ident: Any, gates: List[str]) -> Optional[Dict[str, Any]]:
     if gates:
         marker = owner_marker()
         if item.get("pipeline_host") != marker:
-            stale = stale_readers(backend.list_items(None))
+            has_plan = q.plan_gate({"gates": gates}) is not None
+            stale = stale_readers(backend.list_items(None), require_proto_2=not has_plan)
             if stale:
                 raise ValueError(
                     f"{item.get('ref')}: cannot gate yet; these hosts claimed this queue "
@@ -562,7 +567,7 @@ def set_gates(ident: Any, gates: List[str]) -> Optional[Dict[str, Any]]:
             # The hold rides on the marker write: no window where a wt that
             # cannot read the sidecar sees a plan-gated ticket unheld.
             backend.update(ident, pipeline_host=marker,
-                           pipeline_hold="plan" if q.plan_gate({"gates": gates}) else "")
+                           pipeline_hold="plan" if has_plan else "")
             # No CAS on issue edits: trust the persisted marker, not our write.
             # A racing host that wrote last owns it; we write no sidecar entry.
             persisted = backend.get(ident) or {}

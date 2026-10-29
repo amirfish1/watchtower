@@ -82,15 +82,18 @@ written) → write sidecar entry.
 
 Reader check (OPS-203, relaxed OPS-221): every GitHub claim stamps
 `pipeline: <PIPELINE_PROTO>` (2 since OPS-215) on its history event. Gating is
-refused while any other machine's latest claim on the queue in the last 14 days
-lacks `READER_MIN_PROTO` (1: OPS-203 onward, when protective defers began).
-Every protocol 1+ host honours the issue-level `deferred_until` hold (OPS-215),
-so only an unstamped (protocol 0) pre-OPS-203 claim blocks gating. The error
-names the host and its last claim. Once that host runs OPS-203 or later, its
-next claim clears the check. A retired host ages out after 14 days. Crash
-between the two ⇒ marker without entry ⇒ fail-closed `pipeline_missing`, never
-an unplanned build. Gating a ticket a builder already holds is **refused**
-(the claim is left untouched): the hold only excludes new claims, so a running
+refused while other machines have claims in the last 14 days below the required
+protocol: **READER_MIN_PROTO** (1: OPS-203 onward) **for plan gates** (protected
+by issue-level `deferred_until`), and **PIPELINE_PROTO** (2) **for non-plan
+gates** (verify/review/cmd only; no issue-level protection). Without the
+sidecar, a proto-1 host could otherwise claim and skip verify on a non-plan gate.
+Every protocol 1+ host honours the `deferred_until` hold (OPS-215), so only an
+unstamped (protocol 0) pre-OPS-203 claim blocks plan gates. The error names the
+host and its last claim. Once that host runs the required version, its next
+claim clears the check. A retired host ages out after 14 days. Crash between
+the two ⇒ marker without entry ⇒ fail-closed `pipeline_missing`, never an
+unplanned build. Gating a ticket a builder already holds is **refused** (the
+claim is left untouched): the hold only excludes new claims, so a running
 builder would not pause for the planner. Gate it once it is released.
 
 ## Scope
