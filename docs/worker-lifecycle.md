@@ -902,7 +902,7 @@ before its caller blocks the ticket.
 | stage (`plan.*`, `review.verify`, `assess.*`) | `stage_session` worker alive, or a launch cooldown | `stage`: `reconcile_stages(only_ref)` |
 | `assess.filing` | idle | `assessment_run_ops` (the idempotent op replay) |
 | claim (`work.claimed`, sent-back) | `claim_owner` | dead: `resume` if resume-first applies, else `reopen`; unproven: `escalate`; GitHub (any verdict but alive, either host): `route_owner_host`; alive: none |
-| `work.unowned` (in_progress, no claimer, e.g. `update_status(in_progress, worker='')`) | owner `reconciler`; only a bound session `claim_owner` proves alive vetoes | `reopen` to the pool (no claimer to protect); GitHub: `escalate` |
+| `work.unowned` (in_progress, no claimer, e.g. `update_status(in_progress, worker='')`) | owner `reconciler`; only a bound session `claim_owner` proves alive vetoes | `reopen` to the pool; GitHub: `route_owner_host` (never a block, WT-39) |
 | `work.open` (staffing) | a live, unreleased queue worker | `spawn` one worker (auto_drain on, no launch-failure cooldown; one per queue per sweep) |
 | `dep.stuck` | stuck blocker not yet escalated | `escalate_stuck_blockers`; `BACKSTOP_NO_ESCALATION` if it still is not flagged |
 | `plan.blocked` | idle one tick | `BACKSTOP_UNBLOCKED_PLAN`, escalate to a human |
@@ -943,8 +943,30 @@ per claim identity and capped at `OWNER_ROUTE_MAX` (one open at a time, the next
 no sooner than a stall window after the last closes). A foreign claim's request
 goes to the owning host. A local claim's request asks for `wt release <ref>
 --force` once the claimed session is proven dead. The claim, its labels,
-comments and any question stay untouched. `work.unowned` on GitHub (no
-claimer) still escalates with `q.block`.
+comments and any question stay untouched. That includes `work.unowned`. "No
+claimer" on the read is no promise at write time, because a foreign claim can
+land before an unconditional write. `_apply` also refuses any `escalate` or
+`unblocked_plan` on a GitHub ticket, so no future row can bring the block back.
+
+Automated writers inventory (WT-39). A writer counts if it infers recovery or a
+question from absent or stale ownership evidence:
+
+| Writer | GitHub handling |
+|---|---|
+| `requeue_orphaned_tickets` (dead worker) | `route_github_recovery`, no write |
+| backstop `work.claimed` (`claim_owner` not alive, either host) | `route_owner_host`, no write |
+| backstop `work.unowned` | `route_owner_host`, no write |
+| backstop `_apply` `escalate` / `unblocked_plan` | refused on GitHub (`BACKSTOP_SKIP`) |
+| backstop `reopen` / `resume` / `mark` (stage, spawn, assessment ops) | `recover_claim` is local-only: no-op (`race`) |
+| `dep.stuck` -> `escalate_stuck_blockers` | local store only |
+| `release_stalled_sent_back` | local store only |
+| answer rows (`answer.*`), parking, plan groups, plan stages | unreachable on GitHub (`UNREACHABLE` table) |
+| owner-host `claim_heartbeat` renewal | the owning host's own claim (authentic, not inferred) |
+| stage blocks (`stages._escalate`, spawn failure), review-delivery block, model-floor reopen | act on `in_review`/closed/blocked tickets from stage or delivery failures, not ownership inference; `claim_next` never claims those statuses |
+
+Explicit human or owner actions (`wt release`, `wt answer`, a worker's own
+close or block) still write GitHub bodies. Without CAS they keep a narrowed
+window. They are authorized acts, not inferences.
 
 **Loop guard.** If a ticket is still in the same row with the fingerprint the
 backstop recorded (nothing moved since its last action), a prior `resume`

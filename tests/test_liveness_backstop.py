@@ -396,17 +396,41 @@ def test_unowned_with_a_live_bound_session_is_left_alone(lv, monkeypatch):
     assert lv.q.get(ref)["status"] == "in_progress"
 
 
-def test_github_unowned_escalates_through_block(lv, monkeypatch):
-    blocked = []
+def test_github_unowned_routes_never_blocks(lv, monkeypatch):
+    """WT-39 verify:4: no claimer on the read does not mean no claim can be
+    lost at write time, so GitHub work.unowned routes one bounded recovery
+    request instead of a q.block; the next sweep files nothing more."""
+    blocked, routes = [], []
     item = {"ref": "GH-2", "project": "GH", "status": "in_progress", "claimed_by": None,
             "updated_at": "2000-01-01T00:00:00Z", "history": []}
     monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
-    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)] + [dict(r) for r in routes])
     monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))      # the fresh read
     monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
+    monkeypatch.setattr(lv.q, "enqueue", lambda **k: routes.append(
+        {"ref": f"OPS-{len(routes) + 1}", "status": "open", "project": "OPS",
+         "dedupe_key": k["dedupe_key"]}) or routes[-1])
     acted = _sweep(lv)
-    assert [(a["row"], a["action"]) for a in acted] == [("work.unowned", "escalate")]
-    assert blocked == ["GH-2"]
+    assert [(a["row"], a["action"], a["result"]) for a in acted] == \
+        [("work.unowned", "route_owner_host", "done")]
+    assert blocked == [] and len(routes) == 1
+    assert _sweep(lv) == [] and len(routes) == 1
+
+
+def test_apply_refuses_any_automated_github_block(lv, monkeypatch):
+    """Defence in depth: whatever row decides ``escalate`` or
+    ``unblocked_plan`` on a GitHub ticket, _apply never calls q.block."""
+    blocked = []
+    item = {"ref": "GH-3", "project": "GH", "status": "in_progress", "claimed_by": "x",
+            "updated_at": "2000-01-01T00:00:00Z", "history": []}
+    monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))
+    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
+    for action in ("escalate", "unblocked_plan"):
+        a = {"ref": "GH-3", "queue": "GH", "action": action, "reason": "r", "verdict": "unproven",
+             "evidence": "e", "row": "work.claimed", "idle_s": 9999}
+        assert lv.liveness._apply(dict(item), a, {}, set()).startswith("refused")
+    assert blocked == []
 
 
 def test_live_sent_back_claim_is_left_to_its_release_window(lv):

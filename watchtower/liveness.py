@@ -253,7 +253,8 @@ ROWS: Tuple[Row, ...] = (
          status="in_progress", claimed=True, block="none", answer=SETTLED),
     # in_progress with no claimer (``update_status(in_progress, worker='')``):
     # nobody owns it, so after STALL_S idle the backstop reopens it to the
-    # pool unless a session bound to it is provably alive (GitHub: escalate).
+    # pool unless a session bound to it is provably alive (GitHub: routed to
+    # an explicit recovery request, never blocked, WT-39).
     _row("work.unowned", "reconciler", "claim_owner", "reopen", NOT_PA,
          status="in_progress", claimed=False, block="none", answer=SETTLED),
     _row("work.open", "pool", "staffing", "spawn", _and(NOT_PA, _POOL_GROUP),
@@ -1329,7 +1330,12 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
             verdict = "unowned"
             evidence = "in_progress with no claimer" + (f" ({v.evidence})" if v else "")
             if github:
-                action, reason = "escalate", "in_progress with no claimer (GitHub)"
+                # WT-39: no claimer on the read is no promise at write time:
+                # a foreign claim can land before an unconditional body write.
+                due, routed = _owner_route_due(item, by_ref, now, stall)
+                evidence += f"; {routed}" if routed else ""
+                if due:
+                    action, reason = "route_owner_host", "in_progress with no claimer (GitHub)"
             else:
                 action, reason = "reopen", "in_progress with no claimer and no live owner"
     elif proof["kind"] == "claim_owner" and github and _foreign_host(item):
@@ -1518,6 +1524,12 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
                f"routed to {routed or '?'}", queue=a["queue"])
         return "done" if routed else "route failed: no ref"
     if action == "escalate" or action == "unblocked_plan":
+        if _github(a["queue"]):
+            # WT-39: never an automated block on a GitHub ticket. A block is
+            # a whole-body write GitHub cannot condition on the claim read.
+            q._log("BACKSTOP_SKIP", f"{ref} {action} refused: GitHub tickets are "
+                   "routed, never blocked automatically (WT-39)", queue=a["queue"])
+            return "refused (GitHub: route, never block)"
         question = _escalation_question(item, a)
         if action == "unblocked_plan":
             question = (f"The plan for {ref} is blocked and nobody is asked: "
@@ -1525,12 +1537,6 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
                         f"`wt answer {ref} \"retry\"`.")
             q._log("BACKSTOP_UNBLOCKED_PLAN", f"{ref} plan blocked with no open question",
                    queue=a["queue"])
-        if _github(a["queue"]):
-            stale, expect = _github_snapshot_stale(item, a, by_ref, now)
-            if stale:
-                return stale
-            return "done" if q.block(ref, "", question=question, origin="system",
-                                     expect=expect) else "race"
         if a["row"] == "assess.run.file":
             asmt = item.get("assessment") or {}
             q.assessment_fail(ref, str(asmt.get("token") or ""), a["reason"])

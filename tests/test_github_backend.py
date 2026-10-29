@@ -4027,6 +4027,83 @@ def test_orphan_sweep_real_path_never_reopens_a_github_claim(
     assert workers.requeue_orphaned_tickets(grace_s=0) == [] and len(filed) == 1
 
 
+def test_backstop_real_path_never_blocks_an_unowned_github_issue(tmp_path, monkeypatch):
+    """WT-39 verify:4 replay on the real path (liveness.sweep -> assess ->
+    _apply over the real queue and GitHubIssuesBackend, fake gh): an
+    in_progress issue with no claimer, aged past the stall window. A spy on
+    the ORIGINAL _edit_body injects a live foreign claim right before any
+    write (the verifier's witness), and so does the recovery filing. The
+    sweep writes nothing on the issue -- no edit, no question comment -- the
+    foreign claim survives exactly, and one bounded request goes to OPS."""
+    import time
+
+    from watchtower import github_backend, liveness
+
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    item = q.enqueue(project="GHI", note="half-claimed")
+    q.claim_by_ref(item["ref"], "gone", session_uuid="gone-sess")
+    snap = q.get("GHI-1")
+    data = json.loads(state.read_text())     # strip the claim: work.unowned
+    body = data["issues"][0]["body"]
+    for key in ("claimed_by", "claimed_session_id", "claimed_machine"):
+        body = body.replace(str(snap[key]), "")
+    data["issues"][0]["body"] = body
+    data["issues"][0]["assignees"] = []      # the verifier's "no assignees"
+    state.write_text(json.dumps(data))
+    unowned = q.get("GHI-1")
+    assert unowned["status"] == "in_progress" and not unowned.get("claimed_by")
+    assert liveness.row_of(unowned).id == "work.unowned"
+
+    def take_over():
+        data = json.loads(state.read_text())
+        issue = data["issues"][0]
+        _b, meta = github_backend._split_body(issue["body"])
+        meta.update(claimed_by="live-remote", claimed_session_id="live-sess",
+                    claimed_machine="owner-host")
+        issue["body"] = github_backend._body_with_metadata(_b, meta)
+        state.write_text(json.dumps(data))
+    edits = []
+    original = github_backend.GitHubIssuesBackend._edit_body
+
+    def spy(self, item, body, meta, *extra):
+        take_over()
+        edits.append(item.get("ref"))
+        return original(self, item, body, meta, *extra)
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_edit_body", spy)
+    real_enqueue, filed = q.enqueue, []
+
+    def enqueue(**kw):
+        take_over()
+        filed.append(kw)
+        return real_enqueue(**kw)
+    monkeypatch.setattr(q, "enqueue", enqueue)
+    before = json.loads(state.read_text())
+    later = time.time() + 10 * liveness.stall_s()
+    acted = liveness.sweep(now=later)
+    after = json.loads(state.read_text())
+
+    assert [(a["row"], a["action"], a["result"]) for a in acted] == \
+        [("work.unowned", "route_owner_host", "done")]
+    assert edits == []
+    assert not [c for c in after["commands"][len(before["commands"]):]
+                if c[:2] in (["issue", "edit"], ["issue", "comment"],
+                             ["issue", "reopen"], ["issue", "close"])]
+    fresh = q.get("GHI-1")
+    assert (fresh["status"], fresh["claimed_by"], fresh["claimed_session_id"],
+            fresh["claimed_machine"], bool(fresh.get("needs_input"))) == \
+        ("in_progress", "live-remote", "live-sess", "owner-host", False)
+    assert after["issues"][0]["labels"] == before["issues"][0]["labels"]
+    assert len(filed) == 1 and filed[0]["project"] == "OPS"
+    # One open request at a time: the claim is now live-remote's on
+    # owner-host, so nothing more is filed for the old unowned identity.
+    assert len([a for a in liveness.sweep(now=later) if a["action"] == "route_owner_host"
+                and a["ref"] == "GHI-1" and "unowned" in a["row"]]) == 0
+
+
 def test_update_status_expect_fence_on_a_local_queue(tmp_path, monkeypatch):
     """The same ``expect`` contract holds for the file-backed store."""
     _config, q = _reload_isolated(tmp_path, monkeypatch)
