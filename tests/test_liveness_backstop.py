@@ -1072,6 +1072,30 @@ def test_incident_replay_foreign_live_claim_is_not_escalated(lv, monkeypatch):
     assert blocked == [] and reopened == []
 
 
+VERIFY_NOW = 1793271600.0   # 2026-10-29T11:00:00Z, WT-39 verifier replay
+
+
+@pytest.mark.parametrize("hb_age, action", [
+    (None, "route_owner_host"),     # no stamp, store idle 3h (> 4 windows)
+    (2400, "route_owner_host"),     # expired stamp from 10:20Z
+    (60, ""),                       # fresh stamp from 10:59Z
+])
+def test_verifier_replay_foreign_claim_never_blocks(lv, monkeypatch, hb_age, action):
+    """WT-39 verifier replay through assess -> sweep -> _apply: a foreign
+    claim idle since 08:00Z, unchanged worker/session, seen at 11:00Z. Absent
+    or expired owning-host evidence routes one request to the owner; it never
+    posts a question, reopens, or otherwise writes the claimed issue."""
+    item, _, _ = _foreign(lv, monkeypatch, VERIFY_NOW, hb_age=hb_age)
+    item.update(updated_at="2026-10-29T08:00:00Z", claimed_at="2026-10-29T08:00:00Z")
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))
+    _no_claim_writes(lv, monkeypatch)
+    acted = lv.liveness.sweep(now=VERIFY_NOW)
+    assert [a["action"] for a in acted] == ([action] if action else [])
+    assert [a["result"] for a in acted] == (["done"] if action else [])
+    assert len(lv.routes) == (1 if action else 0)
+
+
 def test_foreign_claim_fresh_local_files_do_not_reset_its_clock(lv, monkeypatch):
     """A same-named session file on this host is not the remote session: past
     the migration bound a foreign claim with no stamp is still routed to its
