@@ -2096,6 +2096,38 @@ def test_notify_never_falls_through_to_a_headless_resume(wt, monkeypatch):
     assert res["ok"] is False and res["queued"] is True
 
 
+@pytest.mark.parametrize("force_queue", [False, True])
+def test_codex_notice_requests_steer_over_http(wt, delegate, monkeypatch, force_queue):
+    """An active Codex target queues mode=send, even for notify=True."""
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+    res = wt.messages.send(
+        SID_D, "[watchtower] Q-1 closed", engine="codex", notify=True,
+        force_queue=force_queue,
+    )
+
+    assert res["ok"] is True and res["transport"] == "delegate"
+    path, body = srv.requests[0]
+    assert path == "/api/inject-input"
+    assert body["session_id"] == SID_D
+    assert body["mode"] == "steer"
+    assert not body.get("force_queue")
+
+
+def test_legacy_parked_codex_notice_retries_as_steer(wt, delegate, monkeypatch):
+    """Existing outbox rows keep mode=send; retry must upgrade the wire mode."""
+    parked = wt.messages.outbox_add(
+        SID_D, "[watchtower] Q-1 closed", mode="send", engine="codex", notify=True,
+    )
+    srv, url = delegate
+    monkeypatch.setenv("WATCHTOWER_DELEGATE_URL", url)
+
+    out = wt.messages.drain_outbox(now=time.time() + 3600)
+
+    assert out["delivered"] == [parked["id"]]
+    assert srv.requests[0][1]["mode"] == "steer"
+
+
 def test_ordinary_send_still_resumes(wt, monkeypatch):
     """The narrowing is scoped to notices: every other caller keeps the full
     adapter chain it has always had."""

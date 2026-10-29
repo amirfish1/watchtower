@@ -1842,8 +1842,8 @@ def _deliver_notify(
        safe seam.
     2. ``fifo`` -- a live WT worker's own stdin; the worker is already running,
        so this costs no extra turn.
-    3. ``delegate`` -- CCC's ``/api/inject-input``, which is itself UDS for a
-       live claude session.
+    3. ``delegate`` -- CCC's ``/api/inject-input``, explicitly in steer mode
+       so active Codex turns receive the notice instead of queueing it.
 
     If none of them can take it the target is idle or unreachable, and the
     caller decides between parking it in the outbox and dropping it -- see
@@ -1858,8 +1858,11 @@ def _deliver_notify(
     if r.get("ok"):
         return r
     errors.append(f"fifo: {r.get('error', 'failed')}")
+    # Enforce the notification delivery class here, including old outbox rows
+    # persisted with mode="send". Passing that mode through makes CCC queue
+    # notices behind active Codex turns despite this chain being steer-class.
     r = _deliver_delegate(
-        resolved, text, mode, force_queue=force_queue,
+        resolved, text, "steer", force_queue=False,
         delegate_timeout_s=delegate_timeout_s,
     )
     if r.get("ok"):
