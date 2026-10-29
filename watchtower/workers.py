@@ -5689,6 +5689,11 @@ def requeue_orphaned_tickets(
     (OPS-104). Those ids are left alone; if the claiming session really did
     die, the ticket just stays in_progress like a `wt block`ed one already does.
 
+    A GitHub-backed claim is never reopened here (WT-39): issue edits take no
+    precondition, so the reopen could overwrite a claim another host wrote
+    after this sweep's reads. An orphaned one gets a bounded recovery request
+    instead (``liveness.route_github_recovery``).
+
     Returns the list of reopened items."""
     from . import queue as _q
     import time as _time
@@ -5828,14 +5833,15 @@ def requeue_orphaned_tickets(
                        f"{wid or str(it.get('claimed_session_id') or '')[:8]} dead)")
             sid_d = str(it.get("claimed_session_id") or "")
             if github_of(it):
-                item = _q.update_status(
-                    ref, "open", quiet=True, require_status="in_progress", reason=why,
-                    orphan=({"session_id": sid_d, "claimed_by": claimer}
-                            if (sid_d or claimer) else None),
-                    # WT-39: reopen only the claim judged dead from this
-                    # snapshot; a fresh read naming another claimer, session
-                    # or host (or a parked question) leaves it alone.
-                    expect={k: it.get(k) for k in _liveness._CLAIM_KEYS})
+                # WT-39: never reopen a GitHub claim automatically. Issue
+                # edits take no precondition, so any fence checked on a read
+                # can still overwrite a claim written after it (another
+                # host's takeover). Route a bounded recovery request instead;
+                # the claim, labels and comments stay untouched.
+                _liveness.route_github_recovery(
+                    it, by_ref, now, f"orphan sweep: {why} (claimer {claimer or '-'} "
+                    f"not alive here)")
+                continue
             else:
                 # CAS on the snapshot this decision was made from (claim
                 # fields, claim_proc, state fingerprint); records the backstop.

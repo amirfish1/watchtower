@@ -7487,8 +7487,8 @@ def recover_claim(ident: Any, *, expect: Dict[str, Any], action: str, reason: st
     ``mark`` (record only; the caller acts). Every applied action writes
     ``backstop = {state, action, count, at, fingerprint}`` (the post-write
     fingerprint the loop guard compares) and a ``backstop`` history event in
-    the same step. Local store only (a GitHub-backed ticket escalates through
-    ``block``)."""
+    the same step. Local store only (a GitHub-backed claim is routed to an
+    explicit recovery request, ``liveness._route_owner_host``, WT-39)."""
     if action not in RECOVER_ACTIONS:
         raise ValueError(f"action must be one of {RECOVER_ACTIONS}")
     if _github_backend_for_project(_project_from_ident(ident)) is not None:

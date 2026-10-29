@@ -901,7 +901,7 @@ before its caller blocks the ticket.
 |---|---|---|
 | stage (`plan.*`, `review.verify`, `assess.*`) | `stage_session` worker alive, or a launch cooldown | `stage`: `reconcile_stages(only_ref)` |
 | `assess.filing` | idle | `assessment_run_ops` (the idempotent op replay) |
-| claim (`work.claimed`, sent-back) | `claim_owner` | dead: `resume` if resume-first applies, else `reopen`; unproven or GitHub: `escalate`; alive: none |
+| claim (`work.claimed`, sent-back) | `claim_owner` | dead: `resume` if resume-first applies, else `reopen`; unproven: `escalate`; GitHub (any verdict but alive, either host): `route_owner_host`; alive: none |
 | `work.unowned` (in_progress, no claimer, e.g. `update_status(in_progress, worker='')`) | owner `reconciler`; only a bound session `claim_owner` proves alive vetoes | `reopen` to the pool (no claimer to protect); GitHub: `escalate` |
 | `work.open` (staffing) | a live, unreleased queue worker | `spawn` one worker (auto_drain on, no launch-failure cooldown; one per queue per sweep) |
 | `dep.stuck` | stuck blocker not yet escalated | `escalate_stuck_blockers`; `BACKSTOP_NO_ESCALATION` if it still is not flagged |
@@ -931,8 +931,20 @@ settled answer by E14, recording `orphan`/`displaced_*`), `resume` (stamps
 `claim_proc.resumed_at`), `escalate` (a system `needs_input` block, E17
 supersession) and `mark` (before a stage/spawn/assessment action). Every write
 appends a `backstop` history event and sets `backstop = {state, action, count,
-at, fingerprint}`. GitHub tickets are refused (the sweep escalates them with
-`q.block`).
+at, fingerprint}`. GitHub tickets are refused.
+
+**GitHub claims are never reopened or blocked automatically (WT-39).** GitHub
+issue edits take no precondition, so a fence checked on any read (the expect
+CAS, the body lock, a re-read) cannot stop a whole-body write from overwriting
+a claim another host wrote after that read. Neither the backstop nor
+`requeue_orphaned_tickets` writes to a GitHub claim. Both file a recovery
+request on this host's OPS lane through `liveness._route_owner_host`, deduped
+per claim identity and capped at `OWNER_ROUTE_MAX` (one open at a time, the next
+no sooner than a stall window after the last closes). A foreign claim's request
+goes to the owning host. A local claim's request asks for `wt release <ref>
+--force` once the claimed session is proven dead. The claim, its labels,
+comments and any question stay untouched. `work.unowned` on GitHub (no
+claimer) still escalates with `q.block`.
 
 **Loop guard.** If a ticket is still in the same row with the fingerprint the
 backstop recorded (nothing moved since its last action), a prior `resume`

@@ -868,11 +868,21 @@ def _owner_route_due(item: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
 
 def _route_owner_host(item: Dict[str, Any], a: Dict[str, Any],
                       by_ref: Dict[str, Dict[str, Any]], now: float) -> str:
-    """File the next owning-host recovery request for a foreign claim;
-    returns its ref. Touches nothing on the claimed ticket: the claim, any
-    open question and any answer stay exactly as the owner left them."""
+    """File the next owning-host recovery request for a GitHub claim the
+    automation will not touch; returns its ref. Touches nothing on the claimed
+    ticket: the claim, any open question and any answer stay exactly as the
+    owner left them.
+
+    A foreign claim is routed because this host cannot see its processes. A
+    claim held here is routed too (WT-39): GitHub issue edits take no
+    precondition, so a reopen or block decided from any read can overwrite a
+    claim written after it. Only an explicit `wt release` on the owning host
+    hands it back."""
     from . import workers
-    ref, host = a["ref"], _foreign_host(item)
+    ref = a["ref"]
+    host = _foreign_host(item)
+    if not host:
+        return _route_local_github(item, a, by_ref, now)
     routes = _owner_routes(item, by_ref)
     n = len(routes) + 1
     age = claim_heartbeat_age(item, now)
@@ -924,6 +934,82 @@ window, or {ref} was recovered or released through {host} as described above.
         source="wt", item_type="bug", priority="p2", readiness="ready",
         dedupe_key=f"{_owner_route_key(item)}#{n}")
     return str(item_.get("ref") or "")
+
+
+def _route_local_github(item: Dict[str, Any], a: Dict[str, Any],
+                        by_ref: Dict[str, Dict[str, Any]], now: float) -> str:
+    """`_route_owner_host` for a GitHub claim held on this host (or with no
+    recorded host): same dedupe key, same OWNER_ROUTE_MAX cap."""
+    from . import workers
+    ref, host = a["ref"], q.machine_tag()
+    routes = _owner_routes(item, by_ref)
+    n = len(routes) + 1
+    prior = (f"Earlier requests for this claim: "
+             f"{', '.join(str(r.get('ref')) for r in routes)} (closed, yet the claim "
+             f"is still unrecovered). " if routes else "")
+    last = " This is the last request the backstop files for this claim." \
+        if n >= OWNER_ROUTE_MAX else ""
+    text = f"""\
+Observed by host {host} (WatchTower backstop / orphan sweep, read-only on {ref}).
+
+Claim: {ref} ({a['queue']}) status in_progress, claimed by {item.get('claimed_by') or '-'}
+session {item.get('claimed_session_id') or '-'} on host {item.get('claimed_machine') or '(none recorded)'}
+since {item.get('claimed_at') or '?'}.
+Evidence: {a['evidence']}; {a.get('idle_s', 0)}s of store idle. {prior}
+
+{ref} is GitHub-backed. GitHub issue edits take no precondition, so an
+automatic reopen or block could overwrite a claim another host wrote after
+this host read it (WT-39). The automation therefore leaves {ref} untouched
+and asks for an explicit recovery instead. Missing local evidence does not
+prove the worker is dead.
+
+Steps (request {n} of at most {OWNER_ROUTE_MAX}):
+1. Re-read {ref} (`wt find {ref} --json`). If the claim changed (other
+   worker/session/host), it closed, or it has an open question, close this
+   request: nothing to recover.
+2. On {host}: `wt liveness {ref}`, and check the session/process named above.
+   - Alive or working: close this request.
+   - Dead: hand it back explicitly with `wt release {ref}` from {host}
+     (it refuses a ticket with an open question; leave that one alone), then
+     close this request citing the release.
+3. Unsure: `wt defer` this request `--until +2h --reason "<what is unclear>"`
+   and redo steps 1-2. Ask a human (`wt block`) only for a credential or device
+   you established is missing.{last}
+
+Safe stop. This request does not authorize closing or editing {ref}'s body,
+stopping a worker you have not proven dead, or resetting or extending any
+budget, review, deadline or grant.
+
+Done when: {ref} was released after its claimed session was proven dead, or its
+claim is shown alive or changed.
+"""
+    item_ = q.enqueue(
+        note=f"Recover {ref}: GitHub claim on {host} looks orphaned; automation will not reopen it",
+        title=f"Claim recovery: {ref} on {host} (#{n})",
+        text=text, accept_line=f"{ref} released after proven death, or shown alive or changed",
+        project=workers._alert_launch_failure_queue(OWNER_ROUTE_QUEUE),
+        source="wt", item_type="bug", priority="p2", readiness="ready",
+        dedupe_key=f"{_owner_route_key(item)}#{n}")
+    return str(item_.get("ref") or "")
+
+
+def route_github_recovery(item: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
+                          now: float, evidence: str, stall: float = 0.0) -> str:
+    """Route recovery of a GitHub claim the orphan sweep judged orphaned (WT-39)
+    instead of reopening it. Returns the filed ref, or '' when a request is
+    open, routing is exhausted, or one closed less than ``stall`` ago."""
+    due, _ = _owner_route_due(item, by_ref, now, stall or stall_s())
+    if not due:
+        return ""
+    project = str(item.get("project") or "")
+    a = {"ref": item.get("ref"), "queue": project, "evidence": evidence,
+         "idle_s": int(max(0.0, now - _store_activity(item)))}
+    routed = _route_owner_host(item, a, by_ref, now)
+    if routed:
+        where = _foreign_host(item) or q.machine_tag()
+        q._log("ORPHAN_ROUTE", f"{item.get('ref')} held on {where}: {evidence}; "
+               f"routed to {routed} (GitHub claims are never auto-reopened)", queue=project)
+    return routed
 
 
 HEARTBEAT_RENEW_S = 600.0
@@ -1261,7 +1347,12 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
         elif v.verdict == "alive":
             pass
         elif github:
-            action, reason = "escalate", f"claim owner {v.verdict} ({v.evidence})"
+            # WT-39: no automatic block or reopen of a GitHub claim (no
+            # conditional write); an explicit recovery request instead.
+            due, routed = _owner_route_due(item, by_ref, now, stall)
+            evidence += f"; {routed}" if routed else ""
+            if due:
+                action, reason = "route_owner_host", f"claim owner {v.verdict} ({v.evidence})"
         elif v.verdict == "dead":
             action = "resume" if _resume_first(item) else "reopen"
             reason = f"claim owner dead ({v.evidence})"
@@ -1422,7 +1513,8 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
             routed = _route_owner_host(item, a, by_ref, time.time() if now is None else now)
         except Exception as exc:  # noqa: BLE001 - the next sweep retries
             return f"route failed: {exc}"
-        q._log("BACKSTOP_OWNER_ROUTE", f"{ref} held on {_foreign_host(item)}: {reason}; "
+        where = _foreign_host(item) or q.machine_tag()
+        q._log("BACKSTOP_OWNER_ROUTE", f"{ref} held on {where}: {reason}; "
                f"routed to {routed or '?'}", queue=a["queue"])
         return "done" if routed else "route failed: no ref"
     if action == "escalate" or action == "unblocked_plan":

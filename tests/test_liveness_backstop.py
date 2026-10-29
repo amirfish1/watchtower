@@ -204,16 +204,25 @@ def test_unproven_owner_escalates_then_stays_human(lv):
     assert _sweep(lv) == []
 
 
-def test_github_claim_escalates_through_block(lv, monkeypatch):
-    blocked = []
+def test_github_claim_routes_recovery_never_blocks(lv, monkeypatch):
+    """WT-39: an unproven GitHub claim (no host recorded) is never blocked or
+    reopened automatically: GitHub edits take no precondition. It routes one
+    bounded recovery request; a second sweep files nothing more."""
+    blocked, routes = [], []
     item = {"ref": "GH-1", "project": "GH", "status": "in_progress", "claimed_by": "x",
             "claimed_session_id": SID2, "updated_at": "2000-01-01T00:00:00Z", "history": []}
     monkeypatch.setattr(lv.q, "_github_backend_for_project", github_by_name)
-    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)])
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(item)] + [dict(r) for r in routes])
     monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))      # the fresh read
     monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocked.append(ref) or {"ref": ref})
+    monkeypatch.setattr(lv.q, "enqueue", lambda **k: routes.append(
+        {"ref": f"OPS-{len(routes) + 1}", "status": "open", "project": "OPS",
+         "dedupe_key": k["dedupe_key"], "text": k["text"]}) or routes[-1])
     acted = _sweep(lv)
-    assert [a["action"] for a in acted] == ["escalate"] and blocked == ["GH-1"]
+    assert [(a["action"], a["result"]) for a in acted] == [("route_owner_host", "done")]
+    assert blocked == [] and len(routes) == 1
+    assert "wt release GH-1`" in routes[0]["text"]
+    assert _sweep(lv) == [] and len(routes) == 1       # one open request at a time
 
 
 # WT-38: a GitHub-backed claim stores no claim_proc. A native session bound to
@@ -267,13 +276,14 @@ def test_github_legacy_claim_with_bound_hosted_thread_is_alive(lv, monkeypatch):
     assert _sweep(lv) == [] and blocked == [] and reopened == []
 
 
-def test_github_legacy_claim_with_quiet_bound_thread_still_escalates(lv, monkeypatch):
+def test_github_legacy_claim_with_quiet_bound_thread_still_routes(lv, monkeypatch):
     item, blocked, reopened = _gh_legacy(lv, monkeypatch)
     now = time.time() + LATER
     _hosted_thread(lv, monkeypatch, "becky-1", SID2, LATER, now)    # stale rollout
     assert _owner(lv, item, now).verdict == "unproven"
     acted = _sweep(lv)
-    assert [a["action"] for a in acted] == ["escalate"] and blocked == ["GH-1"]
+    assert [a["action"] for a in acted] == ["route_owner_host"] and blocked == []
+    assert len(lv.routes) == 1
     assert reopened == []
 
 
@@ -285,7 +295,7 @@ def test_github_legacy_claim_unrelated_session_does_not_veto(lv, monkeypatch):
     now = time.time() + LATER
     _hosted_thread(lv, monkeypatch, "becky-1", SID, 30, now)       # other session
     assert _owner(lv, item, now).verdict == "unproven"
-    assert [a["action"] for a in _sweep(lv)] == ["escalate"] and blocked == ["GH-1"]
+    assert [a["action"] for a in _sweep(lv)] == ["route_owner_host"] and blocked == []
     _hosted_thread(lv, monkeypatch, "someone-else", SID2, 30, now)  # other worker
     v = _owner(lv, item, now)
     assert (v.verdict, v.evidence) == ("unproven", "no claim_proc (legacy claim)")
@@ -308,7 +318,7 @@ def test_github_legacy_claim_held_on_another_host_is_not_proven_here(lv, monkeyp
     assert blocked == [] and reopened == [] and len(lv.routes) == 1
 
 
-def test_github_legacy_claim_lookup_failure_escalates_not_recovers(lv, monkeypatch):
+def test_github_legacy_claim_lookup_failure_routes_not_recovers(lv, monkeypatch):
     item, blocked, reopened = _gh_legacy(lv, monkeypatch)
     now = time.time() + LATER
     _hosted_thread(lv, monkeypatch, "becky-1", SID2, 30, now)
@@ -318,7 +328,8 @@ def test_github_legacy_claim_lookup_failure_escalates_not_recovers(lv, monkeypat
     monkeypatch.setattr(lv.liveness, "_transcript_mtime", boom)
     assert _owner(lv, item, now).verdict == "unproven"
     acted = _sweep(lv)
-    assert [a["action"] for a in acted] == ["escalate"] and blocked == ["GH-1"]
+    assert [a["action"] for a in acted] == ["route_owner_host"] and blocked == []
+    assert len(lv.routes) == 1
     assert reopened == []
 
 
@@ -789,9 +800,10 @@ def test_requeue_preserves_github_claim_while_resumed_transcript_advances(lv, mo
     ref = _claimed(lv)
     lv.kill()
     monkeypatch.setattr(lv.liveness, "_github", lambda project: True)
-    reopened = []
+    reopened, routes = [], []
     monkeypatch.setattr(lv.q, "update_status",
                         lambda r, status, **kw: reopened.append(r) or {"ref": r})
+    monkeypatch.setattr(lv.q, "enqueue", lambda **k: routes.append(k) or {"ref": "OPS-1"})
     base = time.time()
     monkeypatch.setattr(time, "time", lambda: base + 600)
     rollout = lv.tmp / "codex/sessions/2026/10/25" / f"rollout-{SID}.jsonl"
@@ -799,10 +811,12 @@ def test_requeue_preserves_github_claim_while_resumed_transcript_advances(lv, mo
     rollout.write_text('{"type":"response_item"}\n')
     os.utime(rollout, (base + 590, base + 590))
 
-    assert lv.workers.requeue_orphaned_tickets() == [] and reopened == []
-    # A quiet transcript still lets the dead claim recover.
+    assert lv.workers.requeue_orphaned_tickets() == [] and reopened == [] and routes == []
+    # A quiet transcript routes an explicit recovery request; a GitHub claim
+    # is never reopened automatically (WT-39).
     os.utime(rollout, (base - 3600, base - 3600))
-    assert [it["ref"] for it in lv.workers.requeue_orphaned_tickets()] == [ref]
+    assert lv.workers.requeue_orphaned_tickets() == [] and reopened == []
+    assert len(routes) == 1 and f"wt release {ref}`" in routes[0]["text"]
 
 
 # WT-39: a GitHub claim held on another host. This host defers only to the
@@ -875,12 +889,13 @@ def test_foreign_claim_heartbeat_clock_skew(lv, monkeypatch):
 
 def test_local_claim_ignores_its_own_heartbeat(lv, monkeypatch):
     """On the owning host the stamp is never proof: a quiet local session
-    with a fresh-looking heartbeat still escalates on local evidence."""
+    with a fresh-looking heartbeat is still judged on local evidence (and
+    routed, since a GitHub claim is never blocked automatically, WT-39)."""
     now = time.time() + LATER
     item, blocked, _ = _gh_legacy(lv, monkeypatch)
     item["claim_heartbeat"] = _hb(now, 30, machine=lv.q.machine_tag())
     _hosted_thread(lv, monkeypatch, "becky-1", SID2, LATER, now)   # quiet
-    assert _decide(lv, item, now)[:2] == ("unproven", "escalate")
+    assert _decide(lv, item, now)[:2] == ("unproven", "route_owner_host")
 
 
 def test_missing_claimed_machine_keeps_local_judgement(lv, monkeypatch):
@@ -956,7 +971,8 @@ def test_owning_host_renews_heartbeat_only_while_locally_alive(lv, monkeypatch):
     item.pop("claim_heartbeat")
     os.utime(rollout, (now - LATER, now - LATER))
     monkeypatch.setattr(lv.q, "get", lambda ref: dict(item))
-    assert [a["action"] for a in _sweep(lv)] == ["escalate"] and len(backend.calls) == 1
+    assert [a["action"] for a in _sweep(lv)] == ["route_owner_host"] and len(backend.calls) == 1
+    assert blocked == []
 
 
 def test_foreign_host_never_renews_heartbeat(lv, monkeypatch):
@@ -969,8 +985,10 @@ def test_foreign_host_never_renews_heartbeat(lv, monkeypatch):
 
 
 def test_orphan_requeue_leaves_foreign_github_claim_alone(lv, monkeypatch):
-    """A dead builder id known here does not license this host to reopen a
-    GitHub claim recorded on another host; a local one is still reopened."""
+    """A dead builder id known here never licenses an automatic reopen of a
+    GitHub claim: a foreign one is the owning host's (the backstop routes it
+    after its stall rules); a local one gets one bounded recovery request on
+    this host's OPS lane, and nothing is written on the claim (WT-39)."""
     lv.worker(wid="becky-1", sid=SID2)
     lv.kill()
     item, _, _ = _gh_legacy(lv, monkeypatch, claimed_machine=FOREIGN,
@@ -982,14 +1000,18 @@ def test_orphan_requeue_leaves_foreign_github_claim_alone(lv, monkeypatch):
     assert lv.workers.requeue_orphaned_tickets(grace_s=0) == [] and reopened == []
     local = dict(item, claimed_machine=lv.q.machine_tag())
     monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(local)])
-    lv.workers.requeue_orphaned_tickets(grace_s=0)
-    assert reopened == [("GH-1", "open")]
-    # The reopen is fenced on the snapshot's claim identity, so a fresh read
-    # naming another claimer/session/host (the backend checks it under the
-    # body lock) leaves the claim alone.
-    assert fences == [{k: local.get(k) for k in lv.liveness._CLAIM_KEYS}]
-    assert fences[0]["claimed_by"] == "becky-1" and \
-        fences[0]["claimed_machine"] == lv.q.machine_tag()
+    assert lv.liveness._owner_route_key(local) != lv.liveness._owner_route_key(item)
+    assert lv.workers.requeue_orphaned_tickets(grace_s=0) == []
+    assert reopened == [] and fences == [] and len(lv.routes) == 1
+    route = lv.routes[0]
+    assert route["project"] == "OPS" and "Claim recovery: GH-1" in route["title"]
+    assert route["dedupe_key"] == lv.liveness._owner_route_key(local) + "#1"
+    assert "wt release GH-1`" in route["text"] and "becky-1" in route["text"]
+    # One open request per claim: the next sweep files nothing more.
+    opened = {"ref": "OPS-1", "project": "OPS", "status": "open",
+              "dedupe_key": route["dedupe_key"]}
+    monkeypatch.setattr(lv.q, "list_items", lambda *a, **k: [dict(local), dict(opened)])
+    assert lv.workers.requeue_orphaned_tickets(grace_s=0) == [] and len(lv.routes) == 1
 
 
 def test_foreign_claim_without_any_heartbeat_never_asks_a_human(lv, monkeypatch):
@@ -1032,32 +1054,32 @@ def test_fresh_heartbeat_beats_an_old_ticket_clock(lv, monkeypatch):
 
 
 def _local_quiet(lv, monkeypatch, now):
-    """A GitHub claim held HERE whose bound session went quiet: the owning
-    host's own escalation, the one path that still blocks a GitHub claim."""
+    """A GitHub claim held HERE whose bound session went quiet."""
     item = _gh_legacy(lv, monkeypatch)[0]
     _hosted_thread(lv, monkeypatch, "becky-1", SID2, LATER, now)
     return item
 
 
-def test_block_carries_the_fresh_read_as_its_write_fence(lv, monkeypatch):
-    """The fresh read's claim fields go to q.block as ``expect``, so the
-    backend re-checks them under its body lock right before writing."""
+def test_local_quiet_github_claim_routes_and_never_blocks(lv, monkeypatch):
+    """WT-39: even on the owning host the backstop does not block a GitHub
+    claim (a block is a whole-body write GitHub cannot condition on the claim
+    it read); it routes one recovery request and writes nothing on the claim."""
     now = time.time() + LATER
-    _local_quiet(lv, monkeypatch, now)
-    seen = []
-    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: seen.append(k) or {"ref": ref})
-    assert [a["result"] for a in _sweep(lv)] == ["done"]
-    exp = seen[0]["expect"]
-    assert exp["claimed_by"] == "becky-1" and exp["claimed_session_id"] == SID2
-    assert exp["claimed_machine"] == lv.q.machine_tag() and exp["claim_heartbeat"] is None
-    assert exp["status"] == "in_progress" and not exp.get("needs_input")
+    item = _local_quiet(lv, monkeypatch, now)
+    blocks = []
+    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: blocks.append(k) or {"ref": ref})
+    acted = _sweep(lv)
+    assert [(a["action"], a["result"]) for a in acted] == [("route_owner_host", "done")]
+    assert blocks == [] and len(lv.routes) == 1
+    assert lv.routes[0]["dedupe_key"] == lv.liveness._owner_route_key(item) + "#1"
 
 
-def test_block_race_at_the_write_is_reported_not_retried_as_done(lv, monkeypatch):
+def test_local_route_rechecks_the_fresh_issue_first(lv, monkeypatch):
     now = time.time() + LATER
-    _local_quiet(lv, monkeypatch, now)
-    monkeypatch.setattr(lv.q, "block", lambda ref, sid="", **k: None)   # fence tripped
-    assert [a["result"] for a in _sweep(lv)] == ["race"]
+    item = _local_quiet(lv, monkeypatch, now)
+    monkeypatch.setattr(lv.q, "get", lambda ref: dict(item, claimed_by="someone-else"))
+    assert [a["result"].split(" ")[0] for a in _sweep(lv)] == ["race"]
+    assert lv.routes == []
 
 
 INCIDENT_NOW = 1793267276.0   # 2026-10-29T09:47:56Z, BECKY-2966's false escalation

@@ -3954,17 +3954,21 @@ def test_orphan_reopen_fence_still_reopens_the_unchanged_dead_claim(tmp_path, mo
     assert after["status"] == "open" and not after.get("claimed_by")
 
 
-@pytest.mark.parametrize("taken_since", [True, False])
-def test_orphan_sweep_real_path_spares_a_live_claim_taken_since(
+@pytest.mark.parametrize("taken_since", [None, "before_sweep", "in_flight"])
+def test_orphan_sweep_real_path_never_reopens_a_github_claim(
         tmp_path, monkeypatch, taken_since):
-    """WT-39 verifier replay on the real path (requeue_orphaned_tickets ->
-    queue.update_status -> GitHubIssuesBackend.update_status): the sweep's
-    list snapshot shows this host's dead worker, but the issue now holds a
-    live claim on another host. Nothing is written. Control: the unchanged
-    dead claim is still reopened."""
+    """WT-39 verify:3 replay on the real path (workers.requeue_orphaned_tickets
+    with the real queue and GitHubIssuesBackend over fake gh). The sweep's
+    list snapshot shows this host's dead worker. ``in_flight`` is the
+    verifier's witness: another host takes the claim over after every read
+    the sweep makes, right before it would write. GitHub edits take no
+    precondition, so the sweep makes no write at all on a GitHub claim: the
+    ORIGINAL _edit_body is never reached, the issue keeps whatever claim it
+    holds, and one bounded recovery request goes to this host's OPS lane."""
     import subprocess
 
     import watchtower.workers as workers
+    from watchtower import github_backend
 
     state, q, snap, _ = _orphan_snapshot(tmp_path, monkeypatch)
     dead = subprocess.Popen(["true"])
@@ -3972,25 +3976,55 @@ def test_orphan_sweep_real_path_spares_a_live_claim_taken_since(
     workers.record_worker(dead.pid, "GHI", "codex", "dead-local",
                           repo_path=str(tmp_path), session_id="old-sess")
     stale = q.list_items()
+    real_list = q.list_items
     monkeypatch.setattr(q, "list_items", lambda *a, **k: [dict(i) for i in stale])
-    if taken_since:
-        _rewrite_claim(state, snap, claimed_by="live-remote",
-                       claimed_session_id="live-sess", claimed_machine="owner-host")
+    edits = []
+    original = github_backend.GitHubIssuesBackend._edit_body
+
+    def spy(self, item, body, meta, *extra):
+        # The verifier's exact witness: the takeover lands right before the
+        # original whole-body write, after every read and fence.
+        if taken_since == "in_flight":
+            _rewrite_claim(state, snap, **takeover)
+        edits.append((item.get("ref"), extra))
+        return original(self, item, body, meta, *extra)
+    monkeypatch.setattr(github_backend.GitHubIssuesBackend, "_edit_body", spy)
+    takeover = dict(claimed_by="live-remote", claimed_session_id="live-sess",
+                    claimed_machine="owner-host")
+    if taken_since == "before_sweep":
+        _rewrite_claim(state, snap, **takeover)
+    real_enqueue = q.enqueue
+    filed = []
+
+    def enqueue(**kw):
+        if taken_since == "in_flight":       # or while the request is filed
+            _rewrite_claim(state, snap, **takeover)
+        filed.append(kw)
+        return real_enqueue(**kw)
+    monkeypatch.setattr(q, "enqueue", enqueue)
     before = json.loads(state.read_text())
     reopened = workers.requeue_orphaned_tickets(grace_s=0)
     after = json.loads(state.read_text())
-    if taken_since:
-        assert reopened == []
-        assert after["issues"] == before["issues"]
-        assert not [c for c in after["commands"][len(before["commands"]):]
-                    if c[:2] in (["issue", "edit"], ["issue", "comment"],
-                                 ["issue", "reopen"], ["issue", "close"])]
-        fresh = q.get("GHI-1")
-        assert (fresh["status"], fresh["claimed_by"], fresh["claimed_machine"]) == \
-            ("in_progress", "live-remote", "owner-host")
-    else:
-        assert [r["ref"] for r in reopened] == ["GHI-1"]
-        assert q.get("GHI-1")["status"] == "open"
+
+    assert reopened == [] and edits == []
+    assert not [c for c in after["commands"][len(before["commands"]):]
+                if c[:2] in (["issue", "edit"], ["issue", "comment"],
+                             ["issue", "reopen"], ["issue", "close"])]
+    fresh = q.get("GHI-1")
+    holder = (("live-remote", "live-sess", "owner-host") if taken_since
+              else ("dead-local", "old-sess", snap["claimed_machine"]))
+    assert fresh["status"] == "in_progress" and not fresh.get("needs_input")
+    assert (fresh["claimed_by"], fresh["claimed_session_id"], fresh["claimed_machine"]) == holder
+    assert after["issues"][0]["labels"] == before["issues"][0]["labels"]
+    assert any("in-progress" in label for label in after["issues"][0]["labels"])
+    # The snapshot decided on is the dead local claim; its request is filed
+    # once (the OPS lane is local, so it dedupes) and points at `wt release`.
+    assert len(filed) == 1 and filed[0]["dedupe_key"].endswith(":dead-local:old-sess:"
+                                                                 + str(snap["claimed_at"]) + "#1")
+    assert "wt release GHI-1`" in filed[0]["text"]
+    monkeypatch.setattr(q, "list_items", lambda *a, **k: [dict(i) for i in stale]
+                        + [i for i in real_list(project="OPS")])
+    assert workers.requeue_orphaned_tickets(grace_s=0) == [] and len(filed) == 1
 
 
 def test_update_status_expect_fence_on_a_local_queue(tmp_path, monkeypatch):
