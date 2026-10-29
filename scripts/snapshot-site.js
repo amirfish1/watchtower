@@ -2,7 +2,7 @@
 // Adapted from the CCC snapshot.js puppeteer pattern. Serves docs/ over a
 // throwaway localhost http server, then captures every page at desktop (1440)
 // and mobile (390) widths. Uses puppeteer or puppeteer-core from NODE_PATH, else
-// CCC's bundled copy. Set CHROME_PATH to pick a browser.
+// CCC's copy, else any ~/Apps/* checkout (or PUPPETEER_DIR) that has it installed. Set CHROME_PATH to pick a browser.
 //
 //   node scripts/snapshot-site.js                       (serve site/ locally)
 //   SITE_URL=https://watchtower.amirfish.ai node scripts/snapshot-site.js
@@ -18,11 +18,30 @@ const path = require('path');
 const os = require('os');
 
 const CCC = process.env.CCC_DIR || path.join(os.homedir(), 'Apps', 'claude-command-center');
-let puppeteer;
-for (const mod of ['puppeteer', 'puppeteer-core']) {
-  try { puppeteer = require(mod); break; } catch (_) {}
+
+// Resolve puppeteer: NODE_PATH, then CCC's require-puppeteer.js if it exists,
+// then any sibling checkout under ~/Apps (and PUPPETEER_DIR) that has it installed.
+function loadPuppeteer() {
+  for (const mod of ['puppeteer', 'puppeteer-core']) {
+    try { return require(mod); } catch (_) {}
+  }
+  const shim = path.join(CCC, 'require-puppeteer.js');
+  if (fs.existsSync(shim)) {
+    try { return require(shim); } catch (_) {}
+  }
+  const roots = [process.env.PUPPETEER_DIR].filter(Boolean);
+  const apps = path.join(os.homedir(), 'Apps');
+  try {
+    for (const d of fs.readdirSync(apps)) roots.push(path.join(apps, d));
+  } catch (_) {}
+  for (const root of roots) {
+    for (const mod of ['puppeteer', 'puppeteer-core']) {
+      try { return require(require.resolve(mod, { paths: [root] })); } catch (_) {}
+    }
+  }
+  throw new Error('puppeteer not found: set NODE_PATH or PUPPETEER_DIR to a directory whose node_modules has puppeteer or puppeteer-core');
 }
-if (!puppeteer) puppeteer = require(path.join(CCC, 'require-puppeteer.js'));
+const puppeteer = loadPuppeteer();
 
 const DOCS_DIR = path.resolve(__dirname, '..', 'site');
 const OUT_DIR = path.resolve(__dirname, '..', 'docs', 'site-proof', 'shots');

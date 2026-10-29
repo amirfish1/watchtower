@@ -27,7 +27,8 @@ file, `docs/site-proof/` (render proofs), and `scripts/snapshot-site.js`.
 ## Checks
 
 ```bash
-# puppeteer or puppeteer-core must resolve (NODE_PATH), or CCC's copy is used
+# puppeteer or puppeteer-core must resolve (NODE_PATH), else CCC's copy, else any
+# ~/Apps/* checkout or PUPPETEER_DIR with it installed
 node scripts/snapshot-site.js                         # serves site/, shots to docs/site-proof/shots/
 SITE_URL=https://watchtower.amirfish.ai node scripts/snapshot-site.js   # check the live URL
 ```
