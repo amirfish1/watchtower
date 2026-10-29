@@ -43,27 +43,63 @@ def load():
 
 
 def save(data):
-    state_path.write_text(json.dumps(data, indent=2))
+    # Atomic: concurrent fake gh processes must never read a half-written
+    # file (an empty read crashed a concurrent-planner test's thread).
+    tmp = state_path.with_name(f"{state_path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, state_path)
+
+
+# The option grammar real gh (cobra/pflag) applies to the commands WatchTower
+# runs: these flags take a value (the next token, or --flag=value) whatever
+# that value looks like, so a title of "--body" is a title; "--" ends options.
+VALUE_FLAGS = {
+    "--repo", "-R", "--title", "--body", "-b", "--body-file", "-F",
+    "--label", "-l", "--add-label", "--remove-label", "--add-assignee",
+    "--remove-assignee", "--assignee", "-a", "--json", "--state", "-s",
+    "--comment", "-c", "--reason", "-r", "--limit", "-L", "--search", "-S",
+    "--jq", "-q", "-H", "--header", "-f", "--field", "--raw-field", "-X",
+    "--method", "--duplicate-of",
+}
+
+
+def parse(args):
+    """[(flag, value, start_index, token_count)] plus positionals."""
+    flags, positional, i = [], [], 0
+    while i < len(args):
+        a = args[i]
+        if a == "--":
+            positional.extend(args[i + 1:])
+            break
+        name, eq, val = a.partition("=")
+        if a.startswith("-") and eq and name in VALUE_FLAGS:
+            flags.append((name, val, i, 1))
+            i += 1
+        elif a in VALUE_FLAGS and i + 1 < len(args):
+            flags.append((a, args[i + 1], i, 2))
+            i += 2
+        elif a.startswith("-") and len(a) > 1:
+            flags.append((a, None, i, 1))
+            i += 1
+        else:
+            positional.append(a)
+            i += 1
+    return flags, positional
+
+
+def has(args, name):
+    return any(f == name for f, _, _, _ in parse(args)[0])
 
 
 def opt(args, name, default=""):
-    if name in args:
-        i = args.index(name)
-        if i + 1 < len(args):
-            return args[i + 1]
+    for f, v, _, _ in parse(args)[0]:
+        if f == name and v is not None:
+            return v
     return default
 
 
 def opts(args, name):
-    out = []
-    i = 0
-    while i < len(args):
-        if args[i] == name and i + 1 < len(args):
-            out.append(args[i + 1])
-            i += 2
-        else:
-            i += 1
-    return out
+    return [v for f, v, _, _ in parse(args)[0] if f == name and v is not None]
 
 
 def issue_by_number(data, number):
@@ -94,13 +130,13 @@ def project_fields(issue):
 
 data = load()
 args = sys.argv[1:]
-if "--body-file" in args:
-    # Real gh reads the body from the file ("-" is stdin); fold it back into
-    # `--body` so the handlers and recorded commands below see one shape.
-    i = args.index("--body-file")
-    src = args[i + 1]
-    raw = sys.stdin.buffer.read() if src == "-" else Path(src).read_bytes()
-    args = [*args[:i], "--body", raw.decode("utf-8"), *args[i + 2:]]
+for _f, _src, _i, _n in parse(args)[0]:
+    if _f in ("--body-file", "-F"):
+        # Real gh reads the body from the file ("-" is stdin); fold it back
+        # into `--body` so the handlers and recorded commands see one shape.
+        raw = sys.stdin.buffer.read() if _src == "-" else Path(_src).read_bytes()
+        args = [*args[:_i], "--body", raw.decode("utf-8"), *args[_i + _n:]]
+        break
 data["commands"].append(args)
 
 # FAKE_GH_FAIL="issue comment=fail|ratelimit|auth_once|hang|lost|unknown"
@@ -118,7 +154,7 @@ if (_verb and " ".join(args[:2]) == _verb
     if _mode == "hang":
         time.sleep(30)
     if _mode == "fail":
-        if args[:2] == ["issue", "close"] and "--comment" in args:
+        if args[:2] == ["issue", "close"] and has(args, "--comment"):
             # Real gh posts --comment on an OPEN issue BEFORE the close
             # mutation, so a failed close leaves the comment behind.
             issue = issue_by_number(data, args[2])
@@ -225,9 +261,9 @@ if args[:2] == ["issue", "edit"]:
     for label in opts(args, "--remove-label"):
         if label in issue["labels"]:
             issue["labels"].remove(label)
-    if "--title" in args:
+    if has(args, "--title"):
         issue["title"] = opt(args, "--title")
-    if "--body" in args:
+    if has(args, "--body"):
         issue["body"] = opt(args, "--body")
     issue["updatedAt"] = now()
     save(data)
@@ -286,6 +322,15 @@ print("unsupported fake gh command: " + " ".join(args), file=sys.stderr)
 save(data)
 sys.exit(2)
 '''
+
+
+_FAKE_NS: dict = {}
+exec(FAKE_GH[FAKE_GH.index("VALUE_FLAGS"):FAKE_GH.index("def issue_by_number")], _FAKE_NS)
+
+
+def _fake_opt(args, name):
+    """Read a recorded fake-gh command with the fake's own gh option parser."""
+    return _FAKE_NS["opt"](args, name)
 
 
 @pytest.fixture(autouse=True)
@@ -3874,7 +3919,7 @@ def test_github_close_resolution_auth_heal_resends_then_closes(tmp_path, monkeyp
     expected = github_backend._resolution_comment(closed["resolution"])
     comments = _cmds(state, "comment")
     assert len(comments) == 2, "one auth-heal retry, as before"
-    assert [c[c.index("--body") + 1] for c in comments] == [expected, expected]
+    assert [_fake_opt(c, "--body") for c in comments] == [expected, expected]
     issue = json.loads(state.read_text())["issues"][0]
     assert [c["body"] for c in issue["comments"]] == [expected]
     assert issue["state"] == "CLOSED"

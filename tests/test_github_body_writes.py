@@ -64,7 +64,7 @@ def _remote_writer(monkeypatch, backend, state, mutate):
 
     def run(self, args, **kw):
         stale = None
-        if args[:2] == ["issue", "edit"] and "--body" in args and not fired:
+        if args[:2] == ["issue", "edit"] and kw.get("body") is not None and not fired:
             stale = next(i for i in json.loads(state.read_text())["issues"]
                          if str(i["number"]) == str(args[2]))["body"]
         out = real_run(self, args, **kw)

@@ -36,11 +36,27 @@ args = sys.argv[1:]
 tag = str(os.getpid())
 with open(os.path.join(out, tag + ".json"), "w") as fh:
     json.dump({"argv": args}, fh)
+# gh's option grammar for these commands: value flags consume the next
+# token whatever it looks like ("--title --body" is a title); "--" ends options.
+VALUE = {"--repo", "--title", "--body", "--body-file", "-F", "--label",
+         "--add-label", "--remove-label", "--json", "--comment"}
+opts, i = {}, 0
+while i < len(args):
+    a = args[i]
+    if a == "--":
+        break
+    if a in VALUE and i + 1 < len(args):
+        opts.setdefault(a, []).append(args[i + 1])
+        i += 2
+    else:
+        i += 1
+with open(os.path.join(out, tag + ".opts.json"), "w") as fh:
+    json.dump(opts, fh)
 if mode == "hang":
     time.sleep(30)  # never reads stdin; the parent's timeout must still fire
 body = None
-if "--body-file" in args:
-    src = args[args.index("--body-file") + 1]
+if "--body-file" in opts:
+    src = opts["--body-file"][-1]
     body = sys.stdin.buffer.read() if src == "-" else open(src, "rb").read()
     with open(os.path.join(out, tag + ".body"), "wb") as fh:
         fh.write(body)
@@ -109,8 +125,9 @@ def gh(tmp_path, monkeypatch):
         @staticmethod
         def calls():
             recs = []
-            for f in sorted(out.glob("*.json")):
+            for f in sorted(out.glob("*[0-9].json")):
                 rec = json.loads(f.read_text())
+                rec["opts"] = json.loads(f.with_suffix(".opts.json").read_text())
                 body = f.with_suffix(".body")
                 rec["body"] = body.read_bytes() if body.exists() else None
                 rec["pid"] = int(f.stem)
@@ -146,7 +163,7 @@ def test_body_over_the_single_argument_limit_reaches_gh_byte_exact(gh, backend, 
     for verb in (["issue", "edit", "12"], ["issue", "comment", "12"], ["issue", "create"]):
         for f in gh.out_dir.iterdir():
             f.unlink()
-        backend._run([*verb, "--repo", REPO, "--title", "T é", "--body", big])
+        backend._run([*verb, "--repo", REPO, "--title", "T é"], body=big)
         (call,) = gh.calls()
         assert call["body"] == big.encode("utf-8"), verb
         assert big not in call["argv"]
@@ -167,18 +184,18 @@ def test_edit_body_round_trip_keeps_extra_args_and_full_history(gh, backend):
     assert sent == github_backend._body_with_metadata(history, {"status": "open"})
     assert history.rstrip() in sent  # _body_with_metadata trims the tail itself
     assert edits[0]["argv"] == ["issue", "edit", "12", "--repo", REPO,
-                                "--body-file", "-", "--title", "New"]
+                                "--title", "New", "--body-file", "-"]
 
 
 def test_short_body_uses_the_same_transport(gh, backend):
-    backend._run(["issue", "comment", "3", "--repo", REPO, "--body", "ok"])
+    backend._run(["issue", "comment", "3", "--repo", REPO], body="ok")
     (call,) = gh.calls()
     assert call["body"] == b"ok"
     assert call["argv"] == ["issue", "comment", "3", "--repo", REPO, "--body-file", "-"]
 
 
 def test_empty_body_is_sent_not_dropped(gh, backend):
-    backend._run(["issue", "edit", "3", "--repo", REPO, "--body", ""])
+    backend._run(["issue", "edit", "3", "--repo", REPO], body="")
     (call,) = gh.calls()
     assert call["body"] == b""
 
@@ -198,7 +215,7 @@ def test_concurrent_writes_each_deliver_their_own_body(gh, backend):
 
     def write(i):
         try:
-            backend._run(["issue", "comment", str(i), "--repo", REPO, "--body", bodies[i]])
+            backend._run(["issue", "comment", str(i), "--repo", REPO], body=bodies[i])
         except Exception as exc:  # pragma: no cover - surfaced below
             errors.append(exc)
 
@@ -216,7 +233,7 @@ def test_failure_raises_without_echoing_the_body(gh, backend, monkeypatch):
     monkeypatch.setenv("FAKE_GH_MODE", "fail")
     secretish = "BODY-CONTENT-" + "x" * (_arg_limit() + 10)
     with pytest.raises(github_backend.GitHubBackendError) as exc:
-        backend._run(["issue", "edit", "4", "--repo", REPO, "--body", secretish])
+        backend._run(["issue", "edit", "4", "--repo", REPO], body=secretish)
     msg = str(exc.value)
     assert "HTTP 422" in msg and "--body-file -" in msg
     assert "BODY-CONTENT" not in msg
@@ -229,7 +246,7 @@ def test_rate_limit_failure_still_recorded(gh, backend, monkeypatch):
     seen = []
     monkeypatch.setattr(github_backend, "_record_gh_rate_limited", seen.append)
     with pytest.raises(github_backend.GitHubBackendError):
-        backend._run(["issue", "comment", "4", "--repo", REPO, "--body", "hi"])
+        backend._run(["issue", "comment", "4", "--repo", REPO], body="hi")
     assert seen and "rate limit" in seen[0]
 
 
@@ -237,7 +254,7 @@ def test_auth_heal_retry_resends_the_full_body(gh, backend, monkeypatch):
     monkeypatch.setenv("FAKE_GH_MODE", "auth_once")
     monkeypatch.setattr(github_backend, "_attempt_auth_self_heal", lambda: True)
     big = _tricky(_arg_limit() + 1)
-    backend._run(["issue", "edit", "5", "--repo", REPO, "--body", big])
+    backend._run(["issue", "edit", "5", "--repo", REPO], body=big)
     calls = gh.calls()
     assert len(calls) == 2
     assert [c["body"] for c in calls] == [big.encode("utf-8")] * 2
@@ -258,7 +275,7 @@ def test_timeout_is_bounded_kills_gh_and_hides_the_body(gh, backend, monkeypatch
     monkeypatch.setattr(github_backend.subprocess, "run", short_run)
     big = "SECRET-" + _tricky(_arg_limit())
     with pytest.raises(github_backend.GitHubBackendError) as exc:
-        backend._run(["issue", "edit", "6", "--repo", REPO, "--body", big])
+        backend._run(["issue", "edit", "6", "--repo", REPO], body=big)
     assert seen_timeout == [60], "the production bound is unchanged"
     assert "timed out" in str(exc.value)
     assert "SECRET-" not in str(exc.value)
@@ -267,10 +284,82 @@ def test_timeout_is_bounded_kills_gh_and_hides_the_body(gh, backend, monkeypatch
         os.kill(call["pid"], 0)
 
 
-def test_body_via_stdin_only_rewrites_issue_body_writes():
-    f = github_backend._body_via_stdin
-    assert f(["issue", "edit", "1", "--body", "b", "--title", "t"]) == (
-        ["issue", "edit", "1", "--body-file", "-", "--title", "t"], "b")
-    assert f(["issue", "list", "--body", "b"]) == (["issue", "list", "--body", "b"], None)
-    assert f(["api", "-i", "x"]) == (["api", "-i", "x"], None)
-    assert f(["issue", "edit", "1", "--body"]) == (["issue", "edit", "1", "--body"], None)
+
+
+# Values that look like gh flags. gh's parser gives each one to the option
+# before it, so it must reach gh verbatim and must never move the body.
+_FLAG_SHAPED = ["--body", "--body-file", "-F", "-b", "--body=x", "--", "-", "--repo"]
+_SENTINEL = "PRIVATE-BODY-SENTINEL"
+
+
+def test_body_flags_on_argv_are_refused_not_rewritten(gh, backend):
+    """The body is a separate parameter: no argv token is searched for or
+    rewritten, and a caller that puts a body flag on argv is refused."""
+    for bad in (["issue", "edit", "1", "--body", "x"], ["issue", "edit", "1", "-F", "f"],
+                ["issue", "edit", "1", "--body=x"], ["issue", "edit", "1", "--"]):
+        with pytest.raises(github_backend.GitHubBackendError) as exc:
+            backend._run(bad, body=_SENTINEL)
+        assert _SENTINEL not in str(exc.value)
+    assert gh.calls() == [], "refused before gh was spawned"
+
+
+@pytest.mark.parametrize("title", _FLAG_SHAPED + ["normal title é"])
+@pytest.mark.parametrize("size", ["empty", "short", "oversized"])
+def test_enqueue_with_flag_shaped_title_keeps_title_and_body(gh, backend, monkeypatch, title, size):
+    """Verifier witness (WT-40 verify:4): enqueue(title='--body') turned the
+    title into --body-file and left the generated body on argv."""
+    monkeypatch.setattr(backend, "_ensure_labels", lambda: None)
+    monkeypatch.setattr(backend, "get", lambda ident: {"number": 7})
+    # Within enqueue's own clipping bounds (note 4000, text 24000 chars).
+    text = {"empty": "", "short": f"{_SENTINEL} t \"q\"\r\n",
+            "oversized": _SENTINEL + "\U0001F600" * 23000}[size]
+    note = f"{_SENTINEL} n" if size != "oversized" else _SENTINEL + "\U0001F600" * 3970
+
+    backend.enqueue(title=title, note=note, text=text)
+
+    (call,) = gh.calls()
+    assert call["opts"]["--title"] == [title]
+    assert call["opts"]["--body-file"] == ["-"]
+    assert "--body" not in call["opts"]
+    assert call["argv"][:2] == ["issue", "create"]
+    sent = call["body"].decode("utf-8")
+    assert sent == github_backend._body_with_metadata(text or note, _sent_meta(sent))
+    assert not any(_SENTINEL in a for a in call["argv"]), "no body or note text on argv"
+    if size == "oversized":
+        assert len(call["body"]) > _arg_limit()
+
+
+def _sent_meta(sent):
+    return github_backend._split_body(sent)[1]
+
+
+@pytest.mark.parametrize("title", _FLAG_SHAPED)
+def test_failure_diagnostics_never_show_body_note_or_title(gh, backend, monkeypatch, title):
+    monkeypatch.setattr(backend, "_ensure_labels", lambda: None)
+    monkeypatch.setenv("FAKE_GH_MODE", "fail")
+    with pytest.raises(github_backend.GitHubBackendError) as exc:
+        backend.enqueue(title=title + _SENTINEL, note=f"{_SENTINEL} note",
+                        text=f"{_SENTINEL} body")
+    msg = str(exc.value)
+    assert "HTTP 422" in msg and "--body-file -" in msg
+    assert _SENTINEL not in msg
+    assert f"<text:{len(title + _SENTINEL)} chars>" in msg
+
+
+def test_timeout_diagnostics_hide_title_and_body(gh, backend, monkeypatch):
+    monkeypatch.setenv("FAKE_GH_MODE", "hang")
+    real_run = subprocess.run
+    monkeypatch.setattr(github_backend.subprocess, "run",
+                        lambda *a, **k: real_run(*a, **{**k, "timeout": 1.5}))
+    with pytest.raises(github_backend.GitHubBackendError) as exc:
+        backend._run(["issue", "edit", "6", "--repo", REPO, "--title",
+                      github_backend._Text(_SENTINEL)], body=_SENTINEL)
+    assert "timed out" in str(exc.value) and _SENTINEL not in str(exc.value)
+
+
+def test_update_with_flag_shaped_title_edits_both_exactly(gh, backend):
+    item = {"number": 12, "_github_body": "", "text": ""}
+    backend._edit_body(item, "body é", {}, "--title", github_backend._Text("--body"))
+    edit = next(c for c in gh.calls() if c["argv"][:2] == ["issue", "edit"])
+    assert edit["opts"]["--title"] == ["--body"]
+    assert edit["body"].decode("utf-8") == github_backend._body_with_metadata("body é", {})
