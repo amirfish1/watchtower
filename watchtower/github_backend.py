@@ -1152,6 +1152,24 @@ def _parse_iso(value: Any) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+_CLAIM_META_KEYS = frozenset({
+    "claimed_by", "claimed_machine", "claimed_at", "claimed_session_id",
+    "claim_heartbeat",
+})
+
+
+def _claim_predates_close(meta: Dict[str, Any]) -> bool:
+    """True when ``meta`` records a close no later claim followed. Every claim
+    stamps a fresh ``claimed_at``; close keeps the claimant for attribution."""
+    if not meta.get("claimed_by"):
+        return False
+    closed = _parse_iso(meta.get("closed_at"))
+    if closed is None:
+        return False
+    claimed = _parse_iso(meta.get("claimed_at"))
+    return claimed is None or claimed <= closed
+
+
 def _defer_live(until: Any) -> bool:
     parsed = _parse_iso(until) if until else None
     return parsed is not None and parsed.timestamp() > time.time()
@@ -1962,6 +1980,11 @@ class GitHubIssuesBackend:
         # meta is read-only here: the two containers that reach the item are
         # copied below, so the memoized parse can be shared across queues.
         body, meta = _split_body_shared(str(issue.get("body") or ""))
+        if state != "CLOSED" and _claim_predates_close(meta):
+            # Reopened outside wt (a batcher's raw `gh issue reopen`, the
+            # GitHub UI): the claim belongs to the run the close ended, so the
+            # issue is open and unclaimed, not an orphan to recover (WT-42).
+            meta = {k: v for k, v in meta.items() if k not in _CLAIM_META_KEYS}
         text = _issue_text(body, meta.get("note"), issue.get("title"), issue.get("comments"))
         labels = _label_names(issue.get("labels"))
         assignees = _assignee_logins(issue.get("assignees"))
@@ -3019,6 +3042,10 @@ class GitHubIssuesBackend:
                     raise ValueError(f"{ref} {state} on {blocker}")
             number = str(item["number"])
             body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+            # A fresh claim on an issue reopened outside wt drops the ended
+            # run's claim and close stamps instead of inheriting them (WT-42).
+            for key in (*_CLAIM_META_KEYS, "closed_at"):
+                meta.pop(key, None)
             meta.update({
                 "claimed_by": str(session_id),
                 "claimed_machine": machine_tag(),

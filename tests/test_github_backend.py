@@ -4121,3 +4121,57 @@ def test_update_status_expect_fence_on_a_local_queue(tmp_path, monkeypatch):
                            expect={"claimed_by": snap["claimed_by"],
                                    "claimed_session_id": snap.get("claimed_session_id")})
     assert q.get(item["ref"])["status"] == "open"
+
+
+def test_external_reopen_after_close_reads_open_and_unclaimed(tmp_path, monkeypatch):
+    """WT-42: a batcher's raw `gh issue reopen` (ADS-32) left the closed run's
+    claimed_by in the body, so wt read the reopened issue as in_progress and
+    the orphan sweep filed a spurious OPS claim recovery. A claim no later
+    than the recorded close is the ended run's, not a live one."""
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+
+    item = q.enqueue(project="GHI", note="recurring batch", source="test")
+    q.claim_by_ref(item["ref"], "worker-1", session_uuid="old-session")
+    closed = q.close(item["ref"], "worker-1", resolution={"summary": "done"})
+    assert closed["status"] == "closed"
+    assert closed["closed_by"] == "worker-1"
+
+    # Reopen outside wt: only the issue state flips; the body is untouched.
+    gh_state = json.loads(state.read_text())
+    gh_state["issues"][0]["state"] = "OPEN"
+    state.write_text(json.dumps(gh_state))
+
+    reopened = q.get(item["ref"])
+    assert reopened["status"] == "open"
+    assert reopened["claimed_by"] is None
+    assert reopened["claimed_session_id"] is None
+    assert reopened["claimed_at"] is None
+    assert item["ref"] not in {i["ref"] for i in q.list_items(project="GHI", status="in_progress")}
+
+    # The next claim is a fresh run, even within the close's second, and
+    # inherits none of the ended run's identity.
+    claimed = q.claim_next("worker-2", project="GHI")
+    assert claimed["ref"] == item["ref"]
+    assert claimed["status"] == "in_progress"
+    assert claimed["claimed_by"] == "worker-2"
+    assert claimed["claimed_session_id"] is None
+    again = q.get(item["ref"])
+    assert again["status"] == "in_progress"
+    assert again["claimed_by"] == "worker-2"
+
+
+def test_claim_after_close_metadata_still_counts_when_later(tmp_path, monkeypatch):
+    """WT-42 guard: only a claim at or before the close is stale."""
+    from watchtower import github_backend
+    meta = {"claimed_by": "w", "claimed_at": "2026-10-29T16:41:00Z",
+            "closed_at": "2026-10-29T15:34:00Z"}
+    assert not github_backend._claim_predates_close(meta)
+    assert github_backend._claim_predates_close({**meta, "claimed_at": "2026-10-29T15:00:00Z"})
+    assert github_backend._claim_predates_close({**meta, "claimed_at": "2026-10-29T15:34:00Z"})
+    assert github_backend._claim_predates_close({"claimed_by": "w", "closed_at": "2026-10-29T15:34:00Z"})
+    assert not github_backend._claim_predates_close({"claimed_by": "w", "claimed_at": "2026-10-29T15:00:00Z"})
+    assert not github_backend._claim_predates_close({"closed_at": "2026-10-29T15:34:00Z"})
