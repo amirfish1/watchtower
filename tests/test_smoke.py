@@ -1447,6 +1447,26 @@ def test_cli_close_rejects_untracked_follow_ups(store, capsys):
         ]) == 0
 
 
+def test_cli_close_accepts_underscore_queue_refs(store, capsys):
+    """Queue names may contain "_" (OPS-218: IOS_US-12 in a follow-up was
+    rejected as citing no ticket); a bare queue name still is."""
+    import watchtower.queue as q
+    from watchtower.cli import main
+
+    q.enqueue(project="IOS_US", note="evidence")
+    q.enqueue(project="IOS_US", note="repair")
+    assert main([
+        "close", "IOS_US-1", "--summary", "done", "--no-code",
+        "--follow-up", "IOS_US must repair the build",
+    ]) == 1
+    assert q.get("IOS_US-1")["status"] != "closed"
+    assert main([
+        "close", "IOS_US-1", "--summary", "done", "--no-code",
+        "--follow-up", "IOS_US-2 must repair the build",
+    ]) == 0
+    assert q.get("IOS_US-1")["status"] == "closed"
+
+
 def test_cli_close_enqueue_follow_ups(store, capsys):
     """--enqueue-follow-ups files each follow-up/unresolved as a new ticket."""
     import watchtower.queue as q

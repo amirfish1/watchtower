@@ -2293,8 +2293,8 @@ def _assess_new(args: argparse.Namespace) -> int:
 
 
 # A ticket ref inside a follow-up/unresolved entry: BECKY-1625, OPS-12,
-# BECKY-DESIGN-7, or a GitHub-style #1625.
-_TICKET_REF_RE = re.compile(r"\b[A-Z][A-Z0-9]*(?:-[A-Z][A-Z0-9]*)*-\d+\b|#\d+\b")
+# BECKY-DESIGN-7, IOS_US-12 (_norm_project keeps "_"), or a GitHub-style #1625.
+_TICKET_REF_RE = re.compile(r"\b[A-Z][A-Z0-9_]*(?:-[A-Z][A-Z0-9_]*)*-\d+\b|#\d+\b")
 
 
 def _untracked_carry_items(args: argparse.Namespace) -> List[str]:
