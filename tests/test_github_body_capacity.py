@@ -188,7 +188,9 @@ def test_answer_that_cannot_fit_is_refused_before_any_write(tmp_path, monkeypatc
     post nothing, leave the block in place; the retry is refused the same way."""
     state, q, gb = _blocked(tmp_path, monkeypatch)
     monkeypatch.setenv("FAKE_GH_BODY_MAX", str(GITHUB_CAP))
-    _seed_legacy(state, gb, target=GITHUB_CAP - 2000, event="progress", commented=False)
+    # 400 bytes of headroom: a referenced answer entry needs more (WT-45's
+    # 300-char excerpt plus its ref/sha keys), so nothing but a move could fit it.
+    _seed_legacy(state, gb, target=GITHUB_CAP - 400, event="progress", commented=False)
     body_before = _issue(state)["body"]
     comments_before = len(_issue(state)["comments"])
     commands_before = len(json.loads(state.read_text())["commands"])
