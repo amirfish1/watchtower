@@ -407,3 +407,25 @@ def test_legacy_inline_history_reads_unchanged(tmp_path, monkeypatch):
     issue["body"] = gb._body_with_metadata(human, meta)
     state.write_text(json.dumps(data))
     assert q.get("GHI-1")["history"][:2] == legacy
+
+
+def test_compaction_never_grows_an_entry(tmp_path, monkeypatch):
+    """A mirrored question just over the excerpt length would grow by the
+    reference keys (~290 bytes); compaction leaves it inline."""
+    state, q, gb = _setup(tmp_path, monkeypatch)
+    data = json.loads(state.read_text())
+    issue = data["issues"][0]
+    human, meta = gb._split_body(issue["body"])
+    short = "s" * 450
+    meta["history"] = [{"event": "block", "at": "2026-10-01T00:00:01Z", "worker": "w9",
+                        "question": short}] + meta["history"]
+    issue["comments"].append({"author": {"login": "watchtower"},
+                              "url": f"{issue['url']}#issuecomment-801",
+                              "body": f"[watchtower] Needs input from w9:\n\n{short}"})
+    issue["body"] = gb._body_with_metadata(human, meta)
+    state.write_text(json.dumps(data))
+    monkeypatch.setattr(gb, "_ISSUE_BODY_BUDGET_BYTES", 10)
+    monkeypatch.setattr(gb, "_ISSUE_BODY_MAX_BYTES", 10 ** 6)
+    q.comment("GHI-1", "a note", by="worker", session_id="worker-1")
+    first = _meta(gb, state)["history"][0]
+    assert first["question"] == short and "question_ref" not in first
