@@ -1361,6 +1361,9 @@ _ISSUE_BODY_BUDGET_BYTES = 250000
 _COMMENT_MAX_CHARS = 65536
 # WT-45: 1000 left BECKY-2966's 59 referenced answers at 91 KB of excerpts.
 _HISTORY_TEXT_INLINE_MAX = 300
+# A reference costs ~290 bytes (excerpt suffix, ref, sha256, length), so a
+# text this short or shorter stays inline: referencing it would grow the body.
+_HISTORY_REF_MIN = 600
 _COMMENTED_EVENTS = ("answer", "comment")
 _ENTRY_MARKER = "\n\n<!-- watchtower-entry: {} -->"
 _ENTRY_MARKER_RE = re.compile(r"\n\n<!-- watchtower-entry: ([0-9a-f]{16}) -->\s*$")
@@ -1424,7 +1427,7 @@ def _referenced_text(entry: Dict[str, Any], text: str, ref: str,
     entry key holding the text (``question`` for a block, WT-45)."""
     if not text:
         return
-    if len(text) <= _HISTORY_TEXT_INLINE_MAX or not ref:
+    if len(text) <= _HISTORY_REF_MIN or not ref:
         entry[field] = text
         return
     head = text[:_HISTORY_TEXT_INLINE_MAX].rstrip()
@@ -1535,16 +1538,18 @@ def _compact_history(meta: Dict[str, Any], comments: List[Dict[str, Any]],
         else:
             text = str(entry.get(field) or "")
             ref = by_text.get(text, "")  # exact: a comment that differs at all is not this text
-        if len(text) <= _HISTORY_TEXT_INLINE_MAX or not ref:
+        if len(text) <= _HISTORY_REF_MIN or not ref:
             continue
         compact = {k: v for k, v in entry.items()
                    if k not in (field, f"{field}_len", f"{field}_sha256", f"{field}_ref")}
         _referenced_text(compact, text, ref, field)
-        if compact == entry:
-            continue
         # The metadata line is ASCII JSON (ensure_ascii), so the entry's
-        # serialized length change is the body's byte change.
-        size -= len(json.dumps(entry)) - len(json.dumps(compact))
+        # serialized length change is the body's byte change. Move only
+        # what shrinks (a heavily escaped short text can grow).
+        saved = len(json.dumps(entry)) - len(json.dumps(compact))
+        if saved <= 0:
+            continue
+        size -= saved
         hist[i] = compact
         moved += 1
     return moved
@@ -3081,7 +3086,7 @@ class GitHubIssuesBackend:
         movable = any(isinstance(e, dict) and e.get("event") in _REF_FIELD_BY_EVENT
                       and len(str(e.get(_REF_FIELD_BY_EVENT[e["event"]]) or ""))
                       > _HISTORY_TEXT_INLINE_MAX
-                      for e in hist)
+                      for e in hist)  # a WT-44 1,000-char excerpt counts: re-excerpt it
         moved = 0
         if movable:
             comments = item.get("_github_comments")
@@ -3818,7 +3823,7 @@ class GitHubIssuesBackend:
         one stays inline and posts nothing."""
         text = _clip(progress, 24000)
         key = ref = ""
-        if len(text) > _HISTORY_TEXT_INLINE_MAX:
+        if len(text) > _HISTORY_REF_MIN:
             key, ref = self._post_mirror(item, body, meta, "progress", text,
                                          _PROGRESS_COMMENT_PREFIX.format(session_id or "worker"))
         _append_history(meta, "progress", worker=str(session_id), entry_key=key)
