@@ -429,3 +429,163 @@ def test_compaction_never_grows_an_entry(tmp_path, monkeypatch):
     q.comment("GHI-1", "a note", by="worker", session_id="worker-1")
     first = _meta(gb, state)["history"][0]
     assert first["question"] == short and "question_ref" not in first
+
+
+# ------------------------------------------- correction cycle (root 13:03Z)
+def _all_comments_deleted(state):
+    data = json.loads(state.read_text())
+    data["issues"][0]["comments"] = []
+    state.write_text(json.dumps(data))
+
+
+def test_get_with_every_comment_deleted_marks_refs_unresolved(tmp_path, monkeypatch):
+    """A fetched empty comment list is not an omitted one: the referenced
+    text is missing, so the excerpt must be marked, never shown as the text."""
+    state, q, gb = _setup(tmp_path, monkeypatch)
+    progress = "P " + "p" * 1000
+    q.block("GHI-1", session_id="worker-1", question="Q " + "q" * 800, progress=progress)
+    _all_comments_deleted(state)
+    hist = q.get("GHI-1")["history"]
+    prog = [e for e in hist if e["event"] == "progress"][-1]
+    blk = [e for e in hist if e["event"] == "block"][-1]
+    assert prog["text_ref"] and prog["text_unresolved"] is True
+    assert blk["question_ref"] and blk["question_unresolved"] is True
+
+
+def test_list_then_get_does_not_reuse_the_comment_less_conversion(tmp_path, monkeypatch):
+    """The list path (comments omitted) must not memoize an item that a later
+    get() with a fetched-but-empty comment list then serves unmarked."""
+    state, q, gb = _setup(tmp_path, monkeypatch)
+    q.block("GHI-1", session_id="worker-1", question="Q " + "q" * 800,
+            progress="P " + "p" * 1000)
+    _all_comments_deleted(state)
+    backend = q._github_backend_for_project("GHI")
+    monkeypatch.setattr(backend, "grace_s", 0)
+    listed = backend._issue_to_item({k: v for k, v in _issue(state).items()
+                                     if k != "comments"})  # the list path's shape
+    assert not any(e.get("text_unresolved") for e in listed["history"])
+    prog = [e for e in backend.get("GHI-1")["history"] if e["event"] == "progress"][-1]
+    assert prog["text_unresolved"] is True
+
+
+def _near_cap(monkeypatch, gb, state, slack):
+    size = len(_issue(state)["body"].encode())
+    monkeypatch.setattr(gb, "_ISSUE_BODY_BUDGET_BYTES", size + slack)
+    monkeypatch.setattr(gb, "_ISSUE_BODY_MAX_BYTES", size + slack)
+    return size
+
+
+def test_shorter_question_replacing_a_long_one_near_the_cap_lands(tmp_path, monkeypatch):
+    """The preflight must judge the final body: replacing a 3,600-char live
+    question with 'ok?' shrinks it, so the block must not be refused."""
+    state, q, gb = _setup(tmp_path, monkeypatch)
+    q.block("GHI-1", session_id="worker-1", question="Q " + "q" * 3600)
+    _near_cap(monkeypatch, gb, state, 50)
+    q.block("GHI-1", session_id="worker-1", question="ok?")
+    meta = _meta(gb, state)
+    assert meta["block_question"] == "ok?"
+    assert [e["question"] for e in meta["history"] if e["event"] == "block"][-1] == "ok?"
+
+
+def test_block_that_cannot_fit_posts_no_comment(tmp_path, monkeypatch):
+    """The whole live question counts in the preflight: a block whose final
+    body is over the cap is refused before any mirror comment is posted."""
+    state, q, gb = _setup(tmp_path, monkeypatch)
+    _near_cap(monkeypatch, gb, state, 1500)
+    before = len(_issue(state)["comments"])
+    with pytest.raises(gb.GitHubBackendError, match="issue body would be"):
+        q.block("GHI-1", session_id="worker-1", question="Q " + "q" * 3500)
+    assert len(_issue(state)["comments"]) == before
+    assert not _meta(gb, state).get("needs_input")
+
+
+def test_defer_that_cannot_fit_posts_no_progress_comment(tmp_path, monkeypatch):
+    state, q, gb = _setup(tmp_path, monkeypatch)
+    backend = q._github_backend_for_project("GHI")
+    _near_cap(monkeypatch, gb, state, 1000)  # the progress entry fits; the reason does not
+    before = len(_issue(state)["comments"])
+    with pytest.raises(gb.GitHubBackendError, match="issue body would be"):
+        backend.defer("GHI-1", session_id="worker-1", until_iso="2999-01-01T00:00:00Z",
+                      reason="r" * 1500, progress="P " + "p" * 2000)
+    assert len(_issue(state)["comments"]) == before
+
+
+def test_defer_clearing_a_large_claim_near_the_cap_lands(tmp_path, monkeypatch):
+    """Clearing the claim frees bytes the preflight must count."""
+    state, q, gb = _setup(tmp_path, monkeypatch)
+    data = json.loads(state.read_text())
+    issue = data["issues"][0]
+    human, meta = gb._split_body(issue["body"])
+    meta["claimed_machine"] = "m" * 1200  # a bulky claim the defer removes
+    issue["body"] = gb._body_with_metadata(human, meta)
+    state.write_text(json.dumps(data))
+    backend = q._github_backend_for_project("GHI")
+    _near_cap(monkeypatch, gb, state, 50)
+    backend.defer("GHI-1", session_id="worker-1", until_iso="2999-01-01T00:00:00Z",
+                  reason="data", progress="P " + "p" * 2000)
+    meta = _meta(gb, state)
+    assert meta["deferred_until"] and "claimed_machine" not in meta
+    assert [e for e in meta["history"] if e["event"] == "progress"][-1]["text_ref"]
+
+
+def _wt44_entry(gb, text, ref, at, head):
+    entry = {"event": "comment", "at": at, "worker": "w"}
+    gb._referenced_text(entry, text, ref)
+    entry["text"] = f"{text[:head]} ... [{len(text)} chars; full text: {ref}]"
+    return entry
+
+
+def test_merge_keeps_fresh_smaller_excerpt_of_an_entry_ours_did_not_change(monkeypatch):
+    import watchtower.github_backend as gb
+    text, ref = "t" * 5000, "https://github.com/o/r/issues/1#issuecomment-9"
+    old = _wt44_entry(gb, text, ref, "2026-01-01T00:00:00Z", 1000)
+    small = _wt44_entry(gb, text, ref, "2026-01-01T00:00:00Z", 300)
+    mine = {"event": "comment", "at": "2026-01-02T00:00:00Z", "text": "ours"}
+    theirs = {"event": "comment", "at": "2026-01-02T00:00:01Z", "text": "theirs"}
+    body = lambda hist: gb._body_with_metadata("h", {"history": hist})  # noqa: E731
+    merged, conflicts = gb._merge_body_write(body([old]), body([old, mine]),
+                                             body([small, theirs]))
+    assert not conflicts
+    hist = gb._split_body(merged)[1]["history"]
+    assert hist[0] == small and hist[1:] == [theirs, mine]
+
+
+def test_merge_applies_our_shrinking_re_excerpt(monkeypatch):
+    import watchtower.github_backend as gb
+    text, ref = "t" * 5000, "https://github.com/o/r/issues/1#issuecomment-9"
+    old = _wt44_entry(gb, text, ref, "2026-01-01T00:00:00Z", 1000)
+    small = _wt44_entry(gb, text, ref, "2026-01-01T00:00:00Z", 300)
+    theirs = {"event": "comment", "at": "2026-01-02T00:00:01Z", "text": "theirs"}
+    body = lambda hist: gb._body_with_metadata("h", {"history": hist})  # noqa: E731
+    merged, _ = gb._merge_body_write(body([old]), body([small]), body([old, theirs]))
+    assert gb._split_body(merged)[1]["history"] == [small, theirs]
+
+
+def test_lost_mirror_response_still_records_the_entry_key(tmp_path, monkeypatch):
+    """A mirror comment that landed but whose response was lost leaves an
+    entry with its key, so the same words later get the next key and a
+    comment of their own instead of adopting the earlier one."""
+    state, q, gb = _setup(tmp_path, monkeypatch)
+    backend = q._github_backend_for_project("GHI")
+    real_run = type(backend)._run
+    lose = [True]
+
+    def run(self, args, **kw):
+        out = real_run(self, args, **kw)
+        if args[:2] == ["issue", "comment"] and lose:
+            lose.clear()
+            raise gb.GitHubBackendError("connection reset by peer")  # landed, reply lost
+        return out
+
+    monkeypatch.setattr(type(backend), "_run", run)
+    progress = "waiting on data " + "d" * 2000
+    backend.defer("GHI-1", session_id="worker-1", until_iso="2999-01-01T00:00:00Z",
+                  reason="data", progress=progress)
+    first = [e for e in _meta(gb, state)["history"] if e["event"] == "progress"][-1]
+    assert first.get("entry_key") and first["text"] == progress
+    backend.defer("GHI-1", session_id="worker-1", until_iso="2999-01-01T00:00:00Z",
+                  reason="data", progress=progress)
+    progs = [e for e in _meta(gb, state)["history"] if e["event"] == "progress"]
+    assert len(progs) == 2 and progs[0]["entry_key"] != progs[1]["entry_key"]
+    posted = _comments_with_text(state, gb, progress)
+    assert len(posted) == 2 and progs[1]["text_ref"] == posted[-1]["url"]
