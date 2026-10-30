@@ -270,6 +270,14 @@ if args[:2] == ["issue", "edit"]:
     if has(args, "--title"):
         issue["title"] = opt(args, "--title")
     if has(args, "--body"):
+        # FAKE_GH_BODY_MAX: GitHub's issue-body cap (WT-44), refused the way
+        # real gh reports it, before anything on the issue changes.
+        cap = int(os.environ.get("FAKE_GH_BODY_MAX") or 0)
+        if cap and len(opt(args, "--body").encode("utf-8")) > cap:
+            save(data)
+            print(f"failed to update {issue['url']}: GraphQL: Body is too long "
+                  "(updateIssue)\nfailed to update 1 issue", file=sys.stderr)
+            sys.exit(1)
         issue["body"] = opt(args, "--body")
     issue["updatedAt"] = now()
     save(data)
@@ -301,11 +309,13 @@ if args[:2] == ["issue", "close"]:
 if args[:2] == ["issue", "comment"]:
     issue = issue_by_number(data, target(args))
     body = opt(args, "--body")
+    url = f"{issue['url']}#issuecomment-{len(issue['comments']) + 1}"
     if body:
-        issue["comments"].append({"author": {"login": "watchtower"}, "body": body})
+        issue["comments"].append(
+            {"author": {"login": "watchtower"}, "body": body, "url": url})
     issue["updatedAt"] = now()
     save(data)
-    print(f"https://github.com/{opt(args, '--repo', 'owner/repo')}/issues/{issue['number']}#issuecomment-{len(issue['comments'])}")
+    print(url)
     sys.exit(0)
 
 if args[:2] == ["repo", "view"]:
@@ -332,6 +342,12 @@ sys.exit(2)
 
 _FAKE_NS: dict = {}
 exec(FAKE_GH[FAKE_GH.index("VALUE_FLAGS"):FAKE_GH.index("def issue_by_number")], _FAKE_NS)
+
+
+def _comment_text(comment):
+    """An issue comment's text without its WT-44 entry marker."""
+    from watchtower.github_backend import _strip_entry_marker
+    return _strip_entry_marker(str(comment.get("body") or ""))[0]
 
 
 def _fake_opt(args, name):
@@ -979,7 +995,7 @@ def test_github_backend_answer_posts_comment_and_keeps_claim_with_session(
     issue = json.loads(state.read_text())["issues"][0]
     assert "needs_input: false" in issue["body"]
     assert any(
-        isinstance(c, dict) and c.get("body") == "Go with A"
+        isinstance(c, dict) and _comment_text(c) == "Go with A"
         for c in issue["comments"]
     )
     assert any(
@@ -1041,7 +1057,7 @@ def test_github_backend_answer_releases_claim_without_session(tmp_path, monkeypa
     assert issue["state"] == "OPEN"
     assert "watchtower:in-progress" not in issue["labels"]
     assert any(
-        isinstance(c, dict) and c.get("body") == "Go with B"
+        isinstance(c, dict) and _comment_text(c) == "Go with B"
         for c in issue["comments"]
     )
 
@@ -1323,7 +1339,7 @@ def test_github_backend_comment_posts_issue_comment_and_records_history(
 
     issue = json.loads(state.read_text())["issues"][0]
     assert any(
-        isinstance(c, dict) and c.get("body") == "Heads up: checking dependencies."
+        isinstance(c, dict) and _comment_text(c) == "Heads up: checking dependencies."
         for c in issue["comments"]
     )
 
@@ -1367,7 +1383,7 @@ def test_cli_answer_and_comment_resolve_github_backed_refs(tmp_path, monkeypatch
 
     issue = json.loads(state.read_text())["issues"][0]
     assert any(
-        isinstance(c, dict) and c.get("body") == "Take path A"
+        isinstance(c, dict) and _comment_text(c) == "Take path A"
         for c in issue["comments"]
     )
 
@@ -3837,6 +3853,9 @@ def _oversized_close_setup(tmp_path, monkeypatch, kind="unicode"):
     q.enqueue(project="GHI", title="long close", note="n", text="b")
     q.claim_next("worker-1", project="GHI")
     import watchtower.github_backend as github_backend
+    # These prove the close-comment transport; the bodies they produce are
+    # past GitHub's own cap, which WT-44's pre-write guard would refuse.
+    monkeypatch.setattr(github_backend, "_ISSUE_BODY_MAX_BYTES", 1 << 30)
     return state, q, github_backend, {"summary": "done", "caveats": _OVERSIZED_CAVEATS[kind]}
 
 
