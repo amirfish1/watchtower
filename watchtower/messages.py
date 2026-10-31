@@ -872,8 +872,9 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
         "--resume", sid,
         "--input-format", "stream-json",
         "--output-format", "stream-json",
-        "--permission-mode", "bypassPermissions",
     ]
+    if not resolved.get("same_session"):
+        argv.extend(["--permission-mode", "bypassPermissions"])
     # Spawn in the session's own project directory: claude scopes --resume
     # lookups to the cwd's project bucket, so any other cwd fails the resume.
     cwd = _session_cwd_from_transcript(sid) or str(resolved.get("cwd") or "")
@@ -1324,7 +1325,7 @@ def _deliver_codex_app_server(resolved: Dict[str, Any], text: str) -> Dict[str, 
         return {"ok": False, "error": "codex_rpc module unavailable"}
     if not codex_rpc.is_available():
         return {"ok": False, "error": "codex binary not found"}
-    result = codex_rpc.deliver(sid, text)
+    result = codex_rpc.deliver(sid, text, **({"idle_only": True, "session_settings": resolved.get("session_settings") or {}} if resolved.get("same_session") else {}))
     if result.get("ok"):
         try:
             from . import codex_registry
@@ -1616,6 +1617,23 @@ def _delegate_payload(
     return payload
 
 
+_TAKEOVER_CAPABILITIES: Dict[str, Tuple[float, bool]] = {}
+
+
+def _takeover_delegate_capable(base: str) -> bool:
+    cached = _TAKEOVER_CAPABILITIES.get(base)
+    if cached and time.monotonic() - cached[0] < 30:
+        return cached[1]
+    try:
+        info = _get_json(base + "/api/takeover/capabilities", timeout_s=2) or {}
+        capable = (info.get("schema_version") == 1 and info.get("same_session") is True
+                   and info.get("no_queue") is True)
+    except Exception:
+        capable = False
+    _TAKEOVER_CAPABILITIES[base] = (time.monotonic(), capable)
+    return capable
+
+
 def _deliver_delegate(
     resolved: Dict[str, Any], text: str, mode: str, *,
     force_queue: bool = False, delegate_timeout_s: Optional[float] = None,
@@ -1627,10 +1645,17 @@ def _deliver_delegate(
     sid = str(resolved.get("session_id") or "")
     if not sid:
         return {"ok": False, "error": "delegate needs a session_id"}
+    payload = _delegate_payload(sid, text, mode, force_queue, resolved.get("attr"))
+    if resolved.get("same_session"):
+        # Opt in only after a compatible broker is deployed. An old broker
+        # could silently ignore fencing fields and queue/forward the effect.
+        if not _takeover_delegate_capable(base):
+            return {"ok": False, "error": "same-session delegate protocol unavailable"}
+        payload.update(same_session=True, no_queue=True, skip_wt=True, session_settings=resolved.get("session_settings") or {})
     try:
         data = _post_json(
             base + "/api/inject-input",
-            _delegate_payload(sid, text, mode, force_queue, resolved.get("attr")),
+            payload,
             timeout_s=_delegate_timeout_s(delegate_timeout_s),
         )
     except Exception as e:  # noqa: BLE001 - any transport failure means fall through
@@ -1644,6 +1669,8 @@ def _deliver_delegate(
         if code or detail:
             msg += " (" + ": ".join(x for x in (code, detail) if x) + ")"
         return {"ok": False, "error": msg}
+    if resolved.get("same_session") and (data.get("same_session") is not True or data.get("queued") or data.get("forwarded_to")):
+        return {"ok": False, "error": "delegate did not confirm same-session immediate delivery"}
     return {"ok": True, "transport": "delegate"}
 
 
@@ -2462,6 +2489,8 @@ def send(
     dedupe_key: str = "",
     ticket_gen: Optional[int] = None,
     start_new_if_needed: bool = False,
+    same_session: bool = False,
+    session_settings: Optional[Dict[str, Any]] = None,
     attr=None,
     _ledger_owned=False,
 ) -> Dict[str, Any]:
@@ -2501,6 +2530,9 @@ def send(
         if reserved.get("action") in ("queued", "in_flight"):
             return {"ok": False, "deduped": True, "queued": reserved["action"] == "queued", "in_flight": reserved["action"] == "in_flight", "id": reserved.get("msg_id"), "message_id": attr["message_id"], "attribution_v": 1}
     resolved["attr"] = attr
+    if same_session:
+        resolved["same_session"] = True
+        resolved["session_settings"] = dict(session_settings or {})
     if engine:
         resolved["engine"] = str(engine)
     # Only pass force_queue when it is actually set: `deliver` is monkeypatched

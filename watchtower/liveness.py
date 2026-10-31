@@ -1298,6 +1298,9 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
                            "queue": str(item.get("project") or ""), "row": "", "owner": "",
                            "proof": "", "verdict": "", "evidence": "", "idle_s": 0,
                            "action": "", "reason": ""}
+    if item.get("supervision"):
+        out.update(owner="takeover", verdict="retained", reason="Same-session supervision owns recovery")
+        return out
     try:
         row = row_of(item, by_ref, now)
     except (UndeclaredState, UnreachableState, UnclassifiedState) as exc:
@@ -1676,7 +1679,7 @@ def sweep(now: Optional[float] = None, only_ref: str = "") -> List[Dict[str, Any
 DELIVERIES_FILE: Optional[str] = None   # module override (tests); env wins
 DELIVERY_PRUNE_S = 24 * 3600.0
 DELIVERY_MAX_ROWS = 2000
-DELIVERY_PURPOSES = ("nudge", "release", "plan", "review", "answer", "stage_answer", "resume")
+DELIVERY_PURPOSES = ("nudge", "release", "plan", "review", "answer", "stage_answer", "resume", "takeover")
 # Engines whose transcript a receipt can read (receipts._transcript_stat).
 RECEIPT_ENGINES = ("claude", "codex")
 _LIVE_STATES = ("sending", "pending")
@@ -1692,7 +1695,7 @@ FAILED_SETTLE_GRACE_S = 30.0
 # (nonce + ledger); an advisory sender's result never feeds a ticket-state
 # write; the transport layer is the plumbing itself.
 VERIFIED_SENDERS = frozenset({
-    "answers._deliver", "cli._deliver_to_blocked_session", "workers._nudge_one",
+    "takeover.reconcile", "answers._deliver", "cli._deliver_to_blocked_session", "workers._nudge_one",
     "workers._deliver_release_instruction", "cli._plan_send", "queue._notify_review", "cli.cmd_plan", "cli._resume_rejected", "cli.cmd_reopen",
     "cli._deliver_answer", "cli.cmd_gate_ack",
 })

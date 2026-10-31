@@ -409,6 +409,7 @@ def deliver(
     text: str,
     cwd: Optional[str] = None,
     timeout: float = DEFAULT_TIMEOUT_S,
+    *, idle_only: bool = False, session_settings: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Deliver ``text`` into a codex thread: resume it, then steer an active
     turn if one is running, else start a fresh one.
@@ -424,10 +425,18 @@ def deliver(
     failure all come back as a plain failed result so ``messages.deliver`` can
     fall through to the next adapter (delegate or outbox)."""
     total_start = time.monotonic()
+    settings = dict(session_settings or {})
+    if idle_only and (not settings.get("model") or not settings.get("approval_policy")
+                      or (settings.get("sandbox_policy") or {}).get("type") not in
+                      ("read-only", "workspace-write", "danger-full-access")):
+        return {"ok": False, "error": "native model/permission settings unavailable", "stage": "settings"}
     # A thread hosted by a WT app-server worker is reachable only through that
     # worker's own server: resuming it here would be a second writer (-32600).
     from . import codex_app_worker
-    hosted = codex_app_worker.steer(thread_id, text, timeout=timeout)
+    if idle_only and codex_app_worker.find_worker(thread_id):
+        return {"ok": False, "error": "thread is owned by a live app-server worker", "stage": "owner-check"}
+    hosted = ({"code": "no_app_worker"} if idle_only else
+              codex_app_worker.steer(thread_id, text, timeout=timeout))
     if hosted.get("code") != "no_app_worker":
         hosted["latency_ms"] = _elapsed_ms(total_start)
         if hosted.get("ok"):
@@ -445,6 +454,9 @@ def deliver(
             "latency_ms": _elapsed_ms(total_start),
         }
     resume_params: Dict[str, Any] = {"threadId": thread_id, "excludeTurns": False}
+    if idle_only:
+        resume_params.update(model=settings["model"], approvalPolicy=settings["approval_policy"],
+                             sandbox=settings["sandbox_policy"]["type"])
     if cwd:
         resume_params["cwd"] = cwd
     resume_start = time.monotonic()
@@ -463,6 +475,8 @@ def deliver(
     active_turn = _latest_active_turn(thread)
     status = (thread.get("status") or {}).get("type")
 
+    if idle_only and status == "active":
+        return {"ok": False, "error": "same-session target became busy", "stage": "idle-check"}
     if status == "active" and active_turn:
         turn_start = time.monotonic()
         steered = request(
@@ -496,6 +510,18 @@ def deliver(
         }
 
     start_params: Dict[str, Any] = {"threadId": thread_id, "input": _user_input(text)}
+    if idle_only:
+        start_params["model"] = settings["model"]
+        # Native rollouts use snake_case; app-server policy objects use camelCase.
+        policy = {}
+        for key, value in settings["sandbox_policy"].items():
+            parts = key.split("_")
+            policy[parts[0] + "".join(p.title() for p in parts[1:])] = value
+        policy["type"] = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
+                          "danger-full-access": "dangerFullAccess"}[policy["type"]]
+        start_params["sandboxPolicy"] = policy
+        if settings.get("effort"):
+            start_params["effort"] = settings["effort"]
     if cwd:
         start_params["cwd"] = cwd
     turn_start = time.monotonic()

@@ -3474,6 +3474,9 @@ def _answer_and_deliver(args: argparse.Namespace, by_kind: str = "human",
 
 
 def _deliver_answer(args: argparse.Namespace, item: dict, by_kind: str) -> int:
+    if item.get("supervision"):
+        print(f"ANSWERED: {item['ref']} — retained for same-session takeover delivery")
+        return 0
     if (item.get("plan") or {}).get("status") == "blocked":
         print(f"NOTE: {item['ref']} plan gate is STILL BLOCKED; a free-text answer "
               f"does not accept it. Decide with `wt plan decide {item['ref']} "
@@ -4334,6 +4337,33 @@ def cmd_gh(args: argparse.Namespace) -> int:
     else:
         print("GitHub connectivity: healthy")
     return 0
+
+
+def cmd_takeover(args: argparse.Namespace) -> int:
+    from . import takeover, observations
+    try:
+        action = args.session_or_action
+        if action == "candidates":
+            if args.dry_run:
+                raise ValueError("candidate publication does not support --dry-run; no changes made")
+            result = takeover.replace_candidates(args.source, json.loads(args.candidates_json))
+        elif action == "status":
+            result = takeover.status(args.session) if args.session else takeover.status_all()
+        elif action == "cancel":
+            if not args.session:
+                raise ValueError("cancel requires SESSION")
+            result = takeover.cancel(args.session, dry_run=args.dry_run)
+        elif action == "observe":
+            result = observations.observe(args.session, args.engine, persist=not args.dry_run) if args.session else observations.discover(engine=args.engine)
+        else:
+            result = takeover.takeover(action, args.ticket, queue=args.queue, title=args.title,
+                engine=args.engine, dry_run=args.dry_run,
+                legacy=json.loads(args.legacy_json) if args.legacy_json else None)
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    except (ValueError, OSError) as exc:
+        print(json.dumps({"schema_version": 1, "error": str(exc)}))
+        return 1
 
 
 def cmd_outbox(args: argparse.Namespace) -> int:
@@ -6488,6 +6518,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "add"),
     ("Tickets", "import"),
     ("Tickets", "take"),
+    ("Tickets", "takeover"),
     ("Tickets", "edit"),
     ("Tickets", "ready"),
     ("Tickets", "find"),
@@ -6557,6 +6588,7 @@ COMMAND_HELP: Dict[str, str] = {
     "ack": "approve a product-gate pitch (Ack); resolution-caveat acks moved to unresolved-ack",
     "nack": "decline a product-gate pitch: icebox it, or --close to close as Declined",
     "answer": "answer a blocked ticket; auto-resumes its session",
+    "takeover": "supervise an existing session; status, cancel, observe, or publish candidates",
     "migrate-blocks": "park tickets blocked the legacy way (WT-28)",
     "comment": "append a ticket activity comment",
     "discuss": "attach to a blocked ticket's session (claude --resume)",
@@ -7588,6 +7620,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="build the spawn command without launching")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_spawn)
+
+    s = sub.add_parser("takeover", help="supervise an existing native session without replacing it")
+    s.add_argument("session_or_action", help="SESSION, status, cancel, or observe")
+    s.add_argument("session", nargs="?", default="")
+    s.add_argument("--ticket", default="")
+    s.add_argument("--queue", default="")
+    s.add_argument("--title", default="")
+    s.add_argument("--engine", choices=("claude", "codex"), default="")
+    s.add_argument("--legacy-json", default="", help="fenced legacy migration record as JSON")
+    s.add_argument("--source", default="ccc")
+    s.add_argument("--candidates-json", default="")
+    s.add_argument("--dry-run", action="store_true")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_takeover)
 
     s = sub.add_parser("outbox")
     s.set_defaults(func=cmd_outbox, outbox_command=None)

@@ -678,3 +678,10 @@ the queue file alone, with no dependency on any external liveness signal.
 ## License
 
 [WatchTower Software License](LICENSE) © 2026 Amir Fish — source-available, free for non-commercial use; commercial use requires permission. Versions released before 2026-07-28 remain under the [MIT License](LICENSE-MIT).
+
+### Existing interactive sessions
+
+Use `wt takeover SESSION --ticket PROJECT-42 --json` to supervise an existing
+Claude or Codex conversation without staffing another worker. See the
+[takeover guide](docs/takeover.md) for retained answers, cancellation, native
+observations, and the opt-in CCC migration interface.

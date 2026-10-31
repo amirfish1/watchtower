@@ -5765,6 +5765,8 @@ def requeue_orphaned_tickets(
         return _liveness._github(str(item.get("project") or ""))
 
     for it in items:
+        if it.get("supervision"):
+            continue
         if it.get("status") != "in_progress":
             continue
         # Skip tickets parked for human input — a worker exiting after `wt block`
@@ -6719,6 +6721,10 @@ def _reconcile_once_locked(dry_run: bool = False,
                               "parked": [],
                               "spawn_plans": [],
                               "reconcile_id": reconcile_id}
+
+    from . import takeover
+    result["takeover_candidates"] = [] if dry_run else takeover.enroll_candidates()
+    result["takeovers"] = takeover.reconcile(dry_run=dry_run)
 
     requeued_queues: Set[str] = set()
     staffing_before = list_workers(prune=False)

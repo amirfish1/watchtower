@@ -2349,7 +2349,7 @@ def _claim_candidates(
     machine are skipped, so a Mac-bound ticket waits for the Mac and an
     always-on VM only ever takes what it can actually run.
     """
-    candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of")]
+    candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of") and not it.get("supervision")]
     if requested_only:
         # OPS-1492: a dispatcher on a manually drained queue only wants what
         # a human pressed ▶ on (``run_requested``), not the whole open pool.
@@ -2822,6 +2822,8 @@ def claim_by_ref(
         item = next((it for it in data["items"] if it.get("ref") == ref), None)
         if item is None:
             return None
+        if item.get("supervision"):
+            raise ValueError("ticket retains same-session takeover ownership")
         status = item.get("status", "open")
         sb_held = _sent_back_held_unlocked(data["items"], str(session_id),
                                            str(real_sid or ""), item.get("project"))
@@ -6940,6 +6942,9 @@ def reopen_and_claim(
         for it in data["items"]:
             if not _matches(it, ident):
                 continue
+            sup = it.get("supervision") or {}
+            if sup and sup.get("session", {}).get("session_id") not in (str(session_id), str(real_sid or "")):
+                raise ValueError("ticket retains same-session takeover ownership")
             if it.get("status") == "open":
                 raise ValueError(
                     f"{it.get('ref', ident)} is already open — nothing to reopen"
@@ -8385,7 +8390,15 @@ def _wait_gen_matches(it: Dict[str, Any], block_at: str) -> bool:
                 and str(it.get("blocked_at") or "") == str(block_at or ""))
 
 
-def answer(ident: Any, text: str, session_id: str = "", *, by_kind: str = "human",
+def answer(ident: Any, text: str, session_id: str = "", **kwargs) -> Optional[Dict[str, Any]]:
+    # Serialize takeover answers with cancellation and dispatch, then acquire
+    # the ordinary store lock inside the implementation (one lock order).
+    from . import takeover
+    with takeover._lock():
+        return _answer_impl(ident, text, session_id, **kwargs)
+
+
+def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = "human",
            expect_wait_block_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Record a human answer on a blocked ticket and clear ``needs_input`` so the
     resumed session can continue. Answers are append-only, preserving a
@@ -8459,6 +8472,11 @@ def answer(ident: Any, text: str, session_id: str = "", *, by_kind: str = "human
                     _log("ANSWER", f"{it.get('ref', '?')} — {_clip(text, 240)}",
                          queue=it.get("project", ""))
                     _group_wake([str(it.get("ref"))], "integration")
+                    return it
+                if it.get("supervision"):
+                    from . import takeover
+                    takeover.answer_unlocked(it, text, now)
+                    _save_unlocked(data)
                     return it
                 stage_retry = _stage_retry_reset(it, text, now)
                 if (it.get("status") == PARKED_STATUS and it.get("parked")
