@@ -497,7 +497,7 @@ def project(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = 
         readiness = "claimable"
     if q.deferred_now(item, now):
         readiness = "deferred"   # outranks shaping: nothing to do until it ends
-    if item.get("blocked_by"):
+    if item.get("blocked_by") or item.get("duplicate_of"):
         if by_ref is None:
             by_ref = q._refs_index(q.list_items())
         dep = q.blocker_verdict(item, by_ref)[0]

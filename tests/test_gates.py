@@ -822,13 +822,13 @@ def test_explicit_duplicates_share_verification_and_follow_failure_then_recovery
     followers = [_file(q, name, gates=["verify"]) for name in ["spruce", "palfrey"]]
     for it in followers:
         linked = q.link_duplicate(it["ref"], original["ref"])
-        assert linked["status"] == "blocked"
+        assert linked["status"] == "open"
     q.close(original["ref"], resolution={"summary": "fixed", "no_code": True})
     assert [d["ref"] for d in stages.desired(q.list_items())] == [original["ref"]]
     q.verdict(original["ref"], False, "middleware not registered")
     for it in followers:
         saved = q.get(it["ref"])
-        assert saved["status"] == "blocked"
+        assert saved["status"] == "open"
         assert "middleware not registered" in saved["gate_feedback"]
     assert stages.desired(q.list_items()) == []
     q.close(original["ref"], resolution={"summary": "actually fixed", "no_code": True})
@@ -839,7 +839,7 @@ def test_explicit_duplicates_share_verification_and_follow_failure_then_recovery
         assert saved["gate_results"][-1]["inherited_from"] == original["ref"]
     assert stages.desired(q.list_items()) == []
     q.update_status(original["ref"], "open", reason="regression")
-    assert all(q.get(it["ref"])["status"] == "blocked" for it in followers)
+    assert all(q.get(it["ref"])["status"] == "open" for it in followers)
 
 
 def test_duplicate_validation_and_clearing(wt):
@@ -858,10 +858,40 @@ def test_duplicate_validation_and_clearing(wt):
         q.link_duplicate(c["ref"], weak["ref"])
     with pytest.raises(ValueError, match="follows duplicate"):
         q.close(b["ref"], force=True, resolution="override")
-    with pytest.raises(ValueError, match="not open"):
+    with pytest.raises(ValueError, match="follows duplicate"):
         q.claim_by_ref(b["ref"], "worker")
+    assert b["ref"] not in {(q.claim_next(project="GT", session_id=f"w{n}") or {}).get("ref")
+                            for n in range(4)}
     assert q.link_duplicate(b["ref"], "")["status"] == "open"
     assert not q.get(b["ref"]).get("duplicate_of")
+
+
+def test_linked_duplicate_projects_to_a_declared_liveness_row(wt):
+    # WT-49: a follower used to get status 'blocked' (outside VALID_STATUSES),
+    # so liveness read it 'unclassified' and health miscounted it.
+    from watchtower import health, liveness
+    q = wt.q
+    a, b = [_file(q, n, gates=["verify"]) for n in ["a", "b"]]
+    q.link_duplicate(b["ref"], a["ref"])
+
+    def row():
+        items = q.list_items()
+        return liveness.classify(liveness.project(q.get(b["ref"]), q._refs_index(items))).id
+
+    follower = q.get(b["ref"])
+    assert follower["status"] in q.VALID_STATUSES
+    assert q.blocker_verdict(follower, q._refs_index(q.list_items())) == ("waiting", a["ref"])
+    assert q.waiting_on(follower, q._refs_index(q.list_items())) == [a["ref"]]
+    assert row() == "dep.waiting"
+    q.close(a["ref"], resolution={"summary": "fixed", "no_code": True})
+    q.verdict(a["ref"], False, "still broken")
+    assert row() == "dep.waiting"
+    gt = next(r for r in health.all_status(project="GT") if r["queue"] == "GT")
+    assert gt["claimable_depth"] == 1 and gt["blocked"] == 1   # a is claimable, b waits
+    q.close(a["ref"], resolution={"summary": "fixed", "no_code": True})
+    q.verdict(a["ref"], True, "verified")
+    assert q.get(b["ref"])["status"] == "closed"
+    liveness.classify(liveness.project(q.get(b["ref"]), q._refs_index(q.list_items())))
 
 
 def test_duplicate_never_inherits_force_close_without_verification(wt):
@@ -869,7 +899,7 @@ def test_duplicate_never_inherits_force_close_without_verification(wt):
     a, b = [_file(q, n, gates=["verify"]) for n in ["a", "b"]]
     q.link_duplicate(b["ref"], a["ref"])
     q.close(a["ref"], force=True, resolution="unverified")
-    assert q.get(b["ref"])["status"] == "blocked"
+    assert q.get(b["ref"])["status"] == "open"
 
 
 def test_incident_dedupe_key_is_atomic_and_queue_scoped(wt):
@@ -888,12 +918,12 @@ def test_duplicates_wait_for_review_and_ignore_stale_pass_after_reopen(wt):
     q.link_duplicate(b["ref"], a["ref"])
     q.close(a["ref"], resolution="fixed")
     q.verdict(a["ref"], True, "passed")
-    assert q.get(b["ref"])["status"] == "blocked"
+    assert q.get(b["ref"])["status"] == "open"
     q.accept(a["ref"])
     assert q.get(b["ref"])["status"] == "closed"
     q.update_status(a["ref"], "open")
     q.close(a["ref"], force=True, resolution="unverified new close")
-    assert q.get(b["ref"])["status"] == "blocked"
+    assert q.get(b["ref"])["status"] == "open"
 
 
 def test_concurrent_incident_filings_reuse_one_ticket(wt):
@@ -915,7 +945,7 @@ def test_duplicate_cli_and_worker_close_alias(wt_env, run_cli, monkeypatch):
     b = q.enqueue(project="DP", note="follower", gates=["verify"])
     result = run_cli("duplicate", b["ref"], "--of", a["ref"])
     assert result.code == 0, result.err
-    assert q.get(b["ref"])["status"] == "blocked"
+    assert q.get(b["ref"])["status"] == "open"
     result = run_cli("duplicate", b["ref"], "--clear")
     assert result.code == 0, result.err
     q.claim_by_ref(b["ref"], "owner")

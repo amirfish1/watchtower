@@ -1411,7 +1411,8 @@ def render_queue(
                 f'<button class="run-btn" onclick="wtGateAckC(\'{ref}\')">Ack+</button>'
                 f'<button class="run-btn warn" onclick="wtGateNack(\'{ref}\')">Nack</button>'
             )
-        elif status == "open" and not it.get("run_requested", False):
+        elif (status == "open" and not it.get("run_requested", False)
+              and not it.get("duplicate_of")):
             action = (
                 f'<button class="run-btn" title="Run this ticket" '
                 f'onclick="wtRun(\'{ref}\')">Run</button>'

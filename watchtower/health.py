@@ -225,6 +225,8 @@ def queue_status(
         if it.get("claimable", True)
         and it.get("readiness", "") not in q.UNCLAIMABLE_READINESS
         and it.get("ref") not in (waiting_refs or ())
+        # WT-49: a duplicate follower completes with its original, never by claim.
+        and not it.get("duplicate_of")
         # Mirror the remaining claim_next() gates (queue._claim_candidates):
         # an unsettled plan or a model_floor above the queue's worker model
         # means the drainer's `wt claim` returns nothing, so it isn't "stuck".
@@ -458,7 +460,7 @@ def all_status(
         by_ref = q._refs_index(q.list_items(fresh=fresh))
     waiting_refs = {
         str(it.get("ref")) for it in fetched
-        if it.get("status") == "open" and it.get("blocked_by")
+        if it.get("status") == "open" and (it.get("blocked_by") or it.get("duplicate_of"))
         and q.blocker_verdict(it, by_ref)[0] != "ok"
     }
     rows = [

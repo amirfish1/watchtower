@@ -2198,8 +2198,12 @@ def blocker_verdict(
     blocker closed declined/unresolved). ``stuck`` wins over ``waiting``. A
     stuck blocker a human already answered for (``blocker_escalated`` and
     ``needs_input`` cleared) counts as satisfied; a blocker that no longer
-    exists is ignored."""
+    exists is ignored. An unfinished duplicate follower (``duplicate_of``)
+    waits on its original, whatever that original's state (WT-49): it
+    completes only through the duplicate sync, never by claim."""
     waiting = ""
+    if it.get("duplicate_of") and it.get("status") != "closed":
+        waiting = str(it["duplicate_of"])
     for ref in it.get("blocked_by") or []:
         blocker = by_ref.get(str(ref))
         if blocker is None:
@@ -2224,7 +2228,7 @@ def waiting_on(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]) -> List[st
     Empty when unblocked and for tickets that are not open/in-flight."""
     if it.get("status") == "closed":
         return []
-    out: List[str] = []
+    out: List[str] = [str(it["duplicate_of"])] if it.get("duplicate_of") else []
     for ref in it.get("blocked_by") or []:
         blocker = by_ref.get(str(ref))
         if blocker is None:
@@ -2827,6 +2831,9 @@ def claim_by_ref(
             _raise_sent_back_refused(sb_held[0], session_id)
         if status != "open":
             raise ValueError(f"{ref} is not open (status={status})")
+        if item.get("duplicate_of"):   # WT-49: an open follower is not work
+            raise ValueError(f"{ref} follows duplicate original {item['duplicate_of']}; "
+                             "clear the link before independent work")
         _group_claim_check_unlocked(data["items"], item)   # WT-33
         reserved = _affinity_gate_unlocked(item, str(session_id), str(real_sid or ""), time.time())
         if reserved:
@@ -4709,7 +4716,11 @@ def _sync_duplicates_unlocked(data: Dict[str, Any]) -> None:
                     "closed_at": (original or {}).get("closed_at"),
                     "feedback": (original or {}).get("gate_feedback", ""),
                     "complete": complete}
-        target_status = "closed" if complete else "blocked"
+        # An unfinished follower stays ``open`` (a declared status, WT-49):
+        # claim paths skip ``duplicate_of`` and liveness/health read it as a
+        # dependency wait on the original (blocker_verdict), the same shape
+        # as a GitHub follower's pipeline hold.
+        target_status = "closed" if complete else "open"
         if it.get("duplicate_result") == snapshot and it.get("status") == target_status:
             continue
         now = _now_iso()

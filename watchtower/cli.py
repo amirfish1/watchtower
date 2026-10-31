@@ -416,7 +416,7 @@ def _ack_counts(item: dict) -> Tuple[int, int]:
 def _waiting_note(item: dict, by_ref: dict) -> str:
     """"waiting on REF" for an open ticket held back by an unsatisfied
     blocked_by dependency (WT-4), else ""."""
-    if item.get("status") != "open" or not item.get("blocked_by"):
+    if item.get("status") != "open" or not (item.get("blocked_by") or item.get("duplicate_of")):
         return ""
     state, ref = q.blocker_verdict(item, by_ref)
     if state == "waiting":
