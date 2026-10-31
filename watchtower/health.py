@@ -316,15 +316,20 @@ def queue_status(
     # waited. At the staffing cap with every claim alive and moving, more
     # workers can't be spawned and nudging the busy ones helps nobody. Probed
     # only once the cheap rule fires.
+    # WT-48: a claim parked on a human/dependency block (needs_input, liveness
+    # row human.block) holds no worker, so it neither fills the cap nor
+    # counts as a stalled claim; otherwise one parked block anywhere in the
+    # queue made busy unreachable.
     busy = False
-    if stuck and in_progress:
+    working_claims = [it for it in in_progress if not it.get("needs_input")]
+    if stuck and working_claims:
         cap = worker_cap if worker_cap is not None else config.desired_workers(project)
-        if len(in_progress) >= max(1, cap):
+        if len(working_claims) >= max(1, cap):
             if claim_working is None:
                 from . import liveness
                 ctx = liveness.ResolverContext(now=now_ts)
                 claim_working = lambda it: _claim_working(it, ctx)  # noqa: E731
-            busy = all(claim_working(it) for it in in_progress)
+            busy = all(claim_working(it) for it in working_claims)
     stuck = stuck and not busy
 
     # Drain rate: closes within the recent window / window minutes => closes/min.

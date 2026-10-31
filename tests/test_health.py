@@ -221,6 +221,43 @@ def test_live_busy_worker_at_cap_is_not_stuck():
     assert row["stuck"] is True
 
 
+def test_parked_needs_input_claims_do_not_defeat_busy():
+    """WT-48: BECKY-DESIGN read stuck while its one serial worker was busy,
+    because three needs_input claims parked on blocks were counted toward the
+    cap and judged not-working. Parked claims hold no worker: ignore them."""
+    now = datetime.now(timezone.utc)
+    waiting = _item(created_at=_stamp(now, timedelta(hours=2)))
+    live = _item(status="in_progress", created_at=_stamp(now, timedelta(hours=3)),
+                 claimed_at=_stamp(now, timedelta(minutes=25)))
+    live["ref"] = "Q-1"
+    parked = []
+    for n in (2, 3, 4):
+        p = _item(status="in_progress", created_at=_stamp(now, timedelta(hours=5)),
+                  claimed_at=_stamp(now, timedelta(hours=4)))
+        p["ref"], p["needs_input"] = f"Q-{n}", True
+        parked.append(p)
+    items = [waiting, live] + parked
+    probed = []
+
+    def working(it):
+        probed.append(it["ref"])
+        return it is live
+
+    row = health.queue_status("Q", items, now=now, worker_cap=1, claim_working=working)
+    assert row["stuck"] is False and row["busy"] is True
+    assert probed == ["Q-1"]          # parked claims are never probed
+    assert row["in_progress"] == 4    # still reported in the count
+    # A hung live claimant is still an alarm, parked claims or not.
+    row = health.queue_status("Q", items, now=now, worker_cap=1,
+                              claim_working=lambda it: False)
+    assert row["stuck"] is True and row["busy"] is False
+    # Parked claims alone don't fill the cap: claimable work with no live
+    # worker is stuck.
+    row = health.queue_status("Q", [waiting] + parked, now=now, worker_cap=1,
+                              claim_working=lambda it: True)
+    assert row["stuck"] is True and row["busy"] is False
+
+
 def test_claim_working_needs_live_owner_and_recent_activity(monkeypatch):
     from watchtower import liveness
     now = datetime.now(timezone.utc)
