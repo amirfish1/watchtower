@@ -528,7 +528,7 @@ def test_delegate_delivery_payload(wt, delegate, monkeypatch):
     path, body = srv.requests[0]
     assert path == "/api/inject-input"
     assert body == {"session_id": SID_B, "text": "over http", "mode": "steer",
-                    "origin": "wt"}
+                    "origin": "wt", "engine": "claude"}
 
 
 def test_delegate_carries_a_devin_session_id_verbatim(wt, delegate, monkeypatch):
@@ -842,6 +842,7 @@ def test_deliver_codex_prefers_delegate_broker_over_private_app_server(wt, deleg
         "text": "hello through broker",
         "mode": "steer",
         "origin": "wt",
+        "engine": "codex",
     }
 
 

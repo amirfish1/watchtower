@@ -1,6 +1,6 @@
 # Supervise an existing session
 
-`wt takeover` retains an existing Claude or Codex conversation and binds it to
+`wt takeover` retains an existing conversation from any CCC-supported engine and binds it to
 one local WatchTower ticket. It does not spawn a replacement worker, change its
 model, or grant additional authority. Queue staffing and automatic draining
 remain independent. A running `wt daemon` reconciles enrolled sessions even
@@ -16,7 +16,11 @@ wt takeover cancel SESSION --json
 wt takeover observe SESSION --engine claude --json
 ```
 
-The session must have a readable native transcript with repository identity.
+The session must have an observation with canonical engine, host and repository
+identity. Claude and Codex have standalone native readers. Other registered
+engines use CCC's observation adapter; missing native IDs also fall back to the
+broker, including when the engine hint is omitted. A missing broker pauses
+reachability rather than declaring the engine unsupported.
 When the engine is omitted, an ambiguous identity is rejected. Registered
 `@agent` names are accepted for enrollment. An existing unique binding can be
 reused without `--ticket`; otherwise specify a ticket or both queue and title.
@@ -76,7 +80,9 @@ Missing/unreadable stores return errors, not an authoritative empty inventory.
 The durable incremental cache lives under the WT data directory. Initial scans
 read at most 8 MiB per observation and pause intervention while incomplete;
 unchanged completed files are not reread. Discovery does not enroll sessions.
-This stdlib-only optional interface does not import CCC.
+This stdlib-only optional interface does not import CCC. Engine adapters supply
+observation, exact-session delivery and durable receipt evidence; all engines
+share the same takeover state machine, authorization checks and reminder budget.
 
 ### CCC transport and migration
 
@@ -88,6 +94,24 @@ messages, deploy a broker that enforces `same_session:true`, `no_queue:true`,
 `GET /api/takeover/capabilities` for `{schema_version:1,same_session:true,no_queue:true}`
 and caches the result for 30 seconds. Old/unavailable brokers fail closed.
 No broker configuration or service restart is performed by installation.
+
+`GET /api/takeover/observe?session_id=SID&engine=ENGINE` returns schema 1 with
+`session_id`, `engine`, `host`, `repo_path`, `transcript`, `cursor`,
+`completed_turn`, `activity_at`, `state` (`busy`, `idle`, `unknown`), `settings`,
+`observed_at`, `source`, and `error`. The optional `footer` is validated by WT;
+alternatively `completed_text` supplies the raw completed assistant final for
+WT's normal footer parser. Unreadable stores and identity mismatches pause
+intervention. Native ambiguity is rejected rather than resolved by fallback.
+
+With `nonce=...`, the broker may return `receipt_confirmed:true` only after
+finding that exact nonce in persisted user input in that exact session.
+`receipt_evidence` must contain the exact `session_id` and `nonce`, `role:user`,
+`persisted:true`, and a nonempty `source`. WT validates and retains this evidence
+in its durable receipt ledger. Acceptance, transcript growth and assistant
+echoes do not confirm delivery. An uncertain send retains its original nonce;
+missing proof eventually pauses intervention instead of blindly resending.
+Delegate input carries the observed `engine`, canonical session ID, fencing
+fields and retained settings; it never substitutes Claude for an opaque ID.
 
 After fencing legacy CCC effects and settling in-flight sends:
 
@@ -129,8 +153,10 @@ adoptions; cancel separately to stop already-enrolled sessions.
 
 The local queue store is the lifecycle authority; machine/engine/repository
 identity changes pause rather than migrate ownership. There is no distributed
-cross-host lease or automatic archival. Only Claude and Codex native JSONL
-formats are implemented. A malformed footer cannot authorize automatic work.
+cross-host lease or automatic archival. Claude and Codex native JSONL readers
+remain available without CCC. Other engine formats and transports are owned by
+registered broker adapters; temporary adapter/broker absence pauses supervision
+while retaining the ticket claim. A malformed footer cannot authorize automatic work.
 Unknown native turn state deliberately pauses. External waits without a ticket
 trigger need an explicit answer/wake. Context-budget failures preserve the
 session and require operator recovery instead of a replacement conversation.

@@ -682,6 +682,7 @@ the queue file alone, with no dependency on any external liveness signal.
 ### Existing interactive sessions
 
 Use `wt takeover SESSION --ticket PROJECT-42 --json` to supervise an existing
-Claude or Codex conversation without staffing another worker. See the
+conversation from any CCC-supported engine without staffing another worker;
+Claude and Codex also retain standalone native support. See the
 [takeover guide](docs/takeover.md) for retained answers, cancellation, native
 observations, and the opt-in CCC migration interface.

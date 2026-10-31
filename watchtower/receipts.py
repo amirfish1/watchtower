@@ -109,6 +109,9 @@ def _save(rows: List[Dict[str, Any]]) -> None:
 
 
 def _transcript_stat(sid: str, engine: str = "claude") -> Dict[str, Any]:
+    engine = str(engine or 'claude').lower()
+    if engine not in ('claude', 'codex'):
+        return {"path": "", "size": 0, "mtime": 0.0}
     p = (
         messages._find_codex_rollout(sid)
         if str(engine).lower() == "codex"
@@ -147,6 +150,7 @@ def record(
     snapshot for a session that did not exist before the send (size 0)."""
     now = time.time() if now is None else float(now)
     engine = str(engine or "claude").lower()
+    native_snapshot = at_send is None
     if at_send is None:
         at_send = _transcript_stat(str(sid), engine)
     if require_path and not at_send["path"]:
@@ -162,6 +166,10 @@ def record(
         "status": "pending",
         "verified_at": None,
     }
+    if engine not in ('claude', 'codex') or (native_snapshot and not at_send.get('path') and messages._delegate_base()):
+        # Keep the adapter choice durable across daemon restarts. Never read
+        # a Claude transcript just because an unfamiliar engine has the SID.
+        rec['source'] = 'broker'
     from . import sender_envelope as envelope
     attr = envelope.from_text(text)
     if attr:
@@ -220,6 +228,17 @@ def _scan_nonce(path: str, offset: int, nonce: str) -> bool:
 
 
 def _verify_nonce(rec: Dict[str, Any], now: float) -> Dict[str, Any]:
+    if rec.get('source') == 'broker' or (rec.get('engine') or 'claude') not in ('claude', 'codex'):
+        from . import observations
+        obs = observations.broker_observe(str(rec.get('sid') or ''), str(rec.get('engine') or ''), nonce=str(rec['nonce']))
+        if not obs.get('error') and obs.get('receipt_confirmed') is True:
+            rec.update(status='landed', verified_at=now, receipt_evidence=obs['receipt_evidence'])
+            rec.pop('error', None)
+        else:
+            rec['error'] = obs.get('error') or 'broker has no persisted same-session nonce evidence'
+            if now - float(rec.get('sent_at') or 0) > _wait_window_s():
+                rec.update(status='lost', verified_at=now)
+        return rec
     cur = _transcript_stat(str(rec.get("sid") or ""), str(rec.get("engine") or "claude"))
     offset = int(rec.get("offset") or 0)
     if cur["path"] and cur["size"] < offset:

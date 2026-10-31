@@ -63,7 +63,7 @@ def test_conflicts(env):
         t.takeover(SID,wrong['ref'],engine='claude')
     with pytest.raises(ValueError,match='specify'):
         t.takeover(SID,engine='claude')
-    with pytest.raises(ValueError,match='unsupported'):
+    with pytest.raises(ValueError,match='broker unavailable'):
         t.takeover(SID,item['ref'],engine='kimi')
 
 

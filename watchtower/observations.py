@@ -1,20 +1,23 @@
 # Copyright (c) 2026 Amir Fish. All rights reserved.
 # SPDX-License-Identifier: LicenseRef-WatchTower-Software-License
 
-"""Version 1 headless native observations; registration confers no authority.
+"""Version 1 engine-neutral observations; registration confers no authority.
 
 Only completed native turns carry footer evidence. The incremental index is a
-cache, never delivery proof. No CCC imports or server requests.
+cache, never delivery proof. Native readers work without a broker; other
+engines use the optional same-session broker observation contract.
 """
 from __future__ import annotations
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import socket
 import time
 from datetime import datetime
+from urllib.parse import urlencode
 from . import storage
 
 SCHEMA_VERSION = 1
@@ -65,6 +68,80 @@ def _paths(engine, sid=''):
     return root.glob(pattern)
 
 
+def _empty(session_id, engine='', source='native'):
+    return dict(schema_version=1, session_id=str(session_id), engine=engine, host=socket.gethostname(),
+                repo_path='', transcript='', cursor=0, completed_turn='', activity_at=0,
+                state='unknown', footer=None, settings={}, observed_at=time.time(), source=source, error='')
+
+
+def broker_observe(session_id, engine='', *, nonce=''):
+    """Read the broker adapter, validating identity before trusting any evidence.
+
+    No local transcript format or session-id shape is assumed. A nonce result
+    is evidence only when the broker found persisted same-session user input;
+    HTTP acceptance, busy state and transcript growth never prove receipt.
+    """
+    from . import messages
+    out = _empty(session_id, engine, 'broker')
+    base = messages._delegate_base()
+    if not base:
+        return dict(out, error='session observation broker unavailable: no delegate configured')
+    query = dict(session_id=str(session_id), engine=engine)
+    if nonce:
+        query['nonce'] = nonce
+    try:
+        row = messages._get_json(base+'/api/takeover/observe?'+urlencode(query), timeout_s=5)
+        if not isinstance(row, dict):
+            raise ValueError('session observation broker unreachable or protocol unavailable')
+        if row.get('schema_version') != 1 or row.get('session_id') != str(session_id):
+            raise ValueError('broker observation schema or session identity mismatch')
+        if not isinstance(row.get('engine'), str) or not row['engine'] or (engine and row['engine'] != engine):
+            raise ValueError('broker observation engine identity mismatch')
+        if row.get('error'):
+            raise ValueError(str(row['error']))
+        if any(not isinstance(row.get(k), str) or not row[k] for k in ('host', 'repo_path')):
+            raise ValueError('broker canonical host/repository identity missing')
+        if row.get('state') not in ('busy', 'idle', 'unknown'):
+            raise ValueError('broker turn state invalid')
+        for k in ('activity_at', 'observed_at'):
+            if isinstance(row.get(k), str):
+                row[k] = datetime.fromisoformat(row[k].replace('Z', '+00:00')).timestamp()
+            if isinstance(row.get(k), bool) or not isinstance(row.get(k), (int, float)) or not math.isfinite(row[k]) or row[k] < 0:
+                raise ValueError('broker observation timestamps invalid')
+        if not isinstance(row.get('settings', {}), dict):
+            raise ValueError('broker session settings invalid')
+        if any(not isinstance(row.get(k, ''), str) for k in ('transcript', 'completed_turn')):
+            raise ValueError('broker transcript/turn identity invalid')
+        # Broker cursors may be opaque store positions rather than native
+        # byte offsets; their interpretation belongs to the engine adapter.
+        if isinstance(row.get('cursor'), bool) or not isinstance(row.get('cursor'), (int, str)):
+            raise ValueError('broker cursor invalid')
+        for k in out:
+            if k in row and k not in ('footer', 'source'):
+                out[k] = row[k]
+        # The broker may supply raw final text or an already parsed footer.
+        # Revalidate both through the same WT parser used by native readers.
+        parsed = row.get('footer')
+        if row.get('completed_text'):
+            out['footer'] = footer(row['completed_text'])
+        elif isinstance(parsed, dict):
+            out['footer'] = footer('<session-state>\nNEXT_STEP_USER: '+str(parsed.get('next_step_user', ''))+
+                                   '\nCOMPLETION: '+json.dumps(parsed.get('completion'))+'\n</session-state>')
+        elif isinstance(parsed, str):
+            out['footer'] = footer(parsed)
+        if nonce:
+            evidence = row.get('receipt_evidence')
+            out['receipt_confirmed'] = (row.get('receipt_confirmed') is True
+                and isinstance(evidence, dict) and evidence.get('session_id') == str(session_id)
+                and evidence.get('nonce') == nonce and evidence.get('role') == 'user'
+                and evidence.get('persisted') is True
+                and isinstance(evidence.get('source'), str) and bool(evidence['source']))
+            out['receipt_evidence'] = row.get('receipt_evidence') if out['receipt_confirmed'] else None
+        return out
+    except (OSError, ValueError, TypeError) as exc:
+        return dict(_empty(session_id, engine, 'broker'), error=str(exc))
+
+
 def observe(session_id, engine='', *, persist=True, transcript=None):
     """Return v1 identity/activity/turn/footer observation, including unknown errors.
 
@@ -72,20 +149,20 @@ def observe(session_id, engine='', *, persist=True, transcript=None):
     `transcript` is a native path override for controlled fixtures/adapters.
     """
     sid = str(session_id)
-    out = dict(schema_version=1, session_id=sid, engine=engine, host=socket.gethostname(),
-               repo_path='', transcript='', cursor=0, completed_turn='', activity_at=0,
-               state='unknown', footer=None, settings={}, observed_at=time.time(), source='native', error='')
+    out = _empty(sid, engine)
     if engine and engine not in _roots():
-        return dict(out, error=f'unsupported engine: {engine}')
-    matches, errors = [], []
+        return broker_observe(sid, engine)
+    matches = []
     for eng in ([engine] if engine else _roots()):
         try:
             paths = [Path(transcript)] if transcript else list(_paths(eng, sid))
             matches.extend((eng, p) for p in paths)
-        except OSError as exc:
-            errors.append(str(exc))
+        except OSError:
+            pass  # No native identity; ask the broker before declaring it missing.
     if len(matches) != 1:
-        return dict(out, error='ambiguous native identity' if len(matches)>1 else '; '.join(errors) or 'session not found')
+        if len(matches)>1:
+            return dict(out, error='ambiguous native identity')
+        return broker_observe(sid, engine)
     eng, path = matches[0]
     out.update(engine=eng, transcript=str(path))
     cache = storage.data_dir()/'observations'/ (hashlib.sha256(str(path).encode()).hexdigest()+'.json')
@@ -174,7 +251,7 @@ def discover(*, engine='', limit=100, session_ids=()):
     rows, errors = [], []
     for eng in ([engine] if engine else _roots()):
         if eng not in _roots():
-            errors.append(f'unsupported engine: {eng}')
+            errors.append(f'{eng} inventory requires explicit session_ids for broker observation')
             continue
         try:
             for p in _paths(eng):

@@ -1680,7 +1680,8 @@ DELIVERIES_FILE: Optional[str] = None   # module override (tests); env wins
 DELIVERY_PRUNE_S = 24 * 3600.0
 DELIVERY_MAX_ROWS = 2000
 DELIVERY_PURPOSES = ("nudge", "release", "plan", "review", "answer", "stage_answer", "resume", "takeover")
-# Engines whose transcript a receipt can read (receipts._transcript_stat).
+# Native receipt engines eligible for the existing standalone headless/spawn
+# paths. Takeover uses broker receipts for arbitrary engines, without this list.
 RECEIPT_ENGINES = ("claude", "codex")
 _LIVE_STATES = ("sending", "pending")
 # A failed send whose caller did not settle it itself (``settle_failed``) is
@@ -1791,7 +1792,7 @@ def _pre_receipt(sid: str, engine: str, body: str, nonce: str, did: str,
                  transport: str) -> Optional[Dict[str, Any]]:
     """The nonce receipt, recorded before the send; None without a receipt
     source (no session id, or an engine whose transcript is unreadable)."""
-    if not nonce or not sid or engine not in RECEIPT_ENGINES:
+    if not nonce or not sid:
         return None
     from . import receipts
     try:
@@ -1967,6 +1968,13 @@ def deliver(target: str, text: str, *, purpose: str, dedupe_key: str, ref: str =
             if res.get("ok"):
                 return _sent(str(res.get("transport") or "?"), None,
                              receipt_id=str(res.get("receipt_id") or ""))
+            if purpose == 'takeover' and res.get('delivery_uncertain'):
+                # A timed-out broker may already have persisted the input.
+                # Keep the original nonce pending, then pause on lost proof;
+                # never turn an ambiguous attempt into a new delivery.
+                return _sent(str(res.get('transport') or 'delegate'), None,
+                             receipt_id=str(res.get('receipt_id') or ''),
+                             delivery_uncertain=True)
             if res.get("queued"):
                 expire = kw.get("expire", kw.get("ttl_s"))
                 _finish(did, dedupe_key, {"state": "pending", "queued": True,

@@ -286,8 +286,10 @@ def register_agent(
     if _UUID_RE.match(name):
         raise ValueError(f"agent name {name!r} looks like a session UUID; pick a name")
     sid = str(session_id or "").strip()
-    if not _UUID_RE.match(sid):
+    if str(engine or 'claude').lower() in ('claude', 'codex') and not _UUID_RE.match(sid):
         raise ValueError(f"session_id must be a full UUID, got {sid!r}")
+    if not sid or any(ord(c) < 32 for c in sid):
+        raise ValueError('session_id must be nonempty without control characters')
     rec = {
         "session_id": sid,
         "engine": str(engine or "claude"),
@@ -1646,6 +1648,8 @@ def _deliver_delegate(
     if not sid:
         return {"ok": False, "error": "delegate needs a session_id"}
     payload = _delegate_payload(sid, text, mode, force_queue, resolved.get("attr"))
+    if resolved.get("engine"):
+        payload["engine"] = resolved["engine"]
     if resolved.get("same_session"):
         # Opt in only after a compatible broker is deployed. An old broker
         # could silently ignore fencing fields and queue/forward the effect.
@@ -1659,7 +1663,8 @@ def _deliver_delegate(
             timeout_s=_delegate_timeout_s(delegate_timeout_s),
         )
     except Exception as e:  # noqa: BLE001 - any transport failure means fall through
-        return {"ok": False, "error": f"delegate: {e}"}
+        return {"ok": False, "error": f"delegate: {e}",
+                "delivery_uncertain": bool(resolved.get("same_session")), "transport": "delegate"}
     if data.get("ok") is False:
         # Keep the delegate's own reason/code so operators (and the outbox
         # last_error) can see why it refused, not just that it did.
@@ -1668,9 +1673,13 @@ def _deliver_delegate(
         msg = "delegate rejected the message"
         if code or detail:
             msg += " (" + ": ".join(x for x in (code, detail) if x) + ")"
-        return {"ok": False, "error": msg}
-    if resolved.get("same_session") and (data.get("same_session") is not True or data.get("queued") or data.get("forwarded_to")):
-        return {"ok": False, "error": "delegate did not confirm same-session immediate delivery"}
+        return {"ok": False, "error": msg,
+                "delivery_uncertain": bool(resolved.get('same_session') and (data.get('uncertain') or data.get('delivery_uncertain') or code == 'delivery_unknown')),
+                "transport": "delegate"}
+    if resolved.get("same_session") and (data.get("same_session") is not True or data.get("queued") or data.get("forwarded_to")
+                                        or (data.get('session_id') and data['session_id'] != sid)):
+        return {"ok": False, "error": "delegate did not confirm same-session immediate delivery",
+                "delivery_uncertain": True, "transport": "delegate"}
     return {"ok": True, "transport": "delegate"}
 
 
@@ -1757,7 +1766,7 @@ def deliver(
         )
     if pre is not None:
         from . import receipts
-        if result.get("ok"):
+        if result.get("ok") or result.get("delivery_uncertain"):
             receipts.set_transport(pre["id"], str(result.get("transport") or "?"))
             result["receipt_id"] = pre["id"]
         else:
@@ -1907,6 +1916,11 @@ def _deliver_unreceipted(
 ) -> Dict[str, Any]:
     errors: List[str] = []
     busy = False
+    if resolved.get("same_session") and resolved.get("engine") not in ("claude", "codex"):
+        # The broker owns engine-specific settings and same-session delivery.
+        # Legacy native fallbacks do not implement this takeover contract.
+        return _deliver_delegate(resolved, text, mode, force_queue=False,
+                                 delegate_timeout_s=delegate_timeout_s)
     if notify:
         return _deliver_notify(
             resolved, text, mode, force_queue=force_queue,
@@ -1943,7 +1957,7 @@ def _deliver_unreceipted(
             resolved, text, mode, force_queue=force_queue,
             delegate_timeout_s=delegate_timeout_s,
         )
-        if r.get("ok"):
+        if r.get("ok") or r.get("delivery_uncertain"):
             return r
         errors.append(f"delegate: {r.get('error', 'failed')}")
         return {"ok": False, "busy": busy, "error": "; ".join(errors)}
@@ -1967,7 +1981,7 @@ def _deliver_unreceipted(
             resolved, text, mode, force_queue=force_queue,
             delegate_timeout_s=delegate_timeout_s,
         )
-        if r.get("ok"):
+        if r.get("ok") or r.get("delivery_uncertain"):
             return r
         errors.append(f"delegate: {r.get('error', 'failed')}")
     return {"ok": False, "busy": busy, "error": "; ".join(errors)}
@@ -2520,7 +2534,18 @@ def send(
     try:
         resolved = resolve_target(target)
     except ValueError as e:
-        return {"ok": False, "error": str(e)}
+        if same_session and engine and target and not str(target).startswith('@'):
+            # Canonical takeover identity was already observed; arbitrary
+            # broker IDs need not look like a native UUID or worker name.
+            resolved = dict(kind="session", session_id=str(target), engine=str(engine), worker=None)
+        else:
+            return {"ok": False, "error": str(e)}
+    if same_session and engine and not str(target).startswith('@') and resolved.get('session_id') != str(target):
+        # Opaque canonical IDs can collide with address-book names. Takeover
+        # already resolved identity, so a second name lookup cannot redirect it.
+        resolved = dict(kind="session", session_id=str(target), engine=str(engine), worker=None)
+    if same_session and (start_new_if_needed or force_queue):
+        return {"ok": False, "error": "same-session delivery cannot continue elsewhere or queue"}
     dedupe_key = dedupe_key or attr["message_id"]
     owns_ledger = envelope.enabled("wt") and not _ledger_owned
     if owns_ledger:
@@ -2551,6 +2576,10 @@ def send(
     result = _continue_if_cold(resolved, text) if start_new_if_needed else None
     if result is None:
         result = deliver(resolved, text, mode, **extra)
+    if same_session and result.get("delivery_uncertain"):
+        if owns_ledger:
+            ledger_mark(dedupe_key, "sent")
+        return dict(result, queued=False)
     if result.get("ok"):
         out = {"ok": True, "transport": result.get("transport", "?"), "message_id": attr["message_id"], "attr": attr, "attribution_v": 1, "attribution_recorded": attribution_recorded}
         if result.get("new_session_id"):

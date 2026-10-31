@@ -68,6 +68,31 @@ def _claim(it, s):
                               engine=s['session']['engine'], pid=0))
 
 
+def _footer_wait(it, s, f, turn):
+    """Honor recorded owner/external waits at adoption and on fresh turns."""
+    if not f:
+        return False
+    next_user = f['next_step_user']
+    if next_user.lower().rstrip('.') != 'none' or f['completion']['decision_dependency']['score'] > 0:
+        question = next_user if next_user.lower().rstrip('.') != 'none' else 'Owner decision recorded in session footer'
+        s.update(state='needs_input', reason=question)
+        it.update(needs_input=True, block_question=question)
+        return True
+    actions = f['completion']['remaining_actions']
+    user_actions = [a for a in actions if isinstance(a, dict) and a.get('owner') == 'user']
+    if user_actions:
+        question = '; '.join(str(a.get('text') or 'Owner action required') for a in user_actions)
+        s.update(state='needs_input', reason=question)
+        it.update(needs_input=True, block_question=question)
+        return True
+    external = [a for a in actions if isinstance(a, dict) and a.get('owner') == 'external']
+    if external:
+        s.update(state='waiting', reason='; '.join(str(a.get('text') or 'External trigger required') for a in external),
+                 wait_identity=turn, wait_source='footer')
+        return True
+    return False
+
+
 def _new(data, queue, title, repo):
     return q._new_item_unlocked(data, note=title, text=title, source='takeover', proj=queue,
         annotation_id='', url='', title=title, selector='', screenshot_path='', repo_path=repo,
@@ -177,6 +202,8 @@ def takeover(session_id, ticket_ref='', *, queue='', title='', engine='', dry_ru
                     'Ignore repeated takeover action keys already handled. Task: '+str(s['task_brief']))
         if old.get('held_answer') and not legacy:
             _intent(s,'answer','Retained owner answer: '+str(old['held_answer']))
+        elif not legacy:
+            _footer_wait(it, s, obs.get('footer'), obs['completed_turn'])
         if legacy and s['state']=='needs_input':
             it.update(needs_input=True,block_question=legacy.get('reason') or it.get('block_question') or 'Imported owner question remains unanswered')
         it['supervision'] = s
@@ -298,22 +325,10 @@ def _tick(it, obs, now):
     if fresh:
         s['processed_turn']=obs['completed_turn']
         f=obs.get('footer')
-        if f and (f['next_step_user'].lower().rstrip('.') != 'none' or f['completion']['decision_dependency']['score']>0):
-            s.update(state='needs_input',reason=f['next_step_user'])
-            it.update(needs_input=True,block_question=f['next_step_user'])
+        if _footer_wait(it, s, f, obs['completed_turn']):
             return
         if f:
             actions=f['completion']['remaining_actions']
-            user_actions=[a for a in actions if isinstance(a,dict) and a.get('owner')=='user']
-            if user_actions:
-                question='; '.join(str(a.get('text') or 'Owner action required') for a in user_actions)
-                s.update(state='needs_input',reason=question)
-                it.update(needs_input=True,block_question=question)
-                return
-            external=[a for a in actions if isinstance(a,dict) and a.get('owner')=='external']
-            if external:
-                s.update(state='waiting',reason='; '.join(str(a.get('text') or 'External trigger required') for a in external),wait_identity=obs['completed_turn'],wait_source='footer')
-                return
             if (s['state']=='waiting' and not wait and actions
                     and f['completion']['decision_dependency']['score']==0
                     and f['next_step_user'].lower().rstrip('.')=='none'
@@ -475,8 +490,8 @@ def replace_candidates(source, policy):
             raise ValueError('each scope requires repo_path and queue')
         scope['source']=source
         for c in scope.get('candidates',[]):
-            if not isinstance(c,dict) or not c.get('session_id') or c.get('engine') not in ('claude','codex'):
-                raise ValueError('candidate requires native session_id and supported engine')
+            if not isinstance(c,dict) or not isinstance(c.get('session_id'),str) or not c['session_id'].strip() or not isinstance(c.get('engine'),str) or not c['engine'].strip():
+                raise ValueError('candidate requires session_id and engine')
             c['origin']=source
     path=storage.data_dir()/'takeover-policy-ccc.json'
     path.parent.mkdir(parents=True,exist_ok=True)

@@ -7627,7 +7627,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--ticket", default="")
     s.add_argument("--queue", default="")
     s.add_argument("--title", default="")
-    s.add_argument("--engine", choices=("claude", "codex"), default="")
+    s.add_argument("--engine", default="", help="session engine (native reader or CCC broker adapter)")
     s.add_argument("--legacy-json", default="", help="fenced legacy migration record as JSON")
     s.add_argument("--source", default="ccc")
     s.add_argument("--candidates-json", default="")
