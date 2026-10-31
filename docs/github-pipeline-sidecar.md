@@ -262,7 +262,12 @@ entry, i.e. gated) parks it instead of holding it `in_progress`:
 - The owner-comment answer sweep includes parked tickets.
 - Tickets with no sidecar entry keep the legacy hold-while-blocked behaviour.
 - Liveness: `awaiting_answer` x github is covered by the `answer.*` rows;
-  `github_parked` / `github_answer` are gone from `UNREACHABLE`.
+  `github_parked` / `github_answer` are gone from `UNREACHABLE`. When the
+  issue edit after the sidecar route fails (e.g. a body at GitHub's cap),
+  `needs_input` stays set over a `routing` record: row `answer.unlanded`
+  (WT-50), owned by the answerer. Nothing retries it automatically; a
+  repeated `wt answer` with the same text adopts the posted comment by its
+  entry key and keeps the routed generation.
 
 Activation: same preconditions as the gate (every claiming host at or after
 OPS-203) plus the reconciler restart of step 0b, so the router that drives

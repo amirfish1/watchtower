@@ -440,6 +440,29 @@ def test_parked_answer_retry_after_failed_edit_keeps_its_generation(
     assert got and got["status"] == "in_progress" and got["claimed_by"] == "w1"
 
 
+def test_parked_answer_with_failed_edit_is_a_declared_liveness_row(tmp_path, monkeypatch):
+    """WT-50 (BECKY-2966): the route lands before the issue edit, so a failed
+    edit leaves needs_input over a routing record. Liveness must classify it
+    (answer.unlanded, the answerer retries), not report it 'unclassified'."""
+    from watchtower import liveness as lv
+    _state, q, _gb, ref = _parked_near_limit(tmp_path, monkeypatch)
+    monkeypatch.setenv("FAKE_GH_FAIL", "issue edit=fail")
+    with pytest.raises(Exception):
+        q.answer(ref, "use postgres")
+    monkeypatch.delenv("FAKE_GH_FAIL")
+    item = q.get(ref)
+    st = lv.project(item)
+    assert (st.backend, st.status, st.block, st.answer) == (
+        "github", "awaiting_answer", "input", "routing")
+    assert lv.classify(st).id == "answer.unlanded"
+    out = lv.assess(item)
+    assert out["verdict"] == "human" and out["action"] == ""
+    assert "wt answer" in out["evidence"] and "gen 1" in out["evidence"]
+
+    q.answer(ref, "use postgres")
+    assert lv.classify(lv.project(q.get(ref))).id == "answer.routing"
+
+
 def test_parked_second_distinct_answer_still_supersedes(tmp_path, monkeypatch):
     """The retry dedupe is keyed to the write: a new answer is a new gen."""
     _state, q, _gb, ref = _parked_near_limit(tmp_path, monkeypatch)

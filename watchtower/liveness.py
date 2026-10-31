@@ -190,7 +190,16 @@ ROWS: Tuple[Row, ...] = (
     _row("human.block", "human", "-", "-",
          status=("open", "in_progress", "in_review"), block=_not("block", "none")),
     _row("answer.await_human", "human", "-", "-",
+         ({"backend": "file"}, {"backend": "github", "answer": _not("answer", "routing")}),
          status="awaiting_answer", block=_not("block", "none")),
+    # WT-50: a GitHub answer routes the sidecar BEFORE the issue edit (WT-40,
+    # WT-44); when that edit fails (e.g. the body is at GitHub's cap) the
+    # block stays set over a routing record. Nothing retries it on its own: the
+    # answerer re-runs `wt answer`, which adopts the posted comment by its
+    # entry key and keeps the routed generation.
+    _row("answer.unlanded", "human", "-", "wt answer (retry)",
+         status="awaiting_answer", backend="github", block=_not("block", "none"),
+         answer="routing"),
     _row("answer.parked_bare", "reconciler", "system_op", "update_status(open, handoff)",
          status="awaiting_answer", block="none", answer="none"),
     _row("answer.routing", "answer_router", "lease", "E5", NOT_PA,
@@ -290,9 +299,15 @@ def _unreach(uid: str, reason: str, cite: str, *alts: Dict[str, Any]) -> Unreach
 
 
 UNREACHABLE: Tuple[Unreachable, ...] = (
+    # WT-50: on GitHub a parked answer whose issue edit failed leaves the block
+    # over a routing record (row answer.unlanded); every other pair stays out.
     _unreach("block_inflight", "a block supersedes the answer record; the stuck-blocker "
              "escalation skips in-flight answers", "E17, queue._escalate_stuck_blockers",
-             {"block": _not("block", "none"), "answer": INFLIGHT}),
+             {"block": _not("block", "none"), "answer": INFLIGHT, "backend": "file"},
+             {"block": _not("block", "none"), "backend": "github",
+              "answer": tuple(a for a in INFLIGHT if a != "routing")},
+             {"block": _not("block", "none"), "answer": "routing", "backend": "github",
+              "status": _not("status", "awaiting_answer")}),
     _unreach("parked_claimed", "parking releases the claim; a block on a parked ticket "
              "never claims", "queue._park_unlocked, queue.block",
              {"status": "awaiting_answer", "claimed": True}),
@@ -1294,7 +1309,13 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
     github = _github(out["queue"])
     verdict, evidence, action, reason = "", "", "", ""
     min_idle: Optional[float] = stall
-    if row.id.startswith("answer.") and row.id != "answer.await_human":
+    if row.id == "answer.unlanded":
+        pa = item.get("pending_answer") or {}
+        verdict = "human"
+        evidence = (f"answer gen {pa.get('gen')} routed at {pa.get('state_at')} but the issue "
+                    f"edit never landed (needs_input still set); retry `wt answer` with the "
+                    f"same text: it adopts the posted comment and keeps the generation")
+    elif row.id.startswith("answer.") and row.id != "answer.await_human":
         verdict, evidence, action, reason = _answer_floor(item, row, ctx, now)
         min_idle = None
     elif row.id == "plan.blocked":
