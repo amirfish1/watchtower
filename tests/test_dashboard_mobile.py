@@ -24,6 +24,7 @@ ticket note -- that's an open owner decision for a later version).
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
@@ -153,6 +154,68 @@ def test_status_payload_reports_unreachable_workers_and_invalid_effort(wt):
     assert row["awaiting_human"] == 0
     assert "missing session identity" in row["staffing_diagnostics"][0]
     assert row["configuration_error"] == "kimi-code/k3 does not support effort 'high'"
+
+
+@pytest.mark.parametrize(
+    "auto_drain,labels,age_s,expected",
+    [
+        (True, [], 1800, 1),
+        (True, ["watchtower:no-auto-drain"], 1800, 0),
+        (True, [], 0, 0),
+        (False, [], 1800, 0),
+        (False, ["watchtower:play"], 1800, 1),
+    ],
+)
+def test_status_payload_keeps_github_eligibility_count(
+    wt, monkeypatch, auto_drain, labels, age_s, expected
+):
+    """WT-52: the dashboard must not replace health's GitHub eligibility count."""
+    from watchtower.github_backend import GitHubIssuesBackend
+
+    wt.config.set_auto_drain("GHI", auto_drain)
+    created = (datetime.now(timezone.utc) - timedelta(seconds=age_s)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    backend = GitHubIssuesBackend(
+        "GHI", repo="owner/repo", auto_drain=auto_drain, grace_s=180,
+        partition_by_label=False,
+    )
+    item = backend._issue_to_item({
+        "number": 1, "title": "audit", "body": "", "state": "OPEN",
+        "labels": [{"name": label} for label in labels], "assignees": [],
+        "createdAt": created, "updatedAt": created,
+    })
+    monkeypatch.setattr(wt.q, "list_items", lambda **_: [item])
+
+    httpd, port, thread = _serve_once(wt.dashboard)
+    try:
+        status, body = _get(port, "/api/status")
+    finally:
+        thread.join(timeout=5)
+        httpd.server_close()
+    assert status == 200
+    row = next(row for row in json.loads(body)["queues"] if row["queue"] == "GHI")
+    assert row["depth"] == 1
+    assert row["claimable_depth"] == expected
+    assert (row["oldest_claimable_age_s"] is not None) == bool(expected)
+    if not expected:
+        assert row["state"] == "backlog"
+        assert row["stuck"] is False
+
+
+def test_status_payload_keeps_model_floor_exclusion(wt):
+    wt.config.set_auto_drain("OPS", True)
+    wt.config.set_engine("OPS", "kimi")
+    wt.config.set_model("OPS", "kimi-code/k3")
+    wt.q.enqueue(project="OPS", note="needs stronger model",
+                 model_floor="kimi-code/kimi-for-coding-highspeed")
+
+    row = next(row for row in wt.dashboard.status_payload()["queues"]
+               if row["queue"] == "OPS")
+
+    assert row["depth"] == 1
+    assert row["claimable_depth"] == 0
+    assert row["state"] == "backlog"
 
 
 def test_queue_banner_reconcile_action_runs_one_reconcile(wt, monkeypatch):

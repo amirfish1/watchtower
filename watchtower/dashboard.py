@@ -151,12 +151,9 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
             if not str(worker.get("session_id") or "").strip()
         ]
         queue_items = [item for item in items if item.get("project") == r["queue"]]
-        r["claimable_depth"] = len(q._claim_candidates(
-            queue_items,
-            project=r["queue"],
-            item_types=config.claim_types(r["queue"]) or None,
-            all_items=items,
-        ))
+        # Keep health's count alongside its state and claimable-age clock.
+        # The file-store candidate filter ignores GitHub eligibility flags
+        # and, without a worker model, ticket model floors (WT-52).
         r["awaiting_human"] = sum(
             1 for item in queue_items
             if item.get("status") in ("open", "in_progress", "awaiting_answer")
