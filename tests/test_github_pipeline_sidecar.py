@@ -5,6 +5,7 @@ import contextlib
 import importlib
 import json
 import threading
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -376,30 +377,42 @@ def test_ownership_keys_on_the_store_not_the_machine_tag(tmp_path, monkeypatch):
     assert q.get(ref)["pipeline_foreign"]
 
 
-def test_gating_waits_until_every_claiming_host_honors_the_hold(tmp_path, monkeypatch):
-    """OPS-203: a host whose wt predates the plan hold would claim a gated
-    ticket, so gating is refused while one claimed the queue recently."""
+@pytest.mark.parametrize("proto", [0, 1])
+@pytest.mark.parametrize("gates", [
+    ["plan"], ["plan:codex"], ["plan", "verify", "review"],
+    ["verify"], ["review"], ["cmd:true"],
+])
+def test_gating_waits_until_every_claiming_host_honors_the_hold(
+        tmp_path, monkeypatch, proto, gates):
+    """WT-54: all gate compositions require a genuine current-protocol claim.
+    A refusal must leave both the issue and sidecar untouched."""
     state, _config, q, ref = _setup(tmp_path, monkeypatch)
     other = q.enqueue(project="GHI", note="mac work", text="body")["ref"]
     q._MACHINE_TAG_CACHE = "ami"
-    assert q.claim_by_ref(other, "ami-worker")
+    old_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+    with monkeypatch.context() as m:
+        m.setattr(q, "_now_iso", lambda: old_at)
+        assert q.claim_by_ref(other, "ami-worker")
     q._MACHINE_TAG_CACHE = None
     data = json.loads(state.read_text())
     for issue in data["issues"]:
-        issue["body"] = issue["body"].replace('"pipeline": 2', '"pipeline": 0')
+        issue["body"] = issue["body"].replace('"pipeline": 2', f'"pipeline": {proto}')
     state.write_text(json.dumps(data))
+    before = json.loads(state.read_text())["issues"]
 
     with pytest.raises(ValueError, match="ami"):
-        q.update(ref, gates=["plan"])
-    assert "pipeline_host" not in json.loads(state.read_text())["issues"][0]["body"]
+        q.update(ref, gates=gates)
+    assert json.loads(state.read_text())["issues"] == before
+    assert not _sidecar(q).exists()
 
     q.close(other)
     third = q.enqueue(project="GHI", note="more mac work", text="body")["ref"]
     q._MACHINE_TAG_CACHE = "ami"
     assert q.claim_by_ref(third, "ami-worker")
     q._MACHINE_TAG_CACHE = None
-    q.update(ref, gates=["plan"])
-    assert q.get(ref)["gates"] == ["plan"]
+    q.update(ref, gates=gates)
+    assert q.get(ref)["gates"] == gates
 
 
 @contextlib.contextmanager

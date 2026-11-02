@@ -35,11 +35,12 @@ _OWNER: Dict[str, str] = {}
 
 # Stamped on every GitHub claim this code makes. Gating a ticket requires every
 # machine that claimed the queue within READER_WINDOW_S to have stamped it at
-# READER_MIN_PROTO or later, so a host that cannot read the protective hold
-# cannot be claiming there (OPS-203). 1+ (OPS-203 onward) honours the defer.
-# 2 (OPS-215): writes the issue-level hold (``pipeline_hold``) that all 1+ readers respect.
+# READER_MIN_PROTO or later for every gate composition (OPS-203, WT-54).
+# 2 (OPS-215): reads and writes the issue-level hold (``pipeline_hold``).
+# Older readers honour the defer sentinel, but that is not evidence of the
+# required current-protocol claim; the gate-time reader check stays strict.
 PIPELINE_PROTO = 2
-READER_MIN_PROTO = 1
+READER_MIN_PROTO = PIPELINE_PROTO
 READER_WINDOW_S = 14 * 86400
 
 
@@ -107,14 +108,11 @@ def _owner_fields(item: Dict[str, Any], marker: str) -> None:
     item["pipeline_owner_id"] = oid
 
 
-def stale_readers(items: List[Dict[str, Any]], now: Optional[float] = None,
-                  require_proto_2: bool = False) -> Dict[str, str]:
+def stale_readers(items: List[Dict[str, Any]], now: Optional[float] = None) -> Dict[str, str]:
     """Machines (other than this one) whose latest claim in the window was made
-    by a `wt` that does not stamp the required protocol, mapped to that claim's time.
-    With require_proto_2=False (plan gates): READER_MIN_PROTO (1) is acceptable.
-    With require_proto_2=True (non-plan gates): PIPELINE_PROTO (2) is required."""
+    by a `wt` that does not stamp READER_MIN_PROTO, mapped to that claim's time.
+    Plan gates have the same strict reader requirement as every other gate."""
     from . import queue as q
-    min_proto = PIPELINE_PROTO if require_proto_2 else READER_MIN_PROTO
     cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                            time.gmtime((now or time.time()) - READER_WINDOW_S))
     latest: Dict[str, Any] = {}
@@ -126,7 +124,7 @@ def stale_readers(items: List[Dict[str, Any]], now: Optional[float] = None,
             if machine not in latest or at > latest[machine][0]:
                 latest[machine] = (at, h.get("pipeline"))
     return {m: at for m, (at, proto) in latest.items()
-            if m != q.machine_tag() and int(proto or 0) < min_proto}
+            if m != q.machine_tag() and int(proto or 0) < READER_MIN_PROTO}
 
 
 def _read_strict() -> Dict[str, Any]:
@@ -664,11 +662,11 @@ def set_gates(ident: Any, gates: List[str]) -> Optional[Dict[str, Any]]:
         marker = owner_marker()
         if item.get("pipeline_host") != marker:
             has_plan = q.plan_gate({"gates": gates}) is not None
-            stale = stale_readers(backend.list_items(None), require_proto_2=not has_plan)
+            stale = stale_readers(backend.list_items(None))
             if stale:
                 raise ValueError(
                     f"{item.get('ref')}: cannot gate yet; these hosts claimed this queue "
-                    f"with a wt that ignores the pipeline hold: "
+                    f"with a wt below required pipeline protocol {READER_MIN_PROTO}: "
                     + ", ".join(f"{m} (last claim {at})" for m, at in sorted(stale.items()))
                     + ". Update them; a fresh claim from each clears this.")
             # The hold rides on the marker write: no window where a wt that

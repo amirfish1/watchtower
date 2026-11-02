@@ -80,21 +80,31 @@ marker via `backend.update` → **re-read the issue and require our marker**
 loser fails with no sidecar entry; GitHub down ⇒ edit fails, nothing local
 written) → write sidecar entry.
 
-Reader check (OPS-203, relaxed OPS-221): every GitHub claim stamps
+Reader check (OPS-203, strict contract restored by WT-54): every GitHub claim stamps
 `pipeline: <PIPELINE_PROTO>` (2 since OPS-215) on its history event. Gating is
-refused while other machines have claims in the last 14 days below the required
-protocol: **READER_MIN_PROTO** (1: OPS-203 onward) **for plan gates** (protected
-by issue-level `deferred_until`), and **PIPELINE_PROTO** (2) **for non-plan
-gates** (verify/review/cmd only; no issue-level protection). Without the
-sidecar, a proto-1 host could otherwise claim and skip verify on a non-plan gate.
-Every protocol 1+ host honours the `deferred_until` hold (OPS-215), so only an
-unstamped (protocol 0) pre-OPS-203 claim blocks plan gates. The error names the
-host and its last claim. Once that host runs the required version, its next
+refused while another machine's latest claim in the last 14 days is below
+**READER_MIN_PROTO = PIPELINE_PROTO (2)**. This applies to all gate sets,
+including plan-only, model-qualified plan and mixed plan/verify/review gates.
+The issue-level defer protects against older readers, but does not substitute
+for evidence of a current-protocol claim. The error names the host, required
+protocol and last claim. Once that host runs the required version, its next
 claim clears the check. A retired host ages out after 14 days. Crash between
 the two ⇒ marker without entry ⇒ fail-closed `pipeline_missing`, never an
 unplanned build. Gating a ticket a builder already holds is **refused** (the
 claim is left untouched): the hold only excludes new claims, so a running
 builder would not pause for the planner. Gate it once it is released.
+
+WT-54 policy review (2026-11-02): the OPS-221 proto-1 exception in 73e7380 /
+f529e49 did **not** satisfy OPS-219's standing strict-reader requirement.
+Compatibility with a defer sentinel is distinct from the supported proto-2
+claim lifecycle. Restore the uniform reader check; resolve stale claims only
+through supported lifecycle tooling, preserving ownership and history.
+The OPS-322 read-only audit (`~/.watchtower/evidence/OPS-322/audit.json`)
+records real proto-2 claims from ami at 2026-11-01 15:40:36 UTC (BECKY-3055)
+and her at 15:45:35 UTC (BECKY-3046), and no current strict-reader refusal.
+It does not establish a release/reclaim of the historical BECKY-2968 claim.
+BECKY-2335 stays closed; this correction authorizes no new feature acceptance,
+model probes, backfill or retention runs.
 
 ## Scope
 
@@ -211,7 +221,7 @@ Codex review scored the doc-only contract 3/10. Disposition:
 ## Activation / resume procedure
 
 0. Preconditions: every host that claims the queue runs a `wt` at or after
-   the OPS-203 commit (git -C <its wt checkout> merge-base --is-ancestor; on
+   the OPS-215 protocol-2 commit (git -C <its wt checkout> merge-base --is-ancestor; on
    the Mac that checkout is `~/.ccc/watchtower`, see the `~/.local/bin/wt`
    shim). `wt edit --gate` enforces this from claim stamps; the ticket is
    unclaimed, or gated by its own claimant (`WT_WORKER_ID` == claimed_by), which
