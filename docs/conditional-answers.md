@@ -112,3 +112,54 @@ replays and returns a receipt without CLI delivery; `lookup(ref, key)` is
 read-only. The CLI uses `claim_route` and `finish_route` around the existing
 block-kind-aware `_deliver_answer` helper. These capabilities are local-only;
 callers must not fall back to an unguarded legacy answer after a refusal.
+
+## Authoritative local owner-block export
+
+`wt owner-blocks-export --json` exports the **full local owner-block set**, with
+no pagination or display truncation. The JSON envelope has:
+
+- `schema_version: 1`, `adapter: "watchtower-block"`.
+- `authoritative: true`, `complete: true` on successful source reads only.
+- `scope: {backend: "file", store_id: "<stable hash of host and store path>"}`.
+- `store_version: {revision: <SQLite revision>, snapshot_sha256: "<content hash>"}`.
+  Legacy JSON stores have a null revision; the content hash remains available.
+- `capabilities: ["conditional-owner-answer-v1", "answer-receipt-v1", "owner-blocks-export-v1"]`.
+- `items`: every local nonclosed `needs_input` record whose exact source wait
+  classifier is owner. GitHub-backed queues and other wait kinds are excluded.
+  Review-only requests are outside this set and cannot be retired using it.
+
+Each item contains `origin_id` (ticket ref), `project`, `generation`
+(`blocked_at`), `body` (exact question), `wait_kind: "owner"`, `block_kind`,
+`expected_blocked_at`, `expected_block_question`, `expected_wait_kind`, and
+`expected_wait` (the complete current record or null). These expected fields
+map directly to the conditional-answer request. `answerable` is false when an
+old record has no episode identity; do not submit such a record through CAS.
+`source_revision` is SHA-256 of
+`json.dumps([generation, body, "owner", expected_wait], sort_keys=True).encode()`.
+Freeze these source fields unchanged in the outbox; do not recompute them from
+a trimmed display body. The store content hash includes all source items and
+backend settings, so it also changes when an item disappears or leaves scope.
+
+Completeness is scoped to **this store ID, adapter, and local owner-block
+class**, not all WatchTower requests or federated nodes. CCC may retire a
+previously imported row missing from a later successful complete snapshot of
+the **same scope**, including a truly empty set. A changed store ID is a new
+source scope, never evidence that the previous store's requests disappeared.
+
+Export holds an existing source flock shared/read lock and uses a SQLite
+`mode=ro` read transaction (including committed WAL data). It neither calls
+the migrating source/settings resolvers nor writes answers, receipts, worker
+state, migrations, or activity logs. It does not create a missing lock file.
+Legacy JSON can be read in place without creating a database. A busy writer,
+missing/unreadable source or lock, invalid configuration, or required settings
+migration fails closed: exit 2 with
+`{"error":"unavailable","authoritative":false,"complete":false,"message":"..."}`.
+Such a response, a timeout, or an infrastructure failure provides **no absence
+evidence**. Keep prior requests and retry a later read; never withdraw them
+from a partial/failed snapshot. This command does not enable any producer
+migration or review accept/reject operations.
+
+The single-ref `answer-receipt` lookup uses this same strict, shared-lock,
+nonmigrating reader. Missing/unreadable stores and busy writers yield exit 2
+(`unavailable`, or `unsupported` for unsupported sources), never exit 1
+`not_found`. Only exit 1 after a successful source read is authoritative absence.

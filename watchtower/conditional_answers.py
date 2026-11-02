@@ -99,8 +99,14 @@ def submit(ref, request):
 
 def lookup(ref, key):
     """Read-only reconciliation, including after a response was lost."""
-    require_local(ref)
-    for item in q._load_unlocked(strict=True, readonly=True)["items"]:
+    from . import owner_blocks_export
+    project = q._project_from_ident(ref)
+    if not project:
+        raise Unsupported("receipt lookup requires a local QUEUE-N ref")
+    _, items, _, settings = owner_blocks_export.read_source()
+    if str(settings.get(project, {}).get("backend") or "file").strip().lower() != "file":
+        raise Unsupported("receipt lookup requires a local file-backed queue")
+    for item in items:
         if q._matches(item, ref):
             return copy.deepcopy(item.get("answer_receipts", {}).get(key))
     return None

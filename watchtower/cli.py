@@ -3406,6 +3406,17 @@ def _route_parked_answer(item: dict, tid: bool = False) -> Optional[int]:
     return 0
 
 
+def cmd_owner_blocks_export(args: argparse.Namespace) -> int:
+    from . import owner_blocks_export
+    try:
+        print(json.dumps(owner_blocks_export.snapshot(), sort_keys=True))
+        return 0
+    except (OSError, ValueError, q.sqlite3.Error) as exc:
+        print(json.dumps({"error": "unavailable", "message": str(exc),
+                          "authoritative": False, "complete": False}))
+        return 2
+
+
 def cmd_answer_conditional(args: argparse.Namespace) -> int:
     from . import conditional_answers as conditional
     try:
@@ -3440,8 +3451,9 @@ def cmd_answer_receipt(args: argparse.Namespace) -> int:
         receipt = conditional.lookup(args.ref, args.key)
         print(json.dumps(receipt if receipt else {"error": "not_found"}, sort_keys=True))
         return 0 if receipt else 1
-    except conditional.Unsupported as exc:
-        print(json.dumps({"error": "unsupported", "message": str(exc)}))
+    except (OSError, ValueError, q.sqlite3.Error) as exc:
+        kind = "unsupported" if isinstance(exc, conditional.Unsupported) else "unavailable"
+        print(json.dumps({"error": kind, "message": str(exc)}))
         return 2
 
 
@@ -7519,6 +7531,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("-q", "--queue", default=None, help="limit to one queue")
     s.set_defaults(func=cmd_migrate_blocks)
+
+    s = sub.add_parser("owner-blocks-export", help="read-only complete local owner-block snapshot")
+    s.add_argument("--json", action="store_true", help="JSON is always emitted")
+    s.set_defaults(func=cmd_owner_blocks_export)
 
     s = sub.add_parser("answer-conditional", help="atomically answer an observed owner question")
     s.add_argument("ref")

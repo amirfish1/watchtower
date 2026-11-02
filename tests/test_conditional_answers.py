@@ -104,6 +104,8 @@ def test_concurrent_processes_one_answer_and_route(source):
                                          ("https://example.test/issues/1", "file")])
 def test_unsupported_before_any_write(source, monkeypatch, ref, backend):
     monkeypatch.setattr(config, "backend", lambda project: backend)
+    from watchtower import owner_blocks_export
+    monkeypatch.setattr(owner_blocks_export, "_settings", lambda: {"DEMO": {"backend": backend}})
     def forbidden(*args, **kwargs):
         pytest.fail("unsupported backend accessed source")
     monkeypatch.setattr(q, "answer", forbidden)
