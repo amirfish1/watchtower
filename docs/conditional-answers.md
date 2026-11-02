@@ -132,7 +132,8 @@ no pagination or display truncation. The JSON envelope has:
   Review-only requests are outside this set and cannot be retired using it.
 
 Each item contains `origin_id` (ticket ref), `project`, `generation`
-(`blocked_at`), `body` (exact question), `wait_kind: "owner"`, `block_kind`,
+(`blocked_at`), `title`, `status`, `duplicate_of`, `body` (exact question),
+`wait_kind: "owner"`, `block_kind`,
 `expected_blocked_at`, `expected_block_question`, `expected_wait_kind`,
 `expected_store_id` (the scope UUID), and `expected_wait` (the complete current record or null). These expected fields
 map directly to the conditional-answer request. `answerable` is false when an
@@ -142,6 +143,15 @@ old record has no episode identity; do not submit such a record through CAS.
 Freeze these source fields unchanged in the outbox; do not recompute them from
 a trimmed display body. The store content hash includes all source items and
 backend settings, so it also changes when an item disappears or leaves scope.
+
+`title`, `status`, and `duplicate_of` preserve source values as strings (empty
+when absent); title is not inferred from the question or note. The export does
+not add a duplicate-follower or `in_review` filter to WatchTower's owner-wait
+classifier. `block_kind: "rationale"` is retained as a structured distinction.
+Consumers such as CCC may apply stricter owner-question admission, excluding
+duplicate followers and review status and treating rationale as a separate
+read-only approval until its own adapter exists. Exported owner membership and
+`answerable` do not grant that consumer admission or approve a rationale.
 
 Completeness is scoped to **this store ID, adapter, and local owner-block
 class**, not all WatchTower requests or federated nodes. CCC may retire a

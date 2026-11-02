@@ -115,6 +115,8 @@ def snapshot():
         wait = q.current_wait(item)
         rows.append({
             "origin_id": item["ref"], "project": project, "generation": episode,
+            "title": str(item.get("title") or ""), "status": str(item.get("status") or ""),
+            "duplicate_of": str(item.get("duplicate_of") or ""),
             "body": question, "wait_kind": "owner", "expected_wait": wait,
             "expected_blocked_at": episode, "expected_block_question": question,
             "expected_wait_kind": "owner", "expected_store_id": identity, "block_kind": str(item.get("block_kind") or ""),

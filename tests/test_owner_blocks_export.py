@@ -191,3 +191,39 @@ def test_sqlite_export_includes_committed_wal_data(store):
         assert export.snapshot()["items"][0]["body"] == row["block_question"]
     finally:
         connection.close()
+
+
+def test_owner_metadata_preserves_review_status_and_rationale_kind(store):
+    mutate(1, title="  Source title  ", status="in_review", block_kind="rationale")
+    result = export.snapshot()
+    first, second = result["items"]
+    assert first["origin_id"] == "DEMO-1"
+    assert first["title"] == "  Source title  "
+    assert first["status"] == "in_review"
+    assert first["block_kind"] == "rationale"
+    assert first["wait_kind"] == "owner"
+    assert first["duplicate_of"] == ""
+    assert second["title"] == second["duplicate_of"] == ""
+    assert second["status"] == "in_progress"
+    assert result["complete"] and result["authoritative"]
+
+
+def test_duplicate_follower_metadata_is_exported_without_reclassification(store):
+    # Simulate an already-stored blocked follower. Export must preserve the
+    # distinction, not run the writer's duplicate synchronization or hide it.
+    connection = q._connect(q._db_path())
+    try:
+        item = json.loads(connection.execute("SELECT item_json FROM items WHERE number=1").fetchone()[0])
+        item.update(duplicate_of="DEMO-2", title="Duplicate follow-up")
+        connection.execute("UPDATE items SET item_json=? WHERE number=1", (json.dumps(item),))
+        connection.commit()
+    finally:
+        connection.close()
+    before = q._db_path().read_bytes()
+    row = export.snapshot()["items"][0]
+    assert row["origin_id"] == "DEMO-1"
+    assert row["duplicate_of"] == "DEMO-2"
+    assert row["title"] == "Duplicate follow-up"
+    assert row["status"] == "in_progress"
+    assert row["wait_kind"] == "owner"
+    assert q._db_path().read_bytes() == before
