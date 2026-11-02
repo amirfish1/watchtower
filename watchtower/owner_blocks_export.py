@@ -6,13 +6,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import socket
 
-from . import config, queue as q, storage
+from . import config, queue as q, storage, store_identity
 from .conditional_answers import Unsupported, wait_kind
 
 
-CAPABILITIES = ["conditional-owner-answer-v1", "answer-receipt-v1", "owner-blocks-export-v1"]
+CAPABILITIES = ["conditional-owner-answer-v1", "answer-receipt-v1", "owner-blocks-export-v1",
+                "store-identity-v1"]
 
 
 def _digest(value):
@@ -73,6 +73,8 @@ def read_source():
                 if row is None:
                     raise ValueError("source store has no revision")
                 revision = int(row[0])
+                identity_row = connection.execute("SELECT value FROM meta WHERE key='store_id'").fetchone()
+                identity = store_identity.validate(identity_row[0]) if identity_row else None
                 items = [json.loads(row[0]) for row in connection.execute(
                     "SELECT item_json FROM items ORDER BY number")]
             finally:
@@ -83,16 +85,21 @@ def read_source():
                 raise ValueError("invalid legacy source store")
             items = data["items"]
             revision = None
+            identity = data.get("store_id")
+            if identity is not None:
+                identity = store_identity.validate(identity)
         if any(not isinstance(item, dict) or not isinstance(item.get("project"), str)
                or not item["project"] for item in items):
             raise ValueError("source items require explicit project identities")
         q._normalize_items(items)
-        return base, items, revision, settings
+        return base, items, revision, settings, identity
 
 
 def snapshot():
     """Return the full local owner set, authoritative only within its scope."""
-    base, items, revision, settings = read_source()
+    base, items, revision, settings, identity = read_source()
+    if identity is None:
+        raise Unsupported("store identity uninitialized; run wt answer-store-init --json")
     rows = []
     for item in items:
         project = item["project"]
@@ -110,15 +117,14 @@ def snapshot():
             "origin_id": item["ref"], "project": project, "generation": episode,
             "body": question, "wait_kind": "owner", "expected_wait": wait,
             "expected_blocked_at": episode, "expected_block_question": question,
-            "expected_wait_kind": "owner", "block_kind": str(item.get("block_kind") or ""),
+            "expected_wait_kind": "owner", "expected_store_id": identity, "block_kind": str(item.get("block_kind") or ""),
             "source_revision": _digest([episode, question, "owner", wait]),
             "answerable": bool(episode),
         })
     rows.sort(key=lambda row: row["origin_id"])
     return {
         "schema_version": 1, "adapter": "watchtower-block", "authoritative": True,
-        "complete": True, "scope": {"backend": "file", "store_id": _digest(
-            [socket.gethostname(), str(base.resolve())])},
+        "complete": True, "scope": {"backend": "file", "store_id": identity},
         "store_version": {"revision": revision, "snapshot_sha256": _digest([items, settings])},
         "capabilities": list(CAPABILITIES), "items": rows,
     }

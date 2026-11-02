@@ -3406,6 +3406,16 @@ def _route_parked_answer(item: dict, tid: bool = False) -> Optional[int]:
     return 0
 
 
+def cmd_answer_store_init(args: argparse.Namespace) -> int:
+    from . import store_identity
+    try:
+        print(json.dumps(store_identity.initialize(), sort_keys=True))
+        return 0
+    except (OSError, ValueError, q.sqlite3.Error) as exc:
+        print(json.dumps({"error": "unavailable", "message": str(exc)}))
+        return 2
+
+
 def cmd_owner_blocks_export(args: argparse.Namespace) -> int:
     from . import owner_blocks_export
     try:
@@ -3422,7 +3432,7 @@ def cmd_answer_conditional(args: argparse.Namespace) -> int:
     try:
         request = conditional.payload(json.loads(args.request_json))
         conditional.submit(args.ref, request)
-        item = conditional.claim_route(args.ref, request["idempotency_key"])
+        item = conditional.claim_route(args.ref, request["idempotency_key"], request["expected_store_id"])
         if item is not None:
             # Delivery helpers print human output; keep this endpoint JSON-only.
             import contextlib
@@ -3434,8 +3444,8 @@ def cmd_answer_conditional(args: argparse.Namespace) -> int:
             except Exception:
                 # A transport failure may follow successful delivery. Never retry blindly.
                 code = 1
-            conditional.finish_route(args.ref, request["idempotency_key"], code)
-        receipt = conditional.lookup(args.ref, request["idempotency_key"])
+            conditional.finish_route(args.ref, request["idempotency_key"], code, request["expected_store_id"])
+        receipt = conditional.lookup(args.ref, request["idempotency_key"], request["expected_store_id"])
         print(json.dumps(receipt, sort_keys=True))
         return 0
     except (ValueError, TypeError) as exc:
@@ -3448,11 +3458,12 @@ def cmd_answer_conditional(args: argparse.Namespace) -> int:
 def cmd_answer_receipt(args: argparse.Namespace) -> int:
     from . import conditional_answers as conditional
     try:
-        receipt = conditional.lookup(args.ref, args.key)
+        receipt = conditional.lookup(args.ref, args.key, getattr(args, "expected_store_id", None))
         print(json.dumps(receipt if receipt else {"error": "not_found"}, sort_keys=True))
         return 0 if receipt else 1
     except (OSError, ValueError, q.sqlite3.Error) as exc:
-        kind = "unsupported" if isinstance(exc, conditional.Unsupported) else "unavailable"
+        kind = ("unsupported" if isinstance(exc, conditional.Unsupported) else
+                "conflict" if isinstance(exc, conditional.Conflict) else "unavailable")
         print(json.dumps({"error": kind, "message": str(exc)}))
         return 2
 
@@ -7532,6 +7543,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-q", "--queue", default=None, help="limit to one queue")
     s.set_defaults(func=cmd_migrate_blocks)
 
+    s = sub.add_parser("answer-store-init", help="initialize durable local store identity metadata")
+    s.add_argument("--json", action="store_true", help="JSON is always emitted")
+    s.set_defaults(func=cmd_answer_store_init)
+
     s = sub.add_parser("owner-blocks-export", help="read-only complete local owner-block snapshot")
     s.add_argument("--json", action="store_true", help="JSON is always emitted")
     s.set_defaults(func=cmd_owner_blocks_export)
@@ -7544,6 +7559,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("answer-receipt", help="read-only conditional answer reconciliation")
     s.add_argument("ref")
     s.add_argument("key")
+    s.add_argument("--expected-store-id", default=None)
     s.add_argument("--json", action="store_true", help="JSON is always emitted")
     s.set_defaults(func=cmd_answer_receipt)
 

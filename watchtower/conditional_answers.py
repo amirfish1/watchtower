@@ -37,7 +37,7 @@ def wait_kind(item):
 def payload(request):
     required = ("idempotency_key", "text", "expected_blocked_at",
                 "expected_block_question", "expected_wait_kind", "expected_wait")
-    allowed = set(required) | {"session_id", "by_kind", "tid", "engine"}
+    allowed = set(required) | {"session_id", "by_kind", "tid", "engine", "expected_store_id"}
     if not isinstance(request, dict) or set(request) - allowed:
         raise ValueError("unknown conditional answer fields or invalid request object")
     if any(not isinstance(request.get(k), str) for k in required if k != "expected_wait"):
@@ -51,12 +51,24 @@ def payload(request):
     result.setdefault("by_kind", "human")
     result.setdefault("tid", False)
     result.setdefault("engine", None)
+    result.setdefault("expected_store_id", None)
+    if (result["expected_store_id"] is not None and
+            (not isinstance(result["expected_store_id"], str) or not result["expected_store_id"])):
+        raise ValueError("expected_store_id must be a nonempty string or null")
     if (not isinstance(result["session_id"], str)
             or result["by_kind"] not in ("human", "worker", "system")
             or type(result["tid"]) is not bool
             or result["engine"] not in (None, "claude", "codex", "kimi", "devin")):
         raise ValueError("invalid answer attribution or routing options")
     return result
+
+
+def check_store_unlocked(base, expected_store_id):
+    """Check identity before touching any receipt; caller owns source lock."""
+    if expected_store_id is not None:
+        from . import store_identity
+        if store_identity.read_unlocked(base) != expected_store_id:
+            raise Conflict("source store identity changed or is uninitialized")
 
 
 def prepare_unlocked(item, request):
@@ -67,7 +79,7 @@ def prepare_unlocked(item, request):
     key = request["idempotency_key"]
     existing = item.get("answer_receipts", {}).get(key)
     if existing:
-        if existing["request"] != request:
+        if payload(existing["request"]) != request:
             raise Conflict("idempotency key already used with a different payload")
         return False
     if (not item.get("needs_input") or item.get("status") == "closed"
@@ -97,13 +109,15 @@ def submit(ref, request):
     return copy.deepcopy(item["answer_receipts"][request["idempotency_key"]])
 
 
-def lookup(ref, key):
+def lookup(ref, key, expected_store_id=None):
     """Read-only reconciliation, including after a response was lost."""
     from . import owner_blocks_export
     project = q._project_from_ident(ref)
     if not project:
         raise Unsupported("receipt lookup requires a local QUEUE-N ref")
-    _, items, _, settings = owner_blocks_export.read_source()
+    _, items, _, settings, identity = owner_blocks_export.read_source()
+    if expected_store_id is not None and identity != expected_store_id:
+        raise Conflict("source store identity changed or is uninitialized")
     if str(settings.get(project, {}).get("backend") or "file").strip().lower() != "file":
         raise Unsupported("receipt lookup requires a local file-backed queue")
     for item in items:
@@ -112,7 +126,7 @@ def lookup(ref, key):
     return None
 
 
-def claim_route(ref, key):
+def claim_route(ref, key, expected_store_id=None):
     """Consume the single route attempt BEFORE any external side effect.
 
     Crash/exception after this point stays uncertain; replay cannot route again.
@@ -121,6 +135,7 @@ def claim_route(ref, key):
     with q._FileLock(q._lock_path()) as lock:
         if lock._fh is None:
             raise Unsupported("source write lock unavailable")
+        check_store_unlocked(q._resolve_store_path(), expected_store_id)
         data = q._load_unlocked(strict=True)
         for item in data["items"]:
             if not q._matches(item, ref):
@@ -142,11 +157,12 @@ def claim_route(ref, key):
     return None
 
 
-def finish_route(ref, key, exit_code):
+def finish_route(ref, key, exit_code, expected_store_id=None):
     require_local(ref)
     with q._FileLock(q._lock_path()) as lock:
         if lock._fh is None:
             raise Unsupported("source write lock unavailable")
+        check_store_unlocked(q._resolve_store_path(), expected_store_id)
         data = q._load_unlocked(strict=True)
         for item in data["items"]:
             if q._matches(item, ref):

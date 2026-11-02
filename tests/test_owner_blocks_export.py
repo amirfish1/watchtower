@@ -43,7 +43,7 @@ def test_complete_set_capabilities_and_exact_cas_fields(store):
     assert result["complete"] is result["authoritative"] is True
     assert result["scope"]["backend"] == "file"
     assert result["store_version"]["revision"] >= 1
-    assert len(result["scope"]["store_id"]) == 64
+    assert len(result["scope"]["store_id"]) == 36
     assert result["capabilities"] == export.CAPABILITIES
     assert [row["origin_id"] for row in result["items"]] == ["DEMO-1", "DEMO-2"]
     first, second = result["items"]
@@ -123,6 +123,7 @@ def test_failure_is_never_authoritative_absence(store, failure, capsys):
 def test_legacy_json_read_does_not_migrate(store, monkeypatch):
     base, _ = store
     data = q._load_unlocked()
+    data["store_id"] = export.snapshot()["scope"]["store_id"]
     base.write_text(json.dumps(data))
     base.with_suffix(".db").unlink()
     before = base.read_bytes()

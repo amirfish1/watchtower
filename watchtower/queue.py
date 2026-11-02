@@ -869,6 +869,7 @@ def _create_db(db: Path, data: Dict[str, Any]) -> None:
                     ("counter", str(counter)),
                     ("revision", "1"),
                     ("schema_version", str(_SCHEMA_VERSION)),
+                    ("store_id", data.get("store_id") or str(uuid.uuid4())),
                 ],
             )
     finally:
@@ -990,6 +991,7 @@ def _save_unlocked(data: Dict[str, Any]) -> None:
                 ("counter", str(int(data.get("counter", 0)))),
                 ("revision", str(rev)),
                 ("schema_version", str(_SCHEMA_VERSION)),
+                ("store_id", _meta_get(conn, "store_id") or str(uuid.uuid4())),
             ],
         )
         conn.commit()
@@ -8452,6 +8454,8 @@ def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = 
     with _FileLock(_lock_path()) as answer_lock:
         if answer_contract is not None and answer_lock._fh is None:
             raise conditional.Unsupported("source write lock unavailable")
+        if answer_contract is not None:
+            conditional.check_store_unlocked(_resolve_store_path(), answer_contract["expected_store_id"])
         data = _load_unlocked(strict=answer_contract is not None)
         for it in data["items"]:
             if _matches(it, ident):
