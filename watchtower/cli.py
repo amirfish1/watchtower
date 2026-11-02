@@ -3406,6 +3406,45 @@ def _route_parked_answer(item: dict, tid: bool = False) -> Optional[int]:
     return 0
 
 
+def cmd_answer_conditional(args: argparse.Namespace) -> int:
+    from . import conditional_answers as conditional
+    try:
+        request = conditional.payload(json.loads(args.request_json))
+        conditional.submit(args.ref, request)
+        item = conditional.claim_route(args.ref, request["idempotency_key"])
+        if item is not None:
+            # Delivery helpers print human output; keep this endpoint JSON-only.
+            import contextlib
+            try:
+                with contextlib.redirect_stdout(sys.stderr):
+                    code = _deliver_answer(argparse.Namespace(
+                        ref=args.ref, text=request["text"], worker=request["session_id"],
+                        engine=request["engine"], tid=request["tid"]), item, request["by_kind"])
+            except Exception:
+                # A transport failure may follow successful delivery. Never retry blindly.
+                code = 1
+            conditional.finish_route(args.ref, request["idempotency_key"], code)
+        receipt = conditional.lookup(args.ref, request["idempotency_key"])
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    except (ValueError, TypeError) as exc:
+        kind = ("unsupported" if isinstance(exc, conditional.Unsupported) else
+                "conflict" if isinstance(exc, conditional.Conflict) else "invalid_request")
+        print(json.dumps({"error": kind, "message": str(exc)}))
+        return 2
+
+
+def cmd_answer_receipt(args: argparse.Namespace) -> int:
+    from . import conditional_answers as conditional
+    try:
+        receipt = conditional.lookup(args.ref, args.key)
+        print(json.dumps(receipt if receipt else {"error": "not_found"}, sort_keys=True))
+        return 0 if receipt else 1
+    except conditional.Unsupported as exc:
+        print(json.dumps({"error": "unsupported", "message": str(exc)}))
+        return 2
+
+
 def cmd_answer(args: argparse.Namespace) -> int:
     """Inject a human answer onto a blocked ticket and hand it to the session.
 
@@ -7480,6 +7519,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("-q", "--queue", default=None, help="limit to one queue")
     s.set_defaults(func=cmd_migrate_blocks)
+
+    s = sub.add_parser("answer-conditional", help="atomically answer an observed owner question")
+    s.add_argument("ref")
+    s.add_argument("--request-json", required=True)
+    s.set_defaults(func=cmd_answer_conditional)
+
+    s = sub.add_parser("answer-receipt", help="read-only conditional answer reconciliation")
+    s.add_argument("ref")
+    s.add_argument("key")
+    s.add_argument("--json", action="store_true", help="JSON is always emitted")
+    s.set_defaults(func=cmd_answer_receipt)
 
     s = sub.add_parser("answer")
     s.add_argument("ref")

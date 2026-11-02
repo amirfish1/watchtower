@@ -85,6 +85,7 @@ import os
 import re as _re
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -184,6 +185,7 @@ def wait_record(on: str, actor: str = "", ref: str = "", note: str = "",
     if on not in WAIT_ON:
         raise ValueError(f"wait-on must be one of {', '.join(WAIT_ON)}, not {on!r}")
     rec: Dict[str, Any] = {"on": on, "at": _now_iso(), "block_at": str(block_at or ""),
+                           "revision": uuid.uuid4().hex,
                            # A local-queue ref means a ticket on THIS host (OPS-230).
                            "host": machine_tag()}
     if actor:
@@ -8265,7 +8267,10 @@ def block(
             if _matches(it, ident):
                 if origin == "worker" and session_id and not force:
                     _block_owner_guard_unlocked(it, ident, str(session_id))
+                # Block timestamps are episode identities as well as times.
+                # Second precision aliases rapid re-blocks with identical text.
                 now = _now_iso()
+                block_at = now.removesuffix("Z") + datetime.now(timezone.utc).strftime(".%fZ")
                 was_parked = it.get("status") == PARKED_STATUS
                 edge_from = _pa_edge_start(it)
                 _supersede_pending_unlocked(it, now)
@@ -8284,11 +8289,11 @@ def block(
                 it["needs_input"] = True
                 it["block_question"] = _clip(question, 4000)
                 it["block_kind"] = kind
-                it["blocked_at"] = now
+                it["blocked_at"] = block_at
                 it["updated_at"] = now
                 if wait_on:
                     it["wait"] = wait_record(wait_on, wait_actor, wait_ref,
-                                             block_at=now, by=str(session_id or ""))
+                                             block_at=block_at, by=str(session_id or ""))
                 else:
                     it.pop("wait", None)
                 if commit:
@@ -8393,13 +8398,17 @@ def _wait_gen_matches(it: Dict[str, Any], block_at: str) -> bool:
 def answer(ident: Any, text: str, session_id: str = "", **kwargs) -> Optional[Dict[str, Any]]:
     # Serialize takeover answers with cancellation and dispatch, then acquire
     # the ordinary store lock inside the implementation (one lock order).
+    if kwargs.get("answer_contract") is not None:
+        from . import conditional_answers
+        conditional_answers.require_local(ident)
     from . import takeover
     with takeover._lock():
         return _answer_impl(ident, text, session_id, **kwargs)
 
 
 def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = "human",
-           expect_wait_block_at: Optional[str] = None) -> Optional[Dict[str, Any]]:
+           expect_wait_block_at: Optional[str] = None,
+           answer_contract: Optional[dict] = None) -> Optional[Dict[str, Any]]:
     """Record a human answer on a blocked ticket and clear ``needs_input`` so the
     resumed session can continue. Answers are append-only, preserving a
     back-and-forth. A ticket with a resumable worker stays ``in_progress``;
@@ -8410,8 +8419,17 @@ def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = 
     dependency-closed answer, WT-37). ``expect_wait_block_at`` makes it a
     compare-and-swap: answer only while the ticket is still blocked on that
     dependency-wait generation, else return None without writing."""
+    if answer_contract is not None:
+        from . import conditional_answers as conditional
+        conditional.require_local(ident)
+        answer_contract = conditional.payload(answer_contract)
+        if (answer_contract["text"] != text or answer_contract["session_id"] != session_id
+                or answer_contract["by_kind"] != by_kind or expect_wait_block_at is not None):
+            raise ValueError("answer arguments differ from conditional payload")
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
+        if answer_contract is not None:
+            raise conditional.Unsupported("backend changed; conditional answer refused")
         if expect_wait_block_at is not None:
             cur = backend.get(ident)
             if not cur or not _wait_gen_matches(cur, expect_wait_block_at):
@@ -8431,10 +8449,15 @@ def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = 
                 queue=item.get("project", ""),
             )
         return item
-    with _FileLock(_lock_path()):
-        data = _load_unlocked()
+    with _FileLock(_lock_path()) as answer_lock:
+        if answer_contract is not None and answer_lock._fh is None:
+            raise conditional.Unsupported("source write lock unavailable")
+        data = _load_unlocked(strict=answer_contract is not None)
         for it in data["items"]:
             if _matches(it, ident):
+                if answer_contract is not None:
+                    if not conditional.prepare_unlocked(it, answer_contract):
+                        return it
                 if expect_wait_block_at is not None and not _wait_gen_matches(
                         it, expect_wait_block_at):
                     return None
