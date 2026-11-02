@@ -13,6 +13,7 @@ from .conditional_answers import Conflict, Unsupported, wait_kind
 
 RECEIPTS = "owner_wait_initialization_receipts"
 PROVENANCE = "owner_wait_initialization"
+REPAIR = "repair-supervised-owner-wait-v1"
 
 
 @contextmanager
@@ -74,11 +75,69 @@ def _eligible(item, settings):
         raise Conflict("not an eligible missing-episode local owner input wait")
 
 
-def _validate(request):
+def _eligible_supervised_repair(item, settings, identity):
+    """A resolved initialization followed by an unversioned supervised wait.
+
+    This is deliberately narrower than a generic force initializer. The old
+    durable receipt proves which stale wait remains; source history must show
+    that it was answered, and supervision must name the exact current question.
+    """
+    def refused():
+        raise Conflict("not an eligible stale supervised owner wait")
+    original = item.get(PROVENANCE)
+    original = original if isinstance(original, dict) else {}
+    receipts = item.get(RECEIPTS)
+    receipts = receipts if isinstance(receipts, dict) else {}
+    receipt = receipts.get(original.get('idempotency_key'))
+    wait = item.get('wait')
+    sup = item.get('supervision') or {}
+    backend = str(settings.get(item['project'], {}).get('backend') or 'file').strip().lower()
+    if (backend != 'file' or item.get('status') != 'in_progress'
+            or item.get('needs_input') is not True or item.get('needs_review')
+            or item.get('duplicate_of') or item.get('block_kind') not in (None, '', 'input')
+            or item.get('blocked_at') not in (None, '') or item.get('block_history')
+            or not isinstance(item.get('block_question'), str) or not item['block_question'].strip()
+            or not isinstance(wait, dict) or wait.get('on') != 'owner' or q.current_wait(item) is not None
+            or not isinstance(receipt, dict) or receipt.get('wait') != wait
+            or receipt.get('provenance') != original
+            or receipt.get('store_id') != identity or receipt.get('ref') != item.get('ref')
+            or receipt.get('idempotency_key') != original.get('idempotency_key')
+            or not wait.get('revision') or wait.get('block_at') != original.get('initialized_at')
+            or original.get('kind') != 'legacy-owner-wait-initialization'
+            or original.get('historical_block_time') != 'unknown'
+            or not isinstance(sup, dict) or sup.get('schema_version') != 1
+            or sup.get('state') != 'needs_input' or sup.get('reason') != item['block_question']
+            or sup.get('origin') not in ('explicit', 'legacy')):
+        refused()
+    try:
+        uuid.UUID(sup['session']['session_id'])
+        def stamp(value):
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                raise ValueError('timezone required')
+            return parsed
+        prior = stamp(original['initialized_at'])
+        answered = stamp(item['answered_at'])
+        history = item.get('history') or []
+        before = receipt['request']['expected_item'].get('history') or []
+        answers = [(i, h) for i, h in enumerate(history) if h.get('event') == 'answer']
+        if (answered < prior.replace(microsecond=0) or history[:len(before)] != before
+                or not answers or answers[-1][0] < len(before) or stamp(answers[-1][1]['at']) != answered
+                or any(h.get('event') == 'block' for h in history[answers[-1][0] + 1:])):
+            refused()
+    except (KeyError, TypeError, ValueError, AttributeError):
+        refused()
+
+
+def _validate(request, *, repair=False):
     fields = {"version", "idempotency_key", "expected_store_id", "expected_store_version",
               "expected_item", "expected_wait"}
+    if repair:
+        fields.add('operation')
     if not isinstance(request, dict) or set(request) != fields:
         raise ValueError("exact initialization request fields required")
+    if repair and request['operation'] != REPAIR:
+        raise ValueError('exact supervised repair operation required')
     if (type(request["version"]) is not int or request["version"] != 1
             or not isinstance(request["idempotency_key"], str) or not request["idempotency_key"].strip()
             or not isinstance(request["expected_store_id"], str)
@@ -90,12 +149,12 @@ def _validate(request):
     return copy.deepcopy(request)
 
 
-def initialize(ref, request=None, *, apply=False):
+def initialize(ref, request=None, *, apply=False, _repair=False):
     """Preview or apply one frozen request; receipt replay never reinitializes."""
     if apply and request is None:
         raise ValueError("--apply requires a frozen --request-json from a dry run")
     if request is not None:
-        request = _validate(request)
+        request = _validate(request, repair=_repair)
     with _source(apply) as (base, connection, data, settings, identity, version):
         # Identity precedes receipt access, including replay.
         if request is not None and request["expected_store_id"] != identity:
@@ -115,11 +174,16 @@ def initialize(ref, request=None, *, apply=False):
                     or q._canon(item) != q._canon(request["expected_item"])
                     or q._canon(q.current_wait(item)) != q._canon(request["expected_wait"])):
                 raise Conflict("source version, raw question, ticket or full wait changed")
-        _eligible(item, settings)
+        if _repair:
+            _eligible_supervised_repair(item, settings, identity)
+        else:
+            _eligible(item, settings)
         if request is None:
             request = {"version": 1, "idempotency_key": str(uuid.uuid4()),
                        "expected_store_id": identity, "expected_store_version": version,
                        "expected_item": copy.deepcopy(item), "expected_wait": copy.deepcopy(q.current_wait(item))}
+            if _repair:
+                request['operation'] = REPAIR
         if not apply:
             return {"dry_run": True, "replayed": False, "request": request, "receipt": None}
         # This is an initialization time, never a reconstruction of the old block.
@@ -147,3 +211,8 @@ def initialize(ref, request=None, *, apply=False):
             with storage.atomic_destination(base) as temporary:
                 temporary.write_text(json.dumps(data) + "\n")
         return {"dry_run": False, "replayed": False, "request": request, "receipt": copy.deepcopy(receipt)}
+
+
+def repair_supervised(ref, request=None, *, apply=False):
+    """Explicit, default-dry-run recovery; never answers or dispatches work."""
+    return initialize(ref, request, apply=apply, _repair=True)

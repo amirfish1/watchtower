@@ -3425,7 +3425,9 @@ def cmd_owner_wait_init(args: argparse.Namespace) -> int:
     from .conditional_answers import Conflict, Unsupported
     try:
         request = json.loads(args.request_json) if args.request_json is not None else None
-        result = owner_wait_init.initialize(args.ref, request, apply=args.apply)
+        action = (owner_wait_init.repair_supervised if getattr(args, 'repair_supervised', False)
+                  else owner_wait_init.initialize)
+        result = action(args.ref, request, apply=args.apply)
         print(json.dumps(result, sort_keys=True))
         return 0
     except (OSError, ValueError, q.sqlite3.Error) as exc:
@@ -7575,6 +7577,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--apply", action="store_true", help="explicitly apply the frozen request")
     s.add_argument("--json", action="store_true", help="JSON is always emitted")
     s.set_defaults(func=cmd_owner_wait_init)
+
+    s = sub.add_parser("owner-wait-repair", help="preview recovery of a stale supervised owner wait (default dry run)")
+    s.add_argument("ref")
+    s.add_argument("--request-json", default=None, help="exact frozen dry-run repair request")
+    s.add_argument("--apply", action="store_true", help="explicitly apply the frozen repair request")
+    s.add_argument("--json", action="store_true", help="JSON is always emitted")
+    s.set_defaults(func=cmd_owner_wait_init, repair_supervised=True)
 
     s = sub.add_parser("owner-blocks-export", help="read-only complete local owner-block snapshot")
     s.add_argument("--json", action="store_true", help="JSON is always emitted")

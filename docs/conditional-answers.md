@@ -313,5 +313,32 @@ Source settings are read without migration under the source lock; operators
 must not independently edit settings during a controlled apply. Existing
 persistent writers must be refreshed by their owner before controlled use so
 an old in-memory writer cannot discard additive metadata. This implementation
-does not refresh them or enable migration, answers, or producers. No live
-initialization has been performed by this implementation lane.
+does not automatically refresh them or enable migration, answers, or producers.
+
+### Recovering an answered initialization followed by an unversioned wait
+
+`wt owner-wait-repair EXAMPLE-1 --json` previews one narrowly supported recovery
+without changing the source. It requires an open supervised owner question
+whose episode is missing, with an exact stale owner wait from a retained
+initialization receipt. That receipt must belong to this ticket and store.
+Source history must preserve the pre-initialization history, show a subsequent
+answer, and contain no later block. The active supervision must name the exact
+current question. Duplicates, review gates, rationale approvals, nonowner waits,
+changed receipt evidence, and other malformed records are refused.
+
+The frozen request adds `operation: "repair-supervised-owner-wait-v1"` to the
+initialization envelope. Apply only that exact reviewed request:
+
+```sh
+wt owner-wait-repair EXAMPLE-1 --request-json '<exact frozen request>' --apply --json
+```
+
+The original initializer refuses repair requests and still refuses stale waits.
+Repair uses the same actual source lock, complete source version/item/wait CAS,
+store binding, transaction and durable replay contract. It replaces only the
+episode, wait revision/time, current initialization provenance, and receipt map;
+the old receipt remains. Question text, status, supervision, claims, history and
+answers remain unchanged. The new timestamp is the recovery time, explicitly
+labelled with unknown historical block time. No answer, transport, worker wake,
+producer activation or automatic recovery occurs. Re-export before considering
+any separately authorized answer.

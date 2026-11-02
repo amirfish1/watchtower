@@ -205,6 +205,131 @@ def test_stale_raw_owner_wait_is_not_revived(source):
         migration.initialize('EXAMPLE-1')
 
 
+@pytest.fixture
+def stale_supervised(source):
+    request = migration.initialize('EXAMPLE-1')['request']
+    migration.initialize('EXAMPLE-1', request, apply=True)
+    stamp = q._now_iso()
+    def change(item):
+        item.update(blocked_at=None, block_question='  New question?\n', block_kind='',
+                    answered_at=stamp,
+                    supervision=dict(schema_version=1, state='needs_input', origin='explicit',
+                        reason='  New question?\n', session=dict(
+                            session_id='11111111-2222-4333-8444-555555555555')))
+        item['history'].append(dict(event='answer', at=stamp, text='Prior answer'))
+    edit(source, change)
+    return source
+
+
+def test_supervised_repair_is_explicit_preserves_data_and_replays(stale_supervised):
+    source = stale_supervised
+    before = read(source)
+    with pytest.raises(Conflict):
+        migration.initialize('EXAMPLE-1')
+    preview = migration.repair_supervised('EXAMPLE-1')
+    assert preview['dry_run'] and preview['receipt'] is None
+    assert read(source) == before
+    request = preview['request']
+    assert request['operation'] == migration.REPAIR
+    with pytest.raises(ValueError):
+        migration.initialize('EXAMPLE-1', request, apply=True)
+    result = migration.repair_supervised('EXAMPLE-1', request, apply=True)
+    after = read(source)
+    changed = {k for k in set(before) | set(after) if before.get(k) != after.get(k)}
+    assert changed == {'blocked_at', 'wait', migration.PROVENANCE, migration.RECEIPTS}
+    assert after['blocked_at'] != before['wait']['block_at']
+    assert after['wait']['revision'] != before['wait']['revision']
+    assert after[migration.PROVENANCE]['historical_block_time'] == 'unknown'
+    assert after[migration.PROVENANCE]['historical_blocked_at'] is None
+    assert export.snapshot()['items'][0]['body'] == before['block_question']
+    assert set(before[migration.RECEIPTS]) < set(after[migration.RECEIPTS])
+    assert migration.repair_supervised('EXAMPLE-1', request, apply=True)['receipt'] == result['receipt']
+    assert read(source) == after
+
+
+@pytest.mark.parametrize('change', [
+    {'blocked_at': 'another-episode'}, {'wait': {'on': 'external', 'block_at': 'old'}},
+    {'supervision': {}}, {'supervision': {'state': 'running'}},
+    {'answered_at': None}, {'history': []}, {'needs_input': False},
+    {'status': 'in_review'}, {'duplicate_of': 'EXAMPLE-2'}, {'block_kind': 'rationale'},
+    {'block_question': 'Changed without matching supervision'},
+    {'owner_wait_initialization_receipts': {}},
+])
+def test_supervised_repair_ineligible_is_unchanged(stale_supervised, change):
+    edit(stale_supervised, lambda item: item.update(change))
+    before = read(stale_supervised)
+    with pytest.raises(Conflict):
+        migration.repair_supervised('EXAMPLE-1')
+    assert read(stale_supervised) == before
+
+
+@pytest.mark.parametrize('change', [
+    {'block_question': 'Different?'}, {'wait': {'on': 'owner', 'block_at': 'ABA'}},
+    {'supervision': {'state': 'running'}}, {'answers': ['New answer']},
+])
+def test_supervised_repair_full_source_cas(stale_supervised, change):
+    request = migration.repair_supervised('EXAMPLE-1')['request']
+    edit(stale_supervised, lambda item: item.update(change))
+    before = read(stale_supervised)
+    with pytest.raises(Conflict):
+        migration.repair_supervised('EXAMPLE-1', request, apply=True)
+    assert read(stale_supervised) == before
+
+
+def test_supervised_repair_rejects_later_block_even_same_second(stale_supervised):
+    def change(item):
+        item['history'].append(dict(event='block', at=item['answered_at'], question='Another wait'))
+    edit(stale_supervised, change)
+    with pytest.raises(Conflict):
+        migration.repair_supervised('EXAMPLE-1')
+
+
+def test_supervised_repair_cli_default_and_apply(stale_supervised, capsys):
+    assert cli.main(['owner-wait-repair', 'EXAMPLE-1', '--json']) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview['dry_run'] and read(stale_supervised)['blocked_at'] is None
+    assert cli.main(['owner-wait-repair', 'EXAMPLE-1', '--apply']) == 2
+    assert json.loads(capsys.readouterr().out)['error'] == 'invalid_request'
+    assert cli.main(['owner-wait-repair', 'EXAMPLE-1', '--request-json',
+                     json.dumps(preview['request']), '--apply']) == 0
+    assert json.loads(capsys.readouterr().out)['receipt']['provenance']['historical_block_time'] == 'unknown'
+
+
+def test_supervised_repair_dry_run_is_byte_preserving(stale_supervised):
+    base, _ = stale_supervised
+    paths = [p for p in base.parent.iterdir() if p.is_file()]
+    before = {p: p.read_bytes() for p in paths}
+    migration.repair_supervised('EXAMPLE-1')
+    assert {p: p.read_bytes() for p in paths} == before
+
+
+@pytest.mark.parametrize('proof', ['wrong-store', 'wrong-ref', 'wrong-wait', 'changed-history'])
+def test_supervised_repair_rejects_changed_receipt_proof(stale_supervised, proof):
+    def change(item):
+        receipt = item[migration.RECEIPTS][item[migration.PROVENANCE]['idempotency_key']]
+        if proof == 'wrong-store':
+            receipt['store_id'] = str(uuid.uuid4())
+        elif proof == 'wrong-ref':
+            receipt['ref'] = 'EXAMPLE-2'
+        elif proof == 'wrong-wait':
+            receipt['wait']['revision'] = 'different'
+        else:
+            receipt['request']['expected_item']['history'] = [{'event': 'comment', 'text': 'Absent'}]
+    edit(stale_supervised, change)
+    before = read(stale_supervised)
+    with pytest.raises(Conflict):
+        migration.repair_supervised('EXAMPLE-1')
+    assert read(stale_supervised) == before
+
+
+def test_supervised_repair_wrong_store_fenced_before_replay(stale_supervised):
+    request = migration.repair_supervised('EXAMPLE-1')['request']
+    migration.repair_supervised('EXAMPLE-1', request, apply=True)
+    request['expected_store_id'] = str(uuid.uuid4())
+    with pytest.raises(Conflict, match='identity'):
+        migration.repair_supervised('EXAMPLE-1', request, apply=True)
+
+
 def test_old_initialization_provenance_not_applied_to_new_episode(source):
     request = migration.initialize('EXAMPLE-1')['request']
     migration.initialize('EXAMPLE-1', request, apply=True)
