@@ -138,6 +138,18 @@ Each item contains `origin_id` (ticket ref), `project`, `generation`
 `expected_store_id` (the scope UUID), and `expected_wait` (the complete current record or null). These expected fields
 map directly to the conditional-answer request. `answerable` is false when an
 old record has no episode identity; do not submit such a record through CAS.
+
+New owner questions detected by same-session supervision, including its final
+reminder escalation, receive a microsecond block episode, an explicit owner wait
+with a random revision, and a block history event in the same source transaction.
+Repeated reads preserve that episode. An identical question after an answer is
+a new episode, so a frozen answer for the previous question fails the source
+check. This does not enable answering or send a message.
+
+Supervision preserves existing source waits and does not silently initialize
+legacy records with missing episodes. Those still require explicit, reviewed
+source repair; their historical block time cannot be inferred from a footer.
+
 `source_revision` is SHA-256 of
 `json.dumps([generation, body, "owner", expected_wait], sort_keys=True).encode()`.
 Freeze these source fields unchanged in the outbox; do not recompute them from

@@ -370,6 +370,128 @@ def test_footer_user_action_becomes_question(env):
     assert t.status(SID)['question']=='Choose the destination'
 
 
+@pytest.mark.parametrize('style', ['next-step', 'dependency', 'user-action'])
+def test_footer_owner_wait_exports_stable_episode(env, style):
+    from watchtower import owner_blocks_export as export
+    a = adopt(env)
+    obs = o.observe(SID, 'claude')
+    question = 'Choose the destination'
+    footer = dict(next_step_user=question if style == 'next-step' else 'None',
+                  completion=dict(decision_dependency=dict(score=1 if style == 'dependency' else 0),
+                                  remaining_actions=[dict(owner='user', text=question)]
+                                  if style == 'user-action' else []))
+    obs.update(completed_turn='owner-turn', footer=footer)
+    t._update(a['ticket'], a['generation'], lambda i, s: t._tick(i, obs, time.time()))
+    first = export.snapshot()['items'][0]
+    assert first['answerable'] is True
+    assert first['generation'] and '.' in first['generation']
+    assert first['expected_wait']['on'] == 'owner'
+    assert first['expected_wait']['block_at'] == first['generation']
+    assert first['expected_wait']['revision']
+    t.reconcile()
+    assert export.snapshot()['items'][0] == first
+    assert not env[3]
+
+
+def test_identical_footer_question_after_answer_is_new_episode(env, monkeypatch):
+    from watchtower import conditional_answers as ca, owner_blocks_export as export
+    from datetime import datetime, timezone
+    class FrozenClock:
+        @staticmethod
+        def now(zone):
+            return datetime(2026, 1, 15, 18, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(t, 'datetime', FrozenClock)
+    a = adopt(env)
+    obs = o.observe(SID, 'claude')
+    obs.update(completed_turn='question-1', footer=dict(next_step_user='Choose?',
+               completion=dict(decision_dependency=dict(score=1), remaining_actions=[])))
+    t._update(a['ticket'], a['generation'], lambda i, s: t._tick(i, obs, time.time()))
+    first = export.snapshot()['items'][0]
+    q.answer(a['ticket'], 'Use blue')
+    obs['completed_turn'] = 'question-2'
+    t._update(a['ticket'], a['generation'], lambda i, s: t._tick(i, obs, time.time()))
+    second = export.snapshot()['items'][0]
+    assert second['generation'] != first['generation']
+    assert second['expected_wait']['revision'] != first['expected_wait']['revision']
+    request = {k: first[k] for k in ('expected_blocked_at', 'expected_block_question',
+                                    'expected_wait_kind', 'expected_wait', 'expected_store_id')}
+    request.update(idempotency_key='stale-answer', text='Use red')
+    with pytest.raises(ca.Conflict):
+        ca.submit(a['ticket'], request)
+    assert ca.lookup(a['ticket'], 'stale-answer') is None
+    assert len([h for h in q.get(a['ticket'])['history'] if h['event'] == 'answer']) == 1
+    assert not env[3]
+
+
+@pytest.mark.parametrize('on', ['owner', 'external', 'dependency', 'worker'])
+def test_footer_adoption_preserves_existing_source_wait(env, on):
+    import copy
+    a = adopt(env)
+    q.block(a['ticket'], session_id=SID, question='Existing source question', wait_on=on)
+    before = q.get(a['ticket'])
+    item = copy.deepcopy(before)
+    footer = dict(next_step_user='A different footer question',
+                  completion=dict(decision_dependency=dict(score=1), remaining_actions=[]))
+    assert t._footer_wait(item, item['supervision'], footer, 'new-turn') is True
+    for field in ('block_question', 'blocked_at', 'block_kind', 'wait', 'history'):
+        assert item[field] == before[field]
+    assert item['supervision']['state'] == ('needs_input' if on == 'owner' else 'waiting')
+
+
+def test_footer_does_not_implicitly_initialize_legacy_wait(env):
+    a = adopt(env)
+    item = q.get(a['ticket'])
+    item.update(needs_input=True, block_question='Existing legacy question', blocked_at=None,
+                wait=dict(on='owner', block_at='old-episode', revision='old-revision'))
+    footer = dict(next_step_user='Another question',
+                  completion=dict(decision_dependency=dict(score=1), remaining_actions=[]))
+    assert t._footer_wait(item, item['supervision'], footer, 'new-turn') is True
+    assert item['blocked_at'] is None
+    assert item['block_question'] == 'Existing legacy question'
+    assert item['wait']['block_at'] == 'old-episode'
+
+
+def test_adoption_footer_wait_exports_and_conditional_answer_replays(env, monkeypatch):
+    from watchtower import conditional_answers as ca, owner_blocks_export as export
+    original = o.observe
+    def observed(*args, **kwargs):
+        obs = original(*args, **kwargs)
+        obs['footer'] = dict(next_step_user='Choose a destination',
+            completion=dict(decision_dependency=dict(score=1), remaining_actions=[]))
+        return obs
+    monkeypatch.setattr(o, 'observe', observed)
+    preview = t.takeover(SID, queue='TEST', title='Task', engine='claude', dry_run=True)
+    assert preview['state'] == 'needs_input' and q.list_items() == []
+    a = adopt(env)
+    first = export.snapshot()['items'][0]
+    request = {k: first[k] for k in ('expected_blocked_at', 'expected_block_question',
+                                    'expected_wait_kind', 'expected_wait', 'expected_store_id')}
+    request.update(idempotency_key='answer-once', text='  Use blue\nexactly  ')
+    receipt = ca.submit(a['ticket'], request)
+    assert receipt['accepted'] is True and receipt['work_completed'] is False
+    assert ca.submit(a['ticket'], request) == receipt
+    assert ca.lookup(a['ticket'], 'answer-once', first['expected_store_id']) == receipt
+    item = q.get(a['ticket'])
+    assert len([h for h in item['history'] if h['event'] == 'answer']) == 1
+    assert item['status'] == 'in_progress' and not item['needs_input']
+    assert not env[3]
+
+
+def test_reminder_escalation_exports_owner_episode(env):
+    from watchtower import owner_blocks_export as export
+    a = adopt(env)
+    obs = o.observe(SID, 'claude')
+    def escalate(i, s):
+        s.update(intent=None, reminders=t.MAX_REMINDERS, next_deadline=0)
+        t._tick(i, obs, time.time() + t.IDLE_SECONDS + 1)
+    t._update(a['ticket'], a['generation'], escalate)
+    row = export.snapshot()['items'][0]
+    assert row['answerable'] is True and row['generation']
+    assert row['expected_wait']['revision']
+    assert q.get(a['ticket'])['history'][-1]['event'] == 'takeover_escalation'
+    assert not env[3]
+
+
 def test_codex_racing_busy_turn_is_not_steered(env,monkeypatch):
     from watchtower import codex_rpc
     monkeypatch.setattr(codex_rpc,'is_available',lambda:True)

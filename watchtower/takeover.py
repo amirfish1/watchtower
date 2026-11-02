@@ -9,6 +9,7 @@ Cancellation fences dispatch, not an already accepted native turn.
 """
 from __future__ import annotations
 import copy
+from datetime import datetime, timedelta, timezone
 import json
 import time
 import uuid
@@ -68,6 +69,37 @@ def _claim(it, s):
                               engine=s['session']['engine'], pid=0))
 
 
+def _owner_question_unlocked(it, s, question, *, source, turn=''):
+    """Record a newly observed owner wait in the caller's queue transaction.
+
+    Existing waits, including malformed legacy waits, require their own explicit
+    resolution. Never rewrite their question, ownership or historical episode.
+    """
+    if it.get('needs_input'):
+        wait = q.current_wait(it)
+        s.update(state='waiting' if wait and wait['on'] != 'owner' else 'needs_input',
+                 reason=it.get('block_question') or question)
+        return
+    stamp = datetime.now(timezone.utc)
+    used = {h.get('at') for h in it.get('history', []) if h.get('event') == 'block'}
+    used.add(it.get('blocked_at'))
+    episode = stamp.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+    while episode in used:
+        stamp += timedelta(microseconds=1)
+        episode = stamp.isoformat(timespec='microseconds').replace('+00:00', 'Z')
+    edge = q._pa_edge_start(it)
+    q._supersede_pending_unlocked(it, episode)
+    it.update(needs_input=True, block_question=question, block_kind='input',
+              blocked_at=episode, updated_at=episode,
+              wait=q.wait_record('owner', block_at=episode, by=s['session']['session_id']))
+    it.pop('owner_wait_initialization', None)
+    q._append_history(it, 'block', by=q._by('system'), at=episode,
+                      question=question, kind='input', wait_on='owner',
+                      source=source, turn=turn, session_id=s['session']['session_id'])
+    q._check_answer_edge_from(it, edge)
+    s.update(state='needs_input', reason=question)
+
+
 def _footer_wait(it, s, f, turn):
     """Honor recorded owner/external waits at adoption and on fresh turns."""
     if not f:
@@ -75,15 +107,13 @@ def _footer_wait(it, s, f, turn):
     next_user = f['next_step_user']
     if next_user.lower().rstrip('.') != 'none' or f['completion']['decision_dependency']['score'] > 0:
         question = next_user if next_user.lower().rstrip('.') != 'none' else 'Owner decision recorded in session footer'
-        s.update(state='needs_input', reason=question)
-        it.update(needs_input=True, block_question=question)
+        _owner_question_unlocked(it, s, question, source='takeover-footer', turn=turn)
         return True
     actions = f['completion']['remaining_actions']
     user_actions = [a for a in actions if isinstance(a, dict) and a.get('owner') == 'user']
     if user_actions:
         question = '; '.join(str(a.get('text') or 'Owner action required') for a in user_actions)
-        s.update(state='needs_input', reason=question)
-        it.update(needs_input=True, block_question=question)
+        _owner_question_unlocked(it, s, question, source='takeover-footer', turn=turn)
         return True
     external = [a for a in actions if isinstance(a, dict) and a.get('owner') == 'external']
     if external:
@@ -347,8 +377,9 @@ def _tick(it, obs, now):
     if now < max(float(s['next_deadline']),float(obs['activity_at'])+IDLE_SECONDS):
         return
     if s['reminders']>=MAX_REMINDERS:
-        s.update(state='needs_input',reason='Three confirmed work reminders exhausted; owner must review the retained session')
-        it.update(needs_input=True,block_question=s['reason'])
+        _owner_question_unlocked(it, s,
+            'Three confirmed work reminders exhausted; owner must review the retained session',
+            source='takeover-escalation', turn=s['processed_turn'])
         q._append_history(it,'takeover_escalation',by=q._by('system'),reason=s['reason'])
         return
     _intent(s,'remind',f"WatchTower reminder for {it['ref']}: continue the remaining authorized work in this same session. "
