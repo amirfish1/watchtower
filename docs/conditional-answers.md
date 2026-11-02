@@ -210,3 +210,96 @@ already used null-bound key changes the payload and conflicts; preserve the
 original request rather than silently upgrading a replay. Consumers of the
 previous experimental path-hash scope must import the new UUID scope explicitly;
 they must not reinterpret a path hash as this durable identity.
+
+## Explicit legacy owner episode initialization (inert, opt-in)
+
+An old owner input wait can have `blocked_at: null` and no block history. Its
+historical episode and block date are **unknown**. Never derive a generation
+from a hash, title, question number, or guessed historical timestamp.
+
+The separate `owner-wait-initialization-v1` capability provides:
+
+```sh
+wt owner-wait-init EXAMPLE-1 --json
+# Review and retain the exact response.request; no source metadata is changed.
+wt owner-wait-init EXAMPLE-1 --request-json '<exact response.request JSON>' --apply --json
+```
+
+The first command defaults to **DRY RUN**. `--apply` requires the frozen request;
+there is no implicit preview-and-apply mode. Both emit an envelope:
+
+```json
+{"dry_run":true,"replayed":false,"request":{"version":1,"idempotency_key":"random-attempt-UUID","expected_store_id":"persisted-store-UUID","expected_store_version":{"revision":1,"snapshot_sha256":"full-source-content-hash"},"expected_item":{},"expected_wait":null},"receipt":null}
+```
+
+`expected_item` in a real preview is the **complete raw source item**, not the
+empty documentation placeholder. It freezes exact raw question, status,
+`needs_input`, raw wait, ref, owner, answer/routing fields and all other fields;
+`expected_wait` separately freezes the entire current wait or null. The source
+version is exactly the export's `store_version`, including its full content
+hash and SQLite revision (null revision for legacy JSON). All request fields
+are required; unknown fields are rejected. JSON object key order is irrelevant;
+JSON scalar types and whitespace within strings are significant. Persist the
+entire request rather than constructing a reduced payload from display text.
+
+Only exact unique refs in an existing local store are supported. Admission
+requires a nonclosed, nonreview `needs_input: true` owner input wait with a
+nonblank raw question, missing episode (null, empty or absent), no block history
+and no previous initialization provenance. Duplicate followers, review requests,
+rationale, external, dependency, worker and unknown waits are refused. Any raw
+wait must itself be a current owner record; stale owner metadata is not revived.
+Known block history is refused rather than interpreted by this migration.
+
+A persisted random store UUID is mandatory; this command never initializes one.
+It opens the **existing actual source lock**, shared for dry run and exclusive
+for apply, nonblocking and fail closed. The store UUID is checked before receipt
+replay. First application requires exact full store version, raw item and current
+wait CAS under that lock. SQLite also holds `BEGIN IMMEDIATE` through validation
+and commit. Receipt and metadata are atomic in the same item transaction; JSON
+is atomically replaced in place without conversion to SQLite. Missing stores,
+locks, identity or required ref/settings migrations are refused. No ordinary
+save/duplicate synchronization, schema migration, answer delivery, ticket
+history event, worker contact, producer activation or service refresh occurs.
+
+Apply creates a new microsecond UTC episode at actual initialization time,
+a random wait `revision`, and a full owner wait. Existing actor/ref/by/note/host
+and extra wait fields are retained; `block_at`, `at` and `revision` describe the
+new initialization. All other existing source fields, including exact question,
+status, title, ticket ref, owner, answers, routing and `updated_at`, are preserved.
+Only `blocked_at`, `wait`, `owner_wait_initialization` provenance, the receipt
+map and SQLite source revision change. The content hash is a CAS token only,
+never an episode. A timestamp collision with a current episode refuses apply.
+
+Provenance is additive, persisted and exported as `episode_provenance`:
+
+```json
+{"version":1,"kind":"legacy-owner-wait-initialization","initialized_at":"2026-10-01T12:00:00.123456Z","historical_blocked_at":null,"historical_block_time":"unknown","idempotency_key":"random-attempt-UUID"}
+```
+
+Consumers must label this **initialized at**, with historical block time unknown,
+not "blocked since" that date. Export returns null provenance for ordinary
+records or when a later episode supersedes initialization. Export's schema stays
+v1; its capabilities add `owner-wait-initialization-v1`. Existing conditional
+answer fields, source revision calculation and answer semantics are unchanged.
+After application, consumers must re-export and explicitly freeze the new
+full wait/episode before any separately authorized answer.
+
+Successful apply returns `dry_run:false`, `replayed:false` and an immutable
+receipt retained in `owner_wait_initialization_receipts[idempotency_key]`.
+It contains version, ref, store_id, key, initialized_at, blocked_at, full wait,
+provenance and the exact request. Repeating the same ref/key/payload returns that
+receipt with `replayed:true` even after later edits/close; it never changes the
+source again. A same-key changed payload, wrong store or stale first-application
+snapshot yields exit 2 `conflict`. Invalid envelopes yield exit 2
+`invalid_request`, unsupported prerequisites `unsupported`, and I/O/SQLite/lock
+failures `unavailable`. No refusal permits an unguarded fallback. Dry runs with
+a retained request also support read-only receipt reconciliation and replay.
+
+The full-store fence deliberately invalidates preview after unrelated source
+edits, favoring safety over throughput; a fresh preview needs review again.
+Source settings are read without migration under the source lock; operators
+must not independently edit settings during a controlled apply. Existing
+persistent writers must be refreshed by their owner before controlled use so
+an old in-memory writer cannot discard additive metadata. This implementation
+does not refresh them or enable migration, answers, or producers. No live
+initialization has been performed by this implementation lane.

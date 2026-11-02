@@ -3416,6 +3416,21 @@ def cmd_answer_store_init(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_owner_wait_init(args: argparse.Namespace) -> int:
+    from . import owner_wait_init
+    from .conditional_answers import Conflict, Unsupported
+    try:
+        request = json.loads(args.request_json) if args.request_json is not None else None
+        result = owner_wait_init.initialize(args.ref, request, apply=args.apply)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except (OSError, ValueError, q.sqlite3.Error) as exc:
+        kind = ("conflict" if isinstance(exc, Conflict) else "unsupported" if isinstance(exc, Unsupported)
+                else "invalid_request" if isinstance(exc, ValueError) else "unavailable")
+        print(json.dumps({"error": kind, "message": str(exc)}))
+        return 2
+
+
 def cmd_owner_blocks_export(args: argparse.Namespace) -> int:
     from . import owner_blocks_export
     try:
@@ -7546,6 +7561,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("answer-store-init", help="initialize durable local store identity metadata")
     s.add_argument("--json", action="store_true", help="JSON is always emitted")
     s.set_defaults(func=cmd_answer_store_init)
+
+    s = sub.add_parser("owner-wait-init", help="preview legacy owner episode initialization (default dry run)")
+    s.add_argument("ref")
+    s.add_argument("--request-json", default=None, help="exact frozen dry-run request")
+    s.add_argument("--apply", action="store_true", help="explicitly apply the frozen request")
+    s.add_argument("--json", action="store_true", help="JSON is always emitted")
+    s.set_defaults(func=cmd_owner_wait_init)
 
     s = sub.add_parser("owner-blocks-export", help="read-only complete local owner-block snapshot")
     s.add_argument("--json", action="store_true", help="JSON is always emitted")

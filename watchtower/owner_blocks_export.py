@@ -12,7 +12,7 @@ from .conditional_answers import Unsupported, wait_kind
 
 
 CAPABILITIES = ["conditional-owner-answer-v1", "answer-receipt-v1", "owner-blocks-export-v1",
-                "store-identity-v1"]
+                "store-identity-v1", "owner-wait-initialization-v1"]
 
 
 def _digest(value):
@@ -122,6 +122,9 @@ def snapshot():
             "expected_wait_kind": "owner", "expected_store_id": identity, "block_kind": str(item.get("block_kind") or ""),
             "source_revision": _digest([episode, question, "owner", wait]),
             "answerable": bool(episode),
+            "episode_provenance": item.get("owner_wait_initialization") if (
+                isinstance(item.get("owner_wait_initialization"), dict) and
+                item["owner_wait_initialization"].get("initialized_at") == episode) else None,
         })
     rows.sort(key=lambda row: row["origin_id"])
     return {
