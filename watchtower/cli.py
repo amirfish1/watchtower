@@ -982,6 +982,10 @@ def cmd_add(args: argparse.Namespace) -> int:
             return 1
         item = runnable
         print(f"RUNNABLE: {item['ref']}  {item.get('title') or item.get('note', '')}")
+    if getattr(args, "no_dispatch", False):
+        # Scheduled batch filers leave staffing to the daemon's next pass;
+        # synchronous per-ticket reconciliation can exhaust their job budget.
+        return 0
     # Decide + act on the new ticket NOW (nudge current staffing via FIFO, else
     # gracefully release verified-idle staffing and spawn) and log the
     # decision. Centralized in
@@ -7059,6 +7063,9 @@ def build_parser() -> argparse.ArgumentParser:
                              help="request a run and dispatch now (like wt run): bypass "
                                   "grace and auto-drain policy for this ticket; "
                                   "dependencies, planning and worker capacity still apply")
+    disposition.add_argument("--no-dispatch", action="store_true",
+                             help="persist the ticket without immediate worker dispatch; "
+                                  "the daemon picks it up under normal queue policy")
     s.add_argument("--group-parent", action="store_true", dest="group_parent",
                    help="file a plan-group parent (WT-33): one plan for its members, "
                         "one integration check after they all close; never claimed")

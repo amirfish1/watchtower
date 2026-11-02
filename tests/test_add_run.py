@@ -3,6 +3,32 @@
 import pytest
 
 
+def test_add_no_dispatch_persists_for_later_reconcile(wt_env, run_cli, monkeypatch):
+    wt_env.config.set_auto_drain("Q", True)
+    wt_env.config.set_repo_path("Q", str(wt_env.tmp))
+    wt_env.config.set_grace_s("Q", 0)
+    dispatched = []
+    monkeypatch.setattr(wt_env.workers, "dispatch_after_enqueue",
+                        lambda *a: dispatched.append(a) or "")
+    result = run_cli("add", "-q", "Q", "--title", "scheduled finding",
+                     "--no-dispatch")
+    assert result.code == 0, result.output
+    item, = wt_env.queue.list_items(project="Q")
+    assert item["ref"] in result.out
+    assert item["status"] == "open"
+    assert wt_env.queue.count_claimable(project="Q") == 1
+    assert dispatched == []
+
+
+@pytest.mark.parametrize("conflict", ["--claim", "--run"])
+def test_add_no_dispatch_rejects_immediate_disposition(wt_env, run_cli, conflict):
+    result = run_cli("add", "-q", "Q", "--title", "conflict",
+                     "--no-dispatch", conflict)
+    assert result.code != 0
+    assert "error:" in result.err
+    assert wt_env.queue.list_items(project="Q") == []
+
+
 @pytest.mark.parametrize("auto_drain", [False, True])
 def test_add_run_dispatches_before_returning(wt_env, run_cli, monkeypatch, auto_drain):
     wt_env.config.set_auto_drain("Q", auto_drain)
