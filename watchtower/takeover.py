@@ -240,7 +240,7 @@ def answer_unlocked(it, text, now):
     s=it['supervision']
     s['answer_generation']=int(s.get('answer_generation',0))+1
     _claim(it,s)
-    it.pop('pending_answer',None)
+    q._supersede_pending_unlocked(it, now)
     it.pop('parked',None)
     it.update(needs_input=False, block_question='', block_kind='', blocked_at=None)
     if s['state'] in TERMINAL:

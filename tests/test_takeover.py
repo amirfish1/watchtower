@@ -133,6 +133,22 @@ def test_cancelled_answer_is_held(env):
     t.reconcile(); assert not env[3]
 
 
+def test_takeover_answer_preserves_superseded_legacy_answer(env):
+    a=adopt(env)
+    q.block(a['ticket'],session_id=SID,question='Choose?',origin='worker')
+    with q._FileLock(q._lock_path()):
+        data=q._load_unlocked(strict=True)
+        it=next(it for it in data['items'] if it['ref']==a['ticket'])
+        q._write_pending_answer_unlocked(it, 'Earlier guidance', q._now_iso())
+        q._save_unlocked(data)
+    q.answer(a['ticket'], 'Continue with the new guidance')
+    it=q.get(a['ticket'])
+    assert not it.get('pending_answer')
+    assert it['carried_answers'][-1]['answer']=='Earlier guidance'
+    assert any(row['event']=='superseded' for row in it['history'])
+    assert 'Continue with the new guidance' in it['supervision']['intent']['text']
+
+
 def test_reminders_only_count_confirmed_and_bound(env):
     a=adopt(env); now=time.time()
     t.reconcile(now=now)
