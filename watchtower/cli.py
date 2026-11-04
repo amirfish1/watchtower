@@ -1460,6 +1460,15 @@ def _plan_supplement_review_goal(item: dict) -> str:
     )
 
 
+def _resume_env(engine: str, sid: str) -> dict:
+    """Resume env; a Codex session resumes in the account home that holds it."""
+    env = workers.compact_env()
+    home = workers._codex_spawn_home(engine, sid)
+    if home:
+        env["CODEX_HOME"] = home
+    return env
+
+
 def _spawn_plan_role(item: dict, role: str, goal: str = "", name: str = "") -> bool:
     """Shim (WT-24): the daemon spawns planner / reviewer sessions. The ticket's
     plan state is the intent; this only wakes the daemon."""
@@ -3180,7 +3189,7 @@ def _resume_session_headless(
             proc = subprocess.Popen(
                 argv, stdin=subprocess.DEVNULL, stdout=logf,
                 stderr=subprocess.STDOUT, start_new_session=True,
-                cwd=repo or os.getcwd(), env=workers.compact_env(),
+                cwd=repo or os.getcwd(), env=_resume_env(engine, sid),
             )
         finally:
             logf.close()

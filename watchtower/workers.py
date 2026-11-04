@@ -160,8 +160,26 @@ def _worker_runbook_ref() -> str:
     return _WORKER_RUNBOOK_URL
 
 
+def _codex_spawn_home(engine: str, session_id: str = "") -> str:
+    """CODEX_HOME for a Codex spawn: a resumed session stays in the home that
+    holds it; a fresh one uses the account CCC picked for workers. "" means
+    inherit the default."""
+    if str(engine or "").lower() != "codex":
+        return ""
+    from . import config
+    try:
+        home = (config.codex_home_for_session(session_id) if session_id
+                else config.codex_worker_home())
+        if home is None or home.resolve() == config.codex_default_home().resolve():
+            return ""
+        return str(home)
+    except OSError:
+        return ""
+
+
 def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "",
-               ref: str = "", queue: str = "", role: str = "") -> Dict[str, str]:
+               ref: str = "", queue: str = "", role: str = "",
+               codex_home: str = "") -> Dict[str, str]:
     """Environment for a spawned worker subprocess.
 
     The child inherits the parent's environment so legitimate overrides
@@ -196,6 +214,9 @@ def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "
     for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "WT_MESSAGE_ENVELOPE"):
         env.pop(key, None)
     env["WT_WORKER_COMMIT"] = "1"
+    # Which Codex account (subscription) the worker runs on: its CLI home.
+    if codex_home:
+        env["CODEX_HOME"] = codex_home
     env.pop("WT_VERIFY", None)
     env.pop("WT_WORKER_ID", None)
     if worker_id:
@@ -238,14 +259,15 @@ def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "
 _CODEX_EXECPOLICY_RULE = 'prefix_rule(pattern=["wt"], decision="allow")'
 
 
-def ensure_codex_wt_execpolicy() -> bool:
+def ensure_codex_wt_execpolicy(codex_home: Optional[Path] = None) -> bool:
     """Idempotently allow `wt` in Codex's user execpolicy (`$CODEX_HOME/rules`).
 
     Writes a WatchTower-owned ``watchtower.rules`` file next to Codex's own
     ``default.rules``. No-op when Codex isn't set up (no home dir), when the
     rule is already present, or on any OS error -- never raises. Returns True
     when the rule is in place."""
-    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    codex_home = Path(codex_home) if codex_home else Path(
+        os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
     try:
         if not codex_home.is_dir():
             return False
@@ -972,18 +994,27 @@ def _codex_rollout_mtime(w: Dict[str, Any]) -> float:
     session_id = str(w.get("session_id") or "").strip()
     if not session_id:
         return 0.0
-    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-    sessions = codex_home / "sessions"
+    from . import config
     newest = 0.0
-    try:
-        for path in sessions.glob(f"*/*/*/*{session_id}.jsonl"):
-            try:
-                newest = max(newest, path.stat().st_mtime)
-            except OSError:
-                continue
-    except OSError:
-        return 0.0
+    for codex_home in _worker_codex_homes(w, config):
+        try:
+            for path in (codex_home / "sessions").glob(f"*/*/*/*{session_id}.jsonl"):
+                try:
+                    newest = max(newest, path.stat().st_mtime)
+                except OSError:
+                    continue
+        except OSError:
+            continue
     return newest
+
+
+def _worker_codex_homes(w: Dict[str, Any], config) -> List[Path]:
+    """The worker's recorded Codex home first, then every known home."""
+    homes = list(config.codex_homes())
+    recorded = str((w or {}).get("codex_home") or "").strip()
+    if recorded and Path(recorded).is_dir():
+        homes = [Path(recorded)] + [h for h in homes if str(h) != recorded]
+    return homes
 
 
 def _claude_transcript_mtime(w: Dict[str, Any]) -> float:
@@ -1051,17 +1082,20 @@ def _codex_rollout_path(session_id: str) -> Optional[Path]:
     session_id = str(session_id or "").strip()
     if not session_id:
         return None
-    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-    key = (str(codex_home), session_id)
+    from . import config
+    homes = config.codex_homes()
+    key = (tuple(str(h) for h in homes), session_id)
     cached = _CODEX_ROLLOUT_CACHE.get(key)
     if cached and os.path.exists(cached):
         return Path(cached)
-    try:
-        found = sorted(
-            (codex_home / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")
-        )
-    except OSError:
-        return None
+    found: List[Path] = []
+    for codex_home in homes:
+        try:
+            found += sorted(
+                (codex_home / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")
+            )
+        except OSError:
+            continue
     if not found:
         return None
     _CODEX_ROLLOUT_CACHE[key] = str(found[-1])
@@ -1961,12 +1995,20 @@ def _engine_activity(w: Dict[str, Any]) -> Dict[str, Any]:
     if not session_id:
         return _file_activity(None, f"{engine or 'engine'}_activity")
     if engine == "codex":
-        home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+        from . import config
+        homes = _worker_codex_homes(w, config)
         pattern = f"*/*/*/*{session_id}.jsonl"
+
+        def _all_rollouts():
+            for home in homes:
+                try:
+                    yield from (home / "sessions").glob(pattern)
+                except OSError:
+                    continue
         return _matched_activity(
-            (home / "sessions").glob(pattern),
+            _all_rollouts(),
             "codex_rollout",
-            str(home / "sessions" / pattern),
+            str(homes[0] / "sessions" / pattern),
         )
     if engine == "claude":
         home = Path(
@@ -4609,6 +4651,7 @@ def record_worker(
     ticket_queue: str = "",
     exit_file: str = "",
     parent_session_id: str = "",
+    codex_home: str = "",
 ) -> Dict[str, Any]:
     with _WorkersFileLock():
         data = _load()
@@ -4635,6 +4678,8 @@ def record_worker(
             rec["ticket_queue"] = ticket_queue
         if exit_file:
             rec["exit_file"] = exit_file
+        if codex_home:
+            rec["codex_home"] = codex_home
         if session_id:
             rec["session_id"] = session_id
         if parent_session_id and parent_session_id != session_id:
@@ -5274,6 +5319,9 @@ def build_drain_command(
         # Best-effort, idempotent: keep `wt` runnable in turns that do NOT
         # inherit the bypass flag below (see ensure_codex_wt_execpolicy).
         ensure_codex_wt_execpolicy()
+        worker_home = config.codex_worker_home()
+        if worker_home is not None:
+            ensure_codex_wt_execpolicy(worker_home)
         argv = [
             bin_name,
             "exec",
@@ -7930,6 +7978,7 @@ def spawn_workers(
             if launch_failures is not None:
                 launch_failures.append(failure)
             continue
+        worker_codex_home = _codex_spawn_home(engine)
         logf = open(log_path, "ab")
         # claude workers get a stream-json FIFO stdin so they stay live and
         # pushable; one-shot engines (codex exec, kimi -p) keep the goal in
@@ -7949,7 +7998,7 @@ def spawn_workers(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 cwd=repo_path,
-                env=_spawn_env(worker_id, role="worker"),
+                env=_spawn_env(worker_id, role="worker", codex_home=worker_codex_home),
             )
         except OSError as e:
             popen_error = e
@@ -8007,7 +8056,7 @@ def spawn_workers(
             continue
         rec = record_worker(
             proc.pid, queue, engine, worker_id, repo_path, str(log_path),
-            fifo=fifo_path or "", model=model, kind=kind,
+            fifo=fifo_path or "", model=model, kind=kind, codex_home=worker_codex_home,
         )
         rec["argv"] = argv
         rec["_spawn_index"] = spawn_index
@@ -8064,6 +8113,7 @@ def spawn_run_once_worker(
     log_dir = WORKERS_FILE.parent / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{worker_id}.log"
+    worker_codex_home = _codex_spawn_home(engine)
     logf = open(log_path, "ab")
     fifo_path = None
     child_stdin_fd = None
@@ -8078,7 +8128,7 @@ def spawn_run_once_worker(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             cwd=repo_path,
-            env=_spawn_env(worker_id, role="worker"),
+            env=_spawn_env(worker_id, role="worker", codex_home=worker_codex_home),
         )
     finally:
         logf.close()
@@ -8092,7 +8142,7 @@ def spawn_run_once_worker(
             _close_fd_quiet(None)
     rec = record_worker(
         proc.pid, queue, engine, worker_id, repo_path, str(log_path),
-        fifo=fifo_path or "", model=model, ref=ref,
+        fifo=fifo_path or "", model=model, ref=ref, codex_home=worker_codex_home,
     )
     rec["argv"] = argv
     if effort:
@@ -8382,6 +8432,7 @@ def spawn_adhoc(
         argv = [sys.executable, str(Path(__file__).with_name("_exitwrap.py")),
                 "--exit-file", exit_file, "--"] + list(argv)
         _spawn_gate(engine)
+    worker_codex_home = _codex_spawn_home(engine, session_id)
     logf = open(log_path, "ab")
     stdin = open(prompt_file, "rb") if prompt_stdin else subprocess.DEVNULL
     try:
@@ -8394,7 +8445,7 @@ def spawn_adhoc(
             cwd=repo_path,
             env=_spawn_env(worker_id, verify=verify, session_id=session_id,
                            ref=ticket_ref, queue=ticket_queue,
-                           role=stage or "adhoc"),
+                           role=stage or "adhoc", codex_home=worker_codex_home),
         )
     finally:
         logf.close()
@@ -8407,6 +8458,7 @@ def spawn_adhoc(
         # The session running `wt spawn` (worker or a user's agent session) is
         # the parent, so CCC nests the spawn under it and its idea ticket.
         parent_session_id=origins.caller_session_id(),
+        codex_home=worker_codex_home,
     )
     rec["argv"] = argv
     if stage:

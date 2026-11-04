@@ -65,7 +65,12 @@ def _paths(engine, sid=''):
     if not root.is_dir():
         raise OSError(f'{engine} native store unavailable: {root}')
     pattern = f'*/{sid or "*"}.jsonl' if engine == 'claude' else f'*/*/*/*{sid}.jsonl'
-    return root.glob(pattern)
+    if engine != 'codex':
+        return root.glob(pattern)
+    # Workers may run under another Codex account's home (CCC worker account).
+    from . import config
+    roots = [root] + [h / 'sessions' for h in config.codex_homes() if (h / 'sessions') != root and (h / 'sessions').is_dir()]
+    return (p for r in roots for p in r.glob(pattern))
 
 
 def _empty(session_id, engine='', source='native'):

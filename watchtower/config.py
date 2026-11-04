@@ -861,6 +861,88 @@ def _ccc_worker_effort_default() -> str:
         return ""
 
 
+def _ccc_spawn_defaults() -> Dict[str, Any]:
+    try:
+        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def codex_default_home() -> Path:
+    """The Codex home this process (and an un-overridden child) uses."""
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex")).expanduser()
+
+
+def _codex_home_or_none(value: Any) -> Optional[Path]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    path = Path(text).expanduser()
+    return path if path.is_absolute() and path.is_dir() else None
+
+
+def codex_worker_home() -> Optional[Path]:
+    """Codex home queue workers should run in, or None for the default.
+
+    CCC writes ``worker_codex_home`` into spawn-defaults.json when the owner
+    picks which Codex account (primary/secondary subscription) runs workers.
+    A missing or vanished directory means the default home, never a failure.
+    """
+    home = _codex_home_or_none(_ccc_spawn_defaults().get("worker_codex_home"))
+    if home is None:
+        return None
+    try:
+        if home.resolve() == codex_default_home().resolve():
+            return None
+    except OSError:
+        return None
+    return home
+
+
+def codex_homes() -> List[Path]:
+    """Every Codex home a worker's session may live in, default first.
+
+    Workers launched while another account was selected keep running in
+    that account's home, so lookups search all homes CCC knows about
+    (``codex_account_homes``) plus the current worker home.
+    """
+    data = _ccc_spawn_defaults()
+    raw = data.get("codex_account_homes")
+    candidates = [codex_default_home(), data.get("worker_codex_home")]
+    if isinstance(raw, list):
+        candidates += raw[:16]
+    out: List[Path] = []
+    seen = set()
+    for item in candidates:
+        home = item if isinstance(item, Path) else _codex_home_or_none(item)
+        if home is None:
+            continue
+        try:
+            key = str(home.resolve())
+        except OSError:
+            continue
+        if key not in seen:
+            seen.add(key)
+            out.append(home)
+    return out
+
+
+def codex_home_for_session(session_id: str) -> Optional[Path]:
+    """The Codex home holding ``session_id``'s rollout, or None if unknown."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    for home in codex_homes():
+        try:
+            if next((home / "sessions").glob(f"*/*/*/*{sid}.jsonl"), None) is not None:
+                return home
+        except OSError:
+            continue
+    return None
+
+
 def worker_auto_compact_tokens() -> int:
     """Auto-compact threshold in tokens for workers, from CCC's
     spawn-defaults.json ``worker_auto_compact_k`` (thousands; the same

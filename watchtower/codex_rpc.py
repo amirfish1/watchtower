@@ -299,6 +299,23 @@ def _rollout_exists_on_disk(thread_id: Any) -> bool:
         return False
 
 
+def _thread_in_other_home(thread_id: Any) -> bool:
+    """True when the thread lives under another Codex account's home.
+
+    WT's private app-server runs on the default home and cannot load it;
+    CCC (the delegate) routes such threads to the right account process.
+    """
+    sid = str(thread_id or "").strip()
+    if not sid:
+        return False
+    try:
+        from . import config
+        home = config.codex_home_for_session(sid)
+        return home is not None and home.resolve() != config.codex_default_home().resolve()
+    except (OSError, ImportError):
+        return False
+
+
 def _track_thread_health(method: str, thread_id: Any, response: Dict[str, Any]) -> None:
     """Recycle a wedged app-server child on verified false 'thread not found'.
 
@@ -425,6 +442,8 @@ def deliver(
     failure all come back as a plain failed result so ``messages.deliver`` can
     fall through to the next adapter (delegate or outbox)."""
     total_start = time.monotonic()
+    if _thread_in_other_home(thread_id):
+        return {"ok": False, "error": "thread belongs to another Codex account; delegate delivers it", "stage": "account"}
     settings = dict(session_settings or {})
     if idle_only and (not settings.get("model") or not settings.get("approval_policy")
                       or (settings.get("sandbox_policy") or {}).get("type") not in

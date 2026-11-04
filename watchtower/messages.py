@@ -597,21 +597,22 @@ def _find_transcript(sid: str) -> Optional[Path]:
 
 def _find_codex_rollout(sid: str) -> Optional[Path]:
     """Locate the newest durable Codex rollout for a thread, if any."""
-    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    from . import config
     newest: Optional[Path] = None
     newest_mtime = -1.0
-    try:
-        paths = codex_home.joinpath("sessions").glob(f"*/*/*/*{sid}.jsonl")
-        for path in paths:
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            if mtime > newest_mtime:
-                newest = path
-                newest_mtime = mtime
-    except OSError:
-        return None
+    for codex_home in config.codex_homes():
+        try:
+            paths = codex_home.joinpath("sessions").glob(f"*/*/*/*{sid}.jsonl")
+            for path in paths:
+                try:
+                    mtime = path.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime > newest_mtime:
+                    newest = path
+                    newest_mtime = mtime
+        except OSError:
+            continue
     return newest
 
 
