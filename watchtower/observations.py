@@ -69,7 +69,7 @@ def _paths(engine, sid=''):
         return root.glob(pattern)
     # Workers may run under another Codex account's home (CCC worker account).
     from . import config
-    roots = [root] + [h / 'sessions' for h in config.codex_homes() if (h / 'sessions') != root and (h / 'sessions').is_dir()]
+    roots = [root] + [r for r in config.codex_session_roots() if r.resolve() != root.resolve()]
     return (p for r in roots for p in r.glob(pattern))
 
 

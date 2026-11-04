@@ -929,14 +929,70 @@ def codex_homes() -> List[Path]:
     return out
 
 
+def codex_session_roots(first: Any = None) -> List[Path]:
+    """Distinct ``sessions`` dirs across Codex homes (``first`` home first).
+
+    Account homes often symlink ``sessions`` to the default home's, so the
+    same rollout must not be scanned (or counted) once per home.
+    """
+    homes = codex_homes()
+    first_home = _codex_home_or_none(first)
+    if first_home is not None:
+        homes = [first_home] + homes
+    out: List[Path] = []
+    seen = set()
+    for home in homes:
+        root = home / "sessions"
+        try:
+            key = str(root.resolve())
+        except OSError:
+            continue
+        if key not in seen and root.is_dir():
+            seen.add(key)
+            out.append(root)
+    return out
+
+
+def _codex_state_has_thread(home: Path, sid: str) -> bool:
+    import sqlite3
+    for db in sorted(home.glob("state*.sqlite"), reverse=True):
+        try:
+            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.25)
+            try:
+                if con.execute("SELECT 1 FROM threads WHERE id=?", (sid,)).fetchone():
+                    return True
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+    return False
+
+
 def codex_home_for_session(session_id: str) -> Optional[Path]:
-    """The Codex home holding ``session_id``'s rollout, or None if unknown."""
+    """The Codex home (account) that owns ``session_id``, or None if unknown.
+
+    Ownership comes from each home's own thread index, like CCC's account
+    routing: rollouts cannot tell accounts apart when homes share one
+    ``sessions`` dir. A rollout only under a non-shared dir is the fallback.
+    """
     sid = str(session_id or "").strip()
     if not sid:
         return None
-    for home in codex_homes():
+    homes = codex_homes()
+    default = homes[0] if homes else codex_default_home()
+    for home in homes[1:]:
+        if _codex_state_has_thread(home, sid):
+            return home
+    try:
+        default_root = (default / "sessions").resolve()
+    except OSError:
+        default_root = None
+    for home in homes:
         try:
-            if next((home / "sessions").glob(f"*/*/*/*{sid}.jsonl"), None) is not None:
+            root = (home / "sessions").resolve()
+            if home is not default and root == default_root:
+                continue
+            if next(root.glob(f"*/*/*/*{sid}.jsonl"), None) is not None:
                 return home
         except OSError:
             continue

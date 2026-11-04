@@ -77,3 +77,24 @@ def test_execpolicy_written_into_given_home(tmp_path):
     home.mkdir()
     assert workers.ensure_codex_wt_execpolicy(home) is True
     assert "wt" in (home / "rules" / "watchtower.rules").read_text()
+
+
+def test_shared_sessions_dir_uses_thread_index_for_ownership(monkeypatch, tmp_path):
+    import shutil
+    import sqlite3
+    default, second = _setup(monkeypatch, tmp_path)
+    # Account homes usually symlink sessions to the default home's.
+    shutil.rmtree(second / "sessions")
+    (second / "sessions").symlink_to(default / "sessions")
+    _rollout(default, "sid-owned")
+    _rollout(default, "sid-primary")
+    con = sqlite3.connect(second / "state_5.sqlite")
+    con.execute("CREATE TABLE threads (id TEXT PRIMARY KEY)")
+    con.execute("INSERT INTO threads VALUES ('sid-owned')")
+    con.commit()
+    con.close()
+    assert config.codex_home_for_session("sid-owned") == second
+    assert config.codex_home_for_session("sid-primary") == default
+    assert workers._codex_spawn_home("codex", "sid-primary") == ""
+    # One shared dir is scanned once, not once per home.
+    assert config.codex_session_roots() == [default / "sessions"]

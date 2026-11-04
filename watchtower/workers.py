@@ -996,9 +996,9 @@ def _codex_rollout_mtime(w: Dict[str, Any]) -> float:
         return 0.0
     from . import config
     newest = 0.0
-    for codex_home in _worker_codex_homes(w, config):
+    for sessions in _worker_codex_roots(w, config):
         try:
-            for path in (codex_home / "sessions").glob(f"*/*/*/*{session_id}.jsonl"):
+            for path in sessions.glob(f"*/*/*/*{session_id}.jsonl"):
                 try:
                     newest = max(newest, path.stat().st_mtime)
                 except OSError:
@@ -1008,13 +1008,9 @@ def _codex_rollout_mtime(w: Dict[str, Any]) -> float:
     return newest
 
 
-def _worker_codex_homes(w: Dict[str, Any], config) -> List[Path]:
-    """The worker's recorded Codex home first, then every known home."""
-    homes = list(config.codex_homes())
-    recorded = str((w or {}).get("codex_home") or "").strip()
-    if recorded and Path(recorded).is_dir():
-        homes = [Path(recorded)] + [h for h in homes if str(h) != recorded]
-    return homes
+def _worker_codex_roots(w: Dict[str, Any], config) -> List[Path]:
+    """Distinct Codex sessions dirs, the worker's recorded home first."""
+    return config.codex_session_roots((w or {}).get("codex_home"))
 
 
 def _claude_transcript_mtime(w: Dict[str, Any]) -> float:
@@ -1083,16 +1079,16 @@ def _codex_rollout_path(session_id: str) -> Optional[Path]:
     if not session_id:
         return None
     from . import config
-    homes = config.codex_homes()
-    key = (tuple(str(h) for h in homes), session_id)
+    roots = config.codex_session_roots()
+    key = (tuple(str(r) for r in roots), session_id)
     cached = _CODEX_ROLLOUT_CACHE.get(key)
     if cached and os.path.exists(cached):
         return Path(cached)
     found: List[Path] = []
-    for codex_home in homes:
+    for sessions in roots:
         try:
             found += sorted(
-                (codex_home / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")
+                sessions.glob(f"*/*/*/rollout-*-{session_id}.jsonl")
             )
         except OSError:
             continue
@@ -1996,19 +1992,19 @@ def _engine_activity(w: Dict[str, Any]) -> Dict[str, Any]:
         return _file_activity(None, f"{engine or 'engine'}_activity")
     if engine == "codex":
         from . import config
-        homes = _worker_codex_homes(w, config)
+        roots = _worker_codex_roots(w, config) or [config.codex_default_home() / "sessions"]
         pattern = f"*/*/*/*{session_id}.jsonl"
 
         def _all_rollouts():
-            for home in homes:
+            for sessions in roots:
                 try:
-                    yield from (home / "sessions").glob(pattern)
+                    yield from sessions.glob(pattern)
                 except OSError:
                     continue
         return _matched_activity(
             _all_rollouts(),
             "codex_rollout",
-            str(homes[0] / "sessions" / pattern),
+            str(roots[0] / pattern),
         )
     if engine == "claude":
         home = Path(

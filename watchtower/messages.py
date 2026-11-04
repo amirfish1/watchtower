@@ -600,9 +600,9 @@ def _find_codex_rollout(sid: str) -> Optional[Path]:
     from . import config
     newest: Optional[Path] = None
     newest_mtime = -1.0
-    for codex_home in config.codex_homes():
+    for sessions in config.codex_session_roots():
         try:
-            paths = codex_home.joinpath("sessions").glob(f"*/*/*/*{sid}.jsonl")
+            paths = sessions.glob(f"*/*/*/*{sid}.jsonl")
             for path in paths:
                 try:
                     mtime = path.stat().st_mtime
