@@ -7,7 +7,8 @@ bym_alert_bridge.py). Inbound: polls the BlueBubbles 1:1 chat; only messages
 from ALLOWED_HANDLE's chat that are not isFromMe are acted on.
 
   "<REF> <answer>"   -> wt answer <REF> "<answer>"
-  "<answer>"         -> wt answer, only if exactly one question is pending
+  anything else      -> ignored (plain 1:1 texts to Hermes are never consumed
+                        or replied to; an answer needs an explicit ref)
   "ticket: <text>"   -> wt add -q MAZKIR (mock/code-task intake)
 
 Health: GET http://127.0.0.1:8854/status. Log: ~/.local/log/wt-imessage-router.log
@@ -31,7 +32,7 @@ BB_ENV = Path(os.path.expanduser("~/.hermes/.env"))
 CHAT_GUID = "iMessage;-;+16506483298"  # 1:1 chat with the allowed handle
 STATE = Path(os.path.expanduser("~/.local/state/wt-imessage-router.json"))
 LOG_PATH = os.path.expanduser("~/.local/log/wt-imessage-router.log")
-REF_RE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_-]*-\d+)\b[\s:,-]*(.*)$", re.S)
+REF_RE = re.compile(r"^\s*\[?([A-Za-z][A-Za-z0-9_-]*-\d+)\]?(?![\w-])[\s:,-]*(.*)$", re.S)
 TICKET_RE = re.compile(r"^\s*ticket\s*:\s*(.+)$", re.I | re.S)
 
 health = {"started": time.time(), "last_poll": None, "last_error": None,
@@ -48,7 +49,11 @@ def log(line: str) -> None:
 
 
 def parse_reply(text: str, pending: list[str]):
-    """Return ('ticket', text) | ('answer', ref, text) | ('ambiguous', None) | None."""
+    """Return ('ticket', text) | ('answer', ref, text) | None.
+
+    A text is consumed as an answer only when it starts with the ref of a
+    currently pending question. Everything else is an ordinary message to
+    Hermes and must be left alone (no consume, no reply)."""
     m = TICKET_RE.match(text)
     if m:
         return ("ticket", m.group(1).strip())
@@ -57,17 +62,13 @@ def parse_reply(text: str, pending: list[str]):
         ref = m.group(1).upper()
         if ref in pending:
             return ("answer", ref, m.group(2).strip())
-    if text.strip():
-        if len(pending) == 1:
-            return ("answer", pending[0], text.strip())
-        return ("ambiguous", None)
     return None
 
 
 def format_question(t: dict) -> str:
     return (f"[{t['ref']}] needs you: {t.get('title') or t.get('note') or ''}\n\n"
             f"{t.get('block_question', '')}\n\n"
-            f"Reply \"{t['ref']} <answer>\" (or just your answer if it's the only open question).")
+            f"Reply \"{t['ref']} <answer>\" (the ref is required).")
 
 
 def wt(*args: str) -> subprocess.CompletedProcess:
@@ -150,9 +151,6 @@ def tick(state: dict, queues: list[str], notify_queue: str) -> None:
                  + ("" if ok else f": {r.stderr.strip()[:150]}"))
             health["answered"] += ok
             log(f"ANSWER {act[1]} rc={r.returncode}")
-        else:
-            send("Several questions are open: start your reply with the ticket ref, "
-                 "e.g. \"" + (pending[0] if pending else "REF-1") + " yes\".")
     state["seen"] = list(seen)[-200:]
     state["seeded"] = True
     save_state(state)
