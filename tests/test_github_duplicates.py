@@ -77,3 +77,17 @@ def test_link_refused_when_this_host_cannot_read_the_originals_gates(tmp_path, m
     with pytest.raises(ValueError, match="owned by host 'mac'"):
         q.link_duplicate(dup, orig)
     assert not q.get(dup).get("duplicate_of")
+
+
+def test_close_duplicate_of_cli_tolerates_item_without_duplicate_of(tmp_path, monkeypatch, capsys):
+    """WT-56: the GitHub item may omit duplicate_of; the CLI must not KeyError."""
+    import argparse
+    _state, _config, q, orig = _setup(tmp_path, monkeypatch)
+    dup = q.enqueue(project="GHI", note="same incident", text="body")["ref"]
+    from watchtower import cli
+    monkeypatch.setattr(cli.q, "link_duplicate",
+                        lambda ref, of, worker="": {"ref": ref, "status": "closed"})
+    monkeypatch.setattr(cli.stages, "request", lambda *a, **k: None)
+    args = argparse.Namespace(ref=dup, duplicate_of=orig, commit="", no_code=True, worker="w")
+    assert cli.cmd_close(args) == 0
+    assert f"DUPLICATE: {dup} follows {orig} (closed)" in capsys.readouterr().out

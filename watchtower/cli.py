@@ -2428,7 +2428,8 @@ def cmd_close(args: argparse.Namespace) -> int:
             return 1
         if item is None:
             return 1
-        print(f"DUPLICATE: {item['ref']} follows {item['duplicate_of']} ({item['status']})")
+        target = item.get("duplicate_of") or args.duplicate_of
+        print(f"DUPLICATE: {item.get('ref') or args.ref} follows {target} ({item.get('status', '')})")
         stages.request(item["ref"], "duplicate linked")
         return 0
     if not (args.summary or "").strip():
