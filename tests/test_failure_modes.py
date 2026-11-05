@@ -438,6 +438,96 @@ def test_a_queue_with_no_fallback_engine_is_parked_not_looped(wt_env, no_engines
     assert wt_env.config.auto_drain(QUEUE) is False
 
 
+def _park(wt_env):
+    wt_env.config.set_engine(QUEUE, "codex")
+    wt_env.config.set_auto_drain(QUEUE, True)
+    wt_env.config.set_grace_s(QUEUE, 0)
+    wt_env.queue.enqueue(note="work", project=QUEUE, source="test")
+    for _ in range(3):
+        _expire_cooldown(wt_env)
+        result = wt_env.workers.reconcile_once()
+    assert result["parked"] and wt_env.config.auto_drain(QUEUE) is False
+    return result
+
+
+def _config_lines(wt_env):
+    return [l for l in (wt_env.tmp / "activity.log").read_text().splitlines()
+            if " CONFIG " in l and "auto_drain" in l]
+
+
+def test_auto_park_is_labelled_in_the_config_audit_line(wt_env, no_engines):
+    """BECKY's park read `via wt; session=-`, indistinguishable from a person
+    running `wt drain off`. The audit line must name the auto-park."""
+    _park(wt_env)
+    line = _config_lines(wt_env)[-1]
+    assert "auto_drain: true \u2192 false" in line
+    assert "via auto-park (launch failures: codex)" in line
+    marker = wt_env.config.auto_parked(QUEUE)
+    assert marker["engine"] == "codex" and "codex" in marker["engines"]
+
+
+def test_parked_queue_stays_parked_while_the_engine_cools_down(wt_env, no_engines):
+    _park(wt_env)
+    result = wt_env.workers.reconcile_once()
+    assert result["unparked"] == []
+    assert wt_env.config.auto_drain(QUEUE) is False
+
+
+def test_parked_queue_resumes_when_its_engine_changes(wt_env, no_engines):
+    """BECKY stayed off for days after its codex pin was cleared."""
+    _park(wt_env)
+    wt_env.config.set_engine(QUEUE, "claude")
+    result = wt_env.workers.reconcile_once()
+    assert result["unparked"] and "engine changed codex" in result["unparked"][0]["reason"]
+    assert wt_env.config.auto_drain(QUEUE) is True
+    assert wt_env.config.auto_parked(QUEUE) is None
+    line = _config_lines(wt_env)[-1]
+    assert "auto_drain: false \u2192 true" in line and "via auto-unpark" in line
+
+
+def test_parked_queue_resumes_once_the_cooldown_expires(wt_env, no_engines):
+    _park(wt_env)
+    _expire_cooldown(wt_env)
+    reason = wt_env.workers._maybe_auto_unpark(QUEUE)
+    assert "cooldown expired" in reason
+    assert wt_env.config.auto_drain(QUEUE) is True
+    assert any("QUEUE_UNPARKED" in l for l in
+               (wt_env.tmp / "activity.log").read_text().splitlines())
+
+
+def test_still_broken_engine_reparks_after_one_more_failure(wt_env, no_engines):
+    """Unparking on cooldown expiry must not reopen the spawn-die loop: the
+    surviving streak re-parks on the next failed launch."""
+    _park(wt_env)
+    _expire_cooldown(wt_env)
+    result = wt_env.workers.reconcile_once()
+    assert result["unparked"] and result["parked"]
+    assert wt_env.config.auto_drain(QUEUE) is False
+    assert wt_env.config.auto_parked(QUEUE) is not None
+
+
+def test_a_human_drain_off_after_a_park_is_never_undone(wt_env, no_engines):
+    _park(wt_env)
+    wt_env.config.set_auto_drain(QUEUE, False)
+    assert wt_env.config.auto_parked(QUEUE) is None
+    wt_env.config.set_engine(QUEUE, "claude")
+    _expire_cooldown(wt_env)
+    result = wt_env.workers.reconcile_once()
+    assert result["unparked"] == []
+    assert wt_env.config.auto_drain(QUEUE) is False
+
+
+def test_stale_marker_on_a_running_queue_is_dropped(wt_env, no_engines):
+    """A queue resumed by a path that left the marker behind must not be
+    auto-resumed later after someone deliberately turns it off."""
+    _park(wt_env)
+    data = wt_env.config._load()
+    data[QUEUE]["auto_drain"] = True
+    wt_env.config._save(data)
+    wt_env.workers._maybe_auto_unpark(QUEUE)
+    assert wt_env.config.auto_parked(QUEUE) is None
+
+
 def test_a_single_transient_failure_does_not_park_a_healthy_queue(wt_env, no_engines):
     """Parking costs a human a `wt drain on`. One failed start must not."""
     wt_env.config.set_engine(QUEUE, "codex")

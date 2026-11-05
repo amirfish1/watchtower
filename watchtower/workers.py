@@ -3905,6 +3905,52 @@ def headroom_launch_choice(queue: str) -> Optional[Dict[str, str]]:
         return None
 
 
+def _maybe_auto_unpark(queue: str) -> str:
+    """Resume a queue the reconciler parked for launch failures, once the cause
+    is gone. Returns the reason it was unparked, or "".
+
+    Parking used to be one-way: BECKY sat with auto-drain off for six days
+    after its engine was switched away from the one that kept failing,
+    because nothing but a human ``wt drain on`` resumed it. The park marker
+    (written only by the auto-park) lets the reconciler resume the queue when
+    its effective engine changes or every engine it tried has finished cooling
+    down. If the engine is still broken, the surviving failure streak re-parks
+    it on the next failed launch, so this cannot become a spawn-die loop."""
+    from . import config
+    try:
+        marker = config.auto_parked(queue)
+        if not marker:
+            return ""
+        if config.auto_drain(queue):
+            # Someone resumed it by a path that did not clear the marker
+            # (e.g. a direct file edit); a stale marker must never later flip
+            # a deliberate ``drain off`` back on.
+            config.clear_auto_parked(queue)
+            return ""
+        parked_engine = str(marker.get("engine") or "")
+        current = config.engine(queue)
+        if parked_engine and current != parked_engine:
+            reason = f"engine changed {parked_engine} \u2192 {current}"
+        else:
+            engines = [str(e) for e in (marker.get("engines") or [])
+                       if e] or [parked_engine or current]
+            if any(active_launch_failure_cooldown(queue, e) for e in engines):
+                return ""
+            reason = f"launch-failure cooldown expired ({', '.join(engines)})"
+        config.set_auto_drain(queue, True, source=f"auto-unpark ({reason})")
+        try:
+            from watchtower.queue import _log
+            _log("QUEUE_UNPARKED",
+                 f"unparked: {reason}; parked {marker.get('at') or '?'} for "
+                 f"{marker.get('reason') or 'repeated launch failures'}",
+                 queue=queue)
+        except Exception:
+            pass
+        return reason
+    except Exception:  # noqa: BLE001 - never let unpark bookkeeping break a tick
+        return ""
+
+
 def active_launch_failure_cooldown(
     queue: str, engine: str
 ) -> Optional[Dict[str, Any]]:
@@ -6762,7 +6808,7 @@ def _reconcile_once_locked(dry_run: bool = False,
                               "session_title_backfilled": [],
                               "ledger_backfilled": [],
                               "launch_failed": [], "fallbacks": [],
-                              "parked": [],
+                              "parked": [], "unparked": [],
                               "spawn_plans": [],
                               "reconcile_id": reconcile_id}
 
@@ -7323,6 +7369,11 @@ def _reconcile_once_locked(dry_run: bool = False,
     if only_queue:
         loop_queues &= {only_queue}
     for q_name in sorted(loop_queues):
+        if not dry_run:
+            unpark_reason = _maybe_auto_unpark(q_name)
+            if unpark_reason:
+                result["unparked"].append(
+                    {"queue": q_name, "reason": unpark_reason})
         auto = config.auto_drain(q_name)
         desired = config.desired_workers(q_name) if auto else 0
         manual_run = False
@@ -7722,7 +7773,16 @@ def _reconcile_once_locked(dry_run: bool = False,
                     >= _LAUNCH_FAILURE_ALERT_STREAK
                 ]
                 if repeated and config.auto_drain(q_name):
-                    config.set_auto_drain(q_name, False)
+                    config.set_auto_drain(
+                        q_name, False,
+                        source=f"auto-park (launch failures: {launch_engine})",
+                        auto_parked={
+                            "engine": engine,
+                            "engines": sorted(e for e in attempted_engines if e),
+                            "at": _iso_from_epoch(time.time()),
+                            "reason": swap_cause,
+                        },
+                    )
                     why_not = (
                         "no fallback engine is available"
                         if config.fallback_to_default_worker(q_name)
@@ -7732,7 +7792,8 @@ def _reconcile_once_locked(dry_run: bool = False,
                     park_reason = (
                         f"parked: {launch_engine} keeps failing at launch "
                         f"({swap_cause}) and {why_not} "
-                        f"— run `wt drain on {q_name}` once it is fixed"
+                        f"— resumes by itself when the queue's engine changes "
+                        f"or the cooldown ends, or run `wt drain on {q_name}`"
                     )
                     result["parked"].append(
                         {"queue": q_name, "engine": launch_engine,

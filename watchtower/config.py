@@ -312,7 +312,11 @@ def check_outside_changes() -> Dict[str, List[str]]:
     return diff
 
 
-def _save(data: Dict[str, Any]) -> None:
+def _save(data: Dict[str, Any], source: str = "") -> None:
+    """Write the config and log a CONFIG line per changed queue.
+
+    ``source`` names a non-human writer (e.g. the reconciler's auto-park) so
+    its audit line cannot be mistaken for someone running ``wt`` by hand."""
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     # A pending outside edit is reported before our write buries it.
@@ -329,6 +333,8 @@ def _save(data: Dict[str, Any]) -> None:
     _LOAD_MEMO["sig"] = None
     _record_audit(text, data)
     a = actor()
+    if source:
+        a["source"] = source
     tail = (f"via {a['source']}; session={a['session'] or '-'} host={a['host']} "
             f"user={a['user']} pid={a['pid']} parent={a['parent']!r}")
     _log_config(_config_diff(before if isinstance(before, dict) else {}, data), tail)
@@ -506,10 +512,21 @@ def queue_label(queue: str) -> str:
     return configured or f"{DEFAULT_QUEUE_LABEL_PREFIX}{queue}"
 
 
-def set_auto_drain(queue: str, enabled: bool) -> Dict[str, Any]:
+def set_auto_drain(queue: str, enabled: bool, *, source: str = "",
+                   auto_parked: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Turn auto-drain on/off.
+
+    ``auto_parked`` is passed only by the reconciler when it parks a queue
+    whose engine keeps failing at launch; the marker lets it unpark the queue
+    once the cause is gone. Any other call is a deliberate choice and clears
+    the marker, so a human ``drain off`` is never undone automatically."""
     data = _load()
     q = data.setdefault(queue, {})
     q["auto_drain"] = bool(enabled)
+    if auto_parked is not None:
+        q["auto_parked"] = dict(auto_parked)
+    else:
+        q.pop("auto_parked", None)
     # ``drain on`` promises that the reconciler will staff the queue.  A queue
     # may still carry ``desired_workers: 0`` from when it was deliberately
     # parked; leaving that value in place makes auto-drain visibly on but
@@ -522,8 +539,23 @@ def set_auto_drain(queue: str, enabled: bool) -> Dict[str, Any]:
             desired = 0
         if desired < 1:
             q["desired_workers"] = 1
-    _save(data)
+    _save(data, source=source)
     return q
+
+
+def auto_parked(queue: str) -> Optional[Dict[str, Any]]:
+    """The reconciler's park marker for ``queue`` (see ``set_auto_drain``)."""
+    marker = _queue_entry(queue).get("auto_parked")
+    return dict(marker) if isinstance(marker, dict) else None
+
+
+def clear_auto_parked(queue: str) -> None:
+    """Drop a stale park marker without touching ``auto_drain``."""
+    data = _load()
+    q = data.get(queue)
+    if isinstance(q, dict) and "auto_parked" in q:
+        q.pop("auto_parked", None)
+        _save(data, source="auto-park cleanup")
 
 
 def auto_drain(queue: str) -> bool:
