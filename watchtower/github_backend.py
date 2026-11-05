@@ -951,6 +951,111 @@ def _gh_hosts_file() -> Path:
     return Path.home() / ".config" / "gh" / "hosts.yml"
 
 
+# --- REST transport for single-issue commands -------------------------------
+#
+# `gh issue view/edit/close/reopen/comment/create` all go through GitHub's
+# GraphQL API. With a few dozen workers claiming and closing at once, GraphQL
+# answers "API rate limit already exceeded" (a burst/secondary limit) even
+# while `gh api rate_limit` shows budget left, so claims and closes failed in
+# retry loops and fixed tickets stayed in_progress (BYM BECKY queue,
+# 2026-11-05). The same operations over REST (`gh api repos/...`) spend the
+# separate core budget, so `_run_raw` translates these commands to REST below
+# the layer tests stub. `issue list` stays on gh (cached and shared).
+# Set WATCHTOWER_GH_ISSUE_TRANSPORT=graphql to go back to plain `gh issue`.
+
+# `@me` is gh shorthand; REST needs the login (looked up once per process).
+_REST_ME_LOGIN: Dict[str, str] = {}
+_REST_ISSUE_VERBS = frozenset({"view", "edit", "close", "reopen", "comment", "create"})
+
+
+def _rest_issue_transport_enabled() -> bool:
+    return os.environ.get("WATCHTOWER_GH_ISSUE_TRANSPORT", "rest").strip().lower() != "graphql"
+
+
+def _parse_issue_argv(args: List[str]) -> Optional[Dict[str, Any]]:
+    """Parse the `gh issue <verb> ...` argv this module builds, or None when it
+    holds anything the REST path does not understand (then gh runs it)."""
+    if len(args) < 2 or args[0] != "issue" or args[1] not in _REST_ISSUE_VERBS:
+        return None
+    out: Dict[str, Any] = {"verb": args[1], "number": None, "repo": None,
+                           "json": None, "title": None, "labels": [],
+                           "add_labels": [], "remove_labels": [], "add_assignees": []}
+    multi = {"--label": "labels", "--add-label": "add_labels",
+             "--remove-label": "remove_labels", "--add-assignee": "add_assignees"}
+    rest = list(args[2:])
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if tok in multi or tok in ("--repo", "--json", "--title"):
+            if i + 1 >= len(rest):
+                return None
+            val = rest[i + 1]
+            if tok in multi:
+                out[multi[tok]].append(str(val))
+            else:
+                out[tok[2:]] = str(val)
+            i += 2
+            continue
+        if out["number"] is None and out["verb"] != "create" and str(tok).isdigit():
+            out["number"] = str(tok)
+            i += 1
+            continue
+        return None
+    if not out["repo"] or (out["verb"] != "create" and out["number"] is None):
+        return None
+    return out
+
+
+def _rest_login(user: Any) -> str:
+    # GraphQL reports a bot as `github-actions`, REST as `github-actions[bot]`.
+    login = str((user or {}).get("login") or "") if isinstance(user, dict) else ""
+    return login[:-5] if login.endswith("[bot]") else login
+
+
+def _rest_issue_to_gh(issue: Dict[str, Any]) -> Dict[str, Any]:
+    """A REST issue in the shape `gh issue view --json ...` prints."""
+    return {
+        "number": issue.get("number"),
+        "title": issue.get("title") or "",
+        "body": issue.get("body") or "",
+        "state": str(issue.get("state") or "").upper(),
+        "url": issue.get("html_url") or "",
+        "assignees": [{"login": _rest_login(a)} for a in issue.get("assignees") or []],
+        "labels": [{"name": l.get("name"), "color": l.get("color"),
+                    "description": l.get("description") or ""}
+                   for l in issue.get("labels") or [] if isinstance(l, dict)],
+        "author": {"login": _rest_login(issue.get("user"))},
+        "createdAt": issue.get("created_at"),
+        "updatedAt": issue.get("updated_at"),
+        "closedAt": issue.get("closed_at"),
+    }
+
+
+def _rest_comment_to_gh(c: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": c.get("node_id") or str(c.get("id") or ""),
+        "author": {"login": _rest_login(c.get("user"))},
+        "authorAssociation": c.get("author_association") or "",
+        "body": c.get("body") or "",
+        "createdAt": c.get("created_at"),
+        "url": c.get("html_url") or "",
+    }
+
+
+def _json_concat(raw: str) -> List[Any]:
+    """`gh api --paginate` prints one JSON array per page back to back."""
+    dec = json.JSONDecoder()
+    items: List[Any] = []
+    pos, raw = 0, raw or ""
+    while True:
+        while pos < len(raw) and raw[pos].isspace():
+            pos += 1
+        if pos >= len(raw):
+            return items
+        val, pos = dec.raw_decode(raw, pos)
+        items.extend(val if isinstance(val, list) else [val])
+
+
 def _gh_child_env() -> Dict[str, str]:
     """Environment for gh subprocesses: the process env, minus the token
     variables once a scrub has been proven to unmask good stored auth."""
@@ -1978,6 +2083,10 @@ class GitHubIssuesBackend:
         separately, never found by scanning argv, so an option VALUE that
         looks like a flag (a title of ``--body``) keeps its meaning.
         """
+        if _rest_issue_transport_enabled():
+            parsed = _parse_issue_argv(list(args))
+            if parsed is not None:
+                return self._run_rest_issue(parsed, body)
         argv = list(args)
         extra: Dict[str, Any] = {}
         if body is not None:
@@ -2000,6 +2109,114 @@ class GitHubIssuesBackend:
             ) from exc
         except subprocess.TimeoutExpired as exc:
             raise GitHubBackendError(f"gh {_render_argv(argv)} timed out") from exc
+
+    def _gh_api(self, method: str, path: str, payload: Optional[Dict[str, Any]] = None,
+                *, paginate: bool = False) -> "subprocess.CompletedProcess[str]":
+        argv = ["api", "-X", method, "-H", "Accept: application/vnd.github+json"]
+        if paginate:
+            argv.append("--paginate")
+        argv.append(path)
+        extra: Dict[str, Any] = {}
+        if payload is not None:
+            # Body text travels on stdin, never argv (WT-40).
+            argv += ["--input", "-"]
+            extra = {"input": json.dumps(payload), "encoding": "utf-8"}
+        try:
+            return subprocess.run(
+                ["gh", *argv],
+                cwd=self.repo_path or None,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=_gh_child_env(),
+                **extra,
+            )
+        except FileNotFoundError as exc:
+            raise GitHubBackendError(
+                "GitHub backend requires the gh CLI to be installed and on PATH"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise GitHubBackendError(f"gh api {method} {path} timed out") from exc
+
+    def _run_rest_issue(self, p: Dict[str, Any],
+                        body: Optional[str]) -> "subprocess.CompletedProcess[str]":
+        """Run one parsed `gh issue <verb>` over REST and return a result whose
+        stdout matches what the gh command would have printed."""
+        from urllib.parse import quote
+
+        def done(stdout: str) -> "subprocess.CompletedProcess[str]":
+            return subprocess.CompletedProcess(["gh", "api"], 0, stdout, "")
+
+        base = f"repos/{p['repo']}/issues"
+        verb, num = p["verb"], p["number"]
+        if verb == "create":
+            payload: Dict[str, Any] = {"title": p["title"] or "", "body": body or ""}
+            if p["labels"]:
+                payload["labels"] = p["labels"]
+            proc = self._gh_api("POST", base, payload)
+            if proc.returncode != 0:
+                return proc
+            return done(str(json.loads(proc.stdout or "{}").get("html_url") or "") + "\n")
+        path = f"{base}/{num}"
+        if verb == "view":
+            proc = self._gh_api("GET", path)
+            if proc.returncode != 0:
+                return proc
+            issue = _rest_issue_to_gh(json.loads(proc.stdout or "{}"))
+            fields = [f for f in str(p["json"] or "").split(",") if f]
+            if "comments" in fields:
+                cproc = self._gh_api("GET", f"{path}/comments?per_page=100", paginate=True)
+                if cproc.returncode != 0:
+                    return cproc
+                issue["comments"] = [_rest_comment_to_gh(c) for c in _json_concat(cproc.stdout)
+                                     if isinstance(c, dict)]
+            if fields:
+                issue = {k: issue[k] for k in fields if k in issue}
+            return done(json.dumps(issue))
+        if verb == "comment":
+            proc = self._gh_api("POST", f"{path}/comments", {"body": body or ""})
+            if proc.returncode != 0:
+                return proc
+            return done(str(json.loads(proc.stdout or "{}").get("html_url") or "") + "\n")
+        if verb in ("close", "reopen"):
+            proc = self._gh_api("PATCH", path, {"state": "closed" if verb == "close" else "open"})
+            return proc if proc.returncode != 0 else done("")
+        # edit: title/body first, then labels and assignees, like gh.
+        patch: Dict[str, Any] = {}
+        if p["title"] is not None:
+            patch["title"] = p["title"]
+        if body is not None:
+            patch["body"] = body
+        if patch:
+            proc = self._gh_api("PATCH", path, patch)
+            if proc.returncode != 0:
+                return proc
+        if p["add_labels"]:
+            proc = self._gh_api("POST", f"{path}/labels", {"labels": p["add_labels"]})
+            if proc.returncode != 0:
+                return proc
+        for name in p["remove_labels"]:
+            proc = self._gh_api("DELETE", f"{path}/labels/{quote(name, safe='')}")
+            # gh's --remove-label of an absent label is a no-op; REST says 404.
+            if proc.returncode != 0 and "404" not in (proc.stderr or proc.stdout or ""):
+                return proc
+        if p["add_assignees"]:
+            logins = []
+            for who in p["add_assignees"]:
+                if who == "@me":
+                    who = _REST_ME_LOGIN.get("login") or ""
+                    if not who:
+                        me = self._gh_api("GET", "user")
+                        if me.returncode != 0:
+                            return me
+                        who = str(json.loads(me.stdout or "{}").get("login") or "")
+                        if who:
+                            _REST_ME_LOGIN["login"] = who
+                logins.append(who)
+            proc = self._gh_api("POST", f"{path}/assignees", {"assignees": logins})
+            if proc.returncode != 0:
+                return proc
+        return done("")
 
     def _run(self, args: List[str], *, check: bool = True,
              body: Optional[str] = None) -> str:

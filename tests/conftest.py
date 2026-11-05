@@ -501,3 +501,11 @@ def isolated_engine_ancestry(monkeypatch):
     """Synthetic identity tests must not see the developer agent ancestry."""
     from watchtower import sender_envelope
     monkeypatch.setattr(sender_envelope, "_nearest_engine", lambda: "")
+
+
+@pytest.fixture(autouse=True)
+def gh_issue_transport_graphql(monkeypatch):
+    """The fake gh in test_github_backend.py speaks `gh issue ...`, so the
+    existing suite pins the legacy transport. tests/test_github_rest_transport.py
+    covers the default REST transport against its own fake `gh api`."""
+    monkeypatch.setenv("WATCHTOWER_GH_ISSUE_TRANSPORT", "graphql")
