@@ -7377,6 +7377,22 @@ def _reconcile_once_locked(dry_run: bool = False,
         auto = config.auto_drain(q_name)
         desired = config.desired_workers(q_name) if auto else 0
         manual_run = False
+        def audit_eligibility(depth, total, reason):
+            # Observation only: an audit failure must never strand work.
+            try:
+                from . import dispatch_audit
+                dispatch_audit.record(
+                    q_name, items=_open_items_by_q.get(q_name, []),
+                    depth=depth, total_open=total,
+                    health=health_by_queue.get(q_name, {}),
+                    live=len(live_by_queue.get(q_name, [])), desired=desired,
+                    reconcile_id=reconcile_id, scoped=bool(only_queue),
+                    reason=reason, dry_run=dry_run,
+                )
+            except Exception as audit_error:
+                print(f"[watchtower] eligibility audit failed for {q_name}: "
+                      f"{type(audit_error).__name__}", file=sys.stderr)
+
         try:
             if auto:
                 depth, total_open = _claimable_depth(q_name)
@@ -7390,6 +7406,8 @@ def _reconcile_once_locked(dry_run: bool = False,
                 total_open = _total_open_by_q.get(q_name, 0)
                 manual_run = depth > 0
         except Exception as exc:  # A remote queue must not abort every queue.
+            audit_eligibility(None, _total_open_by_q.get(q_name, 0),
+                              f"depth_lookup_failed:{type(exc).__name__}")
             result["skipped"].append(
                 {
                     "queue": q_name,
@@ -7437,6 +7455,7 @@ def _reconcile_once_locked(dry_run: bool = False,
             # rather than asserting a cause (see _zero_claimable_reason).
             reason = (_zero_claimable_reason(q_name, total_open, bool(auto))
                       if total_open > 0 else "depth=0")
+            audit_eligibility(depth, total_open, reason)
             result["skipped"].append({"queue": q_name, "reason": reason})
             if released_by_q.get(q_name):
                 _record_spawn_plan(
@@ -7456,6 +7475,7 @@ def _reconcile_once_locked(dry_run: bool = False,
             # claim time (cmd_claim, live>desired) when the real current state is
             # known, and graceful release is the idle safety net.
             continue
+        audit_eligibility(depth, total_open, "eligible_work")
         live = live_by_queue.get(q_name, [])
         actual = len(live)
         blocked_ids_here = blocked_worker_ids.get(q_name, set())
