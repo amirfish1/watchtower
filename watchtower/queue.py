@@ -3044,8 +3044,14 @@ def update_status(
     close_owner: str = "",
     group_force: bool = False,
     expect: Optional[Dict[str, Any]] = None,
+    close_contract: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    """``expect`` (WT-39): fields the current item must still carry, checked
+    """``close_contract``: a ``conditional_closes`` request for a close. Store
+    identity, the observed question and the idempotency key are checked under
+    this write's lock, and the receipt is saved with the close. Refuses to run
+    on a remote backend or without a real lock.
+
+    ``expect`` (WT-39): fields the current item must still carry, checked
     alongside ``require_status`` (on GitHub, against the fresh read under the
     body lock); a mismatch, or a fence naming no claimer and no session
     (``claim_expect_holds``), makes the write a no-op returning None. The orphan
@@ -3109,6 +3115,11 @@ def update_status(
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {VALID_STATUSES}")
     backend = _github_backend_for_project(_project_from_ident(ident))
+    conditional = None
+    if close_contract is not None:
+        from . import conditional_closes as conditional
+        if status != "closed" or backend is not None:
+            raise conditional.Unsupported("conditional closes need a local close")
     if backend is not None:
         item = backend.update_status(
             ident,
@@ -3139,10 +3150,16 @@ def update_status(
                 _log(verb, detail, queue=item.get('project', ''))
         return item
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
-    with _FileLock(_lock_path()):
-        data = _load_unlocked()
+    with _FileLock(_lock_path()) as status_lock:
+        if conditional is not None:
+            if status_lock._fh is None:
+                raise conditional.Unsupported("source write lock unavailable")
+            conditional.check_store_unlocked(_resolve_store_path(), close_contract["expected_store_id"])
+        data = _load_unlocked(strict=conditional is not None)
         for it in data["items"]:
             if _matches(it, ident):
+                if conditional is not None:
+                    conditional.prepare_unlocked(it, close_contract)
                 if require_status is not None and it.get("status") != require_status:
                     return None
                 if expect is not None and not claim_expect_holds(it, expect):
@@ -3221,7 +3238,7 @@ def update_status(
                         it,
                         "close",
                         by=_by(
-                            "worker",
+                            "human" if conditional is not None else "worker",
                             str(session_id or it.get("closed_by") or ""),
                             str(real_sid or ""),
                             close_machine,
@@ -4860,10 +4877,14 @@ def _github_gated_close(ident: Any, session_id: str, session_uuid: str, resoluti
 def close(
     ident: Any, session_id: str = "", resolution: Any = None, force: bool = False,
     declined: bool = False, session_uuid: str = "",
+    close_contract: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Close a ticket, optionally recording HOW it was fixed.
 
     ``declined``: this close IS the product-gate Nack — exempt from the gate guard.
+
+    ``close_contract``: a ``conditional_closes`` request, checked and receipted
+    in the same locked write as the close (see ``update_status``).
 
     ``resolution`` may be a bare summary string or a dict with any of
     ``summary`` / ``caveats`` / ``follow_ups`` / ``unresolved``. Absent ->
@@ -4941,7 +4962,7 @@ def close(
     item = update_status(
         ident, "closed", session_id, session_uuid=session_uuid, resolution=resolution,
         expect_owner="" if force else str(session_id or ""),
-        hold_review=hold_review, extras=extras,
+        hold_review=hold_review, extras=extras, close_contract=close_contract,
     )
     if item and item.get("status") == "in_review":
         _notify_review(item, hold_review, session_id)

@@ -3486,6 +3486,22 @@ def cmd_answer_conditional(args: argparse.Namespace) -> int:
         return 2
 
 
+def cmd_close_conditional(args: argparse.Namespace) -> int:
+    from . import conditional_closes as conditional
+    try:
+        # Close notifications print human output; keep this endpoint JSON-only.
+        import contextlib
+        with contextlib.redirect_stdout(sys.stderr):
+            receipt = conditional.submit(args.ref, json.loads(args.request_json))
+        print(json.dumps(receipt, sort_keys=True))
+        return 0
+    except (ValueError, TypeError) as exc:
+        kind = ("unsupported" if isinstance(exc, conditional.Unsupported) else
+                "conflict" if isinstance(exc, conditional.Conflict) else "invalid_request")
+        print(json.dumps({"error": kind, "message": str(exc)}))
+        return 2
+
+
 def cmd_answer_receipt(args: argparse.Namespace) -> int:
     from . import conditional_answers as conditional
     try:
@@ -7603,6 +7619,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("ref")
     s.add_argument("--request-json", required=True)
     s.set_defaults(func=cmd_answer_conditional)
+
+    s = sub.add_parser("close-conditional", help="atomically close an observed owner question with no more work")
+    s.add_argument("ref")
+    s.add_argument("--request-json", required=True)
+    s.set_defaults(func=cmd_close_conditional)
 
     s = sub.add_parser("answer-receipt", help="read-only conditional answer reconciliation")
     s.add_argument("ref")

@@ -12,7 +12,7 @@ from .conditional_answers import Unsupported, wait_kind
 
 
 CAPABILITIES = ["conditional-owner-answer-v1", "answer-receipt-v1", "owner-blocks-export-v1",
-                "store-identity-v1", "owner-wait-initialization-v1"]
+                "store-identity-v1", "owner-wait-initialization-v1", "conditional-owner-close-v1"]
 
 
 def _digest(value):

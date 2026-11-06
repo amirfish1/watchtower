@@ -116,6 +116,24 @@ read-only. The CLI uses `claim_route` and `finish_route` around the existing
 block-kind-aware `_deliver_answer` helper. These capabilities are local-only;
 callers must not fall back to an unguarded legacy answer after a refusal.
 
+## Conditional owner closes
+
+`wt close-conditional DEMO-1 --request-json '<request>'` closes a ticket because
+the owner decided the question no longer matters. It always emits JSON on stdout.
+The request takes the same `idempotency_key`, `expected_*` fields and optional
+`expected_store_id` as a conditional answer, with a required `reason` in place of
+`text` and an optional `by` (default `owner`). Acceptance rules are the same: an
+exact, still-current owner question under the actual source write lock. The close
+and its receipt (`close_receipts` on the ticket) are one write.
+
+The close is final work-wise: it wakes no worker, runs no gate, verifier or
+post-fix assessment, and clears any park. It closes as Declined, so a ticket
+waiting on this one is flagged for a human instead of being treated as unblocked
+by finished work. A replay of the same key returns the original receipt and
+writes nothing. Exit 2 carries `conflict`, `unsupported` or `invalid_request`.
+`wt reopen` returns a wrongly closed ticket to the pool; it does not restore the
+original block.
+
 ## Authoritative local owner-block export
 
 `wt owner-blocks-export --json` exports the **full local owner-block set**, with
