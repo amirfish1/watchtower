@@ -47,6 +47,8 @@ def proven(original: Dict[str, Any], required: List[str]) -> bool:
     The overlay merges sidecar events after issue events of the same second,
     so verify/accept keep their order behind ``in_review`` (all sidecar), but
     the issue's close is compared by time, not position."""
+    if original.get("history_resolved") is False:
+        return False  # the archive may hold the proof or its undoing (WT-47)
     results = {r.get("gate"): r for r in (original.get("gate_results") or [])}
     history = list(original.get("history") or [])
     last_review = max((n for n, e in enumerate(history) if e.get("event") == "in_review"),
