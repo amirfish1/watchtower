@@ -125,7 +125,7 @@ def _attempt(candidate, request, directory, timeout, limit):
     if engine == 'claude':
         argv = [workers._resolve_engine_bin('claude'), '-p', '--output-format', 'json',
                 '--tools', '', '--strict-mcp-config', '--setting-sources', '',
-                '--no-session-persistence', '--model', model, '--effort', effort,
+                '--model', model, '--effort', effort,
                 '--max-budget-usd', str(request['max_budget_usd']),
                 '--system-prompt', request['system'],
                 '--json-schema', json.dumps(request['json_schema'])]

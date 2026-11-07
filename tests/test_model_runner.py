@@ -117,7 +117,8 @@ def test_claude_restrictions_and_budget(tmp_path,monkeypatch):
     assert result and not failure
     argv=calls[0]
     assert argv[argv.index('--tools')+1]==''
-    assert '--strict-mcp-config' in argv and '--no-session-persistence' in argv
+    assert '--strict-mcp-config' in argv
+    assert '--no-session-persistence' not in argv
     assert argv[argv.index('--max-budget-usd')+1]=='5'
 
 

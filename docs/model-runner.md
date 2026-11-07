@@ -22,7 +22,7 @@ No queue claims or delivery actions occur.
 ## Current capability limitation
 
 Only Claude supports the enforced `tools:none` contract in this version:
-`--tools ''`, strict MCP configuration, no session persistence and a maximum
+`--tools ''`, strict MCP configuration, saved local conversations and a maximum
 USD budget of 5. Profile configurations containing an unsupported candidate
 fail with `profile_capability_unavailable` before any prompt is sent.
 
