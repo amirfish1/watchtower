@@ -1464,11 +1464,28 @@ _ISSUE_BODY_MAX_BYTES = 262144
 # (_merge_body_write) appends its own entries on top of ours.
 _ISSUE_BODY_BUDGET_BYTES = 250000
 _COMMENT_MAX_CHARS = 65536
-_HISTORY_TEXT_INLINE_MAX = 1000
+# WT-45: 1000 left BECKY-2966's 59 referenced answers at 91 KB of excerpts.
+_HISTORY_TEXT_INLINE_MAX = 300
+# A reference costs ~290 bytes (excerpt suffix, ref, sha256, length), so a
+# text this short or shorter stays inline: referencing it would grow the body.
+_HISTORY_REF_MIN = 600
 _COMMENTED_EVENTS = ("answer", "comment")
 _ENTRY_MARKER = "\n\n<!-- watchtower-entry: {} -->"
 _ENTRY_MARKER_RE = re.compile(r"\n\n<!-- watchtower-entry: ([0-9a-f]{16}) -->\s*$")
 _TEXT_REF_KEYS = ("text", "text_len", "text_sha256", "text_ref")
+# WT-45: progress notes and block questions are referenced the same way. Each
+# event keeps its long text in one field; a reference adds <field>_len,
+# <field>_sha256 and <field>_ref beside it.
+_REF_FIELD_BY_EVENT = {"answer": "text", "comment": "text", "progress": "text",
+                       "block": "question"}
+_REF_FIELDS = ("text", "question")
+_ALL_REF_KEYS = tuple(f"{f}{s}" for f in _REF_FIELDS for s in ("", "_len", "_sha256", "_ref"))
+# Comments that mirror a block question or a progress note open with this
+# prefix, so they read as WatchTower's on the issue; the text after it is the
+# exact original (the sha256 on the history entry proves it).
+_BLOCK_COMMENT_PREFIX = "[watchtower] Needs input from {}:\n\n"
+_PROGRESS_COMMENT_PREFIX = "[watchtower] Progress from {}:\n\n"
+_MIRROR_PREFIX_RE = re.compile(r"\A\[watchtower\] (?:Needs input|Progress) from [^\n]*:\n\n")
 
 
 def _text_sha256(text: str) -> str:
@@ -1507,20 +1524,34 @@ def _entry_key(number: str, event: str, meta: Dict[str, Any], text: str) -> str:
     return f"{base}{seen:04x}"
 
 
-def _referenced_text(entry: Dict[str, Any], text: str, ref: str) -> None:
+def _referenced_text(entry: Dict[str, Any], text: str, ref: str,
+                     field: str = "text") -> None:
     """Store ``text`` on a history entry by reference when it is long: the
     excerpt says how long the full text is and where it lives, and the
-    sha256 lets a reader verify the comment it points at."""
+    sha256 lets a reader verify the comment it points at. ``field`` is the
+    entry key holding the text (``question`` for a block, WT-45)."""
     if not text:
         return
-    if len(text) <= _HISTORY_TEXT_INLINE_MAX or not ref:
-        entry["text"] = text
+    if len(text) <= _HISTORY_REF_MIN or not ref:
+        entry[field] = text
         return
     head = text[:_HISTORY_TEXT_INLINE_MAX].rstrip()
-    entry["text"] = f"{head} ... [{len(text)} chars; full text: {ref}]"
-    entry["text_len"] = len(text)
-    entry["text_sha256"] = _text_sha256(text)
-    entry["text_ref"] = ref
+    entry[field] = f"{head} ... [{len(text)} chars; full text: {ref}]"
+    entry[f"{field}_len"] = len(text)
+    entry[f"{field}_sha256"] = _text_sha256(text)
+    entry[f"{field}_ref"] = ref
+
+
+def _set_history_text(entry: Dict[str, Any], text: str, ref: str, field: str) -> None:
+    """(Re)store ``text`` on ``entry``: by reference when long and ``ref``
+    is set, else inline."""
+    for k in (field, f"{field}_len", f"{field}_sha256", f"{field}_ref"):
+        entry.pop(k, None)
+    _referenced_text(entry, text, ref, field)
+
+
+def _is_referenced(entry: Any) -> bool:
+    return isinstance(entry, dict) and any(entry.get(f"{f}_ref") for f in _REF_FIELDS)
 
 
 def _history_id(entry: Any) -> str:
@@ -1528,45 +1559,110 @@ def _history_id(entry: Any) -> str:
     event before and after its text moved to a comment compares equal."""
     if not isinstance(entry, dict):
         return json.dumps(entry, sort_keys=True, default=str)
-    digest = entry.get("text_sha256") or (
-        _text_sha256(str(entry["text"])) if "text" in entry else "")
-    rest = {k: v for k, v in entry.items() if k not in _TEXT_REF_KEYS}
-    return json.dumps([rest, digest], sort_keys=True, default=str)
+    digests = [entry.get(f"{f}_sha256") or (
+        _text_sha256(str(entry[f])) if f in entry else "") for f in _REF_FIELDS]
+    rest = {k: v for k, v in entry.items() if k not in _ALL_REF_KEYS}
+    return json.dumps([rest, *digests], sort_keys=True, default=str)
+
+
+def _comment_texts(comment: Any) -> List[str]:
+    """Texts a comment holds exactly: its body without the entry marker and,
+    for a block/progress mirror, the same without the mirror prefix."""
+    if not isinstance(comment, dict):
+        return []
+    text, _key = _strip_entry_marker(str(comment.get("body") or ""))
+    out = [text]
+    bare = _MIRROR_PREFIX_RE.sub("", text, count=1)
+    if bare != text:
+        out.append(bare)
+    return out
+
+
+def _resolve_history(history: List[Any], comments: List[Any]) -> List[Any]:
+    """WT-45 reader: ``history`` with each referenced text restored to the
+    exact original from the comment it points at, verified by sha256. An
+    entry whose comment is missing or no longer matches keeps its excerpt and
+    is marked ``<field>_unresolved``; an excerpt is never presented as the
+    text. Returns new entry dicts; the input is not modified."""
+    by_ref: Dict[str, Any] = {}
+    for c in comments or []:
+        if not isinstance(c, dict):
+            continue
+        # url, then id: an ingested owner answer references its comment by
+        # _owner_answer_comment_key (id first), a posted one by url.
+        for ref in (_comment_ref(c), _owner_answer_comment_key(c)):
+            if ref:
+                by_ref.setdefault(ref, c)
+        _text, key = _strip_entry_marker(str(c.get("body") or ""))
+        if key:
+            by_ref.setdefault(f"comment:{key}", c)
+    out: List[Any] = []
+    for entry in history:
+        if not _is_referenced(entry):
+            out.append(entry)
+            continue
+        entry = dict(entry)
+        for field in _REF_FIELDS:
+            ref, digest = entry.get(f"{field}_ref"), entry.get(f"{field}_sha256")
+            if not ref:
+                continue
+            comment = by_ref.get(str(ref))
+            if comment is None and entry.get("entry_key"):
+                comment = by_ref.get(f"comment:{entry['entry_key']}")
+            full = next((t for t in _comment_texts(comment) if _text_sha256(t) == digest), None)
+            if full is None:
+                entry[f"{field}_unresolved"] = True
+            else:
+                entry[field] = full
+        out.append(entry)
+    return out
 
 
 def _compact_history(meta: Dict[str, Any], comments: List[Dict[str, Any]],
                      human_body: str) -> int:
-    """Move long answer/comment texts already posted as issue comments out of
-    the body, oldest first, until it fits the budget. Lossless: an entry moves
-    only when an issue comment holds exactly its text. Returns entries moved."""
+    """Move long history texts that issue comments already hold out of the
+    body, oldest first, until it fits the budget. Lossless: an entry moves
+    only when an issue comment holds exactly its text (answer/comment/
+    progress text, block question, WT-45), and an entry already referenced
+    is re-excerpted only after its comment is found and matches its sha256.
+    Returns entries changed."""
     hist = meta.get("history")
     if not isinstance(hist, list):
         return 0
     by_text: Dict[str, str] = {}
     for c in comments or []:
-        if not isinstance(c, dict):
-            continue
-        text, _key = _strip_entry_marker(str(c.get("body") or ""))
-        ref = _comment_ref(c)
+        ref = _comment_ref(c) if isinstance(c, dict) else ""
         if ref:
-            by_text.setdefault(text, ref)
+            for text in _comment_texts(c):
+                by_text.setdefault(text, ref)
+    resolved = _resolve_history(hist, comments)
     moved = 0
     size = _body_bytes(_body_with_metadata(human_body, meta))
     for i, entry in enumerate(hist):
         if size <= _ISSUE_BODY_BUDGET_BYTES:
             break
-        if (not isinstance(entry, dict) or entry.get("event") not in _COMMENTED_EVENTS
-                or entry.get("text_ref")):
+        field = _REF_FIELD_BY_EVENT.get(entry.get("event")) if isinstance(entry, dict) else None
+        if not field:
             continue
-        text = str(entry.get("text") or "")
-        ref = by_text.get(text)  # exact: a comment that differs at all is not this text
-        if len(text) <= _HISTORY_TEXT_INLINE_MAX or not ref:
+        if entry.get(f"{field}_ref"):
+            if resolved[i].get(f"{field}_unresolved"):
+                continue
+            text, ref = str(resolved[i].get(field) or ""), str(entry[f"{field}_ref"])
+        else:
+            text = str(entry.get(field) or "")
+            ref = by_text.get(text, "")  # exact: a comment that differs at all is not this text
+        if len(text) <= _HISTORY_REF_MIN or not ref:
             continue
-        compact = {k: v for k, v in entry.items() if k != "text"}
-        _referenced_text(compact, text, ref)
+        compact = {k: v for k, v in entry.items()
+                   if k not in (field, f"{field}_len", f"{field}_sha256", f"{field}_ref")}
+        _referenced_text(compact, text, ref, field)
         # The metadata line is ASCII JSON (ensure_ascii), so the entry's
-        # serialized length change is the body's byte change.
-        size -= len(json.dumps(entry)) - len(json.dumps(compact))
+        # serialized length change is the body's byte change. Move only
+        # what shrinks (a heavily escaped short text can grow).
+        saved = len(json.dumps(entry)) - len(json.dumps(compact))
+        if saved <= 0:
+            continue
+        size -= saved
         hist[i] = compact
         moved += 1
     return moved
@@ -1822,10 +1918,21 @@ def _merge_body_write(base_raw: str, ours_raw: str,
             # (WT-44) is the same entry, not a new one to append twice.
             seen = {_history_id(e) for e in old} | {_history_id(e) for e in have}
             add = [e for e in o if _history_id(e) not in seen]
+            # Ours may hold an entry referenced (or re-excerpted, WT-45)
+            # where fresh still has it longer: same entry, keep the smaller.
+            # Only an entry ours actually changed counts; an unchanged one
+            # never undoes fresh's own compaction of it.
+            base_by = {_history_id(e): e for e in old}
             moved = {_history_id(e): e for e in o
-                     if isinstance(e, dict) and e.get("text_ref")}
-            kept = [e if isinstance(e, dict) and e.get("text_ref")
-                    else moved.get(_history_id(e), e) for e in have]
+                     if _is_referenced(e) and base_by.get(_history_id(e)) != e}
+
+            def smaller(e: Any) -> Any:
+                mine = moved.get(_history_id(e))
+                if mine is None or len(json.dumps(mine)) >= len(json.dumps(e)):
+                    return e
+                return mine
+
+            kept = [smaller(e) for e in have]
             if add or kept != have:
                 merged_m["history"] = kept + add
                 dirty = True
@@ -2331,7 +2438,10 @@ class GitHubIssuesBackend:
 
     def _issue_to_item(self, issue: Dict[str, Any]) -> Dict[str, Any]:
         comments_raw = issue.get("comments")
-        has_comments = isinstance(comments_raw, list) and bool(comments_raw)
+        # A fetched list, even an empty one (every comment deleted), is not
+        # an omitted one: get() must resolve against it, so it is never
+        # memoized beside the list path's comment-less conversion (WT-45).
+        has_comments = isinstance(comments_raw, list)
         created_at = issue.get("createdAt")
         state = str(issue.get("state") or "").upper()
         age_settled = (
@@ -2537,7 +2647,12 @@ class GitHubIssuesBackend:
                 item["duplicate_result"] = dict(meta["duplicate_result"])
         history = meta.get("history")
         if isinstance(history, list):
-            item["history"] = list(history)
+            # WT-45: get() carries the comments, so readers see the exact
+            # referenced texts (marked unresolved when a comment is gone, even
+            # all of them); the list path (no comments) keeps excerpts.
+            item["history"] = (_resolve_history(history, comments_raw)
+                               if isinstance(comments_raw, list)
+                               else list(history))
         if meta.get("token_usage"):
             item["token_usage"] = copy.copy(meta["token_usage"])
         if memo_key is not None:
@@ -3208,10 +3323,10 @@ class GitHubIssuesBackend:
         if _body_bytes(ours) <= _ISSUE_BODY_BUDGET_BYTES:
             return ours
         hist = meta.get("history") if isinstance(meta.get("history"), list) else []
-        movable = any(isinstance(e, dict) and e.get("event") in _COMMENTED_EVENTS
-                      and not e.get("text_ref")
-                      and len(str(e.get("text") or "")) > _HISTORY_TEXT_INLINE_MAX
-                      for e in hist)
+        movable = any(isinstance(e, dict) and e.get("event") in _REF_FIELD_BY_EVENT
+                      and len(str(e.get(_REF_FIELD_BY_EVENT[e["event"]]) or ""))
+                      > _HISTORY_TEXT_INLINE_MAX
+                      for e in hist)  # a WT-44 1,000-char excerpt counts: re-excerpt it
         moved = 0
         if movable:
             comments = item.get("_github_comments")
@@ -3224,26 +3339,31 @@ class GitHubIssuesBackend:
         if size > _ISSUE_BODY_MAX_BYTES:
             raise GitHubBackendError(
                 f"{self.repo}#{item['number']} issue body would be {size} bytes; GitHub "
-                f"refuses more than {_ISSUE_BODY_MAX_BYTES}. Moved {moved} answer/comment "
-                f"history text(s) to their issue comments and it still does not fit. "
+                f"refuses more than {_ISSUE_BODY_MAX_BYTES}. Moved {moved} history "
+                f"text(s) to their issue comments and it still does not fit. "
                 f"Nothing was written; the change is safe to retry once it fits.")
         if moved:
             try:
                 from . import queue as _q
                 _q._log("GH-COMPACT", f"{self.repo}#{item['number']} moved {moved} "
-                        f"answer/comment history text(s) to their issue comments "
+                        f"history text(s) to their issue comments "
                         f"({size} bytes)")
             except Exception:  # noqa: BLE001 - logging never breaks a write
                 pass
         return ours
 
     def _post_entry_comment(self, item: Dict[str, Any], body: str,
-                            meta: Dict[str, Any], event: str, text: str) -> str:
+                            meta: Dict[str, Any], event: str, text: str, *,
+                            comment_text: Optional[str] = None,
+                            field: str = "text") -> str:
         """Post ``text`` as an issue comment tagged with an entry key. A comment already carrying the key --
         posted by an attempt whose body edit then failed -- is adopted, not
         reposted. Returns (entry key, reference). Refuses up front, posting nothing, when the text exceeds a
-        comment or its history entry could never fit the body."""
-        if len(text) > _COMMENT_MAX_CHARS - 64:
+        comment or its history entry could never fit the body. ``comment_text``
+        is what is posted when it differs from ``text`` (a block/progress
+        mirror's prefix, WT-45); ``field`` is the history key holding it."""
+        comment_text = text if comment_text is None else comment_text
+        if len(comment_text) > _COMMENT_MAX_CHARS - 64:
             raise GitHubBackendError(
                 f"text is {len(text)} chars; a GitHub comment holds at most "
                 f"{_COMMENT_MAX_CHARS - 64} here. Nothing was written: shorten it "
@@ -3251,17 +3371,64 @@ class GitHubIssuesBackend:
         key = _entry_key(str(item["number"]), event, meta, text)
         projected = copy.deepcopy(meta)
         _append_history(projected, event, entry_key=key)
-        _referenced_text(projected["history"][-1], text, f"{item.get('url', '')}#issuecomment-0")
+        _referenced_text(projected["history"][-1], text, self._probe_ref(item), field)
         self._fit_body(item, body, projected)
+        return key, self._post_keyed_comment(item, key, comment_text)
+
+    @staticmethod
+    def _probe_ref(item: Dict[str, Any]) -> str:
+        """A reference as long as a real comment url, for size checks."""
+        return f"{item.get('url', '')}#issuecomment-{'0' * 12}"
+
+    def _post_keyed_comment(self, item: Dict[str, Any], key: str, comment_text: str) -> str:
+        """Post ``comment_text`` tagged with ``key``, or adopt the comment an
+        earlier attempt already posted with that key and text. Returns its
+        reference."""
         for c in item.get("_github_comments") or []:
             if isinstance(c, dict):
                 found_text, found = _strip_entry_marker(str(c.get("body") or ""))
-                if found == key and found_text == text:
-                    return key, _comment_ref(c) or f"comment:{key}"
+                if found == key and found_text == comment_text:
+                    return _comment_ref(c) or f"comment:{key}"
         out = self._run(["issue", "comment", str(item["number"]), *self._repo_args()],
-                        body=text + _ENTRY_MARKER.format(key))
+                        body=comment_text + _ENTRY_MARKER.format(key))
         url = (out or "").strip().splitlines()[-1:] or [""]
-        return key, url[0] if url[0].startswith("http") else f"comment:{key}"
+        return url[0] if url[0].startswith("http") else f"comment:{key}"
+
+    def _post_mirrors(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
+                      mirrors: List[tuple]) -> None:
+        """WT-45: post block questions and progress notes as keyed issue
+        comments BEFORE the body edit, the same contract as an answer: the
+        comment is the durable full copy and a retry adopts it.
+
+        ``meta`` is the complete post-operation metadata and each mirror is
+        (history entry in it, field, text, comment prefix, entry key), the
+        key derived from the pre-operation metadata so a retry derives it
+        again. The final body is size-checked first, with every live change
+        of the operation in it, so a write that can never fit posts nothing
+        and one that shrinks the body is not refused. The entry keeps its
+        key even when the post fails, so the same words later get the next
+        key instead of adopting a comment whose reply was lost. A comment
+        that does not hold the text exactly (the owner-answer marker
+        defused) or was not posted leaves the text inline: best-effort like
+        the old after-the-edit mirror."""
+        if not mirrors:
+            return
+        staged = []
+        for entry, field, text, prefix, key in mirrors:
+            shown = re.sub(re.escape(_OWNER_ANSWER_MARKER), "owner-answer", text,
+                           flags=re.IGNORECASE)
+            exact = shown == text
+            _set_history_text(entry, text, self._probe_ref(item) if exact else "", field)
+            staged.append((entry, field, text, prefix + shown, key, exact))
+        self._fit_body(item, body, copy.deepcopy(meta))
+        for entry, field, text, comment_text, key, exact in staged:
+            ref = ""
+            if len(comment_text) <= _COMMENT_MAX_CHARS - 64:
+                try:
+                    ref = self._post_keyed_comment(item, key, comment_text)
+                except GitHubBackendError:
+                    ref = ""
+            _set_history_text(entry, text, ref if exact else "", field)
 
     def _edit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
                    *extra: str) -> List[str]:
@@ -3826,14 +3993,16 @@ class GitHubIssuesBackend:
             raise ValueError(f"{item.get('ref')} is claimed by {holder}, not {session_id}")
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        pre, mirrors = copy.deepcopy(meta), []
         if progress:
-            _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
+            self._append_progress(item, pre, meta, session_id, progress, mirrors)
         for key in ("claimed_by", "claimed_machine", "claimed_at", "claimed_session_id"):
             meta.pop(key, None)
         meta["deferred_until"] = until_iso
         meta["defer_reason"] = _clip(reason, 2000)
         self._usage_history(meta, number, "defer", worker=str(session_id),
                             until=until_iso, reason=_clip(reason, 2000))
+        self._post_mirrors(item, body, meta, mirrors)
         self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
         return self.get(ident)
 
@@ -3877,8 +4046,15 @@ class GitHubIssuesBackend:
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         now = _now_iso()
+        question = _clip(question, 4000)
+        # WT-45: comments first, keyed on the pre-block metadata so a retry
+        # after a failed body edit derives the same keys and adopts them.
+        pre, mirrors = copy.deepcopy(meta), []
+        q_key = _entry_key(number, "block", pre, question) if question.strip() else ""
+        if progress:
+            self._append_progress(item, pre, meta, session_id, progress, mirrors)
         meta["needs_input"] = True
-        meta["block_question"] = _clip(question, 4000)
+        meta["block_question"] = question
         meta["blocked_at"] = now
         meta["block_kind"] = kind if kind in _q.BLOCK_KINDS else "input"
         if wait_on:
@@ -3890,26 +4066,37 @@ class GitHubIssuesBackend:
             if not meta.get("claimed_by"):
                 meta["claimed_by"] = str(session_id)
                 meta["claimed_machine"] = machine_tag()
-        if progress:
-            _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
         # The writing host, so a system (backstop) block is attributable (WT-39).
-        self._usage_history(meta, number, "block", worker=str(session_id), question=_clip(question, 4000),
+        self._usage_history(meta, number, "block", worker=str(session_id), question=question,
                             kind=meta["block_kind"], wait_on=wait_on, wait_actor=wait_actor,
-                            wait_ref=wait_ref, machine=machine_tag())
+                            wait_ref=wait_ref, machine=machine_tag(), entry_key=q_key)
+        # The live question stays whole in block_question; only the history
+        # copy is referenced (WT-45). The mirror comment (WT-37) is what makes
+        # the question visible on GitHub; its owner-answer marker is defused
+        # so it can never be ingested as its own answer.
+        if q_key:
+            block_entry = next(e for e in reversed(meta["history"]) if e.get("event") == "block")
+            mirrors.insert(0, (block_entry, "question", question,
+                               _BLOCK_COMMENT_PREFIX.format(session_id or "worker"), q_key))
+        self._post_mirrors(item, body, meta, mirrors)
         self._edit_body(item, body, meta)
-        # Mirror the question onto the issue discussion (WT-37): the metadata
-        # block is invisible to anyone reading the issue on GitHub. Best-effort,
-        # the block itself is already recorded. The owner-answer marker is
-        # defused so the question can never be ingested as its own answer.
-        if question.strip():
-            shown = re.sub(re.escape(_OWNER_ANSWER_MARKER), "owner-answer",
-                           _clip(question, 4000), flags=re.IGNORECASE)
-            self._run([
-                "issue", "comment", number,
-                *self._repo_args(),
-            ], check=False,
-                body=f"[watchtower] Needs input from {session_id or 'worker'}:\n\n{shown}")
         return self.get(ident)
+
+    def _append_progress(self, item: Dict[str, Any], pre: Dict[str, Any],
+                         meta: Dict[str, Any], session_id: str, progress: str,
+                         mirrors: List[tuple]) -> None:
+        """A progress history entry (wt block/defer --progress). A long note
+        is queued in ``mirrors`` to be posted as a keyed comment first and
+        referenced (WT-45), keyed on the pre-operation ``pre``; a short one
+        stays inline and posts nothing."""
+        text = _clip(progress, 24000)
+        key = (_entry_key(str(item["number"]), "progress", pre, text)
+               if len(text) > _HISTORY_REF_MIN else "")
+        _append_history(meta, "progress", worker=str(session_id), entry_key=key)
+        meta["history"][-1]["text"] = text
+        if key:
+            mirrors.append((meta["history"][-1], "text", text,
+                            _PROGRESS_COMMENT_PREFIX.format(session_id or "worker"), key))
 
     @_serialized_body_write
     def renew_claim_heartbeat(self, ident: Any, *, claimed_by: str,
