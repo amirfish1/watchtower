@@ -752,6 +752,34 @@ def session_state(sid: str, now: Optional[float] = None) -> str:
     return "busy" if (now - mtime) < _busy_window_s() else "idle"
 
 
+def _archive_may_displace(it: Dict[str, Any], sid: str, status: str) -> bool:
+    """WT-47: a degraded ticket whose tail has no displacement of ``sid``. The
+    archive digest answers exactly while nothing overflowed; an invalid digest
+    or an overflowed list guards, unless the tail shows ``sid`` re-bound. That
+    is a liveness cost on purpose: a false guard stops a resume, a false clear
+    re-commits redrained work."""
+    from . import github_history_archive as gha
+    from . import queue as _q
+    if it.get("history_resolved") is not False:
+        return False
+    if any(e.get("event") in ("claim", "reopen")
+           and str((e.get("by") or {}).get("session_id") or "") == sid
+           for e in it.get("history") or []):
+        return False
+    digest = _q.history_digest(it)
+    if digest is None:
+        return True
+    h = gha.sid_hash(sid)
+    if h in {p[0] for p in digest.get("displaced") or []}:
+        return True
+    if digest.get("displaced_overflow"):
+        return True
+    return (int(digest.get("legacy_reopen", -1)) >= 0
+            and str(it.get("claimed_session_id") or "") == sid
+            and status in ("open", "closed")
+            and h not in set(digest.get("legacy_rebound") or []))
+
+
 def _displaced_claim_for_session(sid: str) -> Optional[Dict[str, str]]:
     """If ``sid`` had a claim taken from it by the orphan sweep (its worker was
     found dead mid-ticket), return ``{"ref", "reason"}``; else None. Used to
@@ -792,10 +820,11 @@ def _displaced_claim_for_session(sid: str) -> Optional[Dict[str, str]]:
                   and status in ("open", "closed")):
                 hit, legacy = i, True
         if hit < 0:
-            continue
-        if any(e.get("event") in ("claim", "reopen")
-               and str((e.get("by") or {}).get("session_id") or "") == sid
-               for e in hist[hit + 1:]):
+            if not _archive_may_displace(it, sid, status):
+                continue
+        elif any(e.get("event") in ("claim", "reopen")
+                 and str((e.get("by") or {}).get("session_id") or "") == sid
+                 for e in hist[hit + 1:]):
             continue  # sid re-bound itself after the displacement
         if legacy:
             reason = ("reopened after you were reaped for idling" if status == "open"

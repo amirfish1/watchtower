@@ -473,7 +473,7 @@ def _wait_host(it: Dict[str, Any], w: Dict[str, Any]) -> str:
         if h.get("event") == "block":
             by = h.get("by") if isinstance(h.get("by"), dict) else {}
             return str(h.get("machine") or by.get("machine") or "")
-    return ""
+    return str((q.history_digest(it) or {}).get("last_block_host") or "")
 
 
 def _foreign_local_ref(it: Dict[str, Any], dep: Dict[str, Any], w: Dict[str, Any]) -> bool:

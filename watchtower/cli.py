@@ -326,6 +326,49 @@ def _mark_self(item: dict, worker: str, session: str) -> dict:
 
 
 # ----------------------------------------------------------------------- commands
+def cmd_history_archive(args: argparse.Namespace) -> int:
+    """WT-47 §4.2: status of a queue's archived issues, or set the flag. `on`
+    refuses without an attestation, or while a recent claim shows a host below
+    the reader protocol. Rollback is `off`: existing archives are still read."""
+    from . import config as _config
+    from . import github_backend as _gb
+    from . import queue as q
+    queue = args.queue
+    backend = q._github_backend_for_project(queue)
+    if backend is None:
+        print(f"history-archive: {queue} is not a GitHub queue", file=sys.stderr)
+        return 2
+    items = backend.list_items()
+    if args.action == "on":
+        hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
+        if not args.attest_by or not hosts:
+            print("history-archive: --attest-by and --hosts are required; every host "
+                  "with repo write access must run release >= 1 (`wt deploy --json`)",
+                  file=sys.stderr)
+            return 2
+        stale = [it.get("ref") for it in items if _gb._stale_archive_reader(it)]
+        if stale:
+            print("history-archive: refused: recent claims from a host below the reader "
+                  f"protocol on {', '.join(map(str, stale[:10]))}", file=sys.stderr)
+            return 1
+        _config.set_history_archive(queue, True, args.attest_by, hosts)
+    elif args.action == "off":
+        _config.set_history_archive(queue, False)
+    archived = [{"ref": it.get("ref"), "total": q.history_total(it),
+                 "resolved": it.get("history_resolved")}
+                for it in items if "history_resolved" in it]
+    row = {"queue": queue, "on": _config.history_archive_on(queue), "archived": archived}
+    if args.json:
+        print(json.dumps(row, indent=2))
+    else:
+        print(f"{queue}: archival {'on' if row['on'] else 'off'}; "
+              f"{len(archived)} archived issue(s); minimum reader is release 1 for these")
+        for a in archived:
+            print(f"  {a['ref']}: {a['total']} entries"
+                  f"{'' if a['resolved'] else ' (UNRESOLVED)'}")
+    return 0
+
+
 def cmd_deploy(args: argparse.Namespace) -> int:
     """Show the installed tree vs origin; --sync fast-forwards it (WT-16)."""
     from . import deploy
@@ -6710,6 +6753,7 @@ COMMAND_HELP: Dict[str, str] = {
     "export-json": "dump the store as classic {counter, items} JSON",
     "status": "per-queue depth / age / stuck flag",
     "deploy": "installed copy vs origin/main; --sync fast-forwards it when clean",
+    "history-archive": "GitHub history archival: status, or on/off behind an attestation",
     "models": "list approved models per engine; `migrate`/`unpin` bulk-move queue models",
     "config": "recommended queue configuration: settings plus auto-drain policy",
     "set": "compatibility alias for basic queue settings; prefer `wt config`",
@@ -6920,6 +6964,15 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--json", action="store_true")
     a.set_defaults(func=cmd_queue_ls)
     s.set_defaults(func=lambda args: (s.print_help(), 2)[1])
+
+    s = sub.add_parser("history-archive")
+    s.add_argument("action", choices=["status", "on", "off"])
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("--attest-by", default="",
+                   help="who attests every host with repo write access runs release >= 1")
+    s.add_argument("--hosts", default="", help="comma-separated attested hosts")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_history_archive)
 
     s = sub.add_parser("deploy")
     s.add_argument("--sync", action="store_true",

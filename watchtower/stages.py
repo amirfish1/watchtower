@@ -817,6 +817,7 @@ def _supervise(d: Dict[str, Any], rows: List[Dict[str, Any]], budget: _Budget) -
         legacy = _legacy_meta(item, role)
         retired = q.stage_retired_ids(item)   # WT-33 D10: never adopt a retired session
         if (not ss and legacy.get("worker_id") and legacy["worker_id"] not in retired
+                and q.RETIRED_UNKNOWN not in retired
                 and (not legacy.get("stage_key") or legacy.get("stage_key") == key)):
             adopted = True
             ss = {"key": key, "role": role, "attempt": 1, "worker_id": legacy["worker_id"],

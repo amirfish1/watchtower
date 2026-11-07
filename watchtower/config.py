@@ -1723,6 +1723,33 @@ def desired_workers(queue: str) -> int:
     return int(_queue_entry(queue).get("desired_workers", 1))
 
 
+def history_archive_on(queue: str) -> bool:
+    """WT-47 release 2: GitHub history archival for this queue. On only with
+    the recorded attestation; a bare ``true`` in a hand-edited file is off."""
+    entry = _queue_entry(queue).get("history_archive")
+    return (isinstance(entry, dict) and entry.get("on") is True
+            and bool(entry.get("attested_by")) and bool(entry.get("hosts")))
+
+
+def set_history_archive(queue: str, on: bool, attested_by: str = "",
+                        hosts: Any = ()) -> Dict[str, Any]:
+    """Record the flag. Off stops new archives; existing ones are still read."""
+    data = _load()
+    q = data.get(queue)
+    if not isinstance(q, dict):
+        q = data[queue] = {}
+    if on:
+        if not attested_by or not hosts:
+            raise ValueError("turning history archival on needs an attestation and host list")
+        q["history_archive"] = {
+            "on": True, "attested_by": attested_by, "hosts": list(hosts),
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    else:
+        q.pop("history_archive", None)
+    _save(data)
+    return q
+
+
 def is_archived(queue: str) -> bool:
     return bool(_queue_entry(queue).get("archived", False))
 

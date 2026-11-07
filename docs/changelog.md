@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-06 — bounded GitHub issue history (WT-47)
+
+- Move the oldest history entries into hash-chained comment segments, so a long
+  ticket's issue body stays bounded instead of refusing writes at GitHub's cap.
+- Readers rebuild full history; an unverifiable chain is reported and each
+  consumer fails closed.
+- Off by default: `wt history-archive` turns it on per queue, with an attestation.
+  See [history archive](github-history-archive.md).
+
 ## 2026-10-31 — same-session takeover
 
 - Add `wt takeover`, status, cancellation, dry-run, native observations and

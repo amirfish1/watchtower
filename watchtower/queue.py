@@ -1247,6 +1247,65 @@ def _add_timeline_event(events: List[Dict[str, Any]], raw: Dict[str, Any], *, sy
     events.append(ev)
 
 
+RETIRED_UNKNOWN = "?retired-unknown"
+
+
+def history_digest(it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The archive digest of a degraded GitHub item when it may be read: only
+    with a valid ``dstate``, and never on a resolved or local item (WT-47)."""
+    if it.get("history_resolved") is not False:
+        return None
+    state = it.get("history_archive_state") or {}
+    return state.get("digest") if state.get("dstate") == "ok" else None
+
+
+def history_total(it: Dict[str, Any]) -> int:
+    """Logical history length, archived entries included."""
+    return int(it.get("history_base") or 0) + len(it.get("history") or [])
+
+
+def history_issue_total(it: Dict[str, Any]) -> int:
+    """history_total without the sidecar overlay entries."""
+    return history_total(it) - int(it.get("history_overlay") or 0)
+
+
+def history_count(it: Dict[str, Any], kind: str, pred: Any = None) -> "tuple[int, bool]":
+    """(count of ``kind`` entries, exact). Degraded, a digest count is added
+    for its fixed kinds; anything else is a lower bound, ``exact=False``."""
+    seen = sum(1 for h in it.get("history") or [] if isinstance(h, dict)
+               and h.get("event") == kind and (pred is None or pred(h)))
+    if it.get("history_resolved") is not False:
+        return seen, True
+    digest = history_digest(it)
+    from . import github_history_archive as gha
+    if digest is None or pred is not None or kind not in gha.K_DIGEST:
+        return seen, False
+    return seen + int((digest.get("counts", {}).get(kind) or [0])[0]), True
+
+
+def history_last_at(it: Dict[str, Any], kind: str) -> "tuple[Optional[str], bool]":
+    """(latest time of event ``kind`` or clock class, exact). A visible match
+    is exact, because the tail is newer than the archive."""
+    from . import github_history_archive as gha
+    is_class = kind in gha.CLOCK_CLASSES
+    hits = [str(h.get("at") or "") for h in it.get("history") or [] if isinstance(h, dict)
+            and (kind in gha._class_of(h) if is_class else h.get("event") == kind)]
+    if hits:
+        return max(hits), True
+    if it.get("history_resolved") is not False:
+        return None, True
+    digest = history_digest(it)
+    if digest is None:
+        return None, False
+    if is_class:
+        if "clocks" not in digest:
+            return None, False       # another classifier version wrote them
+        return digest["clocks"].get(kind) or None, True
+    if kind not in gha.K_DIGEST:
+        return None, False
+    return (digest.get("counts", {}).get(kind) or [0, None])[1] or None, True
+
+
 def timeline(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Return the canonical chronological activity stream for any ticket shape.
 
@@ -1255,6 +1314,13 @@ def timeline(item: Dict[str, Any]) -> List[Dict[str, Any]]:
     are normalized here at read time without mutating the item.
     """
     events: List[Dict[str, Any]] = []
+
+    if item.get("history_resolved") is False:
+        state = item.get("history_archive_state") or {}
+        _add_timeline_event(events, {
+            "event": "comment", "at": item.get("created_at") or "",
+            "text": f"[{item.get('history_base') or 0} earlier entries archived; "
+                    f"unresolved: {state.get('err') or 'unknown'}]"})
 
     hist = item.get("history")
     if isinstance(hist, list):
@@ -4733,6 +4799,7 @@ def _sync_duplicates_unlocked(data: Dict[str, Any]) -> None:
 
         complete = bool(original and original.get("status") == "closed"
                         and not original.get("gate_pending")
+                        and original.get("history_resolved") is not False
                         and all(proven(g) for g in required))
         snapshot = {"ref": ref, "status": (original or {}).get("status", "missing"),
                     "verify_cycle": (original or {}).get("verify_cycle", 0),
@@ -5300,6 +5367,8 @@ def stage_retired_ids(item: Dict[str, Any]) -> set:
     ids |= {str(h.get("worker_id") or "") for h in (item.get("history") or [])
             if isinstance(h, dict) and h.get("event") == "stage_retired"}
     ids.discard("")
+    if item.get("history_resolved") is False:
+        ids.add(RETIRED_UNKNOWN)  # the archive may hold more: adopt nothing (WT-47)
     return ids
 
 

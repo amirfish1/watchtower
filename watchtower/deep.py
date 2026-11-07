@@ -79,16 +79,21 @@ def deep_brief(item: Dict[str, Any]) -> str:
         "carry genuinely separate work, never this ticket's own goal.",
     ]
     defers = _history(item, "defer")
-    if defers:
-        last = defers[-1]
+    defer_count, defer_exact = q.history_count(item, "defer")
+    if defer_count:
+        last = defers[-1] if defers else {}
+        shown = f"{defer_count}x" if defer_exact else f">={defer_count}x (archive unresolved)"
         lines += [
             "",
-            f"RESUMING: deferred {len(defers)}x; last until {last.get('until') or '?'} "
+            f"RESUMING: deferred {shown}; last until {last.get('until') or '?'} "
             f"-- {last.get('reason') or ''}. Read the latest progress note in the "
             "ticket history and analyse the collected data before changing anything.",
         ]
     attempts = [c for c in _history(item, "comment")
                 if str(c.get("text") or "").lower().startswith("attempt")]
     if attempts:
-        lines.append(f"PRIOR ATTEMPTS on record: {len(attempts)} (see the ticket comments).")
+        shown = str(len(attempts))
+        if item.get("history_resolved") is False:
+            shown = f">={shown} (archive unresolved)"
+        lines.append(f"PRIOR ATTEMPTS on record: {shown} (see the ticket comments).")
     return "\n".join(lines)

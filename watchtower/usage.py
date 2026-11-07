@@ -270,7 +270,7 @@ def on_event(item: dict, event: dict) -> None:
     if kind == "claim":
         finish(item, "worker", at, "replaced")
         begin(item, "worker", str(actor.get("worker") or item.get("claimed_by") or ""),
-              str(actor.get("session_id") or item.get("claimed_session_id") or ""), at, run=f"claim:{len(item.get('history') or [])}",
+              str(actor.get("session_id") or item.get("claimed_session_id") or ""), at, run=f"claim:{int(item.get('history_base') or 0) + len(item.get('history') or [])}",
               attempt=1 + sum(a["role"] == "worker" for a in (item.get("token_usage") or {}).get("attempts", [])))
     elif kind in ("close", "reopen", "release", "block"):
         finish(item, "worker", at, kind)
@@ -451,6 +451,7 @@ def capture(item: dict, callback, *args) -> None:
         with storage.file_lock(path.with_suffix(".lock")):
             record = _read(path, strict=True)
             tracking = {"ref": item.get("ref"), "history": item.get("history", []),
+                        "history_base": int(item.get("history_base") or 0),
                         "claimed_by": item.get("claimed_by"),
                         "claimed_session_id": item.get("claimed_session_id"),
                         "_usage_namespace": item.get("_usage_namespace")}

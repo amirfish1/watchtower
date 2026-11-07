@@ -1133,7 +1133,7 @@ def fingerprint(item: Dict[str, Any],
     except Exception as exc:  # noqa: BLE001 - an unprojectable state still fingerprints
         dims = ["unprojectable", str(exc)]
     bs = item.get("backstop") if isinstance(item.get("backstop"), dict) else {}
-    payload = [dims, item.get("updated_at"), len(item.get("history") or []),
+    payload = [dims, item.get("updated_at"), q.history_total(item),
                item.get("answered_at"), item.get("pending_answer"),
                [bs.get("state"), bs.get("action"), bs.get("count")],
                (item.get("stage_session") or {}).get("key")]

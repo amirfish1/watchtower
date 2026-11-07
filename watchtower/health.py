@@ -55,7 +55,22 @@ def _last_event_at(it: Dict[str, Any], stage_only: bool = False) -> Optional[str
         if (str(ev or "").startswith("stage_") if stage_only else _progress_event(ev)):
             if best is None or h["at"] > best:
                 best = h["at"]
+    if best is None and it.get("history_resolved") is False:
+        # WT-47: None never reads fresh, so an unknown clock stays stale.
+        best = q.history_last_at(it, "stage" if stage_only else "progress")[0]
     return best
+
+
+def _stage_clock(it: Dict[str, Any]) -> str:
+    """Latest stage event, else ``updated_at``. An unresolved archive makes the
+    clock unknown: read it as stale so the stage alerts (WT-47), since
+    ``updated_at`` would read fresh on any comment."""
+    at = _last_event_at(it, stage_only=True)
+    if at:
+        return at
+    if it.get("history_resolved") is False and not q.history_last_at(it, "stage")[1]:
+        return "1970-01-01T00:00:00Z"
+    return str(it.get("updated_at") or "")
 
 
 # History events that cannot put a ticket back into the claim pool, so they
@@ -86,6 +101,8 @@ def _claimable_since(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
         if (isinstance(h, dict) and isinstance(h.get("at"), str)
                 and h.get("event") not in _NOT_READINESS_EVENTS):
             stamps.append(h["at"])
+    if it.get("history_resolved") is False:
+        stamps.append(q.history_last_at(it, "readiness")[0])
     return max((s for s in stamps if isinstance(s, str) and _parse_iso(s)),
                default=None)
 
@@ -296,9 +313,7 @@ def queue_status(
     stage_stuck = False
     if owned:
         by_ref = {str(it.get("ref")): it for it in items}
-        last_stage = max((_last_event_at(by_ref[d["ref"]], stage_only=True)
-                          or str(by_ref[d["ref"]].get("updated_at") or "")
-                          for d in owned), default="")
+        last_stage = max((_stage_clock(by_ref[d["ref"]]) for d in owned), default="")
         stage_age = _age_seconds(last_stage, now)
         stage_stuck = stage_age is not None and stage_age >= stage_stuck_after_s(stuck_minutes)
 
