@@ -207,8 +207,14 @@ confidence over the threshold, the undo `git revert <that same --commit SHA>`, a
 nothing in your words may match the hard-stop floor (customers, money, prices, ads,
 public posts, production, irreversible). Any miss is an ordinary owner card that
 shows the reason. A pass resumes you with an AUTO-DECISION (not a human approval)
-that authorizes only your recommendation. Use `--major-because
-item|unknown|preference|security` to say it needs the owner. Owner commands:
+that authorizes only your recommendation. To say it needs the owner, use `--weight major --major-because
+<reason> --major-detail "<one concrete sentence>"`. Reasons: money, customer-sends,
+public-posts, ad-spend, irreversible, live-product (changes what real users get),
+safety-guard (weakens a privacy/security/safety control), owner-only-action (only
+the owner can do it), needs-information (name the fact only the owner has). The
+detail must be at least ~40 characters and say what concretely goes wrong or what
+exactly only the owner can do; "preference", "unknown", "needs you", "not sure",
+"tbd", "your call" are rejected and nothing is recorded, so restate and retry. Owner commands:
 `wt undo REF` (reverts and verifies), `wt policy -q QUEUE set enabled=true
 enabled_classes=code-change-revertable`, kill switch = create `auto-decision.off`
 in the WatchTower data dir. Workers cannot write policy.

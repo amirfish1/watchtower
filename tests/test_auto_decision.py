@@ -43,6 +43,9 @@ def env(wt_env, tmp_path, monkeypatch):
     return wt_env
 
 
+MD = "Sends the invoice email from the owner's own account, which only they can do."
+
+
 def _block(env, note="fix a thing", **over):
     q = env.queue
     it = q.enqueue(project="T", note=note, source="test")
@@ -93,8 +96,7 @@ def test_plain_block_stays_a_card(env):
     ({"decision_class": "other"}, "no enabled class"),
     ({"confidence": "0.6"}, "confidence 0.6"),
     ({"undo": "none"}, "no concrete undo"),
-    ({"weight": "major"}, "worker says it needs you: major"),
-    ({"major_because": "preference"}, "because preference"),
+    ({"weight": "major", "major_because": "money", "major_detail": MD}, "Major: money. " + MD),
     ({"attest": "money=no"}, "checklist incomplete"),
     ({"attest": ATT.replace("irreversible=no", "irreversible=yes")}, "attested irreversible=yes"),
     ({"recommend": "ok"}, "no named recommendation"),
@@ -225,6 +227,32 @@ def test_policy_writes_refused_for_workers_and_queue_cannot_drop_floor(env, monk
 
 
 def test_major_decline_card_is_short(env):
-    ref, _ = _block(env, weight="major", major_because="item")
+    ref, _ = _block(env, weight="major", major_because="money", major_detail=MD, attest=None)
     q = env.queue.get(ref)["block_question"]
-    assert "worker says it needs you" in q and "checklist incomplete" not in q
+    assert "needs you: Major: money. " in q and "checklist incomplete" not in q
+
+
+@pytest.mark.parametrize("because,detail", [
+    ("preference", MD), ("unknown", MD), ("security", MD), ("", MD), ("money", ""),
+    ("money", "too short"), ("money", "owner decision, not sure, tbd, your call, preference"),
+    ("needs-information", "needs the owner, it is their preference and unknown to me"),
+])
+def test_major_refused_leaves_ticket_untouched(env, because, detail):
+    it = env.queue.enqueue(project="T", note="x", source="t")
+    env.queue.claim_by_ref(it["ref"], "w1")
+    before = env.queue.get(it["ref"])
+    argv = ["block", it["ref"], "--worker", "w1", "--question", "?", "--weight", "major",
+            "--major-detail", detail] + (["--major-because", because] if because else [])
+    try:
+        rc = env.cli.main(argv)
+    except SystemExit as e:      # argparse rejects banned values outright
+        rc = e.code
+    assert rc not in (0, None)
+    after = env.queue.get(it["ref"])
+    assert after["status"] == before["status"] and not after.get("needs_input")
+
+
+@pytest.mark.parametrize("because", list(autodecide.MAJOR_BECAUSE))
+def test_each_allowed_major_reason_accepted(env, because):
+    ref, rc = _block(env, weight="major", major_because=because, major_detail=MD, attest=None)
+    assert rc == 0 and f"Major: {because}. " in env.queue.get(ref)["block_question"]

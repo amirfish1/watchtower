@@ -22,7 +22,33 @@ from typing import Any, Dict, List, Optional, Tuple
 
 POLICY_VERSION = 1
 ATTEST_KEYS = ("money", "customer-sends", "public-posts", "ad-spend", "irreversible")
-MAJOR_BECAUSE = ("item", "unknown", "preference", "security")
+MAJOR_BECAUSE = ("money", "customer-sends", "public-posts", "ad-spend", "irreversible",
+                 "live-product", "safety-guard", "owner-only-action", "needs-information")
+MIN_MAJOR_DETAIL_LEN = 40
+_VAGUE_DETAIL = re.compile(
+    r"\b(preference|unknown|needs? (the )?(owner|you)|owner decision|owner'?s call|not sure|tbd|your call|"
+    r"unsure|don'?t know|n/?a)\b", re.I)
+
+
+def validate_major(because: str, detail: str) -> Optional[str]:
+    """Return an error message when a major claim lacks a concrete reason, else None (CCC-374)."""
+    allowed = ", ".join(MAJOR_BECAUSE)
+    because = (because or "").strip()
+    detail = " ".join((detail or "").split())
+    if because not in MAJOR_BECAUSE:
+        return (f"--weight major needs --major-because with one of: {allowed} "
+                f"(got {because or 'nothing'}). 'preference', 'unknown' and 'security' are not reasons. "
+                "Nothing was recorded; rerun wt block with a concrete reason.")
+    if len(detail) < MIN_MAJOR_DETAIL_LEN:
+        return (f"--major-detail must be one real sentence of at least {MIN_MAJOR_DETAIL_LEN} characters "
+                "saying what concretely goes wrong or what exactly only the owner can do. "
+                "Nothing was recorded; restate it and rerun wt block.")
+    stripped = _VAGUE_DETAIL.sub("", detail)
+    if _VAGUE_DETAIL.search(detail) and len(stripped.strip()) < MIN_MAJOR_DETAIL_LEN:
+        return ("--major-detail is mostly vague words (preference/unknown/needs owner/not sure/tbd/your call). "
+                "State the concrete consequence or the exact fact or action only the owner has. "
+                "Nothing was recorded; restate it and rerun wt block.")
+    return None
 MIN_UNDO_LEN = 12
 _NO_UNDO = re.compile(r"^\W*(none|nothing|n/?a|na|unknown|tbd|no|can'?t|cannot|not possible|irreversible)\b", re.I)
 _SHA = r"[0-9a-f]{7,64}"
@@ -174,8 +200,8 @@ def evaluate(item: Dict[str, Any], p: Dict[str, Any], *, items: Optional[List[Di
         # The worker itself says this needs the owner: show only that on the card,
         # not a wall of unrelated missing-field reasons.
         res["reasons"] = [r for r in why if r.startswith(("kill switch", "auto-approval is off"))] or []
-        res["reasons"].append(f"worker says it needs you: major"
-                              + (f" because {p['major_because']}" if p.get("major_because") else ""))
+        res["reasons"].append(f"Major: {p.get('major_because') or 'unspecified'}. "
+                              + str(p.get("major_detail") or "").strip())
         hits, _err = floor_hits(proposal_text(p))
         res["matched"] = hits
         res["reasons"] += [f"matched hard stop: {h}" for h in hits]

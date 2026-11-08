@@ -3036,6 +3036,7 @@ def _auto_decide_after_block(item: Dict[str, Any], args: argparse.Namespace) -> 
         "undo": getattr(args, "undo", "") or "",
         "attest": autodecide.parse_attest(getattr(args, "attest", "") or ""),
         "major_because": getattr(args, "major_because", "") or "",
+        "major_detail": getattr(args, "major_detail", "") or "",
         "question": getattr(args, "question", "") or "",
         "progress": getattr(args, "progress", "") or "",
     }
@@ -3146,6 +3147,13 @@ def cmd_block(args: argparse.Namespace) -> int:
     uses (`_verify_close_commit`), so a parked (e.g. `--kind
     awaiting-client`) ticket can still show what was done without closing.
     """
+    if getattr(args, "weight", "") == "major" or getattr(args, "major_because", ""):
+        from . import autodecide
+        bad = autodecide.validate_major(getattr(args, "major_because", ""),
+                                        getattr(args, "major_detail", ""))
+        if bad:
+            print(f"error: {bad}", file=sys.stderr)
+            return 1
     commit = ""
     if getattr(args, "commit", ""):
         verified, error = _verify_close_commit(args.ref, args.commit)
@@ -7642,8 +7650,14 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--attest", default="",
                    help="auto-decision: money=no,customer-sends=no,public-posts=no,ad-spend=no,irreversible=no")
     s.add_argument("--major-because", dest="major_because", default="",
-                   choices=["", "item", "unknown", "preference", "security"],
-                   help="auto-decision: why this must go to the owner")
+                   choices=[""] + list(__import__("watchtower.autodecide", fromlist=["x"]).MAJOR_BECAUSE),
+                   help="required with --weight major: money, customer-sends, public-posts, "
+                        "ad-spend, irreversible, live-product (changes what real users get), "
+                        "safety-guard (weakens a privacy/security/safety control), owner-only-action "
+                        "(only the owner can do it), needs-information (a fact only the owner has)")
+    s.add_argument("--major-detail", dest="major_detail", default="",
+                   help="required with --weight major: one concrete sentence (>=40 chars) on what goes "
+                        "wrong or what exactly only the owner can do; vague words are rejected")
     s.add_argument("--wait-on", dest="wait_on", default="", choices=list(q.WAIT_ON),
                    help="who this block waits on: owner = a decision only the owner "
                         "can make (red 'needs you'); external = a client/studio/vendor "
