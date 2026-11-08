@@ -8579,8 +8579,27 @@ def auto_answer(ident: Any, text: str, *, expect_blocked_at: str, decision: Dict
     same moment, a changed ticket or a duplicate resume always wins. Local
     (file) backend only; anything else stays an owner card."""
     from . import autodecide
-    if _github_backend_for_project(_project_from_ident(ident)) is not None:
-        return None
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        # GitHub-backed ticket (CCC-376): the answer is delivered through the backend. The
+        # compare-and-swap is best effort (read, check, write) but backend.answer itself
+        # still requires the ticket to be waiting for input.
+        if autodecide.kill_switch_on():
+            return None
+        cur = get(ident)
+        if (not cur or not cur.get("needs_input") or cur.get("blocked_at") != expect_blocked_at
+                or autodecide.ticket_revision(cur) != revision):
+            return None
+        gen = sum(1 for h in (cur.get("history") or []) if h.get("event") == "answer") + 1
+        prompt = autodecide.AUTO_PROMPT.format(ref=cur.get("ref"), gen=gen, rec=_clip(text, 600))
+        item = backend.answer(ident, prompt, session_id="", kind="system")
+        if not item:
+            return None
+        _gh_history(ident, "auto_decision", text=_clip(prompt, 4000),
+                    decision_id=f"{cur.get('ref')}@{expect_blocked_at}",
+                    blocked_at=expect_blocked_at, revision=revision, **decision)
+        _log("AUTO_DECISION", f"{cur.get('ref', '?')} — {_clip(text, 200)}", queue=cur.get("project", ""))
+        return item
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:

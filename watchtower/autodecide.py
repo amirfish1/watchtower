@@ -348,7 +348,8 @@ AUTO_PROMPT = (
     "WatchTower, NOT a human approval. It authorizes ONLY your own recommendation, exactly as you "
     "stated it: {rec!r}. It approves nothing else: no customer send, money, price, ad, public post, "
     "or client/product sign-off. Apply it, verify it, then finish and close the ticket the normal "
-    "way with `wt close {ref} --worker <your-id> --summary \"...\" --commit <SHA>`; state in the "
+    "way with `wt close {ref} --worker <your-id> --summary \"...\"` plus `--commit <SHA>` if you "
+    "changed code or `--no-code` if you did not; state in the "
     "summary that this was an auto-decision. If anything beyond the recommendation turns out to be "
     "needed, run `wt block` again as an ordinary question. Undo, if the owner asks: `wt undo {ref}`."
 )
