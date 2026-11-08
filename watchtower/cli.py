@@ -3043,6 +3043,8 @@ def _auto_decide_after_block(item: Dict[str, Any], args: argparse.Namespace) -> 
         "replay_cap_usd": getattr(args, "replay_cap_usd", None),
         "replay_backend": getattr(args, "replay_backend", "") or "",
         "prev_value": getattr(args, "prev_value", "") or "",
+        "spend_cap_usd": getattr(args, "spend_cap_usd", None),
+        "spend_category": getattr(args, "spend_category", "") or "",
         "gate_dry_run": bool(getattr(args, "gate_dry_run", False)),
     }
     if not (p["class"] or p["weight"] or p["major_because"]):
@@ -7697,7 +7699,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--recommend", default="", help="auto-decision: the exact choice you recommend")
     s.add_argument("--undo", default="", help="auto-decision: exact undo, e.g. 'git revert <sha>'")
     s.add_argument("--attest", default="",
-                   help="auto-decision: money=no,customer-sends=no,public-posts=no,ad-spend=no,irreversible=no")
+                   help="auto-decision: money=no,customer-sends=no,public-posts=no,ad-spend=no,irreversible=no (capped-own-spend: money=own-capped,customer-money=no,...)")
     s.add_argument("--replay-cap-requests", dest="replay_cap_requests", type=int, default=None,
                    help="capped-replay-spend: hard maximum number of model requests the replay may make")
     s.add_argument("--replay-cap-usd", dest="replay_cap_usd", type=float, default=None,
@@ -7706,6 +7708,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="capped-replay-spend: where the replay runs; 'subscription-proxy' for the $0 path")
     s.add_argument("--prev-value", dest="prev_value", default="",
                    help="capped-replay-spend: the previous value of any ledger/limit you raised, so undo can restore it")
+    s.add_argument("--spend-cap-usd", dest="spend_cap_usd", type=float, default=None,
+                   help="capped-own-spend: hard dollar cap on the owner's own spend (must be >0 and within the queue's own_spend_max_usd)")
+    s.add_argument("--spend-category", dest="spend_category", default="",
+                   choices=[""] + list(__import__("watchtower.autodecide", fromlist=["x"]).OWN_SPEND_CATEGORIES),
+                   help="capped-own-spend: what the spend is for")
     s.add_argument("--gate-dry-run", dest="gate_dry_run", action="store_true",
                    help="run the auto-approval gate and record eligibility, but never approve (owner-requested test mode)")
     s.add_argument("--major-because", dest="major_because", default="",

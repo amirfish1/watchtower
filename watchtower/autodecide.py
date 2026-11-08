@@ -57,6 +57,11 @@ _SHA = r"[0-9a-f]{7,64}"
 _REPLAY_UNDO = (r"^(?:git (?:revert|checkout|restore)|wt policy|rm|cp|mv|sed|jq|echo|tee|python3?|"
                 r"restore|reset|set|edit)\b(?=.*(?:[/~]|\d|\.\w{2,5}\b))")
 SUBSCRIPTION_BACKENDS = ("subscription-proxy",)
+# capped-own-spend (Q856): the owner's OWN small capped spend (a hosting bump, a
+# model-token replay with a dollar cap). Customer money stays major.
+OWN_SPEND_CATEGORIES = ("hosting", "model-usage")
+OWN_SPEND_DEFAULT_MAX_USD = 25.0
+_DOLLAR_FIGURE = re.compile(r"\$\s?(\d+(?:\.\d+)?)")
 # Words that are not real money when the replay is zero-dollar on the subscription proxy.
 _BENIGN_MONEY = re.compile(r"\bsubscription(?:\s+(?:proxy|auth|plan|quota|token))?|\$0(?:\.0+)?(?![\d.])", re.I)
 
@@ -81,7 +86,17 @@ GLOBAL_POLICY: Dict[str, Any] = {
             "replay": True,
             "attest_extra": ["production-writes"],
         },
+        # The owner's own small capped spend. money is attested "own-capped"
+        # (not "no") and customer-money must be "no". Starts dry-run only: a
+        # queue opts in via dry_run_classes, then enabled_classes.
+        "capped-own-spend": {
+            "undo": _REPLAY_UNDO,
+            "needs_commit": False,
+            "own_spend": True,
+            "attest_extra": ["customer-money"],
+        },
     },
+    "own_spend_max_usd": OWN_SPEND_DEFAULT_MAX_USD,
 }
 
 DESK_SCRIPT = Path.home() / ".hermes" / "scripts" / "decision_desk.py"
@@ -115,6 +130,12 @@ def queue_policy(queue: str) -> Dict[str, Any]:
         pass
     try:
         pol["rate_per_hour"] = min(pol["rate_per_hour"], int(ov.get("rate_per_hour", pol["rate_per_hour"])))
+    except (TypeError, ValueError):
+        pass
+    try:                                   # a queue may only LOWER the own-spend ceiling
+        lowered = float(ov.get("own_spend_max_usd", pol["own_spend_max_usd"]))
+        if 0 < lowered < pol["own_spend_max_usd"]:
+            pol["own_spend_max_usd"] = lowered
     except (TypeError, ValueError):
         pass
     extra = [str(k) for k in (ov.get("attest") or []) if str(k) not in pol["attest"]]
@@ -257,10 +278,20 @@ def evaluate(item: Dict[str, Any], p: Dict[str, Any], *, items: Optional[List[Di
     chk("class enabled", bool(cls and spec is not None
                               and (cls in pol["enabled_classes"] or in_dry_class)),
         "no enabled class" + (f" ({cls})" if cls else ""),
-        "use --class code-change-revertable or capped-replay-spend (ask the owner to enable it for this queue)")
+        "use --class code-change-revertable, capped-replay-spend or capped-own-spend (ask the owner to enable it for this queue)")
     required = list(pol["attest"]) + list((spec or {}).get("attest_extra") or [])
+    own = bool(spec and spec.get("own_spend"))
     for k in required:
         v = att.get(k)
+        if own and k == "money":
+            if v == "own-capped":
+                chk("attest money", True, "")
+            else:
+                chk("attest money", False,
+                    "money not attested own-capped" if v is None else f"attested money={v}",
+                    "own-spend proposals attest money=own-capped (the owner's own capped spend, "
+                    "never customer money); anything else is major")
+            continue
         if v is None:
             chk(f"attest {k}", False, f"checklist incomplete: {k} not attested",
                 f"add {k}=no to --attest (only if it is true)")
@@ -284,6 +315,28 @@ def evaluate(item: Dict[str, Any], p: Dict[str, Any], *, items: Optional[List[Di
         if att.get("money") == "no" and cap_usd is not None and cap_usd > 0:
             chk("money attestation consistent", False, "attested money=no but replay dollar cap is above 0",
                 "a paid replay is money=yes and major")
+    spend_cap = None
+    if own:
+        try:
+            spend_cap = float(p.get("spend_cap_usd"))
+        except (TypeError, ValueError):
+            spend_cap = None
+        ceiling = float(pol["own_spend_max_usd"])
+        chk("own-spend cap", spend_cap is not None and 0 < spend_cap <= ceiling,
+            ("own-spend dollar cap missing or not above 0" if spend_cap is None or spend_cap <= 0
+             else f"own-spend cap ${spend_cap:g} is above this queue's ${ceiling:g} limit"),
+            f"pass --spend-cap-usd with a cap above 0 and at most {ceiling:g}; larger spend is major")
+        cat = str(p.get("spend_category") or "").strip().lower()
+        chk("own-spend category", cat in OWN_SPEND_CATEGORIES,
+            f"spend category {cat or 'missing'} is not one of {', '.join(OWN_SPEND_CATEGORIES)}",
+            "pass --spend-category hosting or model-usage; anything else is major")
+        prev = str(p.get("prev_value") or "").strip()
+        chk("previous value", len(prev) >= 1 and not _NO_UNDO.match(prev),
+            "no --prev-value recorded", "pass --prev-value with the setting as it is now, so undo can restore it")
+        undo_text = str(p.get("undo") or "")
+        chk("undo restores previous value", bool(prev) and prev.lower() in undo_text.lower(),
+            "undo does not mention the previous value",
+            "write the undo as the exact command/edit that sets the previous value back")
     try:
         conf = float(p.get("confidence"))
     except (TypeError, ValueError):
@@ -322,6 +375,16 @@ def evaluate(item: Dict[str, Any], p: Dict[str, Any], *, items: Optional[List[Di
         # Zero-dollar subscription replay: benign words (subscription, $0) do not veto the money
         # rule. Anything else (stripe, refund, $5, a paid run, a send) still does.
         hits2, _e2 = floor_hits(_BENIGN_MONEY.sub("", text))
+        if len(hits2) < len(hits):
+            res["exempted"] = [h for h in hits if h not in hits2]
+            hits = hits2
+    if (hits and own and spend_cap is not None and 0 < spend_cap <= float(pol["own_spend_max_usd"])
+            and att.get("customer-money") == "no" and att.get("money") == "own-capped"):
+        # Only a dollar figure within the cap is exempt; stripe/refund/invoice/price/charge
+        # words and everything else still veto.
+        def _within(m: "re.Match[str]") -> str:
+            return "" if float(m.group(1)) <= spend_cap else m.group(0)
+        hits2, _e2 = floor_hits(_DOLLAR_FIGURE.sub(_within, text))
         if len(hits2) < len(hits):
             res["exempted"] = [h for h in hits if h not in hits2]
             hits = hits2

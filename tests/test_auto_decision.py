@@ -371,3 +371,83 @@ def test_github_backed_proposal_roundtrip_via_local_store(env):
     q._proposal_store({"blocked_at": item["blocked_at"], "proposal": {"class": "capped-replay-spend"}}, "T-9")
     assert q.get_block_proposal(item)["class"] == "capped-replay-spend"
     assert q.get_block_proposal(dict(item, blocked_at="later")) is None      # a new block voids it
+
+
+# ---- capped-own-spend (Q856) -------------------------------------------------
+OATT = ("money=own-capped,customer-money=no,customer-sends=no,public-posts=no,"
+        "ad-spend=no,irreversible=no")
+
+
+def _own(env, note="own spend", **over):
+    q = env.queue
+    it = q.enqueue(project="T", note=note, source="test")
+    q.claim_by_ref(it["ref"], "w1")
+    d = {"question": "raise the babysit-queue function memory from 1024 MB to 2048 MB on hosting?",
+         "decision_class": "capped-own-spend", "weight": "minor", "confidence": "0.9",
+         "recommend": "raise function memory to 2048 MB, about $1.50 a week",
+         "undo": "set /tmp/vercel-memory.json memory back to 1024",
+         "attest": OATT, "spend_cap_usd": "5", "spend_category": "hosting",
+         "prev_value": "1024"}
+    d.update(over)
+    argv = ["block", it["ref"], "--worker", "w1"]
+    for k, v in d.items():
+        if v is None:
+            continue
+        flag = "--class" if k == "decision_class" else "--" + k.replace("_", "-")
+        argv += [flag, v]
+    return it["ref"], env.cli.main(argv)
+
+
+@pytest.fixture
+def oenv(env):
+    data = env.config._load()
+    data["T"]["auto_decision"]["dry_run_classes"] = ["capped-own-spend"]
+    env.config._save(data)
+    return env
+
+
+def test_own_spend_capped_is_eligible_in_dry_run(oenv):
+    ref, rc = _own(oenv)
+    it = oenv.queue.get(ref)
+    assert rc == 0
+    ev = _events(oenv, ref)
+    assert "auto_decision_eligible" in ev and "auto_decision" not in ev
+    assert oenv.cli.main(["gate-check", ref]) == 0
+
+
+def test_own_spend_off_unless_queue_opts_in(env):
+    ref, _ = _own(env)
+    assert "auto_decision_eligible" not in _events(env, ref)
+    assert env.cli.main(["gate-check", ref]) == 2
+
+
+@pytest.mark.parametrize("over,needle", [
+    ({"spend_cap_usd": "100"}, "above this queue's"),
+    ({"spend_cap_usd": "0"}, "dollar cap missing"),
+    ({"prev_value": None}, "no --prev-value"),
+    ({"undo": "none"}, "no concrete undo"),
+    ({"undo": "set /tmp/vercel-memory.json memory back to 512"}, "undo does not mention the previous value"),
+    ({"attest": OATT.replace("customer-money=no", "customer-money=yes")}, "customer-money=yes"),
+    ({"attest": OATT.replace("money=own-capped,", "money=no,")}, "money=no"),
+    ({"recommend": "raise memory and refund the studio $2 for the stripe charge"}, "matched hard stop"),
+    ({"recommend": "raise function memory to 2048 MB, about $40 a week"}, "matched hard stop"),
+    ({"spend_category": None}, "category missing"),
+])
+def test_own_spend_gate_failures(oenv, over, needle):
+    ref, _ = _own(oenv, **over)
+    it = oenv.queue.get(ref)
+    assert needle in it["block_question"] and "auto_decision_eligible" not in _events(oenv, ref)
+    assert oenv.cli.main(["gate-check", ref]) == 2
+
+
+def test_own_spend_queue_may_only_lower_the_ceiling(oenv):
+    from watchtower import autodecide
+    data = oenv.config._load()
+    data["T"]["auto_decision"]["own_spend_max_usd"] = 100
+    oenv.config._save(data)
+    assert autodecide.queue_policy("T")["own_spend_max_usd"] == 25
+    data["T"]["auto_decision"]["own_spend_max_usd"] = 2
+    oenv.config._save(data)
+    assert autodecide.queue_policy("T")["own_spend_max_usd"] == 2
+    ref, _ = _own(oenv, spend_cap_usd="5")
+    assert "above this queue's $2 limit" in oenv.queue.get(ref)["block_question"]

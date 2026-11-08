@@ -245,3 +245,27 @@ wt block BECKY-3309 --worker ID --question "Run the 247-case blind replay on the
 - `--gate-dry-run` (or a queue `dry_run_classes` entry) runs the whole gate and marks the
   card "Eligible for auto-approval (test, not approved)"; nothing is answered. Check
   yourself with `wt gate-check REF`: it prints every check and the fix for each failure.
+
+### Own capped spend (`capped-own-spend`, Q856)
+
+The owner's OWN small capped spend (a hosting memory bump, a model-token replay with a
+dollar cap) may be minor. Customer money, Stripe, prices and refunds are still major and
+the hard-stop floor still vetoes them. The class is off everywhere: the owner enables it
+per queue, first `dry_run_classes=capped-own-spend`, later `enabled_classes`. A queue can
+only LOWER `own_spend_max_usd` (default 25), never raise it.
+
+```
+wt block REF --worker ID --question "Raise babysit-queue function memory from 1024 MB to 2048 MB?" \
+  --class capped-own-spend --weight minor --confidence 0.9 \
+  --recommend "raise function memory to 2048 MB, about $1.50 a week" \
+  --spend-cap-usd 5 --spend-category hosting --prev-value 1024 \
+  --undo "set /path/vercel-memory.json memory back to 1024" \
+  --attest money=own-capped,customer-money=no,customer-sends=no,public-posts=no,ad-spend=no,irreversible=no \
+  --gate-dry-run
+```
+
+- `--spend-cap-usd` must be above 0 and at most the queue's `own_spend_max_usd`;
+  `--spend-category` is `hosting` or `model-usage`.
+- `--prev-value` is required and the `--undo` must contain it (the exact edit that restores it).
+- Only a dollar figure at or under the cap is exempt from the floor; stripe, refund,
+  invoice, price or charge words still veto. Check with `wt gate-check REF`.
