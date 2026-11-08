@@ -363,3 +363,11 @@ def test_gate_check_prints_fix_and_is_read_only(renv, capsys):
 def test_policy_set_dry_run_classes(env):
     assert env.cli.main(["policy", "-q", "T", "set", "dry_run_classes=capped-replay-spend"]) == 0
     assert autodecide.queue_policy("T")["dry_run_classes"] == ["capped-replay-spend"]
+
+
+def test_github_backed_proposal_roundtrip_via_local_store(env):
+    from watchtower import queue as q
+    item = {"ref": "T-9", "blocked_at": "2026-01-01T00:00:00Z"}
+    q._proposal_store({"blocked_at": item["blocked_at"], "proposal": {"class": "capped-replay-spend"}}, "T-9")
+    assert q.get_block_proposal(item)["class"] == "capped-replay-spend"
+    assert q.get_block_proposal(dict(item, blocked_at="later")) is None      # a new block voids it

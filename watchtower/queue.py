@@ -8616,7 +8616,9 @@ def note_auto_decline(ident: Any, reasons: str, *, expect_blocked_at: str, match
     """Show on the owner card why a proposal was not auto-approved (CCC-370),
     and flag a signed-"no" contradiction for the senior reviewer/digest."""
     if _github_backend_for_project(_project_from_ident(ident)) is not None:
-        return None
+        _gh_card_text(ident, f"[auto-approval declined: {reasons}]")
+        _gh_history(ident, "auto_decision_declined", text=reasons, matched=matched, policy_hash=policy_hash)
+        return get(ident)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -8635,11 +8637,68 @@ def note_auto_decline(ident: Any, reasons: str, *, expect_blocked_at: str, match
     return None
 
 
+def _proposal_file() -> Path:
+    from . import storage
+    return storage.data_dir() / "auto-decision-proposals.json"
+
+
+def _proposal_store(update: Optional[Dict[str, Any]] = None, ref: str = "") -> Dict[str, Any]:
+    """Tiny local JSON store for GitHub-backed tickets, whose items live on the
+    issue + pipeline sidecar and cannot carry the proposal (CCC-376)."""
+    with _FileLock(_lock_path()):
+        try:
+            data = json.loads(_proposal_file().read_text())
+        except (OSError, ValueError):
+            data = {}
+        if update is not None and ref:
+            data[ref] = update
+            tmp = _proposal_file().with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=1))
+            tmp.replace(_proposal_file())
+        return data
+
+
+def get_block_proposal(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The recorded proposal for the ticket's CURRENT block, local or GitHub-backed."""
+    p = item.get("block_proposal")
+    if p:
+        return p
+    rec = _proposal_store().get(str(item.get("ref") or ""))
+    if rec and rec.get("blocked_at") == item.get("blocked_at"):
+        return rec.get("proposal")
+    return None
+
+
+def _gh_history(ident: Any, event: str, **fields: Any) -> None:
+    """Best effort: append a history event to a GitHub-backed ticket's sidecar."""
+    from . import github_pipeline
+    def _fn(it: Dict[str, Any]) -> Any:
+        _append_history(it, event, by=_by("system"), at=_now_iso(), **fields)
+        return None
+    try:
+        github_pipeline.mutate(ident, _fn)
+    except Exception as exc:  # noqa: BLE001 - audit trail is best effort here
+        _log("AUTO_DECISION", f"{ident}: sidecar history for {event} not written: {exc}",
+             queue=_project_from_ident(ident))
+
+
+def _gh_card_text(ident: Any, text: str) -> None:
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    try:
+        cur = backend.get(ident) or {}
+        if text not in str(cur.get("block_question") or ""):
+            backend.update(ident, block_question=_clip(f"{cur.get('block_question', '')}\n{text}", 4000))
+    except Exception as exc:  # noqa: BLE001
+        _log("AUTO_DECISION", f"{ident}: card note not written: {exc}", queue=_project_from_ident(ident))
+
+
 def record_block_proposal(ident: Any, proposal: Dict[str, Any], *, expect_blocked_at: str) -> Optional[Dict[str, Any]]:
     """Keep the worker's structured auto-decision proposal on the parked ticket so
     ``wt gate-check`` can re-evaluate it read-only later (CCC-376)."""
     if _github_backend_for_project(_project_from_ident(ident)) is not None:
-        return None
+        cur = get(ident) or {}
+        _proposal_store({"blocked_at": expect_blocked_at, "proposal": dict(proposal)}, str(cur.get("ref") or ident))
+        return cur
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -8650,23 +8709,26 @@ def record_block_proposal(ident: Any, proposal: Dict[str, Any], *, expect_blocke
     return None
 
 
+_ELIGIBLE_TAG = "[Eligible for auto-approval (test, not approved)]"
+
+
 def note_auto_eligible(ident: Any, *, expect_blocked_at: str, checks: List[Dict[str, Any]],
                        policy_hash: str, reason: str, exempted: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
     """Eligibility-only (test) mode: the gate passed, but nothing is approved or
     answered. Mark the owner card so it reads as a test, not an approval (CCC-376)."""
+    fields = dict(text=reason, checks=checks, policy_hash=policy_hash, exempted=exempted or [], approved=False)
     if _github_backend_for_project(_project_from_ident(ident)) is not None:
-        return None
+        _gh_card_text(ident, _ELIGIBLE_TAG)
+        _gh_history(ident, "auto_decision_eligible", **fields)
+        return get(ident)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident) and it.get("blocked_at") == expect_blocked_at and it.get("needs_input"):
-                tag = "[Eligible for auto-approval (test, not approved)]"
-                if tag not in str(it.get("block_question") or ""):
-                    it["block_question"] = _clip(f"{it.get('block_question', '')}\n{tag}", 4000)
+                if _ELIGIBLE_TAG not in str(it.get("block_question") or ""):
+                    it["block_question"] = _clip(f"{it.get('block_question', '')}\n{_ELIGIBLE_TAG}", 4000)
                 it["auto_eligible_test"] = True
-                _append_history(it, "auto_decision_eligible", by=_by("system"), at=_now_iso(),
-                                text=reason, checks=checks, policy_hash=policy_hash,
-                                exempted=exempted or [], approved=False)
+                _append_history(it, "auto_decision_eligible", by=_by("system"), at=_now_iso(), **fields)
                 _save_unlocked(data)
                 return it
     return None

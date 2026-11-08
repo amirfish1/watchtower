@@ -3082,7 +3082,7 @@ def cmd_gate_check(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
-    p = item.get("block_proposal")
+    p = q.get_block_proposal(item)
     if not p:
         print(f"{item['ref']}: no auto-decision proposal recorded on the current block "
               "(the worker blocked without --class/--weight).", file=sys.stderr)
