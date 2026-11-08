@@ -2182,14 +2182,18 @@ def _blocker_state(blocker: Dict[str, Any]) -> str:
     ``satisfied``: closed as completed -- not declined at the product gate,
     and its resolution has no ``unresolved`` items. ``waiting``: not closed
     yet. ``stuck``: closed, but declined or with unresolved items, so the
-    dependent must NOT auto-unblock; a human decides. Extend here (e.g. with
+    dependent must NOT auto-unblock; a human decides. Unresolved items the owner
+    already acknowledged (`wt unresolved-ack`) no longer count. Extend here (e.g. with
     a review/accept state), nowhere else."""
     if blocker.get("status") != "closed":
         return "waiting"
     if blocker.get("product_nack"):
         return "stuck"
     res = blocker.get("resolution")
-    if isinstance(res, dict) and any(str(x).strip() for x in (res.get("unresolved") or [])):
+    if isinstance(res, dict) and any(
+        str(x).strip() and not is_acked(res, "unresolved", i)
+        for i, x in enumerate(res.get("unresolved") or [])
+    ):
         return "stuck"
     return "satisfied"
 

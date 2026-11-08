@@ -1141,6 +1141,18 @@ def fingerprint(item: Dict[str, Any],
                         ).hexdigest()[:16]
 
 
+def _post_defer_unclaimed(item: Dict[str, Any]) -> bool:
+    """True when the ticket's last lifecycle event is a `wt defer` (nothing has
+    claimed it since the window was set)."""
+    for h in reversed(item.get("history") or []):
+        t = h.get("type") or h.get("event") if isinstance(h, dict) else None
+        if t == "defer":
+            return True
+        if t in ("claim", "close", "block", "answer"):
+            return False
+    return False
+
+
 def _store_activity(item: Dict[str, Any]) -> float:
     ss = item.get("stage_session") or {}
     hist = item.get("history") or []
@@ -1412,7 +1424,12 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
     if action in _LOOP_GUARDED:
         bs = item.get("backstop") if isinstance(item.get("backstop"), dict) else {}
         if bs.get("state") == row.id and bs.get("fingerprint") == fingerprint(item, by_ref):
-            if bs.get("action") == "resume" and action in ("resume", "reopen"):
+            if action == "spawn" and _post_defer_unclaimed(item):
+                # A `wt defer` window ended and the pool has not picked the
+                # ticket up yet: that is staffing latency, not a stall the
+                # owner can fix. Keep spawning instead of raising a block.
+                pass
+            elif bs.get("action") == "resume" and action in ("resume", "reopen"):
                 action, reason = "reopen", "resumed builder made no progress"
             else:
                 action = "escalate"

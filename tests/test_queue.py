@@ -783,3 +783,17 @@ def test_scoped_status_honours_an_open_blocker_in_another_queue(wt):
     q.close(blocker["ref"], session_id="w1", resolution="done")
     row = next(r for r in health.all_status(project="DEP") if r["queue"] == "DEP")
     assert row["claimable_depth"] == 1 and row["blocked"] == 0
+
+
+def test_acked_unresolved_blocker_does_not_reblock_dependent(wt):
+    """CCC-375: an owner-acknowledged unresolved item no longer holds dependents."""
+    q = wt.q
+    a = _file(q, "first")
+    q.claim_next("w1", project="DEP")
+    q.close(a["ref"], session_id="w1",
+            resolution={"summary": "partial", "unresolved": ["known gap"]})
+    q.ack_resolution(a["ref"], targets=[("unresolved", 0)], by="amir")
+    b = _file(q, "second", blocked_by=[a["ref"]])
+    got = q.get(b["ref"])
+    assert not got.get("needs_input")
+    assert q.claim_next("w2", project="DEP")["ref"] == b["ref"]
