@@ -168,11 +168,18 @@ def evaluate(item: Dict[str, Any], p: Dict[str, Any], *, items: Optional[List[Di
         why.append("kill switch is on")
     if not pol["enabled"]:
         why.append("auto-approval is off for this queue")
-    if p.get("weight") != "minor":
-        why.append(f"worker marked it {p.get('weight') or 'unweighted'}"
-                   + (f" ({p['major_because']})" if p.get("major_because") else ""))
-    if p.get("major_because"):
-        why.append(f"major because {p['major_because']}")
+    if p.get("weight") != "minor" and p.get("weight") != "major":
+        why.append(f"worker marked it {p.get('weight') or 'unweighted'}")
+    if p.get("weight") == "major" or p.get("major_because"):
+        # The worker itself says this needs the owner: show only that on the card,
+        # not a wall of unrelated missing-field reasons.
+        res["reasons"] = [r for r in why if r.startswith(("kill switch", "auto-approval is off"))] or []
+        res["reasons"].append(f"worker says it needs you: major"
+                              + (f" because {p['major_because']}" if p.get("major_because") else ""))
+        hits, _err = floor_hits(proposal_text(p))
+        res["matched"] = hits
+        res["reasons"] += [f"matched hard stop: {h}" for h in hits]
+        return res
     cls = str(p.get("class") or "")
     spec = pol["classes"].get(cls)
     if not cls or spec is None or cls not in pol["enabled_classes"]:

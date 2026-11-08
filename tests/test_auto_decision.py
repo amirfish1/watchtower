@@ -93,8 +93,8 @@ def test_plain_block_stays_a_card(env):
     ({"decision_class": "other"}, "no enabled class"),
     ({"confidence": "0.6"}, "confidence 0.6"),
     ({"undo": "none"}, "no concrete undo"),
-    ({"weight": "major"}, "worker marked it major"),
-    ({"major_because": "preference"}, "major because preference"),
+    ({"weight": "major"}, "worker says it needs you: major"),
+    ({"major_because": "preference"}, "because preference"),
     ({"attest": "money=no"}, "checklist incomplete"),
     ({"attest": ATT.replace("irreversible=no", "irreversible=yes")}, "attested irreversible=yes"),
     ({"recommend": "ok"}, "no named recommendation"),
@@ -222,3 +222,9 @@ def test_policy_writes_refused_for_workers_and_queue_cannot_drop_floor(env, monk
     pol = autodecide.queue_policy("T")
     assert pol["threshold"] == 0.8 and pol["rate_per_hour"] == 6      # can only tighten
     assert set(autodecide.ATTEST_KEYS) <= set(pol["attest"])
+
+
+def test_major_decline_card_is_short(env):
+    ref, _ = _block(env, weight="major", major_because="item")
+    q = env.queue.get(ref)["block_question"]
+    assert "worker says it needs you" in q and "checklist incomplete" not in q
