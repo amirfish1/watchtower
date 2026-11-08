@@ -177,6 +177,9 @@ def answer_sender(by_kind: Any) -> str:
 
 def _answer_prompt(item: Dict[str, Any], pa: Dict[str, Any]) -> str:
     ref, gen, text = item["ref"], pa.get("gen"), pa.get("answer", "")
+    if pa.get("auto_decision"):
+        # CCC-370: never the human "apply the answer and close" wording.
+        return text + _carried_text(pa, item)
     tag = (f"[answer {ref}#{gen}; ignore a repeat of a tag you already applied] ")
     kind = str(item.get("block_kind") or "")
     if kind == "rationale":
@@ -203,6 +206,8 @@ def _answer_prompt(item: Dict[str, Any], pa: Dict[str, Any]) -> str:
 
 
 def _answered_label(pa: Dict[str, Any]) -> str:
+    if pa.get("auto_decision"):
+        return "WatchTower AUTO-DECISION (not a human)"
     return {"worker": "Agent answered", "system": "WatchTower answered"}.get(
         str(pa.get("by_kind") or ""), "Human answered")
 

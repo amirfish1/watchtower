@@ -8563,6 +8563,103 @@ def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = 
     return None
 
 
+def auto_answer(ident: Any, text: str, *, expect_blocked_at: str, decision: Dict[str, Any],
+                revision: str) -> Optional[Dict[str, Any]]:
+    """Record an AUTO-DECISION on a parked ticket (CCC-370), compare-and-swap.
+    ``text`` is the worker's recommendation; the resume prompt is built here.
+
+    Writes only if, under the store lock, the ticket is still the same parked
+    block episode (``blocked_at``), still needs input, has no human answer
+    since, its content revision is unchanged and the kill switch is still off.
+    Otherwise returns None and writes nothing, so a human answer given at the
+    same moment, a changed ticket or a duplicate resume always wins. Local
+    (file) backend only; anything else stays an owner card."""
+    from . import autodecide
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        return None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if not _matches(it, ident):
+                continue
+            if autodecide.kill_switch_on():
+                return None
+            if (it.get("status") != PARKED_STATUS or not it.get("parked")
+                    or not it.get("needs_input") or it.get("blocked_at") != expect_blocked_at
+                    or autodecide.ticket_revision(it) != revision):
+                return None
+            now = _now_iso()
+            gen = int(it.get("last_answer_gen") or 0) + 1
+            text = autodecide.AUTO_PROMPT.format(ref=it.get("ref"), gen=gen, rec=_clip(text, 600))
+            it["needs_input"] = False
+            it["answered_at"] = now
+            it["updated_at"] = now
+            _append_history(it, "auto_decision", by=_by("system"), at=now,
+                            text=_clip(text, 4000),
+                            decision_id=f"{it.get('ref')}@{expect_blocked_at}",
+                            blocked_at=expect_blocked_at, revision=revision, **decision)
+            pa = _write_pending_answer_unlocked(it, text, now, by_kind="system")
+            pa["auto_decision"] = f"{it.get('ref')}@{expect_blocked_at}"
+            _save_unlocked(data)
+            _log("AUTO_DECISION", f"{it.get('ref', '?')} — {_clip(text, 200)}",
+                 queue=it.get("project", ""))
+            return it
+    return None
+
+
+def note_auto_decline(ident: Any, reasons: str, *, expect_blocked_at: str, matched: List[str],
+                      policy_hash: str, contradiction: bool = False) -> Optional[Dict[str, Any]]:
+    """Show on the owner card why a proposal was not auto-approved (CCC-370),
+    and flag a signed-"no" contradiction for the senior reviewer/digest."""
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        return None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident) and it.get("blocked_at") == expect_blocked_at and it.get("needs_input"):
+                now = _now_iso()
+                it["block_question"] = _clip(
+                    f"{it.get('block_question', '')}\n[auto-approval declined: {reasons}]", 4000)
+                _append_history(it, "auto_decision_declined", by=_by("system"), at=now, text=reasons,
+                                matched=matched, policy_hash=policy_hash)
+                if contradiction:
+                    _append_history(it, "contradiction", by=_by("system"), at=now,
+                                    text="worker attested no on a hard-stop item but its text matches: "
+                                         + ", ".join(matched))
+                _save_unlocked(data)
+                return it
+    return None
+
+
+def note_auto_reversed(ident: Any, decision_id: str, *, original: str, revert: str,
+                       by: str = "") -> Optional[Dict[str, Any]]:
+    """Mark an auto-decision reversed -- only called after the revert is verified."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident):
+                _append_history(it, "auto_decision_reversed", by=_by("human", by), at=_now_iso(),
+                                decision_id=decision_id, original=original, revert=revert)
+                _save_unlocked(data)
+                return it
+    return None
+
+
+def auto_decisions(queue: str = "") -> List[Dict[str, Any]]:
+    """Every auto_decision event (with its ticket ref and reversal, if any)."""
+    out: List[Dict[str, Any]] = []
+    for it in _load_unlocked(readonly=True).get("items", []):
+        if queue and it.get("project") != queue:
+            continue
+        hist = it.get("history") or []
+        for h in hist:
+            if h.get("event") == "auto_decision":
+                rev = next((r for r in hist if r.get("event") == "auto_decision_reversed"
+                            and r.get("decision_id") == h.get("decision_id")), None)
+                out.append({"ref": it.get("ref"), "event": h, "reversed": rev})
+    return out
+
+
 _DEFER_REL_RE = _re.compile(r"^\+?(\d+)\s*([mhd])$", _re.IGNORECASE)
 
 

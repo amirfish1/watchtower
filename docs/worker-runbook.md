@@ -189,3 +189,26 @@ otherwise, so name the actor whenever the owner is not the one who must act:
 `wt wait-on REF --on external --actor "Sonia" --note "..."` corrects the
 current block in place (no new question, history kept). A later `wt block`
 without `--wait-on` resets the ticket to an owner wait.
+
+## Minor blocks: proposing an auto-decision (CCC-370)
+
+If a block is a small, reversible code change in the ticket's own repo, you may
+propose that WatchTower approve it for you instead of making the owner read a card:
+
+```
+wt block REF --worker ID --question "..." --commit SHA --class code-change-revertable \
+  --weight minor --confidence 0.9 --recommend "the exact choice" --undo "git revert SHA" \
+  --attest money=no,customer-sends=no,public-posts=no,ad-spend=no,irreversible=no
+```
+
+WatchTower, not you, decides: the queue must have auto-approval enabled
+(`wt policy -q QUEUE show`), the class must be enabled, every attestation `no`,
+confidence over the threshold, the undo `git revert <that same --commit SHA>`, and
+nothing in your words may match the hard-stop floor (customers, money, prices, ads,
+public posts, production, irreversible). Any miss is an ordinary owner card that
+shows the reason. A pass resumes you with an AUTO-DECISION (not a human approval)
+that authorizes only your recommendation. Use `--major-because
+item|unknown|preference|security` to say it needs the owner. Owner commands:
+`wt undo REF` (reverts and verifies), `wt policy -q QUEUE set enabled=true
+enabled_classes=code-change-revertable`, kill switch = create `auto-decision.off`
+in the WatchTower data dir. Workers cannot write policy.

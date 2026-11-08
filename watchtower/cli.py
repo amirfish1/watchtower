@@ -3022,6 +3022,121 @@ def cmd_reopen(args: argparse.Namespace) -> int:
     return 0
 
 
+def _auto_decide_after_block(item: Dict[str, Any], args: argparse.Namespace) -> str:
+    """CCC-370: run the auto-approval gate on a just-parked worker block.
+
+    No proposal flags = today's behaviour (an ordinary card). Returns a one-line
+    outcome for the worker, or "" when nothing was proposed."""
+    from . import autodecide
+    p = {
+        "class": getattr(args, "decision_class", "") or "",
+        "weight": getattr(args, "weight", "") or "",
+        "confidence": getattr(args, "confidence", None),
+        "recommend": getattr(args, "recommend", "") or "",
+        "undo": getattr(args, "undo", "") or "",
+        "attest": autodecide.parse_attest(getattr(args, "attest", "") or ""),
+        "major_because": getattr(args, "major_because", "") or "",
+        "question": getattr(args, "question", "") or "",
+        "progress": getattr(args, "progress", "") or "",
+    }
+    if not (p["class"] or p["weight"] or p["major_because"]):
+        return ""
+    res = autodecide.evaluate(item, p, items=q.list_items(project=item.get("project")))
+    blocked_at = str(item.get("blocked_at") or "")
+    if not res["approve"]:
+        reason = autodecide.card_reason(res)
+        q.note_auto_decline(item["ref"], reason, expect_blocked_at=blocked_at,
+                            matched=res["matched"], policy_hash=res["policy_hash"],
+                            contradiction=bool(res.get("contradiction")))
+        return f"auto-approval declined, owner card stands ({reason})"
+    done = q.auto_answer(
+        item["ref"], p["recommend"], expect_blocked_at=blocked_at,
+        revision=autodecide.ticket_revision(item),
+        decision={"class": p["class"], "confidence": float(p["confidence"]), "attest": p["attest"],
+                  "recommend": p["recommend"], "undo": p["undo"], "commit": item.get("block_commit", ""),
+                  "policy_hash": res["policy_hash"], "policy_version": res["policy_version"],
+                  "claim_session": item.get("claimed_session_id", "")})
+    if not done:
+        return "auto-approval not applied (ticket changed, already answered or kill switch); owner card stands"
+    return "AUTO-DECISION recorded (not a human approval); the worker is resumed with your recommendation only"
+
+
+def cmd_undo(args: argparse.Namespace) -> int:
+    """Revert the commit behind the latest auto-decision on <ref> and verify it (CCC-370)."""
+    import subprocess
+    from . import autodecide
+    item = q.get(args.ref)
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    rows = [r for r in q.auto_decisions(item.get("project", "")) if r["ref"] == item["ref"]]
+    live = [r for r in rows if not r["reversed"]]
+    if not live:
+        print(f"error: {item['ref']} has no un-reversed auto-decision", file=sys.stderr)
+        return 1
+    ev = live[-1]["event"]
+    sha = str(ev.get("commit") or "")
+    if (ev.get("class") != "code-change-revertable" or not sha):
+        print("error: only code-change-revertable decisions with a recorded commit can be undone here",
+              file=sys.stderr)
+        return 1
+    from . import config
+    repo = str(item.get("repo_path") or config.repo_path(item.get("project", "")) or os.getcwd())
+    def git(*a):
+        return subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
+    if git("cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
+        print(f"error: commit {sha[:10]} not found in {repo}", file=sys.stderr)
+        return 1
+    before = git("rev-parse", "HEAD").stdout.strip()
+    r = git("revert", "--no-edit", sha)
+    after = git("rev-parse", "HEAD").stdout.strip()
+    if r.returncode != 0 or not after or after == before:
+        git("revert", "--abort")
+        print(f"error: git revert failed, decision NOT marked reversed:\n{r.stderr.strip()}", file=sys.stderr)
+        return 1
+    subj = git("log", "-1", "--format=%s%n%b", after).stdout
+    if sha[:7] not in subj and "Revert" not in subj:
+        print("error: revert commit not verified, decision NOT marked reversed", file=sys.stderr)
+        return 1
+    q.note_auto_reversed(item["ref"], ev.get("decision_id", ""), original=sha, revert=after,
+                         by=args.worker or _default_worker_id())
+    print(f"REVERTED: {item['ref']} — {sha[:10]} undone by {after[:10]} (not pushed; push it yourself)")
+    return 0
+
+
+def cmd_policy(args: argparse.Namespace) -> int:
+    """Show or set a queue's auto-approval policy (CCC-370). Owner-only: refused
+    inside a worker session (WT_ROLE=worker / WT_WORKER_ID)."""
+    from . import autodecide, config
+    if args.action == "show":
+        pol = autodecide.queue_policy(args.queue)
+        pol["policy_hash"] = autodecide.policy_hash(pol)
+        pol["kill_switch"] = autodecide.kill_switch_on()
+        print(json.dumps(pol, indent=2))
+        return 0
+    if os.environ.get("WT_ROLE") == "worker" or os.environ.get("WT_WORKER_ID"):
+        print("error: policy writes are not available to workers", file=sys.stderr)
+        return 1
+    data = config._load()
+    ov = data.setdefault(args.queue, {}).setdefault("auto_decision", {})
+    for kv in args.settings:
+        k, _, v = kv.partition("=")
+        if k == "enabled":
+            ov["enabled"] = v.lower() in ("1", "true", "yes", "on")
+        elif k == "threshold":
+            ov["threshold"] = float(v)
+        elif k == "rate_per_hour":
+            ov["rate_per_hour"] = int(v)
+        elif k == "enabled_classes":
+            ov["enabled_classes"] = [c for c in v.split(",") if c]
+        else:
+            print(f"error: unknown setting {k!r}", file=sys.stderr)
+            return 1
+    config._save(data)
+    print(json.dumps(autodecide.queue_policy(args.queue), indent=2))
+    return 0
+
+
 def cmd_block(args: argparse.Namespace) -> int:
     """A worker parks a ticket that needs a human decision (WT-28). Stays
     in_progress, bound to its session; flagged needs_input with a question.
@@ -3056,10 +3171,15 @@ def cmd_block(args: argparse.Namespace) -> int:
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
+    auto_note = _auto_decide_after_block(item, args)
+    if auto_note and not getattr(args, "json", False):
+        item = q.get(item["ref"]) or item
     if args.json:
-        print(json.dumps(item, indent=2))
+        print(json.dumps(q.get(item["ref"]) or item, indent=2))
         return 0
     print(f"BLOCKED: {item['ref']} — {item.get('block_question') or '(no question)'}")
+    if auto_note:
+        print(f"  {auto_note}")
     if item.get("status") == q.PARKED_STATUS:
         print("  parked: the ticket left your claim; the human's answer returns to this "
               "session. You may claim the next ticket now.")
@@ -7512,6 +7632,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "same local `git rev-parse` proof as `wt close --commit`")
     s.add_argument("--force", action="store_true",
                    help="block even though another worker holds the claim")
+    s.add_argument("--class", dest="decision_class", default="",
+                   help="auto-decision: the action class your recommendation falls in (CCC-370)")
+    s.add_argument("--weight", default="", choices=["", "minor", "major"],
+                   help="auto-decision: your claim of how consequential this is")
+    s.add_argument("--confidence", type=float, default=None, help="auto-decision: 0..1")
+    s.add_argument("--recommend", default="", help="auto-decision: the exact choice you recommend")
+    s.add_argument("--undo", default="", help="auto-decision: exact undo, e.g. 'git revert <sha>'")
+    s.add_argument("--attest", default="",
+                   help="auto-decision: money=no,customer-sends=no,public-posts=no,ad-spend=no,irreversible=no")
+    s.add_argument("--major-because", dest="major_because", default="",
+                   choices=["", "item", "unknown", "preference", "security"],
+                   help="auto-decision: why this must go to the owner")
     s.add_argument("--wait-on", dest="wait_on", default="", choices=list(q.WAIT_ON),
                    help="who this block waits on: owner = a decision only the owner "
                         "can make (red 'needs you'); external = a client/studio/vendor "
@@ -7552,6 +7684,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_defer)
+
+    s = sub.add_parser("undo", help="revert the commit behind a ticket's latest auto-decision and verify it")
+    s.add_argument("ref")
+    s.add_argument("--worker", default="")
+    s.set_defaults(func=cmd_undo)
+
+    s = sub.add_parser("policy", help="show/set a queue's auto-approval policy (owner only)")
+    s.add_argument("action", choices=["show", "set"])
+    s.add_argument("-q", "--queue", required=True)
+    s.add_argument("settings", nargs="*", help="enabled=true threshold=0.85 rate_per_hour=3 enabled_classes=code-change-revertable")
+    s.set_defaults(func=cmd_policy)
 
     s = sub.add_parser("blocked")
     s.add_argument("-q", "--queue", default=None)
