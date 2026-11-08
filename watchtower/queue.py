@@ -8652,6 +8652,7 @@ def _proposal_store(update: Optional[Dict[str, Any]] = None, ref: str = "") -> D
             data = {}
         if update is not None and ref:
             data[ref] = update
+            _proposal_file().parent.mkdir(parents=True, exist_ok=True)
             tmp = _proposal_file().with_suffix(".tmp")
             tmp.write_text(json.dumps(data, indent=1))
             tmp.replace(_proposal_file())
