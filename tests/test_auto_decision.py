@@ -256,3 +256,110 @@ def test_major_refused_leaves_ticket_untouched(env, because, detail):
 def test_each_allowed_major_reason_accepted(env, because):
     ref, rc = _block(env, weight="major", major_because=because, major_detail=MD, attest=None)
     assert rc == 0 and f"Major: {because}. " in env.queue.get(ref)["block_question"]
+
+
+# ---------------------------------------------------------------- CCC-376
+RATT = ATT + ",production-writes=no"
+
+
+def _replay(env, note="replay", **over):
+    q = env.queue
+    it = q.enqueue(project="T", note=note, source="test")
+    q.claim_by_ref(it["ref"], "w1")
+    d = {"question": "run the 247-case blind replay on the subscription proxy?",
+         "decision_class": "capped-replay-spend", "weight": "minor", "confidence": "0.9",
+         "recommend": "run the replay capped at 300 requests, output to a file",
+         "undo": "rm /tmp/replay-out.json", "attest": RATT,
+         "replay_cap_requests": "300", "replay_cap_usd": "0", "replay_backend": "subscription-proxy"}
+    d.update(over)
+    argv = ["block", it["ref"], "--worker", "w1"]
+    for k, v in d.items():
+        if v is None:
+            continue
+        flag = "--class" if k == "decision_class" else "--" + k.replace("_", "-")
+        argv += [flag, v]
+    return it["ref"], env.cli.main(argv)
+
+
+@pytest.fixture
+def renv(env):
+    data = env.config._load()
+    data["T"]["auto_decision"]["dry_run_classes"] = ["capped-replay-spend"]
+    env.config._save(data)
+    return env
+
+
+def test_replay_zero_dollar_is_eligible_in_dry_run_and_not_approved(renv):
+    ref, rc = _replay(renv)
+    it = renv.queue.get(ref)
+    assert rc == 0 and it["needs_input"] is True
+    ev = _events(renv, ref)
+    assert "auto_decision_eligible" in ev and "auto_decision" not in ev
+    assert "Eligible for auto-approval (test, not approved)" in it["block_question"]
+    assert renv.cli.main(["gate-check", ref]) == 0
+
+
+def test_replay_subscription_word_does_not_veto_but_real_money_does(renv):
+    ref, _ = _replay(renv, progress="uses the subscription proxy, $0 spend")
+    assert "auto_decision_eligible" in _events(renv, ref)
+    for bad in ("charge the stripe account $5 for the replay", "paid run on openrouter"):
+        ref2, _ = _replay(renv, progress=bad)
+        assert "auto_decision_eligible" not in _events(renv, ref2)
+        assert "matched hard stop" in renv.queue.get(ref2)["block_question"]
+
+
+@pytest.mark.parametrize("over,needle", [
+    ({"replay_cap_usd": "5"}, "not zero-dollar"),
+    ({"replay_backend": "openrouter"}, "not zero-dollar"),
+    ({"replay_cap_requests": None}, "request cap"),
+    ({"replay_cap_usd": None}, "dollar cap missing"),
+    ({"undo": "rm it later maybe"}, "undo does not match"),
+    ({"undo": "restore everything to how it was"}, "undo does not match"),
+    ({"attest": ATT}, "production-writes not attested"),
+    ({"attest": RATT.replace("production-writes=no", "production-writes=yes")}, "production-writes=yes"),
+    ({"attest": RATT.replace("customer-sends=no", "customer-sends=yes")}, "customer-sends=yes"),
+])
+def test_replay_gate_failures(renv, over, needle):
+    ref, _ = _replay(renv, **over)
+    it = renv.queue.get(ref)
+    assert needle in it["block_question"] and "auto_decision_eligible" not in _events(renv, ref)
+    assert renv.cli.main(["gate-check", ref]) == 2
+
+
+def test_replay_never_approves_without_dry_run_flag_when_class_only_dry(renv):
+    # class is dry-run-only at the queue level: even a perfect claim must not answer
+    ref, _ = _replay(renv)
+    assert "auto_decision" not in _events(renv, ref)
+    assert renv.queue.get(ref)["needs_input"] is True
+
+
+def test_gate_dry_run_flag_is_per_ticket_and_does_not_leak(env):
+    data = env.config._load()
+    data["T"]["auto_decision"]["enabled_classes"] = ["code-change-revertable", "capped-replay-spend"]
+    env.config._save(data)
+    r1, _ = _block(env, gate_dry_run=None)
+    assert "auto_decision" in _events(env, r1)                 # normal ticket: real approval
+    q = env.queue
+    it = q.enqueue(project="T", note="t", source="t")
+    q.claim_by_ref(it["ref"], "w1")
+    env.cli.main(["block", it["ref"], "--worker", "w1", "--question", "rename helper?", "--commit", env.sha,
+                  "--class", "code-change-revertable", "--weight", "minor", "--confidence", "0.9",
+                  "--recommend", "keep the new helper name", "--undo", f"git revert {env.sha}",
+                  "--attest", ATT, "--gate-dry-run"])
+    ev = _events(env, it["ref"])
+    assert "auto_decision_eligible" in ev and "auto_decision" not in ev
+    assert q.get(it["ref"])["needs_input"] is True
+
+
+def test_gate_check_prints_fix_and_is_read_only(renv, capsys):
+    ref, _ = _replay(renv, replay_cap_usd="5")
+    before = renv.queue.get(ref)
+    assert renv.cli.main(["gate-check", ref]) == 2
+    out = capsys.readouterr().out
+    assert "[FAIL] zero-dollar subscription replay" in out and "fix:" in out
+    assert renv.queue.get(ref)["history"] == before["history"]
+
+
+def test_policy_set_dry_run_classes(env):
+    assert env.cli.main(["policy", "-q", "T", "set", "dry_run_classes=capped-replay-spend"]) == 0
+    assert autodecide.queue_policy("T")["dry_run_classes"] == ["capped-replay-spend"]

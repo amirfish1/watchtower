@@ -218,3 +218,30 @@ exactly only the owner can do; "preference", "unknown", "needs you", "not sure",
 `wt undo REF` (reverts and verifies), `wt policy -q QUEUE set enabled=true
 enabled_classes=code-change-revertable`, kill switch = create `auto-decision.off`
 in the WatchTower data dir. Workers cannot write policy.
+
+### Replay approvals (`capped-replay-spend`, CCC-376)
+
+A model replay/evaluation that writes only to a file, sends nothing, writes
+nothing to production and costs $0 on the subscription proxy can be proposed the
+same way. Example (the BECKY-3309 shape: a 247-case blind replay):
+
+```
+wt block BECKY-3309 --worker ID --question "Run the 247-case blind replay on the subscription proxy?" \
+  --class capped-replay-spend --weight minor --confidence 0.9 \
+  --recommend "run the 247-case replay capped at 300 requests, output to a file" \
+  --replay-cap-requests 300 --replay-cap-usd 0 --replay-backend subscription-proxy \
+  --undo "rm /path/to/replay-output.json" --prev-value "none (no limit raised)" \
+  --attest money=no,customer-sends=no,public-posts=no,ad-spend=no,irreversible=no,production-writes=no \
+  --gate-dry-run
+```
+
+- `--replay-cap-usd` above 0, or any backend other than `subscription-proxy`, means
+  real money: block it as `--weight major --major-because money` instead.
+- `--undo` must be a concrete command or file edit (`rm <file>`, `git checkout -- <file>`,
+  `wt policy ...`, `sed ...`), not prose. If you raised a ledger or limit, put its previous
+  value in `--prev-value` and make the undo restore exactly that.
+- Keep the question, recommendation, undo and progress free of hard-stop words (production,
+  stripe, refund, customer sends, `$5`). The words "subscription" and "$0" are fine here.
+- `--gate-dry-run` (or a queue `dry_run_classes` entry) runs the whole gate and marks the
+  card "Eligible for auto-approval (test, not approved)"; nothing is answered. Check
+  yourself with `wt gate-check REF`: it prints every check and the fix for each failure.

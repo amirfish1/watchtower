@@ -53,6 +53,13 @@ MIN_UNDO_LEN = 12
 _NO_UNDO = re.compile(r"^\W*(none|nothing|n/?a|na|unknown|tbd|no|can'?t|cannot|not possible|irreversible)\b", re.I)
 _SHA = r"[0-9a-f]{7,64}"
 
+# A concrete command or file edit (verb + a path, file name or number), not prose.
+_REPLAY_UNDO = (r"^(?:git (?:revert|checkout|restore)|wt policy|rm|cp|mv|sed|jq|echo|tee|python3?|"
+                r"restore|reset|set|edit)\b(?=.*(?:[/~]|\d|\.\w{2,5}\b))")
+SUBSCRIPTION_BACKENDS = ("subscription-proxy",)
+# Words that are not real money when the replay is zero-dollar on the subscription proxy.
+_BENIGN_MONEY = re.compile(r"\bsubscription(?:\s+(?:proxy|auth|plan|quota|token))?|\$0(?:\.0+)?(?![\d.])", re.I)
+
 # Global defaults. A queue may add classes / attestations and tighten numbers
 # (queue-config.json -> "auto_decision"), never remove a class's requirements
 # or a hard stop.
@@ -65,6 +72,14 @@ GLOBAL_POLICY: Dict[str, Any] = {
         "code-change-revertable": {
             "undo": rf"^git revert {_SHA}\b",
             "needs_commit": True,
+        },
+        # A capped model replay/evaluation: output to a file only, no sends,
+        # no production writes, zero dollars on the subscription proxy.
+        "capped-replay-spend": {
+            "undo": _REPLAY_UNDO,
+            "needs_commit": False,
+            "replay": True,
+            "attest_extra": ["production-writes"],
         },
     },
 }
@@ -111,6 +126,9 @@ def queue_policy(queue: str) -> Dict[str, Any]:
             pol["classes"][name] = {"undo": str(spec["undo"]), "needs_commit": bool(spec.get("needs_commit"))}
     # Which classes are ENABLED is explicit and per queue; none by default.
     pol["enabled_classes"] = [c for c in (ov.get("enabled_classes") or []) if c in pol["classes"]]
+    # Dry-run classes run the whole gate and record eligibility but never approve.
+    pol["dry_run_classes"] = [c for c in (ov.get("dry_run_classes") or [])
+                              if c in pol["classes"] and c not in pol["enabled_classes"]]
     return pol
 
 
@@ -184,18 +202,22 @@ def evaluate(item: Dict[str, Any], p: Dict[str, Any], *, items: Optional[List[Di
     queue = str(item.get("project") or "")
     pol = queue_policy(queue)
     res: Dict[str, Any] = {"approve": False, "reasons": [], "policy_hash": policy_hash(pol),
-                           "policy_version": pol["version"], "matched": []}
+                           "policy_version": pol["version"], "matched": [], "checks": []}
     why = res["reasons"]
     if not p.get("class") and not p.get("weight"):
         why.append("no auto-decision proposal")        # plain block: today's behaviour
         res["plain"] = True
         return res
-    if kill_switch_on():
-        why.append("kill switch is on")
-    if not pol["enabled"]:
-        why.append("auto-approval is off for this queue")
-    if p.get("weight") != "minor" and p.get("weight") != "major":
-        why.append(f"worker marked it {p.get('weight') or 'unweighted'}")
+    def early(name: str, ok: bool, msg: str, fix: str) -> None:
+        res["checks"].append({"name": name, "ok": ok, "detail": "ok" if ok else msg, "fix": "" if ok else fix})
+        if not ok:
+            why.append(msg)
+
+    early("kill switch", not kill_switch_on(), "kill switch is on", "owner must clear the kill switch")
+    early("queue enabled", pol["enabled"], "auto-approval is off for this queue",
+          "owner must enable auto-approval for this queue (wt policy -q Q set enabled=true)")
+    early("weight", p.get("weight") in ("minor", "major"), f"worker marked it {p.get('weight') or 'unweighted'}",
+          "pass --weight minor (or major with --major-because)")
     if p.get("weight") == "major" or p.get("major_because"):
         # The worker itself says this needs the owner: show only that on the card,
         # not a wall of unrelated missing-field reasons.
@@ -208,45 +230,109 @@ def evaluate(item: Dict[str, Any], p: Dict[str, Any], *, items: Optional[List[Di
         return res
     cls = str(p.get("class") or "")
     spec = pol["classes"].get(cls)
-    if not cls or spec is None or cls not in pol["enabled_classes"]:
-        why.append("no enabled class" + (f" ({cls})" if cls else ""))
+    checks: List[Dict[str, Any]] = res["checks"]
+    in_dry_class = cls in pol.get("dry_run_classes", [])
+    res["dry_run"] = bool(p.get("gate_dry_run")) or in_dry_class
+
+    def chk(name: str, ok: bool, msg: str, fix: str = "") -> None:
+        checks.append({"name": name, "ok": ok, "detail": "ok" if ok else msg, "fix": "" if ok else fix})
+        if not ok:
+            why.append(msg)
+
     att = p.get("attest") or {}
-    for k in pol["attest"]:
+    cap_usd, cap_req = None, None
+    if spec and spec.get("replay"):
+        try:
+            cap_usd = float(p.get("replay_cap_usd"))
+            if cap_usd < 0:
+                cap_usd = None
+        except (TypeError, ValueError):
+            cap_usd = None
+        try:
+            cap_req = int(p.get("replay_cap_requests"))
+            if cap_req <= 0:
+                cap_req = None
+        except (TypeError, ValueError):
+            cap_req = None
+    chk("class enabled", bool(cls and spec is not None
+                              and (cls in pol["enabled_classes"] or in_dry_class)),
+        "no enabled class" + (f" ({cls})" if cls else ""),
+        "use --class code-change-revertable or capped-replay-spend (ask the owner to enable it for this queue)")
+    required = list(pol["attest"]) + list((spec or {}).get("attest_extra") or [])
+    for k in required:
         v = att.get(k)
         if v is None:
-            why.append(f"checklist incomplete: {k} not attested")
+            chk(f"attest {k}", False, f"checklist incomplete: {k} not attested",
+                f"add {k}=no to --attest (only if it is true)")
         elif v != "no":
-            why.append(f"attested {k}={v}")
+            chk(f"attest {k}", False, f"attested {k}={v}",
+                f"{k}={v} means this is major: block with --weight major --major-because ...")
+        else:
+            chk(f"attest {k}", True, "")
+    if spec and spec.get("replay"):
+        chk("replay request cap", cap_req is not None,
+            "replay request cap missing or not a positive integer",
+            "pass --replay-cap-requests N (hard max model calls the replay may make)")
+        chk("replay dollar cap", cap_usd is not None,
+            "replay dollar cap missing", "pass --replay-cap-usd 0 (or the real cap; >0 makes it major)")
+        backend = str(p.get("replay_backend") or "").strip().lower()
+        free = cap_usd == 0 and backend in SUBSCRIPTION_BACKENDS
+        chk("zero-dollar subscription replay", free,
+            "replay is not zero-dollar on the subscription proxy: it spends real money, so it is major",
+            "pass --replay-cap-usd 0 --replay-backend subscription-proxy, or block as --weight major "
+            "--major-because money")
+        if att.get("money") == "no" and cap_usd is not None and cap_usd > 0:
+            chk("money attestation consistent", False, "attested money=no but replay dollar cap is above 0",
+                "a paid replay is money=yes and major")
     try:
         conf = float(p.get("confidence"))
     except (TypeError, ValueError):
         conf = -1.0
-    if conf < pol["threshold"]:
-        why.append(f"confidence {conf if conf >= 0 else 'missing'} below {pol['threshold']}")
+    chk("confidence", conf >= pol["threshold"],
+        f"confidence {conf if conf >= 0 else 'missing'} below {pol['threshold']}",
+        f"pass --confidence >= {pol['threshold']} only if you truly are that sure")
     undo = str(p.get("undo") or "").strip()
     if len(undo) < MIN_UNDO_LEN or _NO_UNDO.match(undo):
-        why.append("no concrete undo")
+        chk("undo", False, "no concrete undo", "give an exact command or file edit that restores the "
+            "previous state, e.g. 'rm /path/to/replay-output.json'")
     elif spec and not re.match(spec["undo"], undo):
-        why.append("undo does not match the class's undo form")
+        chk("undo", False, "undo does not match the class's undo form",
+            "git revert <sha> for code-change-revertable; a concrete command or file edit for replays")
+    else:
+        chk("undo", True, "")
     rec = str(p.get("recommend") or "").strip()
-    if len(rec) < 8:
-        why.append("no named recommendation")
+    chk("recommendation", len(rec) >= 8, "no named recommendation", "state the exact choice with --recommend")
     if spec and spec.get("needs_commit"):
         commit = str(item.get("block_commit") or "")
         m = re.match(rf"^git revert ({_SHA})\b", undo)
         if not commit:
-            why.append("no verified --commit recorded")
+            chk("commit", False, "no verified --commit recorded", "pass --commit <SHA> to wt block")
         elif m and not (commit.startswith(m.group(1)) or m.group(1).startswith(commit)):
-            why.append("undo sha is not the recorded commit")
+            chk("commit", False, "undo sha is not the recorded commit", "undo must be git revert <that commit>")
+        else:
+            chk("commit", True, "")
     if items is not None and pol["enabled"] and _recent_count(items, queue, now) >= pol["rate_per_hour"]:
-        why.append(f"rate limit ({pol['rate_per_hour']}/hour) reached")
+        chk("rate limit", False, f"rate limit ({pol['rate_per_hour']}/hour) reached", "wait for the hour to pass")
     # Veto-only floor: scanned over the worker's own words, never the ticket.
-    hits, err = floor_hits(proposal_text(p))
+    text = proposal_text(p)
+    hits, err = floor_hits(text)
+    if (hits and spec and spec.get("replay") and cap_usd == 0
+            and str(p.get("replay_backend") or "").strip().lower() in SUBSCRIPTION_BACKENDS
+            and all(att.get(k) == "no" for k in required)):
+        # Zero-dollar subscription replay: benign words (subscription, $0) do not veto the money
+        # rule. Anything else (stripe, refund, $5, a paid run, a send) still does.
+        hits2, _e2 = floor_hits(_BENIGN_MONEY.sub("", text))
+        if len(hits2) < len(hits):
+            res["exempted"] = [h for h in hits if h not in hits2]
+            hits = hits2
     res["matched"] = hits
     if err:
-        why.append(err)
+        chk("hard-stop floor", False, err, "retry; the floor must load")
     for h in hits:
-        why.append(f"matched hard stop: {h}")
+        chk(f"hard stop: {h}", False, f"matched hard stop: {h}",
+            "reword the question/recommend/undo/progress so it does not name this; if it really is that, it is major")
+    if not hits and not err:
+        chk("hard-stop floor", True, "")
     # Smoke alarm (no authority): signed "no" yet the text names the thing.
     res["contradiction"] = bool(hits) and any(att.get(k) == "no" for k in att)
     res["approve"] = not why

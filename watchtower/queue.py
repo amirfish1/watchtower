@@ -8635,6 +8635,43 @@ def note_auto_decline(ident: Any, reasons: str, *, expect_blocked_at: str, match
     return None
 
 
+def record_block_proposal(ident: Any, proposal: Dict[str, Any], *, expect_blocked_at: str) -> Optional[Dict[str, Any]]:
+    """Keep the worker's structured auto-decision proposal on the parked ticket so
+    ``wt gate-check`` can re-evaluate it read-only later (CCC-376)."""
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        return None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident) and it.get("blocked_at") == expect_blocked_at:
+                it["block_proposal"] = dict(proposal)
+                _save_unlocked(data)
+                return it
+    return None
+
+
+def note_auto_eligible(ident: Any, *, expect_blocked_at: str, checks: List[Dict[str, Any]],
+                       policy_hash: str, reason: str, exempted: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+    """Eligibility-only (test) mode: the gate passed, but nothing is approved or
+    answered. Mark the owner card so it reads as a test, not an approval (CCC-376)."""
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        return None
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if _matches(it, ident) and it.get("blocked_at") == expect_blocked_at and it.get("needs_input"):
+                tag = "[Eligible for auto-approval (test, not approved)]"
+                if tag not in str(it.get("block_question") or ""):
+                    it["block_question"] = _clip(f"{it.get('block_question', '')}\n{tag}", 4000)
+                it["auto_eligible_test"] = True
+                _append_history(it, "auto_decision_eligible", by=_by("system"), at=_now_iso(),
+                                text=reason, checks=checks, policy_hash=policy_hash,
+                                exempted=exempted or [], approved=False)
+                _save_unlocked(data)
+                return it
+    return None
+
+
 def note_auto_reversed(ident: Any, decision_id: str, *, original: str, revert: str,
                        by: str = "") -> Optional[Dict[str, Any]]:
     """Mark an auto-decision reversed -- only called after the revert is verified."""

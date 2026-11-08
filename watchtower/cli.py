@@ -3039,11 +3039,24 @@ def _auto_decide_after_block(item: Dict[str, Any], args: argparse.Namespace) -> 
         "major_detail": getattr(args, "major_detail", "") or "",
         "question": getattr(args, "question", "") or "",
         "progress": getattr(args, "progress", "") or "",
+        "replay_cap_requests": getattr(args, "replay_cap_requests", None),
+        "replay_cap_usd": getattr(args, "replay_cap_usd", None),
+        "replay_backend": getattr(args, "replay_backend", "") or "",
+        "prev_value": getattr(args, "prev_value", "") or "",
+        "gate_dry_run": bool(getattr(args, "gate_dry_run", False)),
     }
     if not (p["class"] or p["weight"] or p["major_because"]):
         return ""
-    res = autodecide.evaluate(item, p, items=q.list_items(project=item.get("project")))
     blocked_at = str(item.get("blocked_at") or "")
+    q.record_block_proposal(item["ref"], p, expect_blocked_at=blocked_at)
+    res = autodecide.evaluate(item, p, items=q.list_items(project=item.get("project")))
+    if res["approve"] and res.get("dry_run"):
+        q.note_auto_eligible(item["ref"], expect_blocked_at=blocked_at, checks=res["checks"],
+                             policy_hash=res["policy_hash"],
+                             reason="every gate check passed; test mode, nothing approved or sent",
+                             exempted=res.get("exempted"))
+        return ("ELIGIBLE for auto-approval but in test mode (--gate-dry-run or a dry-run class): "
+                "NOT approved, the owner card stands")
     if not res["approve"]:
         reason = autodecide.card_reason(res)
         q.note_auto_decline(item["ref"], reason, expect_blocked_at=blocked_at,
@@ -3060,6 +3073,40 @@ def _auto_decide_after_block(item: Dict[str, Any], args: argparse.Namespace) -> 
     if not done:
         return "auto-approval not applied (ticket changed, already answered or kill switch); owner card stands"
     return "AUTO-DECISION recorded (not a human approval); the worker is resumed with your recommendation only"
+
+
+def cmd_gate_check(args: argparse.Namespace) -> int:
+    """Re-evaluate a blocked ticket's recorded auto-decision proposal, read-only (CCC-376)."""
+    from . import autodecide
+    item = q.get(args.ref)
+    if not item:
+        print(f"(no item {args.ref})", file=sys.stderr)
+        return 1
+    p = item.get("block_proposal")
+    if not p:
+        print(f"{item['ref']}: no auto-decision proposal recorded on the current block "
+              "(the worker blocked without --class/--weight).", file=sys.stderr)
+        return 1
+    res = autodecide.evaluate(item, p, items=q.list_items(project=item.get("project")))
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2))
+        return 0 if res["approve"] else 2
+    print(f"{item['ref']} class={p.get('class') or '-'} weight={p.get('weight') or '-'} "
+          f"queue={item.get('project')} policy={res['policy_hash']}")
+    for c in res["checks"]:
+        print(f"  [{'PASS' if c['ok'] else 'FAIL'}] {c['name']}" + ("" if c["ok"] else f": {c['detail']}"))
+        if not c["ok"] and c["fix"]:
+            print(f"         fix: {c['fix']}")
+    if res.get("exempted"):
+        print(f"  note: hard-stop rule(s) not applied for a zero-dollar subscription replay: "
+              f"{', '.join(res['exempted'])}")
+    if res["approve"]:
+        mode = "test mode, would NOT be approved" if res.get("dry_run") else "would be AUTO-APPROVED"
+        print(f"RESULT: ELIGIBLE ({mode}). The card still waits for the owner." if res.get("dry_run")
+              else f"RESULT: ELIGIBLE ({mode})")
+        return 0
+    print("RESULT: NOT eligible: " + "; ".join(res["reasons"]))
+    return 2
 
 
 def cmd_undo(args: argparse.Namespace) -> int:
@@ -3130,6 +3177,8 @@ def cmd_policy(args: argparse.Namespace) -> int:
             ov["rate_per_hour"] = int(v)
         elif k == "enabled_classes":
             ov["enabled_classes"] = [c for c in v.split(",") if c]
+        elif k == "dry_run_classes":
+            ov["dry_run_classes"] = [c for c in v.split(",") if c]
         else:
             print(f"error: unknown setting {k!r}", file=sys.stderr)
             return 1
@@ -7649,6 +7698,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--undo", default="", help="auto-decision: exact undo, e.g. 'git revert <sha>'")
     s.add_argument("--attest", default="",
                    help="auto-decision: money=no,customer-sends=no,public-posts=no,ad-spend=no,irreversible=no")
+    s.add_argument("--replay-cap-requests", dest="replay_cap_requests", type=int, default=None,
+                   help="capped-replay-spend: hard maximum number of model requests the replay may make")
+    s.add_argument("--replay-cap-usd", dest="replay_cap_usd", type=float, default=None,
+                   help="capped-replay-spend: hard dollar cap (0 = free on the subscription proxy)")
+    s.add_argument("--replay-backend", dest="replay_backend", default="",
+                   help="capped-replay-spend: where the replay runs; 'subscription-proxy' for the $0 path")
+    s.add_argument("--prev-value", dest="prev_value", default="",
+                   help="capped-replay-spend: the previous value of any ledger/limit you raised, so undo can restore it")
+    s.add_argument("--gate-dry-run", dest="gate_dry_run", action="store_true",
+                   help="run the auto-approval gate and record eligibility, but never approve (owner-requested test mode)")
     s.add_argument("--major-because", dest="major_because", default="",
                    choices=[""] + list(__import__("watchtower.autodecide", fromlist=["x"]).MAJOR_BECAUSE),
                    help="required with --weight major: money, customer-sends, public-posts, "
@@ -7704,10 +7763,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--worker", default="")
     s.set_defaults(func=cmd_undo)
 
+    s = sub.add_parser("gate-check", help="re-evaluate a blocked ticket's auto-approval proposal, read-only, "
+                                          "printing each check and the fix the worker should make")
+    s.add_argument("ref")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_gate_check)
+
     s = sub.add_parser("policy", help="show/set a queue's auto-approval policy (owner only)")
     s.add_argument("action", choices=["show", "set"])
     s.add_argument("-q", "--queue", required=True)
-    s.add_argument("settings", nargs="*", help="enabled=true threshold=0.85 rate_per_hour=3 enabled_classes=code-change-revertable")
+    s.add_argument("settings", nargs="*", help="enabled=true threshold=0.85 rate_per_hour=3 enabled_classes=code-change-revertable dry_run_classes=capped-replay-spend")
     s.set_defaults(func=cmd_policy)
 
     s = sub.add_parser("blocked")
