@@ -377,6 +377,15 @@ def _tick(it, obs, now):
     if now < max(float(s['next_deadline']),float(obs['activity_at'])+IDLE_SECONDS):
         return
     if s['reminders']>=MAX_REMINDERS:
+        from . import outcomes
+        oid=outcomes.route_exception(it['ref'])
+        if oid:
+            # Linked outcome (feature on): a bounded lead diagnosis owns the
+            # technical exhaustion before any owner question.
+            s.update(state='waiting',wait_identity=f'outcome:{oid}',wait_source='outcome',
+                     reason='Reminder budget exhausted; linked outcome lead diagnosis owns the next action')
+            q._append_history(it,'takeover_escalation',by=q._by('system'),reason=s['reason'],routed_to=oid)
+            return
         _owner_question_unlocked(it, s,
             'Three confirmed work reminders exhausted; owner must review the retained session',
             source='takeover-escalation', turn=s['processed_turn'])
@@ -432,6 +441,27 @@ def reconcile(*, now=None, dry_run=False):
             except Exception as exc:
                 results.append(dict(ticket=it['ref'],state='error',reason=str(exc)))
     return results
+
+
+def resume_from_outcome(ref, outcome_id):
+    """Outcome lead result: resume same-session supervision after a routed
+    reminder exhaustion. Once per supervision generation; never re-sends an
+    uncertain intent and never takes over another claim."""
+    with _lock(), q._FileLock(q._lock_path()):
+        data=q._load_unlocked(strict=True)
+        it=next((i for i in data['items'] if i['ref']==ref),None)
+        s=(it or {}).get('supervision') or {}
+        if not s or s.get('wait_source')!='outcome' or s.get('wait_identity')!=f'outcome:{outcome_id}':
+            return dict(ref=ref, resumed=False, reason='supervision is not waiting on this outcome')
+        if (s.get('intent') or {}).get('state')=='uncertain':
+            return dict(ref=ref, resumed=False, reason='delivery outcome unknown; receipt must be reconciled first')
+        if int(s.get('outcome_resumed_generation') or 0)==int(s['generation']):
+            return dict(ref=ref, resumed=False, reason='already resumed once for this generation')
+        s.update(state='running',wait_identity='',wait_source='',reminders=0,next_deadline=time.time()+IDLE_SECONDS,
+                 outcome_resumed_generation=s['generation'],reason='Outcome lead resumed same-session supervision')
+        q._append_history(it,'takeover_outcome_resume',by=q._by('system'),outcome_id=outcome_id,generation=s['generation'])
+        q._save_unlocked(data)
+        return dict(ref=ref, resumed=True)
 
 
 def status_all():

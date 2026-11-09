@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-11-09 — opt-in outcomes
+
+- Add durable outcomes outside claimable tickets, with temporary bounded leads,
+  ordinary executors, independent verification and evidence-based acceptance.
+- Reconcile explicit session provenance and exact saved-decision receipts;
+  retain ambiguous Unfiled work and source coverage without creating new goals.
+- Route linked technical exhaustion through outcome recovery and preserve
+  existing behavior when disabled. See [outcomes](outcomes.md).
+
 ## 2026-10-31 — same-session takeover
 
 - Add `wt takeover`, status, cancellation, dry-run, native observations and

@@ -6911,6 +6911,13 @@ def _reconcile_once_locked(dry_run: bool = False,
                 result["stages"] = [f"{r}:{a}" for r, a in _stages.reconcile_stages()]
             except Exception:
                 pass
+            # Outcomes (default off): deterministic bookkeeping and bounded
+            # lead/verifier attempts for explicitly enabled installations.
+            try:
+                from . import outcomes as _outcomes
+                result["outcomes"] = _outcomes.reconcile()
+            except Exception:
+                pass
             # WT-31 D3: the liveness backstop, after every specific handler.
             try:
                 from . import liveness as _liveness

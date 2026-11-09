@@ -587,11 +587,17 @@ def _escalate(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any]) -> 
         _log("STAGE_BLOCK", f"{ref} {role} {key}: {reasons}", queue=project)
         return
 
+    from . import outcomes
+    routed = outcomes.route_exception(ref)
+
     def _do(it, s):
         s["escalated"] = True
         s["escalated_from"] = plan_status
+        if routed:
+            s["routed_outcome"] = routed
         q._append_history(it, "stage_escalated", by=q._by("system"), at=q._now_iso(),
-                          role=role, key=key, reason=reasons[:500])
+                          role=role, key=key, reason=reasons[:500],
+                          **({"routed_to": routed} if routed else {}))
         if role in ("planner", "plan_reviewer"):
             plan = dict(it.get("plan") or {})
             plan.update(status="blocked", escalated="stage_watch")
@@ -600,6 +606,11 @@ def _escalate(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any]) -> 
     if role == "assessor":
         a = item.get("assessment") or {}
         q.assessment_fail(ref, a.get("token", ""), f"assessor died twice: {reasons}")
+    if routed:
+        # Linked outcome (feature on): the lead diagnoses first; it can retry
+        # the stage or place a prepared question on this ticket.
+        _log("STAGE_ROUTED", f"{ref} {role} {key}: {reasons} -> outcome {routed}", queue=project)
+        return
     q.block(ref, "", origin="stage", question=question, kind="input")
     _log("STAGE_BLOCK", f"{ref} {role} {key}: {reasons}", queue=project)
 

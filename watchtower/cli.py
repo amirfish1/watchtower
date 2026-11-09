@@ -4654,6 +4654,52 @@ def cmd_takeover(args: argparse.Namespace) -> int:
         return 1
 
 
+def cmd_outcome(args: argparse.Namespace) -> int:
+    """Durable outcomes (default off). ``api`` is the machine wire: exactly one
+    JSON object on stdout; nonzero exit with ``{ok: false, error, code}``."""
+    from . import outcomes
+    action = args.outcome_action
+    try:
+        if action == "api":
+            raw = args.payload_json if args.payload_json is not None else "{}"
+            try:
+                payload = json.loads(raw)
+            except ValueError as exc:
+                raise outcomes.OutcomeError("invalid", f"payload is not valid JSON: {exc}") from exc
+            result = outcomes.api(args.api_action, payload)
+        elif action == "list":
+            result = {"ok": True, "outcomes": outcomes.list_outcomes(args.repo_path or "", args.state or "")}
+        elif action == "show":
+            result = {"ok": True, "outcome": outcomes.get(args.id)}
+        elif action == "reconcile":
+            result = {"ok": True, "result": outcomes.reconcile(dry_run=args.dry_run)}
+        elif action == "settings":
+            flag = True if args.enable else False if args.disable else None
+            result = outcomes.api("settings", {} if flag is None else {"enabled": flag})
+        else:
+            raise outcomes.OutcomeError("invalid", "usage: wt outcome {api,list,show,reconcile,settings}")
+    except outcomes.OutcomeError as exc:
+        print(json.dumps(dict({"ok": False, "error": exc.message, "code": exc.code}, **exc.extra),
+                         ensure_ascii=False, default=str))
+        return 1
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"ok": False, "error": str(exc), "code": "error"}, ensure_ascii=False))
+        return 1
+    if action == "api" or getattr(args, "json", False):
+        print(json.dumps(result, ensure_ascii=False, default=str))
+        return 0
+    if action == "list":
+        rows = result["outcomes"]
+        if not rows:
+            print("No outcomes.")
+        for o in rows:
+            na = (o.get("next_action") or {}).get("text") or "-"
+            print(f"{o['id']}  {o['state']:<9} {o['health']:<13} {o['title'][:50]}  next: {na[:60]}")
+        return 0
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0
+
+
 def cmd_outbox(args: argparse.Namespace) -> int:
     """Inspect and manage messages parked in the durable outbox."""
     from . import messages
@@ -6807,6 +6853,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "import"),
     ("Tickets", "take"),
     ("Tickets", "takeover"),
+    ("Tickets", "outcome"),
     ("Tickets", "edit"),
     ("Tickets", "ready"),
     ("Tickets", "find"),
@@ -6877,6 +6924,7 @@ COMMAND_HELP: Dict[str, str] = {
     "nack": "decline a product-gate pitch: icebox it, or --close to close as Declined",
     "answer": "answer a blocked ticket; auto-resumes its session",
     "takeover": "supervise an existing session; status, cancel, observe, or publish candidates",
+    "outcome": "durable outcomes (default off): api, list, show, reconcile, settings",
     "migrate-blocks": "park tickets blocked the legacy way (WT-28)",
     "comment": "append a ticket activity comment",
     "discuss": "attach to a blocked ticket's session (claude --resume)",
@@ -8014,6 +8062,30 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_takeover)
+
+    s = sub.add_parser("outcome", help="durable outcomes: responsibility for results (default off)")
+    s.set_defaults(func=cmd_outcome, outcome_action=None)
+    osub = s.add_subparsers(dest="outcome_action")
+    o = osub.add_parser("api", help="machine wire: one JSON object in, one out")
+    o.add_argument("api_action", choices=["list", "get", "create", "update", "link", "associate", "event",
+                                           "evidence", "accept", "lead-result", "feed", "settings",
+                                           "reconcile"])
+    o.add_argument("--payload-json", dest="payload_json", default=None)
+    o = osub.add_parser("list", help="list outcomes")
+    o.add_argument("--repo-path", dest="repo_path", default="")
+    o.add_argument("--state", default="")
+    o.add_argument("--json", action="store_true")
+    o = osub.add_parser("show", help="show one outcome")
+    o.add_argument("id")
+    o.add_argument("--json", action="store_true")
+    o = osub.add_parser("reconcile", help="one outcome reconcile pass (the daemon runs this each tick)")
+    o.add_argument("--dry-run", action="store_true", dest="dry_run")
+    o.add_argument("--json", action="store_true")
+    o = osub.add_parser("settings", help="show or change the installation's default-off outcome gate")
+    g = o.add_mutually_exclusive_group()
+    g.add_argument("--enable", action="store_true")
+    g.add_argument("--disable", action="store_true")
+    o.add_argument("--json", action="store_true")
 
     s = sub.add_parser("outbox")
     s.set_defaults(func=cmd_outbox, outbox_command=None)
