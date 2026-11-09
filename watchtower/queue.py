@@ -8768,20 +8768,40 @@ def note_auto_reversed(ident: Any, decision_id: str, *, original: str, revert: s
     return None
 
 
+def _auto_decision_rows(it: Dict[str, Any]) -> List[Dict[str, Any]]:
+    from . import autodecide
+    out: List[Dict[str, Any]] = []
+    hist = it.get("history") or []
+    for h in hist:
+        if h.get("event") == "auto_decision":
+            rev = next((r for r in hist if r.get("event") == "auto_decision_reversed"
+                        and r.get("decision_id") == h.get("decision_id")), None)
+            out.append({"ref": it.get("ref"), "event": h, "reversed": rev,
+                        "followthrough": autodecide.followthrough(hist, h)})
+    return out
+
+
 def auto_decisions(queue: str = "") -> List[Dict[str, Any]]:
-    """Every auto_decision event (with its ticket ref and reversal, if any)."""
+    """Every auto_decision event (with its ticket ref and reversal, if any).
+
+    GitHub-backed queues keep auto_decision in backend history (issue-body
+    metadata + sidecar), not in the local store, so those items are listed
+    through the backend (CCC-399)."""
     out: List[Dict[str, Any]] = []
     for it in _load_unlocked(readonly=True).get("items", []):
         if queue and it.get("project") != queue:
             continue
-        hist = it.get("history") or []
-        for h in hist:
-            if h.get("event") == "auto_decision":
-                rev = next((r for r in hist if r.get("event") == "auto_decision_reversed"
-                            and r.get("decision_id") == h.get("decision_id")), None)
-                from . import autodecide
-                out.append({"ref": it.get("ref"), "event": h, "reversed": rev,
-                            "followthrough": autodecide.followthrough(hist, h)})
+        out.extend(_auto_decision_rows(it))
+    gh = [_norm_project(queue)] if queue and _github_backend_for_project(queue) is not None \
+        else ([] if queue else _github_projects())
+    for proj in gh:
+        try:
+            items = list_items(project=proj)
+        except Exception as exc:  # noqa: BLE001 - one unreachable queue must not hide the rest
+            _log("AUTO_DECISION", f"{proj}: GitHub history not listed: {exc}", queue=proj)
+            continue
+        for it in items:
+            out.extend(_auto_decision_rows(it))
     return out
 
 

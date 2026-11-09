@@ -97,3 +97,26 @@ def test_policy_decisions_lists_state_and_reason(tmp_path, monkeypatch, capsys):
     assert cli.cmd_policy(argparse.Namespace(action="decisions", queue="T", settings=[])) == 0
     out = capsys.readouterr().out
     assert it["ref"] in out and "failed" in out and "replay not run" in out
+
+
+def test_auto_decisions_include_github_backed_queue_history(tmp_path, monkeypatch):
+    """CCC-399: GitHub queues keep auto_decision in backend history, not the local store."""
+    import importlib
+    monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "queue.json"))
+    import watchtower.queue as q
+    importlib.reload(q)
+    gh_item = {"ref": "GH-7", "project": "GH",
+               "history": [DEC, {"event": "close", "resolution": {"summary": "PARTIAL: nope"}}]}
+    monkeypatch.setattr(q, "_github_projects", lambda: ["GH"])
+    monkeypatch.setattr(q, "_github_backend_for_project", lambda p: object() if p == "GH" else None)
+    monkeypatch.setattr(q, "list_items", lambda project=None, **kw: [gh_item] if project == "GH" else [])
+    rows = q.auto_decisions()
+    assert [r["ref"] for r in rows] == ["GH-7"]
+    assert rows[0]["followthrough"]["state"] == "failed"
+    assert [r["ref"] for r in q.auto_decisions("GH")] == ["GH-7"]
+    assert q.auto_decisions("OTHER") == []
+
+    def boom(project=None, **kw):
+        raise RuntimeError("gh down")
+    monkeypatch.setattr(q, "list_items", boom)
+    assert q.auto_decisions() == []  # an unreachable queue must not raise
