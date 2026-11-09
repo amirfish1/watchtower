@@ -434,6 +434,9 @@ def followthrough(hist: List[Dict[str, Any]], decision_event: Dict[str, Any]) ->
     if i < 0:
         i = next((n for n, h in enumerate(hist) if h.get("event") == "auto_decision"
                   and h.get("decision_id") == decision_event.get("decision_id")), -1)
+    if i < 0 and decision_event.get("entry_key"):  # rebuilt from a saved answer (CCC-409)
+        i = next((n for n, h in enumerate(hist) if h.get("event") == "answer"
+                  and h.get("entry_key") == decision_event.get("entry_key")), -1)
     after = hist[i + 1:] if i >= 0 else []
     state, reason = "pending", "saved; waiting for a worker to consume it"
     for h in after:

@@ -120,3 +120,23 @@ def test_auto_decisions_include_github_backed_queue_history(tmp_path, monkeypatc
         raise RuntimeError("gh down")
     monkeypatch.setattr(q, "list_items", boom)
     assert q.auto_decisions() == []  # an unreachable queue must not raise
+
+
+def test_unrecorded_auto_decision_is_rebuilt_from_saved_answer(tmp_path, monkeypatch):
+    """CCC-409: a GitHub-backed ticket with no sidecar entry never stored the
+    auto_decision event; the delivered answer must still be listed."""
+    from watchtower import queue as q
+    answer = ("[answer BECKY-1#7; ignore a repeat of a tag you already applied] This is an "
+              "AUTO-DECISION by WatchTower, NOT a human approval.")
+    hist = [
+        {"event": "block", "at": "2026-11-08T05:00:00Z", "question": "?"},
+        {"event": "answer", "at": "2026-11-08T05:01:00Z", "kind": "system", "entry_key": "k1", "text": answer},
+        {"event": "answer", "at": "2026-11-08T05:02:00Z", "kind": "system", "entry_key": "k2", "text": answer},
+        {"event": "close", "at": "2026-11-08T05:03:00Z",
+         "resolution": {"summary": "PARTIAL: not run"}},
+    ]
+    rows = q._auto_decision_rows({"ref": "BECKY-1", "history": hist})
+    assert len(rows) == 1  # re-delivery of the same tag is not a second decision
+    assert rows[0]["followthrough"]["state"] == "failed"
+    real = hist + [{"event": "auto_decision", "decision_id": rows[0]["event"]["decision_id"]}]
+    assert len(q._auto_decision_rows({"ref": "BECKY-1", "history": real})) == 1

@@ -8768,16 +8768,51 @@ def note_auto_reversed(ident: Any, decision_id: str, *, original: str, revert: s
     return None
 
 
+_AUTO_ANSWER_MARK = "This is an AUTO-DECISION by WatchTower"
+
+
+def _legacy_auto_decision_events(hist: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """auto_decision events for answers that were delivered but never recorded.
+
+    A GitHub-backed ticket with no pipeline sidecar entry silently drops the
+    ``auto_decision`` history write (github_pipeline.mutate returns None), so
+    the saved answer is the only trace of the decision (CCC-409). Rebuild the
+    event from that answer; ignore re-deliveries of the same ``[answer REF#N``
+    tag and tickets that already carry a real event for it."""
+    have = {h.get("decision_id") for h in hist if h.get("event") == "auto_decision"}
+    out: List[Dict[str, Any]] = []
+    seen_tags = set()
+    blocked_at = ""
+    for h in hist:
+        ev = h.get("event")
+        if ev == "block":
+            blocked_at = str(h.get("at") or "")
+        if ev != "answer" or _AUTO_ANSWER_MARK not in str(h.get("text") or ""):
+            continue
+        text = str(h.get("text") or "")
+        tag = text.split(";", 1)[0]
+        if tag in seen_tags:
+            continue
+        seen_tags.add(tag)
+        decision_id = f"{tag.strip('[] ').split(' ', 1)[-1]}@{blocked_at}"
+        if decision_id in have:
+            continue
+        out.append({**h, "event": "auto_decision", "decision_id": decision_id,
+                    "blocked_at": blocked_at, "legacy": True})
+    return out
+
+
 def _auto_decision_rows(it: Dict[str, Any]) -> List[Dict[str, Any]]:
     from . import autodecide
     out: List[Dict[str, Any]] = []
     hist = it.get("history") or []
-    for h in hist:
-        if h.get("event") == "auto_decision":
-            rev = next((r for r in hist if r.get("event") == "auto_decision_reversed"
-                        and r.get("decision_id") == h.get("decision_id")), None)
-            out.append({"ref": it.get("ref"), "event": h, "reversed": rev,
-                        "followthrough": autodecide.followthrough(hist, h)})
+    events = [h for h in hist if h.get("event") == "auto_decision"]
+    events += _legacy_auto_decision_events(hist)
+    for h in events:
+        rev = next((r for r in hist if r.get("event") == "auto_decision_reversed"
+                    and r.get("decision_id") == h.get("decision_id")), None)
+        out.append({"ref": it.get("ref"), "event": h, "reversed": rev,
+                    "followthrough": autodecide.followthrough(hist, h)})
     return out
 
 
