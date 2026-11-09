@@ -178,11 +178,17 @@ def _scan(data, rows, now):
     for o in rows:
         suggestions = [r for r in data['unfiled'].values() if o['id'] in r['suggestions']][:SUGGESTION_LIMIT]
         duty = unmatched if o['id'] == intake_owner else []
-        if (suggestions or duty) and data['reviews'].get(o['id']) != bucket:
+        material = [{k: r.get(k) for k in ('session_id', 'name', 'reason', 'suggestions')}
+                    for r in suggestions + duty]
+        fingerprint = hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+        previous = data['reviews'].get(o['id'])
+        previous = previous if isinstance(previous, dict) else {'bucket': previous}
+        if ((suggestions or duty) and previous.get('bucket') != bucket
+                and previous.get('fingerprint') != fingerprint):
             outcomes.event(dict(id=o['id'], type='owner_review', key=f'intake-review:{bucket}',
                 payload=dict(source='outcome-intake', unfiled=suggestions,
                              administrative_intake=duty, acceptance_credit=False)))
-            data['reviews'][o['id']] = bucket
+            data['reviews'][o['id']] = dict(bucket=bucket, fingerprint=fingerprint)
     data['reviews'] = dict([(k, v) for k, v in data['reviews'].items() if k in by_id][-RECORD_LIMIT:])
 
 

@@ -111,6 +111,17 @@ def test_hourly_cap_cursor_and_review_coalescing(env, monkeypatch):
     assert intake.view()['summary']['cursor'] == 's3'
 
 
+def test_unchanged_unfiled_provenance_does_not_spend_another_lead_wake(env):
+    env['rows'].append(outcome())
+    env['census'].append(session('unassigned'))
+    intake.reconcile(now=100)
+    intake.reconcile(now=3700)
+    assert len(env['events']) == 1
+    env['census'][0]['name'] = 'New provenance to inspect'
+    intake.reconcile(now=7300)
+    assert len(env['events']) == 2
+
+
 def test_skip_archived_polls_and_unassociated_helpers(env):
     env['rows'].append(outcome(sessions=[{'session_id': 'business'}]))
     env['census'].extend([session('archive', archived=True), session('trash', trashed=True),

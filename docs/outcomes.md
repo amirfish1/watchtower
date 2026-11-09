@@ -15,6 +15,9 @@ mutating executor per outcome. Role models come from the existing queue policy.
 Wall limits, retries, wake budgets, concurrent attempts and per-tick spawns are
 bounded in the persisted settings. Output-token ceilings are advisory.
 
+A dated lead recheck still runs while an executor retains its ticket claim.
+That wait is shown as waiting rather than claiming that execution is running.
+
 Acceptance requires current-criteria evidence from a fenced independent
 verifier or an explicitly accepted ticket gate. Ticket closure, suggestions,
 model assertions and owner answers cannot directly establish delivery. Late
@@ -28,6 +31,8 @@ evidence. Other sessions remain Unfiled with reasons and an agent-owned next
 check; one existing lead takes bounded administrative intake for rows without
 candidate outcomes. Repository suggestions are review material, never proof of
 contribution. Archived, trashed and empty polling sessions are excluded.
+Unchanged provenance does not start another lead review merely because an
+hour elapsed; meaningful intake changes are coalesced before a bounded wake.
 
 Saved decisions are pulled from the existing inbox and matched by exact request,
 origin and revision or generation. Only an accepted answer with a matching

@@ -134,6 +134,24 @@ def test_late_runtime_identity_is_adopted_from_exact_worker_receipt(env, monkeyp
     assert oc.get(o["id"])["attempts"][-1]["session_id"] == "resolved-session"
 
 
+def test_dated_lead_recheck_fires_while_existing_executor_retains_its_claim(env, monkeypatch):
+    on()
+    now = time.time()
+    monkeypatch.setattr(oc, "_now", lambda: now)
+    o = make(env)
+    ref = _link_ticket(env, o, status="in_progress")
+    oc.reconcile()
+    submit(o["id"], {"kind": "next_action", "next_action": {"text": "Research blocked execution",
+                 "owner": "agent", "due_at": oc._iso(now + 60), "trigger": "existing ticket progresses"}})
+    assert oc.get(o["id"])["health"] == "waiting"
+    now += 61
+    oc.reconcile()
+    got = oc.get(o["id"])
+    assert any(e["type"] == "deadline_due" for e in got["events"])
+    assert len([a for a in got["attempts"] if a["role"] == "lead"]) == 2
+    assert q.get(ref)["status"] == "in_progress"
+
+
 NEW_TICKET = {"kind": "dispatched_work", "work": {"mode": "new_ticket", "title": "Cache test deps",
                                                    "text": "Add dependency caching; measure.", "reversible": True}}
 

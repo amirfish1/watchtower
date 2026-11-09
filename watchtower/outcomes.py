@@ -1752,24 +1752,30 @@ def _derive_health(data: Dict[str, Any], o: Dict[str, Any], now: float) -> None:
             _set_health(data, o, "scheduled", f"{len(pending) + len(vpending)} event(s) awaiting a bounded wake",
                         "lead" if pending else "verifier")
         return
+    na = o.get("next_action") or {}
+    due = _parse_iso(na.get("due_at")) if na else None
+    # A retained executor can be stalled or blocked. Its claim must not mask
+    # the lead's explicit recovery clock, or the promised recheck never fires.
+    if due and due <= now:
+        _add_event(o, "deadline_due", f"due:{na.get('due_at')}:{_digest(na.get('text'))[:10]}",
+                   {"next_action": na})
+        _set_health(data, o, "scheduled", "Dated next action is due; bounded lead review queued", "lead")
+        return
+    if na.get("owner") == "user":
+        _set_health(data, o, "waiting_owner", na.get("text", ""), "owner")
+        return
+    if due and due > now:
+        _set_health(data, o, "waiting", na.get("text", ""), na.get("owner") or "agent")
+        return
     if executors:
         _set_health(data, o, "running", "Executor ticket " + ", ".join(executors) + " in progress",
                     "executor", "", executors[0])
         return
-    na = o.get("next_action") or {}
-    if na.get("owner") == "user":
-        _set_health(data, o, "waiting_owner", na.get("text", ""), "owner")
-        return
-    due = _parse_iso(na.get("due_at")) if na else None
-    if na and ((due and due > now) or (na.get("trigger") and not due)):
+    if na and na.get("trigger"):
         _set_health(data, o, "waiting", na.get("text", ""), na.get("owner") or "agent")
         return
-    if na and due and due <= now:
-        _add_event(o, "deadline_due", f"due:{na.get('due_at')}:{_digest(na.get('text'))[:10]}",
-                   {"next_action": na})
-    else:
-        _add_event(o, "ownership_gap", f"gap:{o['criteria_revision']}:{_digest(na)[:12]}",
-                   {"reason": "No running attempt, eligible wake or explicit wait"})
+    _add_event(o, "ownership_gap", f"gap:{o['criteria_revision']}:{_digest(na)[:12]}",
+               {"reason": "No running attempt, eligible wake or explicit wait"})
     _set_health(data, o, "scheduled", "Lead wake queued to restore an owned next action", "lead")
 
 

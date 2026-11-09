@@ -8,6 +8,8 @@
   retain ambiguous Unfiled work and source coverage without creating new goals.
 - Route linked technical exhaustion through outcome recovery and preserve
   existing behavior when disabled. See [outcomes](outcomes.md).
+- Keep dated lead recovery checks eligible while a ticket retains its claim,
+  and avoid repeated lead reviews for unchanged Unfiled provenance.
 
 ## 2026-10-31 — same-session takeover
 
