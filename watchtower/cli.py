@@ -3158,6 +3158,15 @@ def cmd_policy(args: argparse.Namespace) -> int:
     """Show or set a queue's auto-approval policy (CCC-370). Owner-only: refused
     inside a worker session (WT_ROLE=worker / WT_WORKER_ID)."""
     from . import autodecide, config
+    if args.action == "decisions":
+        rows = q.auto_decisions(args.queue)
+        for r in rows:
+            ft = r.get("followthrough") or {}
+            rev = " reversed" if r.get("reversed") else ""
+            print(f"{r['ref']}\t{ft.get('state', '?')}{rev}\t{ft.get('reason', '')}")
+        if not rows:
+            print("(no auto-decisions)")
+        return 0
     if args.action == "show":
         pol = autodecide.queue_policy(args.queue)
         pol["policy_hash"] = autodecide.policy_hash(pol)
@@ -7825,7 +7834,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_gate_check)
 
     s = sub.add_parser("policy", help="show/set a queue's auto-approval policy (owner only)")
-    s.add_argument("action", choices=["show", "set"])
+    s.add_argument("action", choices=["show", "set", "decisions"])
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("settings", nargs="*", help="enabled=true threshold=0.85 rate_per_hour=3 enabled_classes=code-change-revertable dry_run_classes=capped-replay-spend")
     s.set_defaults(func=cmd_policy)

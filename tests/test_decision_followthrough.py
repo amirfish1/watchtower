@@ -81,3 +81,19 @@ def test_failed_inject_redelivers_same_answer_and_never_reasks(tmp_path, monkeyp
     assert "[ANSWERED while blocked" in after["text"]
     assert not after.get("needs_input")
     assert sum(1 for h in after["history"] if h.get("event") == "block") == blocks_before
+
+
+def test_policy_decisions_lists_state_and_reason(tmp_path, monkeypatch, capsys):
+    import argparse, importlib
+    monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "queue.json"))
+    import watchtower.queue as q, watchtower.cli as cli
+    importlib.reload(q); importlib.reload(cli)
+    it = q.enqueue(project="T", note="n")
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked()
+        for x in data["items"]:
+            x["history"] = [DEC, {"event": "close", "resolution": {"summary": "PARTIAL: replay not run"}}]
+        q._save_unlocked(data)
+    assert cli.cmd_policy(argparse.Namespace(action="decisions", queue="T", settings=[])) == 0
+    out = capsys.readouterr().out
+    assert it["ref"] in out and "failed" in out and "replay not run" in out
