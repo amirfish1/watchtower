@@ -8779,7 +8779,9 @@ def auto_decisions(queue: str = "") -> List[Dict[str, Any]]:
             if h.get("event") == "auto_decision":
                 rev = next((r for r in hist if r.get("event") == "auto_decision_reversed"
                             and r.get("decision_id") == h.get("decision_id")), None)
-                out.append({"ref": it.get("ref"), "event": h, "reversed": rev})
+                from . import autodecide
+                out.append({"ref": it.get("ref"), "event": h, "reversed": rev,
+                            "followthrough": autodecide.followthrough(hist, h)})
     return out
 
 

@@ -416,3 +416,40 @@ AUTO_PROMPT = (
     "summary that this was an auto-decision. If anything beyond the recommendation turns out to be "
     "needed, run `wt block` again as an ordinary question. Undo, if the owner asks: `wt undo {ref}`."
 )
+
+
+def followthrough(hist: List[Dict[str, Any]], decision_event: Dict[str, Any]) -> Dict[str, str]:
+    """Follow-through state of one saved decision (CCC-392), derived from the
+    ticket history after it, so nothing new is stored and a re-delivery of the
+    SAME answer never opens a new question.
+
+    pending   saved, no worker has picked it up yet (delivery keeps retrying the same answer)
+    consumed  a worker claimed/resumed after it
+    applied   the worker reported progress after consuming it
+    verified  the worker closed it with a complete (non-PARTIAL, nothing unresolved) resolution
+    failed    closed PARTIAL / with unresolved items, or delivery was handed off; ``reason`` says why
+    """
+    hist = list(hist or [])
+    i = next((n for n, h in enumerate(hist) if h is decision_event), -1)
+    if i < 0:
+        i = next((n for n, h in enumerate(hist) if h.get("event") == "auto_decision"
+                  and h.get("decision_id") == decision_event.get("decision_id")), -1)
+    after = hist[i + 1:] if i >= 0 else []
+    state, reason = "pending", "saved; waiting for a worker to consume it"
+    for h in after:
+        ev = h.get("event")
+        if ev == "claim":
+            state, reason = "consumed", "worker resumed on the saved answer"
+        elif ev == "progress" and state in ("consumed", "applied"):
+            state, reason = "applied", str(h.get("text") or "")[:200]
+        elif ev == "close":
+            res = h.get("resolution") or {}
+            summ = str(res.get("summary") or "")
+            first = summ.split("\n")[0]
+            if summ.upper().startswith("PARTIAL") or res.get("unresolved"):
+                state, reason = "failed", (first or "closed with unresolved items")[:300]
+            else:
+                state, reason = "verified", (first or "closed")[:300]
+        elif ev in ("reopen", "answer_route") and "handed off" in str(h.get("reason") or h.get("text") or ""):
+            state, reason = "failed", str(h.get("reason") or h.get("text"))[:300]
+    return {"state": state, "reason": reason}
