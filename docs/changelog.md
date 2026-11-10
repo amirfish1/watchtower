@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-10 — built-in hard-stop floor
+
+- Auto-decisions now work on a fresh install: the hard-stop floor is bundled, and
+  `WT_HARD_STOPS_FILE` can add rules from your own file. See
+  [worker runbook](worker-runbook.md#minor-blocks-proposing-an-auto-decision-ccc-370).
+
 ## 2026-11-09 — opt-in outcomes
 
 - Add durable outcomes outside claimable tickets, with temporary bounded leads,

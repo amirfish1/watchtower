@@ -219,6 +219,15 @@ exactly only the owner can do; "preference", "unknown", "needs you", "not sure",
 enabled_classes=code-change-revertable`, kill switch = create `auto-decision.off`
 in the WatchTower data dir. Workers cannot write policy.
 
+The hard-stop floor is built in, so auto-approval works on a fresh install with
+nothing extra to set up. It always sends these to a human: sending to customers, a
+production change, which reaches customers, money or prices, ad spend or a public
+post, and anything that cannot be undone. To add rules of your own, set
+`WT_HARD_STOPS_FILE` (in the environment `wt` runs in) to a Python file that defines
+`hard_stops(text)` and returns the names of the rules the text matches. Your rules
+are added to the built-in ones and cannot remove them. If that file is set but
+missing or broken, nothing is auto-approved.
+
 ### Replay approvals (`capped-replay-spend`, CCC-376)
 
 A model replay/evaluation that writes only to a file, sends nothing, writes

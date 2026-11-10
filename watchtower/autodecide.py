@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -158,16 +159,35 @@ def policy_hash(pol: Dict[str, Any]) -> str:
 
 
 # ------------------------------------------------------------ hard-stop floor
-def floor_hits(text: str) -> Tuple[List[str], str]:
-    """Matched hard-stop rule names, reusing decision_desk.HARD_STOPS.
+def _rules_from(script: Path, text: str) -> List[str]:
+    spec = importlib.util.spec_from_file_location("_wt_decision_desk", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)          # type: ignore[union-attr]
+    return list(mod.hard_stops(text))
 
-    Returns (hits, error). If the desk script cannot be loaded the floor is
-    unavailable and the caller must fail closed (error is non-empty)."""
+
+def floor_hits(text: str) -> Tuple[List[str], str]:
+    """Matched hard-stop rule names.
+
+    The floor is ``DESK_SCRIPT`` when that file exists, else the bundled
+    ``hardstops`` list. ``WT_HARD_STOPS_FILE`` names a file whose
+    ``hard_stops(text)`` adds rules on top. It can only add: the gate runs in
+    the worker's own process, so an override that replaced the floor would let
+    a worker remove it.
+
+    Returns (hits, error). If a rules file is configured or present but cannot
+    be loaded the floor is unavailable and the caller must fail closed (error
+    is non-empty)."""
     try:
-        spec = importlib.util.spec_from_file_location("_wt_decision_desk", DESK_SCRIPT)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)          # type: ignore[union-attr]
-        return list(mod.hard_stops(text)), ""
+        if DESK_SCRIPT.exists():
+            hits = _rules_from(DESK_SCRIPT, text)
+        else:
+            from . import hardstops
+            hits = list(hardstops.hard_stops(text))
+        extra = os.environ.get("WT_HARD_STOPS_FILE", "").strip()
+        if extra:
+            hits += [h for h in _rules_from(Path(extra).expanduser(), text) if h not in hits]
+        return hits, ""
     except Exception as e:  # noqa: BLE001 - any failure means "no veto data": fail closed
         return [], f"hard-stop floor unavailable ({type(e).__name__})"
 
