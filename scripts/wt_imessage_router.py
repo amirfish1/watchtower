@@ -29,7 +29,8 @@ from pathlib import Path
 HERMES_BIN = os.path.expanduser("~/.hermes/hermes-agent/venv/bin/hermes")
 BRIDGE_HERMES_HOME = os.path.expanduser("~/.hermes-bym-bridge")
 BB_ENV = Path(os.path.expanduser("~/.hermes/.env"))
-CHAT_GUID = "iMessage;-;+16506483298"  # 1:1 chat with the allowed handle
+# The chat id identifies the owner's phone handle; it is machine-local config
+# (BLUEBUBBLES_CHAT_GUID in BB_ENV), never a literal in this public file.
 STATE = Path(os.path.expanduser("~/.local/state/wt-imessage-router.json"))
 LOG_PATH = os.path.expanduser("~/.local/log/wt-imessage-router.log")
 REF_RE = re.compile(r"^\s*\[?([A-Za-z][A-Za-z0-9_-]*-\d+)\]?(?![\w-])[\s:,-]*(.*)$", re.S)
@@ -90,7 +91,10 @@ def bb_recent() -> list:
             os.environ.setdefault(k, v.strip().strip('"'))
     base = os.environ["BLUEBUBBLES_SERVER_URL"].rstrip("/")
     pw = urllib.parse.quote(os.environ["BLUEBUBBLES_PASSWORD"])
-    guid = urllib.parse.quote(CHAT_GUID, safe="")
+    chat_guid = os.environ.get("BLUEBUBBLES_CHAT_GUID", "")
+    if not chat_guid:
+        raise RuntimeError(f"BLUEBUBBLES_CHAT_GUID is not set in {BB_ENV}")
+    guid = urllib.parse.quote(chat_guid, safe="")
     url = f"{base}/api/v1/chat/{guid}/message?limit=20&password={pw}"
     with urllib.request.urlopen(url, timeout=20) as resp:
         return json.loads(resp.read().decode()).get("data") or []
