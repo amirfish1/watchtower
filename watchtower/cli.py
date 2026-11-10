@@ -5275,6 +5275,58 @@ def _warn_if_public_repo(queue: str, config) -> None:
         print(warning, file=sys.stderr)
 
 
+def _daemon_pid_live() -> bool:
+    try:
+        pid = int(DAEMON_PID_FILE.read_text().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _autostart_watcher(args: argparse.Namespace, wait_s: float = 10.0) -> bool:
+    """Start a detached watcher after auto-drain is switched on, unless one is
+    live or the caller opted out (--no-autostart / WT_NO_AUTOSTART=1).
+
+    Forwards --host/--port and reports a start that never came up (False)
+    instead of printing success for a fire-and-forget Popen (WT-59)."""
+    import subprocess
+    import time
+    if getattr(args, "no_autostart", False) or os.environ.get(
+            "WT_NO_AUTOSTART", "").strip().lower() in ("1", "true", "yes", "on"):
+        print("autostart skipped (--no-autostart / WT_NO_AUTOSTART)")
+        return True
+    if _daemon_pid_live():
+        return True
+    cmd = [sys.executable, "-m", "watchtower.cli", "start", "--auto-spawn"]
+    host = getattr(args, "host", None)
+    port = getattr(args, "port", None)
+    if host:
+        cmd += ["--host", host]
+    if port is not None:
+        cmd += ["--port", str(port)]
+    log_path = Path.home() / ".watchtower" / "watcher.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(log_path, "a") as log_f:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
+            start_new_session=True,
+        )
+    deadline = time.monotonic() + wait_s
+    while time.monotonic() < deadline:
+        rc = proc.poll()
+        if rc not in (None, 0):
+            break
+        if rc == 0 and _daemon_pid_live():
+            print(f"service auto-started (log: {log_path})")
+            return True
+        time.sleep(0.2)
+    print(f"error: watcher autostart failed or not ready within {wait_s:g}s "
+          f"(see {log_path}); config was saved. Start it with `wt start`, "
+          f"or pass --no-autostart.", file=sys.stderr)
+    return False
+
+
 def cmd_drain(args: argparse.Namespace) -> int:
     """Enable or disable auto-drain for a queue (wt drain on|off <queue>)."""
     from . import config
@@ -5296,26 +5348,8 @@ def cmd_drain(args: argparse.Namespace) -> int:
             rc = _service_activate()
             if rc == 0:
                 print(f"{_service_kind()} activated (survives reboots)")
-        # Also start the service right now if daemon isn't running.
-        daemon_live = False
-        if DAEMON_PID_FILE.exists():
-            try:
-                pid = int(DAEMON_PID_FILE.read_text().strip())
-                os.kill(pid, 0)
-                daemon_live = True
-            except (ValueError, ProcessLookupError, OSError):
-                pass
-        if not daemon_live:
-            import subprocess
-            log_path = Path.home() / ".watchtower" / "watcher.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(log_path, "a") as log_f:
-                subprocess.Popen(
-                    [sys.executable, "-m", "watchtower.cli", "start", "--auto-spawn"],
-                    stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
-                    start_new_session=True,
-                )
-            print(f"service auto-started (log: {log_path})")
+        if not _autostart_watcher(args):
+            return 1
     return 0
 
 
@@ -5398,25 +5432,8 @@ def cmd_config(args: argparse.Namespace) -> int:
                 rc = _service_activate()
                 if rc == 0:
                     print(f"{_service_kind()} activated (survives reboots)")
-            daemon_live = False
-            if DAEMON_PID_FILE.exists():
-                try:
-                    pid = int(DAEMON_PID_FILE.read_text().strip())
-                    os.kill(pid, 0)
-                    daemon_live = True
-                except (ValueError, ProcessLookupError, OSError):
-                    pass
-            if not daemon_live:
-                import subprocess
-                log_path = Path.home() / ".watchtower" / "watcher.log"
-                log_path.parent.mkdir(parents=True, exist_ok=True)
-                with open(log_path, "a") as log_f:
-                    subprocess.Popen(
-                        [sys.executable, "-m", "watchtower.cli", "start", "--auto-spawn"],
-                        stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
-                        start_new_session=True,
-                    )
-                print(f"service auto-started (log: {log_path})")
+            if not _autostart_watcher(args):
+                return 1
     # Set-type flags (all optional).
     if getattr(args, "backend", None) is not None:
         try:
@@ -8269,6 +8286,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("queue", metavar="QUEUE", help="queue name (e.g. CCC, WT)")
     s.add_argument("--type", action="append", default=None, choices=["bug", "feature"],
                    help="restrict auto-drain workers to these ticket types (repeatable); omit to clear")
+    s.add_argument("--no-autostart", action="store_true", dest="no_autostart",
+                   help="do not start a detached watcher (also WT_NO_AUTOSTART=1)")
+    s.add_argument("--host", default=None,
+                   help="bind host for an autostarted watcher")
+    s.add_argument("--port", type=int, default=None,
+                   help="bind port for an autostarted watcher")
     s.set_defaults(func=cmd_drain)
 
     s = sub.add_parser(
@@ -8312,6 +8335,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--auto-drain", default=None, choices=["on", "off"],
                    dest="auto_drain",
                    help="on = auto-spawn workers; off = backlog mode")
+    s.add_argument("--no-autostart", action="store_true", dest="no_autostart",
+                   help="do not start a detached watcher (also WT_NO_AUTOSTART=1)")
+    s.add_argument("--host", default=None,
+                   help="bind host for an autostarted watcher")
+    s.add_argument("--port", type=int, default=None,
+                   help="bind port for an autostarted watcher")
     s.add_argument("--workers", default=None, type=int,
                    help="number of concurrent workers the reconciler should maintain")
     s.add_argument("--workers-local-path", "--repo-path", default=None, dest="workers_local_path",
