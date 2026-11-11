@@ -179,7 +179,7 @@ def _codex_spawn_home(engine: str, session_id: str = "") -> str:
 
 def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "",
                ref: str = "", queue: str = "", role: str = "",
-               codex_home: str = "") -> Dict[str, str]:
+               codex_home: str = "", engine: str = "") -> Dict[str, str]:
     """Environment for a spawned worker subprocess.
 
     The child inherits the parent's environment so legitimate overrides
@@ -214,6 +214,11 @@ def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "
     for key in ("CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "WT_MESSAGE_ENVELOPE"):
         env.pop(key, None)
     env["WT_WORKER_COMMIT"] = "1"
+    # WT-61: a sandboxed codex worker gets an isolated store, never the real one.
+    if engine == "codex" and queue:
+        from . import config as _cfg
+        if _cfg.codex_sandbox(queue) == "workspace-write":
+            env.update(codex_sandbox_env(queue))
     # Which Codex account (subscription) the worker runs on: its CLI home.
     if codex_home:
         env["CODEX_HOME"] = codex_home
@@ -257,6 +262,51 @@ def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "
 # Codex's user execpolicy is the scoped fix: an allow rule for `wt`
 # auto-approves exactly those commands in every turn, full-auto or not.
 _CODEX_EXECPOLICY_RULE = 'prefix_rule(pattern=["wt"], decision="allow")'
+
+
+class CodexSandboxError(RuntimeError):
+    """The queue's Codex sandbox policy cannot be applied; the spawn must fail
+    closed rather than fall back to danger-full-access."""
+
+
+def codex_sandbox_env(queue: str) -> Dict[str, str]:
+    from . import config as _cfg
+    store = _cfg.codex_sandbox_store(queue)
+    return {
+        "WATCHTOWER_STORE": str(store / "queue.db"),
+        "WATCHTOWER_ACTIVITY_LOG": str(store / "activity.log"),
+        "WATCHTOWER_OUTBOX_FILE": str(store / "outbox.json"),
+        "WATCHTOWER_AGENTS_FILE": str(store / "agents.json"),
+        "WATCHTOWER_DELIVERIES_FILE": str(store / "deliveries.json"),
+    }
+
+
+def codex_sandbox_args(queue: str, repo_path: str) -> List[str]:
+    """Codex CLI args for the ``workspace-write`` policy: no tool network, and
+    only ``repo_path`` and the isolated store writable (TMPDIR and /tmp are
+    excluded). Raises CodexSandboxError when the policy cannot be satisfied."""
+    from . import config as _cfg
+    if not repo_path or not Path(repo_path).is_dir():
+        raise CodexSandboxError(
+            f"codex sandbox for {queue}: workspace {repo_path!r} is not a directory")
+    store = _cfg.codex_sandbox_store(queue)
+    try:
+        store.mkdir(parents=True, exist_ok=True)
+        probe = store / ".write-probe"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as e:
+        raise CodexSandboxError(
+            f"codex sandbox for {queue}: isolated store {store} is not writable: {e}")
+    roots = json.dumps([str(Path(repo_path).resolve()), str(store.resolve())])
+    return [
+        "--sandbox", "workspace-write",
+        "-c", "sandbox_workspace_write.network_access=false",
+        "-c", f"sandbox_workspace_write.writable_roots={roots}",
+        "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+        "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+        "-c", 'approval_policy="never"',
+    ]
 
 
 def ensure_codex_wt_execpolicy(codex_home: Optional[Path] = None) -> bool:
@@ -5364,14 +5414,18 @@ def build_drain_command(
         worker_home = config.codex_worker_home()
         if worker_home is not None:
             ensure_codex_wt_execpolicy(worker_home)
-        argv = [
-            bin_name,
-            "exec",
-            # Match CCC's trusted worker mode. Some Linux hosts cannot run
-            # Codex's default sandbox in a way that still lets workers reach
-            # local queue tooling, so daemon-spawned queue workers bypass it.
-            "--dangerously-bypass-approvals-and-sandbox",
-        ]
+        if config.codex_sandbox(queue) == "workspace-write":
+            # WT-61: restricted policy; fails closed (CodexSandboxError).
+            argv = [bin_name, "exec", *codex_sandbox_args(queue, repo_path)]
+        else:
+            argv = [
+                bin_name,
+                "exec",
+                # Match CCC's trusted worker mode. Some Linux hosts cannot run
+                # Codex's default sandbox in a way that still lets workers reach
+                # local queue tooling, so daemon-spawned queue workers bypass it.
+                "--dangerously-bypass-approvals-and-sandbox",
+            ]
         if model:
             argv += ["--model", model]
         if effort:
@@ -8012,9 +8066,24 @@ def spawn_workers(
             queue, worker_id, repo_path, engine=engine,
             extra_instructions=extra_instructions,
         )
-        argv = build_drain_command(
-            queue, engine, worker_id, repo_path, model, goal=goal, effort=effort,
-        )
+        try:
+            argv = build_drain_command(
+                queue, engine, worker_id, repo_path, model, goal=goal, effort=effort,
+            )
+        except CodexSandboxError as e:
+            # WT-61: fail closed -- never fall back to danger-full-access.
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"{worker_id}.log"
+            with open(log_path, "ab") as logf:
+                logf.write(f"LAUNCH FAILED: sandbox policy: {e}\n".encode("utf-8"))
+            failure = _record_launch_failure(
+                queue=queue, engine=engine, worker_id=worker_id, pid=0,
+                log_path=log_path, reason=f"sandbox policy: {e}", model=model,
+            )
+            failure["_spawn_index"] = spawn_index
+            if launch_failures is not None:
+                launch_failures.append(failure)
+            continue
         logical_bin = _ENGINE_BIN.get(engine, engine)
         if argv and argv[0] == logical_bin:
             resolved_bin = _resolve_engine_bin(engine)
@@ -8082,7 +8151,8 @@ def spawn_workers(
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
                 cwd=repo_path,
-                env=_spawn_env(worker_id, role="worker", codex_home=worker_codex_home),
+                env=_spawn_env(worker_id, role="worker", codex_home=worker_codex_home,
+                               queue=queue, engine=engine),
             )
         except OSError as e:
             popen_error = e
@@ -8212,7 +8282,8 @@ def spawn_run_once_worker(
             stderr=subprocess.STDOUT,
             start_new_session=True,
             cwd=repo_path,
-            env=_spawn_env(worker_id, role="worker", codex_home=worker_codex_home),
+            env=_spawn_env(worker_id, role="worker", codex_home=worker_codex_home,
+                               queue=queue, engine=engine),
         )
     finally:
         logf.close()
@@ -8307,7 +8378,9 @@ def codex_app_worker_command(
 
     Same model/effort/compact settings: ``--model`` and every ``-c``/``--config``
     override carry over; the exec-only sandbox bypass becomes the thread's
-    ``danger-full-access`` sandbox + ``never`` approvals inside the worker."""
+    ``danger-full-access`` sandbox + ``never`` approvals inside the worker. A
+    ``--sandbox MODE`` (WT-61 workspace-write policy) carries over as the
+    thread's sandbox instead."""
     resolved = _resolve_engine_bin("codex") or exec_argv[0]
     # -c with an explicit sys.path entry: the worker's cwd is the queue repo,
     # and `-m` would import a `watchtower` package found there instead.
@@ -8322,8 +8395,8 @@ def codex_app_worker_command(
     i = 0
     while i < len(rest):
         flag = rest[i]
-        if flag in ("--model", "-c", "--config") and i + 1 < len(rest):
-            argv += ["--model" if flag == "--model" else "-c", rest[i + 1]]
+        if flag in ("--model", "-c", "--config", "--sandbox") and i + 1 < len(rest):
+            argv += ["-c" if flag == "--config" else flag, rest[i + 1]]
             i += 2
             continue
         i += 1

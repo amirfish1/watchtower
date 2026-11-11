@@ -5671,6 +5671,10 @@ def cmd_config(args: argparse.Namespace) -> int:
     if getattr(args, "effort", None) is not None:
         config.set_effort(args.queue, args.effort)
         changed.append(f"effort={args.effort or '(engine default)'}")
+    if getattr(args, "codex_sandbox", None) is not None:
+        config.set_codex_sandbox(args.queue, args.codex_sandbox,
+                                 getattr(args, "codex_sandbox_store", "") or "")
+        changed.append(f"codex_sandbox={config.codex_sandbox(args.queue)} (next spawn)")
     if getattr(args, "codex_transport", None) is not None:
         config.set_codex_transport(args.queue, args.codex_transport)
         changed.append(f"codex_transport={config.codex_transport(args.queue)} (next spawn)")
@@ -8485,6 +8489,13 @@ def build_parser() -> argparse.ArgumentParser:
                        "reasoning effort for queue workers; omit for the engine "
                        "default. Empty string clears an override, like --model."
                    ))
+    s.add_argument("--codex-sandbox", default=None, dest="codex_sandbox",
+                   choices=["workspace-write", "full-access", ""],
+                   help=("codex worker sandbox: full-access (default) or "
+                         "workspace-write (no tool network; only the workspace and an "
+                         "isolated WatchTower store writable). Empty string clears."))
+    s.add_argument("--codex-sandbox-store", default="", dest="codex_sandbox_store",
+                   help="isolated store dir for --codex-sandbox workspace-write")
     s.add_argument("--codex-transport", default=None, dest="codex_transport",
                    choices=["exec", "app-server", ""],
                    help=(

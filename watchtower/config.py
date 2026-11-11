@@ -1515,6 +1515,46 @@ def set_codex_transport(queue: str, value: str) -> Dict[str, Any]:
 DEFAULT_CODEX_TRANSPORT = "app-server"
 
 
+CODEX_SANDBOXES = ("workspace-write", "full-access")
+DEFAULT_CODEX_SANDBOX = "full-access"
+
+
+def set_codex_sandbox(queue: str, value: str, store: str = "") -> Dict[str, Any]:
+    """Pin the Codex worker sandbox policy for ``queue`` (WT-61).
+
+    "full-access" (the default; "" clears the pin) keeps the trusted
+    ``danger-full-access`` launch. "workspace-write" runs workers with no tool
+    network access and only the assigned workspace plus an isolated WatchTower
+    store directory writable. ``store`` overrides that directory."""
+    mode = str(value or "").strip().lower()
+    if mode and mode not in CODEX_SANDBOXES:
+        raise ValueError(f"codex sandbox must be one of {CODEX_SANDBOXES}")
+    data = _load()
+    q = data.setdefault(queue, {})
+    if mode and mode != DEFAULT_CODEX_SANDBOX:
+        q["codex_sandbox"] = mode
+    else:
+        q.pop("codex_sandbox", None)
+        q.pop("codex_sandbox_store", None)
+    if store and mode == "workspace-write":
+        q["codex_sandbox_store"] = str(store)
+    _save(data)
+    return q
+
+
+def codex_sandbox(queue: str) -> str:
+    value = str(_queue_entry(queue).get("codex_sandbox") or "").strip().lower()
+    return value if value in CODEX_SANDBOXES else DEFAULT_CODEX_SANDBOX
+
+
+def codex_sandbox_store(queue: str) -> Path:
+    """Isolated, writable WatchTower store dir for sandboxed workers on ``queue``."""
+    explicit = str(_queue_entry(queue).get("codex_sandbox_store") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path.home() / ".watchtower" / "sandbox" / re.sub(r"[^A-Za-z0-9._-]", "_", queue)
+
+
 def codex_transport(queue: str) -> str:
     value = str(_queue_entry(queue).get("codex_transport") or "").strip().lower()
     return value if value in CODEX_TRANSPORTS else DEFAULT_CODEX_TRANSPORT

@@ -346,6 +346,10 @@ def run(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--cwd", default=os.getcwd())
     p.add_argument("--worker-id", default="")
     p.add_argument("--model", default="")
+    p.add_argument("--sandbox", default="danger-full-access",
+                   choices=["danger-full-access", "workspace-write", "read-only"],
+                   help="thread sandbox mode (workspace-write also needs the -c "
+                        "sandbox_workspace_write.* overrides for roots/network)")
     p.add_argument("-c", "--config", action="append", default=[],
                    help="codex config override passed to the app-server (repeatable)")
     p.add_argument("goal")
@@ -397,7 +401,7 @@ def run(argv: Optional[List[str]] = None) -> int:
                 return 1
             time.sleep(0.1)
         client = _Client(sock, on_note=on_note)
-        params: Dict[str, Any] = {"cwd": args.cwd, "approvalPolicy": "never", "sandbox": "danger-full-access"}
+        params: Dict[str, Any] = {"cwd": args.cwd, "approvalPolicy": "never", "sandbox": args.sandbox}
         if args.model:
             params["model"] = args.model
         started = client.call("thread/start", params)
