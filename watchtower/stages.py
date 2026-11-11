@@ -119,15 +119,84 @@ def daemon_supervises_stages() -> bool:
         return True
 
 
-def daemon_running() -> bool:
-    """Whether a ``wt start`` daemon's pidfile names a live process."""
-    path = _daemon_pid_path()
+def proc_start_token(pid: int) -> str:
+    """Opaque start-time identity of ``pid`` ('' when unreadable).
+
+    /proc starttime (jiffies since boot) when available, else ``ps -o lstart``.
+    A PID reused by a different process, e.g. after a container restart gives
+    the new watcher the old daemon's PID, has a different token (WT-62)."""
     try:
-        pid = int(open(path).read().strip())
+        with open(f"/proc/{int(pid)}/stat") as f:
+            return "proc:" + f.read().rpartition(")")[2].split()[19]
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        import subprocess
+        env = dict(os.environ, LC_ALL="C", TZ="UTC")
+        out = subprocess.check_output(["ps", "-p", str(int(pid)), "-o", "lstart="],
+                                      env=env, text=True, timeout=2)
+        return "ps:" + " ".join(out.split())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _token_path(pidfile) -> str:
+    return str(pidfile) + ".start"
+
+
+def write_pid_record(pidfile, pid: int) -> None:
+    """Write ``pidfile`` (a bare int, which other readers parse) plus a sibling
+    ``<pidfile>.start`` identity token."""
+    pidfile = str(pidfile)
+    with open(pidfile, "w") as f:
+        f.write(str(pid))
+    token = proc_start_token(pid)
+    try:
+        if token:
+            with open(_token_path(pidfile), "w") as f:
+                f.write(token)
+        else:
+            os.unlink(_token_path(pidfile))
+    except OSError:
+        pass
+
+
+def clear_pid_record(pidfile) -> None:
+    for p in (str(pidfile), _token_path(pidfile)):
+        try:
+            os.unlink(p)
+        except OSError:
+            pass
+
+
+def live_pid_from_record(pidfile, *, exclude_self: bool = True) -> int:
+    """PID named by ``pidfile`` if it is the SAME live process that wrote it,
+    else 0. Rejects our own PID (a reused PID after a container restart can
+    equal the current process) and a PID whose start token no longer matches.
+    A record with no token (older daemon) is judged by liveness alone."""
+    try:
+        pid = int(open(str(pidfile)).read().strip())
         os.kill(pid, 0)
-        return True
+    except PermissionError:
+        pass
     except (OSError, ValueError):
-        return False
+        return 0
+    if exclude_self and pid == os.getpid():
+        return 0
+    try:
+        recorded = open(_token_path(pidfile)).read().strip()
+    except OSError:
+        recorded = ""
+    if recorded:
+        now = proc_start_token(pid)
+        if now and now != recorded:
+            return 0
+    return pid
+
+
+def daemon_running() -> bool:
+    """Whether a ``wt start`` daemon's pidfile names the live daemon process."""
+    return bool(live_pid_from_record(_daemon_pid_path(), exclude_self=False))
 
 
 def _touch_wake(ref: str, why: str) -> None:

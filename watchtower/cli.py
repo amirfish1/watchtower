@@ -95,13 +95,11 @@ def _svc_state(pid_file: Path) -> str:
     """Return 'running (pid N)' or 'stopped' based on the pidfile."""
     if not pid_file.exists():
         return "stopped"
-    try:
-        pid = int(pid_file.read_text().strip())
-        os.kill(pid, 0)
+    pid = stages.live_pid_from_record(pid_file, exclude_self=False)
+    if pid:
         return f"running  (pid {pid})"
-    except (ValueError, ProcessLookupError, OSError):
-        pid_file.unlink(missing_ok=True)
-        return "stopped  (stale pidfile removed)"
+    stages.clear_pid_record(pid_file)
+    return "stopped  (stale pidfile removed)"
 
 
 def _print_status(rows: List[dict]) -> None:
@@ -5377,12 +5375,7 @@ def _warn_if_public_repo(queue: str, config) -> None:
 
 
 def _daemon_pid_live() -> bool:
-    try:
-        pid = int(DAEMON_PID_FILE.read_text().strip())
-        os.kill(pid, 0)
-        return True
-    except (OSError, ValueError):
-        return False
+    return bool(stages.live_pid_from_record(DAEMON_PID_FILE))
 
 
 def _autostart_watcher(args: argparse.Namespace, wait_s: float = 10.0) -> bool:
@@ -6242,17 +6235,17 @@ def cmd_start(args: argparse.Namespace) -> int:
             return 0
         print(f"warning: service manager exited {rc}; falling back to manual start")
     if not dry_run and DAEMON_PID_FILE.exists():
-        try:
-            pid = int(DAEMON_PID_FILE.read_text().strip())
-            os.kill(pid, 0)
+        # WT-62: a PID alone is not identity -- after a container restart the
+        # stale pidfile's PID can be this very process or another new one.
+        pid = stages.live_pid_from_record(DAEMON_PID_FILE)
+        if pid:
             print(f"watcher already running (pid {pid})")
             return 0
-        except (ValueError, ProcessLookupError, OSError):
-            pass  # stale pidfile
+        # stale pidfile: overwritten below when we become the daemon
     if args.foreground or dry_run:
         if not dry_run:
             DAEMON_PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-            DAEMON_PID_FILE.write_text(str(os.getpid()))
+            stages.write_pid_record(DAEMON_PID_FILE, os.getpid())
             # WT-7: let `stages.request` tell a spawn-less daemon (which never
             # supervises stage sessions, WT-24) from a supervising one.
             stages.supervisor_marker_path().write_text(
@@ -6269,7 +6262,7 @@ def cmd_start(args: argparse.Namespace) -> int:
                     _q._log("DAEMON_STOP", f"(pid {os.getpid()})")
                 except Exception:
                     pass
-                DAEMON_PID_FILE.unlink(missing_ok=True)
+                stages.clear_pid_record(DAEMON_PID_FILE)
                 stages.supervisor_marker_path().unlink(missing_ok=True)
         return 0
     # Re-exec ourselves in the background in foreground-mode. This is the only
@@ -6329,16 +6322,16 @@ def cmd_stop(args: argparse.Namespace) -> int:
                 pass
             # The supervisor-owned daemon owns the pidfile; clear it so a later
             # `wt start`/status doesn't see a stale pid.
-            DAEMON_PID_FILE.unlink(missing_ok=True)
+            stages.clear_pid_record(DAEMON_PID_FILE)
             return 0
         print(f"warning: service manager stop exited {rc}; falling back to signal")
     if not DAEMON_PID_FILE.exists():
         print("watcher not running")
         return 0
-    try:
-        pid = int(DAEMON_PID_FILE.read_text().strip())
-    except ValueError:
-        DAEMON_PID_FILE.unlink(missing_ok=True)
+    # WT-62: never SIGTERM a PID that merely matches a stale record.
+    pid = stages.live_pid_from_record(DAEMON_PID_FILE, exclude_self=False)
+    if not pid:
+        stages.clear_pid_record(DAEMON_PID_FILE)
         print("removed stale pidfile")
         return 0
     try:
@@ -6353,7 +6346,7 @@ def cmd_stop(args: argparse.Namespace) -> int:
     except ProcessLookupError:
         print("watcher process already gone")
     finally:
-        DAEMON_PID_FILE.unlink(missing_ok=True)
+        stages.clear_pid_record(DAEMON_PID_FILE)
     return 0
 
 
