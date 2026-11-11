@@ -66,6 +66,38 @@ def _pid_alive(pid: Any) -> bool:
     return True
 
 
+def _own_start_token() -> str:
+    try:
+        from .stages import proc_start_token
+        return proc_start_token(os.getpid())
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _record_alive(rec: Dict[str, Any]) -> bool:
+    """Is the worker this record describes still the same live process?
+
+    A bare ``kill(pid, 0)`` is fooled by PID reuse: after a container restart
+    the new PID namespace hands the record's small PIDs to unrelated processes
+    (WT-65). So also require the app-server to still be the process listening
+    on the record's socket (Linux, where /proc is readable), and the worker's
+    start token to match when the record carries one."""
+    if not _pid_alive(rec.get("pid")):
+        return False
+    token = str(rec.get("pid_started") or "")
+    if token:
+        from .stages import proc_start_token
+        now = proc_start_token(rec["pid"])
+        if now and now != token:
+            return False
+    sock, server_pid = str(rec.get("sock") or ""), rec.get("server_pid")
+    # /proc only on Linux; elsewhere the cmdline probe would read "dead".
+    if sock and server_pid and os.path.exists(f"/proc/{os.getpid()}/cmdline") \
+            and not _is_our_server(server_pid, sock):
+        return False
+    return True
+
+
 def _is_our_server(pid: Any, sock: str) -> bool:
     """True when ``pid`` is the app-server listening on ``sock``: the FULL
     ``--listen unix://<sock>`` argument must match (sock paths are unique per
@@ -116,7 +148,7 @@ def find_worker(thread_id: str) -> Optional[Dict[str, Any]]:
         return None
     if not isinstance(rec, dict):
         rec = {}
-    if not _pid_alive(rec.get("pid")) or not os.path.exists(str(rec.get("sock") or "")):
+    if not _record_alive(rec) or not os.path.exists(str(rec.get("sock") or "")):
         _retire(path, rec)
         return None
     return rec
@@ -136,7 +168,7 @@ def sweep_orphans() -> int:
             rec = json.loads(path.read_text())
         except (OSError, ValueError):
             continue
-        if isinstance(rec, dict) and not _pid_alive(rec.get("pid")):
+        if isinstance(rec, dict) and not _record_alive(rec):
             _retire(path, rec)
             retired += 1
     return retired
@@ -423,7 +455,7 @@ def run(argv: Optional[List[str]] = None) -> int:
         tmp.write_text(json.dumps({
             "thread_id": thread_id, "turn_id": state["turn_id"], "sock": sock, "pid": os.getpid(),
             "server_pid": server.pid, "worker_id": args.worker_id, "cwd": args.cwd,
-            "started_at": time.time(),
+            "started_at": time.time(), "pid_started": _own_start_token(),
         }))
         os.replace(tmp, record_path)
         while not done.wait(1.0):
