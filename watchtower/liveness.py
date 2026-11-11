@@ -711,6 +711,16 @@ RECENT_TRANSCRIPT_S = 120.0
 RECENT_SESSION_S = 600.0  # ambient claim: session files written this recently = working
 
 
+def _hosted_thread_live(sid: str) -> bool:
+    """A WT app-server worker is still serving ``sid`` (its record retires
+    itself when the worker pid is gone)."""
+    try:
+        from . import codex_app_worker
+        return codex_app_worker.find_worker(sid) is not None
+    except Exception:  # noqa: BLE001 - a failed probe is not proof of life
+        return False
+
+
 def _engine_checks(cp: Dict[str, Any], sid: str, died_at: float,
                    ctx: ResolverContext) -> str:
     """'' when the engine's death checks pass, else why death is unproven."""
@@ -718,7 +728,11 @@ def _engine_checks(cp: Dict[str, Any], sid: str, died_at: float,
     if engine == "claude":
         return "" if _registry_readable() else "claude session registry unreadable"
     if engine == "codex" and q._hosted_codex_thread_owns_worker(
-            str(cp.get("worker_id") or ""), sid):
+            str(cp.get("worker_id") or ""), sid) and _hosted_thread_live(sid):
+        # WT-64: the registry entry names the worker for good, so on its own
+        # it can never read dead (a SIGKILLed app-server worker stayed
+        # in_progress). It vetoes only while its thread shows life; a quiet
+        # one falls through to the transcript-age check below.
         return "hosted codex thread owns the worker"
     argv = ctx.ps()
     if argv is None:

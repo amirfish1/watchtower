@@ -219,8 +219,26 @@ def test_hosted_codex_thread_is_unproven(wt, procs, monkeypatch):
     wt.q.claim_by_ref(ref, "w1", session_uuid=SID)
     w.kill()
     monkeypatch.setattr(wt.q, "_hosted_codex_thread_owns_worker", lambda wid, sid: True)
+    monkeypatch.setattr(wt.liveness, "_hosted_thread_live", lambda sid: True)
     v = _owner(wt, ref)
     assert v.verdict == "unproven" and "hosted codex" in v.evidence
+
+
+def test_hosted_codex_registry_entry_alone_is_not_proof_of_life(wt, procs, monkeypatch):
+    """WT-64: a SIGKILLed app-server worker keeps its registry entry; with no
+    live app-server record and a quiet rollout the claim reads dead."""
+    w = procs("w1", SID, engine="codex")
+    ref = _file(wt)
+    wt.q.claim_by_ref(ref, "w1", session_uuid=SID)
+    w.kill()
+    lv = wt.liveness
+    monkeypatch.setattr(wt.q, "_hosted_codex_thread_owns_worker", lambda wid, sid: True)
+    monkeypatch.setattr(lv, "_hosted_thread_live", lambda sid: False)
+    monkeypatch.setattr(lv, "ps_argv", lambda: ["bash"])
+    monkeypatch.setattr(lv, "_transcript_mtime", lambda e, s: time.time() - 600)
+    assert _owner(wt, ref).verdict == "dead"
+    monkeypatch.setattr(lv, "_transcript_mtime", lambda e, s: time.time() - 10)
+    assert _owner(wt, ref).verdict == "unproven"
 
 
 def test_exit_file_names_the_death(wt, procs, tmp_path):
