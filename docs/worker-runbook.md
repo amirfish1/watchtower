@@ -192,7 +192,8 @@ without `--wait-on` resets the ticket to an owner wait.
 
 ## Minor blocks: proposing an auto-decision (CCC-370)
 
-If a block is a small, reversible code change in the ticket's own repo, you may
+**Check this every time you are about to `wt block`** (CCC-413: 18 blocks in 3 days
+carried no flags, so the gate never ran). If a block is a small, reversible code change in the ticket's own repo, you may
 propose that WatchTower approve it for you instead of making the owner read a card:
 
 ```

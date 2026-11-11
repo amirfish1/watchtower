@@ -423,6 +423,19 @@ ANNOUNCE_TICKET = (
 
 # Style contract for the mandatory close --summary, injected into both goal
 # templates. No braces: safe for the templates' .format() calls.
+MINOR_BLOCK_CONTRACT = (
+    "MINOR BLOCKS (CCC-413): if the decision you are blocking on is a small, "
+    "revertable code change you already committed in this ticket's own repo, "
+    "do not make the owner read a card: add the auto-decision flags to the "
+    "same `wt block`: `--commit <SHA> --class code-change-revertable --weight "
+    "minor --confidence 0.9 --recommend \"the exact choice\" --undo \"git "
+    "revert <SHA>\" --attest money=no,customer-sends=no,public-posts=no,"
+    "ad-spend=no,irreversible=no` (details: worker-runbook 'Minor blocks'). "
+    "WatchTower decides, and any miss is an ordinary owner card. Preference, "
+    "policy, money, customer, production or irreversible decisions get no "
+    "flags (or `--weight major --major-because <reason> --major-detail "
+    "\"<concrete sentence>\"`). "
+)
 SUMMARY_STYLE = (
     "SUMMARY STYLE: the --summary is read by a busy human skimming the "
     "dashboard or a GitHub comment -- format it for a 5-second skim: one "
@@ -568,6 +581,7 @@ DRAIN_GOAL_TEMPLATE = (
     "close it and do NOT guess: run `wt block <ref> --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
     "figured out so far\"`, then move on to the next ticket. "
+    + MINOR_BLOCK_CONTRACT +
     "LEARNINGS: after each `wt close` or `wt block`, append at most one "
     "dated line to ~/.watchtower/learnings/{queue}.pending.md -- only if "
     "the turn produced a genuinely new hard-won fact (append-only, never "
@@ -615,6 +629,7 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "close it and do NOT guess: run `wt block {ref} --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
     "figured out so far\"`. "
+    + MINOR_BLOCK_CONTRACT +
     "Either way -- closed or blocked -- STOP once this one ticket is "
     "resolved. Do NOT claim another ticket, do NOT poll, do NOT wait for new "
     "work. End your turn. "
