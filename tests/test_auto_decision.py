@@ -451,3 +451,17 @@ def test_own_spend_queue_may_only_lower_the_ceiling(oenv):
     assert autodecide.queue_policy("T")["own_spend_max_usd"] == 2
     ref, _ = _own(oenv, spend_cap_usd="5")
     assert "above this queue's $2 limit" in oenv.queue.get(ref)["block_question"]
+
+
+def test_repeated_attest_flags_accumulate_and_conflicts_error():
+    """WT-66: repeated --attest used to keep only the last one."""
+    import pytest
+    from watchtower import cli
+    ns = cli.build_parser().parse_args(
+        ["block", "WT-1", "--attest", "money=no", "--attest", "customer-sends=no,ad-spend=no",
+         "--attest", "money=no"])
+    assert autodecide.parse_attest(ns.attest) == {
+        "money": "no", "customer-sends": "no", "ad-spend": "no"}
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            ["block", "WT-1", "--attest", "money=no", "--attest", "money=yes"])

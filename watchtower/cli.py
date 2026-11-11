@@ -3129,6 +3129,24 @@ def cmd_reopen(args: argparse.Namespace) -> int:
     return 0
 
 
+class _AccumulateAttest(argparse.Action):
+    """``--attest`` may repeat (or carry commas): the checks accumulate. The same
+    key given two different values is an error, never a silent last-wins (WT-66)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        seen: Dict[str, str] = {}
+        for chunk in (getattr(namespace, self.dest, "") or "", values or ""):
+            for part in str(chunk).split(","):
+                if "=" not in part:
+                    continue
+                k, v = (x.strip().lower() for x in part.split("=", 1))
+                if k in seen and seen[k] != v:
+                    parser.error(f"--attest {k} given twice with different values "
+                                 f"({seen[k]!r} vs {v!r})")
+                seen[k] = v
+        setattr(namespace, self.dest, ",".join(f"{k}={v}" for k, v in seen.items()))
+
+
 def _auto_decide_after_block(item: Dict[str, Any], args: argparse.Namespace) -> str:
     """CCC-370: run the auto-approval gate on a just-parked worker block.
 
@@ -7897,8 +7915,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--confidence", type=float, default=None, help="auto-decision: 0..1")
     s.add_argument("--recommend", default="", help="auto-decision: the exact choice you recommend")
     s.add_argument("--undo", default="", help="auto-decision: exact undo, e.g. 'git revert <sha>'")
-    s.add_argument("--attest", default="",
-                   help="auto-decision: money=no,customer-sends=no,public-posts=no,ad-spend=no,irreversible=no (capped-own-spend: money=own-capped,customer-money=no,...)")
+    s.add_argument("--attest", default="", action=_AccumulateAttest,
+                   help="auto-decision (repeatable; repeats accumulate): money=no,customer-sends=no,public-posts=no,ad-spend=no,irreversible=no (capped-own-spend: money=own-capped,customer-money=no,...)")
     s.add_argument("--replay-cap-requests", dest="replay_cap_requests", type=int, default=None,
                    help="capped-replay-spend: hard maximum number of model requests the replay may make")
     s.add_argument("--replay-cap-usd", dest="replay_cap_usd", type=float, default=None,
