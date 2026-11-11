@@ -203,3 +203,28 @@ def test_git_refusal_is_surfaced_not_silently_treated_as_miss(
     # The public verify() helper preserves its old contract for callers that
     # do not want to handle error text.
     assert close_proof.verify("abc1234", str(repo)) == ("", "")
+
+
+@pytest.mark.parametrize("flag,expected_calls", [("1", 0), ("0", 1), ("", 1)])
+def test_close_commit_deploy_sync_honours_wt_no_self_update(
+    wt_env, repo_with_commit, monkeypatch, flag, expected_calls
+):
+    """WT-63: WT_NO_SELF_UPDATE must also cover the close --commit housekeeping."""
+    from watchtower import deploy
+
+    repo, sha = repo_with_commit("r")
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("WT_ROLE", raising=False)
+    monkeypatch.delenv("WT_WORKER_ID", raising=False)
+    monkeypatch.setenv("WT_NO_SELF_UPDATE", flag)
+    calls = []
+    monkeypatch.setattr(
+        deploy, "sync", lambda: calls.append(1) or {"action": "up-to-date"}
+    )
+    it = wt_env.queue.enqueue(project="T", note="n", source="wt")
+    wt_env.queue.claim_by_ref(it["ref"], "w1")
+    rc = wt_env.cli.main(
+        ["close", it["ref"], "--worker", "w1", "--summary", "s", "--commit", sha]
+    )
+    assert rc == 0
+    assert len(calls) == expected_calls

@@ -2515,6 +2515,14 @@ def cmd_duplicate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _self_update_suppressed() -> bool:
+    """True when WT_NO_SELF_UPDATE opts this process out of every installed-
+    checkout housekeeping path (daemon pull, deploy sync, close --commit sync).
+    Unset, empty, 0/false/no/off keep updates on (WT-63)."""
+    v = os.environ.get("WT_NO_SELF_UPDATE", "").strip().lower()
+    return v not in ("", "0", "false", "no", "off")
+
+
 def cmd_close(args: argparse.Namespace) -> int:
     if getattr(args, "duplicate_of", ""):
         if args.commit or not args.no_code:
@@ -2610,7 +2618,7 @@ def cmd_close(args: argparse.Namespace) -> int:
 
     _rename_claiming_session(item, summary)
     _maybe_assess(item)
-    if args.commit:
+    if args.commit and not _self_update_suppressed():
         # WT-16: a landed fix reaches the installed tree right away instead of
         # waiting for the daemon's next sync tick. Best-effort; a dirty tree
         # or an unpushed commit just leaves it for the daemon.
@@ -5908,7 +5916,7 @@ def _maybe_self_update() -> None:
     Set WT_NO_SELF_UPDATE=1 to opt out (e.g. dev checkouts with uncommitted
     work you don't want pulled over).
     """
-    if os.environ.get("WT_NO_SELF_UPDATE"):
+    if _self_update_suppressed():
         return
     try:
         pkg_dir = Path(__file__).resolve().parent
@@ -6167,7 +6175,8 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
             _maybe_self_update()
         # Deploy-only installed tree (WT-16): pick up landed commits within
         # ~30s; a clean fast-forward re-execs so the new code is what runs.
-        if time.time() - last_deploy_sync >= _DEPLOY_SYNC_INTERVAL_S:
+        if (time.time() - last_deploy_sync >= _DEPLOY_SYNC_INTERVAL_S
+                and not _self_update_suppressed()):
             last_deploy_sync = time.time()
             try:
                 from . import deploy
