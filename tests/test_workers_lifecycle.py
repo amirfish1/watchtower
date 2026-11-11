@@ -2369,6 +2369,28 @@ def test_reap_released_workers_lists_park_owners_once_per_pass(wt, monkeypatch):
                 pass
 
 
+def test_reaper_queue_reads_leave_worker_lock_available(wt, monkeypatch):
+    """OPS-436: queue readers must not invert defer's queue -> worker order."""
+    import fcntl
+
+    rec, proc = _released_worker(wt, "Q", released_age_s=7200)
+    discover = wt.workers._fresh_park_owners
+
+    def discover_without_worker_lock(now):
+        with open(wt.workers.WORKERS_FILE.with_suffix(".lock"), "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        return discover(now)
+
+    monkeypatch.setattr(wt.workers, "_fresh_park_owners", discover_without_worker_lock)
+    try:
+        actions = wt.workers.reap_released_workers(ttl_s=3600)
+        assert [action["worker_id"] for action in actions] == [rec["worker_id"]]
+    finally:
+        proc.terminate()
+        proc.wait()
+
+
 def test_reap_released_workers_ignores_worker_released_gate(wt):
     """The GC pass must collect a released worker that every OTHER staffing
     path (live_worker_count, notify_workers, ...) correctly hides via

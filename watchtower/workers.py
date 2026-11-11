@@ -3147,11 +3147,25 @@ def reap_released_workers(
     now = clock()
     actions: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
-    # Computed once per pass, on first need: each call lists every ticket in
-    # every queue (GitHub-backed ones parse each issue body), and calling it
-    # per released row under the workers lock pegged the daemon at 100% CPU
-    # and starved every reader of that lock (95 rows, 2026-10-05).
-    fresh_owners: Optional[set] = None
+    # Queue mutations take queue -> workers. Never scan queues while holding
+    # workers.lock: a concurrent defer can otherwise deadlock both stores.
+    # Avoid the all-queue scan when no release evidence exists. Atomic roster
+    # replacement makes this unlocked snapshot safe; re-read before signalling.
+    has_releases = False
+    for row in _load()["workers"]:
+        if row.get("gc_skipped"):
+            continue
+        if row.get("released_at"):
+            has_releases = True
+            break
+        if row.get("worker_id"):
+            try:
+                has_releases = (STOP_SIGNALS_DIR / row["worker_id"]).is_file()
+            except OSError:
+                continue
+            if has_releases:
+                break
+    fresh_owners = _fresh_park_owners(now) if has_releases else None
     # (worker_id, pid) -> kill stamp. record_worker can leave two rows for one
     # worker; without this the pid is signalled and GC_RELEASED logged twice.
     reaped: Dict[tuple, str] = {}
@@ -3181,7 +3195,7 @@ def reap_released_workers(
             if age_s < ttl_s:
                 continue
             if fresh_owners is None:
-                fresh_owners = _fresh_park_owners(now)
+                continue  # released after the snapshot; inspect on the next pass
             if worker_id in fresh_owners:
                 continue  # WT-28: owns a park younger than the grace
             pid = int(row.get("pid", 0) or 0)
