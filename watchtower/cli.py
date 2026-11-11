@@ -516,18 +516,108 @@ def cmd_queue_ls(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ls_parse_when(value: str, *, now: Optional[float] = None) -> float:
+    """Parse an ISO-8601 timestamp or a relative age (``7d``, ``12h``, ``30m``)."""
+    import re as _re
+    import time as _time
+    from datetime import datetime, timezone
+    text = (value or "").strip()
+    m = _re.fullmatch(r"(\d+(?:\.\d+)?)([smhdw])", text)
+    if m:
+        unit = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[m.group(2)]
+        return (now if now is not None else _time.time()) - float(m.group(1)) * unit
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"bad time {value!r}: use ISO-8601 (2026-11-04T00:00:00Z) or 7d/12h/30m")
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _ls_ts(value: Any) -> Optional[float]:
+    from datetime import datetime, timezone
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _ls_window_select(items: List[Dict[str, Any]], args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], bool]:
+    """Union of the window selectors (closed-since, event window, --ref).
+
+    Returns (selected items sorted by seq, windowed). Selected items that matched
+    on history events carry ``window_events`` (only the in-window events).
+    """
+    closed_since = getattr(args, "closed_since", None)
+    closed_until = getattr(args, "closed_until", None)
+    events = set(getattr(args, "event", None) or [])
+    ev_since = getattr(args, "event_since", None)
+    ev_until = getattr(args, "event_until", None)
+    refs = {r.upper() for r in (getattr(args, "ref", None) or [])}
+    updated_since = getattr(args, "updated_since", None)
+    if not (closed_since or closed_until or events or ev_since or ev_until or refs or updated_since):
+        return items, False
+    if (ev_since or ev_until) and not events:
+        raise ValueError("--event-since/--event-until need at least one --event NAME")
+    lo = _ls_parse_when(closed_since) if closed_since else None
+    hi = _ls_parse_when(closed_until) if closed_until else None
+    elo = _ls_parse_when(ev_since) if ev_since else None
+    ehi = _ls_parse_when(ev_until) if ev_until else None
+    ulo = _ls_parse_when(updated_since) if updated_since else None
+    out = []
+    for it in items:
+        hit = False
+        if str(it.get("ref", "")).upper() in refs:
+            hit = True
+        if (lo is not None or hi is not None) and it.get("status") == "closed":
+            t = _ls_ts(it.get("closed_at"))
+            if t is not None and (lo is None or t >= lo) and (hi is None or t < hi):
+                hit = True
+        if ulo is not None:
+            t = _ls_ts(it.get("updated_at"))
+            if t is not None and t >= ulo:
+                hit = True
+        if events:
+            matched = []
+            for e in it.get("history") or []:
+                if e.get("event") not in events:
+                    continue
+                t = _ls_ts(e.get("at"))
+                if t is None:
+                    continue
+                if (elo is None or t >= elo) and (ehi is None or t < ehi):
+                    matched.append(e)
+            if matched:
+                hit = True
+                it = dict(it, window_events=matched)
+        if hit:
+            out.append(it)
+    out.sort(key=lambda i: (i.get("seq") or 0, str(i.get("ref", ""))))
+    return out, True
+
+
 def cmd_ls(args: argparse.Namespace) -> int:
     """List the tickets in a single queue (the actual items, not just counts)."""
     # fresh=True for the same reason as `wt status`: a CLI read always
     # revalidates, so `wt ls` is never behind the repo.
     items = q.list_items(project=args.queue, fresh=True)
     all_items = items
+    try:
+        items, windowed = _ls_window_select(items, args)
+    except ValueError as e:
+        print(f"wt ls: {e}", file=sys.stderr)
+        return 2
+    offset = max(0, getattr(args, "offset", 0) or 0)
     # Counted over the WHOLE queue, before the status filter, so the default
     # (active) view still surfaces that closed-but-unresolved work exists.
-    unresolved_total = len(_unresolved_items(items))
-    want = args.status
-    if getattr(args, "unresolved", False):
-        want = "unresolved"
+    unresolved_total = len(_unresolved_items(all_items))
+    want = args.status or ("all" if windowed else "active")
     if want == "active":
         items = [i for i in items if i.get("status") in ("open", "in_progress", "in_review", "awaiting_answer")]
     elif want == "blocked":
@@ -536,12 +626,22 @@ def cmd_ls(args: argparse.Namespace) -> int:
         items = _unresolved_items(items)
     elif want != "all":
         items = [i for i in items if i.get("status") == want]
-    limit = args.limit or len(items)
+    total = len(items)
+    limit = args.limit or max(total - offset, 0)
     if args.json:
         # Blockers may live in other queues, so resolve against every queue.
         by_ref = q._refs_index(q.list_items(fresh=True) + all_items)
-        rows = [dict(i, waiting_on=q.waiting_on(i, by_ref)) for i in items[:limit]]
-        print(json.dumps(rows, indent=2))
+        page = items[offset:offset + limit]
+        rows = [dict(i, waiting_on=q.waiting_on(i, by_ref)) for i in page]
+        if windowed or offset:
+            end_at = offset + len(page)
+            print(json.dumps({
+                "items": rows, "total": total, "offset": offset, "limit": limit,
+                "returned": len(rows), "complete": end_at >= total,
+                "next_offset": end_at if end_at < total else None,
+            }, indent=2))
+        else:
+            print(json.dumps(rows, indent=2))
         return 0
     if not items:
         print(f"(no {('' if want=='all' else want+' ')}items in {args.queue})")
@@ -553,7 +653,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
     print(f"{'REF':<14}{'STATUS':<12}{'WORKER':<22}TITLE")
     print("-" * 72)
     by_ref = q._refs_index(all_items)
-    for it in items[:limit]:
+    for it in items[offset:offset + limit]:
         machine = it.get("claimed_machine") or it.get("closed_machine") or ""
         worker = q.with_machine(
             it.get("claimed_by") or it.get("claimed_session_id"), machine
@@ -592,8 +692,9 @@ def cmd_ls(args: argparse.Namespace) -> int:
             if extras:
                 line += f" [{', '.join(extras)}]"
         print(line)
-    if len(items) > limit:
-        print(f"... and {len(items) - limit} more (raise --limit)")
+    if len(items) > offset + limit:
+        print(f"... and {len(items) - offset - limit} more "
+              f"(raise --limit or use --offset {offset + limit})")
     return 0
 
 
@@ -7217,15 +7318,33 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-q", "--queue", required=True)
     s.add_argument(
         "--status",
-        default="active",
+        default=None,
         choices=["active", "open", "in_progress", "in_review", "awaiting_answer",
                  "blocked", "closed", "unresolved", "all"],
-        help="which tickets to show (default: active = open + in_progress + in_review + "
+        help="which tickets to show (default: active, or all when a window "
+             "selector is given; active = open + in_progress + in_review + "
              "awaiting_answer; "
              "blocked = parked for human input; unresolved = closed with "
              "unresolved items flagged in the resolution)",
     )
     s.add_argument("--limit", type=int, default=0, help="max rows (0 = all)")
+    s.add_argument("--offset", type=int, default=0,
+                   help="skip this many rows (pagination; with --json and a window "
+                        "selector the output is an envelope with total/complete/next_offset)")
+    s.add_argument("--closed-since", metavar="WHEN",
+                   help="window selector: tickets closed at/after WHEN (ISO-8601 or 7d/12h)")
+    s.add_argument("--closed-until", metavar="WHEN",
+                   help="exclusive upper bound for --closed-since")
+    s.add_argument("--updated-since", metavar="WHEN",
+                   help="window selector: tickets updated at/after WHEN")
+    s.add_argument("--event", action="append", metavar="NAME",
+                   help="window selector: tickets with a history event NAME "
+                        "(repeatable, e.g. auto_decision, auto_decision_reversed); "
+                        "JSON rows carry the matching events as window_events")
+    s.add_argument("--event-since", metavar="WHEN", help="lower bound (inclusive) on --event time")
+    s.add_argument("--event-until", metavar="WHEN", help="upper bound (exclusive) on --event time")
+    s.add_argument("--ref", action="append", metavar="REF",
+                   help="window selector: include this ticket (repeatable)")
     s.add_argument("--unresolved", action="store_true",
                    help="shorthand for --status unresolved")
     s.add_argument("--json", action="store_true")
