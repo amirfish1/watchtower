@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import time
 
 from . import config, queue as q, storage, store_identity
 from .conditional_answers import Unsupported, wait_kind
@@ -52,7 +53,18 @@ def _read_lock(base):
         raise Unsupported("authoritative export requires cross-process locking")
     # Opening an existing lock read-only avoids creating/truncating any file.
     with base.with_suffix(".lock").open("r") as lock:
-        q.fcntl.flock(lock.fileno(), q.fcntl.LOCK_SH | q.fcntl.LOCK_NB)
+        # Routine publishers race normal queue writes. Allow a short writer to
+        # finish, but keep a stuck writer from hanging source reconciliation.
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                q.fcntl.flock(lock.fileno(), q.fcntl.LOCK_SH | q.fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.05, remaining))
         try:
             yield
         finally:

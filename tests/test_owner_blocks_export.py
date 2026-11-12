@@ -178,6 +178,36 @@ def test_busy_writer_is_unavailable_not_empty_snapshot(store, capsys):
     assert json.loads(capsys.readouterr().out)["complete"] is False
 
 
+def test_export_waits_for_short_writer_and_reads_its_commit(store, monkeypatch, capsys):
+    base, _ = store
+    lock = base.with_suffix(".lock").open("r")
+    q.fcntl.flock(lock.fileno(), q.fcntl.LOCK_EX)
+    retries = []
+
+    def finish_writer(delay):
+        retries.append(delay)
+        connection = q.sqlite3.connect(base.with_suffix(".db"))
+        try:
+            row = json.loads(connection.execute(
+                "SELECT item_json FROM items WHERE number=1").fetchone()[0])
+            row["block_question"] = "Question committed by concurrent writer?"
+            connection.execute("UPDATE items SET item_json=? WHERE number=1", (json.dumps(row),))
+            connection.commit()
+        finally:
+            connection.close()
+        q.fcntl.flock(lock.fileno(), q.fcntl.LOCK_UN)
+
+    monkeypatch.setattr(export.time, "sleep", finish_writer)
+    try:
+        assert cli.main(["owner-blocks-export", "--json"]) == 0
+    finally:
+        lock.close()
+    result = json.loads(capsys.readouterr().out)
+    assert retries
+    assert result["authoritative"] is result["complete"] is True
+    assert result["items"][0]["body"] == "Question committed by concurrent writer?"
+
+
 def test_sqlite_export_includes_committed_wal_data(store):
     base, _ = store
     # Keep a connection open so the committed change remains in the WAL.
