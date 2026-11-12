@@ -167,12 +167,19 @@ def test_reminders_only_count_confirmed_and_bound(env):
     t.reconcile(now=now+2600); assert len(env[3])==4
 
 
-def test_unknown_receipt_does_not_blindly_retry(env):
+def test_lost_receipt_resends_once_then_cancels(env):
     a=adopt(env); t.reconcile()
-    env[2][a['supervision']['intent']['key']]={'state':'lost'}
-    t.reconcile(now=time.time()+5000)
-    assert t.status(SID)['delivery_state']=='uncertain'
-    assert len(env[3])==1
+    env[2][a['supervision']['intent']['key']]={'state':'lost','nonce':'<wt:n1>'}
+    now=time.time()+5000
+    t.reconcile(now=now)
+    s=t.status(SID)['supervision']
+    assert s['intent']['resent'] and s['intent']['key']!=a['supervision']['intent']['key']
+    t.reconcile(now=now+1)
+    assert len(env[3])==2
+    env[2][s['intent']['key']]={'state':'lost','nonce':'<wt:n2>'}
+    t.reconcile(now=now+5000)
+    assert t.status(SID)['state']=='cancelled'
+    assert len(env[3])==2
 
 
 def test_legacy_import_idempotent_no_enrollment_send(env):

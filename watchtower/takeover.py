@@ -11,6 +11,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime, timedelta, timezone
 import json
+import os
 import time
 import uuid
 from pathlib import Path
@@ -329,10 +330,35 @@ def _tick(it, obs, now):
             intent['state']='pending'
         elif row and row['state'] in ('lost','failed'):
             intent['state']='queued'
-            # A lost receipt is ambiguous: do not resend with a new nonce.
+            # A lost receipt is ambiguous. Settle it from the transcript, then
+            # resend at most once under a new nonce; a second loss cancels.
             if row['state']=='lost':
-                s.update(state='paused_unreachable', reason='Delivery outcome unknown; inspect receipt before explicit recovery')
-                intent['state']='uncertain'
+                nonce=row.get('nonce') or ''
+                tpath=obs.get('transcript') or ''
+                try:
+                    text=Path(tpath).read_text(errors='replace') if tpath and Path(tpath).is_file() else None
+                except OSError:
+                    text=None
+                landed=bool(nonce) and text is not None and nonce in text
+                if text is None or not nonce:
+                    # No readable transcript (e.g. broker): absence is unproven.
+                    s.update(state='paused_unreachable', reason='Delivery outcome unknown; inspect receipt before explicit recovery')
+                    intent['state']='uncertain'
+                    return
+                if landed:
+                    intent['state']='confirmed'
+                    s.update(state='running',next_deadline=now+IDLE_SECONDS)
+                    if intent['kind']=='remind':
+                        s['reminders']+=1
+                elif intent.get('resent'):
+                    intent['state']='cancelled'
+                    s.update(state='cancelled',reason='Takeover message lost twice; supervision cancelled')
+                    return
+                else:
+                    turn=intent['key'].split(':')[4] if intent['key'].count(':')>=5 else ''
+                    _intent(s,intent['kind'],intent['text'],turn)
+                    s['intent']['resent']=True
+                    return
     wait=q.current_wait(it)
     if wait and wait.get('on') in ('dependency','external','worker'):
         s.update(state='waiting',wait_identity=json.dumps(wait,sort_keys=True),wait_source='queue',reason='Recorded dependency wait')
