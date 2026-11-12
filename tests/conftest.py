@@ -40,6 +40,23 @@ def hermetic_outcome_storage(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def hermetic_config_paths(tmp_path, monkeypatch):
+    """A host's real ~/.watchtower/queue-config.json must never be an input.
+
+    Authoritative owner-block export refuses while an unmigrated legacy
+    settings file exists, so tests passed on clean CI runners and failed on
+    any machine that had used WatchTower. Point the legacy and active config
+    at an empty temp location unless the test redirects them itself.
+    """
+    from watchtower import config
+
+    legacy = tmp_path / "no-legacy-home" / "queue-config.json"
+    monkeypatch.setattr(config, "_LEGACY_CONFIG_FILE", legacy)
+    if not os.environ.get("WATCHTOWER_CONFIG_FILE"):
+        monkeypatch.setattr(config, "CONFIG_FILE", legacy)
+
+
+@pytest.fixture(autouse=True)
 def hermetic_service_paths(tmp_path, monkeypatch):
     """No test may install or remove the host's actual supervisor unit."""
     from watchtower import cli
