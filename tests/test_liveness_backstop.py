@@ -568,6 +568,25 @@ def test_auto_drain_off_open_work_is_a_backlog(lv):
     assert a["row"] == "work.open" and a["action"] == "" and "auto_drain off" in a["evidence"]
 
 
+def test_remote_placement_never_cycles_into_owner_backstop(lv, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_PLACEMENT", "cloud")
+    ref = _file(lv, placement="mac")
+    lv.config.set_auto_drain(PQ, True)
+    # Even a previous spawn mark must not promote a placement wait to a block.
+    item = lv.q.get(ref)
+    _patch(lv, ref, backstop={"state": "work.open", "action": "mark",
+                            "fingerprint": lv.liveness.fingerprint(item, {})})
+    a = _assess(lv, ref)
+    assert a["verdict"] == "remote" and a["action"] == ""
+    assert "placement mac" in a["evidence"]
+    assert _sweep(lv) == []
+    assert not lv.spawned and not lv.q.get(ref)["needs_input"]
+    # The proper host still staffs it normally.
+    monkeypatch.setenv("WATCHTOWER_PLACEMENT", "mac")
+    _patch(lv, ref, backstop={})
+    assert _assess(lv, ref)["action"] == "spawn"
+
+
 # ------------------------------------------------------------ system ops
 def test_dep_stuck_is_escalated_and_no_escalation_is_logged(lv, monkeypatch):
     blocker = _file(lv, "blocker")

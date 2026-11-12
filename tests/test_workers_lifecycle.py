@@ -201,6 +201,25 @@ def test_reconcile_cold_drain_on_spawns(wt):
     assert [s["queue"] for s in r["spawned"]] == ["Q"]
 
 
+def test_reconcile_explains_remote_placement_then_staffs_ssh_tasks(wt, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_PLACEMENT", "cloud")
+    wt.config.set_auto_drain("Q", True)
+    first = wt.q.enqueue(project="Q", note="Mac CLI task via SSH", placement="mac")
+    second = wt.q.enqueue(project="Q", note="another Mac CLI task via SSH", placement="mac")
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert not r["spawned"]
+    reason = next(s["reason"] for s in r["skipped"] if s["queue"] == "Q")
+    assert "2 placement mac (this machine: cloud)" in reason
+    assert "unexplained" not in reason
+    # A targeted placement correction permits SSH orchestration without
+    # teaching the dispatcher to bypass other tickets' machine pins.
+    for item in (first, second):
+        wt.q.update(item["ref"], placement="any")
+    assert wt.q.count_claimable(project="Q") == 2
+    r = wt.workers.reconcile_once(dry_run=True)
+    assert [s["queue"] for s in r["spawned"]] == ["Q"]
+
+
 def test_reconcile_continues_when_one_queue_depth_lookup_fails(wt, monkeypatch):
     """A transient queue-backend failure must not stop other queues draining."""
     from watchtower.github_backend import GitHubBackendError

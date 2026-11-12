@@ -1413,7 +1413,11 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
     elif proof["kind"] == "staffing":
         from . import config, workers
         queue = out["queue"]
-        if _staffed(queue, ctx):
+        if not q.placement_allows(item):
+            # This host cannot staff the ticket. Repeated local spawn attempts
+            # must not turn a deliberate machine pin into an owner question.
+            verdict, evidence = "remote", f"placement {item.get('placement')} (this machine: {q.machine_placement()})"
+        elif _staffed(queue, ctx):
             verdict = "staffed"
         elif github or not config.auto_drain(queue):
             verdict, evidence = "unstaffed", "auto_drain off" if not github else "github"

@@ -7250,6 +7250,8 @@ def _reconcile_once_locked(dry_run: bool = False,
             elif readiness in _q.UNCLAIMABLE_READINESS:
                 readiness_seen.add(readiness)
                 _bump("readiness")
+            elif not _q.placement_allows(it):
+                _bump(f"placement {it.get('placement')} (this machine: {_q.machine_placement()})")
             elif not auto_on and not it.get("run_requested", False):
                 # Drain is off, so depth is the ▶ count: what holds this
                 # ticket back is that nobody pressed ▶, not any auto gate.
