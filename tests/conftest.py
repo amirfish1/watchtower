@@ -57,6 +57,17 @@ def hermetic_config_paths(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def hermetic_no_autostart(monkeypatch):
+    """`wt drain on` must never spawn a real watcher from a test.
+
+    Autostart forks `wt start` and logs under the real ~/.watchtower, so a
+    host without a live daemon failed these tests and risked a stray
+    service. Tests of the autostart path itself delenv this explicitly.
+    """
+    monkeypatch.setenv("WT_NO_AUTOSTART", "1")
+
+
+@pytest.fixture(autouse=True)
 def hermetic_service_paths(tmp_path, monkeypatch):
     """No test may install or remove the host's actual supervisor unit."""
     from watchtower import cli

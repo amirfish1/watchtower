@@ -616,6 +616,8 @@ def cmd_ls(args: argparse.Namespace) -> int:
     # (active) view still surfaces that closed-but-unresolved work exists.
     unresolved_total = len(_unresolved_items(all_items))
     want = args.status or ("all" if windowed else "active")
+    if getattr(args, "unresolved", False):
+        want = "unresolved"  # documented shorthand for --status unresolved
     if want == "active":
         items = [i for i in items if i.get("status") in ("open", "in_progress", "in_review", "awaiting_answer")]
     elif want == "blocked":
