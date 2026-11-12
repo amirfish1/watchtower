@@ -192,6 +192,20 @@ without `--wait-on` resets the ticket to an owner wait.
 
 ## Minor blocks: proposing an auto-decision (CCC-370)
 
+Before creating a block, check whether the choice is already within your
+authorized work. For a routine implementation detail that is cheap to undo,
+does not reach customers or money, and fits the owner's instructions and past
+decisions, choose it yourself. Record the reason and exact undo step in ticket
+progress (use `desk check` and `desk log` where available), then continue without
+`wt block`. This applies before a commit exists and when queue auto-approval is
+disabled. It grants no new authority: missing information, consequential
+preferences, customer sends, money, public posts, ad spend and irreversible
+actions still require the owner.
+
+The formal gate below handles proposals that still require approval. It runs
+when a worker submits proposal flags, not as a background sweep of old blocks.
+An old block without a proposal is not retroactively approved.
+
 **Check this every time you are about to `wt block`** (CCC-413: 18 blocks in 3 days
 carried no flags, so the gate never ran). If a block is a small, reversible code change in the ticket's own repo, you may
 propose that WatchTower approve it for you instead of making the owner read a card:

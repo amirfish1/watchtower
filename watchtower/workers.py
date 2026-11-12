@@ -424,6 +424,16 @@ ANNOUNCE_TICKET = (
 # Style contract for the mandatory close --summary, injected into both goal
 # templates. No braces: safe for the templates' .format() calls.
 MINOR_BLOCK_CONTRACT = (
+    "BEFORE BLOCKING: first check whether this is an implementation choice "
+    "you are already authorized to make. If it is cheap to undo, does not "
+    "reach customers or money, and fits the owner's instructions and past "
+    "decisions, choose it yourself, record the reason and exact undo step "
+    "in ticket progress, and continue without `wt block`. Where available, "
+    "use `desk check` and `desk log` for that record. This applies before "
+    "any commit exists and even when queue auto-approval is disabled; it "
+    "does not grant new authority or bypass a required approval. Missing "
+    "information, consequential preferences, customer sends, money, public "
+    "posts, ad spend and irreversible actions still require the owner. "
     "MINOR BLOCKS (CCC-413): if the decision you are blocking on is a small, "
     "revertable code change you already committed in this ticket's own repo, "
     "do not make the owner read a card: add the auto-decision flags to the "
