@@ -5478,3 +5478,32 @@ def test_spawn_adhoc_stage_delivers_a_prompt_over_the_argv_string_limit(wt, monk
         time.sleep(0.05)
     got = json.loads(out.read_text())
     assert prompt in [got["stdin"]] + got["argv"]
+
+
+def test_spawn_goal_over_fifo_buffer_waits_for_slow_reader(wt, tmp_path):
+    """A drain goal larger than the 8 KiB macOS FIFO buffer blocks until the
+    engine starts reading stdin, which claude only does after its SessionStart
+    hooks finish. The old 1 s deadline expired first and the spawner SIGTERMed
+    its own worker (exit 143 on every claude spawn once the goal hit ~9 KiB)."""
+    fifo, rdwr = wt.workers._make_stdin_fifo(tmp_path / "w.log")
+    assert fifo
+    goal = "x" * 20000
+    got = bytearray()
+
+    def slow_reader():
+        time.sleep(1.5)  # the engine is still running startup hooks
+        while b"\n" not in got:
+            got.extend(os.read(rdwr, 65536))
+
+    t = threading.Thread(target=slow_reader)
+    t.start()
+    try:
+        assert wt.workers._goal_write_timeout_s() >= 10
+        assert wt.workers.write_to_worker_fifo(
+            fifo, goal, timeout_s=wt.workers._goal_write_timeout_s(),
+        )
+        t.join(10)
+        assert json.loads(bytes(got).decode()).get("type") == "user"
+    finally:
+        t.join(10)
+        os.close(rdwr)

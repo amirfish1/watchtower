@@ -894,12 +894,12 @@ def worker_turn_open(w: Dict[str, Any]) -> bool:
     return turn_open
 
 
-def _write_fifo_frame(fifo_path: str, line: bytes) -> bool:
+def _write_fifo_frame(fifo_path: str, line: bytes, timeout_s: float = 1.0) -> bool:
     """Write a complete frame, serializing writers and bounding backpressure."""
     if not fifo_path:
         return False
     fd = lock_fd = None
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + timeout_s
     try:
         # macOS cannot flock a FIFO itself. A sibling file serializes complete
         # frames across processes, including frames larger than PIPE_BUF.
@@ -936,10 +936,28 @@ def _write_fifo_frame(fifo_path: str, line: bytes) -> bool:
         _close_fd_quiet(lock_fd)
 
 
-def write_to_worker_fifo(fifo_path: str, text: str, engine: str = "claude") -> bool:
+def write_to_worker_fifo(
+    fifo_path: str, text: str, engine: str = "claude", timeout_s: float = 1.0,
+) -> bool:
     """Push a stream-json user message to a live worker's FIFO. Returns True on
     delivery, False if the worker isn't listening (no reader / closed)."""
-    return _write_fifo_frame(fifo_path, _stream_json_user_line(text, engine=engine))
+    return _write_fifo_frame(
+        fifo_path, _stream_json_user_line(text, engine=engine), timeout_s=timeout_s,
+    )
+
+
+def _goal_write_timeout_s() -> float:
+    """Deadline for delivering the drain goal to a just-spawned worker.
+
+    A macOS FIFO buffers 8 KiB, and claude does not read stdin until its
+    SessionStart hooks finish (seconds). A goal over 8 KiB therefore blocks
+    until the engine starts reading; the 1 s steering deadline expired first and
+    the spawner SIGTERMed its own worker as goal-less -- every claude spawn
+    died with exit 143 once the drain goal grew past 8 KiB (~9.1 KiB)."""
+    try:
+        return max(1.0, float(os.environ.get("WATCHTOWER_GOAL_WRITE_TIMEOUT_S", "30")))
+    except ValueError:
+        return 30.0
 
 
 def _stream_json_interrupt_line() -> bytes:
@@ -8224,10 +8242,12 @@ def spawn_workers(
                 launch_failures.append(failure)
             continue
         # Deliver the drain goal as the first stream-json user message. The
-        # child's inherited RDWR fd is already a reader, so this open + write
-        # succeeds immediately and never blocks.
+        # child's inherited RDWR fd is already a reader, so the open succeeds;
+        # a goal larger than the FIFO buffer blocks until the engine starts
+        # reading stdin (after its startup hooks), hence the long deadline.
         if fifo_path is not None:
-            if not write_to_worker_fifo(fifo_path, goal, engine=engine):
+            if not write_to_worker_fifo(fifo_path, goal, engine=engine,
+                                        timeout_s=_goal_write_timeout_s()):
                 # FIFO write failed -> the worker never got its task. Kill it so
                 # we don't leave a stuck, goal-less process behind.
                 try:
@@ -8330,7 +8350,8 @@ def spawn_run_once_worker(
         logf.close()
         _close_fd_quiet(child_stdin_fd)
     if fifo_path is not None:
-        if not write_to_worker_fifo(fifo_path, goal, engine=engine):
+        if not write_to_worker_fifo(fifo_path, goal, engine=engine,
+                                    timeout_s=_goal_write_timeout_s()):
             try:
                 os.kill(proc.pid, 15)
             except OSError:
