@@ -137,6 +137,37 @@ Applies to every ticket, quick or deep.
 - **Partial is labelled partial**: a close that leaves part of the ask undone
   starts its `--summary` with `PARTIAL:` and cites the follow-up ref.
 
+## Customer reports: sentence coverage and action coverage
+
+Keep TWO tables in the SAME linked evidence file: sentence coverage for every
+customer claim (including later clarifications and failed workarounds), and
+customer action coverage for the step-by-step sequence. Reconstruct actions from
+logs, screenshots and reports; label inferred goals/beliefs and unknown ordering.
+For record changes, use the production audit log, later corrections and current
+records; identify actors and present timestamps in the customer's local timezone.
+
+| Step / customer action and intended outcome | Immediate customer repair | Long-term prevention for others | Possible confusion and help at this step | Evidence and status |
+|---|---|---|---|---|
+| Number and local time if known; distinguish fact from inferred intent | Verified remedy or justified N/A | Safeguard at THIS action; verified or explicitly OPEN | How to expose the correct reality before a mistake or quickly enable recovery | Sources, verification, delivered vs proposed vs unknown, remaining work |
+
+At each step ask: **if the initial bug or misunderstanding already happened,
+how can the product prevent the next mistake or quickly help the customer
+understand the correct reality here?** Examine subsequent edits, cancellations,
+rebooking, assistant requests, error/conflict feedback and recovery separately.
+Fixing the first trigger is not prevention evidence for every later action.
+Correct backend behavior or an accurate reply may still leave the customer's
+contradiction unexplained; assess the actual information and next action offered.
+
+Example: a calendar jumps to Monday while a customer intends Friday. After
+fixing that jump, still inspect whether cancelling Monday's booking makes the
+actual date clear, and whether a duplicate warning helps locate the existing
+Friday booking. An audit timeline alone does not establish those safeguards.
+Do not invent mandatory UX changes: record a verified safeguard, an evidenced
+N/A, or a concrete open gap for each step. Distinguish a proposed improvement
+from delivered prevention; never claim the former is verified or close away
+required prevention under an upstream fix. Cite both tables when resolving the
+report and retain unresolved original work under the definition-of-done rules.
+
 ## Ticket depth
 
 The filer sets depth; a worker never guesses it. `quick` is the default.
