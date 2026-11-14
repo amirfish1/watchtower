@@ -1,7 +1,7 @@
 """Authoritative local owner-block snapshot without migration or store writes."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import os
@@ -74,9 +74,14 @@ def _read_lock(base):
 def read_source():
     """Return a strict source copy and settings without migration or writes."""
     base = _base_path()
-    with _read_lock(base):
+    db = base.with_suffix(".db")
+    # SQLite pins revision, identity and items to one committed read snapshot.
+    # The writer flock also covers expensive load/prepare work, so waiting on
+    # it needlessly makes readers unavailable even when WAL reads are safe.
+    # Legacy JSON still needs the flock; recheck the DB after acquiring it in
+    # case a migration completed while we waited.
+    with nullcontext() if db.exists() else _read_lock(base):
         settings = _settings()
-        db = base.with_suffix(".db")
         if db.exists():
             connection = q.sqlite3.connect(db.as_uri() + "?mode=ro", uri=True)
             try:

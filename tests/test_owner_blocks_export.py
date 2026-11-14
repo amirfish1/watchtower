@@ -79,13 +79,26 @@ def test_revision_changes_with_question_or_ownership_revision(store):
     assert third["source_revision"] != second["source_revision"]
 
 
-def test_uses_shared_lock_and_no_mutating_resolvers(store, monkeypatch):
+def legacy_source(store):
     base, _ = store
+    data = q._load_unlocked()
+    data["store_id"] = export.snapshot()["scope"]["store_id"]
+    base.write_text(json.dumps(data))
+    base.with_suffix(".db").unlink()
+    return base
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_snapshot_uses_backend_isolation_and_no_mutating_resolvers(store, monkeypatch, legacy):
+    base = legacy_source(store) if legacy else store[0]
     original = q._normalize_items
     def check_lock(items):
-        # A distinct open description cannot take an exclusive writer lock.
+        # Legacy reads exclude writers; SQLite reads use their own snapshot.
         with base.with_suffix(".lock").open("r") as other:
-            with pytest.raises(BlockingIOError):
+            if legacy:
+                with pytest.raises(BlockingIOError):
+                    q.fcntl.flock(other.fileno(), q.fcntl.LOCK_EX | q.fcntl.LOCK_NB)
+            else:
                 q.fcntl.flock(other.fileno(), q.fcntl.LOCK_EX | q.fcntl.LOCK_NB)
         return original(items)
     def forbidden(*args, **kwargs):
@@ -94,17 +107,19 @@ def test_uses_shared_lock_and_no_mutating_resolvers(store, monkeypatch):
     for name in ("_save_unlocked", "_resolve_store_path", "_load_unlocked", "_connect"):
         monkeypatch.setattr(q, name, forbidden)
     monkeypatch.setattr(config, "config_path", forbidden)
-    before = base.with_suffix(".db").read_bytes()
+    source = base if legacy else base.with_suffix(".db")
+    before = source.read_bytes()
     export.snapshot()
     from watchtower import conditional_answers
     assert conditional_answers.lookup("DEMO-1", "missing-key") is None
-    assert base.with_suffix(".db").read_bytes() == before
+    assert source.read_bytes() == before
 
 
 @pytest.mark.parametrize("failure", ["missing_lock", "missing_store", "corrupt_store", "corrupt_settings"])
 def test_failure_is_never_authoritative_absence(store, failure, capsys):
     base, settings = store
     if failure == "missing_lock":
+        legacy_source(store)
         base.with_suffix(".lock").unlink()
     elif failure == "missing_store":
         base.with_suffix(".db").unlink()
@@ -168,7 +183,7 @@ def test_unknown_backend_cannot_authoritatively_withdraw(store, capsys):
 
 
 def test_busy_writer_is_unavailable_not_empty_snapshot(store, capsys):
-    base, _ = store
+    base = legacy_source(store)
     with base.with_suffix(".lock").open("r") as lock:
         q.fcntl.flock(lock.fileno(), q.fcntl.LOCK_EX)
         try:
@@ -179,22 +194,16 @@ def test_busy_writer_is_unavailable_not_empty_snapshot(store, capsys):
 
 
 def test_export_waits_for_short_writer_and_reads_its_commit(store, monkeypatch, capsys):
-    base, _ = store
+    base = legacy_source(store)
     lock = base.with_suffix(".lock").open("r")
     q.fcntl.flock(lock.fileno(), q.fcntl.LOCK_EX)
     retries = []
 
     def finish_writer(delay):
         retries.append(delay)
-        connection = q.sqlite3.connect(base.with_suffix(".db"))
-        try:
-            row = json.loads(connection.execute(
-                "SELECT item_json FROM items WHERE number=1").fetchone()[0])
-            row["block_question"] = "Question committed by concurrent writer?"
-            connection.execute("UPDATE items SET item_json=? WHERE number=1", (json.dumps(row),))
-            connection.commit()
-        finally:
-            connection.close()
+        data = json.loads(base.read_text())
+        data["items"][0]["block_question"] = "Question committed by concurrent writer?"
+        base.write_text(json.dumps(data))
         q.fcntl.flock(lock.fileno(), q.fcntl.LOCK_UN)
 
     monkeypatch.setattr(export.time, "sleep", finish_writer)
@@ -257,3 +266,41 @@ def test_duplicate_follower_metadata_is_exported_without_reclassification(store)
     assert row["status"] == "in_progress"
     assert row["wait_kind"] == "owner"
     assert q._db_path().read_bytes() == before
+
+
+def test_sqlite_snapshot_remains_consistent_while_writer_holds_queue_lock(store, monkeypatch):
+    base, _ = store
+    before = export.snapshot()
+    writer = q._connect(base.with_suffix(".db"))
+    writer.execute("BEGIN IMMEDIATE")
+    item = json.loads(writer.execute(
+        "SELECT item_json FROM items WHERE number=1").fetchone()[0])
+    item["block_question"] = "Committed during export?"
+    writer.execute("UPDATE items SET item_json=? WHERE number=1", (json.dumps(item),))
+    writer.execute("UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='revision'")
+    connect = q.sqlite3.connect
+    committed = []
+
+    def connect_reader(*args, **kwargs):
+        reader = connect(*args, **kwargs)
+        def commit_between_reads(sql):
+            if "store_id" in sql and not committed:
+                writer.commit()
+                committed.append(True)
+        reader.set_trace_callback(commit_between_reads)
+        return reader
+
+    monkeypatch.setattr(q.sqlite3, "connect", connect_reader)
+    try:
+        with q._FileLock(base.with_suffix(".lock")):
+            # A writer may spend minutes preparing its write. Export must
+            # read the last committed state without waiting for that flock.
+            assert export.snapshot() == before
+        assert committed
+        after = export.snapshot()
+        assert after["store_version"]["revision"] == before["store_version"]["revision"] + 1
+        assert after["scope"] == before["scope"]
+        assert after["items"][0]["body"] == item["block_question"]
+        assert after["items"][0]["source_revision"] != before["items"][0]["source_revision"]
+    finally:
+        writer.close()

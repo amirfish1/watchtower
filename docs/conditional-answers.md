@@ -189,12 +189,15 @@ previously imported row missing from a later successful complete snapshot of
 the **same scope**, including a truly empty set. A changed store ID is a new
 source scope, never evidence that the previous store's requests disappeared.
 
-Export holds an existing source flock shared/read lock and uses a SQLite
-`mode=ro` read transaction (including committed WAL data). It neither calls
+Export uses a SQLite `mode=ro` read transaction (including committed WAL data)
+to read revision, identity and items from one committed snapshot. It does not
+wait for the queue writer flock: a writer may hold that lock while preparing
+changes that are not yet committed. It neither calls
 the migrating source/settings resolvers nor writes answers, receipts, worker
 state, migrations, or activity logs. It does not create a missing lock file.
-Legacy JSON can be read in place without creating a database. A busy writer,
-missing/unreadable source or lock, invalid configuration, or required settings
+Legacy JSON is read under the existing shared source flock, without creating
+a database. A busy legacy writer, missing legacy lock, missing/unreadable
+source, SQLite read failure, invalid configuration, or required settings
 migration fails closed: exit 2 with
 `{"error":"unavailable","authoritative":false,"complete":false,"message":"..."}`.
 Such a response, a timeout, or an infrastructure failure provides **no absence
@@ -202,8 +205,8 @@ evidence**. Keep prior requests and retry a later read; never withdraw them
 from a partial/failed snapshot. This command does not enable any producer
 migration or review accept/reject operations.
 
-The single-ref `answer-receipt` lookup uses this same strict, shared-lock,
-nonmigrating reader. Missing/unreadable stores and busy writers yield exit 2
+The single-ref `answer-receipt` lookup uses this same strict, nonmigrating
+snapshot reader. Missing/unreadable stores and busy legacy writers yield exit 2
 (`unavailable`, or `unsupported` for unsupported sources), never exit 1
 `not_found`. Only exit 1 after a successful source read is authoritative absence.
 
