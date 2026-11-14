@@ -139,11 +139,39 @@ Applies to every ticket, quick or deep.
 - **Partial is labelled partial**: a close that leaves part of the ask undone
   starts its `--summary` with `PARTIAL:` and cites the follow-up ref.
 
+## Proportional verification and waits
+
+Choose the smallest check that proves the reported fix and its meaningful
+regression risks. A focused test or direct behavior check is enough when it
+establishes the outcome. A copy change does not automatically need a separate
+browser session; a backend fix does not need visual checks. Use a browser when
+rendering or interaction is the failure, and an independent verifier when an
+explicit gate requires one or a material uncertainty warrants it.
+
+Reuse relevant passing evidence for the unchanged code. Repeat checks only
+after a relevant change, failure, or concrete gap; do not repeat a passed suite
+or add desktop/phone/theme matrices just to accumulate proof. When WatchTower
+will run a required verification gate after close, do not spawn a second
+verifier for the same acceptance criteria. Required gates still apply.
+
+Related fixes sharing a deployment use one restart owner and one shared
+adoption check. Communicate using actual session IDs, not reply aliases that
+the chosen transport cannot resolve. Once adoption evidence covers your
+commit, use it and move on. Do not hold a worker slot for peer watches or
+future data: if necessary evidence is pending, record the exact trigger and
+success check, use a bounded `wt defer`, then claim the next ready ticket.
+Do not mark an unresolved acceptance criterion complete to free a slot.
+
 ## Customer reports: sentence coverage and action coverage
 
-Keep TWO tables in the SAME linked evidence file: sentence coverage for every
-customer claim (including later clarifications and failed workarounds), and
-customer action coverage for the step-by-step sequence. Reconstruct actions from
+Keep evidence proportional to the report. For a single symptom or simple
+interaction, a concise record of the report, remedy, relevant check and any
+remaining gap is sufficient; separate tables and a new evidence file are not
+mandatory. Do not turn greetings or incidental wording into acceptance work.
+
+For multi-step incidents with distinct claims, contradictions, record changes
+or consequential customer actions, use sentence coverage and action coverage
+in the same linked evidence file. Reconstruct actions from
 logs, screenshots and reports; label inferred goals/beliefs and unknown ordering.
 For record changes, use the production audit log, later corrections and current
 records; identify actors and present timestamps in the customer's local timezone.
