@@ -334,6 +334,10 @@ def _tick(it, obs, now):
                 intent['state']='queued'
             # A lost receipt is ambiguous. Settle it from the transcript, then
             # resend at most once under a new nonce; a second loss cancels.
+            if row and row['state']=='failed' and intent.get('resent'):
+                intent['state']='cancelled'
+                s.update(state='cancelled',reason='Takeover resend failed; supervision cancelled')
+                return
             if not row or row['state']=='lost':
                 # The delivered text always carries the action key.
                 nonce=(row or {}).get('nonce') or intent['key']

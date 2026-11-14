@@ -167,7 +167,8 @@ def test_reminders_only_count_confirmed_and_bound(env):
     t.reconcile(now=now+2600); assert len(env[3])==4
 
 
-def test_lost_receipt_resends_once_then_cancels(env):
+@pytest.mark.parametrize('retry_state', ['lost', 'failed'])
+def test_lost_receipt_resends_once_then_cancels(env, retry_state):
     a=adopt(env); t.reconcile()
     env[2][a['supervision']['intent']['key']]={'state':'lost','nonce':'<wt:n1>'}
     now=time.time()+5000
@@ -176,9 +177,13 @@ def test_lost_receipt_resends_once_then_cancels(env):
     assert s['intent']['resent'] and s['intent']['key']!=a['supervision']['intent']['key']
     t.reconcile(now=now+1)
     assert len(env[3])==2
-    env[2][s['intent']['key']]={'state':'lost','nonce':'<wt:n2>'}
+    env[2][s['intent']['key']]={'state':retry_state,'nonce':'<wt:n2>'}
     t.reconcile(now=now+5000)
     assert t.status(SID)['state']=='cancelled'
+    assert t.status(SID)['delivery_state']=='cancelled'
+    item=q.get(a['ticket'])
+    assert item['status']=='in_progress' and item['claimed_session_id']==SID
+    t.reconcile(now=now+10000)
     assert len(env[3])==2
 
 
