@@ -4834,7 +4834,33 @@ def _sync_duplicates_unlocked(data: Dict[str, Any]) -> None:
                         verify_cycle=snapshot["verify_cycle"], feedback=_clip(snapshot["feedback"], 1000))
 
 
-def link_duplicate(ident: Any, original_ref: str, worker: str = "") -> Optional[Dict[str, Any]]:
+def exact_duplicate_key(item: Dict[str, Any]) -> str:
+    """Conservative identity for automatic dedup, never a semantic match.
+
+    Only filing identity/times may differ. Keep complete text, punctuation,
+    Unicode, source context, attachments, acceptance criteria and unknown
+    fields: an unfamiliar field is not evidence that it is safe to discard.
+    Discussion and prior work are not automatically merged.
+    """
+    if (item.get("status") != "open" or item.get("claimed_by")
+            or item.get("needs_input") or item.get("pending_answer")
+            or item.get("duplicate_of") or group_role(item)
+            or any(h.get("event") != "filed" for h in item.get("history", []))):
+        return ""
+    if not any(str(item.get(k) or "").strip() for k in ("title", "note", "text")):
+        return ""
+    ignored = {"ref", "number", "seq", "created_at", "updated_at",
+               "claimed_at", "closed_at", "history"}
+    content = {k: v for k, v in item.items() if k not in ignored}
+    filed = [{k: v for k, v in h.items() if k != "at"}
+             for h in item.get("history", [])]
+    return json.dumps({"content": content, "filed": filed,
+                       "effective_gates": effective_gates(item)},
+                      sort_keys=True, ensure_ascii=False)
+
+
+def link_duplicate(ident: Any, original_ref: str, worker: str = "", *,
+                   exact_key: str = "") -> Optional[Dict[str, Any]]:
     """Explicitly declare the same incident; wait for its original, never spawn.
 
     Both tickets must be in the same queue, outside plan groups. Refuse
@@ -4842,6 +4868,8 @@ def link_duplicate(ident: Any, original_ref: str, worker: str = "") -> Optional[
     follower for independent work. GitHub refs: github_duplicates (OPS-208).
     """
     if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        if exact_key:
+            raise ValueError("automatic exact dedup requires a local queue")
         from . import github_duplicates
         return github_duplicates.link(ident, original_ref, worker)
     with _FileLock(_lock_path()):
@@ -4866,6 +4894,9 @@ def link_duplicate(ident: Any, original_ref: str, worker: str = "") -> Optional[
             original = next((i for i in data["items"] if i.get("ref") == original_ref), None)
             if original is None or original is it:
                 raise ValueError("duplicate original must exist and be a different ticket")
+            if exact_key and (exact_duplicate_key(it) != exact_key
+                              or exact_duplicate_key(original) != exact_key):
+                raise ValueError("tickets changed since the exact-duplicate scan; nothing linked")
             if original.get("project") != it.get("project"):
                 raise ValueError("duplicate original must be in the same queue")
             if original.get("duplicate_of") or any(i.get("duplicate_of") == it.get("ref") for i in data["items"]):

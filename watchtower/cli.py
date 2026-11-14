@@ -5391,41 +5391,39 @@ def cmd_export_json(args: argparse.Namespace) -> int:
 
 
 def cmd_dedup(args: argparse.Namespace) -> int:
-    """Exact-key dedup pass (WT-FEATURES-14, first cut): group open tickets by
-    normalized title+note, keep the oldest in each group, and (with --apply)
-    close the rest as duplicates. The semantic merge+rank pass is a follow-up."""
-    import re
+    """Preview exact content/context matches; --apply links their completion."""
     from . import queue as q
 
-    def norm(it: dict) -> str:
-        s = (str(it.get("title", "")) + " " + str(it.get("note", ""))).lower()
-        return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", "", s)).strip()
-
-    items = [
-        i for i in q.list_items(status="open")
-        if not args.queue or i.get("project") == args.queue
-    ]
+    items = q.list_items(status="open", project=args.queue, fresh=True, strict=True)
     groups: dict = {}
     for it in items:
-        key = norm(it)
+        key = q.exact_duplicate_key(it)
         if key:
             groups.setdefault(key, []).append(it)
     dups = {k: v for k, v in groups.items() if len(v) > 1}
     if not dups:
         print("no exact duplicates")
         return 0
-    closed = 0
-    for v in dups.values():
+    linked = errors = 0
+    for key, v in dups.items():
         v.sort(key=lambda x: int(x.get("number", 0)))
         keep, rest = v[0], v[1:]
         print(f"dup group: keep {keep['ref']} | dupes {[x['ref'] for x in rest]}")
         if args.apply:
             for x in rest:
-                q.close(x["ref"], resolution=f"duplicate of {keep['ref']}")
-                closed += 1
-    print(f"closed {closed} duplicate(s)" if args.apply
-          else "(dry-run; pass --apply to close duplicates)")
-    return 0
+                try:
+                    item = q.link_duplicate(x["ref"], keep["ref"], exact_key=key)
+                    if item is None:
+                        raise ValueError("ticket disappeared since the scan")
+                except ValueError as exc:
+                    print(f"skipped {x['ref']}: {exc}", file=sys.stderr)
+                    errors += 1
+                    continue
+                linked += 1
+                stages.request(item["ref"], "exact duplicate linked")
+    print(f"linked {linked} duplicate(s); completion follows the original" if args.apply
+          else "(dry-run; pass --apply to link duplicates)")
+    return 1 if errors else 0
 
 
 def cmd_set(args: argparse.Namespace) -> int:
@@ -7236,7 +7234,7 @@ COMMAND_HELP: Dict[str, str] = {
     "run": "mark an existing GitHub issue runnable and dispatch its queue (alias: wt ready)",
     "find": "look up one ticket by ref across all queues (no -q needed)",
     "ls": "list the tickets in one queue",
-    "dedup": "close exact-duplicate open tickets",
+    "dedup": "link exact-duplicate open tickets to their original",
     "migrate-store": "one-time JSON -> SQLite store migration (idempotent)",
     "export-json": "dump the store as classic {counter, items} JSON",
     "status": "per-queue depth / age / stuck flag",
@@ -8807,7 +8805,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("dedup")
     s.add_argument("-q", "--queue", default=None)
-    s.add_argument("--apply", action="store_true", help="close dupes (default: dry-run)")
+    s.add_argument("--apply", action="store_true", help="link exact dupes; wait for original completion (default: dry-run)")
     s.set_defaults(func=cmd_dedup)
 
     s = sub.add_parser("migrate-store")
