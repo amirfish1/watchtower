@@ -8339,7 +8339,7 @@ def block(
         item = backend.block(
             ident, session_id=session_id, question=question, progress=progress,
             kind=kind, wait_on=wait_on, wait_actor=wait_actor, wait_ref=wait_ref,
-            expect=expect, wait_extra=wait_extra,
+            expect=expect, wait_extra=wait_extra, origin=origin,
         )
         if item and origin == "worker" and item.get("pipeline_local"):
             item = _github_park(ident, str(session_id), item) or item
@@ -8378,6 +8378,10 @@ def block(
                 it["needs_input"] = True
                 it["block_question"] = _clip(question, 4000)
                 it["block_kind"] = kind
+                # Who raised this block: "worker" (`wt block`) or WatchTower itself
+                # (stage, plan_gate, outcome, system). Read-only metadata for the
+                # owner view; nothing routes, wakes or approves on it.
+                it["block_origin"] = str(origin or "")
                 it["blocked_at"] = block_at
                 it["updated_at"] = now
                 if wait_on:

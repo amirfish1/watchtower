@@ -2466,6 +2466,7 @@ class GitHubIssuesBackend:
             "needs_input": bool(meta.get("needs_input", False)),
             "block_question": str(meta.get("block_question") or ""),
             "block_kind": str(meta.get("block_kind") or ""),
+            "block_origin": str(meta.get("block_origin") or ""),
             "blocked_at": str(meta.get("blocked_at") or ""),
             # The orphan sweep's answer grace keys on this (OPS-200).
             "answered_at": meta.get("answered_at"),
@@ -3886,6 +3887,7 @@ class GitHubIssuesBackend:
         meta["block_question"] = _clip(question, 4000)
         meta["blocked_at"] = now
         meta["block_kind"] = kind if kind in _q.BLOCK_KINDS else "input"
+        meta["block_origin"] = str(origin or "")       # metadata only (owner view)
         if wait_on:
             meta["wait"] = _q.wait_record(wait_on, wait_actor, wait_ref,
                                           block_at=now, by=str(session_id or ""),

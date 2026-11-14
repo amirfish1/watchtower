@@ -26,7 +26,13 @@ from typing import Any, Dict, List, Optional
 
 from . import queue as q
 
-KINDS = ("owner", "unclassified", "external", "dependency", "worker")
+KINDS = ("owner", "unclassified", "system", "external", "dependency", "worker")
+# Blocks WatchTower raised itself (a stage could not start, a plan discussion
+# stalled, a review request never arrived). They carry no wait record on
+# purpose: recording one would change who gets notified.
+# "system" is also q.block's default origin, so it proves nothing and stays
+# unclassified (that includes the review-notify block in liveness.py).
+_SYSTEM_ORIGINS = ("stage", "plan_gate", "outcome")
 _MAX_CHAIN = 25
 _UNRESOLVED = ("not_found_here", "other_host", "no_ref")
 
@@ -58,6 +64,8 @@ def classify(item: Dict[str, Any]) -> str:
         return "external"
     if kind == "rationale":
         return "owner"
+    if str(item.get("block_origin") or "") in _SYSTEM_ORIGINS:
+        return "system"
     return "unclassified"
 
 
@@ -216,6 +224,10 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
         "groups": out_groups,
         # Listed apart so nothing hides inside a group:
         "unclassified": [r["ref"] for r in shown if r["wait"] == "unclassified"],
+        # Raised by WatchTower itself; whoever operates the queue can clear
+        # them with the command in the question. Listed, never hidden.
+        "system": [{"ref": r["ref"], "question": r["question"][:200]}
+                   for r in shown if r["wait"] == "system"],
         "recheck_due": [{"ref": r["ref"], "decide_by": r["decide_by"],
                          "decide_by_utc": r["decide_by_utc"],
                          "consequence": r["consequence"]}
@@ -290,6 +302,12 @@ def render(view: Dict[str, Any]) -> str:
                 # that was withdrawn, and what work is still owed).
                 extra = "  " + " ".join(r["note"].split())[:110]
             lines.append(f"    {r['ref']:<18} {r['wait']:<12}{extra}")
+    if view.get("system"):
+        lines.append("")
+        lines.append(f"Raised by WatchTower itself ({len(view['system'])}): a stage, plan or review step "
+                     f"stopped. Whoever runs the queue can clear these:")
+        for r in view["system"]:
+            lines.append(f"  {r['ref']:<18} " + " ".join(r["question"].split())[:110])
     if view["unclassified"]:
         lines.append("")
         lines.append(f"Unclassified ({len(view['unclassified'])}): no wait target recorded. They may "

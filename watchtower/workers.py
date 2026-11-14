@@ -428,6 +428,19 @@ ANNOUNCE_TICKET = (
 
 # Style contract for the mandatory close --summary, injected into both goal
 # templates. No braces: safe for the templates' .format() calls.
+# Every `wt block` says who it waits on, so the owner's list holds only what
+# needs the owner. Wording only: it grants nothing. No braces (see above).
+WAIT_TARGET_CONTRACT = (
+    "WAIT TARGET: every `wt block` names who it waits on with `--wait-on`: "
+    "`owner` for a decision only the owner can make; `external --wait-actor "
+    "NAME` for a client, staff member or vendor; `dependency --wait-ref REF` "
+    "for another ticket (add `--wait-ref-host` when that ticket lives on "
+    "another machine); `worker` for work another session is doing. Pick the "
+    "one that is true; do not default to `owner`. For an owner wait also "
+    "pass `--decide-by` (ISO time with a UTC offset, or `none`) and "
+    "`--if-unanswered` (what happens if nobody answers, or `none`). This "
+    "does not change what needs the owner's approval. "
+)
 MINOR_BLOCK_CONTRACT = (
     "BEFORE BLOCKING: first check whether this is an implementation choice "
     "you are already authorized to make. If it is cheap to undo, does not "
@@ -618,7 +631,7 @@ DRAIN_GOAL_TEMPLATE = (
     "close it and do NOT guess: run `wt block <ref> --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
     "figured out so far\"`, then move on to the next ticket. "
-    + MINOR_BLOCK_CONTRACT +
+    + MINOR_BLOCK_CONTRACT + WAIT_TARGET_CONTRACT +
     "LEARNINGS: after each `wt close` or `wt block`, append at most one "
     "dated line to ~/.watchtower/learnings/{queue}.pending.md -- only if "
     "the turn produced a genuinely new hard-won fact (append-only, never "
@@ -666,7 +679,7 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "close it and do NOT guess: run `wt block {ref} --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
     "figured out so far\"`. "
-    + MINOR_BLOCK_CONTRACT +
+    + MINOR_BLOCK_CONTRACT + WAIT_TARGET_CONTRACT +
     "Either way -- closed or blocked -- STOP once this one ticket is "
     "resolved. Do NOT claim another ticket, do NOT poll, do NOT wait for new "
     "work. End your turn. "

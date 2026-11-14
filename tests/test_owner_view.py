@@ -355,3 +355,29 @@ def test_unreadable_queue_is_an_error_or_a_warning_never_an_empty_view(env, monk
     view = ov.snapshot()                                            # all queues: degrade, loudly
     assert view["incomplete"] and "rate limit" in view["warnings"][0]
     assert "WARNING:" in ov.render(view) and view["blocked"] == 1
+
+
+def test_blocks_raised_by_watchtower_itself_are_listed_as_system_not_unclassified(env):
+    """A stage/plan/review block gets no wait record (that would change who is
+    notified), but it is not a worker forgetting to say who it waits on."""
+    q, _cli, _a, ov, name = env
+    sysref = _ticket(q, name, "stage died")
+    q.block(sysref, "", origin="stage", question="Could not spawn the verifier. File a verdict.")
+    worker = _ticket(q, name, "worker said nothing", "w2")
+    q.block(worker, session_id="w2", question="?", origin="worker")
+    view = ov.build(q.list_items(), project=name, now=NOW)
+    assert q.get(sysref)["block_origin"] == "stage" and q.current_wait(q.get(sysref)) is None
+    assert [r["ref"] for r in view["system"]] == [sysref]
+    assert view["unclassified"] == [worker]                      # still visible, still unknown
+    assert view["counts"]["system"] == 1 and view["counts"]["unclassified"] == 1
+    assert "Raised by WatchTower itself (1)" in ov.render(view)
+    q.set_wait(sysref, "owner", note="needs a force-accept decision")   # an explicit wait wins
+    assert _rows(ov.build(q.list_items(), project=name, now=NOW))[sysref]["wait"] == "owner"
+
+
+def test_worker_briefs_tell_workers_to_name_a_wait_target():
+    from watchtower import workers
+    assert "--wait-on" in workers.WAIT_TARGET_CONTRACT and "{" not in workers.WAIT_TARGET_CONTRACT
+    assert "does not change what needs the owner's approval" in workers.WAIT_TARGET_CONTRACT
+    src = open(workers.__file__).read()
+    assert src.count("+ MINOR_BLOCK_CONTRACT + WAIT_TARGET_CONTRACT +") == 2

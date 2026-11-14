@@ -60,7 +60,7 @@ def deep_brief(item: Dict[str, Any]) -> str:
         "the data (hot vs archive), change the UX so the slow path is not on the "
         "critical path. Read the Product constraints section of the queue "
         "learnings file first -- the owner's past decisions live there. If the "
-        "best option needs a product decision, `wt block` with the memo as the "
+        "best option needs a product decision, `wt block --wait-on owner` with the memo as the "
         "question (recommended option first) instead of guessing; record the "
         "owner's answer as a Product constraints line in the learnings file.",
         "",

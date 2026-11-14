@@ -211,7 +211,7 @@ def _answer_prompt(item: Dict[str, Any], pa: Dict[str, Any]) -> str:
             f"{text}.{_carried_text(pa, item)} Apply it, finish the ticket, and close it with "
             f"`wt close {ref} --worker <your-id> --summary \"...\" --commit <SHA>` (or "
             f"`--no-code` if no code changed). If it still cannot be resolved, run `wt block` "
-            f"again with the new open question.")
+            f"again with the new open question and `--wait-on` naming who it now waits on.")
 
 
 def _answered_label(pa: Dict[str, Any]) -> str:
