@@ -3328,6 +3328,36 @@ def cmd_policy(args: argparse.Namespace) -> int:
     return 0
 
 
+def _wait_extra(args: argparse.Namespace) -> Dict[str, str]:
+    """Optional wait context from the CLI flags (owner root/decide-by/
+    consequence, dependency ref host); {} when none was passed."""
+    out = {"root": getattr(args, "wait_root", ""), "decide_by": getattr(args, "decide_by", ""),
+           "consequence": getattr(args, "if_unanswered", ""),
+           "ref_host": getattr(args, "wait_ref_host", "")}
+    return {k: str(v).strip() for k, v in out.items() if str(v or "").strip()}
+
+
+def _wait_target_hint(args: argparse.Namespace, item: dict) -> str:
+    """Compatibility-first nudge (never an error): say what an unlabelled or
+    context-free block looks like in the owner view."""
+    if getattr(args, "kind", "input") != "input":
+        return ""
+    on = getattr(args, "wait_on", "") or ""
+    if not on:
+        return ("note: no --wait-on given. Older readers treat this as waiting on the owner; "
+                "`wt owner-view` lists it as unclassified. Say who it waits on: "
+                f"wt wait-on {item.get('ref')} --on owner|external|dependency|worker")
+    if on == "owner":
+        w = item.get("wait") or {}
+        missing = [flag for key, flag in (("decide_by", "--decide-by"), ("consequence", "--if-unanswered"))
+                   if not w.get(key)]
+        if missing:
+            return (f"note: owner wait without {' / '.join(missing)}. Add the latest safe time "
+                    "to act (ISO 8601 with a UTC offset, or 'none') and what happens if nobody "
+                    "answers (or 'none'), so the owner can tell urgent from held.")
+    return ""
+
+
 def cmd_block(args: argparse.Namespace) -> int:
     """A worker parks a ticket that needs a human decision (WT-28). Stays
     in_progress, bound to its session; flagged needs_input with a question.
@@ -3362,6 +3392,7 @@ def cmd_block(args: argparse.Namespace) -> int:
             wait_actor=getattr(args, "wait_actor", "") or "",
             wait_ref=getattr(args, "wait_ref", "") or "",
             force=bool(getattr(args, "force", False)),
+            wait_extra=_wait_extra(args),
         )
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -3376,6 +3407,9 @@ def cmd_block(args: argparse.Namespace) -> int:
         print(json.dumps(q.get(item["ref"]) or item, indent=2))
         return 0
     print(f"BLOCKED: {item['ref']} — {item.get('block_question') or '(no question)'}")
+    hint = _wait_target_hint(args, item)
+    if hint:
+        print(f"  {hint}", file=sys.stderr)
     if auto_note:
         print(f"  {auto_note}")
     if item.get("status") == q.PARKED_STATUS:
@@ -3397,7 +3431,7 @@ def cmd_wait_on(args: argparse.Namespace) -> int:
     legacy block in place; history keeps every earlier record."""
     try:
         item = q.set_wait(args.ref, args.on, actor=args.actor, ref=args.wait_ref,
-                          note=args.note, by=args.worker)
+                          note=args.note, by=args.worker, extra=_wait_extra(args))
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
@@ -3410,6 +3444,18 @@ def cmd_wait_on(args: argparse.Namespace) -> int:
     w = item.get("wait") or {}
     who = w.get("actor") or w.get("ref") or ""
     print(f"WAITING: {item['ref']} on {w.get('on')}{(' — ' + who) if who else ''}")
+    return 0
+
+
+def cmd_owner_view(args: argparse.Namespace) -> int:
+    """Blocked tickets by who they really wait on, grouped by root, for any
+    backend. Read-only; recovery (`wt blocked`, liveness) is unaffected."""
+    from . import owner_view
+    view = owner_view.snapshot(project=args.queue)
+    if args.json:
+        print(json.dumps(view, indent=2))
+        return 0
+    print(owner_view.render(view))
     return 0
 
 
@@ -3575,6 +3621,7 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
     sid = item.get("claimed_session_id")
     if not sid:
         return 0
+    prompt += answers.rules_notice(item)
     prompt += answers.ownership_check(str(item.get("ref") or ""),
                                       str(item.get("claimed_by") or ""))  # WT-23
     # Context-budget escalation for the answer-resume path. Resuming the
@@ -7044,6 +7091,7 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "find"),
     ("Tickets", "ls"),
     ("Tickets", "blocked"),
+    ("Tickets", "owner-view"),
     ("Tickets", "gated"),
     ("Tickets", "answer"),
     ("Tickets", "ack"),
@@ -7103,6 +7151,7 @@ COMMAND_HELP: Dict[str, str] = {
     "block": "park a ticket that needs a human decision",
     "defer": "take a ticket out of the pool until a data window ends (no human needed)",
     "wait-on": "say who a blocked ticket waits on: owner, external actor, dependency or worker",
+    "owner-view": "blocked tickets by who they really wait on, grouped by root (any backend, read-only)",
     "blocked": "list tickets parked for a human",
     "gated": "product-gate pitches awaiting your Ack/Nack",
     "ack": "approve a product-gate pitch (Ack); resolution-caveat acks moved to unresolved-ack",
@@ -7987,6 +8036,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="who, for --wait-on external (e.g. the client's name)")
     s.add_argument("--wait-ref", dest="wait_ref", default="",
                    help="the blocking ticket ref for --wait-on dependency (e.g. OPS-167)")
+    s.add_argument("--wait-ref-host", dest="wait_ref_host", default="",
+                   help="dependency wait: the host whose local queue holds --wait-ref, when it "
+                        "is not this one (local queues are per host)")
+    s.add_argument("--root", dest="wait_root", default="",
+                   help="owner wait: the ticket whose decision this one really hangs on "
+                        "(one answer there settles this too)")
+    s.add_argument("--decide-by", dest="decide_by", default="",
+                   help="owner wait: latest safe time to act, ISO 8601 WITH a UTC offset "
+                        "(2026-11-17T09:00:00-08:00), or 'none'. When it passes the ticket is "
+                        "flagged for a re-check; it is never treated as handled")
+    s.add_argument("--if-unanswered", dest="if_unanswered", default="",
+                   help="owner wait: what happens if nobody answers (a named consequence), or 'none'")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_block)
@@ -7999,10 +8060,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--ref", dest="wait_ref", default="",
                    help="blocking ticket/handoff ref, for a dependency wait")
     s.add_argument("--note", default="", help="why / what evidence")
+    s.add_argument("--ref-host", dest="wait_ref_host", default="",
+                   help="dependency wait: the host whose local queue holds --ref, when it is "
+                        "not this one")
+    s.add_argument("--root", dest="wait_root", default="",
+                   help="owner wait: the ticket whose decision this one really hangs on "
+                        "(one answer there settles this too)")
+    s.add_argument("--decide-by", dest="decide_by", default="",
+                   help="owner wait: latest safe time to act, ISO 8601 WITH a UTC offset "
+                        "(2026-11-17T09:00:00-08:00), or 'none'. When it passes the ticket is "
+                        "flagged for a re-check; it is never treated as handled")
+    s.add_argument("--if-unanswered", dest="if_unanswered", default="",
+                   help="owner wait: what happens if nobody answers (a named consequence), or 'none'")
     s.add_argument("--worker", default="", help="your worker id (blank = human)")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_wait_on)
+
+    s = sub.add_parser("owner-view", help=COMMAND_HELP.get("owner-view", ""))
+    s.add_argument("-q", "--queue", default=None, help="one queue (default: all)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_owner_view)
 
     s = sub.add_parser("defer", help=COMMAND_HELP.get("defer", ""))
     s.add_argument("ref")

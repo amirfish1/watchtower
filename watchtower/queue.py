@@ -178,12 +178,70 @@ BLOCK_KINDS = ("input", "rationale", "awaiting-client")
 WAIT_ON = ("owner", "external", "dependency", "worker")
 
 
+# Owner-wait context (optional, owner waits only): ``root`` = the ticket whose
+# decision this one really hangs on; ``decide_by`` = the latest safe moment to
+# act (ISO 8601 WITH a UTC offset, or the literal "none"); ``consequence`` =
+# what happens if nobody answers (or "none"). A passed ``decide_by`` is a
+# reason to re-check the facts -- never evidence the matter was handled.
+WAIT_OWNER_FIELDS = ("root", "decide_by", "consequence")
+
+
+def parse_decide_by(value: Any) -> Optional[datetime]:
+    """``decide_by`` as an aware datetime; None for ""/"none". Raises
+    ValueError for a date without a time zone: "Tuesday 9 AM" in which zone
+    is exactly the ambiguity this field exists to remove."""
+    raw = str(value or "").strip()
+    if not raw or raw.lower() == "none":
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00").replace("z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"decide-by must be ISO 8601 with a UTC offset "
+                         f"(e.g. 2026-11-17T09:00:00-08:00) or 'none', not {raw!r}")
+    if dt.tzinfo is None or dt.utcoffset() is None:
+        raise ValueError(f"decide-by needs a time zone offset (e.g. -08:00 or Z): {raw!r}")
+    return dt
+
+
+def wait_owner_fields(on: str, extra: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    """Validate the optional owner-wait context; {} when none was given."""
+    on = str(on or "").strip().lower()
+    out: Dict[str, str] = {}
+    # Dependency waits only: the host whose LOCAL queue holds ``ref``. Local
+    # queues are per host, so OPS-12 here and OPS-12 on another machine are
+    # different tickets; naming the host stops a same-number ticket on the
+    # wrong machine from ever answering this wait.
+    ref_host = str((extra or {}).get("ref_host") or "").strip()
+    if ref_host:
+        if on != "dependency":
+            raise ValueError("ref-host names where a dependency's ticket lives: "
+                             "pass it with a dependency wait")
+        out["ref_host"] = _clip(ref_host, 80)
+    given = {k: str((extra or {}).get(k) or "").strip() for k in WAIT_OWNER_FIELDS}
+    given = {k: v for k, v in given.items() if v}
+    if not given:
+        return out
+    if on != "owner":
+        raise ValueError("root / decide-by / if-unanswered describe an owner wait: "
+                         "pass --wait-on owner (or wt wait-on --on owner)")
+    if "root" in given:
+        out["root"] = _clip(given["root"].upper(), 80)
+    if "decide_by" in given:
+        parse_decide_by(given["decide_by"])
+        out["decide_by"] = "none" if given["decide_by"].lower() == "none" else given["decide_by"]
+    if "consequence" in given:
+        out["consequence"] = _clip(given["consequence"], 600)
+    return out
+
+
 def wait_record(on: str, actor: str = "", ref: str = "", note: str = "",
-                block_at: str = "", by: str = "") -> Dict[str, Any]:
+                block_at: str = "", by: str = "",
+                extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Validated ``wait`` metadata for one block generation (CCC-244)."""
     on = str(on or "").strip().lower()
     if on not in WAIT_ON:
         raise ValueError(f"wait-on must be one of {', '.join(WAIT_ON)}, not {on!r}")
+    owner_fields = wait_owner_fields(on, extra)
     rec: Dict[str, Any] = {"on": on, "at": _now_iso(), "block_at": str(block_at or ""),
                            "revision": uuid.uuid4().hex,
                            # A local-queue ref means a ticket on THIS host (OPS-230).
@@ -196,6 +254,7 @@ def wait_record(on: str, actor: str = "", ref: str = "", note: str = "",
         rec["note"] = _clip(str(note).strip(), 2000)
     if by:
         rec["by"] = _clip(str(by), 120)
+    rec.update(owner_fields)
     return rec
 
 
@@ -8232,6 +8291,7 @@ def block(
     wait_ref: str = "",
     force: bool = False,
     expect: Optional[Dict[str, Any]] = None,
+    wait_extra: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Park a ticket that needs a human decision.
 
@@ -8267,7 +8327,9 @@ def block(
     """
     kind = kind if kind in ("input", "rationale", "awaiting-client") else "input"
     if wait_on:
-        wait_record(wait_on)   # validate before any write
+        wait_record(wait_on, extra=wait_extra)   # validate before any write
+    else:
+        wait_owner_fields("", wait_extra)   # owner context without an owner wait: refuse
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         if origin == "worker" and session_id and not force:
@@ -8277,7 +8339,7 @@ def block(
         item = backend.block(
             ident, session_id=session_id, question=question, progress=progress,
             kind=kind, wait_on=wait_on, wait_actor=wait_actor, wait_ref=wait_ref,
-            expect=expect,
+            expect=expect, wait_extra=wait_extra,
         )
         if item and origin == "worker" and item.get("pipeline_local"):
             item = _github_park(ident, str(session_id), item) or item
@@ -8320,7 +8382,8 @@ def block(
                 it["updated_at"] = now
                 if wait_on:
                     it["wait"] = wait_record(wait_on, wait_actor, wait_ref,
-                                             block_at=block_at, by=str(session_id or ""))
+                                             block_at=block_at, by=str(session_id or ""),
+                                             extra=wait_extra)
                 else:
                     it.pop("wait", None)
                 if commit:
@@ -8375,7 +8438,7 @@ def block(
 
 
 def set_wait(ident: Any, on: str, actor: str = "", ref: str = "", note: str = "",
-             by: str = "") -> Optional[Dict[str, Any]]:
+             by: str = "", extra: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     """Say who the CURRENT block is waiting on, without re-blocking (CCC-244).
 
     Corrects a legacy or mis-labelled block in place: ``needs_input``, the
@@ -8384,10 +8447,10 @@ def set_wait(ident: Any, on: str, actor: str = "", ref: str = "", note: str = ""
     current ``blocked_at`` so a later block generation supersedes it. Raises
     ValueError when the ticket is not blocked or ``on`` is invalid.
     """
-    wait_record(on)
+    wait_record(on, extra=extra)
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
-        item = backend.set_wait(ident, on, actor=actor, ref=ref, note=note, by=by)
+        item = backend.set_wait(ident, on, actor=actor, ref=ref, note=note, by=by, extra=extra)
         if item:
             _log("WAIT", f"{item.get('ref', ident)} — on {on} {actor or ref}".rstrip(),
                  queue=item.get("project", ""))
@@ -8400,7 +8463,8 @@ def set_wait(ident: Any, on: str, actor: str = "", ref: str = "", note: str = ""
                     raise ValueError(f"{it.get('ref', ident)} is not blocked; nothing is waiting")
                 now = _now_iso()
                 it["wait"] = wait_record(on, actor, ref, note,
-                                         block_at=str(it.get("blocked_at") or ""), by=by)
+                                         block_at=str(it.get("blocked_at") or ""), by=by,
+                                         extra=extra)
                 it["updated_at"] = now
                 _append_history(
                     it, "wait", by=_by("worker" if by else "human", str(by or "")), at=now,

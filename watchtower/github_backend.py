@@ -3851,6 +3851,7 @@ class GitHubIssuesBackend:
         wait_actor: str = "",
         wait_ref: str = "",
         expect: Optional[Dict[str, Any]] = None,
+        wait_extra: Optional[Dict[str, Any]] = None,
         **_ignored: Any,
     ) -> Optional[Dict[str, Any]]:
         """Record a worker's request for input on a GitHub-backed ticket.
@@ -3883,7 +3884,8 @@ class GitHubIssuesBackend:
         meta["block_kind"] = kind if kind in _q.BLOCK_KINDS else "input"
         if wait_on:
             meta["wait"] = _q.wait_record(wait_on, wait_actor, wait_ref,
-                                          block_at=now, by=str(session_id or ""))
+                                          block_at=now, by=str(session_id or ""),
+                                          extra=wait_extra)
         else:
             meta.pop("wait", None)
         if session_id:
@@ -3940,6 +3942,7 @@ class GitHubIssuesBackend:
         ref: str = "",
         note: str = "",
         by: str = "",
+        extra: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         """Say who the current block waits on, without re-blocking (CCC-244).
         Body metadata only: no issue comment, the question stays as asked."""
@@ -3951,7 +3954,8 @@ class GitHubIssuesBackend:
         if not meta.get("needs_input") or item.get("status") == "closed":
             raise ValueError(f"{item.get('ref', ident)} is not blocked; nothing is waiting")
         meta["wait"] = _q.wait_record(on, actor, ref, note,
-                                      block_at=str(meta.get("blocked_at") or ""), by=by)
+                                      block_at=str(meta.get("blocked_at") or ""), by=by,
+                                      extra=extra)
         _append_history(
             meta, "wait", kind="worker" if by else "human", worker=str(by or ""),
             wait_on=meta["wait"]["on"], wait_actor=meta["wait"].get("actor", ""),

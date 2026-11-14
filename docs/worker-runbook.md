@@ -256,11 +256,46 @@ otherwise, so name the actor whenever the owner is not the one who must act:
   handoff (neutral).
 - `--wait-on worker`: the decision is already made and only worker time is
   missing (amber).
-- `--wait-on owner` (or no flag): a decision only the owner can make (red).
+- `--wait-on owner`: a decision only the owner can make (red).
+
+Always pass `--wait-on`. A block without it still works and older readers
+still treat it as an owner wait, but `wt block` prints a note and
+`wt owner-view` lists it as **unclassified**: visible, and nobody can tell
+whether it needs the owner.
 
 `wt wait-on REF --on external --actor "Sonia" --note "..."` corrects the
 current block in place (no new question, history kept). A later `wt block`
-without `--wait-on` resets the ticket to an owner wait.
+without `--wait-on` drops the wait record again.
+
+**Owner waits carry three more facts**, so the owner can tell urgent from held:
+
+```bash
+wt block REF --worker ID --question "..." --wait-on owner \
+  --decide-by 2026-11-17T09:00:00-08:00 \
+  --if-unanswered "Client arrives for a class booked as the wrong type" \
+  --root BECKY-3041
+```
+
+- `--decide-by`: the latest safe time to act, ISO 8601 **with a UTC offset**
+  (a time without a zone is refused), or `none` when there is no deadline.
+- `--if-unanswered`: the named real-world consequence, or `none`. "Pending
+  permission" is not a consequence.
+- `--root`: the ticket whose decision this one really hangs on, when the same
+  answer settles several tickets. Omit it when this ticket is its own root.
+
+When `--decide-by` passes, the ticket is flagged for a re-check of the facts.
+It stays blocked and open: a passed time never means handled, expired or
+safe to close. None of these fields grants or removes authority.
+
+**A dependency on another host's local queue** names that host:
+`--wait-on dependency --wait-ref OPS-1635 --wait-ref-host ami` (or
+`wt wait-on REF --on dependency --ref OPS-1635 --ref-host ami`). Local queues
+are per host, so without it the wait resolves only on the host that recorded
+it, and a same-number ticket elsewhere must never answer it.
+
+`wt owner-view [-q QUEUE] [--json]` shows every blocked ticket by who it
+really waits on, grouped by root, on file and GitHub queues alike. It reads
+the current wait record, not the question text, and changes nothing.
 
 ## Minor blocks: proposing an auto-decision (CCC-370)
 

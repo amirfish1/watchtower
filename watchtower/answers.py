@@ -155,8 +155,17 @@ def ownership_check(ref: str, worker_id: str) -> str:
             f"so stop, change nothing more, and do not commit or close it.")
 
 
+def rules_notice(item: Dict[str, Any]) -> str:
+    """Rule files revised since the block (see rule_revision); never fatal."""
+    try:
+        from . import rule_revision
+        return rule_revision.notice(item)
+    except Exception:  # noqa: BLE001 - a notice must never stop an answer
+        return ""
+
+
 def answer_prompt(item: Dict[str, Any], pa: Dict[str, Any]) -> str:
-    return _answer_prompt(item, pa) + ownership_check(
+    return _answer_prompt(item, pa) + rules_notice(item) + ownership_check(
         str(item["ref"]), str(pa.get("prior_worker_id") or ""))
 
 
@@ -490,7 +499,9 @@ def _foreign_local_ref(it: Dict[str, Any], dep: Dict[str, Any], w: Dict[str, Any
         return False
     if config.backend(q._norm_project(it.get("project"))) != "github":
         return False
-    return _wait_host(it, w) != q.machine_tag()
+    # An explicit ``ref_host`` names where the local dependency lives; without
+    # it the only safe reading is the host that recorded the wait.
+    return str(w.get("ref_host") or _wait_host(it, w)) != q.machine_tag()
 
 
 def resume_dependency_waits(items: Optional[List[Dict[str, Any]]] = None) -> List[str]:
