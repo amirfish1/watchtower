@@ -1531,6 +1531,10 @@ def _history_id(entry: Any) -> str:
     digest = entry.get("text_sha256") or (
         _text_sha256(str(entry["text"])) if "text" in entry else "")
     rest = {k: v for k, v in entry.items() if k not in _TEXT_REF_KEYS}
+    if entry.get("event") == "auto_decision" and entry.get("decision_id"):
+        # The same receipt retried on another host has a new recording time;
+        # retain one exact payload when the body writer merges their history.
+        rest.pop("at", None)
     return json.dumps([rest, digest], sort_keys=True, default=str)
 
 
@@ -4255,6 +4259,20 @@ class GitHubIssuesBackend:
                                     original=value.get("ref"), passed=value.get("complete"),
                                     original_status=value.get("status"),
                                     stale=value.get("stale"))
+            elif key == "_system_history":
+                event, extra = value
+                if event == "auto_decision":
+                    from .auto_decision_receipts import verify_decision_content
+                    if verify_decision_content(item, {"event": event, "by": {"kind": "system"}, **extra}) != extra.get("revision"):
+                        raise ValueError("ticket changed before receipt persistence")
+                decision_id = extra.get("decision_id")
+                matches = [h for h in meta.get("history", []) if decision_id and
+                           h.get("event") == event and h.get("decision_id") == decision_id]
+                if matches:
+                    if len(matches) != 1 or any(matches[0].get(k) != v for k, v in extra.items()):
+                        raise ValueError("conflicting system decision receipt")
+                else:
+                    _append_history(meta, event, by={"kind": "system"}, **extra)
             elif key == "_history":
                 event, extra = value
                 _append_history(meta, event, **extra)

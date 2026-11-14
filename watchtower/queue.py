@@ -8659,9 +8659,32 @@ def auto_answer(ident: Any, text: str, *, expect_blocked_at: str, decision: Dict
         item = backend.answer(ident, prompt, session_id="", kind="system")
         if not item:
             return None
-        _gh_history(ident, "auto_decision", text=_clip(prompt, 4000),
-                    decision_id=f"{cur.get('ref')}@{expect_blocked_at}",
-                    blocked_at=expect_blocked_at, revision=revision, **decision)
+        # The answer comment itself changes GitHub ticket text. Prove that
+        # exact mutation, and nothing else, before recording usable authority.
+        from .auto_decision_receipts import answer_content_proof
+        try:
+            fresh = backend.get(ident)
+            blocks = [h for h in (fresh or {}).get("history", []) if h.get("event") == "block"]
+            if not blocks or blocks[-1].get("at") != expect_blocked_at or fresh.get("needs_input"):
+                raise ValueError("block generation changed during answer delivery")
+            source_revision, proof = answer_content_proof(fresh, prompt)
+            if source_revision != revision:
+                raise ValueError("ticket source/discussion changed during answer delivery")
+            saved = _gh_history(ident, "auto_decision", text=_clip(prompt, 4000),
+                                decision_id=f"{cur.get('ref')}@{expect_blocked_at}",
+                                blocked_at=expect_blocked_at, revision=revision, **proof, **decision)
+            if not saved:
+                raise ValueError("system auto_decision receipt was not persisted")
+            from .auto_decision_receipts import verify_decision_content
+            after = backend.get(ident)
+            events = [h for h in (after or {}).get("history", []) if h.get("event") == "auto_decision"
+                      and h.get("decision_id") == f"{cur.get('ref')}@{expect_blocked_at}"]
+            if len(events) != 1 or verify_decision_content(after, events[0]) != revision:
+                raise ValueError("receipt persistence or concurrent source edit failed verification")
+        except Exception as exc:
+            _log("AUTO_DECISION", f"{cur.get('ref')}: answer delivered WITHOUT usable approval receipt: {exc}",
+                 queue=cur.get("project", ""))
+            return None
         _log("AUTO_DECISION", f"{cur.get('ref', '?')} — {_clip(text, 200)}", queue=cur.get("project", ""))
         return item
     with _FileLock(_lock_path()):
@@ -8753,17 +8776,37 @@ def get_block_proposal(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _gh_history(ident: Any, event: str, **fields: Any) -> None:
-    """Best effort: append a history event to a GitHub-backed ticket's sidecar."""
+def _gh_history(ident: Any, event: str, **fields: Any) -> bool:
+    """Persist a real system audit, including ungated GitHub tickets.
+
+    Decision IDs are idempotent; mismatched retries fail rather than replace a
+    receipt. A failure is visible to auto_answer, which returns no approval.
+    """
     from . import github_pipeline
     def _fn(it: Dict[str, Any]) -> Any:
+        if event == "auto_decision":
+            from .auto_decision_receipts import verify_decision_content
+            if verify_decision_content(it, {"event": event, "by": _by("system"), **fields}) != fields.get("revision"):
+                raise ValueError("ticket changed before receipt persistence")
+        decision_id = fields.get("decision_id")
+        matches = [h for h in it.get("history", []) if decision_id and
+                   h.get("event") == event and h.get("decision_id") == decision_id]
+        if matches:
+            if len(matches) != 1 or any(matches[0].get(k) != v for k, v in fields.items()):
+                raise ValueError("conflicting system decision receipt")
+            return "skip"
         _append_history(it, event, by=_by("system"), at=_now_iso(), **fields)
         return None
     try:
-        github_pipeline.mutate(ident, _fn)
-    except Exception as exc:  # noqa: BLE001 - audit trail is best effort here
-        _log("AUTO_DECISION", f"{ident}: sidecar history for {event} not written: {exc}",
+        if github_pipeline.mutate(ident, _fn, skip_returns_item=True) is None:
+            backend = _github_backend_for_project(_project_from_ident(ident))
+            if backend is None or backend.update(ident, _system_history=(event, fields)) is None:
+                raise RuntimeError("system history event was not persisted")
+        return True
+    except Exception as exc:  # receipt failure is never silently usable approval
+        _log("AUTO_DECISION", f"{ident}: system history for {event} NOT persisted: {exc}",
              queue=_project_from_ident(ident))
+        return False
 
 
 def _gh_card_text(ident: Any, text: str) -> None:
