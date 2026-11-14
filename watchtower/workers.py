@@ -6788,7 +6788,7 @@ def reconcile_once(dry_run: bool = False,
     depth=0, or surplus resolved elsewhere).  In ``dry_run`` mode no subprocesses
     are started; the return value shows what *would* happen.
 
-    Passes are serialized under a cross-process file lock. The daemon tick and
+    Staffing is serialized under a cross-process file lock. The daemon tick and
     ``dispatch_after_enqueue`` (``wt add``) can reconcile concurrently; without
     the lock both read the same live count and each spawns the full desired
     delta, over-spawning the queue (WT-75: 4 spawned for desired=2).
@@ -6804,7 +6804,12 @@ def reconcile_once(dry_run: bool = False,
     made a ▶ take ~13 s to reach SPAWN_PLAN.
     """
     from .queue import _FileLock
-    with _FileLock(WORKERS_FILE.parent / "reconcile.lock"):
+    # Fleet maintenance can spend minutes observing old sessions. It has its
+    # own lock: a newly filed ticket must not wait behind that work. Scoped
+    # passes and the full pass still share the staffing lock when counting
+    # live workers and publishing launches.
+    lock_name = "reconcile.lock" if only_queue else "reconcile-maintenance.lock"
+    with _FileLock(WORKERS_FILE.parent / lock_name):
         return _reconcile_once_locked(dry_run, only_queue=only_queue,
                                       supervise_stages=supervise_stages)
 
@@ -6992,8 +6997,8 @@ def _reconcile_once_locked(dry_run: bool = False,
                               "reconcile_id": reconcile_id}
 
     from . import takeover
-    result["takeover_candidates"] = [] if dry_run else takeover.enroll_candidates()
-    result["takeovers"] = takeover.reconcile(dry_run=dry_run)
+    result["takeover_candidates"] = [] if dry_run or only_queue else takeover.enroll_candidates()
+    result["takeovers"] = [] if only_queue else takeover.reconcile(dry_run=dry_run)
 
     requeued_queues: Set[str] = set()
     staffing_before = list_workers(prune=False)
@@ -7158,6 +7163,22 @@ def _reconcile_once_locked(dry_run: bool = False,
             result["ledger_backfilled"] = backfill_worker_session_ledger()
         except Exception:
             pass
+
+    staffing_args = (dry_run, only_queue, result, reconcile_id, staffing_before,
+                     eligible_before_by_q, dead_before_by_q, requeued_queues)
+    if only_queue:
+        # The scoped caller already owns the staffing lock.
+        return _reconcile_staffing_locked(*staffing_args)
+    from .queue import _FileLock
+    with _FileLock(WORKERS_FILE.parent / "reconcile.lock"):
+        return _reconcile_staffing_locked(*staffing_args)
+
+
+def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffing_before,
+                               eligible_before_by_q, dead_before_by_q,
+                               requeued_queues):
+    """Read current capacity and register launches under the staffing lock."""
+    from . import config, health
 
     all_cfg = config.all_queues()
     released_by_q: Dict[str, List[Dict[str, Any]]] = {}

@@ -346,11 +346,13 @@ def test_candidate_eligible_then_cancelled_is_suppressed(env):
     assert t.enroll_candidates()[0]['state']=='ineligible'
 
 
-def test_scope_only_reconcile_runs_takeover(env,monkeypatch):
+def test_scope_only_reconcile_leaves_takeover_to_periodic_pass(env,monkeypatch):
     from watchtower import workers
     seen=[]
     monkeypatch.setattr(t,'reconcile',lambda **kw:seen.append(kw) or [])
     workers.reconcile_once(dry_run=True,only_queue='UNRELATED',supervise_stages=False)
+    assert seen==[]
+    workers.reconcile_once(dry_run=True,supervise_stages=False)
     assert seen==[dict(dry_run=True)]
 
 

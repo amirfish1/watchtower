@@ -694,6 +694,61 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
     assert any("staffed=2==desired=2" in s["reason"] for s in skips)
 
 
+def test_scoped_dispatch_fills_slots_during_fleet_maintenance(wt, monkeypatch):
+    """Slow session supervision must not block two ready tickets behind one
+    busy worker; the later periodic pass must see those launches, not duplicate them."""
+    from watchtower import takeover
+
+    wt.config.set_auto_drain("Q", True)
+    wt.config.set_desired_workers("Q", 3)
+    busy = _live_worker(wt, "Q")
+    held = wt.q.enqueue(project="Q", note="held")
+    wt.q.claim_by_ref(held["ref"], busy["worker_id"])
+    for _ in range(2):
+        wt.q.enqueue(project="Q", note="waiting")
+    entered, release = threading.Event(), threading.Event()
+    results, errors = {}, []
+
+    def maintenance(**kwargs):
+        entered.set()
+        assert release.wait(20), "test did not release maintenance"
+        return []
+
+    def spawn(queue, n=1, engine="claude", **kwargs):
+        return [wt.workers.record_worker(
+            os.getpid(), queue, engine, f"new-{i}", str(wt.tmp),
+            str(wt.tmp / f"new-{i}.log")) for i in range(n)]
+
+    def run(name, **kwargs):
+        try:
+            results[name] = wt.workers.reconcile_once(**kwargs)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(takeover, "reconcile", maintenance)
+    monkeypatch.setattr(wt.workers, "spawn_workers", spawn)
+    # Dry-run full pass still executes takeover observation, without unrelated
+    # maintenance side effects. The scoped pass performs real registry writes.
+    full = threading.Thread(target=run, args=("full",), kwargs={"dry_run": True})
+    scoped = threading.Thread(target=run, args=("scoped",), kwargs={"only_queue": "Q"})
+    full.start()
+    try:
+        assert entered.wait(5)
+        scoped.start()
+        scoped.join(10)
+        assert not scoped.is_alive(), "dispatch waited for fleet maintenance"
+        assert not errors
+        assert len(results["scoped"]["spawned"]) == 2
+    finally:
+        release.set()
+        full.join(20)
+        if scoped.ident:
+            scoped.join(20)
+    assert not full.is_alive() and not errors
+    assert results["full"]["spawned"] == []
+    assert wt.workers.live_worker_count("Q") == 3
+
+
 def test_reconcile_launch_failure_cooldown_blocks_spawn_storm(wt, monkeypatch):
     """A Codex quota failure exits after creating a session. Reconcile must not
     create a fresh cloud session every tick while the reset/cooldown is active."""
