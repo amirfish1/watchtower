@@ -28,6 +28,22 @@ from . import queue as q
 
 KINDS = ("owner", "unclassified", "external", "dependency", "worker")
 _MAX_CHAIN = 25
+_UNRESOLVED = ("not_found_here", "other_host", "no_ref")
+
+
+def _foreign_root(dep: Dict[str, Any]) -> str:
+    """Group name for a dependency this host cannot identify: ``REF@host``
+    when the host is known, ``REF@?`` when it is not. Deliberately not a bare
+    ref, so it can never collide with (or borrow facts from) a local ticket."""
+    ref = dep.get("ref") or "(no ref)"
+    return f"{ref}@{dep.get('lives_on') or '?'}"
+
+
+def _instant(value: str) -> Optional[datetime]:
+    try:
+        return q.parse_decide_by(value)
+    except ValueError:
+        return None
 
 
 def classify(item: Dict[str, Any]) -> str:
@@ -90,8 +106,11 @@ def _row(item: Dict[str, Any], kind: str, now: datetime) -> Dict[str, Any]:
         try:
             due = q.parse_decide_by(decide_by)
             row["recheck_due"] = bool(due and due <= now)
+            row["decide_by_utc"] = (due.astimezone(timezone.utc).isoformat(timespec="seconds")
+                                    if due else "")
         except ValueError:
             row["recheck_due"] = False
+            row["decide_by_utc"] = ""
             row["decide_by_invalid"] = True
     return row
 
@@ -125,9 +144,13 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
             if row["wait"] == "dependency":
                 dep = _dep_lookup(it, q.current_wait(it) or {}, by_ref)
                 row["dependency"] = {k: v for k, v in dep.items() if k != "item"}
-                if dep["ref"] and dep["state"] not in ("no_ref",):
-                    cur = dep["ref"]
-                    continue
+                if dep["state"] in _UNRESOLVED:
+                    # Fail closed: the dependency is not a ticket this host can
+                    # identify. Never continue into a same-number local ticket;
+                    # the root is the host-qualified name, with no local data.
+                    return {"root": _foreign_root(dep), "via": seen[1:], "foreign": dep["state"]}
+                cur = dep["ref"]
+                continue
             return {"root": cur, "via": seen[1:]}
         return {"root": cur or ref, "via": seen[1:], "cycle": True}
 
@@ -139,15 +162,19 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
             row["root_cycle"] = True
         if want and q._norm_project(row["queue"]) != want:
             continue
-        g = groups.setdefault(found["root"], {"root": found["root"], "members": []})
+        g = groups.setdefault(found["root"], {"root": found["root"], "members": [],
+                                              "foreign": found.get("foreign", "")})
         g["members"].append(row)
 
     out_groups: List[Dict[str, Any]] = []
     for root, g in groups.items():
         members = sorted(g["members"], key=lambda r: (r["ref"] != root, r["ref"]))
-        root_item = by_ref.get(root)
-        root_row = rows.get(root)
-        if root_row is not None:
+        foreign = g["foreign"]
+        root_item = None if foreign else by_ref.get(root)
+        root_row = None if foreign else rows.get(root)
+        if foreign:
+            root_state = foreign
+        elif root_row is not None:
             root_state = f"blocked:{root_row['wait']}"
         elif root_item is not None:
             root_state = str(root_item.get("status") or "open")
@@ -161,9 +188,16 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
             "dependents": [r["ref"] for r in members if r["ref"].upper() != root],
             "needs_owner": counts["owner"] > 0 or root_state == "blocked:owner",
             "recheck_due": any(r.get("recheck_due") for r in members),
+            # Earliest decide-by among this root's owner waits, as a UTC
+            # instant (offsets differ, so strings must never be compared).
+            "decide_by_utc": min((r["decide_by_utc"] for r in members if r.get("decide_by_utc")),
+                                 default=""),
             "members": members,
         })
+    # Passed dates first, then owner roots by the earliest real instant
+    # (undated after dated), then everything else.
     out_groups.sort(key=lambda g: (not g["recheck_due"], not g["needs_owner"],
+                                   g["decide_by_utc"] == "", g["decide_by_utc"],
                                    -len(g["members"]), g["root"]))
 
     shown = [r for g in out_groups for r in g["members"]]
@@ -183,7 +217,17 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
         # Listed apart so nothing hides inside a group:
         "unclassified": [r["ref"] for r in shown if r["wait"] == "unclassified"],
         "recheck_due": [{"ref": r["ref"], "decide_by": r["decide_by"],
-                         "consequence": r["consequence"]} for r in shown if r.get("recheck_due")],
+                         "decide_by_utc": r["decide_by_utc"],
+                         "consequence": r["consequence"]}
+                        for r in sorted(shown, key=lambda r: r.get("decide_by_utc") or "")
+                        if r.get("recheck_due")],
+        # Owner waits with a future decide-by, soonest first. The reader picks
+        # its own horizon (the desk: before the digest after next).
+        "upcoming": [{"ref": r["ref"], "root": r["root_ref"], "decide_by": r["decide_by"],
+                      "decide_by_utc": r["decide_by_utc"], "consequence": r["consequence"]}
+                     for r in sorted(shown, key=lambda r: r.get("decide_by_utc") or "")
+                     if r["wait"] == "owner" and r.get("decide_by_utc") and not r["recheck_due"]],
+        "incomplete": False, "warnings": [],
         "owner_missing_context": [{"ref": r["ref"], "missing": r["missing"]} for r in shown
                                   if r["wait"] == "owner" and r.get("missing")],
         "stuck_dependencies": stuck,
@@ -192,7 +236,23 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
 
 
 def snapshot(project: Optional[str] = None) -> Dict[str, Any]:
-    return build(q.list_items(), project=project)
+    """The view over the live store. A queue that could not be read is never
+    shown as "nothing blocked": if the requested queue itself fails this
+    raises; if another queue fails the view is marked ``incomplete`` (its
+    tickets, and dependency lookups into it, are missing)."""
+    warnings: List[str] = []
+    if project:
+        q.list_items(project=project, strict=True)        # the asked-for queue must be readable
+    try:
+        items = q.list_items(strict=True)
+    except Exception as e:  # noqa: BLE001 - degrade to what can be read, loudly
+        warnings.append(f"some queues could not be read, so this view may miss tickets: "
+                        f"{' '.join(str(e).split())[:200]}")
+        items = q.list_items()
+    view = build(items, project=project)
+    view["incomplete"] = bool(warnings)
+    view["warnings"] = warnings
+    return view
 
 
 def render(view: Dict[str, Any]) -> str:
@@ -201,6 +261,8 @@ def render(view: Dict[str, Any]) -> str:
              + (f" in {view['queue']}" if view["queue"] else "")
              + f"  (owner {c['owner']}, unclassified {c['unclassified']}, dependency "
                f"{c['dependency']}, external {c['external']}, worker {c['worker']})"]
+    for w in view.get("warnings") or []:
+        lines.append(f"WARNING: {w}")
     if view["recheck_due"]:
         lines.append("")
         lines.append("Re-check now (the decide-by time has passed; this does NOT mean handled):")
@@ -217,6 +279,9 @@ def render(view: Dict[str, Any]) -> str:
             extra = ""
             if r["wait"] == "owner":
                 extra = f"  decide by {r.get('decide_by') or '(not set)'}"
+                if r.get("note"):
+                    # The current wait note can narrow or correct an older question.
+                    extra += "  now: " + " ".join(r["note"].split())[:90]
             elif r["wait"] == "dependency":
                 d = r.get("dependency") or {}
                 extra = f"  on {d.get('ref') or '(no ref)'} [{d.get('state', '?')}]"

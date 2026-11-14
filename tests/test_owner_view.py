@@ -208,8 +208,22 @@ def test_same_local_ref_on_two_hosts_wakes_only_on_the_named_host(tmp_path, monk
     assert q.get(a["ref"])["wait"]["host"] == "her"
     assert answers.resume_dependency_waits() == []              # writer host: not its ticket
     assert q.get(a["ref"]).get("needs_input")
-    (d,) = ov.build(q.list_items(), project="GHI", now=NOW)["unresolved_dependencies"]
+    # A same-number LOCAL ticket that is blocked on the owner must not adopt the remote wait.
+    q.update_status(dep["ref"], "open")
+    q.claim_by_ref(dep["ref"], "worker-2")
+    q.block(dep["ref"], session_id="worker-2", question="UNRELATED LOCAL DECISION", wait_on="owner")
+    view = ov.build(q.list_items(), project="GHI", now=NOW)
+    (d,) = view["unresolved_dependencies"]
     assert d["state"] == "other_host" and d["lives_on"] == "ami"
+    (g,) = view["groups"]
+    assert g["root"] == f"{dep['ref']}@ami" and g["root_state"] == "other_host"
+    assert g["root_title"] == "" and not g["needs_owner"] and g["dependents"] == [a["ref"]]
+    assert "UNRELATED LOCAL DECISION" not in ov.render(view)
+    whole = ov.build(q.list_items(), now=NOW)                 # the local ticket is its own root
+    assert {x["root"] for x in whole["groups"]} == {f"{dep['ref']}@ami", dep["ref"]}
+    q.answer(dep["ref"], "decided")
+    q.update_status(dep["ref"], "closed", session_id="worker-2", resolution={"summary": "landed"})
+    assert answers.resume_dependency_waits() == []              # still not this host's to answer
     monkeypatch.setattr(q, "_MACHINE_TAG_CACHE", "ami")
     assert answers.resume_dependency_waits() == [f"{a['ref']}:{dep['ref']}"]
     assert not q.get(a["ref"]).get("needs_input")
@@ -282,3 +296,62 @@ def test_rule_revision_notice_only_when_rules_changed_after_the_block(tmp_path, 
     # The answer path clears blocked_at; the block event in history still dates it.
     cleared = dict(item, blocked_at="", needs_input=False)
     assert rr.blocked_since(cleared) is not None and rr.notice(cleared) == note
+
+
+def test_missing_ref_groups_under_a_qualified_name_not_a_bare_ref(env):
+    q, _cli, _a, ov, name = env
+    a = _ticket(q, name)
+    q.block(a, session_id="w1", question="Await", wait_on="dependency", wait_ref="OPS-9999")
+    (g,) = ov.build(q.list_items(), project=name, now=NOW)["groups"]
+    assert g["root"] == "OPS-9999@?" and g["root_state"] == "not_found_here" and not g["needs_owner"]
+
+
+def test_owner_roots_order_by_real_instant_across_offsets(env):
+    """09:00-08:00 is later than 11:30-05:00 although its string sorts first."""
+    q, _cli, _a, ov, name = env
+    late = _ticket(q, name, "pacific")
+    q.block(late, session_id="w1", question="A?", wait_on="owner",
+            wait_extra={"decide_by": "2026-11-17T09:00:00-08:00", "consequence": "late one"})
+    early = _ticket(q, name, "eastern", "w2")
+    q.block(early, session_id="w2", question="B?", wait_on="owner",
+            wait_extra={"decide_by": "2026-11-17T11:30:00-05:00", "consequence": "early one"})
+    undated = _ticket(q, name, "undated", "w3")
+    q.block(undated, session_id="w3", question="C?", wait_on="owner")
+    view = ov.build(q.list_items(), project=name, now=NOW)
+    assert [g["root"] for g in view["groups"]] == [early, late, undated]
+    assert [u["ref"] for u in view["upcoming"]] == [early, late]
+    assert view["upcoming"][0]["decide_by_utc"] == "2026-11-17T16:30:00+00:00"
+    assert view["upcoming"][0]["decide_by"] == "2026-11-17T11:30:00-05:00"     # as written
+    assert not view["recheck_due"]
+
+
+def test_owner_wait_note_is_shown_beside_the_original_question(env):
+    q, _cli, _a, ov, name = env
+    ref = _ticket(q, name)
+    q.block(ref, session_id="w1", question="Should Sonia book Rieko and pick Anne's dates?",
+            wait_on="owner")
+    q.set_wait(ref, "owner", note="Rieko is booked. Only Anne's waitlist dates remain open.")
+    view = ov.build(q.list_items(), project=name, now=NOW)
+    row = _rows(view)[ref]
+    assert row["wait"] == "owner" and row["note"].startswith("Rieko is booked")
+    assert "Should Sonia book Rieko" in row["question"]          # not replaced
+    assert "now: Rieko is booked" in ov.render(view)
+
+
+def test_unreadable_queue_is_an_error_or_a_warning_never_an_empty_view(env, monkeypatch, capsys):
+    q, cli, _a, ov, name = env
+    ref = _ticket(q, name)
+    q.block(ref, session_id="w1", question="?", wait_on="owner")
+    real = q.list_items
+
+    def flaky(*a, **k):
+        if k.get("strict"):
+            raise RuntimeError("API rate limit exceeded")
+        return real(*a, **k)
+
+    monkeypatch.setattr(q, "list_items", flaky)
+    assert cli.main(["owner-view", "-q", name]) == 1                # asked-for queue unreadable
+    assert "rate limit" in capsys.readouterr().err
+    view = ov.snapshot()                                            # all queues: degrade, loudly
+    assert view["incomplete"] and "rate limit" in view["warnings"][0]
+    assert "WARNING:" in ov.render(view) and view["blocked"] == 1

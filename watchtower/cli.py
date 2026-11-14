@@ -3451,7 +3451,11 @@ def cmd_owner_view(args: argparse.Namespace) -> int:
     """Blocked tickets by who they really wait on, grouped by root, for any
     backend. Read-only; recovery (`wt blocked`, liveness) is unaffected."""
     from . import owner_view
-    view = owner_view.snapshot(project=args.queue)
+    try:
+        view = owner_view.snapshot(project=args.queue)
+    except Exception as e:  # noqa: BLE001 - an unreadable queue is an error, never "nothing blocked"
+        print(f"error: could not read {args.queue or 'the queues'}: {e}", file=sys.stderr)
+        return 1
     if args.json:
         print(json.dumps(view, indent=2))
         return 0
