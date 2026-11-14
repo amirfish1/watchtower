@@ -3467,15 +3467,36 @@ def cmd_defer(args: argparse.Namespace) -> int:
     """Wait for data, not for a human: the ticket leaves your claim and the
     claim pool until --until, then any worker resumes it from your progress
     note. For a decision you need from a human, use `wt block`."""
+    from . import release_wait
+    awaits = str(getattr(args, "awaits", "") or "")
+    reason = args.reason
     try:
+        if awaits and awaits != "data":
+            # Checked before anything is written: a fix that is not on the
+            # release branch is refused as "awaiting release".
+            item = q.get(args.ref)
+            if not item:
+                print(f"(no item {args.ref})", file=sys.stderr)
+                return 1
+            repo = str(getattr(args, "repo", "") or item.get("repo_path")
+                       or config.repo_path(item.get("project", "")) or os.getcwd())
+            claim = release_wait.check(
+                awaits, repo, commit=getattr(args, "commit", ""),
+                branch=getattr(args, "release_branch", ""),
+                owner=getattr(args, "integration_owner", ""),
+                path=getattr(args, "integration_path", ""))
+            reason = f"{claim['tag']} {reason}".strip()
         item = q.defer(args.ref, args.worker or _default_worker_id(), args.until,
-                       args.reason, progress=args.progress)
+                       reason, progress=args.progress)
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
         return 1
+    note = release_wait.hint(awaits, args.reason)
+    if note:
+        print(note, file=sys.stderr)
     if args.json:
         print(json.dumps(item, indent=2))
         return 0
@@ -8096,6 +8117,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="what data you are waiting for and why it is needed")
     s.add_argument("--progress", default="",
                    help="what you built and what the resuming worker should analyse")
+    s.add_argument("--awaits", default="", choices=["data", "release", "integration"],
+                   help="what the ticket waits for. release: the fix is already on the release "
+                        "branch (checked; needs --commit and --release-branch). integration: "
+                        "the fix is not on it yet (needs --integration-owner and "
+                        "--integration-path). data (default): a data window or source-only hold")
+    s.add_argument("--commit", default="", help="the fix commit (with --awaits release|integration)")
+    s.add_argument("--release-branch", default="", dest="release_branch",
+                   help="the branch releases are cut from, e.g. origin/next (with --awaits release)")
+    s.add_argument("--integration-owner", default="", dest="integration_owner",
+                   help="who will land the fix on the release branch (with --awaits integration)")
+    s.add_argument("--integration-path", default="", dest="integration_path",
+                   help="how it lands: the branch, PR or ticket (with --awaits integration)")
+    s.add_argument("--repo", default="",
+                   help="checkout to check the commit in (default: the ticket's repo)")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_defer)

@@ -441,6 +441,22 @@ WAIT_TARGET_CONTRACT = (
     "`--if-unanswered` (what happens if nobody answers, or `none`). This "
     "does not change what needs the owner's approval. "
 )
+# A pushed commit is not a shipped fix. Wording only. No braces (see above).
+INTEGRATION_CONTRACT = (
+    "INTEGRATION: a commit pushed to a feature branch is not integrated. "
+    "Before you close a ticket as fixed, or say a fix is waiting for a "
+    "release, confirm the commit (or the same patch) is on the branch "
+    "releases are cut from: `git fetch` then `git merge-base --is-ancestor "
+    "SHA origin/BRANCH`. Never switch the branch of a shared checkout to get "
+    "there; use your own worktree off the fresh release branch. To park a "
+    "merged fix until it ships: `wt defer --awaits release --commit SHA "
+    "--release-branch origin/BRANCH` (WatchTower checks it). If the fix is "
+    "not on that branch, say so: `wt defer --awaits integration "
+    "--integration-owner WHO --integration-path HOW`, and if nobody owns "
+    "landing it, `wt block --wait-on worker` naming the coordinator instead. "
+    "A hold on source that is deliberately not merged yet stays a plain "
+    "`wt defer` or `wt block` with its real reason. "
+)
 MINOR_BLOCK_CONTRACT = (
     "BEFORE BLOCKING: first check whether this is an implementation choice "
     "you are already authorized to make. If it is cheap to undo, does not "
@@ -631,7 +647,7 @@ DRAIN_GOAL_TEMPLATE = (
     "close it and do NOT guess: run `wt block <ref> --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
     "figured out so far\"`, then move on to the next ticket. "
-    + MINOR_BLOCK_CONTRACT + WAIT_TARGET_CONTRACT +
+    + MINOR_BLOCK_CONTRACT + WAIT_TARGET_CONTRACT + INTEGRATION_CONTRACT +
     "LEARNINGS: after each `wt close` or `wt block`, append at most one "
     "dated line to ~/.watchtower/learnings/{queue}.pending.md -- only if "
     "the turn produced a genuinely new hard-won fact (append-only, never "
@@ -679,7 +695,7 @@ RUN_ONCE_GOAL_TEMPLATE = (
     "close it and do NOT guess: run `wt block {ref} --worker {worker_id} "
     "--question \"the specific decision you need\" --progress \"what you've "
     "figured out so far\"`. "
-    + MINOR_BLOCK_CONTRACT + WAIT_TARGET_CONTRACT +
+    + MINOR_BLOCK_CONTRACT + WAIT_TARGET_CONTRACT + INTEGRATION_CONTRACT +
     "Either way -- closed or blocked -- STOP once this one ticket is "
     "resolved. Do NOT claim another ticket, do NOT poll, do NOT wait for new "
     "work. End your turn. "

@@ -380,4 +380,4 @@ def test_worker_briefs_tell_workers_to_name_a_wait_target():
     assert "--wait-on" in workers.WAIT_TARGET_CONTRACT and "{" not in workers.WAIT_TARGET_CONTRACT
     assert "does not change what needs the owner's approval" in workers.WAIT_TARGET_CONTRACT
     src = open(workers.__file__).read()
-    assert src.count("+ MINOR_BLOCK_CONTRACT + WAIT_TARGET_CONTRACT +") == 2
+    assert src.count("+ MINOR_BLOCK_CONTRACT + WAIT_TARGET_CONTRACT + INTEGRATION_CONTRACT +") == 2

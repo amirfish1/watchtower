@@ -245,6 +245,35 @@ carries `deep_brief`; follow it:
 `wt defer` is not `wt block`: defer waits for *data* (no human involved, the
 ticket returns on its own); block waits for a *decision*.
 
+### "Waiting for release" must be true
+
+A commit pushed to a feature branch is not integrated, and a release never
+carries it. Before closing a ticket as fixed, or parking it until a release,
+check the commit is on the branch releases are cut from (`git fetch`, then
+`git merge-base --is-ancestor SHA origin/BRANCH`). Say which case you are in:
+
+```bash
+# Merged, waiting to ship. WatchTower checks the commit (or the same patch
+# under another sha) is on the branch and refuses the defer if it is not.
+wt defer REF --worker ID --until +2d --reason "ships with the next release" \
+  --awaits release --commit SHA --release-branch origin/next
+
+# Fix exists but is not on the release branch. Name who lands it and how.
+wt defer REF --worker ID --until +1d --reason "needs re-landing on next" \
+  --awaits integration --commit SHA \
+  --integration-owner "session 01a1dafb" --integration-path "cherry-pick to next via PR"
+```
+
+- Nobody owns landing it? That is a blocker, not a wait: `wt block --wait-on
+  worker --wait-actor COORDINATOR` (or `--wait-on owner` if no coordinator
+  exists).
+- A deliberate hold on unmerged source (waiting for data, an approval, a
+  dependency) is unchanged: plain `wt defer` or `wt block` with the real reason.
+- Never switch the branch of a shared checkout to get onto the release branch.
+  Work in your own worktree off a fresh copy of it.
+- A plain `wt defer` whose reason mentions a release still works but prints a
+  note asking for `--awaits`.
+
 ### Say who a block waits on
 
 The dashboard paints a blocked ticket red ("needs you") unless the block says
