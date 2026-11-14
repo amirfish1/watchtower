@@ -13,6 +13,8 @@ EXPECTED_SKILLS = (
     "group-chat-checkin",
     "critique",
     "wt-triage-queue",
+    "wt-queue-review",
+    "wt-queue-care",
     "wt-queue-sweep",
     "compact-to-queue",
     "add-annotate-widget",

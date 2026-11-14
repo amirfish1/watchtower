@@ -89,12 +89,12 @@ separate re-sync step. Four skills ship today:
 
 - **`watchtower`**: look up a ticket by ref (`wt find HERMES-20`), check
   queue health, file/claim/close tickets.
-- **`wt-triage-queue`**: unstick a queue that's flagged stuck or has aging,
-  abandoned, or unclosed claims.
-- **`wt-queue-sweep`**: review a healthy queue's tickets that need a
-  decision: blocked-on-human questions and closes with unresolved items.
-  Auto-resolves mechanical blockers after verifying, and presents product
-  decisions as short proposal/opposing-view/score cards.
+- **`wt-queue-review`**: the one queue-review workflow. Health first
+  (stuck queues, dead claims, duplicates, safe mechanical repairs), then
+  content (blocked-on-human questions, closes with unresolved items), with
+  proposal/opposing-view/score cards for product decisions. Handles named
+  queues and explicit wildcards. `wt-triage-queue`, `wt-queue-sweep` and
+  `wt-queue-care` remain as thin aliases that point to it.
 - **`critique`** (`/critique` in any synced harness): spawn two
   cross-family agents that independently critique a plan/design/diff and
   report back via `wt send`. Wraps `wt critique`; the reports arrive
