@@ -1564,6 +1564,9 @@ def _plan_supplement_review_goal(item: dict) -> str:
 def _resume_env(engine: str, sid: str) -> dict:
     """Resume env; a Codex session resumes in the account home that holds it."""
     env = workers.compact_env()
+    if engine == "antigravity":
+        from . import antigravity_accounts
+        return antigravity_accounts.launch_env(antigravity_accounts.session_account(sid), env)
     home = workers._codex_spawn_home(engine, sid)
     if home:
         env["CODEX_HOME"] = home
@@ -3484,6 +3487,11 @@ def _resume_session_headless(
             *workers.codex_compact_args(),
             sid, prompt,
         ]
+    elif engine == "antigravity":
+        from . import antigravity_accounts
+        argv = antigravity_accounts.configure_command(
+            [workers._resolve_antigravity_bin() or "agy", "--resume", sid, "-p", prompt,
+             "--dangerously-skip-permissions"], antigravity_accounts.session_account(sid))
     elif engine == "kimi":
         # Print mode resumes the session, applies the prompt, exits; kimi
         # auto-approves internally in this mode (no permission flag exists).
@@ -3544,7 +3552,7 @@ def _answer_engine(item: Dict[str, object], requested: Optional[str]) -> str:
             for worker in reversed(known):
                 if str(worker.get(field) or "") == value:
                     engine = str(worker.get("engine") or "")
-                    if engine in ("claude", "codex", "kimi", "devin"):
+                    if engine in ("claude", "codex", "kimi", "devin", "antigravity"):
                         return engine
     except (OSError, ValueError):
         pass
@@ -4145,17 +4153,40 @@ def cmd_discuss(args: argparse.Namespace) -> int:
     repo = item.get("repo_path") or os.getcwd()
     if args.engine == "codex":
         inner = ["codex", "resume", sid]
+    elif args.engine == "antigravity":
+        from . import antigravity_accounts
+        inner = antigravity_accounts.configure_command(
+            [workers._resolve_antigravity_bin() or "agy", "--resume", sid],
+            antigravity_accounts.session_account(sid))
     elif args.engine == "kimi":
         inner = ["kimi", "--session", sid]
     elif args.engine == "devin":
         inner = ["devin", "--resume", sid]
     else:
         inner = ["claude", "--resume", sid]
-    cmd = "cd " + shlex.quote(repo) + " && " + " ".join(shlex.quote(c) for c in inner)
+    printable = inner
+    if args.engine == "antigravity" and antigravity_accounts.session_account(sid) == "secondary":
+        # The printed command must select the same auth as subprocess.call.
+        printable = ["env"]
+        cleared = antigravity_accounts._CLOUD_ENV | {"ANTIGRAVITY_GEMINI_DIR", "GEMINI_DIR", "XDG_CONFIG_HOME"}
+        cleared |= {key for key in os.environ if key.startswith("AGY_LLM_GATEWAY_")}
+        for key in sorted(cleared):
+            printable += ["-u", key]
+        routed = _resume_env(args.engine, sid)
+        for key in ("AGY_ADC_AUTH", "HOME", "ANTIGRAVITY_CREDENTIAL_SCOPE",
+                    "ANTIGRAVITY_CONFIG_REL_DIR", "WATCHTOWER_DATA_DIR",
+                    "WATCHTOWER_CONFIG_FILE", "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE",
+                    "CCC_ANTIGRAVITY_ACCOUNT_ID", "CCC_ANTIGRAVITY_PRIMARY_HOME",
+                    "CCC_ANTIGRAVITY_LS_DIR"):
+            printable.append(f"{key}={routed[key]}")
+        printable += inner
+    cmd = "cd " + shlex.quote(repo) + " && " + " ".join(shlex.quote(c) for c in printable)
     if args.print:
         print(cmd)
         return 0
     print(f"Resuming {item['ref']} (session {sid}) in {repo} …")
+    if args.engine == "antigravity":
+        return subprocess.call(inner, cwd=repo, env=_resume_env(args.engine, sid))
     return os.system(cmd) >> 8
 
 
@@ -7853,7 +7884,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--by", default="", help="verifier id (default: your worker id)")
     s.add_argument("--verify-cycle", type=int, default=None, dest="verify_cycle",
                    help="group parent: the integration verify cycle this verdict is for")
-    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
+    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin", "antigravity"],
                    help="override the resumed worker's engine (--fail only)")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
@@ -7863,7 +7894,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("ref")
     s.add_argument("--reason", required=True, help="what must change")
     s.add_argument("--by", default="", help="who rejected (default: human)")
-    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
+    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin", "antigravity"],
                    help="override the resumed session's engine")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
@@ -7887,7 +7918,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "path `wt answer` uses -- steer if live, headless "
                         "resume if dead. Falls back to a plain reopen if the "
                         "ticket has no resumable session.")
-    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
+    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin", "antigravity"],
                    help="override the resumed session's engine (--resume only)")
     s.add_argument("--json", action="store_true")
     _add_redundant_queue_flag(s)
@@ -8084,7 +8115,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("ref")
     s.add_argument("text", help="your answer")
     s.add_argument("--worker", default="")
-    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin"],
+    s.add_argument("--engine", choices=["claude", "codex", "kimi", "devin", "antigravity"],
                    help="override the blocked session engine")
     s.add_argument("--by", default=None, choices=["human", "worker", "system"],
                    help="who is answering (recorded as by.kind and named in "
@@ -8107,7 +8138,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("discuss")
     s.add_argument("ref")
-    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi", "devin"])
+    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi", "devin", "antigravity"])
     s.add_argument("--print", action="store_true", dest="print",
                    help="print the resume command instead of running it")
     _add_redundant_queue_flag(s)
@@ -8124,7 +8155,7 @@ def build_parser() -> argparse.ArgumentParser:
         "release", help="gracefully stop selected workers before their next claim"
     )
     release_workers_parser.add_argument(
-        "--engine", required=True, choices=["claude", "codex", "kimi", "devin"],
+        "--engine", required=True, choices=["claude", "codex", "kimi", "devin", "antigravity"],
         help="release live workers running this engine",
     )
     release_workers_parser.add_argument(
@@ -8399,7 +8430,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="assignee used by GitHub-backed claims (default: @me)")
     s.add_argument("--repo-path", default=None, dest="repo_path",
                    help="default cwd for workers spawned on this queue")
-    s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi", "devin"],
+    s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi", "devin", "antigravity"],
                    help=(
                        "agent engine for workers on this queue (default: claude). "
                        "claude: stream-json mode over a FIFO stdin — live, pushable, "
@@ -8501,7 +8532,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "shared by 2+ queues (default: watchtower:<QUEUE>; "
                         "'*' = catch-all for every issue no sibling queue "
                         "claims; pass '' to reset)")
-    s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi", "devin"],
+    s.add_argument("--engine", default=None, choices=["claude", "codex", "kimi", "devin", "antigravity"],
                    help="agent engine for workers on this queue")
     s.add_argument("--model", default=None,
                    help="model workers are spawned with (e.g. claude-sonnet-5)")
@@ -8637,7 +8668,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--interval", type=int, default=30,
                    help="reconciler tick interval in seconds (default 30)")
     s.add_argument("--stuck-minutes", type=int, default=health.STUCK_MINUTES)
-    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi", "devin"])
+    s.add_argument("--engine", default="claude", choices=["claude", "codex", "kimi", "devin", "antigravity"])
     s.add_argument("--auto-spawn", action="store_true",
                    help="auto spawn-worker on a stuck queue with no live workers")
     s.add_argument("--dry-run", action="store_true", dest="dry_run",

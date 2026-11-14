@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-from . import origins
+from . import origins, antigravity_accounts
 
 try:
     import fcntl
@@ -179,7 +179,8 @@ def _codex_spawn_home(engine: str, session_id: str = "") -> str:
 
 def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "",
                ref: str = "", queue: str = "", role: str = "",
-               codex_home: str = "", engine: str = "") -> Dict[str, str]:
+               codex_home: str = "", engine: str = "",
+               antigravity_account_id: str = "") -> Dict[str, str]:
     """Environment for a spawned worker subprocess.
 
     The child inherits the parent's environment so legitimate overrides
@@ -249,6 +250,10 @@ def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "
     compact = _config.worker_auto_compact_tokens()
     if compact > 0:
         env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(compact))
+    if engine == "antigravity":
+        account = antigravity_account_id or (antigravity_accounts.session_account(session_id)
+                                             if session_id else antigravity_accounts.worker_account())
+        env = antigravity_accounts.launch_env(account, env)
     return env
 
 
@@ -4399,6 +4404,28 @@ def resolve_session_id_from_log(log_path: str) -> str:
     return ""
 
 
+def resolve_antigravity_session_id(log_path: str) -> str:
+    """Recover native IDs from stream output or AGY's own ad-hoc log."""
+    sid = resolve_session_id_from_log(log_path)
+    if sid:
+        return sid
+    pattern = re.compile(
+        r"(?:Created conversation|conversation=|Streaming conversation|to conversation)\s*"
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
+    for candidate in (Path(log_path).with_suffix(".agy.log"), Path(str(log_path) + ".agy.log")):
+        try:
+            with candidate.open("rb") as fh:
+                head = fh.read(65536)
+                fh.seek(max(0, candidate.stat().st_size - 65536))
+                text = (head + fh.read(65536)).decode("utf-8", errors="replace")
+        except OSError:
+            continue
+        matches = pattern.findall(text)
+        if matches:
+            return matches[-1]
+    return ""
+
+
 def _upsert_codex_worker_registry(
     worker: Dict[str, Any],
     *,
@@ -4831,6 +4858,7 @@ def record_worker(
     exit_file: str = "",
     parent_session_id: str = "",
     codex_home: str = "",
+    antigravity_account_id: str = "",
 ) -> Dict[str, Any]:
     with _WorkersFileLock():
         data = _load()
@@ -4857,6 +4885,18 @@ def record_worker(
             rec["ticket_queue"] = ticket_queue
         if exit_file:
             rec["exit_file"] = exit_file
+        if engine == "antigravity":
+            previous = next((row for row in reversed(data["workers"])
+                             if row.get("worker_id") == worker_id), {})
+            account = (previous.get("antigravity_account_id") or antigravity_account_id
+                       or (antigravity_accounts.session_account(session_id) if session_id
+                           else antigravity_accounts.worker_account()))
+            rec["antigravity_account_id"] = antigravity_accounts.validate(account)
+            if log:
+                antigravity_accounts.bind_pending(log, account)
+            if session_id:
+                antigravity_accounts.bind(session_id, account)
+                antigravity_accounts.finalize_pending(log, session_id)
         if codex_home:
             rec["codex_home"] = codex_home
         if session_id:
@@ -4933,10 +4973,15 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
             # event is written). Persisted so CCC can resolve worker -> session
             # and link to its conversation. Parsed at most once per worker.
             if not w.get("session_id") and w.get("log"):
-                sid = resolve_session_id_from_log(w["log"])
+                sid = (resolve_antigravity_session_id(w["log"])
+                       if w.get("engine") == "antigravity"
+                       else resolve_session_id_from_log(w["log"]))
                 if not sid and str(w.get("engine") or "").lower() == "devin":
                     sid = resolve_devin_session_id(str(w.get("worker_id") or ""))
                 if sid:
+                    if w.get("engine") == "antigravity":
+                        antigravity_accounts.bind_pending(w["log"], w.get("antigravity_account_id") or "primary")
+                        antigravity_accounts.finalize_pending(w["log"], sid)
                     w["session_id"] = sid
                     backfilled = True
                     # Ledger it so it survives this worker being pruned later.
@@ -5455,7 +5500,7 @@ def drain_goal(
 
 def build_drain_command(
     queue: str, engine: str, worker_id: str, repo_path: str = "", model: str = "",
-    goal: str = "", effort: str = "",
+    goal: str = "", effort: str = "", antigravity_account_id: str = "",
 ) -> List[str]:
     """Construct the argv for one worker subprocess.
 
@@ -5599,7 +5644,8 @@ def build_drain_command(
         ]
         if model:
             argv += ["--model", model]
-        return argv
+        return antigravity_accounts.configure_command(
+            argv, antigravity_account_id or antigravity_accounts.worker_account(), model)
     argv = [
         bin_name, "-p",
         "--input-format", "stream-json",
@@ -8132,6 +8178,7 @@ def spawn_workers(
     own default) instead of reading the queue's configured model -- for a
     worker substituted onto a different engine than the queue's own.
     """
+    agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
     repo_path = repo_path or os.getcwd()
     if not model and inherit_queue_model:
         from . import config
@@ -8158,6 +8205,7 @@ def spawn_workers(
         try:
             argv = build_drain_command(
                 queue, engine, worker_id, repo_path, model, goal=goal, effort=effort,
+                antigravity_account_id=agy_account,
             )
         except CodexSandboxError as e:
             # WT-61: fail closed -- never fall back to danger-full-access.
@@ -8189,6 +8237,8 @@ def spawn_workers(
                 "dry_run": True,
                 "_spawn_index": spawn_index,
             }
+            if agy_account:
+                rec["antigravity_account_id"] = agy_account
             if model:
                 rec["model"] = model
             if effort:
@@ -8221,6 +8271,8 @@ def spawn_workers(
                 launch_failures.append(failure)
             continue
         worker_codex_home = _codex_spawn_home(engine)
+        if agy_account:
+            antigravity_accounts.bind_pending(str(log_path), agy_account)
         logf = open(log_path, "ab")
         # claude workers get a stream-json FIFO stdin so they stay live and
         # pushable; one-shot engines (codex exec, kimi -p) keep the goal in
@@ -8241,7 +8293,7 @@ def spawn_workers(
                 start_new_session=True,
                 cwd=repo_path,
                 env=_spawn_env(worker_id, role="worker", codex_home=worker_codex_home,
-                               queue=queue, engine=engine),
+                           antigravity_account_id=agy_account, queue=queue, engine=engine),
             )
         except OSError as e:
             popen_error = e
@@ -8302,6 +8354,7 @@ def spawn_workers(
         rec = record_worker(
             proc.pid, queue, engine, worker_id, repo_path, str(log_path),
             fifo=fifo_path or "", model=model, kind=kind, codex_home=worker_codex_home,
+            antigravity_account_id=agy_account,
         )
         rec["argv"] = argv
         rec["_spawn_index"] = spawn_index
@@ -8339,6 +8392,7 @@ def spawn_run_once_worker(
     from . import config
     repo_path = repo_path or config.repo_path(queue) or os.getcwd()
     engine = engine or config.engine(queue) or "claude"
+    agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
     if not model:
         model = config.model(queue)
     effort = config.effort(queue)
@@ -8349,6 +8403,7 @@ def spawn_run_once_worker(
     goal = run_once_goal(queue, worker_id, ref, repo_path)
     argv = build_drain_command(
         queue, engine, worker_id, repo_path, model, goal=goal, effort=effort,
+        antigravity_account_id=agy_account,
     )
     logical_bin = _ENGINE_BIN.get(engine, engine)
     if argv and argv[0] == logical_bin:
@@ -8359,6 +8414,8 @@ def spawn_run_once_worker(
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{worker_id}.log"
     worker_codex_home = _codex_spawn_home(engine)
+    if agy_account:
+        antigravity_accounts.bind_pending(str(log_path), agy_account)
     logf = open(log_path, "ab")
     fifo_path = None
     child_stdin_fd = None
@@ -8374,7 +8431,7 @@ def spawn_run_once_worker(
             start_new_session=True,
             cwd=repo_path,
             env=_spawn_env(worker_id, role="worker", codex_home=worker_codex_home,
-                               queue=queue, engine=engine),
+                           antigravity_account_id=agy_account, queue=queue, engine=engine),
         )
     finally:
         logf.close()
@@ -8390,6 +8447,7 @@ def spawn_run_once_worker(
     rec = record_worker(
         proc.pid, queue, engine, worker_id, repo_path, str(log_path),
         fifo=fifo_path or "", model=model, ref=ref, codex_home=worker_codex_home,
+        antigravity_account_id=agy_account,
     )
     rec["argv"] = argv
     if effort:
@@ -8506,6 +8564,7 @@ def codex_compact_args() -> List[str]:
 def build_adhoc_command(
     engine: str, prompt: str, *, model: str = "", repo_path: str = "",
     log_path: str = "", session_id: str = "", prompt_stdin: bool = False,
+    antigravity_account_id: str = "",
 ) -> List[str]:
     """Argv for a one-shot ad-hoc agent. All engines run in print/exec mode
     with the goal in argv -- no FIFO, no drain loop; the process exits when
@@ -8549,7 +8608,9 @@ def build_adhoc_command(
         if model:
             argv += ["--model", model]
         argv += ["-p", prompt]
-        return argv
+        account = antigravity_account_id or (antigravity_accounts.session_account(session_id)
+                                             if session_id else antigravity_accounts.worker_account())
+        return antigravity_accounts.configure_command(argv, account, model)
     if engine == "claude":
         if not shutil.which(_ENGINE_BIN["claude"]):
             raise ValueError("claude CLI not found on PATH")
@@ -8621,6 +8682,7 @@ def spawn_adhoc(
     `wt send` fails and silently drops the report -- unresolvable targets
     don't get parked in the outbox (nothing to retry against), so without
     this check the report is just lost (OPS-89)."""
+    agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
     repo_path = repo_path or os.getcwd()
     if report_to:
         from . import messages
@@ -8657,6 +8719,7 @@ def spawn_adhoc(
     argv = build_adhoc_command(
         engine, prompt, model=model, repo_path=repo_path, log_path=str(log_path),
         session_id=session_id, prompt_stdin=prompt_stdin,
+        antigravity_account_id=agy_account,
     )
     if dry_run:
         rec = {
@@ -8664,6 +8727,8 @@ def spawn_adhoc(
             "engine": engine, "repo_path": repo_path, "argv": argv,
             "kind": "adhoc", "dry_run": True,
         }
+        if agy_account:
+            rec["antigravity_account_id"] = agy_account
         if session_id:
             rec["session_id"] = session_id
         if model:
@@ -8682,6 +8747,8 @@ def spawn_adhoc(
                 "--exit-file", exit_file, "--"] + list(argv)
         _spawn_gate(engine)
     worker_codex_home = _codex_spawn_home(engine, session_id)
+    if agy_account:
+        antigravity_accounts.bind_pending(str(log_path), agy_account)
     logf = open(log_path, "ab")
     stdin = open(prompt_file, "rb") if prompt_stdin else subprocess.DEVNULL
     try:
@@ -8694,7 +8761,9 @@ def spawn_adhoc(
             cwd=repo_path,
             env=_spawn_env(worker_id, verify=verify, session_id=session_id,
                            ref=ticket_ref, queue=ticket_queue,
-                           role=stage or "adhoc", codex_home=worker_codex_home),
+                           role=stage or "adhoc", codex_home=worker_codex_home,
+                           antigravity_account_id=agy_account,
+                           engine=engine if engine == "antigravity" else ""),
         )
     finally:
         logf.close()
@@ -8708,6 +8777,7 @@ def spawn_adhoc(
         # the parent, so CCC nests the spawn under it and its idea ticket.
         parent_session_id=origins.caller_session_id(),
         codex_home=worker_codex_home,
+        antigravity_account_id=agy_account,
     )
     rec["argv"] = argv
     if stage:

@@ -549,3 +549,10 @@ def gh_issue_transport_graphql(monkeypatch):
     existing suite pins the legacy transport. tests/test_github_rest_transport.py
     covers the default REST transport against its own fake `gh api`."""
     monkeypatch.setenv("WATCHTOWER_GH_ISSUE_TRANSPORT", "graphql")
+
+
+@pytest.fixture(autouse=True)
+def hermetic_antigravity_accounts(tmp_path, monkeypatch):
+    """Account bindings and CLI settings in tests never touch the host's state."""
+    monkeypatch.setenv("WATCHTOWER_ANTIGRAVITY_STATE_DIR", str(tmp_path / "agy-accounts"))
+    monkeypatch.setenv("WATCHTOWER_ANTIGRAVITY_HOME", str(tmp_path / "agy-home"))
