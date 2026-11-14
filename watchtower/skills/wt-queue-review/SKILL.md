@@ -75,6 +75,20 @@ wt ls -q <Q> --status blocked --json --limit 0      # parked for a human
 wt ls -q <Q> --status unresolved --json --limit 0   # closed with unresolved items
 ```
 
+**Read current rules first** (`docs/worker-runbook.md`, `wt --help`, recent
+decisions via `desk check`). Workers often block on a rule that has since
+changed. Example: complexity or duration alone no longer requires an owner
+decision or promotion from quick to deep (runbook "Ticket depth", D235); a
+block citing the old rule is a stale *procedural* block. Answer it as a
+mechanical (Rule A) item: cite the current rule, tell the worker to continue.
+That is not product approval, and every other gate (access, approval, spending
+limits, sends, money) still applies.
+
+`wt ls --status unresolved` also returns records whose items are already
+acknowledged. Subtract the per-index `*_ack` maps (unresolved, caveats,
+follow_ups) and keep only tickets with at least one unacknowledged item (a
+queue showed 21 rows but only 4 with open items).
+
 Read each ticket's `block_question`, `progress` history, and for closed ones
 `resolution.unresolved` / `follow_ups` / `caveats`; never judge from the
 one-line question. Scratch output goes under `~/dev/scratch/`, not `/tmp`.
