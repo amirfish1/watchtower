@@ -1,12 +1,10 @@
 """Deep-work brief: the claim-time guidance for ``depth: deep`` tickets.
 
-A quick ticket (the default) is fix-and-look work: the filer uses the product
-and sees within minutes whether the fix is right. A deep ticket is work whose
-outcome you cannot judge by using the product -- performance, chronic
-regressions, multi-step optimisation. The generic drain contract rewards
-"fix one plausible cause, close, file the rest", which is exactly how a
-recurring perf alert gets five honest ~10% fixes and never a solution. So a
-deep claim carries this brief, and it overrides the quick defaults.
+Every ticket requires thorough investigation, a complete solution and verified
+outcomes. ``quick`` is the legacy name for the default depth, not a speed or
+quality target. Deep tickets add structure for sustained work across hours or
+days, including performance, chronic regressions and multi-step optimisation.
+Budgets are active-work checkpoints, not a ceiling on the ticket's lifetime.
 
 Kept free of braces so callers can embed it in .format() templates.
 """
@@ -32,7 +30,8 @@ def deep_brief(item: Dict[str, Any]) -> str:
     gates = [str(g) for g in (item.get("gates") or [])]
     cmd_gates = [g[4:] for g in gates if g.startswith("cmd:")]
     lines = [
-        f"DEEP TICKET ({ref}) -- these rules override the quick-fix defaults.",
+        f"DEEP TICKET ({ref}) -- sustained work across hours or days; the same "
+        "thoroughness and completion standard applies to every ticket.",
         "",
         "GOAL: done means the reason this ticket was filed is gone, measured the "
         "same way it was detected and under the conditions that caused it (cold "
@@ -65,14 +64,20 @@ def deep_brief(item: Dict[str, Any]) -> str:
         "question (recommended option first) instead of guessing; record the "
         "owner's answer as a Product constraints line in the learnings file.",
         "",
-        f"3. BUDGET: about {budget} minutes of active work. Record every attempt "
+        f"3. CHECKPOINT BUDGET: about {budget} minutes of active work per "
+        "checkpoint, not a total time limit for the ticket. Honour any explicit "
+        "ticket or owner spending/time cap. Record every attempt "
         f"as `wt comment {ref} \"attempt N: <change> -- metric before -> after\"`.",
         "",
-        "4. STOP RULE (whichever comes first): the budget is spent; two attempts "
-        "in a row with no measured gain; four attempts without converging on the "
-        "goal. On stop do NOT close: `wt block` with what you tried, the measured "
-        "trajectory and your best remaining options -- usually a product "
-        "question.",
+        "4. STOP RULE: at each checkpoint, record the measured trajectory, "
+        "remaining work and next checkpoint plan. Continue authorized work "
+        "while evidence supports progress, including across sessions or days. "
+        "After two attempts in a row with no measured gain, stop repeating "
+        "that approach: reassess the evidence and options before trying a "
+        "different approach. Defer when waiting for data; block only for a "
+        "genuine decision, access or authorization gap. Preserve a resumable "
+        "progress note before a session ends. Never close because a checkpoint "
+        "or session ended, and never exceed an explicit cap without approval.",
         "",
         "5. CLOSING: only when the goal is met, with the measurement in the "
         "summary (before -> after, which conditions). A follow-up ticket may "

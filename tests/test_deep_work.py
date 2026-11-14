@@ -71,6 +71,19 @@ def test_deep_brief_carries_goal_rules_and_measure_gate(wt):
     assert "{" not in brief and "}" not in brief  # safe inside .format() templates
 
 
+def test_deep_brief_supports_sustained_work_without_weakening_caps(wt):
+    it = wt.q.enqueue(note="multi-day investigation", project="ZZT", depth="deep",
+                      budget_min=240)
+    brief = wt.deep.deep_brief(it)
+    for needle in ("hours or days", "240 minutes", "not a total time limit",
+                   "Continue authorized work", "resumable progress note",
+                   "two attempts in a row with no measured gain",
+                   "never exceed an explicit cap without approval"):
+        assert needle in brief, needle
+    assert "four attempts" not in brief
+    assert "override the quick-fix defaults" not in brief
+
+
 def test_edit_depth_round_trip(wt):
     it = wt.q.enqueue(note="perf", project="ZZT")
     e = wt.q.update(it["ref"], depth="deep", budget_min=30)
@@ -159,8 +172,29 @@ def test_cli_add_deep_and_defer(wt, capsys):
     assert "depth: deep (60m budget)" in found and "deferred until" in found
 
 
-def test_worker_goal_templates_point_at_deep_brief():
+@pytest.mark.parametrize("engine", ["claude", "codex", "kimi", "devin", "antigravity"])
+def test_rendered_worker_goals_require_thorough_work_at_every_depth(wt, engine):
     from watchtower import workers
-    for tpl in (workers.DRAIN_GOAL_TEMPLATE, workers.RUN_ONCE_GOAL_TEMPLATE):
-        assert "deep_brief" in tpl
-        assert "reason the ticket was filed" in tpl
+    goals = [workers.drain_goal("ZZT", "w1", "/repo", engine=engine),
+             workers.run_once_goal("ZZT", "w1", "ZZT-1", "/repo")]
+    for goal in goals:
+        for needle in ("every ticket requires thorough investigation",
+                       "verification of the reported outcome",
+                       "Continue authorized structural work",
+                       "hours or days", "deep_brief", "reason the ticket was filed"):
+            assert needle in goal, needle
+        for shortcut in ("fix-and-look", "a quick look is enough", "no design step",
+                         "asking the owner to promote it to deep"):
+            assert shortcut not in goal, shortcut
+
+
+@pytest.mark.parametrize("command", ["add", "take", "edit"])
+def test_depth_help_explains_quality_and_checkpoints(wt, capsys, command):
+    with pytest.raises(SystemExit) as exc:
+        wt.cli.main([command, "--help"])
+    assert exc.value.code == 0
+    help_text = " ".join(capsys.readouterr().out.split())
+    assert "thorough" in help_text
+    assert "hours or days" in help_text
+    assert "checkpoint interval" in help_text
+    assert "fix-and-look" not in help_text

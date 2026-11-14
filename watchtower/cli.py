@@ -7446,14 +7446,15 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--url", default="")
         subparser.add_argument("--lane", default="normal", choices=list(q.VALID_LANES))
         subparser.add_argument("--depth", default="", choices=list(q.VALID_DEPTHS) + [""],
-                               help="quick (default): fix-and-look work. deep: work you "
-                                    "can't judge by using the product (perf, chronic "
-                                    "regressions) -- the claim carries the deep-work brief: "
-                                    "evidence first, options memo, measured goal, budget + "
-                                    "stop rule. Set by owners and system filers, not by "
-                                    "workers filing follow-ups")
+                               help="every ticket requires thorough investigation, a "
+                                    "complete solution and verified outcomes. quick is "
+                                    "the legacy default name, not a speed target. deep "
+                                    "adds a sustained-work brief for hours or days of "
+                                    "work: evidence, options, measured goals and progress "
+                                    "checkpoints. Set by owners and system filers, not "
+                                    "by workers filing follow-ups")
         subparser.add_argument("--budget-min", type=int, default=0, dest="budget_min",
-                               help=f"deep tickets: working budget in minutes "
+                               help=f"deep tickets: active-work checkpoint interval in minutes "
                                     f"(default {q.DEEP_DEFAULT_BUDGET_MIN})")
         subparser.add_argument("--type", default="", choices=["bug", "feature", ""],
                                help="item type: bug or feature")
@@ -7608,9 +7609,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="drop this ticket's gate override (an empty override "
                         "= no gates; use --gate to set one)")
     s.add_argument("--depth", default=None, choices=list(q.VALID_DEPTHS),
-                   help="quick or deep (deep = claim carries the deep-work brief)")
+                   help="quick (legacy default; thorough work) or deep "
+                        "(adds a sustained-work brief for hours or days)")
     s.add_argument("--budget-min", type=int, default=None, dest="budget_min",
-                   help="deep tickets: working budget in minutes")
+                   help="deep tickets: active-work checkpoint interval in minutes")
     s.add_argument("--queue", default=None,
                    help="move the ticket to a different queue in place, "
                         "reassigning its ref (WT-83); file-backed queues only")

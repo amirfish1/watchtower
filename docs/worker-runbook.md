@@ -128,9 +128,11 @@ Applies to every ticket, quick or deep.
 
 - **Done means the reason the ticket was filed has gone away**: the symptom it
   reports no longer reproduces. Fixing one plausible cause is progress, not done.
-- **Verify the way the problem was seen**: for a quick ticket, a focused check
-  proportionate to the change is enough; for a deep ticket, re-measure under the
-  conditions that produced the problem (cold paths, cache misses, real load).
+- **Verify the way the problem was seen** on every ticket. Cover the reported
+  failure, its consequences and relevant regression risks. A focused test can
+  be sufficient when it establishes that outcome; choose broader verification
+  when the evidence requires it. For measured problems, re-measure under the
+  conditions that produced them (cold paths, cache misses, real load).
 - **A follow-up carries separate work, never the ticket's own goal.** If the
   symptom still reproduces, keep the ticket open (`wt block`, or `wt defer` while
   data accumulates) instead of closing with the remainder in a follow-up.
@@ -170,21 +172,25 @@ report and retain unresolved original work under the definition-of-done rules.
 
 ## Ticket depth
 
-The filer sets depth; a worker never guesses it. `quick` is the default.
+Every ticket requires thorough investigation, a complete solution and verified
+outcomes. The filer sets depth; a worker never guesses it. `quick` remains the
+default value for compatibility. It is not a speed target or a lower quality
+standard, and it does not prohibit design work or excuse relying on the owner
+to discover regressions. Choose investigation, design and verification based
+on the actual failure, its consequences and relevant regression risks.
 
-**Quick** is fix-and-look work. The owner uses the product and sees within
-minutes whether a fix is right, so: no design step, verification proportionate
-to the change (no full browser reproduction for a small UI tweak). Several
-related quick tickets can share one verification as a plan group
-(`wt add --group-parent --children ...`). If a quick ticket turns out to be
-structural (no contained fix removes the symptom), `wt block` it asking the
-owner to promote it to deep rather than shipping a token fix.
+Continue authorized structural work when necessary. Complexity or duration
+alone does not require an owner decision or promotion to deep. Existing access,
+approval and spending limits still apply. Several related tickets can share
+verification as a plan group (`wt add --group-parent --children ...`) when that
+verification covers each ticket's acceptance criteria.
 
-**Deep** (`wt add --depth deep [--budget-min N]`) is for work whose outcome you
-cannot judge by using the product: performance, chronic regressions,
-multi-step optimisation. Set by owners (the filing UI) and by system filers
-that know what they file (e.g. a perf watchdog), not by workers filing
-follow-ups. A deep claim's JSON carries `deep_brief`; follow it. In short:
+**Deep** (`wt add --depth deep [--budget-min N]`) adds structure for sustained
+work across hours or days, including performance, chronic regressions and
+multi-step optimisation. It adds planning and progress checkpoints to the same
+quality standard required on every ticket. Set by owners and system filers
+that know what they file, not by workers filing follow-ups. A deep claim's JSON
+carries `deep_brief`; follow it:
 
 1. **Evidence first.** If you lack the data to know the cause, build the
    logging, ship it, decide how much data and how long, then
@@ -194,11 +200,18 @@ follow-ups. A deep claim's JSON carries `deep_brief`; follow it. In short:
    scope, tier the data, change the UX). Read the queue learnings' *Product
    constraints* first; if the best option needs an owner decision, `wt block`
    with the memo. Record the owner's answer as a Product constraints line.
-3. **Budget** (default 90 min). Log each attempt:
+3. **Checkpoint budget** (default 90 min of active work per checkpoint, not a
+   total ticket time limit). Honour explicit ticket/owner time and spending
+   caps. Log each attempt:
    `wt comment REF "attempt N: <change> -- metric before -> after"`.
-4. **Stop rule**: budget spent, two attempts in a row with no gain, or four
-   attempts without converging. On stop, block with the trajectory and best
-   remaining options; don't close.
+4. **Stop rule**: at each checkpoint, record the measured trajectory, remaining
+   work and next checkpoint plan. Continue authorized work while evidence
+   supports progress, including across sessions or days. After two attempts
+   in a row with no measured gain, stop repeating that approach and reassess
+   evidence/options before changing approach. Defer for data; block only for
+   a genuine decision, access or authorization gap. Leave resumable progress
+   before ending a session. A checkpoint/session ending never makes incomplete
+   work done; exceeding an explicit cap still requires approval.
 5. **Close** only when the goal is met, with the measurement in the summary.
 
 `wt defer` is not `wt block`: defer waits for *data* (no human involved, the

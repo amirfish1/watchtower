@@ -115,10 +115,10 @@ VALID_STATUSES = ("open", "in_progress", "in_review", "awaiting_answer", "closed
 # as ``awaiting_answer`` with a ``parked`` record (who to route the answer to).
 PARKED_STATUS = "awaiting_answer"
 VALID_LANES = ("normal", "express")
-# Working mode. ``quick`` (the default, never stored) is fix-and-look work;
-# ``deep`` tickets get the deep-work brief at claim time (evidence first,
-# options memo incl. product options, measured goal, budget + stop rule) --
-# see watchtower/deep.py. ``budget_min`` rides along on deep tickets only.
+# Working mode. ``quick`` is the legacy default (never stored); every ticket
+# requires thorough investigation, a complete solution and verified outcomes.
+# ``deep`` adds a sustained-work brief at claim time; see watchtower/deep.py.
+# ``budget_min`` is an active-work checkpoint interval for deep tickets only.
 VALID_DEPTHS = ("quick", "deep")
 DEEP_DEFAULT_BUDGET_MIN = 90
 # `wt defer`: the longest a ticket may sit out of the claim pool waiting for
@@ -1708,8 +1708,8 @@ def enqueue(
     """Append a new ``open`` item and return it (with its assigned ref).
 
     ``depth``: ``quick`` (default) or ``deep`` -- a deep ticket's claim carries
-    the deep-work brief (watchtower/deep.py); ``budget_min`` is its working
-    budget in minutes (default 90). Local store only.
+    the deep-work brief (watchtower/deep.py); ``budget_min`` is its active-work
+    checkpoint interval in minutes (default 90).
 
     ``placement``: ``mac`` | ``cloud`` | ``any`` -- which kind of machine may
     claim it (see ``VALID_PLACEMENTS``). Blank lets a Mac filer's keyword

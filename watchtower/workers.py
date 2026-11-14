@@ -528,19 +528,21 @@ CLOSE_COMPLETENESS = (
 # claim's JSON carries ``deep_brief`` (watchtower/deep.py). No braces: safe
 # for the templates' .format() calls.
 DEPTH_CONTRACT = (
-    "TICKET DEPTH: a claimed ticket is quick (the default) or deep. QUICK "
-    "means fix-and-look: no design step, and verification proportionate to "
-    "the change -- a focused test or a quick look is enough; the owner uses "
-    "the product and sees within minutes whether it is right, so do not spin "
-    "up a full browser reproduction for a small UI tweak. DEEP: if the claim "
-    "JSON has a deep_brief field, follow it -- it overrides these quick "
-    "defaults (evidence first, an options memo that includes product "
-    "options, a measured goal, a time budget and a stop rule; use `wt defer "
-    "<ref> --until ... --reason ...` to wait for data instead of guessing). "
-    "If a quick ticket turns out to be structural -- the symptom cannot be "
-    "removed by a contained fix -- do not ship a token fix and close: "
-    "`wt block` it asking the owner to promote it to deep, with what you "
-    "found. "
+    "TICKET DEPTH: every ticket requires thorough investigation, a complete "
+    "solution and verification of the reported outcome. The default depth "
+    "is stored as quick for compatibility; it is not an instruction to "
+    "optimize for speed, skip design or rely on the owner to catch mistakes. "
+    "Choose investigation, design and verification to cover the actual "
+    "failure, its consequences and relevant regression risks. Continue "
+    "authorized structural work when needed; discovering complexity alone "
+    "does not require an owner decision or promotion to deep. DEEP: if the "
+    "claim JSON has a deep_brief field, follow its additional guidance for "
+    "sustained work across hours or days: evidence first, an options memo "
+    "including product options, a measured goal, progress checkpoints and "
+    "a stop rule for unproductive attempts. A checkpoint is not a total "
+    "time limit or permission to close incomplete work. Use `wt defer "
+    "<ref> --until ... --reason ...` to wait for data instead of guessing; "
+    "block only for a genuine decision, access or authorization gap. "
 )
 
 # Push contract injected into both goal templates. Deployment pulls from

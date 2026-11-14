@@ -202,7 +202,7 @@ wt models unpin (--queues A,B | --all-matching MODEL) [--apply]</div>
         <tr><td>--priority</td><td><code>p0</code> (highest) through <code>p4</code> (lowest).</td></tr>
         <tr><td>--value / --confidence</td><td>Business value and confidence: <code>H</code>, <code>M</code>, or <code>L</code>.</td></tr>
         <tr><td>--model-floor</td><td>Filer's best-guess minimum model this ticket needs (an approved model id from any engine). Empty is fine; never a blocker at filing time.</td></tr>
-        <tr><td>--depth / --budget-min</td><td><code>quick</code> (default) or <code>deep</code>. A deep ticket's claim carries the deep-work brief: evidence first, an options memo, a measured goal, and a budget (default 90 minutes) with a stop rule.</td></tr>
+        <tr><td>--depth / --budget-min</td><td>Every ticket requires thorough investigation, a complete solution, and verified outcomes. <code>quick</code> is the legacy default name, not a speed target. <code>deep</code> adds structure for work across hours or days: evidence, an options memo, measured goals, and active-work checkpoints (default 90 minutes per checkpoint, not a total ticket time limit).</td></tr>
         <tr><td>--pre-ack</td><td>Skip the product gate for this ticket; the decision to build it is already made.</td></tr>
         <tr><td>--dedupe-key</td><td>Stable incident key; atomically reuses an existing ticket in this local queue.</td></tr>
         <tr><td>--placement</td><td>Which machine may run it: <code>mac</code>, <code>cloud</code>, or <code>any</code>.</td></tr>
