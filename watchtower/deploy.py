@@ -52,6 +52,40 @@ def status(fetch: bool = True) -> Dict[str, Any]:
             "behind": behind, "ahead": ahead, "dirty": dirty}
 
 
+def head() -> str:
+    """HEAD of the installed checkout right now, or "" (not a checkout, or git
+    could not answer). Local only: no fetch."""
+    repo = installed_root()
+    if not repo:
+        return ""
+    r = _git(repo, "rev-parse", "HEAD", timeout=10)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def boot_drift(boot_head: str, st: Dict[str, Any]) -> Dict[str, Any]:
+    """Is a long-running process still running the code that is installed?
+
+    ``boot_head`` is the installed HEAD the process read when it started;
+    ``st`` is a fresh ``status()``/``sync()`` result. The disk can move without
+    this process moving it (a manual ``wt deploy --sync``, another daemon, a
+    close-time sync): the next ``sync()`` then says "up-to-date" although the
+    modules in memory are the old ones.
+
+    Returns ``{"state", "boot", "head"}``. ``state``:
+    ``current``  -- same revision, or either side is unknown (never a reason to
+                    restart);
+    ``stale``    -- the installed tree is at another revision and is clean, so
+                    re-reading it is safe;
+    ``held``     -- another revision, but the tree has uncommitted edits: a
+                    restart would load half-written code, so do not."""
+    boot, now = str(boot_head or ""), str((st or {}).get("head") or "")
+    out = {"state": "current", "boot": boot, "head": now}
+    if not boot or not now or boot == now:
+        return out
+    out["state"] = "held" if (st or {}).get("dirty") else "stale"
+    return out
+
+
 def _stale_files(repo: str, branch: str, files: List[str]) -> bool:
     """True when every dirty file's content equals a blob already in
     origin/<branch>'s history for that path: a stale checkout (the ref moved,

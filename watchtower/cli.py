@@ -6083,6 +6083,54 @@ def _maybe_self_update() -> None:
         print(f"[watchtower] self-update skipped: {e}", flush=True)
 
 
+def _boot_head() -> str:
+    """Installed revision this process starts from ("" when unknown)."""
+    if _self_update_suppressed():
+        return ""
+    try:
+        from . import deploy
+        return deploy.head()
+    except Exception:  # noqa: BLE001 - unknown is fine: it never restarts anything
+        return ""
+
+
+def _deploy_sync_tick(boot_head: str, held: str = "") -> str:
+    """One installed-tree check for the running daemon. Re-execs (same pid,
+    same argv, the path the daemon has always used) when the code on disk is
+    no longer the code in memory:
+
+    * this process fast-forwarded the tree itself (``sync()`` says "moved"), or
+    * something else did (a manual ``wt deploy --sync``, another daemon) so
+      ``sync()`` says "up-to-date" while the installed HEAD differs from the
+      one read at boot. Without this the daemon ran old imports forever.
+
+    A tree with uncommitted edits is never re-read (``held``): that is logged
+    once per revision. Returns the revision last reported as held, so the
+    caller can pass it back and keep the log quiet."""
+    from . import deploy
+    res = deploy.sync()
+    if res["action"] == "moved":
+        print(f"[watchtower] deploy sync {res['was'][:8]} -> {res['head'][:8]}; re-exec", flush=True)
+        os.execvp(sys.executable, [sys.executable, "-m", "watchtower.cli"] + sys.argv[1:])
+        return held
+    if res["action"] == "refused":
+        print(f"[watchtower] deploy sync refused: {res['reason']}", flush=True)
+    drift = deploy.boot_drift(boot_head, res)
+    if drift["state"] == "stale":
+        msg = f"running {drift['boot'][:8]}, installed {drift['head'][:8]} (moved by another process)"
+        try:
+            q._log("DEPLOY_PICKUP", msg)
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"[watchtower] {msg}; re-exec", flush=True)
+        os.execvp(sys.executable, [sys.executable, "-m", "watchtower.cli"] + sys.argv[1:])
+    elif drift["state"] == "held" and held != drift["head"]:
+        held = drift["head"]
+        print(f"[watchtower] running {drift['boot'][:8]}, installed {drift['head'][:8]}, but the "
+              "installed tree has uncommitted edits; not restarting onto them", flush=True)
+    return held
+
+
 def _daemon_loop(args: argparse.Namespace) -> None:
     """Own the GitHub-list-cache poller thread's lifetime, then run the tick
     loop. A ``try/finally`` here (rather than inside the loop itself) is
@@ -6109,6 +6157,9 @@ def _daemon_loop(args: argparse.Namespace) -> None:
 
 
 def _daemon_loop_ticks(args: argparse.Namespace) -> None:
+    # Read before anything can move the tree, so "what this process imported"
+    # is compared with "what is installed" on every deploy tick below.
+    boot_head, boot_held = _boot_head(), ""
     _maybe_self_update()  # pick up reconciler fixes on every (re)start; re-execs if HEAD moved
     last_self_update_check = time.time()
     last_deploy_sync = 0.0
@@ -6303,13 +6354,7 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
                 and not _self_update_suppressed()):
             last_deploy_sync = time.time()
             try:
-                from . import deploy
-                res = deploy.sync()
-                if res["action"] == "moved":
-                    print(f"[watchtower] deploy sync {res['was'][:8]} -> {res['head'][:8]}; re-exec", flush=True)
-                    os.execvp(sys.executable, [sys.executable, "-m", "watchtower.cli"] + sys.argv[1:])
-                elif res["action"] == "refused":
-                    print(f"[watchtower] deploy sync refused: {res['reason']}", flush=True)
+                boot_held = _deploy_sync_tick(boot_head, boot_held)
             except Exception as e:  # noqa: BLE001 - never kill the loop
                 print(f"[watchtower] deploy sync failed: {e}", flush=True)
         # WT-24: sleep until the next tick, but wake early when a CLI transition
