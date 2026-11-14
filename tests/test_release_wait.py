@@ -5,7 +5,11 @@ release"). Source-only holds and plain data defers are unchanged."""
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -135,3 +139,31 @@ def test_plain_and_source_only_defers_still_work(env, repo, capsys):
     assert rc == 0                                          # compatibility: advice, not refusal
     assert "does not say what it waits on" in capsys.readouterr().err
     assert q.get(vague)["defer_reason"] == "pushed; awaiting release"
+
+
+@pytest.mark.parametrize("repo_source", ["queue", "cwd"])
+@pytest.mark.parametrize("awaits", ["release", "integration"])
+def test_defer_cli_resolves_repo_without_an_explicit_path(wt_env, repo, repo_source, awaits):
+    """Workers can defer pathless tickets using queue config or their checkout."""
+    ref = _ticket(wt_env.queue, "T")
+    assert not wt_env.queue.get(ref).get("repo_path")
+    if repo_source == "queue":
+        wt_env.config.set_repo_path("T", repo["path"])
+    cwd = wt_env.tmp if repo_source == "queue" else Path(repo["path"])
+    flags = (["--commit", repo["merged"], "--release-branch", "origin/next"]
+             if awaits == "release" else
+             ["--commit", repo["stranded"], "--integration-owner", "worker-2",
+              "--integration-path", "cherry-pick to next"])
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
+    done = subprocess.run(
+        [sys.executable, "-m", "watchtower.cli", "defer", ref, "--worker", "w1",
+         "--until", "+30m", "--reason", "waiting for adoption", "--awaits", awaits,
+         "--json", *flags],
+        cwd=cwd, env=env, capture_output=True, text=True, timeout=30)
+    assert done.returncode == 0, done.stderr
+    item = json.loads(done.stdout)
+    stored = wt_env.queue.get(ref)
+    assert item["ref"] == ref and stored["status"] == "open"
+    assert stored.get("deferred_until") and not stored.get("claimed_by")
+    assert stored["defer_reason"].startswith(f"[awaits {awaits}")
+    assert wt_env.queue.count_claimable(project="T") == 0

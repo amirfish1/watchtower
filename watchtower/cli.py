@@ -3467,7 +3467,7 @@ def cmd_defer(args: argparse.Namespace) -> int:
     """Wait for data, not for a human: the ticket leaves your claim and the
     claim pool until --until, then any worker resumes it from your progress
     note. For a decision you need from a human, use `wt block`."""
-    from . import release_wait
+    from . import config, release_wait
     awaits = str(getattr(args, "awaits", "") or "")
     reason = args.reason
     try:
