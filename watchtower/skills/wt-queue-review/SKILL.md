@@ -33,8 +33,8 @@ problem complete: a ticket closes only when its work is verified done.
 **What needs the owner vs not.** Routine reversible agent work (verified
 mechanical answers, releasing dead claims, exact-duplicate dedup, acking items
 proven moot, filing a ticket you are Auto-GO on) is done and logged in the
-digest, no approval. Ask only for: product/policy design approval, information
-only the owner has, and hard stops above. Run `desk check "<question>"` first;
+digest, no approval. Ask only for consequential product/policy choices not already authorized,
+information only the owner has, and applicable hard stops above. Run `desk check "<question>"` first;
 if past decisions answer it and it's cheap to undo, decide and `desk log`.
 
 ## Part 1: Health (per queue)
@@ -51,7 +51,10 @@ Don't act on a "stuck" flag alone; read `wt ls` to see what is stuck
 
 Safe mechanical repairs:
 - **Claimed, worker dead** (no recent activity and `wt workers --json` shows no
-  live worker): `wt release <ref> --worker <id>`. Never fabricate a close.
+  live worker): release only an unblocked abandoned claim with
+  `wt release <ref> --worker <id>`. Preserve `needs_input`, existing questions
+  and explicit holds; classify those waits in Part 2. Never force-release
+  a blocked ticket merely because its worker exited. Never fabricate a close.
 - **Exact-duplicate open tickets**: `wt dedup -q <Q>` (dry run), then
   `wt dedup -q <Q> --apply`.
 - **Parked for a human**: classify in Part 2 first; only a verified
@@ -100,8 +103,10 @@ changelog snippet, stale repo entry, commit/close-proof plumbing): resolve it
 automatically after verifying. Never escalate to the user.
 
 **B. Product / policy decision** (the worker proposes a design or policy and
-asks for approval): present to the user in the format below. Approving a
-worker's proposed design is NEVER automatic, whatever the score.
+asks for approval): first check current rules and prior authorization.
+Routine reversible implementation choices within authorized scope belong to
+the agent; record the choice and proceed. Present only a consequential choice,
+missing preference or genuinely required approval. A score grants no authority.
 
 **C. Needs information only the user has** (a repro, a preference): ask the
 user directly, briefly.
@@ -172,11 +177,11 @@ Never flood. Each card, short enough that the user never opens the ticket:
 - **Risk: L/M/H** — chance that making the change breaks something or is hard
   to undo. Say what drives it in a few words.
 - **Auto-GO rule:** score above 0.8 AND blast radius L AND risk L means GO with
-  no question: do the proposal (e.g. file the ticket with `wt add ... --pre-ack`;
+  no question only when already authorized: do the proposal (e.g. file the ticket with `wt add ... --pre-ack`;
   omit `--submitter`, a made-up name makes the close notification undeliverable)
   and list it in the end-of-sweep digest. Applies to proposals the sweep itself
-  makes. It does NOT override "approving a worker's proposed design is never
-  automatic". Anything else: ask.
+  makes. It never grants authorization or overrides an actual approval gate.
+  Lower scores call for more evidence, not automatically an owner question.
 - **Your call** — what to reply. Then `wt answer` exactly the user's decision,
   including any refinements they add.
 
@@ -189,9 +194,9 @@ feature's keywords). If it was killed or removed, its caveats are moot: propose
 acking, nothing else. Never infer that a feature is live from a data file
 (e.g. a `fired: true` flag); read the code path that sets it. Group tickets
 that share a root cause. Classify each
-item by nature, then apply that category's rule. Reopening, filing a product-decision ticket or acking an item you cannot
-justify from verified facts needs the user's say-so; the auto-acks named below
-do not.
+item by nature, then apply that category's rule. Perform authorized reversible
+tracking repairs with verified evidence. Do not acknowledge unresolved work
+without evidence; ask only if a real choice or required approval remains.
 
 **Acknowledge** with `wt unresolved-ack <ref> --all` (or `--unresolved N`,
 `--caveat N`, `--follow-up N`; `--undo` reverses; no history rewrite). NOT
@@ -224,10 +229,10 @@ Origin and staleness rules:
 - Sending to customers is never done by this skill: draft/propose only.
 
 1. **Couldn't verify** (worker lacked the means to test it). Assess (a) feature
-   size S/M/L and (b) probability 0-1 that the fix is right unverified, with the
-   evidence. Small AND high probability: let it go and `wt unresolved-ack` it.
-   Important OR low probability: bring it to the user with a proposal to reopen
-   or file a dedicated verification ticket.
+   size S/M/L and (b) what evidence is missing. Run available authorized checks
+   or route verification to an agent. Do not acknowledge required acceptance
+   merely because the fix seems likely correct. Ask only if verification needs
+   new access, spending approval or a consequential tradeoff.
 2. **Real bug noticed, never filed**: a decision card (Rule B) whose proposal is
    "file this bug", with confidence it is worth fixing and the case for NOT
    opening it.
