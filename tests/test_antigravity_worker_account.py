@@ -195,6 +195,7 @@ def test_secondary_isolates_profiles_and_preserves_operational_context(setup_acc
     assert all(key not in env for key in ("ANTIGRAVITY_GEMINI_DIR", "GEMINI_DIR", "XDG_CONFIG_HOME"))
     assert env["WATCHTOWER_DATA_DIR"] == os.environ["WATCHTOWER_DATA_DIR"]
     assert env["WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE"] == str(setup_accounts)
+    assert env["WATCHTOWER_MODEL_POLICY_FILE"] == str(config.CCC_MODEL_POLICY_FILE)
     assert env["CCC_SERVER"] == "http://127.0.0.1:12345"
     assert env["WATCHTOWER_DELEGATE_URL"] == env["CCC_SERVER"]
     isolated_cli = home / ".gemini" / "antigravity-cli"

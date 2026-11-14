@@ -4176,6 +4176,7 @@ def cmd_discuss(args: argparse.Namespace) -> int:
         for key in ("AGY_ADC_AUTH", "HOME", "ANTIGRAVITY_CREDENTIAL_SCOPE",
                     "ANTIGRAVITY_CONFIG_REL_DIR", "WATCHTOWER_DATA_DIR",
                     "WATCHTOWER_CONFIG_FILE", "WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE",
+                    "WATCHTOWER_MODEL_POLICY_FILE",
                     "CCC_ANTIGRAVITY_ACCOUNT_ID", "CCC_ANTIGRAVITY_PRIMARY_HOME",
                     "CCC_ANTIGRAVITY_LS_DIR"):
             printable.append(f"{key}={routed[key]}")

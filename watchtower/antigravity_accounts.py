@@ -256,6 +256,7 @@ def launch_env(account_id, env=None):
         result.setdefault("WATCHTOWER_DATA_DIR", str(storage.data_dir()))
         result.setdefault("WATCHTOWER_CONFIG_FILE", str(config.config_path()))
         result.setdefault("WATCHTOWER_CCC_SPAWN_DEFAULTS_FILE", str(config.CCC_SPAWN_DEFAULTS_FILE))
+        result.setdefault("WATCHTOWER_MODEL_POLICY_FILE", str(config.CCC_MODEL_POLICY_FILE))
         if not result.get("CCC_SERVER"):
             try:
                 server = (Path(config.CCC_SPAWN_DEFAULTS_FILE).parent / "port.txt").read_text().strip()
