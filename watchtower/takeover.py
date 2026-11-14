@@ -328,18 +328,21 @@ def _tick(it, obs, now):
             s['state']='running'
         elif row and row['state'] in ('pending','sending'):
             intent['state']='pending'
-        elif row and row['state'] in ('lost','failed'):
-            intent['state']='queued'
+        elif (row and row['state'] in ('lost','failed')) or (not row and intent['state']=='uncertain'):
+            # An aged-out receipt row leaves an uncertain intent; settle it too.
+            if row:
+                intent['state']='queued'
             # A lost receipt is ambiguous. Settle it from the transcript, then
             # resend at most once under a new nonce; a second loss cancels.
-            if row['state']=='lost':
-                nonce=row.get('nonce') or ''
+            if not row or row['state']=='lost':
+                # The delivered text always carries the action key.
+                nonce=(row or {}).get('nonce') or intent['key']
                 tpath=obs.get('transcript') or ''
                 try:
                     text=Path(tpath).read_text(errors='replace') if tpath and Path(tpath).is_file() else None
                 except OSError:
                     text=None
-                landed=bool(nonce) and text is not None and nonce in text
+                landed=bool(nonce) and text is not None and (nonce in text or intent['key'] in text)
                 if text is None or not nonce:
                     # No readable transcript (e.g. broker): absence is unproven.
                     s.update(state='paused_unreachable', reason='Delivery outcome unknown; inspect receipt before explicit recovery')

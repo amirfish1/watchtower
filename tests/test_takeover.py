@@ -586,3 +586,14 @@ def test_codex_existing_writer_prevents_private_resume(env,monkeypatch):
     monkeypatch.setattr(codex_rpc,'request',lambda *a,**kw:pytest.fail('competing writer'))
     result=codex_rpc.deliver(SID,'continue',idle_only=True,session_settings=dict(model='original',approval_policy='on-request',sandbox_policy={'type':'read-only'}))
     assert not result['ok'] and result['stage']=='owner-check'
+
+
+def test_uncertain_intent_without_receipt_row_resends_once(env):
+    a=adopt(env); t.reconcile()
+    env[2][a['supervision']['intent']['key']]={'state':'lost','nonce':'<wt:n1>'}
+    now=time.time()+5000
+    # Force the old failure shape: uncertain intent whose receipt row has aged out.
+    def mark(i,r): r['intent']['state']='uncertain'; r['state']='paused_unreachable'
+    t._update(a['ticket'],1,mark); env[2].clear()
+    t.reconcile(now=now)
+    assert t.status(SID)['supervision']['intent']['resent']
