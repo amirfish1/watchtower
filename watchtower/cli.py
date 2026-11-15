@@ -6064,9 +6064,18 @@ def _maybe_self_update() -> None:
             f"[watchtower] self-update moved HEAD {before[:8]} -> {after[:8]}; re-exec",
             flush=True,
         )
-        os.execvp(sys.executable, [sys.executable, "-m", "watchtower.cli"] + sys.argv[1:])
+        _reexec_when_writes_drain()
     except Exception as e:  # noqa: BLE001 - an update hiccup must never block the daemon
         print(f"[watchtower] self-update skipped: {e}", flush=True)
+
+
+def _reexec_when_writes_drain() -> None:
+    from .github_write_lock import quiesce_for_reexec
+    with quiesce_for_reexec() as drained:
+        if not drained:
+            print("[watchtower] re-exec postponed: GitHub transactions still active", flush=True)
+            return
+        os.execvp(sys.executable, [sys.executable, "-m", "watchtower.cli"] + sys.argv[1:])
 
 
 def _boot_head() -> str:
@@ -6097,7 +6106,7 @@ def _deploy_sync_tick(boot_head: str, held: str = "") -> str:
     res = deploy.sync()
     if res["action"] == "moved":
         print(f"[watchtower] deploy sync {res['was'][:8]} -> {res['head'][:8]}; re-exec", flush=True)
-        os.execvp(sys.executable, [sys.executable, "-m", "watchtower.cli"] + sys.argv[1:])
+        _reexec_when_writes_drain()
         return held
     if res["action"] == "refused":
         print(f"[watchtower] deploy sync refused: {res['reason']}", flush=True)
@@ -6109,7 +6118,7 @@ def _deploy_sync_tick(boot_head: str, held: str = "") -> str:
         except Exception:  # noqa: BLE001
             pass
         print(f"[watchtower] {msg}; re-exec", flush=True)
-        os.execvp(sys.executable, [sys.executable, "-m", "watchtower.cli"] + sys.argv[1:])
+        _reexec_when_writes_drain()
     elif drift["state"] == "held" and held != drift["head"]:
         held = drift["head"]
         print(f"[watchtower] running {drift['boot'][:8]}, installed {drift['head'][:8]}, but the "

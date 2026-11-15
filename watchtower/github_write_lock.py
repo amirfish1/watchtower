@@ -20,9 +20,55 @@ from . import github_backend as gb
 
 LABEL = "watchtower:body-lock:v1"
 WAIT_SECONDS = 30
+REEXEC_WAIT_SECONDS = 30
 
 
 _LOCAL = threading.local()
+_TRANSACTIONS = threading.Condition()
+_ACTIVE = 0
+_QUIESCING = False
+
+
+@contextlib.contextmanager
+def _transaction():
+    global _ACTIVE
+    with _TRANSACTIONS:
+        # Nested writes already belong to a draining transaction. Blocking
+        # those would prevent that transaction from ever finishing.
+        _TRANSACTIONS.wait_for(lambda: not _QUIESCING or getattr(_LOCAL, "depth", 0))
+        _LOCAL.depth = getattr(_LOCAL, "depth", 0) + 1
+        _ACTIVE += 1
+    try:
+        yield
+    finally:
+        with _TRANSACTIONS:
+            _ACTIVE -= 1
+            _LOCAL.depth -= 1
+            _TRANSACTIONS.notify_all()
+
+
+@contextlib.contextmanager
+def quiesce_for_reexec():
+    """Keep new writers out until exec, without abandoning active writers.
+
+    exec discards other threads but preserves PID/start identity. An
+    interrupted write would leave a fence that recovery regards as live.
+    A timeout postpones adoption rather than weakening that recovery rule.
+    """
+    global _QUIESCING
+    with _TRANSACTIONS:
+        if _QUIESCING or getattr(_LOCAL, "depth", 0):
+            owns_gate = drained = False
+        else:
+            owns_gate = _QUIESCING = True
+            drained = _TRANSACTIONS.wait_for(lambda: _ACTIVE == 0, REEXEC_WAIT_SECONDS)
+    try:
+        yield drained
+    finally:
+        if owns_gate:
+            with _TRANSACTIONS:
+                _QUIESCING = False
+                _TRANSACTIONS.notify_all()
 
 
 def child_options():
@@ -183,7 +229,7 @@ def hold(backend):
     path = _fence_path(nonce)
     path.parent.mkdir(parents=True, exist_ok=True)
     previous_fd = getattr(_LOCAL, "fd", None)
-    with path.open("x+") as fence:
+    with _transaction(), path.open("x+") as fence:
         fcntl.flock(fence.fileno(), fcntl.LOCK_EX)
         _LOCAL.fd = fence.fileno()
         try:

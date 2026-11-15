@@ -66,6 +66,15 @@ write is not a verified resolution: re-read the ticket before retrying a close.
 Normal host restarts preserve enough on-disk identity/fence evidence to recover;
 a lost store/fence requires investigation, not automatic stealing.
 
+Daemon self-updates also drain in-process GitHub transactions before re-exec,
+holding new writers out until exec. Re-exec preserves PID/start identity but
+discards other threads, so executing in the middle of a write would strand an
+empty fence under a still-live identity. A 30s drain timeout postpones adoption
+to the next update tick; it never expires or steals the repository lock. A
+returning/failed exec reopens writer admission. For an incident already stranded
+by an older daemon's re-exec, a controlled owning-host daemon restart changes
+the PID identity; ordinary recovery still requires the inherited fence to drain.
+
 A worker-attributed release also refuses a foreign claimant and carries its
 original claim snapshot into the locked write. A replacement claim arriving
 while it waits cannot be released. Explicit `--force` recovery remains deliberate;
