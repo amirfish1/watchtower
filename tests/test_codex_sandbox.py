@@ -33,7 +33,7 @@ def test_exec_workspace_write(cfg, monkeypatch):
     assert argv[argv.index("--sandbox") + 1] == "workspace-write"
     assert "sandbox_workspace_write.network_access=false" in argv
     roots = next(a for a in argv if a.startswith("sandbox_workspace_write.writable_roots="))
-    assert json.loads(roots.split("=", 1)[1]) == [str(repo.resolve()), str(store.resolve())]
+    assert json.loads(roots.split("=", 1)[1]) == [str(repo.resolve()), str((store / "w1").resolve())]
     env = workers._spawn_env("w1", queue="DEMO", engine="codex")
     assert env["WATCHTOWER_STORE"].startswith(str(store))
     # other engines on the queue are not redirected

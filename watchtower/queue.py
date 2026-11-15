@@ -3412,6 +3412,7 @@ def update_status(
     group_force: bool = False,
     expect: Optional[Dict[str, Any]] = None,
     close_contract: Optional[Dict[str, Any]] = None,
+    sandbox_contract: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """``close_contract``: a ``conditional_closes`` request for a close. Store
     identity, the observed question and the idempotency key are checked under
@@ -3482,6 +3483,8 @@ def update_status(
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {VALID_STATUSES}")
     backend = _github_backend_for_project(_project_from_ident(ident))
+    if sandbox_contract is not None and backend is not None:
+        raise ValueError("sandbox bridge requires a local file-backed queue")
     conditional = None
     if close_contract is not None:
         from . import conditional_closes as conditional
@@ -3518,6 +3521,8 @@ def update_status(
         return item
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
     with _FileLock(_lock_path()) as status_lock:
+        if sandbox_contract is not None and status_lock._fh is None:
+            raise ValueError("sandbox source write lock unavailable")
         if conditional is not None:
             if status_lock._fh is None:
                 raise conditional.Unsupported("source write lock unavailable")
@@ -3525,6 +3530,13 @@ def update_status(
         data = _load_unlocked(strict=conditional is not None)
         for it in data["items"]:
             if _matches(it, ident):
+                if sandbox_contract is not None:
+                    from . import sandbox_bridge
+                    if (status != "closed" or it.get("status") != "in_progress"
+                            or it.get("needs_input")
+                            or sandbox_bridge._fence(it) != sandbox_contract["fence"]
+                            or effective_gates(it) != sandbox_contract["gates"]):
+                        raise ValueError("sandbox claim or gates changed during close")
                 if conditional is not None:
                     conditional.prepare_unlocked(it, close_contract)
                 if require_status is not None and it.get("status") != require_status:
@@ -5340,6 +5352,7 @@ def close(
     ident: Any, session_id: str = "", resolution: Any = None, force: bool = False,
     declined: bool = False, session_uuid: str = "",
     close_contract: Optional[Dict[str, Any]] = None,
+    sandbox_expect: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Close a ticket, optionally recording HOW it was fixed.
 
@@ -5360,6 +5373,19 @@ def close(
     (e.g. dedup-close) pass no ``session_id`` and are unaffected. ``force=True``
     bypasses the guard for a human deliberately force-closing someone's ticket."""
     cur = get(ident)
+    sandbox_contract = None
+    if sandbox_expect is not None:
+        from . import sandbox_bridge
+        if (_github_backend_for_project(_project_from_ident(ident)) is not None
+                or cur is None or sandbox_bridge._fence(cur) != sandbox_expect
+                or cur.get("status") != "in_progress" or cur.get("needs_input")
+                or not session_id or cur.get("claimed_by") != session_id
+                or force or declined or close_contract is not None):
+            raise ValueError("sandbox close requires the current assigned local claim")
+        sandbox_gates = effective_gates(cur)
+        if any(g.startswith("cmd:") for g in sandbox_gates):
+            raise ValueError("sandbox close cannot run command gates outside its sandbox; trusted review required")
+        sandbox_contract = {"fence": sandbox_expect, "gates": sandbox_gates}
     if cur is not None and cur.get("duplicate_of"):
         raise ValueError(f"{cur.get('ref', ident)} follows duplicate original {cur['duplicate_of']}; clear the link before independent work")
     if _github_backend_for_project(_project_from_ident(ident)) is None:
@@ -5394,6 +5420,14 @@ def close(
         gh, gh_results = _github_gated_close(ident, session_id, session_uuid, resolution, force)
         if gh is not None:
             return gh
+    elif sandbox_contract is not None:
+        # No gate command from a writable checkout is executed by the broker.
+        # Review/verify still enter their ordinary required lifecycle.
+        stages = (["verify"] if "verify" in sandbox_gates else [])
+        stages += next(([g] for g in sandbox_gates
+                        if g == "review" or g.startswith("review:")), [])
+        extras = {"gate_results": [], "gate_stages": stages}
+        hold_review = stages[0] if stages else ""
     elif not force:
         current = get(ident)
         if current is not None and current.get("status") != "closed" and effective_gates(current):
@@ -5425,6 +5459,7 @@ def close(
         ident, "closed", session_id, session_uuid=session_uuid, resolution=resolution,
         expect_owner="" if force else str(session_id or ""),
         hold_review=hold_review, extras=extras, close_contract=close_contract,
+        sandbox_contract=sandbox_contract,
     )
     if item and item.get("status") == "in_review":
         _notify_review(item, hold_review, session_id)

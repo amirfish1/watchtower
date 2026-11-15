@@ -3562,6 +3562,10 @@ def _resume_session_headless(
     owner while the answer is being applied. Returns True if the resume process
     started."""
     if engine == "codex":
+        from . import config, sandbox_bridge
+        if ((queue and config.codex_sandbox(queue) == "workspace-write")
+                or sandbox_bridge.restricted_session(sid, worker_id)):
+            return False  # a generic exec resume must never drop sandbox policy
         argv = [
             "codex", "exec", "resume",
             "--dangerously-bypass-approvals-and-sandbox",
@@ -6121,6 +6125,9 @@ def _daemon_loop(args: argparse.Namespace) -> None:
 
     dashboard.install_stack_dump_handler()  # kill -USR1 <pid> -> all stacks on stderr
     gh_poller_stop = threading.Event()
+    from . import sandbox_bridge
+    if not getattr(args, "dry_run", False):
+        threading.Thread(target=sandbox_bridge.serve, args=(gh_poller_stop,), daemon=True).start()
     threading.Thread(
         target=github_backend.poll_list_caches_forever,
         args=(5.0,),
@@ -8320,7 +8327,7 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--dry-run", action="store_true")
     b.set_defaults(func=cmd_session_names)
 
-    s = sub.add_parser("send")
+    s = sub.add_parser("send", aliases=["tell"])
     s.add_argument("target", help="worker id, @agent name, or session UUID/prefix")
     s.add_argument("text", help="the message, or '-' to read it from stdin "
                                 "(quote-safe for long/multi-line bodies)")
@@ -8901,6 +8908,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not getattr(args, "command", None):
         parser.print_help()
         return 0
+    if os.environ.get("WT_SANDBOX_BRIDGE"):
+        from . import sandbox_bridge
+        return sandbox_bridge.cli(args)
     return args.func(args)
 
 

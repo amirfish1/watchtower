@@ -463,6 +463,9 @@ def deliver(
         else:
             hosted["stage"] = "app-worker/turn/steer"
         return hosted
+    from . import sandbox_bridge
+    if sandbox_bridge.restricted_session(thread_id):
+        return {"ok": False, "error": "sandbox worker requires its original policy-bound app-server", "stage": "sandbox-policy"}
     app_server_warm = is_running()
     if not is_available():
         return {
