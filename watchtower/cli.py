@@ -533,109 +533,85 @@ def _ls_parse_when(value: str, *, now: Optional[float] = None) -> float:
     return dt.timestamp()
 
 
-def _ls_ts(value: Any) -> Optional[float]:
-    from datetime import datetime, timezone
-    if not value or not isinstance(value, str):
+def _ls_window_spec(args: argparse.Namespace) -> Optional["q.WindowSpec"]:
+    """Build the bounded-read spec from the ls flags; None when no selector."""
+    g = lambda n: getattr(args, n, None)  # noqa: E731
+    events = list(g("event") or [])
+    if not (g("closed_since") or g("closed_until") or events or g("event_since")
+            or g("event_until") or g("ref") or g("updated_since")):
         return None
-    try:
-        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.timestamp()
-
-
-def _ls_window_select(items: List[Dict[str, Any]], args: argparse.Namespace) -> Tuple[List[Dict[str, Any]], bool]:
-    """Union of the window selectors (closed-since, event window, --ref).
-
-    Returns (selected items sorted by seq, windowed). Selected items that matched
-    on history events carry ``window_events`` (only the in-window events).
-    """
-    closed_since = getattr(args, "closed_since", None)
-    closed_until = getattr(args, "closed_until", None)
-    events = set(getattr(args, "event", None) or [])
-    ev_since = getattr(args, "event_since", None)
-    ev_until = getattr(args, "event_until", None)
-    refs = {r.upper() for r in (getattr(args, "ref", None) or [])}
-    updated_since = getattr(args, "updated_since", None)
-    if not (closed_since or closed_until or events or ev_since or ev_until or refs or updated_since):
-        return items, False
-    if (ev_since or ev_until) and not events:
+    if (g("event_since") or g("event_until")) and not events:
         raise ValueError("--event-since/--event-until need at least one --event NAME")
-    lo = _ls_parse_when(closed_since) if closed_since else None
-    hi = _ls_parse_when(closed_until) if closed_until else None
-    elo = _ls_parse_when(ev_since) if ev_since else None
-    ehi = _ls_parse_when(ev_until) if ev_until else None
-    ulo = _ls_parse_when(updated_since) if updated_since else None
-    out = []
-    for it in items:
-        hit = False
-        if str(it.get("ref", "")).upper() in refs:
-            hit = True
-        if (lo is not None or hi is not None) and it.get("status") == "closed":
-            t = _ls_ts(it.get("closed_at"))
-            if t is not None and (lo is None or t >= lo) and (hi is None or t < hi):
-                hit = True
-        if ulo is not None:
-            t = _ls_ts(it.get("updated_at"))
-            if t is not None and t >= ulo:
-                hit = True
-        if events:
-            matched = []
-            for e in it.get("history") or []:
-                if e.get("event") not in events:
-                    continue
-                t = _ls_ts(e.get("at"))
-                if t is None:
-                    continue
-                if (elo is None or t >= elo) and (ehi is None or t < ehi):
-                    matched.append(e)
-            if matched:
-                hit = True
-                it = dict(it, window_events=matched)
-        if hit:
-            out.append(it)
-    out.sort(key=lambda i: (i.get("seq") or 0, str(i.get("ref", ""))))
-    return out, True
+    w = lambda v: _ls_parse_when(v) if v else None  # noqa: E731
+    return q.WindowSpec(
+        closed_since=w(g("closed_since")), closed_until=w(g("closed_until")),
+        updated_since=w(g("updated_since")), events=events,
+        event_since=w(g("event_since")), event_until=w(g("event_until")),
+        refs=g("ref") or ())
 
 
 def cmd_ls(args: argparse.Namespace) -> int:
     """List the tickets in a single queue (the actual items, not just counts)."""
-    # fresh=True for the same reason as `wt status`: a CLI read always
-    # revalidates, so `wt ls` is never behind the repo.
-    items = q.list_items(project=args.queue, fresh=True)
-    if getattr(args, "client_id", None) is not None:
-        items = [i for i in items if i.get("client_id", "") == args.client_id]
-    all_items = items
     try:
-        items, windowed = _ls_window_select(items, args)
+        spec = _ls_window_spec(args)
     except ValueError as e:
         print(f"wt ls: {e}", file=sys.stderr)
         return 2
+    windowed = spec is not None
     offset = max(0, getattr(args, "offset", 0) or 0)
-    # Counted over the WHOLE queue, before the status filter, so the default
-    # (active) view still surfaces that closed-but-unresolved work exists.
-    unresolved_total = len(_unresolved_items(all_items))
+    wmeta: Dict[str, Any] = {}
+    if windowed:
+        # WT-60: bounded read from the time index; only the page is parsed and
+        # the rest of the store is never loaded.
+        want = "unresolved" if getattr(args, "unresolved", False) else (args.status or "all")
+        items, wmeta = q.window_items(args.queue, spec, offset=offset,
+                                      limit=max(0, args.limit or 0), status=want,
+                                      client_id=getattr(args, "client_id", None))
+        blockers = sorted({str(b) for i in items for b in (i.get("blocked_by") or [])}
+                          | ({str((i.get("wait") or {}).get("ref") or "") for i in items} - {""}))
+        all_items = items + list(q.items_by_refs(blockers).values())
+        unresolved_total = 0
+    else:
+        # fresh=True for the same reason as `wt status`: a CLI read always
+        # revalidates, so `wt ls` is never behind the repo.
+        items = q.list_items(project=args.queue, fresh=True)
+        if getattr(args, "client_id", None) is not None:
+            items = [i for i in items if i.get("client_id", "") == args.client_id]
+        all_items = items
+        # Counted over the WHOLE queue, before the status filter, so the default
+        # (active) view still surfaces that closed-but-unresolved work exists.
+        unresolved_total = len(_unresolved_items(all_items))
     want = args.status or ("all" if windowed else "active")
     if getattr(args, "unresolved", False):
-        want = "unresolved"  # documented shorthand for --status unresolved
-    if want == "active":
+        want = "unresolved"
+    if not windowed and want == "active":
         items = [i for i in items if i.get("status") in ("open", "in_progress", "in_review", "awaiting_answer")]
-    elif want == "blocked":
+    elif not windowed and want == "blocked":
         items = [i for i in items if i.get("needs_input")]
-    elif want == "unresolved":
+    elif not windowed and want == "unresolved":
         items = _unresolved_items(items)
-    elif want != "all":
+    elif not windowed and want != "all":
         items = [i for i in items if i.get("status") == want]
-    total = len(items)
-    limit = args.limit or max(total - offset, 0)
+    if windowed:
+        # Filtering and counting happened before pagination in the index.
+        page, limit = items, wmeta["limit"]
+        total = wmeta["total"]
+        items, offset = page, 0
+    else:
+        total = len(items)
+        limit = args.limit or max(total - offset, 0)
     if args.json:
+        if windowed:
+            # Resolve blockers by ref lookup, not by loading every queue.
+            by_ref = q._refs_index(all_items)
+            rows = [dict(i, waiting_on=q.waiting_on(i, by_ref)) for i in items]
+            print(json.dumps({**wmeta, "items": rows}, indent=2))
+            return 0
         # Blockers may live in other queues, so resolve against every queue.
         by_ref = q._refs_index(q.list_items(fresh=True) + all_items)
         page = items[offset:offset + limit]
         rows = [dict(i, waiting_on=q.waiting_on(i, by_ref)) for i in page]
-        if windowed or offset:
+        if offset:
             end_at = offset + len(page)
             print(json.dumps({
                 "items": rows, "total": total, "offset": offset, "limit": limit,
@@ -647,6 +623,8 @@ def cmd_ls(args: argparse.Namespace) -> int:
         return 0
     if not items:
         print(f"(no {('' if want=='all' else want+' ')}items in {args.queue})")
+        if windowed and not wmeta["complete"]:
+            print(f"INCOMPLETE: {wmeta.get('coverage', 'more pages available')}")
         return 0
     if unresolved_total and want != "unresolved":
         print(f"{args.queue}: {unresolved_total} closed "
@@ -694,7 +672,11 @@ def cmd_ls(args: argparse.Namespace) -> int:
             if extras:
                 line += f" [{', '.join(extras)}]"
         print(line)
-    if len(items) > offset + limit:
+    if windowed:
+        if not wmeta["complete"]:
+            print(f"... INCOMPLETE: {wmeta['returned']} of {total} matched "
+                  f"({wmeta.get('coverage') or '--offset ' + str(wmeta['next_offset']) + ' for the next page'})")
+    elif len(items) > offset + limit:
         print(f"... and {len(items) - offset - limit} more "
               f"(raise --limit or use --offset {offset + limit})")
     return 0

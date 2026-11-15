@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import os
 import re
 import subprocess
@@ -360,6 +361,14 @@ def _rewrite_persisted_list_cache(mutate) -> None:
         with open(tmp, "w") as f:
             json.dump(data, f)
         os.replace(tmp, path)
+        # Reporting reads stay local and bounded; the existing writer maintains
+        # projections only for queues that have requested them.
+        try:
+            from . import reporting_cache
+            reporting_cache.publish_existing(data, path)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            _log_quota("report_index_error", error=str(exc))
+
 
 
 def _write_persisted_list_entry(key: str, entry: Dict[str, Any]) -> None:

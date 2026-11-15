@@ -764,6 +764,77 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_items_project_status ON items(project, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_items_ref ON items(ref)")
+    _ensure_time_index_schema(conn)
+
+
+# Derived reporting indexes. Triggers record changed primary keys, including writes
+# from older binaries; steady reads never scan item_json to detect stale rows.
+def _ensure_time_index_schema(conn: sqlite3.Connection) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+    for name, decl in (("closed_ts", "REAL"), ("updated_ts", "REAL"),
+                       ("window_seq", "INTEGER"), ("window_client", "TEXT"),
+                       ("window_blocked", "INTEGER"), ("window_unresolved", "INTEGER")):
+        if name not in cols:
+            conn.execute(f"ALTER TABLE items ADD COLUMN {name} {decl}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_closed ON items(project, closed_ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_items_updated ON items(project, updated_ts)")
+    conn.execute("CREATE TABLE IF NOT EXISTS item_events (number INTEGER NOT NULL, "
+                 "project TEXT NOT NULL, event TEXT NOT NULL, at_ts REAL NOT NULL)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_lookup ON item_events(project, event, at_ts)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_events_number ON item_events(number)")
+    conn.execute("CREATE TABLE IF NOT EXISTS window_dirty (number INTEGER PRIMARY KEY)")
+    for action in ("INSERT", "UPDATE OF item_json"):
+        name = "window_insert" if action == "INSERT" else "window_update"
+        conn.execute(f"CREATE TRIGGER IF NOT EXISTS {name} AFTER {action} ON items BEGIN "
+                     "INSERT OR IGNORE INTO window_dirty VALUES (NEW.number); END")
+    conn.execute("CREATE TRIGGER IF NOT EXISTS window_delete AFTER DELETE ON items BEGIN "
+                 "DELETE FROM item_events WHERE number=OLD.number; "
+                 "DELETE FROM window_dirty WHERE number=OLD.number; END")
+    if _meta_get(conn, "window_index_version") != "1":
+        conn.execute("INSERT OR IGNORE INTO window_dirty SELECT number FROM items")
+        conn.execute(_META_UPSERT, ("window_index_version", "1"))
+
+
+def _window_ts(value: Any) -> Optional[float]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        return None
+
+
+def _index_item(conn: sqlite3.Connection, it: Dict[str, Any]) -> None:
+    num = int(it.get("number", 0))
+    closed = _window_ts(it.get("closed_at")) if it.get("status") == "closed" else None
+    conn.execute("UPDATE items SET closed_ts=?, updated_ts=?, window_seq=?, "
+                 "window_client=?, window_blocked=?, window_unresolved=? WHERE number=?",
+                 (closed, _window_ts(it.get("updated_at")), it.get("seq") or num,
+                  it.get("client_id", ""), bool(it.get("needs_input")),
+                  bool(_unresolved_for_window(it)), num))
+    conn.execute("DELETE FROM item_events WHERE number=?", (num,))
+    rows = []
+    for event in it.get("history") or []:
+        ts = _window_ts(event.get("at"))
+        if event.get("event") and ts is not None:
+            rows.append((num, it.get("project", ""), event["event"], ts))
+    conn.executemany("INSERT INTO item_events VALUES (?,?,?,?)", rows)
+    conn.execute("DELETE FROM window_dirty WHERE number=?", (num,))
+
+
+def _unresolved_for_window(it: Dict[str, Any]) -> bool:
+    res = it.get("resolution")
+    return (it.get("status") == "closed" and isinstance(res, dict)
+            and any(str(x).strip() for x in (res.get("unresolved") or [])))
+
+
+def _repair_time_index(conn: sqlite3.Connection) -> None:
+    for num, blob in conn.execute("SELECT i.number, i.item_json FROM window_dirty d "
+                                  "JOIN items i ON i.number=d.number").fetchall():
+        _index_item(conn, dict(json.loads(blob), number=num))
 
 
 def _meta_get(conn: sqlite3.Connection, key: str, default: str = "") -> str:
@@ -924,6 +995,8 @@ def _create_db(db: Path, data: Dict[str, Any]) -> None:
         _ensure_schema(conn)
         with conn:
             conn.executemany(_ITEM_UPSERT, rows)
+            for row in rows:
+                _index_item(conn, json.loads(row[5]))
             conn.executemany(
                 _META_UPSERT,
                 [
@@ -1034,6 +1107,7 @@ def _save_unlocked(data: Dict[str, Any]) -> None:
     conn = _connect(db)
     try:
         _ensure_schema(conn)
+        conn.commit()
         conn.execute("BEGIN IMMEDIATE")
         existing = dict(conn.execute("SELECT number, item_json FROM items").fetchall())
         seen = set()
@@ -1042,9 +1116,11 @@ def _save_unlocked(data: Dict[str, Any]) -> None:
             seen.add(row[0])
             if existing.get(row[0]) != row[5]:
                 conn.execute(_ITEM_UPSERT, row)
+                _index_item(conn, it)
         gone = set(existing) - seen
         if gone:
             conn.executemany("DELETE FROM items WHERE number = ?", [(n,) for n in gone])
+            conn.executemany("DELETE FROM item_events WHERE number = ?", [(n,) for n in gone])
         rev = int(_meta_get(conn, "revision", "0") or 0) + 1
         conn.executemany(
             _META_UPSERT,
@@ -1966,6 +2042,181 @@ def _group_enqueue_unlocked(data: Dict[str, Any], saved: Dict[str, Any], group_p
         raise ValueError(f"a member cannot be blocked by its own group parent {parent.get('ref')}")
     _group_add_member_unlocked(data, parent, saved, now)
     _validate_group_unlocked(items, parent)
+
+
+class WindowSpec:
+    """Selectors for a bounded read (union semantics). Times are epoch floats;
+    ``*_until`` bounds are exclusive, ``*_since`` inclusive."""
+
+    def __init__(self, *, closed_since=None, closed_until=None, updated_since=None,
+                 events=(), event_since=None, event_until=None, refs=()):
+        self.closed_since, self.closed_until = closed_since, closed_until
+        self.updated_since = updated_since
+        self.events = tuple(events or ())
+        self.event_since, self.event_until = event_since, event_until
+        self.refs = tuple(str(r).upper() for r in (refs or ()))
+
+    def matches(self, it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Reference evaluation for comparing indexed reads with full scans."""
+        hit = str(it.get("ref", "")).upper() in self.refs
+        if (self.closed_since is not None or self.closed_until is not None) \
+                and it.get("status") == "closed":
+            t = _window_ts(it.get("closed_at"))
+            if t is not None and (self.closed_since is None or t >= self.closed_since) \
+                    and (self.closed_until is None or t < self.closed_until):
+                hit = True
+        if self.updated_since is not None:
+            t = _window_ts(it.get("updated_at"))
+            if t is not None and t >= self.updated_since:
+                hit = True
+        if self.events:
+            matched = self.window_events(it)
+            if matched:
+                hit = True
+                it = dict(it, window_events=matched)
+        return it if hit else None
+
+    def window_events(self, it: Dict[str, Any]) -> List[Dict[str, Any]]:
+        out = []
+        for e in it.get("history") or []:
+            if e.get("event") not in self.events:
+                continue
+            t = _window_ts(e.get("at"))
+            if t is not None and (self.event_since is None or t >= self.event_since) \
+                    and (self.event_until is None or t < self.event_until):
+                out.append(e)
+        return out
+
+
+def window_items(project: str, spec: "WindowSpec", *, offset: int = 0, limit: int = 0,
+                 fresh: bool = False, status: str = "all", client_id: Optional[str] = None
+                 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Read a page from local time indexes; selector union, then filters and
+    pagination. Since is inclusive, until exclusive. complete covers both
+    pagination and source coverage; no per-ticket remote reads are made."""
+    proj = _norm_project(project)
+    offset, limit = max(0, offset), max(0, limit)
+    backend = _github_backend_for_project(proj)
+    if backend is not None:
+        from . import reporting_cache
+        return reporting_cache.window_items(backend, spec, offset=offset, limit=limit,
+                                             status=status, client_id=client_id)
+    db = _db_path()
+    with _FileLock(_lock_path()):
+        if not db.exists():
+            # One-time legacy JSON migration. Subsequent reads touch only the index.
+            _create_db(db, _load_unlocked(strict=True))
+        page, total = _window_from_index(db, proj, spec, offset, limit,
+                                         status=status, client_id=client_id)
+    return page, _window_meta(total, offset, limit, len(page), "sqlite")
+
+
+def _window_meta(total: int, offset: int, limit: int, returned: int, index: str):
+    end = offset + returned
+    return {"total": total, "offset": offset, "limit": limit or max(total - offset, 0),
+            "returned": returned, "complete": end >= total,
+            "next_offset": end if end < total else None, "index": index}
+
+
+def _window_query(proj, spec, status, client_id):
+    queries, args = [], []
+    if spec.closed_since is not None or spec.closed_until is not None:
+        sql = "SELECT number FROM items WHERE project=? AND closed_ts IS NOT NULL"
+        args.append(proj)
+        if spec.closed_since is not None:
+            sql += " AND closed_ts>=?"
+            args.append(spec.closed_since)
+        if spec.closed_until is not None:
+            sql += " AND closed_ts<?"
+            args.append(spec.closed_until)
+        queries.append(sql)
+    if spec.updated_since is not None:
+        queries.append("SELECT number FROM items WHERE project=? AND updated_ts>=?")
+        args.extend((proj, spec.updated_since))
+    if spec.events:
+        ph = ",".join("?" for _ in spec.events)
+        sql = f"SELECT number FROM item_events WHERE project=? AND event IN ({ph})"
+        args.extend((proj, *spec.events))
+        if spec.event_since is not None:
+            sql += " AND at_ts>=?"
+            args.append(spec.event_since)
+        if spec.event_until is not None:
+            sql += " AND at_ts<?"
+            args.append(spec.event_until)
+        queries.append(sql)
+    if spec.refs:
+        ph = ",".join("?" for _ in spec.refs)
+        queries.append(f"SELECT number FROM items WHERE project=? AND ref IN ({ph})")
+        args.extend((proj, *spec.refs))
+    union = " UNION ".join(queries) or "SELECT number FROM items WHERE 0"
+    sql = f"FROM items i JOIN ({union}) hits ON hits.number=i.number WHERE i.project=?"
+    args.append(proj)
+    if status == "active":
+        sql += " AND i.status IN ('open','in_progress','in_review','awaiting_answer')"
+    elif status == "blocked":
+        sql += " AND i.window_blocked=1"
+    elif status == "unresolved":
+        sql += " AND i.window_unresolved=1"
+    elif status != "all":
+        sql += " AND i.status=?"
+        args.append(status)
+    if client_id is not None:
+        sql += " AND i.window_client=?"
+        args.append(client_id)
+    return sql, args
+
+
+def _window_from_index(db: Path, proj: str, spec: "WindowSpec", offset: int, limit: int,
+                       *, status: str = "all", client_id: Optional[str] = None):
+    conn = _connect(db)
+    try:
+        # Schema installation/backfill is one-time. Dirty keys are maintained
+        # by triggers, including updates from older writers with unchanged clocks.
+        if _meta_get(conn, "window_index_version") != "1":
+            _ensure_schema(conn)
+            conn.commit()
+        conn.execute("BEGIN IMMEDIATE")
+        _repair_time_index(conn)
+        sql, args = _window_query(proj, spec, status, client_id)
+        total = conn.execute("SELECT count(*) " + sql, args).fetchone()[0]
+        rows = conn.execute("SELECT i.item_json " + sql +
+                            " ORDER BY i.window_seq, i.ref LIMIT ? OFFSET ?",
+                            [*args, limit or -1, offset]).fetchall()
+        page = [json.loads(row[0]) for row in rows]
+        for it in page:
+            events = spec.window_events(it)
+            if events:
+                it["window_events"] = events
+        conn.commit()
+        return page, total
+    finally:
+        conn.close()
+
+
+def items_by_refs(refs: List[str]) -> Dict[str, Dict[str, Any]]:
+    """Resolve only named dependencies from local stores and GitHub mirrors."""
+    wanted = {str(r).upper() for r in refs if r}
+    out = {}
+    by_project = {}
+    for ref in wanted:
+        by_project.setdefault(_project_from_ident(ref), []).append(ref)
+    for proj, names in by_project.items():
+        backend = _github_backend_for_project(proj)
+        if backend is not None:
+            page, _ = window_items(proj, WindowSpec(refs=names))
+        else:
+            db = _db_path()
+            if not db.exists():
+                continue
+            conn = _connect(db)
+            try:
+                ph = ",".join("?" for _ in names)
+                page = [json.loads(row[0]) for row in conn.execute(
+                    f"SELECT item_json FROM items WHERE ref IN ({ph})", names)]
+            finally:
+                conn.close()
+        out.update((str(it["ref"]).upper(), it) for it in page)
+    return out
 
 
 def list_items(
