@@ -30,6 +30,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -6795,6 +6796,22 @@ def backfill_recent_session_titles(
     return out
 
 
+@contextmanager
+def _staffing_lock(queue: str):
+    """Serialize one queue, sharing the barrier with other queue dispatches.
+
+    Stage ticks/retry still take reconcile.lock exclusively: they must exclude
+    every staffing pass. Ordinary queues share that barrier but hold their own
+    exclusive lock through capacity reads, launch observation and registration.
+    Never release a queue's lock before its new workers are registered.
+    """
+    from .queue import _FileLock
+    key = hashlib.sha256(queue.upper().encode("utf-8")).hexdigest()
+    with _FileLock(WORKERS_FILE.parent / "reconcile.lock", shared=True):
+        with _FileLock(WORKERS_FILE.parent / "reconcile-queues" / f"{key}.lock"):
+            yield
+
+
 def reconcile_once(dry_run: bool = False,
                    only_queue: str = "",
                    supervise_stages: bool = True) -> Dict[str, Any]:
@@ -6817,9 +6834,9 @@ def reconcile_once(dry_run: bool = False,
     depth=0, or surplus resolved elsewhere).  In ``dry_run`` mode no subprocesses
     are started; the return value shows what *would* happen.
 
-    Staffing is serialized under a cross-process file lock. The daemon tick and
-    ``dispatch_after_enqueue`` (``wt add``) can reconcile concurrently; without
-    the lock both read the same live count and each spawns the full desired
+    Staffing for each queue is serialized under a cross-process file lock.
+    The daemon tick and ``dispatch_after_enqueue`` (``wt add``) can reconcile
+    concurrently; without the lock both read the same live count and each spawns the full desired
     delta, over-spawning the queue (WT-75: 4 spawned for desired=2).
     ``spawn_workers`` persists every worker via ``record_worker()`` before the
     lock is released, so a blocked pass sees the fresh workers and skips.
@@ -6835,10 +6852,12 @@ def reconcile_once(dry_run: bool = False,
     from .queue import _FileLock
     # Fleet maintenance can spend minutes observing old sessions. It has its
     # own lock: a newly filed ticket must not wait behind that work. Scoped
-    # passes and the full pass still share the staffing lock when counting
-    # live workers and publishing launches.
-    lock_name = "reconcile.lock" if only_queue else "reconcile-maintenance.lock"
-    with _FileLock(WORKERS_FILE.parent / lock_name):
+    # passes and the full pass share each queue's staffing lock when counting
+    # live workers and publishing launches. Other queues need not wait through
+    # this queue's serial launch-failure observation windows.
+    lock = (_staffing_lock(only_queue) if only_queue else
+            _FileLock(WORKERS_FILE.parent / "reconcile-maintenance.lock"))
+    with lock:
         return _reconcile_once_locked(dry_run, only_queue=only_queue,
                                       supervise_stages=supervise_stages)
 
@@ -7189,16 +7208,28 @@ def _reconcile_once_locked(dry_run: bool = False,
     staffing_args = (dry_run, only_queue, result, reconcile_id, staffing_before,
                      eligible_before_by_q, dead_before_by_q, requeued_queues)
     if only_queue:
-        # The scoped caller already owns the staffing lock.
-        return _reconcile_staffing_locked(*staffing_args)
-    from .queue import _FileLock
-    with _FileLock(WORKERS_FILE.parent / "reconcile.lock"):
-        return _reconcile_staffing_locked(*staffing_args)
+        # The scoped caller already owns this queue's staffing lock.
+        _reconcile_staffing_locked(*staffing_args, staff_queue=only_queue)
+    else:
+        from . import queue as _q
+        # Discover first-ticket queues as well as configured/released ones.
+        # Every queue's capacity is read afresh INSIDE its lock: dispatch may
+        # have staffed it while this pass was launching on an earlier queue.
+        seen = {str(it.get("project") or "") for it in _q.list_items()}
+        config.ensure_entries(seen - {""})
+        queues = (set(config.all_queues()) | seen |
+                  {str(w.get("queue") or "") for w in staffing_before} |
+                  {str(w.get("queue") or "") for w in result["released"]}) - {""}
+        for queue in sorted(queues):
+            with _staffing_lock(queue):
+                _reconcile_staffing_locked(*staffing_args, staff_queue=queue)
+    _log_reconcile_result(result, reconcile_id)
+    return result
 
 
 def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffing_before,
                                eligible_before_by_q, dead_before_by_q,
-                               requeued_queues):
+                               requeued_queues, *, staff_queue):
     """Read current capacity and register launches under the staffing lock."""
     from . import config, health
 
@@ -7259,7 +7290,7 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
     # waiting on the block to clear.
     from . import queue as _q
     try:
-        _all_items = _q.list_items(project=only_queue or None) or []
+        _all_items = _q.list_items(project=staff_queue) or []
     except Exception:
         _all_items = None
 
@@ -7298,10 +7329,10 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
     except Exception:
         retained_parked = set()
 
-    # Use health for queue depth + stuck ground-truth -- one call covers all queues.
+    # Read this queue's health and capacity again under its staffing lock.
     health_by_queue: Dict[str, Dict[str, Any]] = {
         row["queue"]: row
-        for row in health.all_status(project=only_queue or None, items=_all_items)
+        for row in health.all_status(project=staff_queue, items=_all_items)
     }
 
     # Raw open depth per queue, for the "N open" figure in skip/spawn messages
@@ -7313,7 +7344,7 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
     # list pass the reconciler already makes.
     _open_items_by_q: Dict[str, List[Dict[str, Any]]] = {}
     try:
-        for it in (_all_items if _all_items is not None else (_q.list_items(project=only_queue or None) or [])):
+        for it in (_all_items if _all_items is not None else (_q.list_items(project=staff_queue) or [])):
             if it.get("status") != "open":
                 continue
             qn = str(it.get("project") or "")
@@ -7597,8 +7628,7 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
         pass
 
     loop_queues = set(all_cfg) | set(released_by_q)
-    if only_queue:
-        loop_queues &= {only_queue}
+    loop_queues &= {staff_queue}
     for q_name in sorted(loop_queues):
         if not dry_run:
             unpark_reason = _maybe_auto_unpark(q_name)
@@ -8101,6 +8131,9 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
                     zero_spawn_reason="staffing_sufficient_after_release",
                 )
 
+
+def _log_reconcile_result(result, reconcile_id):
+    """Emit each launch/requeue once, after all queues have been considered."""
     # Log the reconcile event to the unified activity log via queue._log().
     try:
         from watchtower.queue import _log
@@ -8358,6 +8391,14 @@ def spawn_workers(
             if launch_failures is not None:
                 launch_failures.append(failure)
             continue
+        # SPAWN is emitted only after observation (and, for a fleet pass,
+        # after staffing other queues). Record actual process creation too,
+        # otherwise those audit timestamps misrepresent enqueue-to-start.
+        from .queue import _log
+        _log("SPAWN_START", _audit_detail(
+            worker_id=worker_id, pid=proc.pid, engine=engine,
+            model=model, started_at=datetime.now(timezone.utc).isoformat(),
+        ), queue=queue)
         # Deliver the drain goal as the first stream-json user message. The
         # child's inherited RDWR fd is already a reader, so the open succeeds;
         # a goal larger than the FIFO buffer blocks until the engine starts

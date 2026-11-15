@@ -694,6 +694,164 @@ def test_concurrent_reconciles_do_not_overspawn(wt, monkeypatch):
     assert any("staffed=2==desired=2" in s["reason"] for s in skips)
 
 
+def test_dispatch_does_not_wait_for_another_queues_launch(wt, monkeypatch):
+    """WT-68: preserve same-queue serialization without queuing B behind
+    A's launch-failure observation. The periodic pass must re-read B's capacity
+    when it reaches B, so an intervening scoped launch is never duplicated."""
+    for queue in ("A", "B"):
+        wt.config.set_auto_drain(queue, True)
+        wt.q.enqueue(project=queue, note="waiting")
+    entered, release = threading.Event(), threading.Event()
+    results, errors, launches = {}, [], []
+
+    def spawn(queue, n=1, engine="claude", **kwargs):
+        if queue == "A":
+            entered.set()
+            assert release.wait(20), "test did not release launch observation"
+        launches.append(queue)
+        return [wt.workers.record_worker(
+            os.getpid(), queue, engine, f"new-{queue}", str(wt.tmp),
+            str(wt.tmp / f"new-{queue}.log"))]
+
+    def run(name, **kwargs):
+        try:
+            results[name] = wt.workers.reconcile_once(**kwargs)
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(wt.workers, "spawn_workers", spawn)
+    full = threading.Thread(target=run, args=("full",), kwargs={"dry_run": True})
+    scoped = threading.Thread(target=run, args=("scoped",), kwargs={"only_queue": "B"})
+    full.start()
+    try:
+        assert entered.wait(10)
+        scoped.start()
+        scoped.join(5)
+        assert not scoped.is_alive(), "B dispatch waited for A launch observation"
+        assert not errors
+        assert launches == ["B"]
+    finally:
+        release.set()
+        full.join(30)
+        if scoped.ident is not None:
+            scoped.join(30)
+    assert not full.is_alive() and not scoped.is_alive()
+    assert not errors
+    assert launches == ["B", "A"]
+    assert len(results["scoped"]["spawned"]) == 1
+    assert len(results["full"]["spawned"]) == 1
+    assert wt.workers.live_worker_count("B") == 1
+
+
+def test_staffing_lock_keeps_the_exclusive_stage_barrier(wt):
+    """Separate processes see both the global recovery barrier and queue lock."""
+    import hashlib
+    probe = """
+import fcntl, sys
+with open(sys.argv[1], 'a') as f:
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        sys.exit(3)
+"""
+    barrier = wt.tmp / "reconcile.lock"
+    per_queue = wt.tmp / "reconcile-queues" / (hashlib.sha256(b"Q").hexdigest() + ".lock")
+    with wt.workers._staffing_lock("Q"):
+        for path in (barrier, per_queue):
+            assert subprocess.run([sys.executable, "-c", probe, str(path)]).returncode == 3
+    for path in (barrier, per_queue):
+        assert subprocess.run([sys.executable, "-c", probe, str(path)]).returncode == 0
+
+    entered = threading.Event()
+    def staff():
+        with wt.workers._staffing_lock("Q"):
+            entered.set()
+    with wt.q._FileLock(barrier):
+        thread = threading.Thread(target=staff)
+        thread.start()
+        assert not entered.wait(0.1), "staffing bypassed exclusive stage/recovery lock"
+    thread.join(10)
+    assert entered.is_set() and not thread.is_alive()
+
+
+def test_enqueue_to_claim_during_concurrent_launch_observation(wt, monkeypatch):
+    """A real local child claims B while five A launches observe the unchanged
+    6s failure window. No model, provider, fleet setting or real queue is used.
+    With the old global staffing lock B waited >=30s before even launching."""
+    wt.config.set_auto_drain("A", True)
+    wt.config.set_desired_workers("A", 5)
+    wt.config.set_auto_drain("B", True)
+    for _ in range(5):
+        wt.q.enqueue(project="A", note="concurrent launch load")
+    repo = str(Path(__file__).resolve().parents[1])
+    entered = threading.Event()
+    children, errors = [], []
+    original_observe = wt.workers._wait_for_immediate_launch_failure
+    sandbox = {key: value for key, value in os.environ.items()
+               if key.startswith("WATCHTOWER_")}
+
+    def command(queue, engine, worker, *args, **kwargs):
+        script = (
+            # Production _spawn_env deliberately strips pytest's sandbox.
+            # These harmless Python children must explicitly restore it
+            # BEFORE importing q; never let them use a real queue store.
+            f"import os,sys,time; os.environ.update({sandbox!r}); "
+            f"sys.path.insert(0, {repo!r}); "
+            "from pathlib import Path; "
+            "from watchtower import queue as q; "
+            f"assert q.claim_next({worker!r}, project={queue!r}); "
+            f"Path({str(wt.tmp / (queue + '-claim-time'))!r}).write_text(str(time.monotonic())); "
+            "time.sleep(60)"
+        )
+        return [sys.executable, "-c", script]
+
+    def observe(proc, **kwargs):
+        children.append(proc)
+        if kwargs["queue"] == "A":
+            entered.set()
+        return original_observe(proc, **kwargs)
+
+    def load():
+        try:
+            wt.workers.reconcile_once(only_queue="A")
+        except BaseException as exc:
+            errors.append(exc)
+
+    monkeypatch.setattr(wt.workers, "build_drain_command", command)
+    monkeypatch.setattr(wt.workers, "_wait_for_immediate_launch_failure", observe)
+    # A one-shot engine avoids FIFO/provider machinery; the subprocess above
+    # is the only executable. Keep the real production observation duration.
+    for queue in ("A", "B"):
+        wt.config.set_engine(queue, "kimi")
+    monkeypatch.setattr(wt.workers, "_LAUNCH_FAILURE_GRACE_S", 6)
+    thread = threading.Thread(target=load)
+    thread.start()
+    try:
+        assert entered.wait(10)
+        start = time.monotonic()
+        ticket = wt.q.enqueue(project="B", note="latency probe")
+        reason = wt.workers.dispatch_after_enqueue("B", ticket["ref"])
+        elapsed = time.monotonic() - start
+        claimed = wt.q.get(ticket["ref"])
+        assert claimed["status"] == "in_progress", reason
+        claim_elapsed = float((wt.tmp / "B-claim-time").read_text()) - start
+        print(f"enqueue-to-claim: {claim_elapsed:.3f}s; dispatch return: {elapsed:.3f}s")
+        assert claim_elapsed < 30, f"concurrent launch load delayed B by {claim_elapsed:.3f}s"
+        assert len([p for p in children if p.poll() is None]) >= 2
+        log = (wt.tmp / "activity.log").read_text()
+        assert "SPAWN_START" in log
+    finally:
+        thread.join(45)
+        # Terminate only the exact harmless children created by this test.
+        for proc in children:
+            if proc.poll() is None:
+                proc.terminate()
+        for proc in children:
+            proc.wait(timeout=10)
+    assert not thread.is_alive() and not errors
+    assert len(children) == 6
+
+
 def test_scoped_dispatch_fills_slots_during_fleet_maintenance(wt, monkeypatch):
     """Slow session supervision must not block two ready tickets behind one
     busy worker; the later periodic pass must see those launches, not duplicate them."""

@@ -459,8 +459,9 @@ def _coerce_session_uuid(value: Any) -> Optional[str]:
 class _FileLock:
     """Best-effort cross-process advisory lock around the queue file."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, shared: bool = False):
         self._path = path
+        self._shared = shared
         self._fh = None
 
     def __enter__(self):
@@ -469,7 +470,7 @@ class _FileLock:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             self._fh = open(self._path, "w")
-            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_SH if self._shared else fcntl.LOCK_EX)
         except OSError:
             self._fh = None
         return self
