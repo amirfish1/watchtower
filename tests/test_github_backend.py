@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import sys
 import threading
 import time
 import urllib.request
@@ -3835,12 +3836,27 @@ def test_reconcile_skip_reason_names_readiness_when_readiness_is_the_gate(
 
 
 _SENTINEL = "CAVEAT-SENTINEL"
-# Two witnesses past Linux MAX_ARG_STRLEN (128 KiB) once normalized into the
-# close comment: 40 x 4000 ASCII (~160 KB) and 12 x 4000 emoji (~192 KB UTF-8).
+# Linux caps ONE argv string at MAX_ARG_STRLEN = 32 pages. That is 128 KiB on
+# 4 KiB-page kernels and more on 16/64 KiB-page arm64 kernels. Other systems
+# have no per-argument cap, so the fixture targets the common Linux value
+# there; reading their page size would demand 512 KiB on Apple Silicon
+# (WATCHTOWER-43).
+_ARG_STRLEN_MAX = 32 * (os.sysconf("SC_PAGE_SIZE") if sys.platform.startswith("linux") else 4096)
+
+
+def _witness_count(floor, bytes_each):
+    """Enough caveats to clear the limit with 20% to spare, never fewer than
+    ``floor`` (the original 128 KiB sizing)."""
+    return max(floor, -(-_ARG_STRLEN_MAX * 6 // 5 // bytes_each))
+
+
+# Two witnesses past MAX_ARG_STRLEN once normalized into the close comment:
+# at 128 KiB, 40 x 4000 ASCII (~160 KB) and 12 x 4000 emoji (~192 KB UTF-8).
 _OVERSIZED_CAVEATS = {
-    "ascii": [f"{_SENTINEL} {i}: \"q\" 'q'\\\n" + "a" * 4000 for i in range(40)],
+    "ascii": [f"{_SENTINEL} {i}: \"q\" 'q'\\\n" + "a" * 4000
+              for i in range(_witness_count(40, 4000))],
     "unicode": [f"{_SENTINEL} {i}: é中 \"q\"\r\n" + "\U0001F600" * 4000
-                for i in range(12)],
+                for i in range(_witness_count(12, 16000))],
 }
 
 
@@ -3886,7 +3902,7 @@ def test_github_close_with_oversized_resolution_posts_comment_via_stdin(tmp_path
     issue = data["issues"][0]
     assert issue["state"] == "CLOSED"
     expected = github_backend._resolution_comment(closed["resolution"])
-    assert len(expected.encode("utf-8")) > 32 * os.sysconf("SC_PAGE_SIZE")
+    assert len(expected.encode("utf-8")) > _ARG_STRLEN_MAX
     # The pre-existing normalization clips each caveat; the transport must
     # then carry every normalized caveat whole.
     assert len(closed["resolution"]["caveats"]) == len(_OVERSIZED_CAVEATS[kind])
