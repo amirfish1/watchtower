@@ -7044,10 +7044,21 @@ def release(ident: Any, session_id: str = "", force: bool = False, *,
                 f"{current.get('ref', ident)} \"...\"` to resolve it, or pass "
                 f"force=True (--force on the CLI) if the block is stale."
             )
+    if (not force and session_id and current and current.get("status") == "in_progress"
+            and current.get("claimed_by") and current["claimed_by"] != session_id):
+        raise ValueError(
+            f"{current.get('ref', ident)} is claimed by {current['claimed_by']}, "
+            f"not {session_id}; only its owner may release it. "
+            "Use --force only for an intentional recovery.")
     if reserve_for:
         return _release_with_reservation(ident, reserve_for, reserve_session, ttl)
+    # The snapshot can change while acquiring the cross-host write lock.
+    # Never release the replacement claim, even when both are in_progress.
+    expect = ({key: current.get(key) for key in
+               ("claimed_by", "claimed_session_id", "claimed_machine", "claimed_at")}
+              if current else None)
     return update_status(ident, "open", session_id, require_status="in_progress",
-                          reason="released")
+                          reason="released", expect=expect)
 
 
 def _release_with_reservation(ident: Any, reserve_for: str, reserve_session: str,

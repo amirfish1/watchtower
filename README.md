@@ -328,6 +328,9 @@ GitHub-backed refs use the issue number (`MYAPP-123` is issue `#123`). A
 GitHub-backed queue lists open issues plus issues completed in the last 14 days
 from the configured repository, so GitHub is the visible storage layer.
 
+GitHub body writes use a cross-host repository mutex. All writing hosts must
+adopt it; see [locking, crash recovery and rollout](docs/github-write-lock.md).
+
 Whether a ticket gets worked comes from three independent inputs, not from a
 whitelist label:
 

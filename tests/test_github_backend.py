@@ -135,8 +135,52 @@ def project_fields(issue):
     }
 
 
-data = load()
 args = sys.argv[1:]
+# Real GitHub arbitrates label-name creation atomically. Independent host
+# tests share this fake server but never a client lock directory.
+if args[:2] == ["api", "-X"]:
+    import sqlite3
+    from urllib.parse import unquote
+    gate = sqlite3.connect(str(state_path) + ".gate", timeout=30)
+    gate.execute("BEGIN IMMEDIATE")
+    method = args[2]
+    endpoint = next(a for a in args if a.startswith("repos/") or a == "graphql")
+    payload = json.loads(sys.stdin.read() or "{}") if "--input" in args else {}
+    data = load()
+    labels = data.setdefault("mutex_labels", {})
+    if endpoint.endswith("/labels") and method == "POST":
+        name = payload["name"]
+        if name in labels:
+            print(json.dumps({"errors": [{"code": "already_exists"}]}))
+            print("gh: Validation Failed (HTTP 422)", file=sys.stderr)
+            sys.exit(1)
+        data["next_label"] = data.get("next_label", 0) + 1
+        label = dict(payload, node_id="LA_" + str(data["next_label"]))
+        labels[name] = label
+        save(data)
+        print(json.dumps(label))
+        sys.exit(0)
+    if "/labels/" in endpoint and method == "GET":
+        name = unquote(endpoint.rsplit("/", 1)[1])
+        if name not in labels:
+            print("gh: Not Found (HTTP 404)", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(labels[name]))
+        sys.exit(0)
+    if endpoint == "graphql" and "deleteLabel" in payload.get("query", ""):
+        node_id = payload["variables"]["id"]
+        name = next((n for n, l in labels.items() if l["node_id"] == node_id), None)
+        if name is None:
+            print(json.dumps({"errors": [{"type": "NOT_FOUND"}]}))
+        else:
+            del labels[name]
+            save(data)
+            print(json.dumps({"data": {"deleteLabel": {"clientMutationId": None}}}))
+        sys.exit(0)
+    print("unsupported lock api: " + endpoint, file=sys.stderr)
+    sys.exit(2)
+
+data = load()
 for _f, _src, _i, _n in parse(args)[0]:
     if _f in ("--body-file", "-F"):
         # Real gh reads the body from the file ("-" is stdin); fold it back

@@ -108,6 +108,11 @@ _LEGACY_INVALID_JSON_ESCAPE_RE = re.compile(r'\\(?!["\\/bfnrt]|u[0-9a-fA-F]{4})'
 _BODY_LOCKS_HELD = threading.local()
 
 
+def _write_lock_child_options():
+    from .github_write_lock import child_options
+    return child_options()
+
+
 def _serialized_body_write(method):
     """Run a read-modify-write of the issue body under the per-repo lock.
 
@@ -2105,6 +2110,7 @@ class GitHubIssuesBackend:
                 text=True,
                 timeout=60,
                 env=_gh_child_env(),
+                **_write_lock_child_options(),
                 **extra,
             )
         except FileNotFoundError as exc:
@@ -2133,6 +2139,7 @@ class GitHubIssuesBackend:
                 text=True,
                 timeout=60,
                 env=_gh_child_env(),
+                **_write_lock_child_options(),
                 **extra,
             )
         except FileNotFoundError as exc:
@@ -3168,6 +3175,7 @@ class GitHubIssuesBackend:
     def _claim_lock_path(self) -> Path:
         """Per-repo advisory lock serializing claim_by_ref's read-then-write.
 
+        The local lock also bounds API contention for the cross-host mutex.
         `gh issue edit` has no compare-and-swap: two workers can both read an
         issue as open (via `self.get`) before either write lands, then both
         write `--add-label in-progress` and `claimed_by`, believing they each
@@ -3184,6 +3192,7 @@ class GitHubIssuesBackend:
     @contextlib.contextmanager
     def _body_lock(self):
         """The claim lock, reentrant within a thread (see `_serialized_body_write`)."""
+        from . import github_write_lock
         path = str(self._claim_lock_path())
         held = getattr(_BODY_LOCKS_HELD, "paths", None)
         if held is None:
@@ -3194,7 +3203,8 @@ class GitHubIssuesBackend:
         with _FileLock(Path(path)):
             held.add(path)
             try:
-                yield
+                with github_write_lock.hold(self):
+                    yield
             finally:
                 held.discard(path)
 
@@ -3616,6 +3626,12 @@ class GitHubIssuesBackend:
             from . import queue as _q
             if not _q.claim_expect_holds(item, expect):
                 return None
+        if status == "closed" and expect_owner and item.get("status") == "closed":
+            raise ValueError(
+                f"{item.get('ref', ident)} is already closed by "
+                f"{item.get('closed_by') or item.get('claimed_by') or '?'}; "
+                "re-check ownership with wt find before writing a resolution. "
+                "Pass --force only for an intentional correction.")
         # No queue-label guard on close: the label admitted nothing to begin
         # with, and refusing to close an issue a worker just finished because
         # of a missing label only ever stranded finished work.
