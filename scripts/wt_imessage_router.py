@@ -11,6 +11,12 @@ from ALLOWED_HANDLE's chat that are not isFromMe are acted on.
                         or replied to; an answer needs an explicit ref)
   "ticket: <text>"   -> wt add -q MAZKIR (mock/code-task intake)
 
+Pre-send check (optional): when WT_IMESSAGE_PRESEND_CHECK names a program, every
+question is shown to it before it is sent (`<program> check --ref REF --queues A,B`,
+text on stdin; exit 0 = send). Anything else, including a check that cannot run,
+means the question is NOT sent and is checked again after HOLD_RETRY_S. The send
+itself, the wording and the reply contract do not change. Unset = no check.
+
 Health: GET http://127.0.0.1:8854/status. Log: ~/.local/log/wt-imessage-router.log
 Stdlib only.
 """
@@ -20,6 +26,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 import urllib.parse
@@ -33,11 +40,14 @@ BB_ENV = Path(os.path.expanduser("~/.hermes/.env"))
 # (BLUEBUBBLES_CHAT_GUID in BB_ENV), never a literal in this public file.
 STATE = Path(os.path.expanduser("~/.local/state/wt-imessage-router.json"))
 LOG_PATH = os.path.expanduser("~/.local/log/wt-imessage-router.log")
+# Machine-local path of the owner-notification pre-send check; never a literal here.
+PRESEND_CHECK = os.environ.get("WT_IMESSAGE_PRESEND_CHECK", "")
+HOLD_RETRY_S = 900
 REF_RE = re.compile(r"^\s*\[?([A-Za-z][A-Za-z0-9_-]*-\d+)\]?(?![\w-])[\s:,-]*(.*)$", re.S)
 TICKET_RE = re.compile(r"^\s*ticket\s*:\s*(.+)$", re.I | re.S)
 
 health = {"started": time.time(), "last_poll": None, "last_error": None,
-          "pending": [], "answered": 0, "filed": 0}
+          "pending": [], "answered": 0, "filed": 0, "held": []}
 
 
 def log(line: str) -> None:
@@ -84,6 +94,36 @@ def send(text: str) -> None:
         raise RuntimeError(f"hermes send rc={r.returncode}: {r.stderr.strip()[:200]}")
 
 
+def presend(ref: str, text: str, queues: list[str]):
+    """None when no check is configured, else (ok, check_id, why).
+
+    Fail closed: a check that is missing, crashes, times out or answers
+    anything but a clean yes is a no."""
+    if not PRESEND_CHECK:
+        return None
+    try:
+        r = subprocess.run([sys.executable, PRESEND_CHECK, "check", "--ref", ref,
+                            "--queues", ",".join(queues)],
+                           input=text, capture_output=True, text=True, timeout=90)
+        data = json.loads(r.stdout or "{}")
+        ok = r.returncode == 0 and data.get("ok") is True and bool(data.get("id"))
+        return (ok, data.get("id"), str(data.get("code") or f"rc={r.returncode}")[:80])
+    except Exception as e:
+        return (False, None, type(e).__name__)
+
+
+def report(*args: str) -> None:
+    """Tell the check what became of a question. Best effort: never raises,
+    never delays a send or an answer by more than the timeout."""
+    if not PRESEND_CHECK:
+        return
+    try:
+        subprocess.run([sys.executable, PRESEND_CHECK, *args],
+                       capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        log(f"REPORT FAIL {args[0]}: {type(e).__name__}")
+
+
 def bb_recent() -> list:
     for line in BB_ENV.read_text().splitlines():
         if line.startswith("BLUEBUBBLES_") and "=" in line:
@@ -118,16 +158,35 @@ def tick(state: dict, queues: list[str], notify_queue: str) -> None:
     for t in blocked:
         if t["ref"] not in state["notified"]:
             if not first:  # first run records existing blocks without texting
+                held = state.setdefault("held", {})
+                if time.time() < held.get(t["ref"], 0):
+                    continue  # refused by the pre-send check; looked at again later
+                text = format_question(t)
+                verdict = presend(t["ref"], text, queues)
+                if verdict and not verdict[0]:
+                    # Nothing was sent, so this is not "notified": the ticket
+                    # may become a real owner question later and is re-checked.
+                    held[t["ref"]] = time.time() + HOLD_RETRY_S
+                    log(f"HELD {t['ref']}: {verdict[2]}")
+                    continue
+                held.pop(t["ref"], None)
                 try:
-                    send(format_question(t))
+                    send(text)
                     log(f"SENT {t['ref']}")
+                    if verdict:
+                        report("outcome", "--id", verdict[1], "--outcome", "accepted")
                 except Exception as e:
                     # A failed send was still reaching the phone, then this
                     # loop retried every poll. One attempt, then stop.
                     log(f"SEND FAIL {t['ref']}: {e}")
+                    if verdict:
+                        report("outcome", "--id", verdict[1], "--outcome", "failed",
+                               "--detail", type(e).__name__)
             state["notified"].append(t["ref"])
     live = {t["ref"] for t in blocked}
     state["notified"] = [r for r in state["notified"] if r in live]  # re-block re-notifies
+    state["held"] = {r: at for r, at in state.get("held", {}).items() if r in live}
+    health["held"] = sorted(state["held"])
     pending = [t["ref"] for t in blocked]
     health["pending"] = pending
 
@@ -155,6 +214,7 @@ def tick(state: dict, queues: list[str], notify_queue: str) -> None:
                  + ("" if ok else f": {r.stderr.strip()[:150]}"))
             health["answered"] += ok
             log(f"ANSWER {act[1]} rc={r.returncode}")
+            report("answer", "--ref", act[1], "--ok", "1" if ok else "0")
     state["seen"] = list(seen)[-200:]
     state["seeded"] = True
     save_state(state)
@@ -166,7 +226,7 @@ class Status(http.server.BaseHTTPRequestHandler):
         age = None if health["last_poll"] is None else round(time.time() - health["last_poll"])
         ok = self.path == "/status"
         body = json.dumps({"ok": age is not None and age < 120, "last_poll_age_s": age,
-                           **{k: health[k] for k in ("last_error", "pending", "answered", "filed")}}
+                           **{k: health[k] for k in ("last_error", "pending", "answered", "filed", "held")}}
                           if ok else {"error": "not found"}).encode()
         self.send_response(200 if ok else 404)
         self.send_header("Content-Type", "application/json")
