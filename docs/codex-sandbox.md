@@ -72,8 +72,62 @@ dependency). Never broaden the roots to an external worktree Git directory.
 
 An independent Claude review found the Git uploadpack escape and wrapper import
 escape, plus unsafe stage/resume paths. The corresponding focused fixes and
-regressions are included here. A second cross-family review was requested;
-its result and a review of the final revised diff remain to be evaluated.
+regressions are included here. The second cross-family review completed; its
+report is `~/.watchtower/logs/critique-antigravity-9563be6a.log`. Its additional
+findings require fixes and review of the final combined diff.
+
+### Second checkpoint (2026-11-15, worker wt-81a70df6)
+
+`4177768` on `origin/wt-61-wt-81a70df6` adds source-identity and claim-generation
+checks at the actual block/progress/close mutation lock; central gate refusal
+also covers group parents after a sandbox child finishes. Interactive
+`wt discuss` refuses an unrestricted resume of a restricted session. Assessors
+carry their stage and queue so they cannot bypass stage policy by using the
+ad-hoc launcher. The lifecycle/assessment/gates/groups run passed 146 tests;
+the related sandbox/app-worker/RPC/messages/liveness run passed 264 tests;
+the required push gate passed 420 tests. This is progress, not acceptance.
+
+Direct model-free Codex 0.169.0 `command/exec` kernel probes on this Linux host
+found `socket(AF_UNIX)` and `socket(AF_INET)` both refused with `EPERM` under
+`networkAccess=false`. The review's claimed immediate Unix-socket escape did
+**not** reproduce here. Keep a real socket probe in acceptance rather than
+assuming either safety or escape from mount permissions alone.
+
+The same probes found `/dev/shm` writable outside the two allowed roots with
+the legacy policy and even an explicit `/dev/shm = "read"` profile entry.
+An explicit `/dev/shm = "deny"` entry blocked the write. On this machine,
+`/tmp` resolves beneath `/dev/shm/hermes-tmp`: do not put native acceptance
+fixtures, trusted runtime code, or a writable root there and then reopen the
+denied subtree as read-only. The main review worktree was moved to
+`/home/hermes/Apps/watchtower-wt61-81a70df6` for this reason.
+
+`scripts/verify_codex_sandbox.py --transport exec|app-server` is an opt-in
+actual-model acceptance runner. It creates its own queue, registry, source
+store and Git fixture under the user's home, uses the production command/env
+builders and real spool broker, and requires the worker to claim, fix, test,
+commit and close one fixture ticket. It also checks forbidden ordinary and
+shared-memory writes and Unix/TCP socket denial. It references existing Codex
+authentication without copying it. It does not touch the real queue/settings.
+The runner is not passing acceptance evidence until both actual runs finish
+successfully against the final combined source.
+
+Parallel source work from this checkpoint is deliberately separate:
+
+- `wt61-bridge-hardening-claude-cbfd73aa`, session
+  `a1c42192-b7a7-4009-b27e-364760b97c5d`, tree
+  `/tmp/wt-61-bridge-81a70df6`, branch `wt-61-bridge-81a70df6`: bridge recovery,
+  durable restriction records, bounded responses/cleanup, scoped messaging and
+  fenced block/progress.
+- `wt61-policy-workflow-claude-1b9b2e05`, session
+  `1d842551-b8fc-4ceb-b241-737d0e4d85d7`, tree
+  `/tmp/wt-61-policy-81a70df6`, branch `wt-61-policy-81a70df6`: launch policy,
+  inherited environment/config, actual root/network enforcement and local Git
+  workflow. The two lanes were told to coordinate commit-proof verification.
+
+Their commits and reports must be checked before adoption. A successor must
+integrate their verified changes in a private worktree, run both real transport
+acceptance checks, and complete security review before any merge to main.
+Neither lane has authority to close WT-61 or change live policy.
 
 ## Remaining original acceptance — keep WT-61 open
 
