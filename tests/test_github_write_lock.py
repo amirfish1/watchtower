@@ -194,3 +194,27 @@ def test_lock_api_failure_never_writes_issue_or_falls_back(tmp_path, monkeypatch
     with pytest.raises(gb.GitHubBackendError, match='Cannot acquire GitHub write lock'):
         backend.claim_by_ref(ref, 'denied')
     assert json.loads(state.read_text())['issues'] == before
+
+
+def test_failed_cleanup_recovers_ended_transaction_in_live_process(tmp_path, monkeypatch):
+    state, q, ref, backend = _setup(tmp_path, monkeypatch)
+    from watchtower import github_write_lock as lock
+    real_api = backend._gh_api
+    failed = []
+    def lost_cleanup(method, path, *args, **kw):
+        if path == 'graphql' and not failed:
+            failed.append(True)
+            return subprocess.CompletedProcess([], 1, '{}', 'gh: Service Unavailable (HTTP 503)')
+        return real_api(method, path, *args, **kw)
+    monkeypatch.setattr(backend, '_gh_api', lost_cleanup)
+    with pytest.raises(gb.GitHubBackendError, match='API failed'):
+        with backend._body_lock():
+            pass
+    stranded = json.loads(state.read_text())['mutex_labels'][lock.LABEL]
+    monkeypatch.setattr(lock, 'WAIT_SECONDS', 0)
+    # The daemon PID is STILL alive. Its completed transaction, not its
+    # liveness or a TTL, is what makes cleanup safe to retry.
+    with backend._body_lock():
+        replacement = json.loads(state.read_text())['mutex_labels'][lock.LABEL]
+        assert replacement['node_id'] != stranded['node_id']
+    assert json.loads(state.read_text())['mutex_labels'] == {}

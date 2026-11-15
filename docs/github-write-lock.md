@@ -43,19 +43,22 @@ identity to another host.
 A POSIX flock on `<store-dir>/gh-write-fences/<nonce>` is inherited by every gh
 request process, including the single-issue REST transport. If the parent dies
 while gh is still writing, that child retains the fence. A later writer on the
-**owning store/host** may recover only when the PID is absent or provably reused
-and a nonblocking exclusive fence lock proves inherited request processes have
-drained. Missing identity/fence, a live process, an unreadable process identity
-or a foreign store never authorizes recovery. Recovered fence files are kept so
+**owning store/host** may recover only when a nonblocking exclusive fence lock
+proves inherited request processes have drained, AND either the PID is absent/
+provably reused or the local fence explicitly records `ended`. The writer records
+`ended` only after leaving its transaction, including when cleanup failed; this
+lets a still-running daemon retry cleanup safely after an API outage. Missing
+identity/fence, an active/unproven transaction or a foreign store never authorizes
+recovery. Recovered fence files are kept so
 concurrent recoverers cannot lock different inodes for the same acquisition.
 
 There is no time-based stealing: issue API side effects have no server-enforced
 fencing token. The 30s wait limit ends a caller's attempt, not the holder's lock.
-A failed cleanup can leave a lock owned by a still-running process; stop/drain
-that owning process before recovery, after checking its ongoing work. Do not
-restart a daemon merely because another host is busy. A locked foreign repo
-needs an owning-host write after that host's dead holder and children have
-ended. If the host is unavailable, preserve the lock and track that dependency.
+A failed cleanup reports an error and retains its ended-transaction record. A
+later owning-host write retries safe cleanup; a live PID alone is no longer a
+reason to require a daemon restart. Do not restart a daemon merely because
+another host is busy. A locked foreign repo needs an owning-host write after
+that transaction and its request children have ended. If the host is unavailable, preserve the lock and track that dependency.
 
 Never manually delete the reserved label **by name**, expire it, clear a
 foreign/unproven holder, or fall back to a local-only lock. A failed or ambiguous
@@ -89,4 +92,5 @@ Tests: `python3 -m pytest tests/test_github_write_lock.py` uses separate client
 processes, independent homes/stores and local locks, and a shared fake GitHub
 server whose label creation is atomic. It covers one winning claim, foreign
 and stale release/close refusal, crash recovery, an orphan request fence,
-immutable-ID cleanup and API permission failure without an issue write.
+immutable-ID cleanup, failed-cleanup recovery in a live daemon and API permission
+failure without an issue write.

@@ -101,8 +101,6 @@ def _recover_here(backend, label):
     else:
         current = _start(pid)
         dead = bool(current) and current != started
-    if not dead:
-        return False
     # Parent death alone is insufficient: a gh child can still be writing.
     # It inherits this descriptor; only the owning host can prove it drained.
     try:
@@ -113,6 +111,8 @@ def _recover_here(backend, label):
         try:
             fcntl.flock(fence.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            return False
+        if not dead and fence.read() != "ended":
             return False
         try:
             _delete(backend, label["node_id"])
@@ -167,7 +167,7 @@ def _acquire(backend, description):
             raise gb.GitHubBackendError(
                 f"{backend.repo} write lock busy ({label.get('description')}); "
                 "no issue was written. Retry, or run the write on the owning "
-                "host after its recorded process ends. Never delete by name "
+                "host after the recorded transaction or process ends. Never delete by name "
                 "or steal a live/unproven lock.")
         time.sleep(min(1, max(0, deadline - time.monotonic())))
 
@@ -193,7 +193,15 @@ def hold(backend):
             finally:
                 _delete(backend, node_id)
         finally:
-            _LOCAL.fd = previous_fd
+            try:
+                # Written only AFTER the transaction and its synchronous
+                # requests end, including when cleanup failed. A future
+                # writer can retry cleanup without restarting a live daemon;
+                # any inherited child must still release the flock first.
+                fence.write("ended")
+                fence.flush()
+            finally:
+                _LOCAL.fd = previous_fd
     # Only successful transactions remove their file. Lost responses and
     # process death leave the fence available for owning-host recovery.
     path.unlink()
