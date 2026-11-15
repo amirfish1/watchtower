@@ -220,7 +220,7 @@ def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "
     if engine == "codex" and queue:
         from . import config as _cfg
         if _cfg.codex_sandbox(queue) == "workspace-write":
-            env.update(codex_sandbox_env(queue))
+            env.update(codex_sandbox_env(queue, worker_id))
     # Which Codex account (subscription) the worker runs on: its CLI home.
     if codex_home:
         env["CODEX_HOME"] = codex_home
@@ -275,19 +275,23 @@ class CodexSandboxError(RuntimeError):
     closed rather than fall back to danger-full-access."""
 
 
-def codex_sandbox_env(queue: str) -> Dict[str, str]:
+def codex_sandbox_env(queue: str, worker_id: str = "") -> Dict[str, str]:
     from . import config as _cfg
-    store = _cfg.codex_sandbox_store(queue)
+    from . import sandbox_bridge
+    store = sandbox_bridge.worker_store(queue, worker_id) if worker_id else _cfg.codex_sandbox_store(queue)
     return {
         "WATCHTOWER_STORE": str(store / "queue.db"),
         "WATCHTOWER_ACTIVITY_LOG": str(store / "activity.log"),
         "WATCHTOWER_OUTBOX_FILE": str(store / "outbox.json"),
         "WATCHTOWER_AGENTS_FILE": str(store / "agents.json"),
         "WATCHTOWER_DELIVERIES_FILE": str(store / "deliveries.json"),
+        "WATCHTOWER_DATA_DIR": str(store / "data"),
+        "WT_SANDBOX_BRIDGE": str(store),
+        "WT_SANDBOX_QUEUE": queue,
     }
 
 
-def codex_sandbox_args(queue: str, repo_path: str) -> List[str]:
+def codex_sandbox_args(queue: str, repo_path: str, worker_id: str = "") -> List[str]:
     """Codex CLI args for the ``workspace-write`` policy: no tool network, and
     only ``repo_path`` and the isolated store writable (TMPDIR and /tmp are
     excluded). Raises CodexSandboxError when the policy cannot be satisfied."""
@@ -295,7 +299,8 @@ def codex_sandbox_args(queue: str, repo_path: str) -> List[str]:
     if not repo_path or not Path(repo_path).is_dir():
         raise CodexSandboxError(
             f"codex sandbox for {queue}: workspace {repo_path!r} is not a directory")
-    store = _cfg.codex_sandbox_store(queue)
+    from . import sandbox_bridge
+    store = sandbox_bridge.worker_store(queue, worker_id) if worker_id else _cfg.codex_sandbox_store(queue)
     try:
         store.mkdir(parents=True, exist_ok=True)
         probe = store / ".write-probe"
@@ -5570,7 +5575,7 @@ def build_drain_command(
             ensure_codex_wt_execpolicy(worker_home)
         if config.codex_sandbox(queue) == "workspace-write":
             # WT-61: restricted policy; fails closed (CodexSandboxError).
-            argv = [bin_name, "exec", *codex_sandbox_args(queue, repo_path)]
+            argv = [bin_name, "exec", *codex_sandbox_args(queue, repo_path, worker_id)]
         else:
             argv = [
                 bin_name,
@@ -8315,6 +8320,19 @@ def spawn_workers(
                 rec["kind"] = kind
             spawned.append(rec)
             continue
+        if engine == "codex" and config.codex_sandbox(queue) == "workspace-write":
+            from . import sandbox_bridge
+            try:
+                sandbox_bridge.register(queue, worker_id, repo_path)
+            except (ValueError, OSError) as exc:
+                failure = _record_launch_failure(
+                    queue=queue, engine=engine, worker_id=worker_id, pid=0,
+                    log_path=log_dir / f"{worker_id}.log",
+                    reason=f"sandbox bridge policy: {exc}", model=model)
+                failure["_spawn_index"] = spawn_index
+                if launch_failures is not None:
+                    launch_failures.append(failure)
+                continue
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{worker_id}.log"
         # Popen(cwd=...) raises a bare OSError indistinguishable from "the
@@ -8481,6 +8499,12 @@ def spawn_run_once_worker(
         queue, engine, worker_id, repo_path, model, goal=goal, effort=effort,
         antigravity_account_id=agy_account,
     )
+    if engine == "codex" and config.codex_sandbox(queue) == "workspace-write":
+        from . import sandbox_bridge
+        try:
+            sandbox_bridge.register(queue, worker_id, repo_path, assigned_ref=ref)
+        except (ValueError, OSError) as exc:
+            raise CodexSandboxError(f"sandbox bridge policy: {exc}") from exc
     logical_bin = _ENGINE_BIN.get(engine, engine)
     if argv and argv[0] == logical_bin:
         resolved_bin = _resolve_engine_bin(engine)
@@ -8611,7 +8635,7 @@ def codex_app_worker_command(
     # -c with an explicit sys.path entry: the worker's cwd is the queue repo,
     # and `-m` would import a `watchtower` package found there instead.
     pkg_parent = str(Path(__file__).resolve().parent.parent)
-    argv = [sys.executable, "-c",
+    argv = [sys.executable, "-I", "-c",
             "import sys; sys.path.insert(0, sys.argv.pop(1)); "
             "from watchtower.codex_app_worker import main; sys.exit(main())",
             pkg_parent, "run", "--codex-bin", resolved, "--worker-id", worker_id]
@@ -8760,6 +8784,10 @@ def spawn_adhoc(
     this check the report is just lost (OPS-89)."""
     agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
     repo_path = repo_path or os.getcwd()
+    if stage and ticket_queue:
+        from . import config
+        if config.codex_sandbox(ticket_queue) == "workspace-write":
+            raise CodexSandboxError("sandbox queue stages require an isolated stage transport; refusing full-access launch")
     if report_to:
         from . import messages
         try:

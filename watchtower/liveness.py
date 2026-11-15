@@ -1736,6 +1736,7 @@ VERIFIED_SENDERS = frozenset({
     "cli._deliver_answer", "cli.cmd_gate_ack",
 })
 ADVISORY_SENDERS = frozenset({
+    "sandbox_bridge._message",
     "answers._wake", "queue._notify_ticket_event", "cli.cmd_comment", "cli.cmd_send",
     "cli.cmd_chat_new", "cli.cmd_chat_nudge", "cli._daemon_loop_ticks", "dashboard.do_POST",
     "messages.ask", "messages.stop_displaced_successor",

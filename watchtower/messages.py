@@ -1974,6 +1974,14 @@ def _deliver_unreceipted(
 ) -> Dict[str, Any]:
     errors: List[str] = []
     busy = False
+    if resolved.get("engine") == "codex":
+        from . import sandbox_bridge
+        worker = resolved.get("worker") or {}
+        if sandbox_bridge.restricted_session(str(resolved.get("session_id") or ""), str(worker.get("worker_id") or "")):
+            from . import codex_app_worker
+            # No delegate, resume or generic app-server fallback can silently
+            # promote a sandboxed thread to a full-access turn.
+            return codex_app_worker.steer(str(resolved.get("session_id") or ""), text)
     if resolved.get("remote_node"):
         # Another node's session: no local socket, FIFO, TTY or transcript can
         # reach it, so the delegate's federation proxy is the only transport.
