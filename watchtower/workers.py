@@ -5871,7 +5871,9 @@ def start_assessment(item: Dict[str, Any], *, force: bool = False,
             raise ValueError(f"model {target['model']!r} for the assessor ({target['engine']}) "
                              f"is blocked by model policy; not substituting another model")
         rec = spawn_adhoc(assessor_goal(item, token), target["engine"], model=target["model"],
-                          repo_path=repo, name=f"assess-{ref}", report_to="")
+                          repo_path=repo, name=f"assess-{ref}", report_to="",
+                          stage="assessor", ticket_ref=str(item.get("ref") or ref),
+                          ticket_queue=str(item.get("project") or ""))
     except Exception as exc:  # noqa: BLE001
         _q.assessment_fail(ref, token, f"could not spawn the assessor: {exc}")
         return {"status": "failed", "reason": str(exc)}
@@ -8785,8 +8787,9 @@ def spawn_adhoc(
     agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
     repo_path = repo_path or os.getcwd()
     if stage and ticket_queue:
-        from . import config
-        if config.codex_sandbox(ticket_queue) == "workspace-write":
+        from . import config, queue as _q
+        origin_restricted = bool(ticket_ref and _q._sandbox_restricted(_q.get(ticket_ref) or {}))
+        if config.codex_sandbox(ticket_queue) == "workspace-write" or origin_restricted:
             raise CodexSandboxError("sandbox queue stages require an isolated stage transport; refusing full-access launch")
     if report_to:
         from . import messages

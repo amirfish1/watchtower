@@ -3537,6 +3537,10 @@ def update_status(
                             or sandbox_bridge._fence(it) != sandbox_contract["fence"]
                             or effective_gates(it) != sandbox_contract["gates"]):
                         raise ValueError("sandbox claim or gates changed during close")
+                    if sandbox_contract.get("store_id"):
+                        from . import store_identity
+                        if store_identity.read_unlocked(_resolve_store_path()) != sandbox_contract["store_id"]:
+                            raise ValueError("sandbox source identity changed during close")
                 if conditional is not None:
                     conditional.prepare_unlocked(it, close_contract)
                 if require_status is not None and it.get("status") != require_status:
@@ -4528,6 +4532,27 @@ def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str,
     return res
 
 
+def _sandbox_restricted(item: Dict[str, Any]) -> bool:
+    """Restriction follows the builder's origin, including a group's members.
+
+    A queue setting can be disabled after a build. That must not make the
+    checkout safe to execute with the daemon's authority.
+    """
+    from . import config, sandbox_bridge
+    if config.codex_sandbox(str(item.get("project") or "")) == "workspace-write":
+        return True
+    if sandbox_bridge.restricted_session(str(item.get("claimed_session_id") or ""),
+                                         str(item.get("claimed_by") or "")):
+        return True
+    if group_role(item) == "parent":
+        for ref in group_children(item):
+            child = get(ref) or {}
+            if sandbox_bridge.restricted_session(str(child.get("claimed_session_id") or ""),
+                                                 str(child.get("claimed_by") or "")):
+                return True
+    return False
+
+
 def evaluate_gates(item: Dict[str, Any], commit: str = "",
                    pinned: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Run the cmd gates in order, stopping at the first failure. Returns
@@ -4537,6 +4562,13 @@ def evaluate_gates(item: Dict[str, Any], commit: str = "",
     False (and ``stages`` is then empty). ``pinned``: see ``_run_cmd_gate``."""
     results: List[Dict[str, Any]] = []
     gates = effective_gates(item)
+    if any(g.startswith("cmd:") for g in gates) and _sandbox_restricted(item):
+        # This is shared by ordinary closes AND group reconciliation. Guard
+        # before worktree setup: even host git operations can invoke repo code.
+        gate = next(g for g in gates if g.startswith("cmd:"))
+        return [_pinned_setup_failed(gate[4:], commit,
+                "sandbox command gates require an isolated gate transport; "
+                "refusing host execution", time.time())], []
     persistent = False
     if any(g.startswith("cmd:") for g in gates):
         try:
@@ -5353,6 +5385,7 @@ def close(
     declined: bool = False, session_uuid: str = "",
     close_contract: Optional[Dict[str, Any]] = None,
     sandbox_expect: Optional[Dict[str, Any]] = None,
+    sandbox_store_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Close a ticket, optionally recording HOW it was fixed.
 
@@ -5385,7 +5418,8 @@ def close(
         sandbox_gates = effective_gates(cur)
         if any(g.startswith("cmd:") for g in sandbox_gates):
             raise ValueError("sandbox close cannot run command gates outside its sandbox; trusted review required")
-        sandbox_contract = {"fence": sandbox_expect, "gates": sandbox_gates}
+        sandbox_contract = {"fence": sandbox_expect, "gates": sandbox_gates,
+                            "store_id": sandbox_store_id}
     if cur is not None and cur.get("duplicate_of"):
         raise ValueError(f"{cur.get('ref', ident)} follows duplicate original {cur['duplicate_of']}; clear the link before independent work")
     if _github_backend_for_project(_project_from_ident(ident)) is None:
@@ -8739,6 +8773,8 @@ def block(
     force: bool = False,
     expect: Optional[Dict[str, Any]] = None,
     wait_extra: Optional[Dict[str, Any]] = None,
+    sandbox_expect: Optional[Dict[str, Any]] = None,
+    sandbox_store_id: str = "",
 ) -> Optional[Dict[str, Any]]:
     """Park a ticket that needs a human decision.
 
@@ -8778,6 +8814,8 @@ def block(
     else:
         wait_owner_fields("", wait_extra)   # owner context without an owner wait: refuse
     backend = _github_backend_for_project(_project_from_ident(ident))
+    if sandbox_expect is not None and (backend is not None or force or origin != "worker"):
+        raise ValueError("sandbox block requires a local worker claim")
     if backend is not None:
         if origin == "worker" and session_id and not force:
             cur = backend.get(ident)   # WT-40: sidecar-owned tickets get the local owner guard
@@ -8797,10 +8835,14 @@ def block(
                 item, "needs_input", detail=question, actor=session_id,
             )
         return item
-    with _FileLock(_lock_path()):
+    with _FileLock(_lock_path()) as source_lock:
+        if sandbox_expect is not None and source_lock._fh is None:
+            raise ValueError("sandbox source write lock unavailable")
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
+                if sandbox_expect is not None:
+                    _sandbox_claim_guard_unlocked(it, session_id, sandbox_expect, sandbox_store_id)
                 if origin == "worker" and session_id and not force:
                     _block_owner_guard_unlocked(it, ident, str(session_id))
                 # Block timestamps are episode identities as well as times.
@@ -9623,9 +9665,24 @@ def gate_nack(
     return None
 
 
-def comment(ident: Any, text: str, by: str = "human", session_id: str = "") -> Optional[Dict[str, Any]]:
+def _sandbox_claim_guard_unlocked(item, worker, fence, store_id=""):
+    """Check the real source and claim within the actual mutation lock."""
+    from . import sandbox_bridge, store_identity
+    if (not worker or item.get("claimed_by") != worker
+            or item.get("status") != "in_progress" or item.get("needs_input")
+            or sandbox_bridge._fence(item) != fence):
+        raise ValueError("sandbox claim changed during mutation")
+    if store_id and store_identity.read_unlocked(_resolve_store_path()) != store_id:
+        raise ValueError("sandbox source identity changed during mutation")
+
+
+def comment(ident: Any, text: str, by: str = "human", session_id: str = "", *,
+            sandbox_expect: Optional[Dict[str, Any]] = None,
+            sandbox_store_id: str = "") -> Optional[Dict[str, Any]]:
     """Append a plain ticket activity comment without changing ticket state."""
     backend = _github_backend_for_project(_project_from_ident(ident))
+    if sandbox_expect is not None and (backend is not None or by != "worker"):
+        raise ValueError("sandbox progress requires a local worker claim")
     if backend is not None:
         item = backend.comment(ident, text, by=by, session_id=session_id)
         if item:
@@ -9636,10 +9693,14 @@ def comment(ident: Any, text: str, by: str = "human", session_id: str = "") -> O
             )
         return item
     actor_kind = by if by in ("worker", "human", "system") else "human"
-    with _FileLock(_lock_path()):
+    with _FileLock(_lock_path()) as source_lock:
+        if sandbox_expect is not None and source_lock._fh is None:
+            raise ValueError("sandbox source write lock unavailable")
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
+                if sandbox_expect is not None:
+                    _sandbox_claim_guard_unlocked(it, session_id, sandbox_expect, sandbox_store_id)
                 now = _now_iso()
                 it["updated_at"] = now
                 _append_history(

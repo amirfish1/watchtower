@@ -4237,6 +4237,11 @@ def cmd_discuss(args: argparse.Namespace) -> int:
               f"real session id)", file=sys.stderr)
         return 1
     repo = item.get("repo_path") or os.getcwd()
+    from . import sandbox_bridge
+    if sandbox_bridge.restricted_session(sid, str(item.get("claimed_by") or "")):
+        print("error: this session originated in a sandbox; interactive resume "
+              "cannot preserve its policy. Use a fresh policy-bound worker.", file=sys.stderr)
+        return 1
     if args.engine == "codex":
         inner = ["codex", "resume", sid]
     elif args.engine == "antigravity":
