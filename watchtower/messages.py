@@ -120,6 +120,50 @@ _DEVIN_CLI_SESSION_RE = re.compile(r"^devincli-[A-Za-z0-9][A-Za-z0-9._-]*$")
 _AGENT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
+def split_node_ref(target: Any) -> Tuple[str, str]:
+    """Split CCC's federated session reference ``<node-uuid>:<session>``.
+
+    Returns ``(node_id, native_id)``; ``node_id`` is "" for anything that is
+    not node-qualified (a bare id, a worker id, an ``@agent`` name). The node
+    half must be a full UUID -- the same rule as CCC's
+    ``federation.parse_session_ref`` -- so no other target shape changes
+    meaning."""
+    t = str(target or "").strip()
+    head, sep, tail = t.partition(":")
+    if sep and tail and _UUID_RE.match(head):
+        return head.lower(), tail
+    return "", t
+
+
+def local_node_ids() -> Tuple[str, ...]:
+    """This host's CCC node id plus WT's older local alias, if any."""
+    try:
+        primary, aliases = envelope.node_identity()
+    except Exception:  # noqa: BLE001 - unknown identity means "no local ids"
+        return ()
+    return tuple(str(n).lower() for n in (primary, *aliases) if n)
+
+
+def node_qualified(node: Any, session_id: Any) -> str:
+    """Address ``session_id`` on ``node``: ``<node>:<sid>`` when the session
+    lives on another CCC node, the bare id when it is local, unknown, or the
+    id is already node-qualified. A ticket on a backend shared by several
+    hosts (GitHub) records only the bare session id of whoever filed it; a
+    different host that transitions the ticket must say which node owns that
+    session, or every local transport misses it and the notice dead-letters
+    (WATCHTOWER-42)."""
+    sid = str(session_id or "").strip()
+    node = str(node or "").strip().lower()
+    # Only a session UUID is federation-addressable. A worker id or @agent
+    # name means nothing to another node's CCC; qualifying it would turn
+    # today's "unresolvable, dropped" into a parked notice that dead-letters.
+    if not _UUID_RE.match(sid) or not _UUID_RE.match(node):
+        return sid
+    if node in local_node_ids():
+        return sid
+    return f"{node}:{sid}"
+
+
 # ------------------------------------------------------------------ path helpers
 def _agents_file() -> Path:
     return Path(
@@ -455,6 +499,16 @@ def resolve_target(target: str, include_recent: bool = True) -> Dict[str, Any]:
     t = str(target or "").strip()
     if not t:
         raise ValueError("target is required")
+    # A CCC federated reference ("<node-uuid>:<sid>", WATCHTOWER-42). Our own
+    # node resolves as the bare id; another node's session is addressable
+    # only through the delegate, whose federation layer proxies it to the
+    # owning CCC. The engine is left to that owner to determine.
+    node, native = split_node_ref(t)
+    if node:
+        if node not in local_node_ids():
+            return {"kind": "session", "session_id": t, "worker": None,
+                    "engine": "", "remote_node": node, "known": False}
+        t = native
     live = [w for w in workers.list_workers(prune=False) if w.get("alive")]
     for w in live:
         if str(w.get("worker_id") or "") == t:
@@ -1757,7 +1811,10 @@ def deliver(
     resolved = dict(resolved, attr=attr)
     text = envelope.carry(text, attr, app="wt")
     envelope.journal(attr, app="wt", event="attempt")
-    pre = _pre_send_receipt(resolved, text) if sid else None
+    # A session on another node has no transcript here to verify a receipt
+    # against, so recording one would only manufacture a "lost" delivery.
+    local = bool(sid) and not resolved.get("remote_node")
+    pre = _pre_send_receipt(resolved, text) if local else None
     if live_only:
         result = _deliver_live_only(resolved, text)
     else:
@@ -1773,7 +1830,7 @@ def deliver(
         else:
             receipts.discard(pre["id"])
         return result
-    if result.get("ok") and sid:
+    if result.get("ok") and local:
         try:
             from . import receipts
             transport = str(result.get("transport") or "?")
@@ -1917,6 +1974,15 @@ def _deliver_unreceipted(
 ) -> Dict[str, Any]:
     errors: List[str] = []
     busy = False
+    if resolved.get("remote_node"):
+        # Another node's session: no local socket, FIFO, TTY or transcript can
+        # reach it, so the delegate's federation proxy is the only transport.
+        # A notice keeps its steer class (_deliver_notify) across the hop.
+        return _deliver_delegate(
+            resolved, text, "steer" if notify else mode,
+            force_queue=force_queue and not notify,
+            delegate_timeout_s=delegate_timeout_s,
+        )
     if resolved.get("same_session") and resolved.get("engine") not in ("claude", "codex"):
         # The broker owns engine-specific settings and same-session delivery.
         # Legacy native fallbacks do not implement this takeover contract.
@@ -2574,7 +2640,8 @@ def send(
     if live_only:
         extra["live_only"] = True
         queue_on_fail = False
-    result = _continue_if_cold(resolved, text) if start_new_if_needed else None
+    result = (_continue_if_cold(resolved, text)
+              if start_new_if_needed and not resolved.get("remote_node") else None)
     if result is None:
         result = deliver(resolved, text, mode, **extra)
     if same_session and result.get("delivery_uncertain"):

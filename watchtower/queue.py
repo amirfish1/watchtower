@@ -1499,6 +1499,41 @@ def _submitter_wants(item: Dict[str, Any], event: str, _config: Any) -> bool:
         return True  # a config hiccup must never silently mute notifications
 
 
+def _local_submitter_node(submitter: Any) -> str:
+    """The CCC node id to record beside an auto/explicit ``submitter``.
+
+    A session id names a session on ONE host. On a backend several hosts
+    share (GitHub), the ticket is later blocked/closed by workers elsewhere,
+    and their notice to a bare id searched only their own host and
+    dead-lettered after 20 attempts (WATCHTOWER-42). Recording the filing
+    node lets them address it as ``<node>:<sid>`` through CCC federation.
+    "" when there is no submitter, it is already node-qualified, or the
+    identity cannot be read -- notification is best-effort, filing is not."""
+    sub = str(submitter or "").strip()
+    if not sub:
+        return ""
+    try:
+        from . import messages
+        if messages.split_node_ref(sub)[0]:
+            return ""
+        ids = messages.local_node_ids()
+    except Exception:  # noqa: BLE001
+        return ""
+    return ids[0] if ids else ""
+
+
+def submitter_address(item: Optional[Dict[str, Any]]) -> str:
+    """Where to deliver to ``item``'s submitter from THIS host: the bare id
+    when it was filed here (or on an unknown node), else ``<node>:<sid>``."""
+    item = item or {}
+    sub = str(item.get("submitter") or "").strip()
+    try:
+        from . import messages
+        return messages.node_qualified(item.get("submitter_node"), sub)
+    except Exception:  # noqa: BLE001
+        return sub
+
+
 def _notify_ticket_event(
     item: Optional[Dict[str, Any]], event: str, detail: str = "",
     actor: Any = None,
@@ -1563,7 +1598,10 @@ def _notify_ticket_event(
 
     project = str(item.get("project") or "")
     if _submitter_wants(item, event, _config):
-        _add(item.get("submitter"))
+        # Actor matching uses the bare id the actor would present; delivery
+        # uses the node-qualified address when the filer lives elsewhere.
+        if str(item.get("submitter") or "").strip() not in actors:
+            _add(submitter_address(item))
     try:
         for target in _config.subscribers(project):
             _add(target)
@@ -1591,13 +1629,22 @@ def _notify_ticket_event(
         # here -- ask CCC (the one source of truth for the forward map)
         # whether it should really go to a successor instead.
         try:
-            deliver_target = messages.ccc_forward_target(target) or target
+            remote_node, native = messages.split_node_ref(target)
+        except Exception:
+            remote_node, native = "", target
+        try:
+            # Forwards are the owning CCC's lineage map; this host's CCC only
+            # knows its own sessions, and the owner applies its map on arrival.
+            deliver_target = target if remote_node else (messages.ccc_forward_target(target) or target)
         except Exception:
             deliver_target = target
         try:
             from . import sender_envelope as envelope
+            attr = envelope.service("wt:notify", native if remote_node else deliver_target) if envelope.enabled("wt") else None
+            if attr and remote_node:
+                attr["intended_recipient"] = {"id": native, "node": remote_node}
             messages.send(deliver_target, text, notify=True, start_new_if_needed=True,
-                          **({"attr": envelope.service("wt:notify", deliver_target)} if envelope.enabled("wt") else {}))
+                          **({"attr": attr} if attr else {}))
         except Exception:
             pass  # best-effort -- a delivery hiccup never fails the transition
 
@@ -1712,6 +1759,7 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
         **_placement_fields(placement, note, text, title),
         "submitter": str(submitter or ""),
         "submitter_explicit": bool(submitter_explicit),
+        **({"submitter_node": node} if (node := _local_submitter_node(submitter)) else {}),
         "claimed_by": None,
         "claimed_at": None,
         "closed_at": None,
@@ -4422,7 +4470,7 @@ def checks_block(item: Dict[str, Any]) -> str:
 
 def _reviewer_target(item: Dict[str, Any], stage: str) -> str:
     target = gate_stage_label(stage)
-    return str(item.get("submitter") or "") if target == "submitter" else target
+    return submitter_address(item) if target == "submitter" else target
 
 
 def _dependents_of(ref: str) -> List[str]:
@@ -5543,6 +5591,8 @@ def _group_file_fix_unlocked(data: Dict[str, Any], parent: Dict[str, Any], findi
         pre_ack=bool(parent.get("pre_ack") or parent.get("product_ack")), blocked_by=None,
         gates=None, accept_line=str(parent.get("accept") or ""))
     fix["gates"] = gates
+    if parent.get("submitter_node"):
+        fix["submitter_node"] = parent["submitter_node"]  # same filer, same host
     fix["group"] = {"role": "child", "parent": pref, "kind": "integration_fix"}
     g = parent["group"]
     g["fixes"] = list(g.get("fixes") or []) + [fix["ref"]]

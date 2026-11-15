@@ -2474,6 +2474,7 @@ class GitHubIssuesBackend:
             if isinstance(meta.get("blocked_by"), list) else [],
             "submitter": str(meta.get("submitter") or ""),
             "submitter_explicit": bool(meta.get("submitter_explicit", False)),
+            "submitter_node": str(meta.get("submitter_node") or ""),
             "claimed_by": (
                 meta.get("claimed_by")
                 or (",".join(assignees) if queue_member and status == "in_progress" and assignees else None)
@@ -2992,6 +2993,12 @@ class GitHubIssuesBackend:
             # event or only the default set -- see queue._submitter_wants.
             "submitter_explicit": bool(submitter_explicit),
         }
+        # The filing host's CCC node: workers on OTHER hosts block/close this
+        # issue too, and need it to reach a bare submitter id (WATCHTOWER-42).
+        from .queue import _local_submitter_node
+        submitter_node = _local_submitter_node(submitter)
+        if submitter_node:
+            meta["submitter_node"] = submitter_node
         if blocked_by:
             meta["blocked_by"] = self._validate_blockers("", blocked_by)
         # Pre-validated by queue._depth_fields: {} for quick, else depth+budget_min.
