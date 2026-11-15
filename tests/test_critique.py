@@ -46,6 +46,12 @@ PARENT_SID = "aaaaaaaa-bbbb-4ccc-8ddd-000000000001"
 CODEX_TID = "019f3abb-2026-7fe0-b437-ed9c858534b5"
 
 
+def _prompt(record):
+    argv = record["argv"]
+    # Antigravity account settings follow its -p value.
+    return argv[argv.index("-p") + 1] if record["engine"] == "antigravity" else argv[-1]
+
+
 def test_critique_spawns_the_two_other_families(wt, monkeypatch, capsys):
     cli = _cli(wt)
     workers = _workers(wt)
@@ -65,7 +71,7 @@ def test_critique_spawns_the_two_other_families(wt, monkeypatch, capsys):
     assert "--dangerously-bypass-approvals-and-sandbox" in out[0]["argv"]
     assert "--dangerously-skip-permissions" in out[1]["argv"]
     for r in out:
-        prompt = r["argv"][-1]
+        prompt = _prompt(r)
         assert "does this design hold up?" in prompt
         assert "contrarian" in prompt
         # WT-native reply-to footer targets the parent session via wt send,
@@ -110,7 +116,7 @@ def test_critique_family_autodetected_from_codex_env(wt, monkeypatch, capsys):
     out = json.loads(captured.out)
     assert [r["engine"] for r in out] == ["claude", "antigravity"]
     for r in out:
-        assert "wt send @codex-thread-" in r["argv"][-1]
+        assert "wt send @codex-thread-" in _prompt(r)
     reg = wt.messages.resolve_target(
         f"@codex-thread-{CODEX_TID.replace('-', '')[:12]}"
     )
@@ -289,7 +295,7 @@ def test_critique_without_report_to_has_no_send_footer(wt, monkeypatch, capsys):
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     for r in out:
-        assert "wt send" not in r["argv"][-1]
+        assert "wt send" not in _prompt(r)
 
 
 def test_critique_without_report_to_warns_loudly_on_real_spawn(wt, monkeypatch, capsys):
@@ -425,7 +431,7 @@ def test_spawn_antigravity_argv_shape(wt, monkeypatch, tmp_path, capsys):
     assert argv[0] == str(fake)
     assert "--dangerously-skip-permissions" in argv
     assert "--add-dir" in argv and str(tmp_path) in argv
-    assert argv[-2:] == ["-p", "goal"]
+    assert argv[argv.index("-p") + 1] == "goal"
     # AGY's internal log is a *sibling* .agy.log, not worker.log.agy.log
     agy_log = argv[argv.index("--log-file") + 1]
     assert agy_log.endswith(".agy.log") and not agy_log.endswith(".log.agy.log")
