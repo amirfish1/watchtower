@@ -83,7 +83,9 @@ host that has not adopted. `wt deploy --json` locates each installed source;
 `wt deploy --sync` is the guarded update path. Coordinate one restart per host,
 preserve workers, and prove adoption with private-fixture contention.
 
-Rollback: revert the OPS-463 source commit, push and sync/restart the same hosts.
+Rollback: revert all OPS-463 source commits, newest first, then push and
+sync/restart the same hosts. Reverting only the cleanup-recovery follow-up does
+not remove cross-host exclusion.
 First let current mutex holders and their request children finish. Do not erase
 an active lock to accelerate a rollback. Rollback restores the original
 cross-host race; it is not a resolution of OPS-463.
