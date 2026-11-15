@@ -4607,3 +4607,29 @@ def test_claim_after_close_metadata_still_counts_when_later(tmp_path, monkeypatc
     assert github_backend._claim_predates_close({"claimed_by": "w", "closed_at": "2026-10-29T15:34:00Z"})
     assert not github_backend._claim_predates_close({"claimed_by": "w", "claimed_at": "2026-10-29T15:00:00Z"})
     assert not github_backend._claim_predates_close({"closed_at": "2026-10-29T15:34:00Z"})
+
+
+def test_client_id_github_cli_roundtrip_and_filter(tmp_path, monkeypatch, capsys):
+    """Correlation metadata survives the real CLI and issue-body transport."""
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend('GHI', 'github')
+    config.set_github_repo('GHI', 'test-owner/test-repo')
+    from watchtower import cli
+    opaque = '  Case/opaque:雪\n"\\ --flag  '
+    assert cli.main(['add', '-q', 'GHI', '--title', 'linked', '--client-id', opaque, '--json']) == 0
+    item = json.loads(capsys.readouterr().out)
+    assert item['client_id'] == opaque
+    q.enqueue(project='GHI', note='other')
+    assert q.get(item['ref'])['client_id'] == opaque
+    assert cli.main(['ls', '-q', 'GHI', '--status', 'all', '--client-id', opaque, '--json']) == 0
+    assert [r['ref'] for r in json.loads(capsys.readouterr().out)] == [item['ref']]
+    assert cli.main(['edit', item['ref'], '--client-id', 'replacement', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['client_id'] == 'replacement'
+    assert q.get(item['ref'])['client_id'] == 'replacement'
+    assert cli.main(['ls', '-q', 'GHI', '--client-id', opaque, '--json']) == 0
+    assert json.loads(capsys.readouterr().out) == []
+    assert cli.main(['edit', item['ref'], '--client-id', '', '--json']) == 0
+    assert json.loads(capsys.readouterr().out)['client_id'] == ''
+    assert cli.main(['ls', '-q', 'GHI', '--client-id', '', '--json']) == 0
+    assert len(json.loads(capsys.readouterr().out)) == 2

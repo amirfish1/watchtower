@@ -80,6 +80,7 @@ The file holds ``{"counter": <int>, "items": [<item>, ...]}``.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import re as _re
@@ -1783,6 +1784,7 @@ def enqueue(
     source: str = "wt",
     project: str = "",
     annotation_id: str = "",
+    client_id: str = "",
     dedupe_key: str = "",
     url: str = "",
     title: str = "",
@@ -1882,6 +1884,7 @@ def enqueue(
                              "queue (GitHub-backed gates live in this host's pipeline sidecar)")
         gates = validate_gates(gates) if gates else None
         saved = backend.enqueue(
+            client_id=client_id,
             note=note,
             text=text,
             source=source,
@@ -1928,6 +1931,7 @@ def enqueue(
             submitter_explicit=submitter_explicit, pre_ack=pre_ack, blocked_by=blocked_by,
             gates=gates, accept_line=accept_line, assessment_origin=assessment_origin,
             placement=placement, depth=depth, budget_min=budget_min)
+        saved["client_id"] = client_id
         if dedupe_key:
             saved["dedupe_key"] = dedupe_key
         if grouped:
@@ -2159,7 +2163,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
         "needs_input", "block_question", "model_floor", "blocked_by", "gates", "accept",
-        "planner_model", "verifier_model", "placement",
+        "planner_model", "verifier_model", "placement", "client_id",
     })
     if "placement" in fields:
         raw = str(fields["placement"] or "").strip().lower()
@@ -4381,6 +4385,69 @@ def stage_session_update(ident: Any, fn) -> Optional[Dict[str, Any]]:
     return None
 
 
+def retry_stage(ident: Any, expected_cycle: int) -> Dict[str, Any]:
+    """Atomically reset an exhausted local stage, fenced against stale callers.
+
+    Uses the daemon's dispatch lock so a stage cannot spawn between validation
+    and reset. This only queues state for the next supervisor pass.
+    """
+    if expected_cycle < 0:
+        raise ValueError("expected cycle must be nonnegative")
+    if _github_backend_for_project(_project_from_ident(ident)) is not None:
+        raise ValueError("stage retry supports local queue storage only")
+    from . import stages, workers
+    with (_FileLock(workers.WORKERS_FILE.parent / "reconcile-maintenance.lock") as maintenance_lock,
+          _FileLock(workers.WORKERS_FILE.parent / "reconcile.lock") as dispatch_lock,
+          _FileLock(_lock_path()) as queue_lock):
+        if any(lock._fh is None for lock in (maintenance_lock, dispatch_lock, queue_lock)):
+            raise ValueError("recovery requires exclusive dispatch and queue locks")
+        data = _load_unlocked(strict=True)
+        it = next((i for i in data["items"] if _matches(i, ident)), None)
+        if it is None:
+            raise ValueError("ticket not found")
+        ss = it.get("stage_session") or {}
+        if int(ss.get("retry_cycle") or 0) != expected_cycle:
+            raise ValueError("stale stage retry cycle")
+        if not ss.get("escalated"):
+            raise ValueError("stage is not escalated (or already retried)")
+        if it.get("duplicate_of") or it.get("parked") or it.get("status") == PARKED_STATUS:
+            raise ValueError("duplicate or parked ticket cannot retry a stage")
+        if (it.get("supervision") or {}).get("state") not in (None, "cancelled", "completed"):
+            raise ValueError("active supervision owns the ticket")
+        if (it.get("pending_answer") or {}).get("state", "none") not in ("none", "delivered"):
+            raise ValueError("pending or unknown answer delivery owns the ticket")
+        if it.get("needs_input") and it.get("block_origin") != "stage":
+            raise ValueError("resolve unrelated ticket wait before retrying")
+        wait = current_wait(it)
+        if wait and wait.get("on") != "owner":
+            raise ValueError("resolve dependency wait before retrying")
+        if ss.get("worker_id") and stages.session_alive(str(ss["worker_id"])):
+            raise ValueError("stage session is still alive")
+        if ss.get("pid") and workers._pid_alive(int(ss["pid"])):
+            raise ValueError("stage process is still alive")
+        if blocker_verdict(it, _refs_index(data["items"]))[0] != "ok":
+            raise ValueError("ticket has unresolved dependency gates")
+        now = _now_iso()
+        _stage_retry_reset(it, "Explicit stage retry", now)
+        if it.get("needs_input"):
+            it.update(needs_input=False, block_question="", block_kind="", blocked_at=None)
+            it.pop("wait", None)
+        desired = stages.desired([it])
+        if not desired or desired[0]["role"] != ss.get("role"):
+            raise ValueError("ticket no longer calls for the escalated stage")
+        # Membership/pipeline changes also fence old escalations. Assessors
+        # intentionally advance their own key when starting a fresh cycle.
+        if ss.get("role") != "assessor" and desired[0]["key"] != ss.get("key"):
+            raise ValueError("stage key changed since escalation")
+        it["updated_at"] = now
+        _append_history(it, "stage_retry_requested", by=_by("system"), at=now,
+                        expected_cycle=expected_cycle, previous_claim=it.get("claimed_by"))
+        _save_unlocked(data)
+        return {"ok": True, "ref": it["ref"], "retried": True,
+                "cycle": it["stage_session"]["retry_cycle"],
+                "stage_session": copy.deepcopy(it["stage_session"])}
+
+
 def _stage_retry_reset(it: Dict[str, Any], text: str, now: str) -> bool:
     """Human ``answer`` on a stage escalation (WT-24), same store transaction:
     per-role retry transition + a fresh attempt budget. True when it applied."""
@@ -4402,6 +4469,7 @@ def _stage_retry_reset(it: Dict[str, Any], text: str, now: str) -> bool:
             it["assessment"] = a
             _append_history(it, "assessment", by=_by("system"), at=now, outcome="retry")
     it["stage_session"] = {
+        "retry_cycle": int(ss.get("retry_cycle") or 0) + 1,
         "key": ss.get("key", ""), "role": role, "attempt": 0, "escalated": False,
         "deaths": list(ss.get("deaths") or [])[-10:], "retry_at": now,
         "retry_note": _clip(text, 2000),
@@ -8460,7 +8528,7 @@ def block(
                 it["block_question"] = _clip(question, 4000)
                 it["block_kind"] = kind
                 # Who raised this block: "worker" (`wt block`) or WatchTower itself
-                # (stage, plan_gate, outcome, system). Read-only metadata for the
+                # (stage, plan_gate, system). Read-only metadata for the
                 # owner view; nothing routes, wakes or approves on it.
                 it["block_origin"] = str(origin or "")
                 it["blocked_at"] = block_at

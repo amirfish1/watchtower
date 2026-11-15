@@ -2472,6 +2472,7 @@ class GitHubIssuesBackend:
             "answered_at": meta.get("answered_at"),
             "blocked_by": [str(r) for r in (meta.get("blocked_by") or []) if r]
             if isinstance(meta.get("blocked_by"), list) else [],
+            "client_id": meta.get("client_id", ""),
             "submitter": str(meta.get("submitter") or ""),
             "submitter_explicit": bool(meta.get("submitter_explicit", False)),
             "submitter_node": str(meta.get("submitter_node") or ""),
@@ -2945,6 +2946,7 @@ class GitHubIssuesBackend:
         note: str,
         text: str = "",
         source: str = "wt",
+        client_id: str = "",
         annotation_id: str = "",
         url: str = "",
         title: str = "",
@@ -2968,6 +2970,7 @@ class GitHubIssuesBackend:
             raise ValueError("note or text is required")
         self._ensure_labels()
         meta = {
+            "client_id": client_id,
             "queue": self.queue,
             "annotation_id": str(annotation_id or ""),
             "source": str(source or "wt"),
@@ -3027,6 +3030,7 @@ class GitHubIssuesBackend:
             "type": meta["type"],
             "readiness": meta["readiness"],
             "priority": meta["priority"],
+            "client_id": client_id,
             "submitter": meta["submitter"],
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
@@ -4245,7 +4249,7 @@ class GitHubIssuesBackend:
             elif key in {
                 "readiness", "priority", "value", "confidence", "note",
                 "url", "selector", "screenshot_path", "repo_path",
-                "needs_input", "block_question",
+                "needs_input", "block_question", "client_id",
             }:
                 meta[key] = value
             elif key == "pipeline_host":

@@ -410,15 +410,6 @@ def _tick(it, obs, now):
     if now < max(float(s['next_deadline']),float(obs['activity_at'])+IDLE_SECONDS):
         return
     if s['reminders']>=MAX_REMINDERS:
-        from . import outcomes
-        oid=outcomes.route_exception(it['ref'])
-        if oid:
-            # Linked outcome (feature on): a bounded lead diagnosis owns the
-            # technical exhaustion before any owner question.
-            s.update(state='waiting',wait_identity=f'outcome:{oid}',wait_source='outcome',
-                     reason='Reminder budget exhausted; linked outcome lead diagnosis owns the next action')
-            q._append_history(it,'takeover_escalation',by=q._by('system'),reason=s['reason'],routed_to=oid)
-            return
         _owner_question_unlocked(it, s,
             'Three confirmed work reminders exhausted; owner must review the retained session',
             source='takeover-escalation', turn=s['processed_turn'])
@@ -476,25 +467,53 @@ def reconcile(*, now=None, dry_run=False):
     return results
 
 
-def resume_from_outcome(ref, outcome_id):
-    """Outcome lead result: resume same-session supervision after a routed
-    reminder exhaustion. Once per supervision generation; never re-sends an
-    uncertain intent and never takes over another claim."""
-    with _lock(), q._FileLock(q._lock_path()):
+def resume(ref, expected_generation):
+    """Resume settled waiting supervision once per generation; never send inline."""
+    if expected_generation < 1:
+        raise ValueError('expected generation must be positive')
+    if q._github_backend_for_project(q._project_from_ident(ref)) is not None:
+        raise ValueError('supervision resume supports local queue storage only')
+    with _lock() as dispatch_lock, q._FileLock(q._lock_path()) as queue_lock:
+        if dispatch_lock._fh is None or queue_lock._fh is None:
+            raise ValueError('recovery requires exclusive dispatch and queue locks')
         data=q._load_unlocked(strict=True)
         it=next((i for i in data['items'] if i['ref']==ref),None)
-        s=(it or {}).get('supervision') or {}
-        if not s or s.get('wait_source')!='outcome' or s.get('wait_identity')!=f'outcome:{outcome_id}':
-            return dict(ref=ref, resumed=False, reason='supervision is not waiting on this outcome')
-        if (s.get('intent') or {}).get('state')=='uncertain':
-            return dict(ref=ref, resumed=False, reason='delivery outcome unknown; receipt must be reconciled first')
-        if int(s.get('outcome_resumed_generation') or 0)==int(s['generation']):
-            return dict(ref=ref, resumed=False, reason='already resumed once for this generation')
-        s.update(state='running',wait_identity='',wait_source='',reminders=0,next_deadline=time.time()+IDLE_SECONDS,
-                 outcome_resumed_generation=s['generation'],reason='Outcome lead resumed same-session supervision')
-        q._append_history(it,'takeover_outcome_resume',by=q._by('system'),outcome_id=outcome_id,generation=s['generation'])
+        if not it or not it.get('supervision'):
+            raise ValueError('ticket has no supervision binding')
+        s=it['supervision']
+        if s['generation'] != expected_generation:
+            raise ValueError('stale supervision generation')
+        if s.get('resumed_generation') == expected_generation:
+            raise ValueError('already resumed once for this generation')
+        if s.get('state') != 'waiting':
+            raise ValueError('supervision is not waiting')
+        if (s.get('intent') or {}).get('state', 'none') not in ('none','confirmed','cancelled'):
+            raise ValueError('delivery is pending or unknown; reconcile receipt first')
+        if it.get('status') != 'in_progress' or it.get('duplicate_of'):
+            raise ValueError('ticket is not an active independent claim')
+        sid=s['session']['session_id']
+        if it.get('claimed_session_id') != sid or it.get('claimed_by') != sid:
+            raise ValueError('supervision no longer owns the claim')
+        if it.get('parked') or q._plan_active_unlocked(it):
+            raise ValueError('parked claim or active plan prevents resume')
+        if it.get('needs_input') or q.current_wait(it):
+            raise ValueError('resolve ticket wait before resuming supervision')
+        if (it.get('pending_answer') or {}).get('state', 'none') not in ('none','delivered'):
+            raise ValueError('pending or unknown answer delivery owns the ticket')
+        if any(other is not it and (
+                ((other.get('supervision') or {}).get('session',{}).get('session_id') == sid
+                 and (other.get('supervision') or {}).get('state') not in TERMINAL)
+                or (other.get('claimed_session_id') == sid and other.get('status') == 'in_progress'))
+               for other in data['items']):
+            raise ValueError('ambiguous session ownership')
+        if q.blocker_verdict(it,q._refs_index(data['items']))[0] != 'ok':
+            raise ValueError('ticket has unresolved dependency gates')
+        s.update(state='running',wait_identity='',wait_source='',reminders=0,
+                 next_deadline=time.time()+IDLE_SECONDS,resumed_generation=expected_generation,
+                 reason='Explicit supervision resume')
+        q._append_history(it,'takeover_resume',by=q._by('system'),generation=expected_generation)
         q._save_unlocked(data)
-        return dict(ref=ref, resumed=True)
+        return dict(ok=True,ref=ref,resumed=True,generation=s['generation'],supervision=copy.deepcopy(s))
 
 
 def status_all():

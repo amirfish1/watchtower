@@ -605,6 +605,8 @@ def cmd_ls(args: argparse.Namespace) -> int:
     # fresh=True for the same reason as `wt status`: a CLI read always
     # revalidates, so `wt ls` is never behind the repo.
     items = q.list_items(project=args.queue, fresh=True)
+    if getattr(args, "client_id", None) is not None:
+        items = [i for i in items if i.get("client_id", "") == args.client_id]
     all_items = items
     try:
         items, windowed = _ls_window_select(items, args)
@@ -779,6 +781,7 @@ def cmd_find(args: argparse.Namespace) -> int:
     )
     checks = q.checks_block(item)
     if args.json:
+        item_with_timeline = dict(item_with_timeline, effective_gates=q.effective_gates(item))
         if checks:
             item_with_timeline = dict(item_with_timeline, checks_after_close=checks)
         print(json.dumps(item_with_timeline, indent=2))
@@ -917,7 +920,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         "title", "note", "text", "url", "type", "readiness", "priority",
         "value", "confidence", "model_floor", "planner_model", "verifier_model",
         "selector", "screenshot_path", "repo_path", "accept", "placement",
-        "depth", "budget_min",
+        "depth", "budget_min", "client_id",
     ):
         value = getattr(args, name, None)
         if value is not None:
@@ -941,7 +944,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
             "--title/--note/--text/--url/--type/--readiness/--priority/"
             "--value/--confidence/--model-floor/--selector/"
             "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates/--accept/"
-            "--depth/--budget-min",
+            "--depth/--budget-min/--client-id",
             file=sys.stderr,
         )
         return 1
@@ -977,6 +980,21 @@ def cmd_edit(args: argparse.Namespace) -> int:
 
 
 def cmd_add(args: argparse.Namespace) -> int:
+    if not getattr(args, "json", False):
+        return _cmd_add(args)
+    from contextlib import redirect_stdout
+    # Keep dispatch/claim diagnostics out of the machine-readable response.
+    args._created_ref = ""
+    with redirect_stdout(sys.stderr):
+        result = _cmd_add(args)
+    if result:
+        print(json.dumps({"ok": False, "error": "ticket add failed; see stderr"}))
+    else:
+        _print_item(q.get(args._created_ref))
+    return result
+
+
+def _cmd_add(args: argparse.Namespace) -> int:
     if getattr(args, "run", False):
         conflict = ("--claim" if getattr(args, "claim", False) else
                     "--group-parent" if getattr(args, "group_parent", False) else "")
@@ -1013,6 +1031,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             url=args.url or "",
             lane=args.lane,
             source="wt",
+            client_id=getattr(args, "client_id", ""),
             item_type=getattr(args, "type", "") or "",
             readiness=getattr(args, "readiness", "") or "",
             priority=getattr(args, "priority", "") or "",
@@ -1039,6 +1058,7 @@ def cmd_add(args: argparse.Namespace) -> int:
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+    args._created_ref = item["ref"]
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}"
           + (f"  [deep, {item.get('budget_min')}m budget]" if q.is_deep(item) else ""))
     if not getattr(args, "claim", False):
@@ -2094,7 +2114,15 @@ def cmd_group(args: argparse.Namespace) -> int:
 
 
 def cmd_stages(args: argparse.Namespace) -> int:
-    """`wt stages tick|show` -- manual / daemonless stage supervision (WT-24)."""
+    """`wt stages tick|show|retry` -- manual / daemonless stage supervision (WT-24)."""
+    if args.stages_cmd == "retry":
+        try:
+            result = q.retry_stage(args.ref, args.expected_cycle)
+        except (ValueError, OSError) as exc:
+            print(json.dumps({"ok": False, "error": str(exc)}))
+            return 1
+        print(json.dumps(result))
+        return 0
     if args.stages_cmd == "tick":
         from .queue import _FileLock
         from . import liveness
@@ -4871,7 +4899,13 @@ def cmd_takeover(args: argparse.Namespace) -> int:
     from . import takeover, observations
     try:
         action = args.session_or_action
-        if action == "candidates":
+        if action == "resume":
+            if not args.session or args.expected_generation is None:
+                raise ValueError("resume requires REF and --expected-generation N")
+            if args.dry_run:
+                raise ValueError("resume does not support --dry-run; no changes made")
+            result = takeover.resume(args.session, args.expected_generation)
+        elif action == "candidates":
             if args.dry_run:
                 raise ValueError("candidate publication does not support --dry-run; no changes made")
             result = takeover.replace_candidates(args.source, json.loads(args.candidates_json))
@@ -4890,54 +4924,8 @@ def cmd_takeover(args: argparse.Namespace) -> int:
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except (ValueError, OSError) as exc:
-        print(json.dumps({"schema_version": 1, "error": str(exc)}))
+        print(json.dumps({"ok": False, "schema_version": 1, "error": str(exc)}))
         return 1
-
-
-def cmd_outcome(args: argparse.Namespace) -> int:
-    """Durable outcomes (default off). ``api`` is the machine wire: exactly one
-    JSON object on stdout; nonzero exit with ``{ok: false, error, code}``."""
-    from . import outcomes
-    action = args.outcome_action
-    try:
-        if action == "api":
-            raw = args.payload_json if args.payload_json is not None else "{}"
-            try:
-                payload = json.loads(raw)
-            except ValueError as exc:
-                raise outcomes.OutcomeError("invalid", f"payload is not valid JSON: {exc}") from exc
-            result = outcomes.api(args.api_action, payload)
-        elif action == "list":
-            result = {"ok": True, "outcomes": outcomes.list_outcomes(args.repo_path or "", args.state or "")}
-        elif action == "show":
-            result = {"ok": True, "outcome": outcomes.get(args.id)}
-        elif action == "reconcile":
-            result = {"ok": True, "result": outcomes.reconcile(dry_run=args.dry_run)}
-        elif action == "settings":
-            flag = True if args.enable else False if args.disable else None
-            result = outcomes.api("settings", {} if flag is None else {"enabled": flag})
-        else:
-            raise outcomes.OutcomeError("invalid", "usage: wt outcome {api,list,show,reconcile,settings}")
-    except outcomes.OutcomeError as exc:
-        print(json.dumps(dict({"ok": False, "error": exc.message, "code": exc.code}, **exc.extra),
-                         ensure_ascii=False, default=str))
-        return 1
-    except (OSError, ValueError) as exc:
-        print(json.dumps({"ok": False, "error": str(exc), "code": "error"}, ensure_ascii=False))
-        return 1
-    if action == "api" or getattr(args, "json", False):
-        print(json.dumps(result, ensure_ascii=False, default=str))
-        return 0
-    if action == "list":
-        rows = result["outcomes"]
-        if not rows:
-            print("No outcomes.")
-        for o in rows:
-            na = (o.get("next_action") or {}).get("text") or "-"
-            print(f"{o['id']}  {o['state']:<9} {o['health']:<13} {o['title'][:50]}  next: {na[:60]}")
-        return 0
-    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
-    return 0
 
 
 def cmd_outbox(args: argparse.Namespace) -> int:
@@ -7153,7 +7141,6 @@ COMMAND_SECTIONS: List[Tuple[str, str]] = [
     ("Tickets", "import"),
     ("Tickets", "take"),
     ("Tickets", "takeover"),
-    ("Tickets", "outcome"),
     ("Tickets", "edit"),
     ("Tickets", "ready"),
     ("Tickets", "find"),
@@ -7226,7 +7213,6 @@ COMMAND_HELP: Dict[str, str] = {
     "nack": "decline a product-gate pitch: icebox it, or --close to close as Declined",
     "answer": "answer a blocked ticket; auto-resumes its session",
     "takeover": "supervise an existing session; status, cancel, observe, or publish candidates",
-    "outcome": "durable outcomes (default off): api, list, show, reconcile, settings",
     "migrate-blocks": "park tickets blocked the legacy way (WT-28)",
     "comment": "append a ticket activity comment",
     "discuss": "attach to a blocked ticket's session (claude --resume)",
@@ -7490,6 +7476,7 @@ def build_parser() -> argparse.ArgumentParser:
     m.set_defaults(func=model_run_command)
 
     s = sub.add_parser("ls", aliases=["list"])  # `wt list` is a common first guess
+    s.add_argument("--client-id", default=None, help="opaque client correlation identifier (exact match)")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument(
         "--status",
@@ -7620,6 +7607,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
 
     s = sub.add_parser("add")
+    s.add_argument("--json", action="store_true", help="return one ticket JSON snapshot")
+    s.add_argument("--client-id", default="", help="opaque client correlation identifier (exact match)")
     _add_common_ticket_args(s)
     s.add_argument("--after", action="append", default=None, metavar="REF",
                    help="this ticket is not claimable until REF closes as "
@@ -7679,6 +7668,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_take)
 
     s = sub.add_parser("edit")
+    s.add_argument("--client-id", default=None, help="opaque client correlation identifier (exact match)")
     s.add_argument("ref", help="ticket ref (e.g. WT-48) or bare number")
     s.add_argument("--title", default=None)
     s.add_argument("--note", default=None)
@@ -7951,6 +7941,10 @@ def build_parser() -> argparse.ArgumentParser:
     g2 = sg.add_parser("show", help="print a ticket's stage-supervision record")
     g2.add_argument("ref")
     g2.add_argument("--json", action="store_true")
+    g3 = sg.add_parser("retry", help="reset an escalated stage with a cycle fence; no inline spawn")
+    g3.add_argument("ref")
+    g3.add_argument("--expected-cycle", type=int, required=True)
+    g3.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_stages)
 
     s = sub.add_parser("liveness", help=COMMAND_HELP.get("liveness", ""))
@@ -8415,7 +8409,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_spawn)
 
     s = sub.add_parser("takeover", help="supervise an existing native session without replacing it")
-    s.add_argument("session_or_action", help="SESSION, status, cancel, or observe")
+    s.add_argument("session_or_action", help="SESSION, status, cancel, observe, or resume REF")
+    s.add_argument("--expected-generation", type=int, default=None)
     s.add_argument("session", nargs="?", default="")
     s.add_argument("--ticket", default="")
     s.add_argument("--queue", default="")
@@ -8427,30 +8422,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--dry-run", action="store_true")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_takeover)
-
-    s = sub.add_parser("outcome", help="durable outcomes: responsibility for results (default off)")
-    s.set_defaults(func=cmd_outcome, outcome_action=None)
-    osub = s.add_subparsers(dest="outcome_action")
-    o = osub.add_parser("api", help="machine wire: one JSON object in, one out")
-    o.add_argument("api_action", choices=["list", "get", "create", "update", "link", "associate", "event",
-                                           "evidence", "accept", "lead-result", "feed", "settings",
-                                           "reconcile"])
-    o.add_argument("--payload-json", dest="payload_json", default=None)
-    o = osub.add_parser("list", help="list outcomes")
-    o.add_argument("--repo-path", dest="repo_path", default="")
-    o.add_argument("--state", default="")
-    o.add_argument("--json", action="store_true")
-    o = osub.add_parser("show", help="show one outcome")
-    o.add_argument("id")
-    o.add_argument("--json", action="store_true")
-    o = osub.add_parser("reconcile", help="one outcome reconcile pass (the daemon runs this each tick)")
-    o.add_argument("--dry-run", action="store_true", dest="dry_run")
-    o.add_argument("--json", action="store_true")
-    o = osub.add_parser("settings", help="show or change the installation's default-off outcome gate")
-    g = o.add_mutually_exclusive_group()
-    g.add_argument("--enable", action="store_true")
-    g.add_argument("--disable", action="store_true")
-    o.add_argument("--json", action="store_true")
 
     s = sub.add_parser("outbox")
     s.set_defaults(func=cmd_outbox, outbox_command=None)

@@ -604,3 +604,77 @@ def test_uncertain_intent_without_receipt_row_resends_once(env):
     t._update(a['ticket'],1,mark); env[2].clear()
     t.reconcile(now=now)
     assert t.status(SID)['supervision']['intent']['resent']
+
+
+def _waiting_for_client(env):
+    a = adopt(env)
+    def waiting(it, s):
+        s.update(state='waiting', wait_source='footer', wait_identity='external-1')
+        s['intent']['state']='confirmed'
+    t._update(a['ticket'], a['generation'], waiting)
+    return a
+
+
+def test_generic_resume_cli_fences_generation_and_duplicate(env, run_cli):
+    a=_waiting_for_client(env)
+    before=q.get(a['ticket'])
+    result=run_cli('takeover','resume',a['ticket'],'--expected-generation','99','--json')
+    assert result.code==1 and 'stale' in json.loads(result.out)['error']
+    assert q.get(a['ticket'])==before
+    result=run_cli('takeover','resume',a['ticket'],'--expected-generation',str(a['generation']),'--json')
+    response=json.loads(result.out)
+    assert result.code==0 and response['ok'] and response['resumed']
+    assert response['supervision']['state']=='running' and not env[3]
+    after=q.get(a['ticket'])
+    assert after['claimed_session_id']==before['claimed_session_id']==SID
+    result=run_cli('takeover','resume',a['ticket'],'--expected-generation',str(a['generation']))
+    assert result.code==1 and 'already resumed' in json.loads(result.out)['error']
+    assert q.get(a['ticket'])==after
+
+
+@pytest.mark.parametrize('kind', ['uncertain','pending','queued','wrong-owner','duplicate',
+                                  'owner-wait','pending-answer','handed-off','cancelled','second-ticket'])
+def test_generic_resume_refuses_unsettled_or_changed_authority(env, kind):
+    a=_waiting_for_client(env)
+    def change(it,s):
+        if kind in ('uncertain','pending','queued'):
+            s['intent']['state']=kind
+        elif kind=='wrong-owner':
+            it['claimed_by']='other'
+        elif kind=='duplicate':
+            it['duplicate_of']='TEST-99'
+        elif kind=='owner-wait':
+            it['needs_input']=True
+        elif kind in ('pending-answer','handed-off'):
+            it['pending_answer']={'state':'routing' if kind=='pending-answer' else 'handed_off'}
+        elif kind=='cancelled':
+            s['state']='cancelled'
+    t._update(a['ticket'],a['generation'],change)
+    if kind=='second-ticket':
+        extra=q.enqueue(project='TEST',note='another claim')
+        q.stage_session_update(extra['ref'],lambda it,ss:it.update(claimed_session_id=SID,status='in_progress'))
+    before=q.get(a['ticket'])
+    with pytest.raises(ValueError):
+        t.resume(a['ticket'],a['generation'])
+    assert q.get(a['ticket'])==before and not env[3]
+
+
+def test_generic_resume_serializes_duplicate_calls(env):
+    a=_waiting_for_client(env)
+    def attempt(_):
+        try:
+            return t.resume(a['ticket'],a['generation'])['resumed']
+        except ValueError:
+            return False
+    with ThreadPoolExecutor(4) as pool:
+        results=list(pool.map(attempt,range(4)))
+    assert results.count(True)==1 and not env[3]
+
+
+def test_generic_resume_refuses_unavailable_locks(env, monkeypatch):
+    a=_waiting_for_client(env)
+    before=q.get(a['ticket'])
+    monkeypatch.setattr(q,'fcntl',None)
+    with pytest.raises(ValueError,match='exclusive'):
+        t.resume(a['ticket'],a['generation'])
+    assert q.get(a['ticket'])==before and not env[3]

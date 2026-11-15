@@ -269,7 +269,8 @@ def request_assessment(ref: str, force: bool = False) -> Optional[Dict[str, Any]
             q._assessment_new_cycle(a, "forced run" if force else "retry")
         else:
             return "skip"
-        it["stage_session"] = {"key": f"assess:{a.get('cycle', 1)}", "role": "assessor",
+        it["stage_session"] = {"retry_cycle": int((it.get("stage_session") or {}).get("retry_cycle") or 0) + 1,
+                               "key": f"assess:{a.get('cycle', 1)}", "role": "assessor",
                                "attempt": 0, "escalated": False,
                                "deaths": list((it.get("stage_session") or {}).get("deaths") or [])[-10:]}
     item = q._assessment_update(ref, _do)
@@ -594,8 +595,12 @@ def _ss_set(ref: str, **fields: Any) -> Optional[Dict[str, Any]]:
 
 def _ss_replace(ref: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     def _do(it, ss):
+        cycle = int(ss.get("retry_cycle") or 0)
+        if ss.get("key") and ss.get("key") != fields.get("key"):
+            cycle += 1
         ss.clear()
         ss.update(fields)
+        ss["retry_cycle"] = cycle
     return q.stage_session_update(ref, _do)
 
 
@@ -656,17 +661,11 @@ def _escalate(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any]) -> 
         _log("STAGE_BLOCK", f"{ref} {role} {key}: {reasons}", queue=project)
         return
 
-    from . import outcomes
-    routed = outcomes.route_exception(ref)
-
     def _do(it, s):
         s["escalated"] = True
         s["escalated_from"] = plan_status
-        if routed:
-            s["routed_outcome"] = routed
         q._append_history(it, "stage_escalated", by=q._by("system"), at=q._now_iso(),
-                          role=role, key=key, reason=reasons[:500],
-                          **({"routed_to": routed} if routed else {}))
+                          role=role, key=key, reason=reasons[:500])
         if role in ("planner", "plan_reviewer"):
             plan = dict(it.get("plan") or {})
             plan.update(status="blocked", escalated="stage_watch")
@@ -675,11 +674,6 @@ def _escalate(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any]) -> 
     if role == "assessor":
         a = item.get("assessment") or {}
         q.assessment_fail(ref, a.get("token", ""), f"assessor died twice: {reasons}")
-    if routed:
-        # Linked outcome (feature on): the lead diagnoses first; it can retry
-        # the stage or place a prepared question on this ticket.
-        _log("STAGE_ROUTED", f"{ref} {role} {key}: {reasons} -> outcome {routed}", queue=project)
-        return
     q.block(ref, "", origin="stage", question=question, kind="input")
     _log("STAGE_BLOCK", f"{ref} {role} {key}: {reasons}", queue=project)
 

@@ -32,7 +32,7 @@ KINDS = ("owner", "unclassified", "system", "external", "dependency", "worker")
 # purpose: recording one would change who gets notified.
 # "system" is also q.block's default origin, so it proves nothing and stays
 # unclassified (that includes the review-notify block in liveness.py).
-_SYSTEM_ORIGINS = ("stage", "plan_gate", "outcome")
+_SYSTEM_ORIGINS = ("stage", "plan_gate")
 _MAX_CHAIN = 25
 _UNRESOLVED = ("not_found_here", "other_host", "no_ref")
 

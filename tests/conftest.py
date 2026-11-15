@@ -28,14 +28,8 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def hermetic_outcome_storage(tmp_path, monkeypatch):
-    """An enabled local pilot must never become an input to a test tick.
-
-    Outcome settings and intake use storage.data_dir(), whereas several older
-    worker fixtures redirect only their own module-level files. Isolate the
-    persistent data boundary for every test, including CLI subprocesses.
-    Narrower fixtures may override this path as usual.
-    """
+def hermetic_persistent_storage(tmp_path, monkeypatch):
+    """Keep persisted runtime data isolated, including CLI subprocesses."""
     monkeypatch.setenv("WATCHTOWER_DATA_DIR", str(tmp_path / "persistent-data"))
 
 
