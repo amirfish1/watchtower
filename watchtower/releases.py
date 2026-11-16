@@ -7,6 +7,8 @@ recorded patch in the ticket's repository; an unrelated deployment cannot wake i
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
 import re
 import subprocess
 import time
@@ -18,6 +20,7 @@ from . import config, queue as q, release_wait
 
 STATUS = "awaiting_release"
 RUNTIME_BUILD = ""  # set once by the daemon from its boot revision, never disk HEAD
+CCC_PORT_FILE = Path.home() / ".claude" / "command-center" / "port.txt"
 _SHA = re.compile(r"^[0-9a-fA-F]{7,40}$")
 _GITHUB = re.compile(r"^github:([\w.-]+/[\w.-]+):([^:\r\n]+)$")
 
@@ -155,7 +158,13 @@ def probe(target):
         if not states or states[0].get("state") != "success":
             return "", ""
         return str(dep.get("sha") or ""), f"GitHub deployment {repo}/{dep['id']} success ({env})"
-    url = "http://127.0.0.1:8090/api/version" if target == "ccc:dashboard" else target
+    url = target
+    if target == "ccc:dashboard":
+        base = os.environ.get("CCC_SERVER", "").strip() or CCC_PORT_FILE.read_text().strip()
+        if base.isdigit():
+            base = f"http://127.0.0.1:{base}"
+        validate_target(base)
+        url = base.rstrip("/") + "/api/version"
     with urllib.request.urlopen(url, timeout=5) as response:
         report = json.load(response)
     return str(report.get("code_rev") or report.get("sha") or ""), f"running build from {url}"

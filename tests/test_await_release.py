@@ -242,7 +242,7 @@ def test_github_wait_is_fenced_from_older_readers(env, repo):
     assert item["run_requested"]
 
 
-def test_daemon_version_endpoint_reports_frozen_boot_build(env, monkeypatch):
+def test_daemon_version_endpoint_reports_frozen_boot_build(env, monkeypatch, tmp_path):
     import json
     import threading
     import urllib.request
@@ -255,6 +255,12 @@ def test_daemon_version_endpoint_reports_frozen_boot_build(env, monkeypatch):
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{httpd.server_port}/api/version") as res:
             assert json.load(res)["code_rev"] == "a" * 40
+        # CCC may publish a port different from 8090, which another app owns.
+        monkeypatch.delenv("CCC_SERVER", raising=False)
+        port_file = tmp_path / "ccc-port.txt"
+        port_file.write_text(f"http://127.0.0.1:{httpd.server_port}")
+        monkeypatch.setattr(r, "CCC_PORT_FILE", port_file)
+        assert r.probe("ccc:dashboard")[0] == "a" * 40
     finally:
         httpd.shutdown()
         httpd.server_close()

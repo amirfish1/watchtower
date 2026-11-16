@@ -18,7 +18,8 @@ The daemon coalesces reads by target, at most once per minute, and compares the
 observed SHA against the recorded patch. It refreshes remote refs first and
 fetches a new deployment SHA if necessary. This reads release evidence; it
 never deploys, promotes, or restarts a service. Service adoption uses a frozen
-process revision, not the moving source checkout: CCC `/api/version` `code_rev`,
+process revision, not the moving source checkout: CCC `/api/version` `code_rev`
+(discovered through `CCC_SERVER` or its published `port.txt`, not a fixed port),
 WatchTower daemon boot revision (also exposed at its `/api/version`), or an
 explicit HTTP JSON build endpoint. An explicit `release-observe` report supports
 other service reporters. CCC dashboard and execution-worker adoption are separate;
