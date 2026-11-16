@@ -382,6 +382,7 @@ def queue_status(
         "in_progress": len(in_progress),
         "in_review": sum(1 for it in items if it.get("status") == "in_review"),
         "awaiting_answer": sum(1 for it in items if it.get("status") == "awaiting_answer"),
+        "awaiting_release": sum(1 for it in items if it.get("status") == "awaiting_release"),
         "closed": len(closed),
         "oldest_open_age_s": oldest_open_age,
         "oldest_open_age": _fmt_age(oldest_open_age),

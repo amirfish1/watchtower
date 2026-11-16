@@ -1338,9 +1338,14 @@ def _defer_live(until: Any) -> bool:
 # knows ``pipeline_hold`` reads the human defer it saved instead and lets the
 # sidecar overlay decide the hold.
 PIPELINE_HOLD_UNTIL = "2099-12-31T00:00:00Z"
+# Wire fence for readers predating WT-82. Current readers use the distinct
+# release state, with no expiry; older readers must never claim these issues.
+RELEASE_COMPAT_HOLD = "9999-12-31T00:00:00Z"
 
 
 def _effective_defer(meta: Dict[str, Any]) -> str:
+    if meta.get("release_wait") and meta.get("deferred_until") == RELEASE_COMPAT_HOLD:
+        return ""
     until = str(meta.get("deferred_until") or "")
     hold = meta.get("pipeline_hold")
     if isinstance(hold, dict) and until == PIPELINE_HOLD_UNTIL:
@@ -2418,6 +2423,8 @@ class GitHubIssuesBackend:
         number = int(issue.get("number") or 0)
         if state == "CLOSED":
             status = "closed"
+        elif meta.get("release_wait"):
+            status = "awaiting_release"
         elif queue_member and (meta.get("claimed_by") or self.in_progress_label in labels):
             status = "in_progress"
         else:
@@ -2561,6 +2568,10 @@ class GitHubIssuesBackend:
                 item["defer_reason"] = str(meta["pipeline_hold"].get("prev_reason") or "")
         if isinstance(meta.get("pipeline_hold"), dict):
             item["pipeline_hold"] = dict(meta["pipeline_hold"])
+        if isinstance(meta.get("release_wait"), dict):
+            item["release_wait"] = dict(meta["release_wait"])
+        if isinstance(meta.get("release_event"), dict):
+            item["release_event"] = dict(meta["release_event"])
         if isinstance(meta.get("wait"), dict):
             item["wait"] = dict(meta["wait"])
         if meta.get("duplicate_of"):
@@ -3641,6 +3652,8 @@ class GitHubIssuesBackend:
         expect_owner: str = "",
         require_status: Optional[str] = None,
         expect: Optional[Dict[str, Any]] = None,
+        release_expect: Optional[Dict[str, Any]] = None,
+        extras: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if status not in ("open", "in_progress", "closed"):
             raise ValueError("status must be one of ('open', 'in_progress', 'closed')")
@@ -3659,6 +3672,13 @@ class GitHubIssuesBackend:
         # closed ticket and the worker had to close it twice).
         if require_status is not None and item.get("status") != require_status:
             return None
+        if release_expect is not None and (item.get("status") != "awaiting_release"
+                or item.get("release_wait") != release_expect):
+            return None
+        if release_expect is not None and status == "closed":
+            from . import queue as _q
+            if _q.effective_gates(item):
+                return None
         # WT-39: the claim identity the caller decided on (the orphan sweep's
         # dead local worker) must still be the one on the fresh read, else a
         # live claim taken since -- possibly on another host -- is cleared.
@@ -3690,6 +3710,12 @@ class GitHubIssuesBackend:
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
 
+        meta.pop("release_wait", None)
+        if meta.get("deferred_until") == RELEASE_COMPAT_HOLD:
+            meta.pop("deferred_until", None)
+            meta.pop("defer_reason", None)
+        if extras and extras.get("release_event"):
+            meta["release_event"] = extras["release_event"]
         if status == "open":
             for key in (
                 "claimed_by", "claimed_machine", "claimed_at",
@@ -3704,7 +3730,13 @@ class GitHubIssuesBackend:
             ):
                 meta.pop(key, None)
             self._usage_history(meta, number, "reopen", reason=reason)
-            self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
+            release_labels = (["--add-label", self.run_requested_label]
+                              if release_expect is not None and (extras or {}).get("run_requested") else [])
+            self._edit_body(item, body, meta, "--remove-label", self.in_progress_label, *release_labels)
+            if release_expect is not None:
+                fresh = self.get(ident)
+                if (fresh or {}).get("release_wait") or (fresh or {}).get("release_event") != (extras or {}).get("release_event"):
+                    return None
             self._run(["issue", "reopen", number, *self._repo_args()], check=False)
             return self.get(ident)
 
@@ -3760,6 +3792,10 @@ class GitHubIssuesBackend:
                          worker=str(session_id or meta.get("closed_by") or ""),
                          resolution=norm)
         self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
+        if release_expect is not None:
+            fresh = self.get(ident)
+            if (fresh or {}).get("release_wait") or (fresh or {}).get("release_event") != (extras or {}).get("release_event"):
+                return None
         # `gh issue close --comment` takes the text on argv only (no file or
         # stdin form), and a resolution with long caveats can pass the
         # per-argument limit (WT-40). So we make gh's own steps ourselves:
@@ -3870,6 +3906,26 @@ class GitHubIssuesBackend:
             text=detail,
         )
         self._edit_body(item, body, meta)
+        return self.get(ident)
+
+    @_serialized_body_write
+    def await_release(self, ident, *, session_id, wait, progress="", expected_defer=None):
+        from . import releases
+        item = self.get(ident)
+        if item is None:
+            return None
+        releases.require_parkable(item, session_id, expected_defer)
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        if progress:
+            _append_history(meta, "progress", worker=session_id, text=_clip(progress, 24000))
+        for key in (*_CLAIM_META_KEYS, "deferred_until", "defer_reason"):
+            meta.pop(key, None)
+        meta["release_wait"] = dict(wait)
+        meta["deferred_until"] = RELEASE_COMPAT_HOLD
+        meta["defer_reason"] = "Release wait compatibility fence; only a verified build event resumes it"
+        self._usage_history(meta, str(item["number"]), "await_release", worker=session_id,
+                            release_wait=dict(wait))
+        self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
         return self.get(ident)
 
     @_serialized_body_write

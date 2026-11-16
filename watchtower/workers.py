@@ -451,8 +451,10 @@ INTEGRATION_CONTRACT = (
     "releases are cut from: `git fetch` then `git merge-base --is-ancestor "
     "SHA origin/BRANCH`. Never switch the branch of a shared checkout to get "
     "there; use your own worktree off the fresh release branch. To park a "
-    "merged fix until it ships: `wt defer --awaits release --commit SHA "
-    "--release-branch origin/BRANCH` (WatchTower checks it). If the fix is "
+    "merged fix until it ships: `wt await-release REF --commit SHA "
+    "--release-branch origin/BRANCH --target TARGET --reason REASON --live-check` "
+    "(untimed; WatchTower verifies integration and observes deployment/adoption). "
+    "See worker-runbook.md for targets. If the fix is "
     "not on that branch, say so: `wt defer --awaits integration "
     "--integration-owner WHO --integration-path HOW`, and if nobody owns "
     "landing it, `wt block --wait-on worker` naming the coordinator instead. "
@@ -7182,6 +7184,13 @@ def _reconcile_once_locked(dry_run: bool = False,
                 expire_parked_retention()
             except Exception:
                 pass
+        if not dry_run:
+            try:
+                from . import releases as _releases
+                result["releases_observed"] = _releases.reconcile()
+            except Exception as exc:
+                from .queue import _log
+                _log("RELEASE_OBSERVER_ERROR", str(exc)[:200])
         # Single supervisor (WT-24): only a real auto-spawn daemon supervises stage
         # sessions -- never a --dry-run or spawn-less one.
         if supervise_stages and not dry_run:

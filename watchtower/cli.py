@@ -3505,6 +3505,43 @@ def cmd_owner_view(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_await_release(args: argparse.Namespace) -> int:
+    from . import releases, config
+    try:
+        item = q.get(args.ref)
+        if not item:
+            raise ValueError(f"no item {args.ref}")
+        repo = args.repo or item.get("repo_path") or config.repo_path(item.get("project", "")) or os.getcwd()
+        result = releases.park(args.ref, args.worker or _default_worker_id(), repo=repo,
+                               commit=args.commit, branch=args.release_branch, target=args.target,
+                               reason=args.reason, summary=args.summary, verified=args.verified,
+                               live_check=not args.close_on_release, progress=args.progress)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2) if args.json else
+          f"AWAITING RELEASE: {_display_ref(result)} → {args.target} (no timer wake)")
+    return 0
+
+
+def cmd_release_observe(args: argparse.Namespace) -> int:
+    from . import releases
+    try:
+        result = releases.observe(args.target, args.build, evidence=args.evidence)
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_release_migrate(args: argparse.Namespace) -> int:
+    from . import releases
+    print(json.dumps(releases.migrate(project=args.queue, apply=args.apply,
+                                      repo_override=args.repo, target_override=args.target), indent=2))
+    return 0
+
+
 def cmd_defer(args: argparse.Namespace) -> int:
     """Wait for data, not for a human: the ticket leaves your claim and the
     claim pool until --until, then any worker resumes it from your progress
@@ -3527,6 +3564,16 @@ def cmd_defer(args: argparse.Namespace) -> int:
                 branch=getattr(args, "release_branch", ""),
                 owner=getattr(args, "integration_owner", ""),
                 path=getattr(args, "integration_path", ""))
+            if awaits == "release":
+                from . import releases
+                target = getattr(args, "target", "") or releases.migration_target(repo)
+                if target:
+                    item = releases.park(args.ref, args.worker or _default_worker_id(),
+                                         repo=repo, commit=args.commit, branch=args.release_branch,
+                                         target=target, reason=args.reason, progress=args.progress)
+                    print(json.dumps(item, indent=2) if args.json else
+                          f"AWAITING RELEASE: {_display_ref(item)} → {target} (no timer wake)")
+                    return 0
             reason = f"{claim['tag']} {reason}".strip()
         item = q.defer(args.ref, args.worker or _default_worker_id(), args.until,
                        reason, progress=args.progress)
@@ -6223,6 +6270,8 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     # Read before anything can move the tree, so "what this process imported"
     # is compared with "what is installed" on every deploy tick below.
     boot_head, boot_held = _boot_head(), ""
+    from . import releases
+    releases.RUNTIME_BUILD = boot_head
     _maybe_self_update()  # pick up reconciler fixes on every (re)start; re-execs if HEAD moved
     last_self_update_check = time.time()
     last_deploy_sync = 0.0
@@ -7559,7 +7608,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--status",
         default=None,
         choices=["active", "open", "in_progress", "in_review", "awaiting_answer",
-                 "blocked", "closed", "unresolved", "all"],
+                 "awaiting_release", "blocked", "closed", "unresolved", "all"],
         help="which tickets to show (default: active, or all when a window "
              "selector is given; active = open + in_progress + in_review + "
              "awaiting_answer; "
@@ -8220,6 +8269,36 @@ def build_parser() -> argparse.ArgumentParser:
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_wait_on)
 
+    s = sub.add_parser("await-release", help="park merged code until a release/adoption event; no timer")
+    s.add_argument("ref")
+    s.add_argument("--worker", default="")
+    s.add_argument("--commit", required=True)
+    s.add_argument("--release-branch", required=True)
+    s.add_argument("--target", required=True, help="github:OWNER/REPO:ENV, ccc:dashboard, watchtower:local, or build JSON URL")
+    s.add_argument("--repo", default="")
+    s.add_argument("--reason", required=True)
+    s.add_argument("--progress", default="")
+    mode = s.add_mutually_exclusive_group()
+    mode.add_argument("--live-check", action="store_true", help="default: one worker checks after adoption")
+    mode.add_argument("--close-on-release", action="store_true", help="acceptance already proven; needs summary and verified evidence")
+    s.add_argument("--summary", default="")
+    s.add_argument("--verified", default="", help="pre-release acceptance evidence (automatic close only)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_await_release)
+
+    s = sub.add_parser("release-observe", help="report a successful deployment or running-service build")
+    s.add_argument("--target", required=True)
+    s.add_argument("--build", required=True)
+    s.add_argument("--evidence", required=True)
+    s.set_defaults(func=cmd_release_observe)
+
+    s = sub.add_parser("release-migrate", help="preview/migrate verified typed release defers; never integration/data holds")
+    s.add_argument("-q", "--queue", default=None)
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--repo", default="", help="explicit repository for pathless legacy waits")
+    s.add_argument("--target", default="", help="explicit release target for ambiguous legacy waits")
+    s.set_defaults(func=cmd_release_migrate)
+
     s = sub.add_parser("owner-view", help=COMMAND_HELP.get("owner-view", ""))
     s.add_argument("-q", "--queue", default=None, help="one queue (default: all)")
     s.add_argument("--json", action="store_true")
@@ -8241,6 +8320,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "the fix is not on it yet (needs --integration-owner and "
                         "--integration-path). data (default): a data window or source-only hold")
     s.add_argument("--commit", default="", help="the fix commit (with --awaits release|integration)")
+    s.add_argument("--target", default="", help="release/adoption target; redirects --awaits release to an untimed wait")
     s.add_argument("--release-branch", default="", dest="release_branch",
                    help="the branch releases are cut from, e.g. origin/next (with --awaits release)")
     s.add_argument("--integration-owner", default="", dest="integration_owner",

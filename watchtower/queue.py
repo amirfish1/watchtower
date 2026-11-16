@@ -114,7 +114,7 @@ try:  # POSIX cross-process locking; degrade gracefully if unavailable.
 except Exception:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore
 
-VALID_STATUSES = ("open", "in_progress", "in_review", "awaiting_answer", "closed")
+VALID_STATUSES = ("open", "in_progress", "in_review", "awaiting_answer", "awaiting_release", "closed")
 # WT-28: a worker-blocked ticket on the local store leaves the worker's claim and waits
 # as ``awaiting_answer`` with a ``parked`` record (who to route the answer to).
 PARKED_STATUS = "awaiting_answer"
@@ -2429,7 +2429,9 @@ def queues() -> Dict[str, Dict[str, int]]:
             proj, {"open": 0, "in_progress": 0, "closed": 0, "total": 0}
         )
         st = it.get("status", "open")
-        if st in row:
+        if st == "awaiting_release":
+            row[st] = row.get(st, 0) + 1
+        elif st in row:
             row[st] += 1
         row["total"] += 1
     return out
@@ -3520,6 +3522,7 @@ def update_status(
     group_force: bool = False,
     expect: Optional[Dict[str, Any]] = None,
     close_contract: Optional[Dict[str, Any]] = None,
+    release_expect: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """``close_contract``: a ``conditional_closes`` request for a close. Store
     identity, the observed question and the idempotency key are checked under
@@ -3609,6 +3612,7 @@ def update_status(
             expect_owner=expect_owner,
             require_status=require_status,
             expect=expect,
+            **({"release_expect": release_expect, "extras": extras} if release_expect is not None else {}),
         )
         if item:
             verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
@@ -3642,6 +3646,13 @@ def update_status(
                     return None
                 if expect is not None and not claim_expect_holds(it, expect):
                     return None
+                if release_expect is not None and (it.get("status") != "awaiting_release"
+                        or it.get("release_wait") != release_expect):
+                    return None
+                if release_expect is not None and status == "closed" and effective_gates(it):
+                    return None
+                if status in ("open", "closed"):
+                    it.pop("release_wait", None)
                 # Ownership guard for close (see expect_owner docstring). Runs
                 # inside the lock against the fresh item, so it's race-free with
                 # a concurrent close by the fresh worker that re-drained the
@@ -9639,6 +9650,48 @@ def defer(ident: Any, session_id: str, until: Any, reason: str,
                 _note_worker_ticket_done(session_id)
             return it
     return None
+
+
+def await_release(ident: Any, session_id: str, wait: Dict[str, Any],
+                  progress: str = "", expected_defer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Release a delivery claim into a persistent, untimed release wait.
+
+    The caller validates branch/target before entering. Migration fences the
+    original defer reason so a stale scan cannot park newly resumed work.
+    """
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        item = backend.await_release(ident, session_id=session_id, wait=wait,
+                                     progress=progress, expected_defer=expected_defer)
+    else:
+        item = None
+        with _FileLock(_lock_path()):
+            data = _load_unlocked()
+            for it in data["items"]:
+                if not _matches(it, ident):
+                    continue
+                from . import releases
+                releases.require_parkable(it, session_id, expected_defer)
+                now = _now_iso()
+                actor = _by("worker", session_id)
+                if progress:
+                    _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
+                if it.get("status") == "in_progress":
+                    _release_claim_to_open_unlocked(it, now, "awaiting release")
+                _reopen_pending_unlocked(it, now, "handoff", "awaiting release")
+                for key in ("deferred_until", "defer_reason", "claimed_by", "claimed_at",
+                            "claimed_machine", "claim_proc", "claim_heartbeat", "resume"):
+                    it.pop(key, None)
+                it.update(status="awaiting_release", release_wait=dict(wait), updated_at=now)
+                _append_history(it, "await_release", by=actor, at=now, release_wait=dict(wait))
+                _save_unlocked(data)
+                item = it
+                break
+    if item:
+        _note_worker_ticket_done(session_id)
+        _log("AWAIT_RELEASE", f"{item['ref']} {wait['commit'][:12]} -> {wait['target']}",
+             queue=item.get("project", ""))
+    return item
 
 
 def _require_rationale_block(it: Dict[str, Any], ident: Any) -> None:

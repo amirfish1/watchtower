@@ -1668,6 +1668,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._json(200 if item else 404, item if item else {"error": "not found"})
             except Exception as exc:
                 self._json(503, {"error": str(exc)})
+        elif path == "/api/version":
+            from . import releases
+            self._json(200, {"code_rev": releases.RUNTIME_BUILD, "pid": os.getpid()})
         elif path == "/api/status":
             self._json(200, cached_status_payload())
         elif path == "/api/queues":

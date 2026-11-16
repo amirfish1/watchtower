@@ -217,7 +217,11 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
     stuck = [dep_line(r) for r in shown if r.get("dependency", {}).get("state") == "stuck"]
     unresolved = [dep_line(r) for r in shown
                   if r.get("dependency", {}).get("state") in ("not_found_here", "other_host", "no_ref")]
+    from . import releases
+    release_rows = releases.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want], now=now)
     return {
+        "awaiting_release": release_rows,
+        "release_attention": [r for r in release_rows if r["attention"]],
         "generated_at": now.isoformat(timespec="seconds"),
         "queue": want or "",
         "counts": {k: sum(1 for r in shown if r["wait"] == k) for k in KINDS},
@@ -274,6 +278,10 @@ def render(view: Dict[str, Any]) -> str:
              + (f" in {view['queue']}" if view["queue"] else "")
              + f"  (owner {c['owner']}, unclassified {c['unclassified']}, dependency "
                f"{c['dependency']}, external {c['external']}, worker {c['worker']})"]
+    release_rows = view.get("awaiting_release") or []
+    lines.append(f"Awaiting release: {len(release_rows)} (separate from deferred; no timer wake)")
+    for row in view.get("release_attention") or []:
+        lines.append(f"  CHECK RELEASE: {row['ref']} {row['age_days']} days; {row['target']}; branch {row['branch_state']}")
     for w in view.get("warnings") or []:
         lines.append(f"WARNING: {w}")
     if view["recheck_due"]:
