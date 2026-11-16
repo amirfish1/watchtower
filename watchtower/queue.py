@@ -785,8 +785,14 @@ def _ensure_time_index_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS window_dirty (number INTEGER PRIMARY KEY)")
     for action in ("INSERT", "UPDATE OF item_json"):
         name = "window_insert" if action == "INSERT" else "window_update"
+        # Plain INSERT OR IGNORE here is overridden by the outer UPSERT's conflict
+        # mode and aborts when the row is already dirty; guard with NOT EXISTS.
+        if _meta_get(conn, "window_trigger_version") != "2":
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
         conn.execute(f"CREATE TRIGGER IF NOT EXISTS {name} AFTER {action} ON items BEGIN "
-                     "INSERT OR IGNORE INTO window_dirty VALUES (NEW.number); END")
+                     "INSERT INTO window_dirty SELECT NEW.number WHERE NOT EXISTS "
+                     "(SELECT 1 FROM window_dirty WHERE number=NEW.number); END")
+    conn.execute(_META_UPSERT, ("window_trigger_version", "2"))
     conn.execute("CREATE TRIGGER IF NOT EXISTS window_delete AFTER DELETE ON items BEGIN "
                  "DELETE FROM item_events WHERE number=OLD.number; "
                  "DELETE FROM window_dirty WHERE number=OLD.number; END")
