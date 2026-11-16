@@ -5,6 +5,10 @@ description: Use when a session's context is filling up, before running /compact
 
 # Compact to queue
 
+Use named ticket refs in prose (`WT-79:add-ticket-subscribe`); JSON keeps the
+bare `ref` and separate `slug`. Commands accept bare refs and stale names.
+
+
 A compaction summary is lossy memory; a queue ticket is durable state. When a
 long session is about to compact — or is ending with work still open — file
 the *remaining* work as WatchTower tickets so any future session (human,

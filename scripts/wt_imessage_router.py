@@ -43,7 +43,7 @@ LOG_PATH = os.path.expanduser("~/.local/log/wt-imessage-router.log")
 # Machine-local path of the owner-notification pre-send check; never a literal here.
 PRESEND_CHECK = os.environ.get("WT_IMESSAGE_PRESEND_CHECK", "")
 HOLD_RETRY_S = 900
-REF_RE = re.compile(r"^\s*\[?([A-Za-z][A-Za-z0-9_-]*-\d+)\]?(?![\w-])[\s:,-]*(.*)$", re.S)
+REF_RE = re.compile(r"^\s*\[?([A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z][A-Za-z0-9_]*)*-\d+)(?::[A-Za-z0-9_-]+|-[A-Za-z0-9_-]+)?\]?(?![\w-])[\s:,-]*(.*)$", re.S)
 TICKET_RE = re.compile(r"^\s*ticket\s*:\s*(.+)$", re.I | re.S)
 
 health = {"started": time.time(), "last_poll": None, "last_error": None,

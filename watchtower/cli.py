@@ -59,6 +59,18 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import __version__
 from . import sender_envelope as envelope
 from . import answers, deep, health, queue as q, resume_verify, stages, workers
+from .refs import canonical_ref, display_ref
+
+
+def _display_ref(value: Any) -> str:
+    """Render a ticket at a text boundary; JSON and internal keys stay bare."""
+    if isinstance(value, dict):
+        return display_ref(value)
+    try:
+        item = q.get(canonical_ref(value))
+    except Exception:
+        item = None
+    return display_ref(item) if item else str(value)
 
 DAEMON_PID_FILE = Path(
     os.environ.get("WATCHTOWER_DAEMON_PID")
@@ -170,7 +182,7 @@ def _print_status(rows: List[dict]) -> None:
         ref = w.get("active_ref")
         if ref:
             since = w.get("active_since_human")
-            activity = f"-> {ref}" + (f" ({since})" if since else "")
+            activity = f"-> {_display_ref(ref)}" + (f" ({since})" if since else "")
         elif w.get("last_closed_ref"):
             activity = f"idle (last: {w['last_closed_ref']})"
         else:
@@ -418,9 +430,9 @@ def _waiting_note(item: dict, by_ref: dict) -> str:
         return ""
     state, ref = q.blocker_verdict(item, by_ref)
     if state == "waiting":
-        return f"waiting on {ref}"
+        return f"waiting on {_display_ref(ref)}"
     if state == "stuck":
-        return f"blocked: {ref} declined/unresolved"
+        return f"blocked: {_display_ref(ref)} declined/unresolved"
     return ""
 
 
@@ -445,7 +457,7 @@ def cmd_queue_archive(args: argparse.Namespace) -> int:
         else:
             print(f"{name}: refusing to archive, {len(live)} unclosed ticket(s):", file=sys.stderr)
             for it in live:
-                print(f"  {it.get('ref')}  [{it.get('status')}]  {it.get('title', '')}", file=sys.stderr)
+                print(f"  {_display_ref(it)}  [{it.get('status')}]  {it.get('title', '')}", file=sys.stderr)
             print("close/move them first, or pass --force", file=sys.stderr)
         return 1
     # A drain-on queue is staffed on purpose: it may be an automation target
@@ -639,7 +651,7 @@ def cmd_ls(args: argparse.Namespace) -> int:
             it.get("claimed_by") or it.get("claimed_session_id"), machine
         )[:20]
         title = _oneline(it.get("title") or it.get("note") or "")[:56]
-        line = f"{str(it.get('ref','')):<14}{str(it.get('status','')):<12}{worker:<22}{title}"
+        line = f"{_display_ref(it):<14}  {str(it.get('status','')):<12}{worker:<22}{title}"
         waiting = _waiting_note(it, by_ref)
         if waiting:
             line += f"  [{waiting}]"
@@ -714,7 +726,7 @@ def cmd_unresolved(args: argparse.Namespace) -> int:
         n, n_acked = _ack_counts(it)
         title = _oneline(it.get("title") or it.get("note") or "")[:56]
         mark = f" [{n} unresolved{f', {n_acked} acked' if n_acked else ''}]"
-        print(f"{str(it.get('ref','')):<14}{title}{mark}")
+        print(f"{_display_ref(it):<14}  {title}{mark}")
         res = it.get("resolution") if isinstance(it.get("resolution"), dict) else {}
         summary = _oneline(str(res.get("summary") or ""))
         if summary:
@@ -755,7 +767,7 @@ def cmd_find(args: argparse.Namespace) -> int:
     resolve it without knowing which queue it lives in."""
     item = q.get(args.ref)
     if not item:
-        print(f"not found: {args.ref}", file=sys.stderr)
+        print(f"not found: {_display_ref(args.ref)}", file=sys.stderr)
         return 1
     caller_worker, caller_session = _caller_identity(args)
     item_with_timeline = _mark_self(
@@ -774,7 +786,7 @@ def cmd_find(args: argparse.Namespace) -> int:
         item.get("claimed_machine"),
     )
     title = _oneline(item.get("title") or item.get("note") or "")
-    print(f"{item.get('ref',''):<14}[{item.get('status',''):<11}] {title}")
+    print(f"{_display_ref(item):<14}  [{item.get('status',''):<11}] {title}")
     filer = str(item.get("submitter") or item.get("github_author") or "")
     if filer:
         from . import messages
@@ -788,7 +800,7 @@ def cmd_find(args: argparse.Namespace) -> int:
         g = item.get("group") or {}
         print(f"  group: parent of {', '.join(q.group_children(item)) or '(none)'} "
               f"({'sealed' if g.get('sealed') else 'unsealed'}, membership v{q.group_mv(item)}, "
-              f"integration {q.group_integration_state(item)}); `wt group show {item.get('ref')}`")
+              f"integration {q.group_integration_state(item)}); `wt group show {_display_ref(item)}`")
     elif q.group_role(item) == "child":
         print(f"  group: {(item.get('group') or {}).get('kind', 'member')} of "
               f"{q.group_parent_ref(item)}")
@@ -871,12 +883,12 @@ def _warn_floor_above_queue(items: List[Dict[str, Any]]) -> None:
                 how = f"no installed engine serves {floor}, so it stays open"
             elif not config.auto_drain(queue) and not it.get("run_requested"):
                 how = (f"a one-off {floor} worker is spawned for it once you run "
-                       f"`wt ready {it.get('ref')}` (auto-drain is off)")
+                       f"`wt ready {_display_ref(it)}` (auto-drain is off)")
             else:
                 how = f"the reconciler spawns a one-off {floor} worker for it"
         except Exception:
             continue  # a hint, never a reason to fail the command
-        print(f"warning: {it.get('ref')} needs {floor} but queue {queue} runs "
+        print(f"warning: {_display_ref(it)} needs {floor} but queue {queue} runs "
               f"{qmodel}; its workers won't claim it -- {how}", file=sys.stderr)
 
 
@@ -901,7 +913,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
         return 1
     fields = {}
     for name in (
-        "title", "note", "text", "url", "type", "readiness", "priority",
+        "title", "slug", "note", "text", "url", "type", "readiness", "priority",
         "value", "confidence", "model_floor", "planner_model", "verifier_model",
         "selector", "screenshot_path", "repo_path", "accept", "placement",
         "depth", "budget_min", "client_id",
@@ -934,7 +946,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if not fields and new_queue is None:
         print(
             "error: no fields to edit -- pass at least one of "
-            "--title/--note/--text/--url/--type/--readiness/--priority/"
+            "--title/--slug/--note/--text/--url/--type/--readiness/--priority/"
             "--value/--confidence/--model-floor/--selector/"
             "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates/--accept/"
             "--depth/--budget-min/--client-id/--subscribe/--no-subscribe",
@@ -965,8 +977,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
     if args.json:
         _print_item(item)
     else:
-        moved = f" (moved {old_ref} -> {item['ref']})" if old_ref else ""
-        print(f"EDITED: {item['ref']}{moved}  {item.get('title') or item.get('note','')}")
+        moved = f" (moved {_display_ref(old_ref)} -> {_display_ref(item)})" if old_ref else ""
+        print(f"EDITED: {_display_ref(item)}{moved}  {item.get('title') or item.get('note','')}")
     if "model_floor" in fields or new_queue is not None:
         _warn_floor_above_queue([item])
     return 0
@@ -1053,22 +1065,22 @@ def _cmd_add(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     args._created_ref = item["ref"]
-    print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}"
+    print(f"FILED: {_display_ref(item)}  {item.get('title') or item.get('note','')}"
           + (f"  [deep, {item.get('budget_min')}m budget]" if q.is_deep(item) else ""))
     print("  you'll be notified" if getattr(args, "subscribe", False) else
-          f"  no updates to you; run wt subscribe {item['ref']} to hear back")
+          f"  no updates to you; run wt subscribe {_display_ref(item)} to hear back")
     if not getattr(args, "claim", False):
         _warn_floor_above_queue([item])
     if q.group_role(item) == "parent":
         g = item.get("group") or {}
         members = ", ".join(g.get("members") or []) or "none yet"
-        print(f"GROUP: {item['ref']} members [{members}] "
+        print(f"GROUP: {_display_ref(item)} members [{members}] "
               + ("sealed; the group plan starts now" if g.get("sealed") else
-                 f"unsealed; `wt group attach {item['ref']} REF...` then "
-                 f"`wt group seal {item['ref']}`"))
+                 f"unsealed; `wt group attach {_display_ref(item)} REF...` then "
+                 f"`wt group seal {_display_ref(item)}`"))
         return 0   # a parent is never claimed or dispatched
     if q.group_role(item) == "child":
-        print(f"GROUP: {item['ref']} is a member of {q.group_parent_ref(item)}; claimable "
+        print(f"GROUP: {_display_ref(item)} is a member of {q.group_parent_ref(item)}; claimable "
               f"once the group plan is accepted")
     # Enqueue-and-claim: file the ticket, then immediately mark it in_progress so
     # the reconciler (which only spawns for OPEN tickets) leaves it alone. For the
@@ -1079,10 +1091,10 @@ def _cmd_add(args: argparse.Namespace) -> int:
         worker = args.worker or _default_worker_id()
         try:
             q.claim_by_ref(item["ref"], worker)
-            print(f"CLAIMED: {item['ref']} -> {worker}")
+            print(f"CLAIMED: {_display_ref(item)} -> {worker}")
         except Exception as e:
             # Enqueue already succeeded; a claim hiccup shouldn't fail the file.
-            print(f"[watchtower] could not claim {item['ref']}: {e}", file=sys.stderr)
+            print(f"[watchtower] could not claim {_display_ref(item)}: {e}", file=sys.stderr)
         return 0
     # Equivalent to filing then `wt run`: record the per-ticket request before
     # dispatch so grace/auto-drain policy cannot hold this submission back.
@@ -1090,15 +1102,15 @@ def _cmd_add(args: argparse.Namespace) -> int:
         try:
             runnable = q.mark_runnable(item["ref"])
         except Exception as e:
-            print(f"error: filed {item['ref']}, but could not request its run: {e}",
+            print(f"error: filed {_display_ref(item)}, but could not request its run: {e}",
                   file=sys.stderr)
             return 1
         if runnable is None:
-            print(f"error: filed {item['ref']}, but could not request its run: ticket not found",
+            print(f"error: filed {_display_ref(item)}, but could not request its run: ticket not found",
                   file=sys.stderr)
             return 1
         item = runnable
-        print(f"RUNNABLE: {item['ref']}  {item.get('title') or item.get('note', '')}")
+        print(f"RUNNABLE: {_display_ref(item)}  {item.get('title') or item.get('note', '')}")
     if getattr(args, "no_dispatch", False):
         # Scheduled batch filers leave staffing to the daemon's next pass;
         # synchronous per-ticket reconciliation can exhaust their job budget.
@@ -1175,7 +1187,7 @@ def cmd_import(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
                 return 1
-            dependency_lines.append(f"- {ref}: {title}")
+            dependency_lines.append(f"- {_display_ref(ref)}: {title}")
         ticket_body = candidate.body
         if dependency_lines:
             ticket_body += "\n\nDepends on:\n" + "\n".join(dependency_lines)
@@ -1202,7 +1214,7 @@ def cmd_import(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             return 1
-        print(f"FILED: {item['ref']}  {item.get('title') or item.get('note', '')}")
+        print(f"FILED: {_display_ref(item)}  {item.get('title') or item.get('note', '')}")
         refs_by_title[candidate.title] = str(item["ref"])
         created += 1
     print(
@@ -1254,7 +1266,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
         if not item:
-            print(f"error: {ref} not found", file=sys.stderr)
+            print(f"error: {_display_ref(ref)} not found", file=sys.stderr)
             return 1
     else:
         try:
@@ -1336,7 +1348,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
             reason=f"placement {item.get('placement')} not runnable on {q.machine_placement()}",
         )
         print(
-            f"error: {item['ref']} is placement={item.get('placement')!r}; this machine is "
+            f"error: {_display_ref(item)} is placement={item.get('placement')!r}; this machine is "
             f"{q.machine_placement()!r} -- released back to open "
             "(`wt edit REF --placement any` to allow it here)",
             file=sys.stderr,
@@ -1353,7 +1365,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
                 reason=f"model floor {model_floor} not met by {my_model or '(unset)'}",
             )
             print(
-                f"error: {item['ref']} requires model floor {model_floor!r}; "
+                f"error: {_display_ref(item)} requires model floor {model_floor!r}; "
                 f"this worker runs {my_model or '(unset)'!r} — released back to "
                 "open for a floor-model worker",
                 file=sys.stderr,
@@ -1390,16 +1402,16 @@ def cmd_claim(args: argparse.Namespace) -> int:
         fb = _sent_back_view(item)
         if item.get("handed_back"):
             age = q._age_min((item.get("sent_back") or {}).get("at"))
-            print(f"HANDED BACK: {item['ref']} -> {worker} (sent back {age}m ago; "
+            print(f"HANDED BACK: {_display_ref(item)} -> {worker} (sent back {age}m ago; "
                   "fix this before any new ticket)")
         else:
-            print(f"CLAIMED: {item['ref']} -> {worker}")
+            print(f"CLAIMED: {_display_ref(item)} -> {worker}")
         print(item.get("text") or item.get("note") or "")
         if fb:
             print(f"\nSENT BACK by {fb['by']} {fb['age']}m ago: {fb['reason']}")
             if item.get("handed_back") and fb.get("deadline"):
                 print(f"Released to the pool at {fb['deadline']} if you show no "
-                      f"progress (a `wt comment {item['ref']}` counts).")
+                      f"progress (a `wt comment {_display_ref(item)}` counts).")
             elif item.get("sent_back_released"):
                 print(f"(released from {fb['released_from']} for no progress)")
         if item.get("gate_feedback") and str(item["gate_feedback"]) != (fb or {}).get("reason"):
@@ -1448,7 +1460,7 @@ def _group_plan_brief(item: dict) -> Tuple[str, str]:
         blocks.append(f"### {r}: {ch.get('title') or ch.get('note') or ''}\n"
                       f"{ch.get('text') or ch.get('note') or ''}"
                       + (f"\nACCEPT LINE: {ch['accept']}" if ch.get("accept") else ""))
-    tickets = (f"GROUP {ref}: {item.get('text') or item.get('note') or item.get('title') or ''}\n"
+    tickets = (f"GROUP {_display_ref(item)}: {item.get('text') or item.get('note') or item.get('title') or ''}\n"
                + (f"GROUP ACCEPT LINE: {item['accept']}\n" if item.get("accept") else "")
                + "\nMEMBER TICKETS:\n" + "\n\n".join(blocks))
     rules = (f"This is ONE plan for the whole group: start with `## Shared` (the "
@@ -1483,12 +1495,12 @@ def _group_plan_goal(item: dict, feedback: str = "") -> str:
                      f"Other sections may stay `{q.GROUP_PLAN_UNCHANGED}`.\n" if rejected else "")
                   + "Revise the plan to address that.\n")
     return (
-        f"You are the PLANNER for WatchTower plan group {ref} (membership v{q.group_mv(item)}). "
+        f"You are the PLANNER for WatchTower plan group {_display_ref(item)} (membership v{q.group_mv(item)}). "
         f"Do not write code or edit files. Read the tickets and the relevant code, then "
         f"write an implementation plan for the group: approach, files to change, risks, "
         f"the test list, and any open decisions you resolved (decide them yourself; "
         f"nobody will answer questions).\n\n{rules}\n\n{tickets}\n{revise}"
-        f"\nWhen done, file the plan (not to anyone else): `wt plan submit {ref}"
+        f"\nWhen done, file the plan (not to anyone else): `wt plan submit {_display_ref(item)}"
         f"{_mv_flag(item)} --file <path-to-plan.md>`. A refused submit names what is "
         f"missing; a SUPERSEDED one means the membership changed: stop."
     )
@@ -1500,7 +1512,7 @@ def _plan_goal(item: dict, feedback: str = "") -> str:
     ref = item["ref"]
     plan = item.get("plan") or {}
     return (
-        f"You are the PLANNER for WatchTower ticket {ref}. Do not write code or "
+        f"You are the PLANNER for WatchTower ticket {_display_ref(item)}. Do not write code or "
         f"edit files. Read the ticket and the relevant code, then write an "
         f"implementation plan: approach, files to change, risks, the test list, "
         f"and any open decisions you resolved (decide them yourself; nobody "
@@ -1511,8 +1523,8 @@ def _plan_goal(item: dict, feedback: str = "") -> str:
            f"{plan.get('text', '')}\n\nThe reviewer REJECTED it: {feedback}\n"
            f"Revise the plan to address that.\n" if feedback else "")
         + f"\nWhen done, file the plan (not to anyone else): "
-        f"`wt plan submit {ref} --file <path-to-plan.md>` or "
-        f"`wt plan submit {ref} --text \"...\"`."
+        f"`wt plan submit {_display_ref(item)} --file <path-to-plan.md>` or "
+        f"`wt plan submit {_display_ref(item)} --text \"...\"`."
     )
 
 
@@ -1523,15 +1535,15 @@ def _plan_review_goal(item: dict) -> str:
         tickets, rules = _group_plan_brief(item)
         mv = _mv_flag(item)
         return (
-            f"You are an independent PLAN REVIEWER for WatchTower plan group {ref} "
+            f"You are an independent PLAN REVIEWER for WatchTower plan group {_display_ref(item)} "
             f"(membership v{q.group_mv(item)}). You did not write the plan. Do not edit "
             f"files. Check the plan against every member ticket and the real code: is "
             f"the shared section a sound contract for all members, is each member's "
             f"section right and adequate (files, risks, tests, its accept line)?\n\n"
             f"{rules}\n\n{tickets}\n\nPLAN (round {plan.get('round', 1)}, "
             f"v{plan.get('version') or plan.get('round', 1)}):\n{q.render_plan(item)}\n\n"
-            f"File your verdict: `wt plan verdict {ref}{mv} --accept --reasons \"why it is "
-            f"sound\"` or `wt plan verdict {ref}{mv} --reject --section <REF> [--section "
+            f"File your verdict: `wt plan verdict {_display_ref(item)}{mv} --accept --reasons \"why it is "
+            f"sound\"` or `wt plan verdict {_display_ref(item)}{mv} --reject --section <REF> [--section "
             f"<REF>...] --reasons \"what must change\"` naming every member section that "
             f"must change (omit --section when the shared section is the problem). Reject "
             f"only for real defects; a different-but-workable approach is an accept."
@@ -1539,7 +1551,7 @@ def _plan_review_goal(item: dict) -> str:
     ref = item["ref"]
     plan = item.get("plan") or {}
     return (
-        f"You are an independent PLAN REVIEWER for WatchTower ticket {ref}. "
+        f"You are an independent PLAN REVIEWER for WatchTower ticket {_display_ref(item)}. "
         f"You did not write the plan. Do not edit files. Check the plan against "
         f"the ticket and the real code: is the approach sound, are the files "
         f"and risks right, is the test list adequate, does it satisfy the "
@@ -1547,8 +1559,8 @@ def _plan_review_goal(item: dict) -> str:
         f"{item.get('text') or item.get('note') or item.get('title') or ''}\n"
         + (f"\nACCEPT LINE: {item['accept']}\n" if item.get("accept") else "")
         + f"\nPLAN (round {plan.get('round', 1)}):\n{plan.get('text', '')}\n\n"
-        f"File your verdict on the ticket: `wt plan verdict {ref} --accept "
-        f"--reasons \"why it is sound\"` or `wt plan verdict {ref} --reject "
+        f"File your verdict on the ticket: `wt plan verdict {_display_ref(item)} --accept "
+        f"--reasons \"why it is sound\"` or `wt plan verdict {_display_ref(item)} --reject "
         f"--reasons \"what must change\"`. Reject only for real defects; a "
         f"different-but-workable approach is an accept."
     )
@@ -1560,7 +1572,7 @@ def _plan_supplement_review_goal(item: dict) -> str:
     plan = item.get("plan") or {}
     sup = q.plan_open_supplement(item) or {}
     return (
-        f"You are an independent PLAN REVIEWER for WatchTower ticket {ref}. Its plan "
+        f"You are an independent PLAN REVIEWER for WatchTower ticket {_display_ref(item)}. Its plan "
         f"v{plan.get('accepted_version') or plan.get('version')} is ALREADY ACCEPTED and "
         f"stays accepted; you review only supplement s{sup.get('n')} that "
         f"{sup.get('by') or 'a worker'} filed afterwards. You did not write it. Do not "
@@ -1570,7 +1582,7 @@ def _plan_supplement_review_goal(item: dict) -> str:
         + (f"\nACCEPT LINE: {item['accept']}\n" if item.get("accept") else "")
         + f"\nACCEPTED PLAN:\n{q.render_plan(item)}\n\n"
         f"SUPPLEMENT s{sup.get('n')} UNDER REVIEW:\n{sup.get('text', '')}\n\n"
-        f"File your verdict: `wt plan supplement verdict {ref} --n {sup.get('n')} --accept "
+        f"File your verdict: `wt plan supplement verdict {_display_ref(item)} --n {sup.get('n')} --accept "
         f"--reasons \"why it is sound\"` or `... --reject --reasons \"what is wrong\"`. "
         f"Your verdict never changes the accepted plan or the ticket's claim; an accepted "
         f"supplement is appended to the plan builders and verifiers read."
@@ -1676,7 +1688,7 @@ def _block_stalled_plan(ref: str, item: Optional[dict]) -> bool:
     q.block(ref, str(item.get("claimed_session_id") or ""), origin="plan_gate",
             question=(f"Plan discussion stalled: "
                       f"{item['plan'].get('discussion', {}).get('reason', '')}. "
-                      f"Decide with `wt plan decide {ref} --accept|--retry`."),
+                      f"Decide with `wt plan decide {_display_ref(ref)} --accept|--retry`."),
             progress=f"Plan v{item['plan'].get('version')}:\n"
                      f"{item['plan'].get('text', '')}")
     return True
@@ -1705,22 +1717,22 @@ def _plan_discussion_goal(item: dict, role: str) -> str:
     objections = f"\nREVIEWER OBJECTIONS:\n{disc.get('objections', '')}\n"
     if role == "planner":
         return (
-            f"You are the PLANNER for WatchTower ticket {ref}, in plan discussion round "
+            f"You are the PLANNER for WatchTower ticket {_display_ref(item)}, in plan discussion round "
             f"{disc.get('round')}. Your previous session has ended; this is a fresh turn. "
             f"Do not write code or edit files.\n{base}"
             f"\nPLAN v{version} (as reviewed):\n{plan.get('text', '')}\n{objections}{transcript}"
             f"\nFix the objections rather than rewriting the plan wholesale. If you "
-            f"disagree with one, say so: `wt plan discuss {ref}{mv} --from planner --text \"...\"`. "
-            f"Then file the amended plan: `wt plan submit {ref}{mv} --file <path-to-plan.md>`."
+            f"disagree with one, say so: `wt plan discuss {_display_ref(item)}{mv} --from planner --text \"...\"`. "
+            f"Then file the amended plan: `wt plan submit {_display_ref(item)}{mv} --file <path-to-plan.md>`."
         )
     return (
-        f"You are the independent PLAN REVIEWER for WatchTower ticket {ref}. You reviewed "
+        f"You are the independent PLAN REVIEWER for WatchTower ticket {_display_ref(item)}. You reviewed "
         f"an earlier version and rejected it; the planner has filed an amended plan. Your "
         f"previous session has ended; this is a fresh turn. Do not edit files.\n{base}"
         f"{objections}{transcript}\nAMENDED PLAN v{version}:\n{plan.get('text', '')}\n\n"
         f"Check it against the ticket and the real code, then file your verdict on this "
-        f"exact version: `wt plan verdict {ref}{mv} --accept --version {version} --reasons "
-        f"\"why it is sound\"` or `wt plan verdict {ref}{mv} --reject --version {version} "
+        f"exact version: `wt plan verdict {_display_ref(item)}{mv} --accept --version {version} --reasons "
+        f"\"why it is sound\"` or `wt plan verdict {_display_ref(item)}{mv} --reject --version {version} "
         + (f"--section <REF> " if mv else "")
         + f"--reasons \"what still must change\"`. Reject only for real remaining defects."
     )
@@ -1760,9 +1772,9 @@ def recover_plan_discussions(queue: str, stale_s: float = 900.0) -> int:
                                 f"exited); no one to deliver to")
             else:
                 res = _plan_send(it, role,
-                                 f"Reminder: {ref} plan discussion is waiting on you ({role}). "
+                                 f"Reminder: {_display_ref(ref)} plan discussion is waiting on you ({role}). "
                                  f"Objections: {disc.get('objections', '')}. "
-                                 f"See `wt plan show {ref}`.", "reminder")
+                                 f"See `wt plan show {_display_ref(ref)}`.", "reminder")
                 if res.get("ok") and res.get("delivery_id") and \
                         res.get("state") in ("pending", "unverified"):
                     # sent: the ledger's handler counts it or escalates it
@@ -1796,10 +1808,10 @@ def _group_plan_note(item: dict) -> str:
     status = plan.get("status", "")
     ref = item["ref"]
     if not q.group_plan_settled(parent):
-        return (f"GROUP PLAN PENDING: {ref} is a member of plan group {pref}; its plan is "
-                f"not accepted yet. Do NOT start building. Run `wt plan wait {pref}`.")
+        return (f"GROUP PLAN PENDING: {_display_ref(item)} is a member of plan group {_display_ref(pref)}; its plan is "
+                f"not accepted yet. Do NOT start building. Run `wt plan wait {_display_ref(pref)}`.")
     if status == "failed":
-        return (f"Group plan for {pref} did not run ({plan.get('reason', '')}); plan your "
+        return (f"Group plan for {_display_ref(pref)} did not run ({plan.get('reason', '')}); plan your "
                 f"part yourself and keep it compatible with the siblings below.")
     version = plan.get("accepted_version") or plan.get("version") or plan.get("round", 1)
     kind = (item.get("group") or {}).get("kind", "member")
@@ -1810,16 +1822,16 @@ def _group_plan_note(item: dict) -> str:
         integ = q.group_integration(parent)
         cmap = "\n".join(f"- {r}: {c or '(no code)'}"
                          for r, c in (integ.get("commits") or {}).items())
-        return (f"INTEGRATION FIX for plan group {pref} (plan v{version}). The members "
+        return (f"INTEGRATION FIX for plan group {_display_ref(pref)} (plan v{version}). The members "
                 f"are closed; their integration failed:\n{integ.get('findings') or ''}\n"
                 f"Integration commit: {integ.get('sha') or 'none'}\nPer-child commits:\n"
                 f"{cmap}\nFix it in one commit on top of all of them, following the shared "
                 f"plan:\n{q.render_plan(parent, by_ref, sections=None)}")
-    return (f"GROUP PLAN {pref} v{version} (follow it; the shared section binds every "
-            f"member, the section for {ref} is yours):\n{q.render_plan(item, by_ref)}"
+    return (f"GROUP PLAN {_display_ref(pref)} v{version} (follow it; the shared section binds every "
+            f"member, the section for {_display_ref(item)} is yours):\n{q.render_plan(item, by_ref)}"
             + (f"\n\nSIBLINGS (built by others; do not do their work):\n{sib_lines}"
                if sib_lines else "")
-            + f"\n\nAfter every member closes, {pref} runs ONE integration check at a "
+            + f"\n\nAfter every member closes, {_display_ref(pref)} runs ONE integration check at a "
               f"commit containing all of them.")
 
 
@@ -1836,16 +1848,16 @@ def _plan_note(item: dict) -> str:
         sup = q.plan_open_supplement(item)
         return (f"ACCEPTED PLAN (follow it):\n{q.render_plan(item)}"
                 + (f"\n\nSupplement s{sup['n']} is under independent review and is NOT "
-                   f"binding yet (`wt plan show {ref}`)." if sup else ""))
+                   f"binding yet (`wt plan show {_display_ref(item)}`)." if sup else ""))
     if status == "failed":
         return f"Plan stage did not run ({plan.get('reason', '')}); plan the work yourself."
     if status == "blocked":
         return "Plan stage is blocked awaiting a human decision; do not build yet."
     if status == "discussing":
         return (f"PLAN IN DISCUSSION: the planner and reviewer are resolving the "
-                f"reviewer's objections. Do NOT start building. Run `wt plan wait {ref}`.")
+                f"reviewer's objections. Do NOT start building. Run `wt plan wait {_display_ref(item)}`.")
     return (f"PLAN PENDING: a planner and a reviewer are producing the plan. Do NOT "
-            f"start building. Run `wt plan wait {ref}` (blocks until it is accepted "
+            f"start building. Run `wt plan wait {_display_ref(item)}` (blocks until it is accepted "
             f"and prints it), then follow the accepted plan.")
 
 
@@ -1854,7 +1866,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
     action, ref = args.plan_cmd, args.ref
     item = q.get(ref)
     if not item:
-        print(f"error: no item {ref}", file=sys.stderr)
+        print(f"error: no item {_display_ref(ref)}", file=sys.stderr)
         return 1
     try:
         if action == "submit":
@@ -1864,7 +1876,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
             item = q.plan_submit(ref, text, by=args.by or _default_worker_id(),
                                  expect_mv=getattr(args, "mv", None))
             plan = item["plan"]
-            print(f"PLAN FILED: {ref} round {plan['round']} v{plan.get('version')} -> reviewing")
+            print(f"PLAN FILED: {_display_ref(ref)} round {plan['round']} v{plan.get('version')} -> reviewing")
             if (plan.get("discussion") or {}).get("status") == "active":
                 # The amended plan needs a verdict on this exact version from
                 # a supervised reviewer turn (WT-29); no message to a dead peer.
@@ -1878,7 +1890,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                                   expect_mv=getattr(args, "mv", None),
                                   sections=getattr(args, "section", None))
             status = item["plan"]["status"]
-            print(f"PLAN {'ACCEPTED' if args.accept else 'REJECTED'}: {ref} -> {status}")
+            print(f"PLAN {'ACCEPTED' if args.accept else 'REJECTED'}: {_display_ref(ref)} -> {status}")
             if status == "accepted":
                 _dispatch_planned(item)
             if status == "discussing":
@@ -1902,7 +1914,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 q.block(ref, str(item.get("claimed_session_id") or ""), origin="plan_gate",
                         question=(f"{why} Last reviewer reasons: "
                                   f"{reviews[-1].get('reasons', '')}. Decide with "
-                                  f"`wt plan decide {ref}{_mv_flag(item)} --accept|--retry`."
+                                  f"`wt plan decide {_display_ref(ref)}{_mv_flag(item)} --accept|--retry`."
                                   + group_exit),
                         progress=f"Plan (round {item['plan'].get('round')}):\n"
                                  f"{q.render_plan(item)}")
@@ -1913,22 +1925,22 @@ def cmd_plan(args: argparse.Namespace) -> int:
                     text = Path(args.file).expanduser().read_text()
                 item = q.plan_supplement_submit(ref, text, by=args.by or _default_worker_id())
                 sup = q.plan_open_supplement(item) or {}
-                print(f"SUPPLEMENT FILED: {ref} s{sup.get('n')} -> independent review "
+                print(f"SUPPLEMENT FILED: {_display_ref(ref)} s{sup.get('n')} -> independent review "
                       f"(plan stays accepted v{item['plan'].get('accepted_version')})")
                 stages.request(ref, "plan supplement filed")
             else:
                 item = q.plan_supplement_verdict(ref, bool(args.accept), args.reasons or "",
                                                  by=args.by or _default_worker_id(), n=args.n)
                 sup = (item["plan"].get("supplements") or [{}])[-1]
-                print(f"SUPPLEMENT {sup.get('status', '').upper()}: {ref} s{sup.get('n')}; "
+                print(f"SUPPLEMENT {sup.get('status', '').upper()}: {_display_ref(ref)} s{sup.get('n')}; "
                       f"plan still {item['plan'].get('status')}")
         elif action == "discuss":
             item = q.plan_discuss(ref, args.sender, args.text, expect_mv=getattr(args, "mv", None))
             peer = "reviewer" if args.sender == "planner" else "planner"
             sent = (_plan_role_alive(item, peer)
-                    and _plan_send(item, peer, f"[{ref} plan discussion, from the "
+                    and _plan_send(item, peer, f"[{_display_ref(ref)} plan discussion, from the "
                                                f"{args.sender}] {args.text}").get("ok"))
-            print(f"DISCUSSION: {ref} {args.sender} -> {peer} "
+            print(f"DISCUSSION: {_display_ref(ref)} {args.sender} -> {peer} "
                   + ("(sent live; awaiting its receipt)" if sent else
                      "(recorded; peer not running / not reachable live, its next turn sees it)"))
         elif action == "decide":
@@ -1943,7 +1955,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
                                      "drop --text/--file")
                 item = q.plan_restore(ref, by=args.by or "human")
                 sup = q.plan_open_supplement(item)
-                print(f"PLAN RESTORED: {ref} -> plan accepted "
+                print(f"PLAN RESTORED: {_display_ref(ref)} -> plan accepted "
                       f"v{item['plan'].get('accepted_version')}; claim and block untouched"
                       + (f"; supplement s{sup.get('n')} reviews on the next stage tick"
                          if sup else ""))
@@ -1952,7 +1964,7 @@ def cmd_plan(args: argparse.Namespace) -> int:
             item = q.plan_decide(ref, decision, text, retries=args.retries,
                                  by=args.by or "human", expect_mv=getattr(args, "mv", None))
             status = item["plan"]["status"]
-            print(f"PLAN DECISION {decision.upper()}: {ref} -> plan {status}; "
+            print(f"PLAN DECISION {decision.upper()}: {_display_ref(ref)} -> plan {status}; "
                   f"human block cleared")
             if status == "planning":
                 stages.request(ref, "plan retry")
@@ -1964,11 +1976,11 @@ def cmd_plan(args: argparse.Namespace) -> int:
             if routed is not None:
                 return routed
             if item.get("claimed_session_id"):
-                prompt = (f"A human decided the blocked plan on ticket {ref}: "
+                prompt = (f"A human decided the blocked plan on ticket {_display_ref(ref)}: "
                           f"{decision} (plan is now {status}). "
-                          + (f"Follow the accepted plan: `wt plan show {ref}`."
+                          + (f"Follow the accepted plan: `wt plan show {_display_ref(ref)}`."
                              if status == "accepted" else
-                             f"Wait for the revised plan: `wt plan wait {ref}`."))
+                             f"Wait for the revised plan: `wt plan wait {_display_ref(ref)}`."))
                 return _deliver_to_blocked_session(item, text or decision, prompt,
                                                    "", args.by or "")
         elif action == "show":
@@ -1982,14 +1994,14 @@ def cmd_plan(args: argparse.Namespace) -> int:
                                       "plan_version": pplan.get("version", 0),
                                       "text": q.render_plan(item)}, indent=2))
                 else:
-                    print(f"{ref} is a member of plan group {pref}: plan "
+                    print(f"{_display_ref(ref)} is a member of plan group {_display_ref(pref)}: plan "
                           f"{pplan.get('status') or 'none'} (v{pplan.get('version', 0)})")
                     print(q.render_plan(item))
                 return 0
             if args.json:
                 print(json.dumps(plan, indent=2))
             else:
-                print(f"{ref} plan: {plan.get('status', 'none')} (round {plan.get('round', 0)})"
+                print(f"{_display_ref(ref)} plan: {plan.get('status', 'none')} (round {plan.get('round', 0)})"
                       + (f" membership v{q.group_mv(item)}" if q.group_role(item) == "parent"
                          else ""))
                 if q.group_role(item) == "parent" and (plan.get("text") or plan.get("sections")):
@@ -2027,13 +2039,13 @@ def cmd_plan(args: argparse.Namespace) -> int:
                 if plan.get("status") in ("accepted", "failed", "blocked", ""):
                     break
                 if time.time() >= deadline:
-                    print(f"TIMEOUT: plan for {ref} still {plan.get('status')}", file=sys.stderr)
+                    print(f"TIMEOUT: plan for {_display_ref(ref)} still {plan.get('status')}", file=sys.stderr)
                     return 2
                 time.sleep(5)
             if member is not None:
                 print(_plan_note(q.get(member["ref"]) or member))
             else:
-                print(_plan_note(item) or f"{ref} has no plan stage")
+                print(_plan_note(item) or f"{_display_ref(ref)} has no plan stage")
             return 0 if plan.get("status") in ("accepted", "failed") else 1
     except q.GroupFenced as exc:
         print(f"SUPERSEDED: {exc}", file=sys.stderr)
@@ -2065,18 +2077,18 @@ def cmd_group(args: argparse.Namespace) -> int:
             parent = q.group_attach(args.parent, list(args.refs), replan=bool(args.replan),
                                     seal=bool(args.seal))
             g = parent.get("group") or {}
-            print(f"ATTACHED: {', '.join(args.refs)} -> {parent['ref']} (members "
+            print(f"ATTACHED: {', '.join(args.refs)} -> {_display_ref(parent)} (members "
                   f"{', '.join(g.get('members') or [])}; membership v{q.group_mv(parent)}"
                   + ("; sealed" if g.get("sealed") else "") + ")")
         elif action == "seal":
             parent = q.group_seal(args.parent)
-            print(f"SEALED: {parent['ref']} membership v{q.group_mv(parent)}; the group plan starts")
+            print(f"SEALED: {_display_ref(parent)} membership v{q.group_mv(parent)}; the group plan starts")
         elif action == "detach":
             child = q.group_detach(args.ref)
-            print(f"DETACHED: {child['ref']} is a standalone ticket again")
+            print(f"DETACHED: {_display_ref(child)} is a standalone ticket again")
         elif action == "fix":
             fix = q.group_fix(args.parent, args.text or "")
-            print(f"FIX FILED: {fix['ref']} for {args.parent} (integration resumes once it closes)")
+            print(f"FIX FILED: {_display_ref(fix)} for {args.parent} (integration resumes once it closes)")
             try:
                 workers.dispatch_after_enqueue(fix.get("project", ""), fix["ref"])
             except Exception:  # noqa: BLE001
@@ -2087,13 +2099,13 @@ def cmd_group(args: argparse.Namespace) -> int:
                 print(json.dumps(info, indent=2))
                 return 0
             integ = info["integration"]
-            print(f"{info['ref']} [{info['status']}] {info['title']}")
+            print(f"{_display_ref(info)} [{info['status']}] {info['title']}")
             print(f"  membership v{info['membership_version']} "
                   f"{'sealed' if info['sealed'] else 'UNSEALED'}; plan {info['plan_status'] or 'none'}"
                   f" v{info['plan_version']}")
             for k in info["members"] + info["fixes"]:
                 tag = " (fix)" if k["kind"] == "integration_fix" else ""
-                print(f"  - {k['ref']}{tag} [{k['status']}] {k['commit'] or ''} {k['title']}".rstrip())
+                print(f"  - {_display_ref(k)}{tag} [{k['status']}] {k['commit'] or ''} {k['title']}".rstrip())
             print(f"  integration: {integ.get('state')} cycle {integ.get('cycle', 0)} "
                   f"fixes {len(info['fixes'])}/{integ.get('allowance')} proof {info['proof']}"
                   + (f" at {integ.get('sha')[:12]}" if integ.get("sha") else "")
@@ -2126,24 +2138,24 @@ def cmd_stages(args: argparse.Namespace) -> int:
             acted = stages.reconcile_stages(only_ref=args.ref or "")
             backstop = liveness.sweep(only_ref=args.ref or "")   # WT-31 D3
         for ref, action in acted:
-            print(f"{ref}: {action}")
+            print(f"{_display_ref(ref)}: {action}")
         for a in backstop:
-            print(f"{a['ref']}: backstop {a['action']} ({a['result']}) — {a['reason']}")
+            print(f"{_display_ref(a)}: backstop {a['action']} ({a['result']}) — {a['reason']}")
         if not acted and not backstop:
             print("no stage work due")
         return 0
     item = q.get(args.ref)
     if not item:
-        print(f"error: no item {args.ref}", file=sys.stderr)
+        print(f"error: no item {_display_ref(args.ref)}", file=sys.stderr)
         return 1
     ss = item.get("stage_session") or {}
     if args.json:
         print(json.dumps(ss, indent=2))
         return 0 if ss else 1
     if not ss:
-        print(f"{item['ref']}: no stage session")
+        print(f"{_display_ref(item)}: no stage session")
         return 1
-    print(f"{item['ref']}: {ss.get('role')} key={ss.get('key')} attempt "
+    print(f"{_display_ref(item)}: {ss.get('role')} key={ss.get('key')} attempt "
           f"{ss.get('attempt')}/{stages.MAX_ATTEMPTS} worker={ss.get('worker_id') or '-'}"
           + (" ESCALATED" if ss.get("escalated") else ""))
     for d in ss.get("deaths") or []:
@@ -2160,7 +2172,7 @@ def cmd_liveness(args: argparse.Namespace) -> int:
     if ref:
         item = q.get(ref)
         if not item:
-            print(f"error: no item {ref}", file=sys.stderr)
+            print(f"error: no item {_display_ref(ref)}", file=sys.stderr)
             return 1
         ref = str(item.get("ref") or ref)
     rows = liveness.report(queue=args.queue or "", ref=ref)
@@ -2173,7 +2185,7 @@ def cmd_liveness(args: argparse.Namespace) -> int:
     for r in rows:
         due = f"  -> {r['action']}: {r['reason']}" if r["action"] else ""
         idle = f" idle {r['idle_s']}s" if r["idle_s"] else ""
-        print(f"{r['ref']:<14} {r['row']:<24} owner={r['owner'] or '-'} "
+        print(f"{_display_ref(r):<14} {r['row']:<24} owner={r['owner'] or '-'} "
               f"proof={r['proof'] or '-'} {r['verdict'] or '-'}"
               + (f" ({r['evidence']})" if r["evidence"] else "") + idle + due)
     return 0
@@ -2216,9 +2228,9 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"error: {e}", file=sys.stderr)
             return 1
         if not item:
-            print(f"error: {args.ref} not found", file=sys.stderr)
+            print(f"error: {_display_ref(args.ref)} not found", file=sys.stderr)
             return 1
-        print(f"CANCELLED: {item['ref']}  {item.get('title') or item.get('note','')}")
+        print(f"CANCELLED: {_display_ref(item)}  {item.get('title') or item.get('note','')}")
         return 0
     try:
         item = q.mark_runnable(args.ref)
@@ -2226,9 +2238,9 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if not item:
-        print(f"error: {args.ref} not found", file=sys.stderr)
+        print(f"error: {_display_ref(args.ref)} not found", file=sys.stderr)
         return 1
-    print(f"RUNNABLE: {item['ref']}  {item.get('title') or item.get('note','')}")
+    print(f"RUNNABLE: {_display_ref(item)}  {item.get('title') or item.get('note','')}")
     if not getattr(args, "no_dispatch", False):
         try:
             reason = workers.dispatch_after_enqueue(item.get("project", ""), item.get("ref", ""))
@@ -2289,7 +2301,7 @@ def _verify_close_commit(ref: str, sha: str) -> Tuple[str, str]:
         return "", "error: --commit must be a 7- to 64-character hexadecimal commit SHA"
     item = q.get(ref)
     if not item:
-        return "", f"error: {ref} not found"
+        return "", f"error: {_display_ref(ref)} not found"
     from . import close_proof, config
     repo = str(item.get("repo_path") or config.repo_path(item.get("project", "")) or os.getcwd())
     # A queue has one repo_path, but its tickets need not. Look in the expected
@@ -2316,7 +2328,7 @@ def _verify_close_commit(ref: str, sha: str) -> Tuple[str, str]:
             f"error: {candidate} is not a commit in {repo}, any other configured "
             f"repo, or the current directory ({os.getcwd()}). If the work lives in "
             "a different repo, run `wt close` from inside that repo or set the "
-            f"ticket's repo with `wt edit {ref} --repo-path <path>`; otherwise "
+            f"ticket's repo with `wt edit {_display_ref(ref)} --repo-path <path>`; otherwise "
             "commit the verified work or use "
             "`wt block <ref> --progress \"...\"` instead of closing"
         )
@@ -2382,11 +2394,11 @@ def cmd_assess(args: argparse.Namespace) -> int:
                 print(f"not found: {r}", file=sys.stderr)
                 rc = 1
                 continue
-            print(f"APPROVED: {it['ref']} is now claimable")
+            print(f"APPROVED: {_display_ref(it)} is now claimable")
         return rc
     item = q.get(args.ref)
     if not item:
-        print(f"not found: {args.ref}", file=sys.stderr)
+        print(f"not found: {_display_ref(args.ref)}", file=sys.stderr)
         return 1
     ref = item["ref"]
     if action == "show":
@@ -2395,9 +2407,9 @@ def cmd_assess(args: argparse.Namespace) -> int:
             print(json.dumps(a, indent=2))
             return 0 if a else 1
         if not a:
-            print(f"{ref}: no assessment")
+            print(f"{_display_ref(ref)}: no assessment")
             return 1
-        print(f"{ref}: assessment {a.get('status')} (attempt {a.get('attempt', 0)})"
+        print(f"{_display_ref(ref)}: assessment {a.get('status')} (attempt {a.get('attempt', 0)})"
               + (f" -- {a['reason']}" if a.get("reason") else ""))
         for p, v in (a.get("points") or {}).items():
             print(f"  {p:<11}[{v.get('verdict')}] {v.get('note')}")
@@ -2410,7 +2422,7 @@ def cmd_assess(args: argparse.Namespace) -> int:
         if args.dry_run:
             res = workers.start_assessment(item, force=args.force, dry_run=True)
             if res["status"] == "failed":
-                print(f"cannot assess {ref}: {res['reason']}", file=sys.stderr)
+                print(f"cannot assess {_display_ref(ref)}: {res['reason']}", file=sys.stderr)
                 return 1
             t = res["assessor"]
             print(f"repo: {res['repo']}\nassessor: {t['engine']}/{t['model'] or '(default)'} "
@@ -2418,9 +2430,9 @@ def cmd_assess(args: argparse.Namespace) -> int:
             return 0
         queued = stages.request_assessment(ref, force=True)
         if queued is None:
-            print(f"ASSESS SKIPPED: {ref} -- not a closed ticket", file=sys.stderr)
+            print(f"ASSESS SKIPPED: {_display_ref(ref)} -- not a closed ticket", file=sys.stderr)
             return 1
-        print(f"ASSESS QUEUED: {ref} -- the watcher will spawn the assessor")
+        print(f"ASSESS QUEUED: {_display_ref(ref)} -- the watcher will spawn the assessor")
         wait = float(getattr(args, "wait", 0) or 0)
         deadline = time.time() + wait
         while wait and time.time() < deadline:
@@ -2434,13 +2446,13 @@ def cmd_assess(args: argparse.Namespace) -> int:
         try:
             q.assessment_run_ops(ref)
         except q.AssessmentFenced as exc:
-            print(f"ASSESS SUPERSEDED: {ref} -- {exc}", file=sys.stderr)
+            print(f"ASSESS SUPERSEDED: {_display_ref(ref)} -- {exc}", file=sys.stderr)
             return 1
         except Exception as exc:  # noqa: BLE001
-            print(f"ASSESS INCOMPLETE: {ref} -- {exc}; resume with wt assess resume {ref}",
+            print(f"ASSESS INCOMPLETE: {_display_ref(ref)} -- {exc}; resume with wt assess resume {_display_ref(ref)}",
                   file=sys.stderr)
             return 1
-        print(f"ASSESSED: {ref}")
+        print(f"ASSESSED: {_display_ref(ref)}")
         return 0
     # submit
     try:
@@ -2457,7 +2469,7 @@ def cmd_assess(args: argparse.Namespace) -> int:
             return 2
         q.assessment_accept_submission(ref, token, payload)
     except q.AssessmentFenced as exc:
-        print(f"ASSESS SUPERSEDED: {ref} -- {exc}", file=sys.stderr)
+        print(f"ASSESS SUPERSEDED: {_display_ref(ref)} -- {exc}", file=sys.stderr)
         return 1
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -2465,14 +2477,14 @@ def cmd_assess(args: argparse.Namespace) -> int:
     try:
         done = q.assessment_run_ops(ref, token)
     except q.AssessmentFenced as exc:
-        print(f"ASSESS SUPERSEDED: {ref} -- {exc}; nothing more written", file=sys.stderr)
+        print(f"ASSESS SUPERSEDED: {_display_ref(ref)} -- {exc}; nothing more written", file=sys.stderr)
         return 1
     except Exception as exc:  # noqa: BLE001
-        print(f"ASSESS INCOMPLETE: {ref} -- {exc}; resume with wt assess resume {ref}",
+        print(f"ASSESS INCOMPLETE: {_display_ref(ref)} -- {exc}; resume with wt assess resume {_display_ref(ref)}",
               file=sys.stderr)
         return 1
     a = (done or {}).get("assessment") or {}
-    print(f"ASSESSED: {ref} -- {len(a.get('followups') or [])} follow-up(s): "
+    print(f"ASSESSED: {_display_ref(ref)} -- {len(a.get('followups') or [])} follow-up(s): "
           f"{', '.join(a.get('followups') or []) or 'nothing to add'}")
     return 0
 
@@ -2536,9 +2548,9 @@ def cmd_duplicate(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if item is None:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
-    print(f"{item['ref']}: {item['status']}" +
+    print(f"{_display_ref(item)}: {item['status']}" +
           (f"; follows {item['duplicate_of']}" if item.get("duplicate_of") else "; duplicate link cleared"))
     stages.request(item["ref"], "duplicate link changed")
     return 0
@@ -2624,25 +2636,25 @@ def cmd_close(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     if item.get("status") == "open":
-        print(f"GATE FAILED: {item['ref']} reopened -- {item.get('gate_feedback', '')}\n"
-              f"  fix it, then run `wt close {item['ref']} ...` again.\n"
+        print(f"GATE FAILED: {_display_ref(item)} reopened -- {item.get('gate_feedback', '')}\n"
+              f"  fix it, then run `wt close {_display_ref(item)} ...` again.\n"
               f"{q.checks_block(item)}", file=sys.stderr)
         return 1
     res = item.get("resolution") or {}
     summary = res.get("summary", "")
     if item.get("status") == "in_review":
         pending = str(item.get("gate_pending") or "review")
-        print(f"IN REVIEW: {item['ref']} -- gates passed; awaiting "
+        print(f"IN REVIEW: {_display_ref(item)} -- gates passed; awaiting "
               f"{q.gate_stage_label(pending)}"
               + (f" — {summary}" if summary else ""))
         _rename_claiming_session(item, summary)
         if pending == "verify":
             stages.request(item["ref"], "verify")
         return 0
-    print(f"CLOSED: {item['ref']}" + (f" — {summary}" if summary else ""))
+    print(f"CLOSED: {_display_ref(item)}" + (f" — {summary}" if summary else ""))
     _print_ticket_usage(item)
 
     _rename_claiming_session(item, summary)
@@ -2671,7 +2683,7 @@ def cmd_close(args: argparse.Namespace) -> int:
                 note=note,
                 source="wt-followup",
             )
-            print(f"  FILED follow-up: {new['ref']}  {note}")
+            print(f"  FILED follow-up: {_display_ref(new)}  {note}")
     return 0
 
 
@@ -2687,7 +2699,7 @@ def _print_resolution_items(item: dict) -> None:
     entries, with their ack state -- what `wt unresolved-ack <ref>` prints when no
     selector was given, so the caller can see which index to ack."""
     res = item.get("resolution") or {}
-    print(f"{item.get('ref', '')}  {res.get('summary') or item.get('title') or ''}")
+    print(f"{_display_ref(item)}  {res.get('summary') or item.get('title') or ''}")
     for field, _dest, flag in _ACK_FIELDS:
         vals = res.get(field) or []
         for i, val in enumerate(vals):
@@ -2757,7 +2769,7 @@ def _cmd_unresolved_ack_bulk(args: argparse.Namespace) -> int:
         print(f"would {verb.lower()} {len(items)} "
               f"{'ticket' if len(items) == 1 else 'tickets'} in {queue}:")
         for it in items:
-            print(f"  {str(it.get('ref','')):<14}"
+            print(f"  {_display_ref(it):<14}"
                   f"{_oneline(it.get('title') or it.get('note') or '')[:56]}")
         return 0
     by = args.by or _default_worker_id()
@@ -2780,7 +2792,7 @@ def _cmd_unresolved_ack_bulk(args: argparse.Namespace) -> int:
     print(f"{verb}ED: {len(updated)} "
           f"{'ticket' if len(updated) == 1 else 'tickets'} in {queue}")
     for it in updated:
-        print(f"  {str(it.get('ref','')):<14}"
+        print(f"  {_display_ref(it):<14}"
           f"{_oneline(it.get('title') or it.get('note') or '')[:56]}")
     for ref, err in failed:
         print(f"  {str(ref):<14}SKIPPED — {err}", file=sys.stderr)
@@ -2813,7 +2825,7 @@ def cmd_unresolved_ack(args: argparse.Namespace) -> int:
     if not targets and not args.all:
         item = q.get(args.ref)
         if not item:
-            print(f"not found: {args.ref}", file=sys.stderr)
+            print(f"not found: {_display_ref(args.ref)}", file=sys.stderr)
             return 1
         _print_resolution_items(item)
         return 0
@@ -2829,12 +2841,12 @@ def cmd_unresolved_ack(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(item, indent=2))
         return 0
-    print(f"{'UNACKED' if args.undo else 'ACKED'}: {item['ref']}")
+    print(f"{'UNACKED' if args.undo else 'ACKED'}: {_display_ref(item)}")
     _print_resolution_items(item)
     return 0
 
@@ -2855,18 +2867,18 @@ def cmd_release(args: argparse.Namespace) -> int:
     if not item:
         existing = q.get(args.ref)
         if existing is None:
-            print(f"(no item {args.ref})", file=sys.stderr)
+            print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         else:
             print(
-                f"error: {args.ref} is {existing.get('status')}, not in_progress "
+                f"error: {_display_ref(args.ref)} is {existing.get('status')}, not in_progress "
                 "-- nothing to release",
                 file=sys.stderr,
             )
         return 1
     if reserve_for:
-        print(f"RELEASED: {item['ref']} -> open (reserved for {reserve_for}, {args.ttl:.0f}s)")
+        print(f"RELEASED: {_display_ref(item)} -> open (reserved for {reserve_for}, {args.ttl:.0f}s)")
     else:
-        print(f"RELEASED: {item['ref']} -> open")
+        print(f"RELEASED: {_display_ref(item)} -> open")
     return 0
 
 
@@ -2879,7 +2891,7 @@ def _verifier_goal(item: dict) -> str:
     # OPS-204: a GitHub verdict is fenced on its cycle (a stale one is refused).
     cyc = f" --verify-cycle {int(item.get('verify_cycle') or 0)}" if item.get("review_hold") else ""
     return (
-        f"You are an INDEPENDENT verifier for WatchTower ticket {ref}. You did "
+        f"You are an INDEPENDENT verifier for WatchTower ticket {_display_ref(item)}. You did "
         f"not do the work and must not trust its summary. Check, against the "
         f"real running app or code"
         + (f" at commit {commit}" if commit else "")
@@ -2896,8 +2908,8 @@ def _verifier_goal(item: dict) -> str:
         "mocks and the test suite. WT_VERIFY=1 is set in your environment; "
         "never run production side effects. When "
         f"done, file your verdict on the ticket (not to anyone else): "
-        f"`wt verdict {ref}{cyc} --pass --findings \"what you checked\"` or "
-        f"`wt verdict {ref}{cyc} --fail --findings \"what is wrong, with evidence\"`."
+        f"`wt verdict {_display_ref(item)}{cyc} --pass --findings \"what you checked\"` or "
+        f"`wt verdict {_display_ref(item)}{cyc} --fail --findings \"what is wrong, with evidence\"`."
     )
 
 
@@ -2917,7 +2929,7 @@ def _integration_verifier_goal(item: dict) -> str:
         kids.append(f"- {r} @ {(integ.get('commits') or {}).get(r) or '(no code)'}: {crit[:400]}")
     accept = str(item.get("accept") or "").strip()
     return (
-        f"You are the INDEPENDENT INTEGRATION verifier for WatchTower plan group {ref}. "
+        f"You are the INDEPENDENT INTEGRATION verifier for WatchTower plan group {_display_ref(item)}. "
         f"Each member was built and verified on its own; your job is the group as a "
         f"whole at ONE commit, {sha or '(see `wt group show ' + ref + '`)'}, which contains "
         f"every member's work. Check out that commit (a detached worktree; never "
@@ -2933,8 +2945,8 @@ def _integration_verifier_goal(item: dict) -> str:
         "integration is user-visible. Do NOT execute scripts that call paid APIs, send "
         "customer messages, or touch production data. WT_VERIFY=1 is set in your "
         "environment. When done, file your verdict on the group (this exact cycle; a "
-        f"stale cycle is refused): `wt verdict {ref} --verify-cycle {vc} --pass --findings "
-        f"\"what you checked\"` or `wt verdict {ref} --verify-cycle {vc} --fail --findings "
+        f"stale cycle is refused): `wt verdict {_display_ref(item)} --verify-cycle {vc} --pass --findings "
+        f"\"what you checked\"` or `wt verdict {_display_ref(item)} --verify-cycle {vc} --fail --findings "
         f"\"what is wrong, with evidence\"`. A fail files an integration-fix ticket."
     )
 
@@ -2958,14 +2970,14 @@ def cmd_verdict(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(item, indent=2))
     else:
         v = item.get("verifier") or (item.get("verifier_history") or [{}])[-1] or {}
         via = f" [{v['engine']}{'/' + v['model'] if v.get('model') else ''}]" if v.get("engine") else ""
-        print(f"VERDICT {'PASS' if args.passed else 'FAIL'}{via}: {item['ref']} -> {item.get('status')}")
+        print(f"VERDICT {'PASS' if args.passed else 'FAIL'}{via}: {_display_ref(item)} -> {item.get('status')}")
     if item.get("status") == "closed":
         _maybe_assess(item)
     if not args.passed and item.get("status") == "in_progress" and item.get("claimed_session_id"):
@@ -2994,7 +3006,7 @@ def _context_recycle_bytes() -> int:
 
 def _log_resume(item: dict, what: str) -> None:
     """One RESUME line per attempt (WT-30 D7)."""
-    q._log("RESUME", f"{item.get('ref', '?')} — {what}", queue=item.get("project", ""))
+    q._log("RESUME", f"{_display_ref(item)} — {what}", queue=item.get("project", ""))
 
 
 def _sent_back_minutes_label(item: dict) -> str:
@@ -3015,17 +3027,17 @@ def _resume_rejected(item: dict, reason: str, engine: str = "") -> int:
             q.release(item["ref"], session_id=str(item.get("claimed_by") or ""))
             _log_resume(item, f"skipped: builder session {sid[:8]} over the context "
                               f"budget ({size} bytes >= {limit})")
-            print(f"RESUME: {item['ref']} — builder session {sid[:8]} is over the "
+            print(f"RESUME: {_display_ref(item)} — builder session {sid[:8]} is over the "
                   f"context budget ({size} bytes); released for a fresh worker with "
                   f"the rejection text.")
             return 0
     prompt = (
-        f"Your work on ticket {item['ref']} was sent back: {reason}. Address it "
+        f"Your work on ticket {_display_ref(item)} was sent back: {reason}. Address it "
         f"before any other ticket, then close again with `wt close "
-        f"{item['ref']} --worker <your-id> --summary \"...\" --commit <SHA>` "
+        f"{_display_ref(item)} --worker <your-id> --summary \"...\" --commit <SHA>` "
         f"(or `--no-code`). If you show no progress within "
         f"{_sent_back_minutes_label(item)} it is released to another worker; "
-        f"a `wt comment {item['ref']}` counts as progress.\n\n"
+        f"a `wt comment {_display_ref(item)}` counts as progress.\n\n"
         + q.checks_block(item)
     ).strip()
     return _deliver_to_blocked_session(item, reason, prompt, engine or "",
@@ -3047,13 +3059,13 @@ def cmd_accept(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(item, indent=2))
         _maybe_assess(item)
         return 0
-    print(f"ACCEPTED: {item['ref']} -> closed")
+    print(f"ACCEPTED: {_display_ref(item)} -> closed")
     _maybe_assess(item)
     return 0
 
@@ -3067,12 +3079,12 @@ def cmd_reject(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(item, indent=2))
     else:
-        print(f"REJECTED: {item['ref']} -> {item.get('status')} — {args.reason}")
+        print(f"REJECTED: {_display_ref(item)} -> {item.get('status')} — {args.reason}")
     if item.get("status") == "in_progress" and item.get("claimed_session_id"):
         return _resume_rejected(item, args.reason, args.engine or "")
     return 0
@@ -3102,7 +3114,7 @@ def cmd_reopen(args: argparse.Namespace) -> int:
         except Exception:
             item = None
         if not item:
-            print(f"(no item {args.ref})", file=sys.stderr)
+            print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
             return 1
         sid = item.get("claimed_session_id")
         if not sid:
@@ -3116,7 +3128,7 @@ def cmd_reopen(args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(reopened, indent=2))
                 return 0
-            print(f"REOPENED: {args.ref} — no resumable session recorded; "
+            print(f"REOPENED: {_display_ref(args.ref)} — no resumable session recorded; "
                   f"reopened to the open pool only.")
             return 0
         try:
@@ -3132,10 +3144,10 @@ def cmd_reopen(args: argparse.Namespace) -> int:
             print(f"error: {exc}", file=sys.stderr)
             return 1
         if not claimed:
-            print(f"(no item {args.ref})", file=sys.stderr)
+            print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
             return 1
         prompt = (
-            f"The client re-engaged ticket {args.ref} after it was closed: "
+            f"The client re-engaged ticket {_display_ref(args.ref)} after it was closed: "
             f"{args.resume}. This continues the same topic you already "
             f"worked -- pick it back up with that context."
         )
@@ -3149,12 +3161,12 @@ def cmd_reopen(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(item, indent=2))
         return 0
-    print(f"REOPENED: {item['ref']}" + (f" — {args.reason}" if args.reason else ""))
+    print(f"REOPENED: {_display_ref(item)}" + (f" — {args.reason}" if args.reason else ""))
     return 0
 
 
@@ -3236,18 +3248,18 @@ def cmd_gate_check(args: argparse.Namespace) -> int:
     from . import autodecide
     item = q.get(args.ref)
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     p = q.get_block_proposal(item)
     if not p:
-        print(f"{item['ref']}: no auto-decision proposal recorded on the current block "
+        print(f"{_display_ref(item)}: no auto-decision proposal recorded on the current block "
               "(the worker blocked without --class/--weight).", file=sys.stderr)
         return 1
     res = autodecide.evaluate(item, p, items=q.list_items(project=item.get("project")))
     if getattr(args, "json", False):
         print(json.dumps(res, indent=2))
         return 0 if res["approve"] else 2
-    print(f"{item['ref']} class={p.get('class') or '-'} weight={p.get('weight') or '-'} "
+    print(f"{_display_ref(item)} class={p.get('class') or '-'} weight={p.get('weight') or '-'} "
           f"queue={item.get('project')} policy={res['policy_hash']}")
     for c in res["checks"]:
         print(f"  [{'PASS' if c['ok'] else 'FAIL'}] {c['name']}" + ("" if c["ok"] else f": {c['detail']}"))
@@ -3271,12 +3283,12 @@ def cmd_undo(args: argparse.Namespace) -> int:
     from . import autodecide
     item = q.get(args.ref)
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     rows = [r for r in q.auto_decisions(item.get("project", "")) if r["ref"] == item["ref"]]
     live = [r for r in rows if not r["reversed"]]
     if not live:
-        print(f"error: {item['ref']} has no un-reversed auto-decision", file=sys.stderr)
+        print(f"error: {_display_ref(item)} has no un-reversed auto-decision", file=sys.stderr)
         return 1
     ev = live[-1]["event"]
     sha = str(ev.get("commit") or "")
@@ -3304,7 +3316,7 @@ def cmd_undo(args: argparse.Namespace) -> int:
         return 1
     q.note_auto_reversed(item["ref"], ev.get("decision_id", ""), original=sha, revert=after,
                          by=args.worker or _default_worker_id())
-    print(f"REVERTED: {item['ref']} — {sha[:10]} undone by {after[:10]} (not pushed; push it yourself)")
+    print(f"REVERTED: {_display_ref(item)} — {sha[:10]} undone by {after[:10]} (not pushed; push it yourself)")
     return 0
 
 
@@ -3317,7 +3329,7 @@ def cmd_policy(args: argparse.Namespace) -> int:
         for r in rows:
             ft = r.get("followthrough") or {}
             rev = " reversed" if r.get("reversed") else ""
-            print(f"{r['ref']}\t{ft.get('state', '?')}{rev}\t{ft.get('reason', '')}")
+            print(f"{_display_ref(r)}\t{ft.get('state', '?')}{rev}\t{ft.get('reason', '')}")
         if not rows:
             print("(no auto-decisions)")
         return 0
@@ -3370,7 +3382,7 @@ def _wait_target_hint(args: argparse.Namespace, item: dict) -> str:
     if not on:
         return ("note: no --wait-on given. Older readers treat this as waiting on the owner; "
                 "`wt owner-view` lists it as unclassified. Say who it waits on: "
-                f"wt wait-on {item.get('ref')} --on owner|external|dependency|worker")
+                f"wt wait-on {_display_ref(item)} --on owner|external|dependency|worker")
     if on == "owner":
         w = item.get("wait") or {}
         missing = [flag for key, flag in (("decide_by", "--decide-by"), ("consequence", "--if-unanswered"))
@@ -3394,8 +3406,8 @@ def cmd_block(args: argparse.Namespace) -> int:
     dependency_refs = q.dependency_only_question(args.question)
     if getattr(args, "wait_on", "") == "dependency" or dependency_refs:
         refs = [getattr(args, "wait_ref", "")] if getattr(args, "wait_ref", "") else dependency_refs
-        flags = " ".join(f"--after {ref}" for ref in refs) or "--after REF"
-        print(f"error: a ticket dependency is not a human question; use: wt edit {args.ref} {flags}", file=sys.stderr)
+        flags = " ".join(f"--after {_display_ref(ref)}" for ref in refs) or "--after REF"
+        print(f"error: a ticket dependency is not a human question; use: wt edit {_display_ref(args.ref)} {flags}", file=sys.stderr)
         return 1
     if getattr(args, "weight", "") == "major" or getattr(args, "major_because", ""):
         from . import autodecide
@@ -3428,7 +3440,7 @@ def cmd_block(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     auto_note = _auto_decide_after_block(item, args)
     if auto_note and not getattr(args, "json", False):
@@ -3436,7 +3448,7 @@ def cmd_block(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(q.get(item["ref"]) or item, indent=2))
         return 0
-    print(f"BLOCKED: {item['ref']} — {item.get('block_question') or '(no question)'}")
+    print(f"BLOCKED: {_display_ref(item)} — {item.get('block_question') or '(no question)'}")
     hint = _wait_target_hint(args, item)
     if hint:
         print(f"  {hint}", file=sys.stderr)
@@ -3448,7 +3460,7 @@ def cmd_block(args: argparse.Namespace) -> int:
         return 0
     sid = item.get("claimed_session_id")
     if sid:
-        print(f"  session {sid} — resume with: wt discuss {item['ref']}")
+        print(f"  session {sid} — resume with: wt discuss {_display_ref(item)}")
     else:
         print("  (no resumable session id recorded; a human can still read progress notes)")
     return 0
@@ -3466,14 +3478,14 @@ def cmd_wait_on(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(item, indent=2))
         return 0
     w = item.get("wait") or {}
     who = w.get("actor") or w.get("ref") or ""
-    print(f"WAITING: {item['ref']} on {w.get('on')}{(' — ' + who) if who else ''}")
+    print(f"WAITING: {_display_ref(item)} on {w.get('on')}{(' — ' + who) if who else ''}")
     return 0
 
 
@@ -3506,7 +3518,7 @@ def cmd_defer(args: argparse.Namespace) -> int:
             # release branch is refused as "awaiting release".
             item = q.get(args.ref)
             if not item:
-                print(f"(no item {args.ref})", file=sys.stderr)
+                print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
                 return 1
             repo = str(getattr(args, "repo", "") or item.get("repo_path")
                        or config.repo_path(item.get("project", "")) or os.getcwd())
@@ -3522,7 +3534,7 @@ def cmd_defer(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     note = release_wait.hint(awaits, args.reason)
     if note:
@@ -3530,7 +3542,7 @@ def cmd_defer(args: argparse.Namespace) -> int:
     if args.json:
         print(json.dumps(item, indent=2))
         return 0
-    print(f"DEFERRED: {item['ref']} until {item['deferred_until']} — {item.get('defer_reason')}")
+    print(f"DEFERRED: {_display_ref(item)} until {item['deferred_until']} — {item.get('defer_reason')}")
     print("  the ticket left your claim; it returns to the pool when the window ends. "
           "You may claim the next ticket now.")
     return 0
@@ -3551,7 +3563,7 @@ def cmd_blocked(args: argparse.Namespace) -> int:
         return 0
     for it in rows:
         kind = "GATE" if it.get("block_kind") == "rationale" else "input"
-        print(f"{it['ref']:<12} [{kind}] {it.get('block_question') or '(no question)'}"
+        print(f"{_display_ref(it):<12} [{kind}] {it.get('block_question') or '(no question)'}"
               + ("  (answered, routing)"
                  if (it.get('pending_answer') or {}).get('state') == 'routing' else ""))
         print(f"             session={q.answer_session(it) or '-'}  "
@@ -3559,8 +3571,8 @@ def cmd_blocked(args: argparse.Namespace) -> int:
         if it.get("status") == q.PARKED_STATUS:
             print(f"             {workers.parked_label(it)}")
         if it.get("block_kind") == "rationale":
-            print(f"             decide with: wt ack {it['ref']} [-m ...]  |  "
-                  f"wt nack {it['ref']} -m \"why not\" [--close]")
+            print(f"             decide with: wt ack {_display_ref(it)} [-m ...]  |  "
+                  f"wt nack {_display_ref(it)} -m \"why not\" [--close]")
     return 0
 
 
@@ -3711,7 +3723,7 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
             q.release(item["ref"], session_id=str(
                 item.get("claimed_by") or worker or ""))
             print(
-                f"ANSWERED: {item['ref']} — answer embedded on the ticket and "
+                f"ANSWERED: {_display_ref(item)} — answer embedded on the ticket and "
                 f"claim released: original session {str(sid)[:8]} is over the "
                 f"answer context budget ({_tsize} transcript bytes >= "
                 f"{_requeue_at}); a fresh worker will apply it."
@@ -3734,7 +3746,7 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
         _log_resume(item, f"skipped: {why}")
         _hand_off_blocked_claim(item, answer_text, str(sid), worker, bound, "skipped", why,
                                 "could not be verified-resumed")
-        print(f"ANSWERED: {item['ref']} — {why}; "
+        print(f"ANSWERED: {_display_ref(item)} — {why}; "
               + ("claim released for a fresh worker with your answer."
                  if bound else "answer recorded on the ticket for the next worker."))
         return 0
@@ -3758,7 +3770,7 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
             q.set_resume_state(item["ref"], str(sid), "running",
                                transport=str(sent.get("transport") or ""))
         _log_resume(item, str(sent.get("transport") or "?"))
-        print(f"ANSWERED: {item['ref']} — delivered to session {sid} via "
+        print(f"ANSWERED: {_display_ref(item)} — delivered to session {sid} via "
               f"{sent.get('transport', '?')} to apply your answer and close.")
         return 0
     if sent.get("state") in ("queued", "in_flight"):
@@ -3770,14 +3782,14 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
         # the session goes idle. The answer_grace in requeue_orphaned_tickets
         # keeps the sweep from reopening the ticket in the meantime.
         held = "session is mid-turn" if sent.get("busy") else "delivery deferred"
-        print(f"ANSWERED: {item['ref']} — {held}; answer queued for delivery "
+        print(f"ANSWERED: {_display_ref(item)} — {held}; answer queued for delivery "
               f"({sent.get('msg_id') or '?'}).")
         return 0
     if sent.get("ok"):
         if bound:
             q.set_resume_state(item["ref"], str(sid), "headless")
         _log_resume(item, "headless")
-        print(f"ANSWERED: {item['ref']} — resuming session {sid} in {repo} "
+        print(f"ANSWERED: {_display_ref(item)} — resuming session {sid} in {repo} "
               f"to apply your answer and close.")
         return 0
     # D7: every transport failed. The failed ledger row is settled by its
@@ -3791,13 +3803,13 @@ def _deliver_to_blocked_session(item: dict, answer_text: str, prompt: str,
         _hand_off_blocked_claim(item, answer_text, str(sid), worker, bound,
                                 "failed" if settled is None else "", err,
                                 "could not be resumed")
-        print(f"ANSWERED: {item['ref']} — delivery failed ({err}) and {delivery_engine} "
+        print(f"ANSWERED: {_display_ref(item)} — delivery failed ({err}) and {delivery_engine} "
               "resume did not stay running; claim released for a fresh worker.")
         return 0
-    print(f"ANSWERED: {item['ref']} — needs_input cleared, but delivery "
+    print(f"ANSWERED: {_display_ref(item)} — needs_input cleared, but delivery "
           f"failed ({err}); {delivery_engine} "
           "resume also failed to stay running. Resume manually: "
-          f"wt discuss {item['ref']} --engine {delivery_engine}")
+          f"wt discuss {_display_ref(item)} --engine {delivery_engine}")
     return 0
 
 
@@ -3841,7 +3853,7 @@ def _route_parked_answer(item: dict, tid: bool = False) -> Optional[int]:
     if item.get("status") != q.PARKED_STATUS or pa.get("state") != "routing":
         return None
     res = answers.route_answer(item["ref"], int(pa["gen"]), tid=tid)
-    print(f"ANSWERED: {item['ref']} — routed: {res.get('route')} ({res.get('reason')}).")
+    print(f"ANSWERED: {_display_ref(item)} — routed: {res.get('route')} ({res.get('reason')}).")
     return 0
 
 
@@ -4002,7 +4014,7 @@ def _answer_and_deliver(args: argparse.Namespace, by_kind: str = "human",
                     expect_wait_block_at=expect_wait_block_at)
     if not item:
         if expect_wait_block_at is None:
-            print(f"(no item {args.ref})", file=sys.stderr)
+            print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1, None
     return _deliver_answer(args, item, by_kind), item
 
@@ -4010,21 +4022,21 @@ def _answer_and_deliver(args: argparse.Namespace, by_kind: str = "human",
 def _deliver_answer(args: argparse.Namespace, item: dict, by_kind: str) -> int:
     from . import config
     if config.is_tracker(item.get("project", "")) and not item.get("supervision"):
-        print(f"ANSWERED: {item['ref']} — decision recorded in tracker; no worker dispatched")
+        print(f"ANSWERED: {_display_ref(item)} — decision recorded in tracker; no worker dispatched")
         return 0
     if item.get("supervision"):
-        print(f"ANSWERED: {item['ref']} — retained for same-session takeover delivery")
+        print(f"ANSWERED: {_display_ref(item)} — retained for same-session takeover delivery")
         return 0
     if (item.get("plan") or {}).get("status") == "blocked":
-        print(f"NOTE: {item['ref']} plan gate is STILL BLOCKED; a free-text answer "
-              f"does not accept it. Decide with `wt plan decide {item['ref']} "
+        print(f"NOTE: {_display_ref(item)} plan gate is STILL BLOCKED; a free-text answer "
+              f"does not accept it. Decide with `wt plan decide {_display_ref(item)} "
               f"--accept [--text/--file amended plan]` or `--retry [--retries N]`.")
     ss = item.get("stage_session") or {}
     if ss.get("retry_at") and ss.get("retry_at") == item.get("answered_at"):
         # WT-24: an answer on a stage escalation is a retry of that stage, not
         # a message for the builder session (even when one is retained).
         role = str(ss.get("role") or "stage")
-        print(f"ANSWERED: {item['ref']} — {role.replace('_', ' ')} retry queued; the "
+        print(f"ANSWERED: {_display_ref(item)} — {role.replace('_', ' ')} retry queued; the "
               f"watcher will spawn a fresh {role.replace('_', ' ')} (attempt 1, "
               f"key {ss.get('key')})")
         return 0
@@ -4033,17 +4045,17 @@ def _deliver_answer(args: argparse.Namespace, item: dict, by_kind: str) -> int:
         return routed
     sid = item.get("claimed_session_id")
     if not sid:
-        print(f"ANSWERED: {item['ref']} — needs_input cleared. "
+        print(f"ANSWERED: {_display_ref(item)} — needs_input cleared. "
               f"(no resumable session recorded; a worker will pick it up on "
               f"next claim)")
         return 0
     block_kind = str(item.get("block_kind") or "")
     if block_kind == "awaiting-client" and getattr(args, "tid", False):
         prompt = (
-            f"The client answered on ticket {item['ref']} and this is the "
+            f"The client answered on ticket {_display_ref(item)} and this is the "
             f"end of the topic (Topic-Is-Done): {args.text}. The client is "
             f"done with this topic. Push anything still local, then close "
-            f"with `wt close {item['ref']} --worker <your-id> --summary "
+            f"with `wt close {_display_ref(item)} --worker <your-id> --summary "
             f'"..." --commit <SHA>` (or `--no-code` if nothing changed). '
             f"Append your learnings line to ~/.watchtower/learnings/"
             f"<your-queue>.pending.md if this turn earned one. Message the "
@@ -4052,25 +4064,25 @@ def _deliver_answer(args: argparse.Namespace, item: dict, by_kind: str) -> int:
         )
     elif block_kind == "awaiting-client":
         prompt = (
-            f"The client replied on ticket {item['ref']}: {args.text}. Do "
-            f"this turn, then park again with `wt block {item['ref']} "
+            f"The client replied on ticket {_display_ref(item)}: {args.text}. Do "
+            f"this turn, then park again with `wt block {_display_ref(item)} "
             f"--worker <your-id> --kind awaiting-client` unless the topic is "
             f"finished, in which case close it instead."
         )
     elif by_kind == "system":
         prompt = (
-            f"WatchTower: the dependency your block on ticket {item['ref']} was "
+            f"WatchTower: the dependency your block on ticket {_display_ref(item)} was "
             f"waiting on has completed ({args.text}). Re-check what you were "
             f"waiting for, then finish the ticket and close it with `wt close "
-            f"{item['ref']} --worker <your-id> --summary \"...\" --commit <SHA>` "
+            f"{_display_ref(item)} --worker <your-id> --summary \"...\" --commit <SHA>` "
             f"(or `--no-code` if no code changed). If it still cannot be "
             f"resolved, run `wt block` again with the new open question."
         )
     else:
         prompt = (
             f"{answers.answer_sender(by_kind)} answered your blocked question on "
-            f"ticket {item['ref']}. The answer: {args.text}. Apply it, finish the ticket, and close it "
-            f"with `wt close {item['ref']} --worker <your-id> --summary \"...\" "
+            f"ticket {_display_ref(item)}. The answer: {args.text}. Apply it, finish the ticket, and close it "
+            f"with `wt close {_display_ref(item)} --worker <your-id> --summary \"...\" "
             "--commit <SHA>` (or `--no-code` if no code changed). "
             f"If it still cannot be resolved, run `wt block` again with the new "
             f"open question."
@@ -4092,12 +4104,12 @@ def cmd_gate_ack(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(item, indent=2))
         return 0
-    print(f"ACKED: {item['ref']} — product gate approved."
+    print(f"ACKED: {_display_ref(item)} — product gate approved."
           + (f" Comment: {args.comment}" if args.comment else ""))
     routed = _route_parked_answer(item)
     if routed is not None:
@@ -4111,9 +4123,9 @@ def cmd_gate_ack(args: argparse.Namespace) -> int:
         f" The approver added: {args.comment}." if args.comment else ""
     )
     prompt = (
-        f"Your product-gate pitch on ticket {item['ref']} was APPROVED — "
+        f"Your product-gate pitch on ticket {_display_ref(item)} was APPROVED — "
         f"proceed to implementation now.{comment_line} Implement, verify, "
-        f"and close with `wt close {item['ref']} --worker <your-id> "
+        f"and close with `wt close {_display_ref(item)} --worker <your-id> "
         f"--summary \"...\" --commit <SHA>` (or `--no-code`)."
     )
     return _deliver_to_blocked_session(
@@ -4130,17 +4142,17 @@ def cmd_gate_nack(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     if args.json:
         print(json.dumps(item, indent=2))
         return 0
     if args.close:
-        print(f"NACKED+CLOSED: {item['ref']} — declined: {args.comment}")
+        print(f"NACKED+CLOSED: {_display_ref(item)} — declined: {args.comment}")
     else:
-        print(f"NACKED: {item['ref']} — iceboxed (readiness=needs-rationale): "
+        print(f"NACKED: {_display_ref(item)} — iceboxed (readiness=needs-rationale): "
               f"{args.comment}")
-        print(f"  revive later with: wt edit {item['ref']} --readiness ready")
+        print(f"  revive later with: wt edit {_display_ref(item)} --readiness ready")
     return 0
 
 
@@ -4200,7 +4212,7 @@ def cmd_comment(args: argparse.Namespace) -> int:
 
     item = q.comment(args.ref, args.text, by=args.by, session_id=args.worker)
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     delivery = ""
     target = item.get("claimed_session_id") or item.get("claimed_by")
@@ -4222,7 +4234,7 @@ def cmd_comment(args: argparse.Namespace) -> int:
 
         prompt = (
             f"[WATCHTOWER] A new comment was added to your claimed ticket "
-            f"{item['ref']}:\n\n{args.text}"
+            f"{_display_ref(item)}:\n\n{args.text}"
         )
         try:
             sent = messages.deliver_message(
@@ -4249,7 +4261,7 @@ def cmd_comment(args: argparse.Namespace) -> int:
                     " — live injection unavailable"
                     + (f" ({sent.get('error')})" if sent.get("error") else "")
                 )
-    print(f"COMMENTED: {item['ref']}{delivery}")
+    print(f"COMMENTED: {_display_ref(item)}{delivery}")
     return 0
 
 
@@ -4259,11 +4271,11 @@ def cmd_discuss(args: argparse.Namespace) -> int:
     (engine-aware). With --print, shows the command instead of running it."""
     item = q.get(args.ref)
     if not item:
-        print(f"(no item {args.ref})", file=sys.stderr)
+        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1
     sid = q.answer_session(item)
     if not sid:
-        print(f"(no resumable session on {args.ref} — it was never claimed with a "
+        print(f"(no resumable session on {_display_ref(args.ref)} — it was never claimed with a "
               f"real session id)", file=sys.stderr)
         return 1
     repo = item.get("repo_path") or os.getcwd()
@@ -4301,7 +4313,7 @@ def cmd_discuss(args: argparse.Namespace) -> int:
     if args.print:
         print(cmd)
         return 0
-    print(f"Resuming {item['ref']} (session {sid}) in {repo} …")
+    print(f"Resuming {_display_ref(item)} (session {sid}) in {repo} …")
     if args.engine == "antigravity":
         return subprocess.call(inner, cwd=repo, env=_resume_env(args.engine, sid))
     return os.system(cmd) >> 8
@@ -4385,7 +4397,7 @@ def cmd_interrupt(args: argparse.Namespace) -> int:
     if item is not None:
         claimed_by = str(item.get("claimed_by") or "")
         if str(item.get("status") or "") != "in_progress" or not claimed_by:
-            print(f"{item.get('ref', target)}: not claimed / nothing to interrupt")
+            print(f"{_display_ref(item)}: not claimed / nothing to interrupt")
             return 0
         worker_id = claimed_by
     res = workers.interrupt_worker_turn(worker_id)
@@ -5348,7 +5360,7 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     note = args.note or f"Monitor failed: `{args.cmd}` exited {rc}"
     item = q.enqueue(note=note, title=(args.title or "monitor failure"),
                      project=args.queue)
-    print(f"FAIL (rc={rc}) -> filed {item.get('ref')} in {args.queue}")
+    print(f"FAIL (rc={rc}) -> filed {_display_ref(item)} in {args.queue}")
     return 0
 
 
@@ -5412,7 +5424,7 @@ def cmd_dedup(args: argparse.Namespace) -> int:
     for key, v in dups.items():
         v.sort(key=lambda x: int(x.get("number", 0)))
         keep, rest = v[0], v[1:]
-        print(f"dup group: keep {keep['ref']} | dupes {[x['ref'] for x in rest]}")
+        print(f"dup group: keep {_display_ref(keep)} | dupes {[x['ref'] for x in rest]}")
         if args.apply:
             for x in rest:
                 try:
@@ -5420,7 +5432,7 @@ def cmd_dedup(args: argparse.Namespace) -> int:
                     if item is None:
                         raise ValueError("ticket disappeared since the scan")
                 except ValueError as exc:
-                    print(f"skipped {x['ref']}: {exc}", file=sys.stderr)
+                    print(f"skipped {_display_ref(x)}: {exc}", file=sys.stderr)
                     errors += 1
                     continue
                 linked += 1
@@ -5598,12 +5610,12 @@ def _ticket_subscription(args: argparse.Namespace, enabled: bool) -> int:
         print(json.dumps(q.ticket_subscribers(item), indent=2))
     else:
         verb = "SUBSCRIBED" if enabled else "UNSUBSCRIBED"
-        print(f"{verb}: {target} -> {item['ref']}")
+        print(f"{verb}: {target} -> {_display_ref(item)}")
     return 0
 
 
 def _subscription_is_ticket(value: str) -> bool:
-    return bool(re.fullmatch(r".+-\d+", value.strip()))
+    return bool(re.fullmatch(r".+-\d+", canonical_ref(value)))
 
 
 def cmd_subscribe(args: argparse.Namespace) -> int:
@@ -7734,6 +7746,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--client-id", default=None, help="opaque client correlation identifier (exact match)")
     s.add_argument("ref", help="ticket ref (e.g. WT-48) or bare number")
     s.add_argument("--title", default=None)
+    s.add_argument("--slug", default=None, help="short ticket name (up to four words / 30 characters)")
     s.add_argument("--note", default=None)
     s.add_argument("--text", default=None)
     s.add_argument("--url", default=None)
@@ -8978,6 +8991,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     except (ValueError, TypeError) as exc:
         parser.error(str(exc))
     args = parser.parse_args(argv)
+    # Normalize only reference arguments, never prose, paths or chat names.
+    if getattr(args, "command", "") != "chat":
+        for name in ("ref", "refs", "after", "children", "group", "root",
+                     "wait_ref", "original", "parent", "section", "of"):
+            value = getattr(args, name, None)
+            if isinstance(value, str):
+                setattr(args, name, canonical_ref(value))
+            elif isinstance(value, list):
+                setattr(args, name, [canonical_ref(v) for v in value])
+        if getattr(args, "command", "") == "interrupt":
+            args.target = canonical_ref(args.target)
+        if getattr(args, "command", "") in ("subscribe", "unsubscribe"):
+            args.queue = canonical_ref(args.queue)
     args.message_attr = incoming_attr
     if not getattr(args, "command", None):
         parser.print_help()

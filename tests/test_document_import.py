@@ -370,7 +370,7 @@ def test_apply_records_provenance_type_and_resolved_dependencies(wt, monkeypatch
     assert all(item["source"] == "doc-import" for item in items)
     assert all(item["id"].startswith("doc-import:v3:") for item in items)
     assert items[0]["url"].endswith("headings.md#L5-L10")
-    assert "Depends on:\n- DOCS-1: Build importer" in items[1]["text"]
+    assert "Depends on:\n- DOCS-1:build-importer: Build importer" in items[1]["text"]
     assert "FILED: DOCS-2" in capsys.readouterr().out
 
 

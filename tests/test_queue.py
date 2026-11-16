@@ -198,7 +198,7 @@ def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsy
     assert target == sid
     assert text == (
         f"[WATCHTOWER] A new comment was added to your claimed ticket "
-        f"{claimed['ref']}:\n\nUse the safer parser."
+        f"{claimed['ref']}:canonical-log:\n\nUse the safer parser."
     )
     # A comment must not cost the worker its in-flight turn: the steer verb
     # prefers the peer socket, which cannot truncate one (CCC-1000).
@@ -303,7 +303,7 @@ def test_cli_comment_on_unclaimed_ticket_does_not_send(wt, monkeypatch, capsys):
     )
 
     assert wt.cli.main(["comment", item["ref"], "For later."]) == 0
-    assert capsys.readouterr().out.strip() == f"COMMENTED: {item['ref']}"
+    assert capsys.readouterr().out.strip() == f"COMMENTED: {item['ref']}:canonical-log"
 
 
 def test_close_ownership_guard_blocks_reap_duplicate(wt):
@@ -793,7 +793,7 @@ def test_status_counts_blocked_separately_and_ls_shows_waiting(wt, capsys):
     row = next(r for r in rows if r["queue"] == "DEP")
     assert row["depth"] == 2 and row["claimable_depth"] == 1 and row["blocked"] == 1
     note = wt.cli._waiting_note(q.get(b["ref"]), q._refs_index(q.list_items()))
-    assert note == f"waiting on {a['ref']}"
+    assert note == f"waiting on {a['ref']}:first"
 
 
 def test_scoped_status_honours_an_open_blocker_in_another_queue(wt):

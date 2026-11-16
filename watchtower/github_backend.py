@@ -10,6 +10,8 @@ store for a queue configured with ``backend=github`` and uses the installed
 
 from __future__ import annotations
 
+from .refs import canonical_ref, display_ref, slug_of, ticket_slug
+
 import hashlib
 import json
 import sqlite3
@@ -2318,7 +2320,7 @@ class GitHubIssuesBackend:
         )
 
     def _issue_number(self, ident: Any) -> Optional[int]:
-        s = str(ident or "").strip()
+        s = canonical_ref(ident)
         if not s:
             return None
         if s.isdigit():
@@ -2470,7 +2472,8 @@ class GitHubIssuesBackend:
             "note": _clip(meta.get("note") or _first_line(body) or issue.get("title", ""), 4000),
             "text": _clip(text, 24000),
             "url": str(issue.get("url") or ""),
-            "title": _clip(issue.get("title", ""), 200),
+            "title": _clip(re.sub(r"^" + re.escape(f"{self.queue}-{number}") + r":[a-z0-9-]+\s+", "", issue.get("title", "")), 200),
+            "slug": ticket_slug(meta.get("slug") or re.sub(r"^" + re.escape(f"{self.queue}-{number}") + r":[a-z0-9-]+\s+", "", issue.get("title", ""))),
             "selector": "",
             "screenshot_path": "",
             "repo_path": self.repo_path,
@@ -3025,6 +3028,7 @@ class GitHubIssuesBackend:
         # Pre-validated by queue._depth_fields: {} for quick, else depth+budget_min.
         meta.update(depth_fields or {})
         issue_title = _clip(title or note or "WatchTower ticket", 200)
+        meta["slug"] = ticket_slug(issue_title)
         body = _body_with_metadata(text, meta)
         out = self._run([
             "issue", "create",
@@ -3036,6 +3040,9 @@ class GitHubIssuesBackend:
         match = _ISSUE_URL_RE.search(out.strip())
         if not match:
             raise GitHubBackendError("gh issue create did not print an issue URL")
+        named = display_ref({"ref": f"{self.queue}-{match.group(1)}", "slug": meta["slug"]})
+        self._run(["issue", "edit", match.group(1), *self._repo_args(),
+                   "--title", _Text(_clip(f"{named} {issue_title}", 256))])
         return self.get(f"{self.queue}-{match.group(1)}") or {
             "number": int(match.group(1)),
             "project": self.queue,
@@ -3045,6 +3052,7 @@ class GitHubIssuesBackend:
             "note": note,
             "text": text,
             "title": issue_title,
+            "slug": meta["slug"],
             "type": meta["type"],
             "readiness": meta["readiness"],
             "priority": meta["priority"],
@@ -4247,6 +4255,7 @@ class GitHubIssuesBackend:
             return None
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         title = item.get("title", "")
+        meta.setdefault("slug", slug_of(item))
         dependency_wait = bool(fields.pop("_dependency_wait", False))
         if dependency_wait:
             from . import queue as _q
@@ -4273,6 +4282,8 @@ class GitHubIssuesBackend:
                                     fields={"depth": value.get("depth", "quick"),
                                             **({"budget_min": value["budget_min"]}
                                                if "budget_min" in value else {})})
+            elif key == "slug":
+                meta["slug"] = ticket_slug(value)
             elif key == "title":
                 title = _clip(value, 200)
             elif key == "text":
@@ -4330,7 +4341,8 @@ class GitHubIssuesBackend:
             _q._dependency_wait_unlocked(meta, _now_iso(),
                                          worker_done=item.get("status") == "in_progress")
             extra_args = ["--remove-label", self.in_progress_label]
-        self._edit_body(item, body, meta, "--title", _Text(title), *extra_args)
+        named = display_ref(dict(item, slug=meta["slug"]))
+        self._edit_body(item, body, meta, "--title", _Text(_clip(f"{named} {title}", 256)), *extra_args)
         return self.get(ident)
 
     def peek_next(

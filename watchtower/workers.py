@@ -6318,13 +6318,15 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
         claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
+        from .refs import display_ref
+        label = display_ref(item) if item else ref
         nudge = (
-            f"A run was requested for {ref} on {queue} (its queue is not "
+            f"A run was requested for {label} on {queue} (its queue is not "
             f"auto-draining, so this ticket only). Claim it with "
             f"`wt claim -q {queue} {ref} --worker <your-id> --json`, work it, "
             f"and do not claim anything else on this queue."
             if run_requested else
-            f"New ticket {ref} filed on {queue}. Claim it with "
+            f"New ticket {label} filed on {queue}. Claim it with "
             f"`wt claim -q {queue} --worker <your-id>{claim_filter} --json` and drain the queue."
         )
         # ...and the session that filed it (or pressed ▶) already knows.

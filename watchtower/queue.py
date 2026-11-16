@@ -81,6 +81,8 @@ The file holds ``{"counter": <int>, "items": [<item>, ...]}``.
 
 from __future__ import annotations
 
+from .refs import canonical_ref, display_ref, slug_of, ticket_slug
+
 import copy
 import json
 import os
@@ -643,7 +645,7 @@ def _project_for(source: str = "", repo_path: str = "", project: str = "") -> st
 
 def _project_from_ident(ident: Any) -> str:
     """Extract the queue prefix from a human ref like ``WT-20``."""
-    s = str(ident or "").strip()
+    s = canonical_ref(ident)
     m = _re.match(r"^([A-Za-z0-9_-]+)-\d+$", s)
     return _norm_project(m.group(1)) if m else ""
 
@@ -702,6 +704,8 @@ def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     used: Dict[str, set] = {}
     pending: List[Dict[str, Any]] = []
     for it in ordered:
+        if it.get("status") != "closed" and not it.get("slug"):
+            it["slug"] = slug_of(it)
         proj = it.get("project") or _project_for(
             it.get("source", ""), it.get("repo_path", ""), ""
         )
@@ -726,7 +730,7 @@ def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _matches(it: Dict[str, Any], ident: Any) -> bool:
     """Match an item by global number or by ref ('DEMO-2', case-insensitive)."""
-    s = str(ident).strip()
+    s = canonical_ref(ident)
     if s.isdigit() and int(it.get("number", 0)) == int(s):
         return True
     return str(it.get("ref", "")).upper() == s.upper()
@@ -1106,6 +1110,9 @@ def _save_unlocked(data: Dict[str, Any]) -> None:
     the caller just loaded from the legacy JSON if one existed, so that
     build is the one-time migration. Callers hold ``_FileLock`` (same
     contract as the JSON era), so load→diff→write is race-free."""
+    for it in data.get("items", []):
+        if it.get("status") != "closed" and not it.get("slug"):
+            it["slug"] = slug_of(it)
     _sync_duplicates_unlocked(data)
     db = _db_path()
     if not db.exists():
@@ -1711,7 +1718,7 @@ def _notify_ticket_event(
         pass
     if not targets:
         return
-    ref = str(item.get("ref") or item.get("number") or "?")
+    ref = display_ref(item)
     verb = _NOTIFY_VERBS.get(event, event)
     text = f"[watchtower] {ref} {verb}"
     if detail:
@@ -1835,6 +1842,7 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
         "text": _clip(text or note, 24000),
         "url": _clip(url, 1000),
         "title": _clip(title, 200),
+        "slug": ticket_slug(title or note),
         "selector": _clip(selector, 1000),
         "screenshot_path": str(screenshot_path or ""),
         "repo_path": str(repo_path or ""),
@@ -2079,7 +2087,7 @@ class WindowSpec:
         self.updated_since = updated_since
         self.events = tuple(events or ())
         self.event_since, self.event_until = event_since, event_until
-        self.refs = tuple(str(r).upper() for r in (refs or ()))
+        self.refs = tuple(canonical_ref(r) for r in (refs or ()))
 
     def matches(self, it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Reference evaluation for comparing indexed reads with full scans."""
@@ -2220,7 +2228,7 @@ def _window_from_index(db: Path, proj: str, spec: "WindowSpec", offset: int, lim
 
 def items_by_refs(refs: List[str]) -> Dict[str, Dict[str, Any]]:
     """Resolve only named dependencies from local stores and GitHub mirrors."""
-    wanted = {str(r).upper() for r in refs if r}
+    wanted = {canonical_ref(r) for r in refs if r}
     out = {}
     by_project = {}
     for ref in wanted:
@@ -2479,10 +2487,12 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     dependency_wait = bool(fields.pop("_dependency_wait", False))
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
-        "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
+        "note", "text", "title", "slug", "url", "selector", "screenshot_path", "repo_path",
         "needs_input", "block_question", "model_floor", "blocked_by", "gates", "accept",
         "planner_model", "verifier_model", "placement", "client_id",
     })
+    if "slug" in fields:
+        fields["slug"] = ticket_slug(fields["slug"])
     if "placement" in fields:
         raw = str(fields["placement"] or "").strip().lower()
         if raw and raw not in VALID_PLACEMENTS:
@@ -4912,9 +4922,10 @@ def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any,
         return None
     res = item.get("resolution") or {}
     deps = _dependents_of(ref)
-    text = (f"[watchtower] {ref} awaits your review -- "
+    label = display_ref(item)
+    text = (f"[watchtower] {label} awaits your review -- "
             f"{_clip(str(res.get('summary') or item.get('title') or ''), 200)}. "
-            f"Run `wt accept {ref}` or `wt reject {ref} --reason \"...\"`."
+            f"Run `wt accept {label}` or `wt reject {label} --reason \"...\"`."
             + (f" Accepting unblocks: {', '.join(deps)}." if deps else ""))
     try:
         from . import liveness, messages

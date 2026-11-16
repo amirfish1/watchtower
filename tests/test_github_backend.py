@@ -1454,7 +1454,7 @@ def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys)
 
     assert main(["claim", "-q", "GHCLI", "--worker", "cli-worker"]) == 0
     out = capsys.readouterr().out
-    assert "CLAIMED: GHCLI-1 -> cli-worker" in out
+    assert "CLAIMED: GHCLI-1:cli-issue -> cli-worker" in out
 
     assert main([
         "close", "GHCLI-1",
@@ -4697,3 +4697,26 @@ def test_tracker_github_blocks_do_not_create_claims(tmp_path, monkeypatch):
     assert blocked['needs_input'] and not blocked.get('claimed_by')
     assert q.count_claimable('GHI') == q.count_manual_eligible('GHI') == 0
     assert q.peek_next(project='GHI') is None
+
+
+def test_named_refs_round_trip_github_titles_and_metadata(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("SMALL-BUGS", "github")
+    config.set_github_repo("SMALL-BUGS", "test-owner/test-repo")
+    item = q.enqueue(project="SMALL-BUGS", title="Fix ticket names", note="Details")
+    assert item["ref"] == "SMALL-BUGS-1"
+    assert item["title"] == "Fix ticket names"
+    assert item["slug"] == "fix-ticket-names"
+    issue = json.loads(state.read_text())["issues"][0]
+    assert issue["title"] == "SMALL-BUGS-1:fix-ticket-names Fix ticket names"
+    assert q.get("SMALL-BUGS-1:mistyped")["ref"] == item["ref"]
+    assert q.get("SMALL-BUGS-1-old-name")["ref"] == item["ref"]
+    edited = q.update("SMALL-BUGS-1:old", title="New title", slug="Renamed ticket")
+    assert edited["slug"] == "renamed-ticket"
+    assert edited["title"] == "New title"
+    issue = json.loads(state.read_text())["issues"][0]
+    assert issue["title"] == "SMALL-BUGS-1:renamed-ticket New title"
+    assert 'slug: "renamed-ticket"' in issue["body"]
+    q.update("SMALL-BUGS-1:anything", title="Another title")
+    assert q.get("SMALL-BUGS-1")["slug"] == "renamed-ticket"

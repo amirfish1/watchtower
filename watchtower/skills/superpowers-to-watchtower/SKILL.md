@@ -1,4 +1,8 @@
 ---
+
+Use named ticket refs in prose (`WT-79:add-ticket-subscribe`); JSON keeps the
+bare `ref` and separate `slug`. Commands accept bare refs and stale names.
+
 name: superpowers-to-watchtower
 description: Use when a superpowers plan (writing-plans / brainstorming output saved locally) is ready and you want durable, dashboard-visible tracking instead of an in-session scratch ledger — it imports the plan into a Watchtower queue as tickets, then optionally dispatches one CCC lane per ticket that closes its ticket with a summary. Bridges superpowers (ephemeral subagents, file-tracked) to Watchtower (durable queue) to CCC (fleet dashboard).
 allowed-tools: Bash

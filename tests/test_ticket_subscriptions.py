@@ -93,7 +93,8 @@ def test_filing_prints_subscription_status(wt_cli, monkeypatch, capsys, subscrib
         args.append('--subscribe')
     assert wt_cli.cli.main(args) == 0
     out = capsys.readouterr().out
-    ref = wt_cli.q.list_items(project='SUB')[0]['ref']
+    from watchtower.refs import display_ref
+    ref = display_ref(wt_cli.q.list_items(project='SUB')[0])
     assert 'FILED: ' + ref in out
     assert ("you'll be notified" if subscribe else f'no updates to you; run wt subscribe {ref} to hear back') in out
 

@@ -5,6 +5,10 @@ description: Use to review WatchTower queues end to end - "triage", "sweep", "qu
 
 # Queue review: health first, then content
 
+Use named ticket refs in prose (`WT-79:add-ticket-subscribe`); JSON keeps the
+bare `ref` and separate `slug`. Commands accept bare refs and stale names.
+
+
 One workflow. Two levels, always in this order, because a stuck queue can't
 deliver the answers a content review produces:
 

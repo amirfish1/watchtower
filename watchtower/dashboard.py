@@ -44,6 +44,8 @@ the same way (see docs/messaging-design.md).
 
 from __future__ import annotations
 
+from .refs import display_ref
+
 import hmac
 import html
 import json
@@ -477,7 +479,7 @@ _STYLE = """
     }
     .thead { color: var(--muted); font-size: 11px; letter-spacing: .1em;
              text-transform: uppercase; }
-    .tref { font-size: 13px; color: var(--beam); }
+    .tref { font-size: 13px; color: var(--beam); overflow-wrap: anywhere; }
     .tstatus { font-size: 12px; }
     .tstatus.open { color: var(--muted); }
     .tstatus.in_progress { color: var(--calm); }
@@ -1205,7 +1207,7 @@ def _closed_block(closed: List[Dict[str, Any]], total_closed: int) -> str:
         crows.append(
             f'      <div class="crow">\n'
             f'        <div class="crow-top">\n'
-            f'          <span class="tref mono">{ref}</span>\n'
+            f'          <span class="tref mono">{html.escape(display_ref(it))}</span>\n'
             f'          <span class="tworker mono">{worker}</span>\n'
             f'          {summary_html}\n'
             f'        </div>\n'
@@ -1418,7 +1420,7 @@ def render_queue(
         status_text = "awaiting decision" if gated else status
         trows.append(
             f'      <div class="trow">\n'
-            f'        <span class="tref mono">{ref}</span>\n'
+            f'        <span class="tref mono">{html.escape(display_ref(it))}</span>\n'
             f'        <span class="tstatus {status_class} mono">{html.escape(status_text)}</span>\n'
             f'        <span class="tworker mono">{worker}</span>\n'
             f'        <span class="ttitle">{title}</span>\n'

@@ -31,6 +31,12 @@ def test_bracketed_tag_answer():
     assert r.parse_reply("[A-1] yes", ["A-1"]) == ("answer", "A-1", "yes")
 
 
+def test_named_ref_answer():
+    for text in ("[SMALL-BUGS-7:old-name] yes", "SMALL-BUGS-7:anything yes", "SMALL-BUGS-7-old-name yes"):
+        assert r.parse_reply(text, ["SMALL-BUGS-7"]) == ("answer", "SMALL-BUGS-7", "yes")
+    assert r.parse_reply("A-1:only-a-name", ["A-1"]) is None
+
+
 def test_prefix_ref_not_matched():
     assert r.parse_reply("A-10 yes", ["A-1"]) is None
 
@@ -60,7 +66,7 @@ def test_question_wording_is_pinned():
     # for word; changing the format here must change it there too.
     assert r.format_question(T) == QUESTION
     assert r.parse_reply("PROJECTS-7 yes", ["PROJECTS-7"]) == ("answer", "PROJECTS-7", "yes")
-    assert r.REF_RE.pattern == r"^\s*\[?([A-Za-z][A-Za-z0-9_-]*-\d+)\]?(?![\w-])[\s:,-]*(.*)$"
+    assert r.REF_RE.match("PROJECTS-7:stale yes").groups() == ("PROJECTS-7", "yes")
 
 
 @pytest.fixture
