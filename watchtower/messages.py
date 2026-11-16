@@ -889,6 +889,8 @@ def _deliver_resume(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     line, and does not track the process further. Refuses (with ``busy``) when
     the target session looks actively mid-turn."""
     sid = str(resolved.get("session_id") or "")
+    if _is_restricted(resolved):
+        return _restricted_refusal()
     if resolved.get("engine") != "claude" or not sid:
         return {"ok": False, "error": "resume needs a claude session_id"}
     if _find_transcript(sid) is None:
@@ -1425,6 +1427,11 @@ def compact_codex(resolved: Dict[str, Any]) -> Dict[str, Any]:
     sid = str(resolved.get("session_id") or "").strip()
     if not sid:
         return {"ok": False, "error": "codex compact needs a thread/session id"}
+    if _is_restricted(resolved):
+        # Neither CCC's compact endpoint nor WT's shared app-server carries
+        # the thread's sandbox profile.
+        return _restricted_refusal("sandbox session cannot be compacted outside its "
+                                   "policy-bound app-server")
     base = _delegate_base() if _codex_delegate_first_enabled() else None
     if base:
         try:
@@ -1696,6 +1703,8 @@ def _deliver_delegate(
     force_queue: bool = False, delegate_timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Adapter 3 (optional, last): hand delivery to a configured delegate."""
+    if _is_restricted(resolved):
+        return _restricted_refusal()
     base = _delegate_base()
     if not base:
         return {"ok": False, "error": "no delegate configured"}
@@ -1748,6 +1757,10 @@ def _continue_if_cold(resolved: Dict[str, Any], text: str) -> Optional[Dict[str,
     None means "deliver normally": no delegate, no session id, the decision
     says the session is small or still warm, or any lookup/spawn failure --
     this is a cost optimisation and must never block delivery."""
+    if _is_restricted(resolved):
+        # A continuation is a brand-new unsandboxed session seeded from the
+        # restricted one. Refuse instead of "deliver normally".
+        return _restricted_refusal()
     base = _delegate_base()
     sid = str(resolved.get("session_id") or "")
     if not base or not sid:
@@ -1966,6 +1979,56 @@ def _deliver_notify(
             "error": "; ".join(errors)}
 
 
+def _is_restricted(resolved: Dict[str, Any], target: str = "") -> bool:
+    """Engine-independent sandbox guard (WT-61).
+
+    Restriction is a durable property of the session/worker (tombstones that
+    outlive ``workers.json`` pruning), so it is decided from every identity
+    the caller supplied -- resolved session, worker, address name and the raw
+    target, with any ``<node>:`` prefix stripped -- never from the engine
+    guess, which falls back to ``claude`` for an unknown UUID. An unreadable
+    ledger counts as restricted.
+    """
+    from . import sandbox_bridge
+    worker = resolved.get("worker") or {}
+    names: List[str] = []
+    for value in (resolved.get("session_id"), target, resolved.get("target"),
+                  resolved.get("name"),
+                  worker.get("session_id"), worker.get("worker_id")):
+        value = str(value or "")
+        if value:
+            names.append(value)
+            if ":" in value:
+                names.append(value.rsplit(":", 1)[1])
+    try:
+        return any(sandbox_bridge.restricted_session(n, n) for n in names)
+    except Exception:  # noqa: BLE001 - never grant promotion on a ledger failure
+        return True
+
+
+def _restricted_refusal(error: str = "") -> Dict[str, Any]:
+    """Terminal: not retryable, so it is never parked in the outbox."""
+    return {"ok": False, "terminal": True, "busy": False, "code": "sandbox_restricted",
+            "error": error or "sandbox session: only its live policy-bound worker may "
+                              "be messaged; resume, delegate and continuation are refused"}
+
+
+def _deliver_restricted(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """The one permitted transport for a restricted session: steer the live,
+    pinned app-server worker. Anything else is a terminal refusal."""
+    sid = str(resolved.get("session_id") or "")
+    if resolved.get("remote_node") or not sid:
+        return _restricted_refusal()
+    from . import codex_app_worker
+    try:
+        result = codex_app_worker.steer(sid, text)
+    except Exception as exc:  # noqa: BLE001
+        return _restricted_refusal(f"sandbox steer failed: {exc}")
+    if result.get("ok"):
+        return result
+    return _restricted_refusal(str(result.get("error") or "") or None)
+
+
 def _deliver_unreceipted(
     resolved: Dict[str, Any], text: str, mode: str = "send",
     *, force_queue: bool = False, prefer_uds: bool = False,
@@ -1974,14 +2037,11 @@ def _deliver_unreceipted(
 ) -> Dict[str, Any]:
     errors: List[str] = []
     busy = False
-    if resolved.get("engine") == "codex":
-        from . import sandbox_bridge
-        worker = resolved.get("worker") or {}
-        if sandbox_bridge.restricted_session(str(resolved.get("session_id") or ""), str(worker.get("worker_id") or "")):
-            from . import codex_app_worker
-            # No delegate, resume or generic app-server fallback can silently
-            # promote a sandboxed thread to a full-access turn.
-            return codex_app_worker.steer(str(resolved.get("session_id") or ""), text)
+    if _is_restricted(resolved):
+        # Whatever the engine label says: no delegate, resume or generic
+        # app-server fallback can promote a sandboxed thread to a full-access
+        # turn.
+        return _deliver_restricted(resolved, text)
     if resolved.get("remote_node"):
         # Another node's session: no local socket, FIFO, TTY or transcript can
         # reach it, so the delegate's federation proxy is the only transport.
@@ -2464,6 +2524,7 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
             resolved = resolve_target(str(m.get("to") or ""), include_recent=False)
             if m.get("engine"):
                 resolved["engine"] = str(m["engine"])
+            resolved["target"] = str(m.get("to") or "")
             resolved["attr"] = envelope.relay(
                 m.get("attr") or envelope.make(m.get("to", "")), "wt:outbox")
             # `notify` only when it is actually set: `deliver` is
@@ -2531,7 +2592,7 @@ def drain_outbox(now: Optional[float] = None) -> Dict[str, List[str]]:
                 )
             else:
                 m["last_error"] = str(res.get("error") or "delivery failed")
-                if attempts >= MAX_ATTEMPTS:
+                if attempts >= MAX_ATTEMPTS or res.get("terminal"):
                     m["status"] = "dead"
                     result["dead"].append(str(m["id"]))
                     if m.get("ticket"):
@@ -2630,6 +2691,7 @@ def send(
         if reserved.get("action") in ("queued", "in_flight"):
             return {"ok": False, "deduped": True, "queued": reserved["action"] == "queued", "in_flight": reserved["action"] == "in_flight", "id": reserved.get("msg_id"), "message_id": attr["message_id"], "attribution_v": 1}
     resolved["attr"] = attr
+    resolved["target"] = str(target or "")      # the raw address, for the sandbox guard
     if same_session:
         resolved["same_session"] = True
         resolved["session_settings"] = dict(session_settings or {})
@@ -2675,7 +2737,7 @@ def send(
         if owns_ledger:
             ledger_mark(dedupe_key, "sent")
         return out
-    if not queue_on_fail:
+    if not queue_on_fail or result.get("terminal"):
         if owns_ledger:
             ledger_release(dedupe_key)
         return {"ok": False, "queued": False,
@@ -2952,6 +3014,9 @@ def ask(target: str, text: str, timeout_ms: int = 30000, *, attr=None) -> Dict[s
     except ValueError as e:
         return {"ok": False, "error": str(e), "source": "resolve"}
     deadline = time.time() + max(0.1, timeout_ms / 1000.0)
+    if _is_restricted(resolved, target):
+        # ask would POST to the delegate / resume the session unsandboxed.
+        return dict(_restricted_refusal(), source="sandbox-policy")
 
     w = resolved.get("worker") or {}
     log = str(w.get("log") or "")

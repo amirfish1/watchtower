@@ -33,6 +33,138 @@ from typing import Iterable, List, Tuple
 
 COMMIT_SHA_RE = re.compile(r"[0-9a-fA-F]{7,64}")
 
+# Host git must never act on a repository whose metadata a sandboxed worker
+# could have written (WT-61): config can name an ``uploadpack`` helper, a
+# ``core.fsmonitor`` hook or a promisor remote that runs with the daemon's
+# authority the moment git needs an object it lacks. The primary control is
+# ``restricted_repo`` below (never run git there at all). These are defence in
+# depth for every local host git invocation, restricted or not.
+GIT_HARDEN_ARGS = (
+    "-c", "protocol.allow=never", "-c", "core.fsmonitor=false",
+    "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false",
+    "-c", "core.alternateRefsCommand=", "-c", "gc.auto=0",
+    "-c", "maintenance.auto=false", "-c", "fetch.fsckObjects=false",
+)
+
+
+def git_env() -> dict:
+    """Environment for host git: no lazy fetch, replacement refs or prompts."""
+    env = dict(os.environ)
+    env.update(GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1",
+               GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0",
+               GIT_ASKPASS="true", GIT_CONFIG_NOSYSTEM="1")
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_INDEX_FILE", "GIT_EXEC_PATH",
+                "GIT_EXTERNAL_DIFF", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_PROXY_COMMAND"):
+        env.pop(key, None)
+    return env
+
+
+def _real(path) -> str:
+    try:
+        return os.path.realpath(os.path.expanduser(str(path)))
+    except (OSError, ValueError):
+        return os.path.abspath(os.path.expanduser(str(path)))
+
+
+def _within(path: str, root: str) -> bool:
+    return bool(root) and (path == root or path.startswith(root.rstrip(os.sep) + os.sep))
+
+
+def _restricted_roots():
+    """``(roots, unknown)`` -- every workspace/store a sandbox owns, durably.
+
+    Sources are the live queue configuration (any queue set to
+    ``workspace-write``) AND the trusted bridge scopes, which survive a queue
+    setting being turned off later. ``unknown`` is True when the ledger cannot
+    be read: that never grants host git access.
+    """
+    roots = []
+    unknown = False
+    try:
+        from . import config
+        data = config._load()
+        for name, entry in (data.items() if isinstance(data, dict) else ()):
+            if not isinstance(entry, dict):
+                continue
+            if config.codex_sandbox(name) == "workspace-write":
+                for key in ("repo_path",):
+                    if entry.get(key):
+                        roots.append(_real(entry[key]))
+                try:
+                    roots.append(_real(config.codex_sandbox_store(name)))
+                except Exception:  # noqa: BLE001 - store path is only extra scope
+                    pass
+    except Exception:  # noqa: BLE001 - unreadable queue config: fail closed
+        unknown = True
+    try:
+        from . import sandbox_bridge
+        try:
+            with sandbox_bridge.directory(sandbox_bridge.authority_dir()) as fd:
+                names = [n for n in os.listdir(fd) if n.endswith(".json")]
+                for name in names:
+                    try:
+                        scope = sandbox_bridge._read(fd, name)
+                    except (OSError, ValueError):
+                        unknown = True
+                        continue
+                    for key in ("repo", "store"):
+                        if isinstance(scope, dict) and scope.get(key):
+                            roots.append(_real(scope[key]))
+        except FileNotFoundError:
+            pass
+    except Exception:  # noqa: BLE001 - unreadable bridge ledger: fail closed
+        unknown = True
+    return roots, unknown
+
+
+def _git_pointers(repo: str) -> List[str]:
+    """Paths a ``.git`` file or ``commondir`` file sends git to, unresolved
+    beyond one hop: pointing a trusted-looking checkout at a sandbox's git
+    directory is the same escape as running git in the sandbox."""
+    out: List[str] = []
+    dotgit = os.path.join(repo, ".git")
+    try:
+        if os.path.isfile(dotgit) and not os.path.islink(dotgit):
+            with open(dotgit, "r", errors="replace") as fh:
+                first = fh.read(4096).strip()
+            if first.startswith("gitdir:"):
+                target = first[len("gitdir:"):].strip()
+                target = target if os.path.isabs(target) else os.path.join(repo, target)
+                out.append(_real(target))
+                common = os.path.join(target, "commondir")
+                if os.path.isfile(common):
+                    with open(common, "r", errors="replace") as fh:
+                        rel = fh.read(4096).strip()
+                    out.append(_real(rel if os.path.isabs(rel) else os.path.join(target, rel)))
+        elif os.path.islink(dotgit):
+            out.append(_real(dotgit))
+    except OSError:
+        out.append(repo)
+    return out
+
+
+def restricted_repo(repo: str, _ledger=None) -> str:
+    """Why host git must not touch ``repo`` ("" when it may).
+
+    A repo is restricted when it is, lies inside, or is reached through the
+    git pointers of a sandbox workspace/store -- by configuration or by durable
+    bridge scope. Remote ``host:/path`` repos are not local metadata.
+    """
+    repo = str(repo or "").strip()
+    if not repo or _REMOTE_RE.match(repo):
+        return ""
+    real = _real(repo)
+    roots, unknown = _ledger if _ledger is not None else _restricted_roots()
+    if unknown:
+        return "sandbox restriction ledger is unreadable; refusing host git"
+    for candidate in (real, *_git_pointers(real)):
+        for root in roots:
+            if _within(candidate, root):
+                return (f"{repo} is a sandbox workspace; refusing host git "
+                        "against worker-writable repository metadata")
+    return ""
+
 # ``host:/path`` (ssh) rather than a Windows-style drive or a bare relative
 # path. Requires the path component to be absolute so "repo:sha"-ish typos do
 # not silently become remote lookups.
@@ -49,7 +181,8 @@ def _rev_parse_argv(repo: str, candidate: str) -> Tuple[List[str], str]:
     Remote repos are verified with the identical ``git rev-parse`` run over
     ssh, so a remote proof is exactly as strong as a local one.
     """
-    verify = ["git", "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"]
+    verify = ["git", *GIT_HARDEN_ARGS, "rev-parse", "--verify", "--quiet",
+              f"{candidate}^{{commit}}"]
     remote = _REMOTE_RE.match(repo)
     if remote:
         return (
@@ -82,10 +215,15 @@ def resolve_in_repo(repo: str, candidate: str) -> Tuple[str, str]:
     if not argv:
         return "", ""
     remote = bool(_REMOTE_RE.match(repo))
+    if not remote:
+        why = restricted_repo(repo)
+        if why:
+            return "", why
     try:
         result = subprocess.run(
             argv,
             cwd=None if remote else repo,
+            env=None if remote else git_env(),
             capture_output=True,
             text=True,
             check=False,
@@ -121,12 +259,15 @@ def configured_repos() -> List[str]:
     except Exception:
         return []
     repos: List[str] = []
+    ledger = _restricted_roots()
     if isinstance(data, dict):
         for entry in data.values():
             if not isinstance(entry, dict):
                 continue
             repo = str(entry.get("repo_path") or "").strip()
-            if repo and repo not in repos:
+            # A sandbox queue's workspace is worker-writable: never a place
+            # a different queue's close proof may run host git (WT-61).
+            if repo and repo not in repos and not restricted_repo(repo, ledger):
                 repos.append(repo)
     return repos
 
@@ -145,6 +286,17 @@ def search_order(primary: str, extra: Iterable[str] = ()) -> List[str]:
     return order
 
 
+def safe_search_order(primary: str, extra: Iterable[str] = ()) -> List[str]:
+    """``search_order`` minus every sandbox workspace except an explicit
+    ``primary`` (which ``resolve_in_repo`` itself refuses and reports)."""
+    out: List[str] = []
+    for repo in search_order(primary, extra):
+        if repo != str(primary or "").strip() and restricted_repo(repo):
+            continue
+        out.append(repo)
+    return out
+
+
 def verify_with_errors(
     candidate: str, primary: str, extra: Iterable[str] = ()
 ) -> Tuple[str, str, List[str]]:
@@ -158,7 +310,7 @@ def verify_with_errors(
     if not COMMIT_SHA_RE.fullmatch(candidate):
         return "", "", []
     errors: List[str] = []
-    for repo in search_order(primary, extra):
+    for repo in safe_search_order(primary, extra):
         verified, err = resolve_in_repo(repo, candidate)
         if verified:
             return verified, repo, []

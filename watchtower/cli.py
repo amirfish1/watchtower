@@ -3570,11 +3570,19 @@ def _resume_session_headless(
     worker id so the orphan sweep cannot reopen its ticket and spawn a second
     owner while the answer is being applied. Returns True if the resume process
     started."""
+    # Engine-independent: a restricted session's label can be wrong or absent
+    # (an unknown UUID defaults to claude), and every headless resume below is
+    # a full-access process that would silently drop the sandbox policy.
+    from . import config, sandbox_bridge
+    try:
+        restricted = bool((queue and config.codex_sandbox(queue) == "workspace-write")
+                          or sandbox_bridge.restricted_session(sid, worker_id)
+                          or (worker_id and sandbox_bridge.restricted_session("", worker_id)))
+    except Exception:  # noqa: BLE001 - an unreadable ledger never grants promotion
+        restricted = True
+    if restricted:
+        return False
     if engine == "codex":
-        from . import config, sandbox_bridge
-        if ((queue and config.codex_sandbox(queue) == "workspace-write")
-                or sandbox_bridge.restricted_session(sid, worker_id)):
-            return False  # a generic exec resume must never drop sandbox policy
         argv = [
             "codex", "exec", "resume",
             "--dangerously-bypass-approvals-and-sandbox",

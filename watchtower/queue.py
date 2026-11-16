@@ -6215,7 +6215,13 @@ def group_sweep(only_ref: str = "") -> List[Tuple[str, str]]:
             if not repo:
                 from . import config as _config
                 repo = str(_config.repo_path(str(snap.get("project") or "")) or "")
-            sha, source, problem = integration_git.containing_sha(repo, commits)
+            if _group_sandbox_origin(snap):
+                # Before any host git: the member commits live in isolated
+                # stores and the workspace metadata is worker-writable.
+                problem = ("sandbox_restricted: sandbox group reconciliation requires "
+                           "isolated git/gate transport; refusing host git execution")
+            else:
+                sha, source, problem = integration_git.containing_sha(repo, commits)
             if sha and not problem:
                 snap["repo_path"] = repo
                 results, stages = evaluate_gates(snap, sha, pinned=True)
@@ -6224,6 +6230,24 @@ def group_sweep(only_ref: str = "") -> List[Tuple[str, str]]:
         acted.append((ref, _group_integration_commit(ref, token, commits, sha, source,
                                                      problem, results, stages)))
     return acted
+
+
+def _group_sandbox_origin(snap: Dict[str, Any]) -> bool:
+    """True when the group's parent or ANY member came from a sandboxed worker
+    or queue, judged by durable origin (session/worker tombstones) and not only
+    today's queue setting. Fails closed on any lookup error."""
+    try:
+        from . import config
+        if _sandbox_restricted(snap):
+            return True
+        for ref in group_children(snap):
+            child = get(ref) or {}
+            if (config.codex_sandbox(str(child.get("project") or "")) == "workspace-write"
+                    or _sandbox_restricted(child)):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 - an unreadable ledger never grants host git
+        return True
 
 
 def _group_integration_commit(ref: str, token: str, commits: Dict[str, str], sha: str,
@@ -6264,7 +6288,8 @@ def _group_integration_commit(ref: str, token: str, commits: Dict[str, str], sha
         setup = next((r for r in results if r.get("setup_failed")), None)
         outcome = ""
         if problem.startswith("commit_missing") or problem.startswith("no_repo") \
-                or problem.startswith("gate_setup") or setup is not None:
+                or problem.startswith("gate_setup") or problem.startswith("sandbox_restricted") \
+                or setup is not None:
             kind = "commit_missing" if problem.startswith("commit_missing") else "gate_setup"
             integ.update(state="idle", blocked=kind)
             detail = problem or str((setup or {}).get("output_tail") or "")

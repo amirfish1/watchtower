@@ -19,9 +19,13 @@ from . import close_proof
 
 
 def _git(repo: str, *args: str) -> Tuple[int, str]:
+    # Same hardening as close proofs: repository config is untrusted input.
+    if close_proof.restricted_repo(repo):
+        return -1, "restricted sandbox repository"
     try:
-        proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
-                              timeout=30)
+        proc = subprocess.run(["git", *close_proof.GIT_HARDEN_ARGS, "-C", repo, *args],
+                              capture_output=True, text=True, timeout=30,
+                              env=close_proof.git_env())
     except (OSError, subprocess.SubprocessError) as exc:
         return -1, str(exc)
     return proc.returncode, (proc.stdout or "").strip()
@@ -43,6 +47,10 @@ def containing_sha(repo: str, commits: Dict[str, str]) -> Tuple[str, str, str]:
     repo = os.path.expanduser(str(repo or ""))
     if not repo or not os.path.isdir(repo):
         return "", "", f"no_repo: {repo or '(no repo_path)'} is not a directory"
+    why = close_proof.restricted_repo(repo)
+    if why:
+        # Before ANY git: even rev-parse can run attacker-chosen helpers.
+        return "", "", f"sandbox_restricted: {why}"
     full: Dict[str, str] = {}
     for ref, sha in commits.items():
         if not sha:
