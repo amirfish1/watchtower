@@ -86,3 +86,17 @@ def test_restricted_prompt_describes_available_operations(env):
     assert "~/.watchtower/learnings" not in text
     assert "git push origin" not in text and "--no-code" in text
     assert "--wait-on" not in text  # coordinator supplies trusted wait routing
+
+
+def test_old_handoff_cannot_adopt_after_answer_generation_changes(env, monkeypatch):
+    w = env
+    sha, trusted = fixture_patch(w, monkeypatch)
+    item = claim(w)
+    assert submit(w, "close", dict(close_body(item["ref"]), commit=sha, no_code=False), w.claim)["ok"]
+    with w.queue._FileLock(w.queue._lock_path()):
+        data = w.queue._load_unlocked()
+        next(x for x in data["items"] if x["ref"] == item["ref"])["last_answer_gen"] = 42
+        w.queue._save_unlocked(data)
+    with pytest.raises(ValueError, match="current parked claim"):
+        handoff.adopt(w.worker, sha, trusted)
+    assert (trusted / "sum.py").read_text() == "answer = 4\n"

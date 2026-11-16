@@ -104,6 +104,28 @@ def adopt(worker, commit, destination):
     with storage.file_lock(directory / (name + ".lock")):
         with bridge.directory(directory) as fd:
             record = bridge._read(fd, name + ".json")
+            from . import config, queue as q, store_identity
+            if record["source"] != str(q._db_path().resolve()):
+                raise ValueError("handoff belongs to a different source store")
+            with q._FileLock(q._lock_path()) as source_lock:
+                if source_lock._fh is None:
+                    raise ValueError("handoff source lock unavailable")
+                if store_identity.read_unlocked(q._resolve_store_path()) != record["store_id"]:
+                    raise ValueError("handoff source identity changed")
+                data = q._load_unlocked()
+                item = next((x for x in data["items"] if x.get("ref") == record["ref"]), {})
+                if config.product_gate(record["queue"]) and not (item.get("product_ack") or item.get("pre_ack")):
+                    raise ValueError("product acknowledgement is required before adoption")
+                fence = bridge._fence(item)
+                before = record["claim"]["fence"]
+                if (item.get("status") != q.PARKED_STATUS or not item.get("needs_input")
+                        or (item.get("parked") or {}).get("worker_id") != worker
+                        or (item.get("wait") or {}).get("on") != "worker"
+                        or any(fence.get(k) != before.get(k) for k in
+                               ("last_answer_gen", "_bridge_claim_count"))
+                        or not any(h.get("event") == "progress" and
+                                   name + ".json" in h.get("text", "") for h in item.get("history", []))):
+                    raise ValueError("handoff no longer belongs to the current parked claim")
             patch_fd = os.open(name + ".patch", os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
             with os.fdopen(patch_fd, "rb") as source:
                 raw = source.read(MAX_PATCH + 1)

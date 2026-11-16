@@ -833,6 +833,9 @@ def _execute(scope, request, key):
         raise ValueError("invalid commit proof")
     resolution = _resolution(body)
     if body["commit"]:
+        from . import config
+        if config.product_gate(scope["queue"]) and not (item.get("product_ack") or item.get("pre_ack")):
+            raise ValueError("product acknowledgement is required before a code handoff")
         resolution["commit"] = _commit_proof(scope, body["commit"])
         from . import sandbox_handoff
         artifact = sandbox_handoff.export(scope, resolution)
