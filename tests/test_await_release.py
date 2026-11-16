@@ -312,3 +312,10 @@ def test_new_release_commit_is_fetched_before_build_comparison(env, repo, tmp_pa
     _git(builder, "push", "origin", "next")
     assert r.release_wait.on_branch(repo["path"], repo["merged"], build)["state"] == "unknown"
     assert r.observe("ccc:dashboard", build, evidence="new running release") == [dict(ref=ref, status="open")]
+    # A deleted release branch must not keep a stale origin/next as proof.
+    q.claim_by_ref(ref, "w2")
+    r.park(ref, "w2", repo=repo["path"], commit=repo["merged"], branch="origin/next",
+           target="ccc:dashboard", reason="another release check")
+    _git(builder, "push", "origin", "--delete", "next")
+    assert r.observe("ccc:dashboard", build, evidence="branch was deleted") == []
+    assert r.owner_rows([q.get(ref)])[0]["branch_state"] == "unknown"

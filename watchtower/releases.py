@@ -106,7 +106,7 @@ def observe(target, build, *, evidence, items=None):
             if rc or "origin" not in remotes.splitlines():
                 refreshed[repo] = rc == 0  # local-only repository/fixture
             else:
-                refreshed[repo] = release_wait._git(repo, "fetch", "--no-tags", "origin")[0] == 0
+                refreshed[repo] = release_wait._git(repo, "fetch", "--prune", "--no-tags", "origin")[0] == 0
                 if refreshed[repo] and release_wait._git(repo, "cat-file", "-e", f"{build}^{{commit}}")[0]:
                     refreshed[repo] = release_wait._git(repo, "fetch", "--no-tags", "origin", build)[0] == 0
         if not refreshed[repo]:
