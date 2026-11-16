@@ -24,8 +24,10 @@ ticket out of the read-only SQLite snapshot; callers still receive private data.
 
 The iMessage router and the intake bridge's `WatchTowerClient.find/blocked` use
 HTTP reads. `WATCHTOWER_API_URL` overrides the base URL. They never fall back to
-spawning a CLI on an outage: the polling loop records the failure and retains
-its state for the next tick. Write commands retain their existing CLI path.
+spawning a CLI on an outage. Blocked reads raise without clearing notification
+state. Intake ticket lookups preserve the existing unknown-state result on
+transport failure: reconciliation skips it, and the keyed-create guard must
+not dispatch it. Write commands retain their existing CLI path.
 Deploy the server endpoints before restarting the clients. Restart only
 `wt-imessage-router.service` and the four `client-intake@...` units; no gateway
 or WhatsApp bridge restart is required.
