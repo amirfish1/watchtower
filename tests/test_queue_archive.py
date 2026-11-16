@@ -83,6 +83,33 @@ def test_refuses_with_open_tickets_unless_force(env, capsys):
     assert config.is_archived("DEAD")
 
 
+def test_force_archive_retires_only_existing_refs_and_restores_on_unarchive(env):
+    from watchtower import owner_view
+
+    retired = _item("DEAD-1", "open")
+    retired.update(needs_input=True, block_question="missing synthetic commit",
+                   gates=["plan", "cmd:echo hi"])
+    env.append(retired)
+    original = json.dumps(retired, sort_keys=True)
+    assert cli.cmd_queue_archive(_ns(apply=True, force=True)) == 0
+    assert config.ticket_is_archived(retired)
+    assert "DEAD" not in {r["queue"] for r in health.all_status(items=list(env))}
+    assert owner_view.build(list(env))["blocked"] == 0
+    assert json.dumps(retired, sort_keys=True) == original
+    assert "DEAD" in {r["queue"] for r in health.all_status(items=list(env), include_archived=True)}
+
+    later = _item("DEAD-2", "open")
+    later.update(needs_input=True, block_question="A real later question")
+    env.append(later)
+    assert not config.ticket_is_archived(later)
+    assert next(r for r in health.all_status(items=list(env)) if r["queue"] == "DEAD")["depth"] == 1
+    view = owner_view.build(list(env))
+    assert view["blocked"] == 1 and view["unclassified"] == ["DEAD-2"]
+    assert cli.cmd_queue_unarchive(_ns()) == 0
+    assert not config.ticket_is_archived(retired)
+    assert owner_view.build(list(env))["blocked"] == 2
+
+
 def test_closed_tickets_do_not_block(env):
     env.append(_item("DEAD-1", "closed"))
     assert cli.cmd_queue_archive(_ns(apply=True)) == 0

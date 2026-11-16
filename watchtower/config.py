@@ -1767,7 +1767,19 @@ def is_archived(queue: str) -> bool:
     return bool(_queue_entry(queue).get("archived", False))
 
 
-def set_archived(queue: str, archived: bool) -> Dict[str, Any]:
+def ticket_is_archived(item: Dict[str, Any]) -> bool:
+    """A forced archive retires its recorded tickets, without closing them.
+
+    Later tickets are deliberately not hidden. Unarchive restores the whole
+    queue, including outstanding questions and unchanged acceptance gates.
+    """
+    entry = _queue_entry(str(item.get("project") or ""))
+    return bool(entry.get("archived") and item.get("ref")
+                and item["ref"] in (entry.get("archived_ticket_refs") or []))
+
+
+def set_archived(queue: str, archived: bool, *,
+                 ticket_refs: Optional[List[str]] = None) -> Dict[str, Any]:
     """Retire (or restore) a queue. Archiving also turns auto_drain off and
     records when; the queue's tickets are untouched."""
     data = _load()
@@ -1778,9 +1790,12 @@ def set_archived(queue: str, archived: bool) -> Dict[str, Any]:
         q["archived"] = True
         q["archived_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         q["auto_drain"] = False
+        if ticket_refs is not None:
+            q["archived_ticket_refs"] = list(ticket_refs)
     else:
         q.pop("archived", None)
         q.pop("archived_at", None)
+        q.pop("archived_ticket_refs", None)
     _save(data)
     return q
 

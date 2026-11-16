@@ -25,6 +25,7 @@ import time
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from . import queue as q
+from . import config
 
 
 class UndeclaredState(ValueError):
@@ -1656,6 +1657,8 @@ def report(queue: str = "", ref: str = "", now: Optional[float] = None) -> List[
     ctx = ResolverContext(now)
     out = []
     for it in items:
+        if not ref and config.ticket_is_archived(it):
+            continue
         if ref and str(it.get("ref") or "") != ref:
             continue
         if queue and str(it.get("project") or "") != queue:
@@ -1679,6 +1682,8 @@ def sweep(now: Optional[float] = None, only_ref: str = "") -> List[Dict[str, Any
     acted: List[Dict[str, Any]] = []
     spawned: set = set()
     for it in items:
+        if config.ticket_is_archived(it):
+            continue
         if only_ref and str(it.get("ref") or "") != only_ref:
             continue
         if it.get("status") == "closed" and \

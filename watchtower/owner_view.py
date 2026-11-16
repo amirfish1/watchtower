@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from . import queue as q
+from . import config
 
 KINDS = ("owner", "unclassified", "system", "external", "dependency", "worker")
 # Blocks WatchTower raised itself (a stage could not start, a plan discussion
@@ -132,7 +133,7 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
     want = q._norm_project(project) if project else ""
     rows: Dict[str, Dict[str, Any]] = {}
     for it in items:
-        if _is_blocked(it):
+        if _is_blocked(it) and not config.ticket_is_archived(it):
             rows[str(it.get("ref") or "").upper()] = _row(it, classify(it), now)
 
     def root_of(ref: str) -> Dict[str, Any]:

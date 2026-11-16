@@ -469,7 +469,7 @@ def cmd_queue_archive(args: argparse.Namespace) -> int:
             print(f"{name}: would archive (auto_drain off, hidden from status); "
                   f"re-run with --apply")
         return 0
-    config.set_archived(name, True)
+    config.set_archived(name, True, ticket_refs=[str(it["ref"]) for it in live])
     if args.json:
         print(json.dumps({"queue": name, "archived": True}, indent=2))
     else:

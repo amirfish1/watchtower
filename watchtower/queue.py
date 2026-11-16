@@ -6071,10 +6071,13 @@ def _group_due_unlocked(items: List[Dict[str, Any]], now: Optional[float] = None
     """Parents whose integration should run now (D7.1): open, sealed, plan
     settled, no open question, every child done, and idle/fixing with no
     open fix -- or gating with a lease past its TTL."""
+    from . import config
     by_ref = _refs_index(items)
     out: List[Dict[str, Any]] = []
     for it in items:
         if group_role(it) != "parent" or it.get("status") != "open" or it.get("needs_input"):
+            continue
+        if config.ticket_is_archived(it):
             continue
         if not group_plan_settled(it) or blocker_verdict(it, by_ref)[0] != "ok":
             continue
@@ -9637,11 +9640,13 @@ def list_blocked(
     every worker holding a blocked ticket there read as fully productive to
     the reconciler's staffing math (see ``list_active_claims``), so a queue
     stuck entirely behind blocked tickets never got replacement workers."""
+    from . import config
     src = list_items(project=project) if items is None else items
     return [it for it in src
-            if it.get("needs_input")
-            or (it.get("status") == PARKED_STATUS
-                and (it.get("pending_answer") or {}).get("state") == "routing")]
+            if not config.ticket_is_archived(it)
+            and (it.get("needs_input")
+                 or (it.get("status") == PARKED_STATUS
+                     and (it.get("pending_answer") or {}).get("state") == "routing"))]
 
 
 def list_active_claims(
