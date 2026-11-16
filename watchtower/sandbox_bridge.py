@@ -136,7 +136,7 @@ def worker_store(queue, worker):
     from . import config
     if not NAME.fullmatch(worker):
         raise ValueError("invalid sandbox worker id")
-    return config.codex_sandbox_store(queue).expanduser().absolute() / worker
+    return canonical(config.codex_sandbox_store(queue)) / worker
 
 
 def _under(path, root):
@@ -322,13 +322,13 @@ def _protected():
     from . import config, queue as q, workers, messages
     home = Path.home()
     control = workers.WORKERS_FILE.parent
-    files = [q.store_path(), q._db_path(), q._lock_path(), config.CONFIG_FILE,
+    files = [q.store_path(), q._db_path(), q._lock_path(), config.config_path(),
              workers.WORKERS_FILE, messages._outbox_file(), Path(sys.executable),
              home / ".netrc", home / ".git-credentials", home / ".gitconfig"]
     binary = workers._resolve_engine_bin("codex")
     if binary:
         files.append(Path(binary))
-    trees = [authority_dir(), storage.data_dir(), Path(__file__).absolute().parent,
+    trees = [authority_dir(), storage.data_dir(), control, Path(__file__).absolute().parent,
              workers.STOP_SIGNALS_DIR, control / "codex-app", control / "logs",
              home / ".codex", home / ".claude", home / ".ssh", home / ".gnupg",
              home / ".aws", home / ".kube", home / ".docker",
@@ -355,6 +355,19 @@ def _check_roots(workspace, store):
                 raise ValueError("sandbox writable root overlaps trusted control, runtime, code or credential paths")
     if any(_under(s, w) or _under(w, s) for s in _forms(store) for w in _forms(workspace)):
         raise ValueError("sandbox workspace and worker store must be separate roots")
+    # Even an otherwise ordinary directory must not grant access to another
+    # worker's private store. Scopes are trusted and survive worker exit.
+    for path in islice(authority_dir().glob("*.json"), LEDGER_SCAN):
+        try:
+            peer = json.loads(path.read_text())
+            peer_store, peer_repo = Path(peer["store"]), Path(peer["repo"])
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ValueError("cannot validate existing sandbox roots") from exc
+        for left, right in ((workspace, peer_store), (store, peer_repo)):
+            if _under(left, right) or _under(right, left):
+                raise ValueError("sandbox root overlaps another worker's private roots")
+        if store != peer_store and (_under(store, peer_store) or _under(peer_store, store)):
+            raise ValueError("sandbox store overlaps another worker's store")
 
 
 def register(queue, worker, repo, assigned_ref=""):
@@ -362,8 +375,13 @@ def register(queue, worker, repo, assigned_ref=""):
     from . import config, queue as q, store_identity
     if config.backend(queue) != "file":
         raise ValueError("sandbox bridge requires a local file-backed queue")
-    store = worker_store(queue, worker)
-    workspace = Path(repo).resolve(strict=True)
+    store = canonical(worker_store(queue, worker))
+    workspace = canonical(repo)
+    try:
+        with directory(workspace):
+            pass
+    except OSError as exc:
+        raise ValueError("sandbox workspace contains a missing or symlinked component") from exc
     # A writable checkout of the broker itself is not a security boundary.
     _check_roots(workspace, store)
     if assigned_ref and q._project_from_ident(assigned_ref) != queue:
@@ -628,13 +646,6 @@ def _message(scope, op, body, key):
         pinned["session_id"], message_id=str(uuid.UUID(hex=key)), basis="runtime",
         evidence={"source": "sandbox_bridge", "untrusted": True},
         who=envelope.author("session", scope["worker"], scope["worker"], "codex"))
-    worker = resolved.get("worker") or {}
-    log, offset = str(worker.get("log") or ""), None
-    if op == "ask" and worker.get("fifo") and log:
-        try:
-            offset = os.path.getsize(log)
-        except OSError:
-            offset = None
     sent = messages.deliver(resolved, text, "send", live_only=True)
     if not isinstance(sent, dict) or not sent.get("ok"):
         return {"ok": False, "delivered": False,
@@ -644,10 +655,9 @@ def _message(scope, op, body, key):
         if isinstance(sent.get(field), str) and _TOKEN.fullmatch(sent[field]):
             out[field] = sent[field]
     if op == "ask":
-        reply = {}
-        if offset is not None and sent.get("transport") == "fifo":
-            reply = messages._await_reply(log, offset, time.time() + 30, source="fifo")
-        answer = reply.get("answer") if isinstance(reply, dict) and reply.get("ok") else sent.get("answer")
+        # Only an explicitly correlated transport reply may cross this boundary.
+        # Raw recipient logs contain unrelated host/session content.
+        answer = sent.get("answer")
         if isinstance(answer, str) and answer:
             out["answer"] = answer[:PAGE_CHARS]
         else:
@@ -824,6 +834,19 @@ def _execute(scope, request, key):
     resolution = _resolution(body)
     if body["commit"]:
         resolution["commit"] = _commit_proof(scope, body["commit"])
+        from . import sandbox_handoff
+        artifact = sandbox_handoff.export(scope, resolution)
+        blocked = q.block(
+            item["ref"], session_id=scope["worker"], origin="worker",
+            question="Integration worker: review and adopt the sandbox patch, verify it, "
+                     "and land it on the release branch before resolving this ticket.",
+            progress="Sandbox commit " + resolution["commit"] + "; trusted handoff: " + artifact
+                     + ". This is candidate source, not an integrated fix.\n\n" + resolution["summary"],
+            wait_on="worker", wait_actor="sandbox integration worker",
+            **_fenced(q.block, scope))
+        if not blocked:
+            raise ValueError("claim changed during handoff; nothing was resolved")
+        return {"ok": True, "integration_pending": True, "item": _project(blocked)}
     # The regular close path still owns gates, product acknowledgement and
     # ownership checks. It refuses unsafe command gates under bridge mode.
     closed = q.close(item["ref"], scope["worker"], resolution=resolution,
@@ -1231,8 +1254,11 @@ def cli(args):
             _mark_mine(item)
             print(json.dumps(item, indent=2))
     elif op == "close":
-        summary = (item.get("resolution") or {}).get("summary", "")
-        print(f"{str(item.get('status')).upper()}: {item.get('ref')} — {summary}")
+        if result.get("integration_pending"):
+            print(f"AWAITING INTEGRATION: {item.get('ref')} — patch exported; ticket remains open")
+        else:
+            summary = (item.get("resolution") or {}).get("summary", "")
+            print(f"{str(item.get('status')).upper()}: {item.get('ref')} — {summary}")
     elif op == "block":
         if as_json:
             print(json.dumps(item, indent=2))

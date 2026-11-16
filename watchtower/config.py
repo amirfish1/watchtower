@@ -1552,7 +1552,7 @@ def codex_sandbox_store(queue: str) -> Path:
     explicit = str(_queue_entry(queue).get("codex_sandbox_store") or "").strip()
     if explicit:
         return Path(explicit).expanduser()
-    return Path.home() / ".watchtower" / "sandbox" / re.sub(r"[^A-Za-z0-9._-]", "_", queue)
+    return Path.home() / ".watchtower-sandbox" / re.sub(r"[^A-Za-z0-9._-]", "_", queue)
 
 
 def codex_transport(queue: str) -> str:

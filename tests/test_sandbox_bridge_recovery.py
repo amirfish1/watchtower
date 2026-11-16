@@ -318,18 +318,17 @@ def test_destination_must_match_the_pinned_worker_exactly(env, monkeypatch):
     assert len(sent) == 1
 
 
-def test_ask_waits_only_on_a_live_fifo_reply(env, monkeypatch):
+def test_ask_never_tails_recipient_host_log(env, monkeypatch):
     w = env
     log = w.tmp / "filer.log"
     log.write_text("")
     messages = _destination(monkeypatch, {"session_id": SID, "engine": "claude", "worker": {
         "worker_id": "filer-w1", "fifo": str(w.tmp / "fifo"), "log": str(log)}})
     monkeypatch.setattr(messages, "deliver", lambda *a, **k: {"ok": True, "transport": "fifo"})
-    monkeypatch.setattr(messages, "_await_reply", lambda path, offset, deadline, source: {
-        "ok": True, "answer": "the reply", "source": source, "log": path})
+    monkeypatch.setattr(messages, "_await_reply", lambda *a, **k: pytest.fail("raw log read"))
     claim(w, submitter="@filer")
     assert submit(w, "ask", {"target": "@filer", "text": "question"}, w.claim) == {
-        "ok": True, "delivered": True, "transport": "fifo", "answer": "the reply"}
+        "ok": True, "delivered": True, "transport": "fifo", "answer_pending": True}
 
 
 def test_message_budget_survives_a_fence_refresh(env, monkeypatch):
@@ -465,7 +464,7 @@ def test_symlinked_protected_tree_is_still_refused(env, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     (w.tmp / "alias").symlink_to(codex_home, target_is_directory=True)
     (codex_home / "repo").mkdir()
-    with pytest.raises(ValueError, match="trusted control"):
+    with pytest.raises(ValueError, match="trusted control|symlinked component"):
         bridge.register("SB", "via-link", str(w.tmp / "alias" / "repo"))
 
 

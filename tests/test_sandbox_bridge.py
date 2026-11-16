@@ -13,6 +13,9 @@ from watchtower import sandbox_bridge as bridge
 @pytest.fixture
 def env(wt_env, monkeypatch):
     w = wt_env
+    # Sandbox roots must be outside the entire trusted worker control tree.
+    monkeypatch.setattr(w.workers, "WORKERS_FILE", w.tmp / "control" / "workers.json")
+    monkeypatch.setenv("WATCHTOWER_WORKERS_FILE", str(w.workers.WORKERS_FILE))
     w.repo = w.tmp / "repo"
     w.repo.mkdir()
     w.config.set_codex_sandbox("SB", "workspace-write", str(w.tmp / "isolated"))

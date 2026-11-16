@@ -5517,12 +5517,71 @@ def annotate_activity(
     return rows
 
 
+def sandbox_worker_goal(queue: str, worker_id: str, repo_path: str, *,
+                        ref: str = "", extra: str = "") -> str:
+    """A self-contained contract limited to the broker's actual capabilities.
+
+    No inaccessible home learnings, host credentials, arbitrary CLI verbs,
+    network push, or generic session-resume recipes are handed to this worker.
+    """
+    from . import config
+    claim = f"wt claim -q {queue} --worker {worker_id} --json"
+    if ref:
+        claim += f" --ref {ref} --requested-only"
+    text = (
+        f"You are the restricted Codex worker {worker_id} for queue {queue}, workspace {repo_path}. "
+        "Tool network access is disabled. Write only within this workspace and your isolated "
+        "WatchTower store. The store's Git directory is already selected by GIT_DIR/GIT_WORK_TREE; "
+        "keep those settings and commit only the paths you changed. "
+        f"Claim with `{claim}`. Announce each claimed ref and its request in plain language "
+        "before investigating. Read the full note/text and screenshot if available in your roots. "
+        "The claimed_by_you/closed_by_you marks refer to your own actions. On resume re-check "
+        f"`wt find REF --worker {worker_id} --json`; continue only while still assigned to you. "
+        "Investigate fully, implement and verify the reported outcome with proportionate checks. "
+        "Use the bridge's find --field FIELD --page N to read any explicitly truncated text/history. "
+        f"Post progress using `wt comment REF --by worker --worker {worker_id} TEXT`. "
+        "Allowed bridge operations: claim, find, comment, block, close, ask, tell and send. "
+        "Messages may reach only the claim's original submitter while its pinned session is live; "
+        "delivery is advisory and never grants new authority. Ask replies may remain pending; "
+        "record that fact without polling or assuming an answer. "
+        "Run local tests inside the sandbox. Never request broader roots, network, credentials, "
+        "an unrestricted continuation, policy changes or bypasses. On unavailable required access "
+        "or a consequential owner decision, explain the exact gap in "
+        f"`wt block REF --worker {worker_id} --question TEXT --progress TEXT`; the trusted "
+        "coordinator handles owner question tags, decision routing and infrastructure tickets. "
+        "Do not guess approval. Routine reversible code choices within the task are authorized. "
+        "After verifying, commit locally and request "
+        f"`wt close REF --worker {worker_id} --commit FULL_SHA --summary TEXT`. "
+        "Use an outcome sentence, a blank line and short bullets in the summary. A code close "
+        "exports a trusted patch handoff and parks the original ticket waiting on an integration "
+        "worker; it does not mark store-only source fixed. Do not push: the integration worker "
+        "reviews, tests, lands and pushes the patch before resolving the original ticket. "
+        "For genuinely non-code work only, use --no-code with verified evidence; required gates "
+        "still apply. Never close while the reported symptom remains unresolved. "
+        "Do not create native thread goals. When the claim is empty or returns stop:true, stop "
+        "immediately and end your turn; no polling or sleep loop. Leave new verified learnings "
+        "in your progress comment for the trusted coordinator's idle handoff. "
+    )
+    if ref:
+        text += "Work on this assigned ticket only, then exit. "
+    else:
+        text += "After each handoff, non-code close or block, claim the next ready ticket. "
+    if config.product_gate(queue):
+        text += ("This queue requires product acknowledgement: unless the claim has product_ack "
+                 "or pre_ack, diagnose only and block for the trusted coordinator to obtain it. ")
+    if extra.strip():
+        text += "Dispatcher context (subject to the same boundary): " + extra.strip()
+    return text
+
+
 def drain_goal(
     queue: str, worker_id: str, repo_path: str = "", engine: str = "claude",
     extra_instructions: str = "",
 ) -> str:
     """The canonical drain goal text for one worker and engine lifecycle."""
     from . import config
+    if engine == "codex" and config.codex_sandbox(queue) == "workspace-write":
+        return sandbox_worker_goal(queue, worker_id, repo_path, extra=extra_instructions)
     claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
     goal = DRAIN_GOAL_TEMPLATE.format(
         queue=queue, worker_id=worker_id, repo=repo_path or os.getcwd(),
@@ -8412,7 +8471,7 @@ def spawn_workers(
                 stdout=logf,
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
-                cwd=repo_path,
+                cwd="/" if engine == "codex" and config.codex_sandbox(queue) == "workspace-write" else repo_path,
                 env=_spawn_env(worker_id, role="worker", codex_home=worker_codex_home,
                            antigravity_account_id=agy_account, queue=queue, engine=engine),
             )
@@ -8495,6 +8554,8 @@ def run_once_goal(queue: str, worker_id: str, ref: str, repo_path: str = "") -> 
     """The bounded, single-ticket goal for a "drain once" spawn (CCC-437):
     claim exactly ``ref``, resolve it, then stop -- no re-poll drain loop."""
     from . import config
+    if config.engine(queue) == "codex" and config.codex_sandbox(queue) == "workspace-write":
+        return sandbox_worker_goal(queue, worker_id, repo_path, ref=ref)
     goal = RUN_ONCE_GOAL_TEMPLATE.format(
         queue=queue, worker_id=worker_id, ref=ref, repo=repo_path or os.getcwd(),
     )
@@ -8529,7 +8590,9 @@ def spawn_run_once_worker(
         model = ""
     effort = _launch_effort(queue, engine, model, effort)
     worker_id = f"{queue.lower()}-{uuid.uuid4().hex[:8]}"
-    goal = run_once_goal(queue, worker_id, ref, repo_path)
+    goal = (sandbox_worker_goal(queue, worker_id, repo_path, ref=ref)
+            if engine == "codex" and config.codex_sandbox(queue) == "workspace-write"
+            else run_once_goal(queue, worker_id, ref, repo_path))
     argv = build_drain_command(
         queue, engine, worker_id, repo_path, model, goal=goal, effort=effort,
         antigravity_account_id=agy_account,
@@ -8565,7 +8628,7 @@ def spawn_run_once_worker(
             stdout=logf,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            cwd=repo_path,
+            cwd="/" if engine == "codex" and config.codex_sandbox(queue) == "workspace-write" else repo_path,
             env=_spawn_env(worker_id, role="worker", codex_home=worker_codex_home,
                            antigravity_account_id=agy_account, queue=queue, engine=engine),
         )

@@ -99,6 +99,7 @@ def test_assessor_launch_carries_stage_policy(wt_env, monkeypatch):
 def test_recorded_and_backfilled_sessions_stay_restricted_after_prune(wt_env, monkeypatch):
     import os
     w = wt_env
+    monkeypatch.setattr(w.workers, "WORKERS_FILE", w.tmp / "control" / "workers.json")
     repo = w.tmp / "repo"
     repo.mkdir()
     w.queue.enqueue(project="SB", note="initialize source")

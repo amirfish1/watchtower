@@ -57,12 +57,46 @@ run inside native Codex sandboxes, never host Git against worker config,
 `.git` pointers or alternates. Proof roots and base come from a trusted launch
 record and must match the bridge scope. Full SHAs must strictly descend from
 the assigned base. A read-only proof sandbox disables lazy fetch, replacements,
-hooks and transports. Patch export exists as inert data; a safe integration
-workflow is still missing (below).
+hooks and transports. Trusted Git operations must use a system executable,
+never the worker-writable PATH (the earlier checkpoint failed this condition).
+
+## Patch handoff and restricted worker contract
+
+A code close request exports a bounded patch and its digest to trusted
+`sandbox-bridge/handoffs/`, then parks the original ticket with a worker wait.
+It does **not** close the ticket or claim the store-only commit integrated.
+The request still requires a valid, strict-descendant commit proof, source
+identity and the original claim fence. Non-code closes retain required gates.
+
+The integration worker reviews the exported patch and supplies its own clean,
+trusted worktree at the recorded base to:
+
+```sh
+python3 scripts/adopt_sandbox_patch.py --worker WORKER --commit FULL_SHA --destination TRUSTED_WORKTREE
+```
+
+The script rejects sandbox destinations, changed digests, dirty worktrees and
+project control metadata. It applies data with system Git, disables hooks,
+external transports, replacements and fsmonitor, then creates a local commit.
+It does not run proposed code, push, or close the ticket. After source review,
+the integration worker tests, lands and pushes this commit, verifies ancestry
+on the freshly fetched release branch, and resolves the original ticket with
+that integrated commit through its required gates. Conflicts/base drift remain
+open integration work; a new handoff requires the current claim fence.
+
+Restricted workers receive a self-contained prompt matching the available
+bridge verbs. They do not receive host-home learnings, generic resume recipes,
+or instructions to push over a disabled network. They post learnings through
+progress for the trusted coordinator. Ask may return a correlated transport
+reply or explicit `answer_pending`; the broker never tails recipient host logs.
+Worker stores default to `~/.watchtower-sandbox/QUEUE/WORKER`, outside the
+entire trusted worker-control directory. Other workers' stores are protected.
 
 ## Verification on 2026-11-16 — worker wt-039caa56
 
-Both actual-model disposable-queue acceptance runs now PASS. The runner uses
+Both earlier actual-model **honest-path** disposable-queue runs passed. They
+did not exercise a planted `store/bin/git`, empty base or the integration
+handoff and are not security acceptance for the revised candidate. The runner uses
 production launch builders **and** `codex_sandbox_prepare`, an isolated source
 store/registry and a real spool broker; it never edits live queue settings.
 Each worker claims a fixture, fixes addition, runs unittest, checks boundaries,
@@ -90,20 +124,17 @@ combined-source security review is still required before integration.
 
 ## Remaining acceptance — keep WT-61 open
 
-1. **Safe gated workflows.** Command gates and full-access stage/assessment
+1. **Safe gated workflows.** At the earlier checkpoint, command gates and full-access stage/assessment
    launches currently refuse sandbox-origin work, including group-parent
    gates after policy changes. This is a safety boundary, not completed
    stage support. Implement isolated command/verification/assessment
    transports with scoped verdicts; never skip a required gate or run hostile
    tests with daemon authority. Generic resumed/delegated turns remain refused
    unless the exact restricted policy is retained.
-2. **Integration handoff and worker contract.** Local commits are in the
-   isolated store; workers cannot push over the disabled network. The generic
-   drain/run-once prompt still asks for push, learns outside its read roots,
-   and has CLI verbs outside this bridge contract. Supply a restricted-worker
-   contract and a trusted, reviewable patch-adoption path before live use.
-   A fixture close proves bridge behavior, not release-branch integration of
-   a real fix. Do not close real work on an unintegrated store-only commit.
+2. **Revised handoff acceptance.** Exercise the new restricted prompt,
+   adversarial proof rejection, code handoff, trusted adoption and final gate
+   behavior on both real transports. A local fixture release ref is test
+   evidence only; real tickets require fetched remote release ancestry.
 3. **Combined security review.** Review final root/path/config races,
    source replacement and launch/proof records; verify destination pinning
    and protected runtime/control paths. Credentials must remain outside
