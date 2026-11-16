@@ -87,6 +87,87 @@ def test_cancel_keeps_claim_and_fences_pending(env):
     assert b['supervision']['intent']['key']!=a['supervision']['intent']['key']
 
 
+def test_cancel_detaches_comments_and_reenrollment_restores_them(env, monkeypatch, capsys):
+    from watchtower import cli, messages
+    calls = []
+    monkeypatch.setattr(messages, 'deliver_message',
+                        lambda target, text, **kw: calls.append(target) or {'ok': True})
+    monkeypatch.setattr(cli, '_comment_author_is_claimant', lambda *a: False)
+    a = adopt(env)
+    ref = a['ticket']
+
+    def comment():
+        assert cli.main(['comment', ref, 'Guidance from coordinator']) == 0
+        capsys.readouterr()
+
+    comment()
+    assert calls == [SID]
+    preview = t.cancel(SID, dry_run=True)
+    assert preview['comment_target'] == ''
+    assert t.status(SID)['comment_target'] == SID
+    cancelled = t.cancel(SID)
+    assert cancelled['claim']['claimed_session_id'] == SID
+    assert cancelled['comment_target'] == ''
+    assert cancelled['comments_detached'] is True
+    comment()
+    assert calls == [SID]
+    assert q.get(ref)['history'][-1]['text'] == 'Guidance from coordinator'
+    # Answers retained for explicit recovery must not resubscribe comments.
+    q.answer(ref, 'Retained guidance')
+    comment()
+    assert calls == [SID]
+    t.cancel(SID)  # idempotent, including across module reloads
+    importlib.reload(t)
+    assert t.status(SID)['comments_detached'] is True
+    t.takeover(SID, ref, engine='claude')
+    comment()
+    assert calls == [SID, SID]
+
+
+def test_cancel_does_not_detach_replacement_claimant(env, monkeypatch, capsys):
+    from watchtower import cli, messages
+    a = adopt(env)
+    # Model a recovery replacing ownership after enrollment. Normal fleet
+    # claiming deliberately refuses tickets retaining supervision affinity.
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked(strict=True)
+        it = next(it for it in data['items'] if it['ref'] == a['ticket'])
+        it.update(claimed_by='replacement', claimed_session_id=OTHER)
+        q._save_unlocked(data)
+    result = t.cancel(SID)
+    assert result['comment_target'] == OTHER
+    assert result['comments_detached'] is False
+    calls = []
+    monkeypatch.setattr(messages, 'deliver_message',
+                        lambda target, text, **kw: calls.append(target) or {'ok': True})
+    assert cli.main(['comment', a['ticket'], 'Guidance for replacement']) == 0
+    assert calls == [OTHER]
+
+
+def test_status_exposes_failed_attempts_even_without_confirmed_reminders(env, monkeypatch):
+    adopt(env)
+    monkeypatch.setattr(liveness, 'deliver', lambda *a, **kw: {'ok': False, 'error': 'unreachable'})
+    t.reconcile()
+    result = t.status(SID)
+    assert result['delivery_attempts'] == 1
+    assert result['state'] == 'paused_unreachable'
+    assert result['confirmed_reminders'] == 0
+    assert result['comment_target'] == SID
+    assert result['claim']['status'] == 'in_progress'
+
+
+def test_cancel_preserves_owner_wait_and_answer_does_not_resubscribe(env):
+    a = adopt(env)
+    q.block(a['ticket'], session_id=SID, question='Choose the next step?', origin='worker')
+    t.cancel(SID)
+    it = q.get(a['ticket'])
+    assert it['needs_input'] and it['block_question'] == 'Choose the next step?'
+    assert it['status'] == q.PARKED_STATUS
+    q.answer(a['ticket'], 'Keep this for explicit re-enrollment')
+    assert t.status(SID)['comment_target'] == ''
+    assert t.status(SID)['comments_detached'] is True
+
+
 def test_cancel_serializes_dispatch(env,monkeypatch):
     adopt(env); entered=threading.Event(); release=threading.Event()
     def send(*a,**kw):

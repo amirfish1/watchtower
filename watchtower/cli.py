@@ -4172,6 +4172,8 @@ def _unsessioned_target_warning(target: str) -> str:
 
 
 def cmd_comment(args: argparse.Namespace) -> int:
+    from . import takeover
+
     item = q.comment(args.ref, args.text, by=args.by, session_id=args.worker)
     if not item:
         print(f"(no item {args.ref})", file=sys.stderr)
@@ -4184,6 +4186,9 @@ def cmd_comment(args: argparse.Namespace) -> int:
         # Waking the claimant here can turn helper spawns into a wake loop.
         target = ""
         delivery = " — system comment; not injected"
+    elif live and not takeover.comment_target(item):
+        target = ""
+        delivery = " — cancelled takeover; comment delivery detached"
     elif live and _comment_author_is_claimant(item, args):
         # Recorded on the ticket, but not echoed back at its own author.
         target = ""

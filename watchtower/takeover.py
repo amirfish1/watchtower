@@ -31,13 +31,37 @@ def _items():
     return q._load_unlocked(strict=True).get('items', [])
 
 
+def comment_target(it):
+    """A cancelled takeover retains task ownership, not a comment subscription.
+
+    Match the retained session so cancelling stale supervision cannot silence
+    a replacement claimant. Derive this from durable state, including legacy
+    cancellations and answers retained for explicit re-enrollment.
+    """
+    if it.get('status') != 'in_progress':
+        return ''
+    target = it.get('claimed_session_id') or it.get('claimed_by') or ''
+    s = it.get('supervision') or {}
+    if s.get('state') in TERMINAL and target == s.get('session', {}).get('session_id'):
+        return ''
+    return target
+
+
 def _response(it):
     s = copy.deepcopy(it['supervision'])
+    target = comment_target(it)
     return dict(schema_version=1, supervision_id=s['id'], generation=s['generation'],
                 ticket=it['ref'], session=s['session'], state=s['state'],
                 delivery_state=(s.get('intent') or {}).get('state', 'none'),
                 reason=s.get('reason',''), question=it.get('block_question','') if it.get('needs_input') else '',
-                wait_identity=s.get('wait_identity',''), supervision=s)
+                wait_identity=s.get('wait_identity',''), supervision=s,
+                claim={key: it.get(key) for key in
+                       ('status', 'claimed_by', 'claimed_session_id', 'claimed_at')},
+                comment_target=target,
+                comments_detached=bool(it.get('status') == 'in_progress'
+                    and (it.get('claimed_session_id') or it.get('claimed_by')) and not target),
+                delivery_attempts=(s.get('intent') or {}).get('attempts', 0),
+                confirmed_reminders=s.get('reminders', 0))
 
 
 def status(session_id):

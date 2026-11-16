@@ -46,6 +46,9 @@ persists an answer for the same session; missing transcripts and failed delivery
 never reopen it for another worker. Cancelled supervision retains answers for
 explicit re-enrollment. Cancel increments the generation, fences future sends,
 preserves the ticket and its question, and suppresses automatic re-enrollment.
+The retained claim no longer subscribes the cancelled session to ticket comments;
+comments remain in ticket history. Explicit re-enrollment restores that subscription.
+Cancelling an old supervision does not detach a replacement claimant.
 It cannot retract an instruction already delivered or interrupt a running turn.
 The dispatch lock means cancel may wait for an in-flight transport to return.
 
@@ -68,6 +71,10 @@ Enrollment/status/cancel return `schema_version`, `supervision_id`, `generation`
 `ticket`, `session: {engine, session_id, host, repo_path}`, `state`,
 `delivery_state`, `reason`, `question`, `wait_identity`, and a `supervision`
 record. Batch status returns `{schema_version, capabilities, supervisions}`.
+Responses also expose the retained `claim`, effective `comment_target` (empty
+when detached or inactive), `comments_detached`, current-intent `delivery_attempts`,
+and `confirmed_reminders`. Zero confirmed reminders does not mean zero delivery
+attempts or zero comment notifications while supervision was active.
 States include `pending_delivery`, `running`, `waiting`, `needs_input`,
 `paused_unreachable`, `cancelled`, and `completed`.
 
