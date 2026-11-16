@@ -54,6 +54,9 @@ def arm_helper(repo, marker):
 @pytest.fixture
 def env(wt_env, monkeypatch):
     w = wt_env
+    # Keep fixture workspaces outside the full trusted worker control tree.
+    monkeypatch.setattr(w.workers, "WORKERS_FILE", w.tmp / "control" / "workers.json")
+    monkeypatch.setenv("WATCHTOWER_WORKERS_FILE", str(w.workers.WORKERS_FILE))
     w.marker = w.tmp / "marker"
     w.sb_repo = w.tmp / "sandbox-ws"
     make_repo(w.sb_repo)

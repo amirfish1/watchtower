@@ -1,5 +1,6 @@
 """A store commit hands off source without claiming release integration."""
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -14,16 +15,27 @@ def git(repo, *args):
                                    "-C", str(repo), *args], text=True).strip()
 
 
-def fixture_patch(w, monkeypatch):
+def fixture_patch(w, monkeypatch, binary=False):
     git(w.repo, "init", "-q")
     (w.repo / "sum.py").write_text("answer = 4\n")
     git(w.repo, "add", "sum.py")
+    odd_name = os.fsdecode(b"name-\xff")
+    if binary:
+        (w.repo / "payload.bin").write_bytes(b"\x00old\xff")
+        (w.repo / odd_name).write_bytes(b"old\n")
+        git(w.repo, "add", "payload.bin", odd_name)
     git(w.repo, "-c", "user.name=Test", "-c", "user.email=test@localhost", "commit", "-qm", "base")
     base = git(w.repo, "rev-parse", "HEAD")
     trusted = w.tmp / "integration"
     subprocess.run(["/usr/bin/git", "clone", "--no-local", "-q", str(w.repo), str(trusted)], check=True)
     (w.repo / "sum.py").write_text("answer = 5\n")
-    patch = git(w.repo, "diff", "--binary") + "\n"
+    if binary:
+        (w.repo / "payload.bin").write_bytes(b"\x00new\xfe")
+        (w.repo / odd_name).write_bytes(b"new\n")
+    patch = subprocess.check_output(["/usr/bin/git", "-C", str(w.repo), "-c",
+                                     "core.quotePath=false", "diff", "--binary", "--full-index"])
+    if binary:
+        assert b"\xff" in patch and b"GIT binary patch" in patch
     sha = "ab" * 20
     monkeypatch.setattr(policy, "launch_record", lambda _: {
         "repo": str(w.repo), "store": str(w.store), "base": base})
@@ -32,9 +44,10 @@ def fixture_patch(w, monkeypatch):
     return sha, trusted
 
 
-def test_code_close_exports_and_parks_until_trusted_adoption(env, monkeypatch):
+@pytest.mark.parametrize("binary", [False, True])
+def test_code_close_exports_and_parks_until_trusted_adoption(env, monkeypatch, binary):
     w = env
-    sha, trusted = fixture_patch(w, monkeypatch)
+    sha, trusted = fixture_patch(w, monkeypatch, binary)
     item = claim(w)
     body = dict(close_body(item["ref"]), commit=sha, no_code=False)
     result = submit(w, "close", body, w.claim)
@@ -45,6 +58,9 @@ def test_code_close_exports_and_parks_until_trusted_adoption(env, monkeypatch):
     assert not current.get("resolution")
     adopted = handoff.adopt(w.worker, sha, trusted)
     assert (trusted / "sum.py").read_text() == "answer = 5\n"
+    if binary:
+        assert (trusted / "payload.bin").read_bytes() == b"\x00new\xfe"
+        assert (trusted / os.fsdecode(b"name-\xff")).read_bytes() == b"new\n"
     assert git(trusted, "rev-parse", "HEAD") == adopted["commit"]
     # Adoption is source preparation, never an automatic push or close.
     assert w.queue.get(item["ref"])["status"] == "awaiting_answer"

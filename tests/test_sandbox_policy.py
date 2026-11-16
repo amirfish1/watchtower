@@ -66,6 +66,14 @@ def fx(base):
             "head": _git(repo, "rev-parse", "HEAD")}
 
 
+def test_launcher_reuses_record_for_worker_whose_store_has_different_name(native, fx, monkeypatch):
+    monkeypatch.setattr(workers, "_codex_sandbox_store", lambda *a: fx["store"])
+    first = workers.codex_sandbox_prepare("FIXTURE", "different-worker", str(fx["repo"]))
+    second = workers.codex_sandbox_prepare("FIXTURE", "different-worker", str(fx["repo"]))
+    assert first["base"] == second["base"] == fx["head"]
+    assert sp.launch_record("different-worker")["store"] == str(fx["store"])
+
+
 # ---------------------------------------------------------------- unit tests
 
 

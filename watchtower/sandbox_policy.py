@@ -97,6 +97,9 @@ _MAX_RECORD = 4096
 # every entry is something that executes on the host (shell snapshots source
 # the owner's shell profile, worktrees run host Git), talks to a remote
 # service, or starts another agent.
+# Keep Codex's Code Mode host available: current models route shell tools
+# through it. Those nested tools still use the native permission profile;
+# disabling this dispatcher prevents any claim/test/commit command running.
 DISABLED_FEATURES = (
     "apps", "plugins", "remote_plugin", "plugin_sharing", "plugin_hooks",
     "plugin_discovery_prefetch", "recommended_plugins", "hooks",
@@ -109,7 +112,7 @@ DISABLED_FEATURES = (
     "multi_agent_v2", "agent_message_board", "agent_message_board_mcp",
     "send_async_message", "send_message_to_user_async", "wake_on_agent_messages",
     "shell_snapshot", "shell_snapshot_v2", "worktrees", "workspace_dependencies",
-    "daemon_auto_start", "code_mode_host", "code_mode_host_grpc", "js_repl",
+    "daemon_auto_start", "js_repl",
     "js_repl_tools_only", "network_proxy", "remote_control", "remote_models",
     "standalone_web_search", "web_search_cached", "web_search_request",
     "search_tool", "tool_search",

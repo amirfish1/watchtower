@@ -143,6 +143,43 @@ combined-source security review is still required before integration.
    scans are capped. Mac trusted-prefix handling has unit coverage but no
    native macOS acceptance; fail closed if enforcement cannot be established.
 
+## Combined checkpoint — worker wt-65ecd04d, 2026-11-16
+
+Private branch `wt-61-wt-65ecd04d`, worktree
+`/home/hermes/Apps/watchtower-wt61-65ecd04d`, combines parent `a7e2c2d`,
+policy lane `1ae673c` and host-fence lane `e7517e7`. Integration now preserves
+patch bytes through export and adoption (including binary payloads and
+non-UTF-8 filenames), passes the worker id to Git preparation on relaunch,
+and checks store project configuration in both launchers. Fence fixtures
+keep their workspaces outside the entire trusted worker-control directory.
+
+Actual-model acceptance first exposed `code-mode host is disabled` in both
+transports: the selected model routes shell commands through this dispatcher.
+The candidate now retains Codex's default Code Mode host configuration,
+while nested tools retain the native profile and external tools stay disabled
+(decision D448). No writable/readable roots or network permission were added.
+Revised runs both passed forged-proof rejection, boundary probes, local test
+and commit, real broker handoff, trusted adoption and final fixture close:
+
+| Transport | Retained evidence | Adopted fixture commit |
+|---|---|---|
+| exec | `/home/hermes/wt-sandbox-acceptance-ifyiea71/controller/verdict.json` | `4029a91ae759a741a73f33de03d69e0e7032d2d1` |
+| app-server | `/home/hermes/wt-sandbox-acceptance-sq4ardcq/controller/verdict.json` | `ff0a2cc8523db513becb2eb8fa42774d0ab0739a` |
+
+These are disposable local-release fixtures, not evidence of integration on
+the real release branch. The complete gated workflow and final combined
+security review remain open; retain the default-off source hold.
+
+The earlier stages lane (`80bde4e0-af13-418b-9885-8c7bb6befe44`) produced no
+code or commit. Its transcript records a Bash prototype denial at
+`2026-11-16T02:06:50.303Z` (tool `toolu_01Wk3y9jm8rYe8r8ZFaAvkrM`):
+"The user doesn't want to take this action right now. STOP what you are doing
+and wait for the user to tell you how to proceed." The record does not identify
+the denial's source. That command included a scratch-directory `rm -rf *`;
+any resumed implementation should use fresh disposable directories and
+bounded cleanup. Do not treat the earlier lane as pending completed work or
+silently retry its denied prototype; clarify the hold before that step.
+
 Review branch/worktree: `wt-61-wt-039caa56`,
 `/home/hermes/Apps/watchtower-wt61-039caa56`. No live policies, customer sends,
 credentials, send switches or services were changed. Source remains deliberately

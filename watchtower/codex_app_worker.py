@@ -404,7 +404,7 @@ def run(argv: Optional[List[str]] = None) -> int:
         if not profiled:
             return ""
         from . import sandbox_policy
-        return ", ".join(sandbox_policy.project_config_hazards(args.cwd))
+        return ", ".join(sandbox_policy.project_config_hazards(args.cwd, args.sandbox_store))
 
     hazard = config_hazard()
     if hazard:

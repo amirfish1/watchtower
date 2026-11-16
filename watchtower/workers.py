@@ -319,7 +319,7 @@ def codex_sandbox_args(queue: str, repo_path: str, worker_id: str = "") -> List[
             f"codex sandbox for {queue}: workspace {repo_path!r} is not a directory")
     store = _codex_sandbox_store(queue, worker_id)
     try:
-        hazards = sandbox_policy.project_config_hazards(repo_path)
+        hazards = sandbox_policy.project_config_hazards(repo_path, store)
         if hazards:
             raise sandbox_policy.SandboxPolicyError(
                 "untrusted Codex project config present: " + ", ".join(hazards))
@@ -336,7 +336,7 @@ def codex_sandbox_prepare(queue: str, worker_id: str, repo_path: str) -> Dict[st
     from . import sandbox_policy
     store = _codex_sandbox_store(queue, worker_id)
     try:
-        info = sandbox_policy.prepare(repo_path, store)
+        info = sandbox_policy.prepare(repo_path, store, worker=worker_id)
         sandbox_policy.record_launch(worker_id, repo_path, store, info.get("base") or "")
         return info
     except (sandbox_policy.SandboxPolicyError, OSError) as e:

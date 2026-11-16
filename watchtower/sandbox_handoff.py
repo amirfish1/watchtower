@@ -37,8 +37,7 @@ def export(scope, resolution):
         raise ValueError("handoff launch roots do not match the claim")
     commit = resolution["commit"]
     name = _name(scope["worker"], commit)
-    patch = policy.export_patch(rec["repo"], rec["store"], commit, rec["base"], MAX_PATCH)
-    raw = patch.encode()
+    raw = policy.export_patch(rec["repo"], rec["store"], commit, rec["base"], MAX_PATCH)
     if not raw or len(raw) > MAX_PATCH:
         raise ValueError("handoff patch is empty or exceeds the size limit")
     record = {"worker": scope["worker"], "ref": scope["claim"]["ref"],
@@ -64,22 +63,23 @@ def export(scope, resolution):
     return str(directory / (name + ".json"))
 
 
-def _git(destination, *args, input_text=None):
+def _git(destination, *args, input_bytes=None):
     git = shutil.which("git", path="/usr/bin:/bin:/usr/local/bin")
     if not git:
         raise ValueError("trusted system git is unavailable")
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(GIT_NO_LAZY_FETCH="1", GIT_NO_REPLACE_OBJECTS="1",
                GIT_TERMINAL_PROMPT="0", GIT_CONFIG_NOSYSTEM="1",
-               GIT_CONFIG_GLOBAL="/dev/null")
+               GIT_CONFIG_GLOBAL="/dev/null", GIT_GRAFT_FILE="/dev/null")
     result = subprocess.run(
         [git, "-c", "protocol.allow=never", "-c", "core.hooksPath=/dev/null",
-         "-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false",
-         "-C", str(destination), *args], env=env, input=input_text,
-        capture_output=True, text=True, errors="replace", timeout=60)
+         "-c", "core.fsmonitor=false", "-c", "core.commitGraph=false",
+         "-c", "commit.gpgsign=false",
+         "-C", str(destination), *args], env=env, input=input_bytes,
+        capture_output=True, timeout=60)
     if result.returncode:
-        raise ValueError("trusted integration git failed: " + result.stderr[-500:])
-    return result.stdout.strip()
+        raise ValueError("trusted integration git failed: " + result.stderr[-500:].decode("utf-8", "replace"))
+    return result.stdout.decode("utf-8", "surrogateescape").strip()
 
 
 def adopt(worker, commit, destination):
@@ -139,14 +139,13 @@ def adopt(worker, commit, destination):
                 raise ValueError("integration checkout must start at the recorded base")
             # git apply rejects absolute/parent paths and symlink traversal.
             # --index also requires the working tree to match the trusted index.
-            patch = raw.decode("utf-8")
-            _git(destination, "apply", "--check", "--index", "--binary", "-", input_text=patch)
-            names = _git(destination, "apply", "--numstat", "-z", "-", input_text=patch)
+            _git(destination, "apply", "--check", "--index", "--binary", "-", input_bytes=raw)
+            names = _git(destination, "apply", "--numstat", "-z", "-", input_bytes=raw)
             for line in names.split("\0"):
                 path = line.split("\t", 2)[-1]
                 if any(p in (".git", ".codex", ".agents") for p in Path(path).parts):
                     raise ValueError("handoff changes protected project metadata")
-            _git(destination, "apply", "--index", "--binary", "-", input_text=patch)
+            _git(destination, "apply", "--index", "--binary", "-", input_bytes=raw)
             _git(destination, "-c", "user.name=WatchTower Integration", "-c",
                  "user.email=watchtower@localhost", "commit", "-m",
                  "Adopt sandbox fix for " + record["ref"])
