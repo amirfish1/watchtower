@@ -151,8 +151,17 @@ def save_state(s: dict) -> None:
     STATE.write_text(json.dumps(s))
 
 
+def read_blocked() -> list:
+    base = os.environ.get("WATCHTOWER_API_URL", "http://127.0.0.1:8787").rstrip("/")
+    with urllib.request.urlopen(base + "/api/blocked", timeout=20) as response:
+        data = json.load(response)
+    if not isinstance(data, list) or any(not isinstance(t, dict) for t in data):
+        raise RuntimeError("WatchTower blocked API returned invalid tickets")
+    return data
+
+
 def tick(state: dict, queues: list[str], notify_queue: str) -> None:
-    blocked = [t for t in json.loads(wt("blocked", "--json").stdout or "[]")
+    blocked = [t for t in read_blocked()
                if t.get("project") in queues]
     first = not state["seeded"]
     for t in blocked:

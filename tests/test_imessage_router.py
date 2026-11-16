@@ -77,6 +77,7 @@ def router(monkeypatch, tmp_path):
     monkeypatch.setattr(r, "bb_recent", lambda: [])
     monkeypatch.setattr(r, "log", logs.append)
     monkeypatch.setattr(r, "report", lambda *a: reports.append(a))
+    monkeypatch.setattr(r, "read_blocked", lambda: [T])
     monkeypatch.setattr(r, "wt", lambda *a: type("R", (), {"stdout": json.dumps([T]), "stderr": "", "returncode": 0})())
     state = {"seeded": True, "notified": [], "seen": []}
     return type("Ctx", (), {"sent": sent, "reports": reports, "logs": logs, "state": state,
@@ -144,3 +145,27 @@ def test_answer_is_reported(router, monkeypatch):
     router.tick()
     assert ("answer", "--ref", "PROJECTS-7", "--ok", "1") in router.reports
     assert router.sent == ["Answered PROJECTS-7"]
+
+
+def test_daemon_failure_preserves_notification_state(router, monkeypatch):
+    import copy
+    before = copy.deepcopy(router.state)
+    def fail():
+        raise OSError("daemon unavailable")
+    monkeypatch.setattr(r, "read_blocked", fail)
+    with pytest.raises(OSError):
+        router.tick()
+    assert router.state == before
+    assert router.sent == []
+
+
+def test_blocked_read_uses_http(monkeypatch):
+    import io
+    urls = []
+    def request(url, **kw):
+        urls.append(url)
+        return io.BytesIO(json.dumps([T]).encode())
+    monkeypatch.setattr(r.urllib.request, "urlopen", request)
+    monkeypatch.setattr(r, "wt", lambda *a: pytest.fail("poll must not spawn wt"))
+    assert r.read_blocked() == [T]
+    assert urls == ["http://127.0.0.1:8787/api/blocked"]

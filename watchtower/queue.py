@@ -2259,15 +2259,21 @@ def list_items(
     *,
     fresh: bool = False,
     strict: bool = False,
+    blocked_only: bool = False,
+    raise_on_error: bool = False,
 ) -> List[Dict[str, Any]]:
     if project:
         backend = _github_backend_for_project(project)
         if backend is not None:
             return backend.list_items(
-                status=status, lane=lane, fresh=fresh, strict=strict
+                status=status, lane=lane, fresh=fresh, strict=strict,
+                **({"blocked_only": True} if blocked_only else {}),
             )
-    data = _load_unlocked(strict=strict)
+    data = _load_unlocked(strict=strict or raise_on_error, **({"readonly": True} if blocked_only else {}))
     items = data.get("items", [])
+    if blocked_only:
+        import copy
+        items = [copy.deepcopy(it) for it in items if _is_blocked(it)]
     github_projects = set(_github_projects()) if not project else set()
     if github_projects:
         items = [
@@ -2288,11 +2294,12 @@ def list_items(
                 try:
                     items.extend(
                         backend.list_items(
-                            status=status, lane=lane, fresh=fresh, strict=strict
+                            status=status, lane=lane, fresh=fresh, strict=strict,
+                            **({"blocked_only": True} if blocked_only else {}),
                         )
                     )
                 except Exception as e:
-                    if strict:
+                    if strict or raise_on_error:
                         raise
                     if getattr(e, "cached", False):
                         continue
@@ -2432,10 +2439,11 @@ def get(ident: Any) -> Optional[Dict[str, Any]]:
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         return backend.get(ident)
-    for it in _load_unlocked().get("items", []):
+    for it in _load_unlocked(readonly=True).get("items", []):
         if _matches(it, ident):
+            import copy
             from . import usage
-            return usage.attach(it)
+            return usage.attach(copy.deepcopy(it))
     return None
 
 
@@ -9796,9 +9804,17 @@ def comment(ident: Any, text: str, by: str = "human", session_id: str = "") -> O
     return None
 
 
+def _is_blocked(it: Dict[str, Any]) -> bool:
+    return bool(it.get("needs_input")
+                or (it.get("status") == PARKED_STATUS
+                    and (it.get("pending_answer") or {}).get("state") == "routing"))
+
+
 def list_blocked(
     project: Optional[str] = None,
     items: Optional[List[Dict[str, Any]]] = None,
+    *,
+    strict: bool = False,
 ) -> List[Dict[str, Any]]:
     """Tickets parked for a human (``needs_input`` truthy), optionally scoped to
     one queue. The CLI's ``wt blocked`` and CCC both read this.
@@ -9810,12 +9826,11 @@ def list_blocked(
     the reconciler's staffing math (see ``list_active_claims``), so a queue
     stuck entirely behind blocked tickets never got replacement workers."""
     from . import config
-    src = list_items(project=project) if items is None else items
+    src = (list_items(project=project, blocked_only=True, **({"raise_on_error": True} if strict else {}))
+           if items is None else items)
     return [it for it in src
             if not config.ticket_is_archived(it)
-            and (it.get("needs_input")
-                 or (it.get("status") == PARKED_STATUS
-                     and (it.get("pending_answer") or {}).get("state") == "routing"))]
+            and _is_blocked(it)]
 
 
 def list_active_claims(

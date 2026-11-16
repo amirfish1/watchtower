@@ -2460,6 +2460,11 @@ class GitHubIssuesBackend:
             "machine": meta.get("resolution_machine", ""),
         })
 
+        title = str(issue.get("title") or "")
+        # One fixed regex avoids compiling a different pattern for every ref.
+        named = re.match(r"([A-Z][A-Z0-9_-]*-\d+):[a-z0-9-]+\s+", title)
+        if named and named.group(1) == f"{self.queue}-{number}":
+            title = title[named.end():]
         item: Dict[str, Any] = {
             "number": number,
             "project": self.queue,
@@ -2472,8 +2477,8 @@ class GitHubIssuesBackend:
             "note": _clip(meta.get("note") or _first_line(body) or issue.get("title", ""), 4000),
             "text": _clip(text, 24000),
             "url": str(issue.get("url") or ""),
-            "title": _clip(re.sub(r"^" + re.escape(f"{self.queue}-{number}") + r":[a-z0-9-]+\s+", "", issue.get("title", "")), 200),
-            "slug": ticket_slug(meta.get("slug") or re.sub(r"^" + re.escape(f"{self.queue}-{number}") + r":[a-z0-9-]+\s+", "", issue.get("title", ""))),
+            "title": _clip(title, 200),
+            "slug": ticket_slug(meta.get("slug") or title),
             "selector": "",
             "screenshot_path": "",
             "repo_path": self.repo_path,
@@ -3069,6 +3074,7 @@ class GitHubIssuesBackend:
         *,
         fresh: bool = False,
         strict: bool = False,
+        blocked_only: bool = False,
     ) -> List[Dict[str, Any]]:
         from . import usage
         open_raw = (
@@ -3086,7 +3092,7 @@ class GitHubIssuesBackend:
         from . import github_pipeline
         memo_key = (
             # OPS-201: a sidecar-only transition changes eligibility too.
-            self._memo_config(), status, lane, github_pipeline.signature(),
+            self._memo_config(), status, lane, blocked_only, github_pipeline.signature(),
         )
         ledger_stamp = None if strict else usage.ledger_dir_stamp()
         now = time.time()
@@ -3113,6 +3119,21 @@ class GitHubIssuesBackend:
                 issues.append(issue)
                 age = _age_seconds(issue.get("closedAt"))
                 valid_until = min(valid_until, now + retention_s - age)
+        if blocked_only:
+            # The issue metadata and local routing sidecar are sufficient to
+            # reject unrelated tickets before text/usage/history projection.
+            sidecar = github_pipeline._read_cached()
+            entries = (sidecar or {}).get("items", {})
+            def candidate(issue):
+                _, meta = _split_body_shared(str(issue.get("body") or ""))
+                if meta.get("needs_input"):
+                    return True
+                if (meta.get("pending_answer") or {}).get("state") == "routing":
+                    return True
+                entry = entries.get(f"{self.repo}#{issue.get('number')}") or {}
+                return (not entry.get("tombstone")
+                        and (entry.get("pending_answer") or {}).get("state") == "routing")
+            issues = [issue for issue in issues if candidate(issue)]
         items = [self._issue_to_item(issue) for issue in issues]
         if self.partition_by_label:
             # Two or more queues share this repo: each shows only its own

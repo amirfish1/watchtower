@@ -171,6 +171,25 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     return {"queues": rows, "workers": wrows, "github": health.github_connectivity()}
 
 
+BLOCKED_CACHE_TTL_S = 5.0
+_blocked_cache: Dict[str, Any] = {"at": 0.0, "payload": None}
+_blocked_compute = threading.Lock()
+
+
+def cached_blocked_payload() -> List[Dict[str, Any]]:
+    """Share one blocked projection across pollers, with bounded staleness.
+
+    Failures propagate as 503, never an empty or indefinitely stale snapshot:
+    callers must preserve their notification/answer state on a failed read.
+    """
+    with _blocked_compute:
+        if (_blocked_cache["payload"] is None
+                or time.monotonic() - _blocked_cache["at"] >= BLOCKED_CACHE_TTL_S):
+            payload = q.list_blocked(strict=True)
+            _blocked_cache.update(payload=payload, at=time.monotonic())
+        return _blocked_cache["payload"]
+
+
 STATUS_CACHE_TTL_S = 5.0
 _status_cache: Dict[str, Any] = {"at": 0.0, "payload": None}
 _status_compute = threading.Lock()
@@ -1631,6 +1650,24 @@ class _Handler(BaseHTTPRequestHandler):
                 norm, payload, queue_tickets(norm),
                 closed=closed_tickets(norm), total_closed=len(all_closed),
             ))
+        elif path == "/api/blocked":
+            params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            project = params.get("queue", [""])[0]
+            try:
+                rows = cached_blocked_payload()
+                if project:
+                    project = q._norm_project(project)
+                    rows = [it for it in rows if it.get("project") == project]
+                self._json(200, rows)
+            except Exception as exc:
+                self._json(503, {"error": str(exc)})
+        elif path.startswith("/api/ticket/"):
+            ref = urllib.parse.unquote(path[len("/api/ticket/"):])
+            try:
+                item = q.get(ref)
+                self._json(200 if item else 404, item if item else {"error": "not found"})
+            except Exception as exc:
+                self._json(503, {"error": str(exc)})
         elif path == "/api/status":
             self._json(200, cached_status_payload())
         elif path == "/api/queues":
