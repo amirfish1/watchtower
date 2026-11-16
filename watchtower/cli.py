@@ -917,6 +917,8 @@ def cmd_edit(args: argparse.Namespace) -> int:
             except Exception:
                 existing = []
         fields["blocked_by"] = existing + [a for a in (after or []) if a not in existing]
+        if after:
+            fields["_dependency_wait"] = True
     if getattr(args, "clear_gates", False) or getattr(args, "gate", None):
         fields["gates"] = list(getattr(args, "gate", None) or [])
     new_queue = getattr(args, "queue", None)
@@ -1025,6 +1027,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
             verifier_model=getattr(args, "verifier_model", "") or "",
             dedupe_key=getattr(args, "dedupe_key", "") or "",
             submitter=submitter,
+            submitter_subscribed=bool(getattr(args, "subscribe", False)),
             submitter_explicit=bool((getattr(args, "submitter", "") or "").strip()),
             pre_ack=bool(getattr(args, "pre_ack", False)),
             blocked_by=list(getattr(args, "after", None) or []),
@@ -3377,6 +3380,12 @@ def cmd_block(args: argparse.Namespace) -> int:
     uses (`_verify_close_commit`), so a parked (e.g. `--kind
     awaiting-client`) ticket can still show what was done without closing.
     """
+    dependency_refs = q.dependency_only_question(args.question)
+    if getattr(args, "wait_on", "") == "dependency" or dependency_refs:
+        refs = [getattr(args, "wait_ref", "")] if getattr(args, "wait_ref", "") else dependency_refs
+        flags = " ".join(f"--after {ref}" for ref in refs) or "--after REF"
+        print(f"error: a ticket dependency is not a human question; use: wt edit {args.ref} {flags}", file=sys.stderr)
+        return 1
     if getattr(args, "weight", "") == "major" or getattr(args, "major_because", ""):
         from . import autodecide
         bad = autodecide.validate_major(getattr(args, "major_because", ""),
@@ -7614,18 +7623,16 @@ def build_parser() -> argparse.ArgumentParser:
                                     "terminal so a later bare close composes)")
         subparser.add_argument(
             "--submitter", default="",
-            help="addressable target (worker id / @agent name / session UUID) "
-                 "to notify when this ticket is claimed/closed/needs input; "
-                 "defaults to your own session ($CLAUDE_CODE_SESSION_ID / "
-                 "$CODEX_THREAD_ID) like --report-to does. Omit entirely (pass "
-                 "no flag and run with neither env var set) to file with no "
-                 "submitter -- notifications are then skipped silently.",
+            help="addressable filer identity; defaults to your session. "
+                 "Status notices require --subscribe separately.",
         )
 
     s = sub.add_parser("add")
     s.add_argument("--json", action="store_true", help="return one ticket JSON snapshot")
     s.add_argument("--client-id", default="", help="opaque client correlation identifier (exact match)")
     _add_common_ticket_args(s)
+    s.add_argument("--subscribe", action="store_true",
+                   help="opt the filer into this ticket's status notices (off by default)")
     s.add_argument("--after", action="append", default=None, metavar="REF",
                    help="this ticket is not claimable until REF closes as "
                         "completed (repeatable)")
@@ -7717,8 +7724,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--screenshot-path", default=None, dest="screenshot_path")
     s.add_argument("--repo-path", default=None, dest="repo_path")
     s.add_argument("--after", action="append", default=None, metavar="REF",
-                   help="add a blocker: this ticket is not claimable until REF "
-                        "closes as completed (repeatable)")
+                   help="release this ticket to wait for REF to close as completed; "
+                        "clears a legacy dependency question (repeatable)")
     s.add_argument("--clear-after", action="store_true", dest="clear_after",
                    help="remove all blockers from this ticket")
     s.add_argument("--gate", action="append", default=None, metavar="GATE",
@@ -8777,7 +8784,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "worker_headroom_dispatch (default off)")
     s.add_argument("--notify-events", default=None, dest="notify_events",
                    help="comma-separated events a ticket's submitter is "
-                        "notified about: claimed,closed,needs_input,"
+                        "notified about after wt add --subscribe: claimed,closed,needs_input,"
                         "awaits_decision (default: all but claimed -- a claim "
                         "costs the filer a turn and tells it nothing). "
                         "'none' notifies the submitter about nothing; "

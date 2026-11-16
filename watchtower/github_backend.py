@@ -2491,6 +2491,7 @@ class GitHubIssuesBackend:
             "client_id": meta.get("client_id", ""),
             "submitter": str(meta.get("submitter") or ""),
             "submitter_explicit": bool(meta.get("submitter_explicit", False)),
+            "submitter_subscribed": bool(meta.get("submitter_subscribed", False)),
             "submitter_node": str(meta.get("submitter_node") or ""),
             "claimed_by": (
                 meta.get("claimed_by")
@@ -2977,6 +2978,7 @@ class GitHubIssuesBackend:
         confidence: str = "",
         submitter: str = "",
         submitter_explicit: bool = False,
+        submitter_subscribed: bool = False,
         blocked_by: Optional[List[str]] = None,
         depth_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -3007,10 +3009,9 @@ class GitHubIssuesBackend:
             # home (labels only carry booleans/enums cheaply; a free-form
             # target string belongs in the body, same as `note`/`resolution`).
             "submitter": str(submitter or ""),
-            # Was that submitter NAMED by the filer (`wt add --submitter`)
-            # rather than auto-detected? It decides whether they hear every
-            # event or only the default set -- see queue._submitter_wants.
+            # Named identity and notice subscription are separate (WT-78).
             "submitter_explicit": bool(submitter_explicit),
+            "submitter_subscribed": bool(submitter_subscribed),
         }
         # The filing host's CCC node: workers on OTHER hosts block/close this
         # issue too, and need it to reach a bare submitter id (WATCHTOWER-42).
@@ -4245,6 +4246,10 @@ class GitHubIssuesBackend:
             return None
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         title = item.get("title", "")
+        dependency_wait = bool(fields.pop("_dependency_wait", False))
+        if dependency_wait:
+            from . import queue as _q
+            _q._dependency_wait_check(item)
         for key, value in fields.items():
             if key == "blocked_by":
                 blockers = self._validate_blockers(
@@ -4315,7 +4320,13 @@ class GitHubIssuesBackend:
             elif key == "_history":
                 event, extra = value
                 _append_history(meta, event, **extra)
-        self._edit_body(item, body, meta, "--title", _Text(title))
+        extra_args = []
+        if dependency_wait:
+            from . import queue as _q
+            _q._dependency_wait_unlocked(meta, _now_iso(),
+                                         worker_done=item.get("status") == "in_progress")
+            extra_args = ["--remove-label", self.in_progress_label]
+        self._edit_body(item, body, meta, "--title", _Text(title), *extra_args)
         return self.get(ident)
 
     def peek_next(

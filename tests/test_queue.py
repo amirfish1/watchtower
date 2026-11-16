@@ -49,7 +49,7 @@ def test_notify_ticket_event_forwards_submitter_through_ccc(wt, monkeypatch):
     )
     item = {
         "project": "MEMORY", "ref": "MEMORY-1", "number": 1,
-        "submitter": "old-sid", "pre_ack": True,
+        "submitter": "old-sid", "submitter_subscribed": True,
     }
     wt.q._notify_ticket_event(item, "closed", detail="done")
     assert sent == ["new-sid"]
@@ -66,7 +66,7 @@ def test_notify_ticket_event_no_forward_uses_target_unchanged(wt, monkeypatch):
     )
     item = {
         "project": "MEMORY", "ref": "MEMORY-1", "number": 1,
-        "submitter": "still-here-sid", "pre_ack": True,
+        "submitter": "still-here-sid", "submitter_subscribed": True,
     }
     wt.q._notify_ticket_event(item, "closed", detail="done")
     assert sent == ["still-here-sid"]

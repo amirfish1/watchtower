@@ -55,7 +55,8 @@ Item shape::
       "screenshot_path": "...", "repo_path": "...",
       "submitter": "",                    # addressable filer target (optional,
                                           # see enqueue's submitter param) --
-                                          # notified on claim/close/needs-input
+                                          # attribution only
+      "submitter_subscribed": false,      # explicit wt add --subscribe opt-in
       "claimed_by": null, "claimed_at": null, "closed_at": null,
       "claimed_session_id": null,        # real worker/session id, when known
       "claimed_machine": null,           # ~3-letter machine tag (machine_tag()),
@@ -1544,43 +1545,17 @@ def _actor_identities(*values: Any) -> set:
 
 
 def _submitter_wants(item: Dict[str, Any], event: str, _config: Any) -> bool:
-    """Should this ticket's ``submitter`` hear about ``event``? (WATCHTOWER-23)
+    """Filer identity is attribution; only --subscribe opts into notices.
 
-    Filing a ticket makes the filing session its submitter automatically --
-    nobody opted into anything -- so by default it hears only the events that
-    hand it something to act on (``config.DEFAULT_NOTIFY_EVENTS``: closed,
-    needs_input, awaits_decision). A claim tells the filer nothing it can use
-    while costing it a turn, which is the whole point of the setting.
-
-    Two ways to get the full stream back:
-
-    - per queue, ``wt config <q> --notify-events claimed,closed,...``;
-    - per ticket, filing it with an explicit ``--submitter`` or ``--pre-ack``.
-      Both mean a human/session deliberately attached itself to THIS ticket
-      (rather than being recorded as filer by ``_default_report_to``), so it
-      is treated as watching and gets everything.
-
-    A ``needs_input``/``awaits_decision`` whose current wait is ``owner`` or
-    ``external`` skips the automatic submitter: that question is not its to
-    answer (IDEAS-101).
-
-    Subscribers are not filtered here at all -- ``wt subscribe`` is itself the
-    explicit opt-in, and ``wt unsubscribe`` is its off switch.
+    Queue subscriptions and successor forwarding are independent of this flag.
+    Old tickets without it are silent too (WT-78).
     """
-    if item.get("submitter_explicit") or item.get("pre_ack"):
-        return True
-    # A block waiting on the owner or an outside party asks the filer nothing:
-    # waking it just spends a turn re-reading a question it cannot answer
-    # (IDEAS-101: drain workers woken for hours by their filed OPS tickets).
-    # It still hears ``closed``.
-    if event in ("needs_input", "awaits_decision"):
-        wait = current_wait(item)
-        if wait and wait.get("on") in ("owner", "external"):
-            return False
+    if not item.get("submitter_subscribed"):
+        return False
     try:
         return event in _config.notify_events(str(item.get("project") or ""))
     except Exception:
-        return True  # a config hiccup must never silently mute notifications
+        return False
 
 
 def _local_submitter_node(submitter: Any) -> str:
@@ -1665,6 +1640,8 @@ def _notify_ticket_event(
     """
     if not item or not event:
         return
+    if event in ("needs_input", "awaits_decision") and (current_wait(item) or {}).get("on") == "dependency":
+        return  # Legacy dependency blocks never ask anyone a question.
     try:
         from . import messages
         from . import config as _config
@@ -1800,7 +1777,7 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
                        blocked_by: Optional[List[str]], gates: Optional[List[str]],
                        accept_line: str, assessment_origin: str = "",
                        placement: str = "", depth: str = "",
-                       budget_min: int = 0) -> Dict[str, Any]:
+                       budget_min: int = 0, submitter_subscribed: bool = False) -> Dict[str, Any]:
     """Append a new ``open`` item to an already-loaded local store (the caller
     holds the store lock and saves). Shared by :func:`enqueue` and the
     post-fix-assessment filer so both create identical tickets."""
@@ -1845,6 +1822,7 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
         **_placement_fields(placement, note, text, title),
         "submitter": str(submitter or ""),
         "submitter_explicit": bool(submitter_explicit),
+        "submitter_subscribed": bool(submitter_subscribed),
         **({"submitter_node": node} if (node := _local_submitter_node(submitter)) else {}),
         "claimed_by": None,
         "claimed_at": None,
@@ -1887,6 +1865,7 @@ def enqueue(
     verifier_model: str = "",
     submitter: str = "",
     submitter_explicit: bool = False,
+    submitter_subscribed: bool = False,
     pre_ack: bool = False,
     blocked_by: Optional[List[str]] = None,
     gates: Optional[List[str]] = None,
@@ -1927,10 +1906,9 @@ def enqueue(
     "" and the ticket simply gets no submitter notifications -- this never
     blocks filing.
 
-    ``submitter_explicit``: the caller NAMED this submitter (``wt add
-    --submitter``) rather than being auto-detected as the filing session, so
-    it is watching this ticket deliberately and hears every event
-    (``_submitter_wants``), not just the default set."""
+    ``submitter_explicit`` records attribution from ``--submitter``. Neither
+    it nor ``pre_ack`` enables notices. ``submitter_subscribed`` (``wt add
+    --subscribe``) opts into the queue-configured status events."""
     note = _clip(note, 4000)
     if not note and not text:
         raise ValueError("note or text is required")
@@ -1986,7 +1964,7 @@ def enqueue(
             value=value,
             confidence=confidence,
             submitter=submitter,
-            submitter_explicit=submitter_explicit,
+            submitter_explicit=submitter_explicit, submitter_subscribed=submitter_subscribed,
             blocked_by=blocked_by,
             depth_fields=_depth_fields(depth, budget_min),
         )
@@ -2013,7 +1991,7 @@ def enqueue(
             repo_path=repo_path, lane=lane, item_type=item_type, readiness=readiness,
             priority=priority, value=value, confidence=confidence, model_floor=model_floor,
             planner_model=planner_model, verifier_model=verifier_model, submitter=submitter,
-            submitter_explicit=submitter_explicit, pre_ack=pre_ack, blocked_by=blocked_by,
+            submitter_explicit=submitter_explicit, submitter_subscribed=submitter_subscribed, pre_ack=pre_ack, blocked_by=blocked_by,
             gates=gates, accept_line=accept_line, assessment_origin=assessment_origin,
             placement=placement, depth=depth, budget_min=budget_min)
         saved["client_id"] = client_id
@@ -2447,7 +2425,19 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
             out = github_pipeline.set_gates(ident, list(fields.pop("gates") or []))
             if not fields or out is None:
                 return out
-        return backend.update(ident, **fields)
+        dependency_wait = bool(fields.get("_dependency_wait"))
+        saved = backend.update(ident, **fields)
+        if saved and dependency_wait:
+            if saved.get("pipeline_local"):
+                from . import github_pipeline
+                def release_park(cur):
+                    _reopen_pending_unlocked(cur, _now_iso(), "handoff", "waiting on ticket dependencies")
+                    cur.pop("parked", None)
+                github_pipeline.mutate(ident, release_park)
+                saved = backend.get(ident)
+            _supersede_outbox(ident)
+        return saved
+    dependency_wait = bool(fields.pop("_dependency_wait", False))
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
@@ -2498,12 +2488,16 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                     if group_parent_ref(it) and group_parent_ref(it) in fields["blocked_by"]:
                         raise ValueError(f"{it.get('ref')} cannot be blocked by its own group "
                                          f"parent {group_parent_ref(it)}")
+                if dependency_wait:
+                    _dependency_wait_check(it)
                 edge_from = _pa_edge_start(it)
                 for k, v in fields.items():
                     if k in ALLOWED:
                         # "item_type" and "type" are aliases — store as "type"
                         key = "type" if k == "item_type" else k
                         it[key] = v
+                if dependency_wait:
+                    _dependency_wait_unlocked(it, now)
                 superseded = bool(fields.get("needs_input")) and edge_from is not None
                 if superseded:
                     # A new block supersedes the pending answer, as block() does (E17).
@@ -2518,7 +2512,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                     _append_history(it, "edit", by=_by("system"), at=now, fields=changed)
                 it["updated_at"] = now
                 _save_unlocked(data)
-                if superseded:
+                if superseded or dependency_wait:
                     _supersede_outbox(it.get("ref"))
                 return it
     return None
@@ -8616,6 +8610,33 @@ def resume_claim(ident: Any, gen: int) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _dependency_wait_check(it: Dict[str, Any]) -> None:
+    if it.get("status") not in ("open", "in_progress", PARKED_STATUS):
+        raise ValueError(f"{it.get('ref')} is {it.get('status')}; cannot wait on a dependency")
+    if it.get("pipeline_foreign"):
+        raise ValueError(f"{it.get('ref')}: dependency edit must run on the pipeline owner host")
+    if group_role(it) == "parent" or _plan_active_unlocked(it) or it.get("supervision"):
+        raise ValueError(f"{it.get('ref')}: active plan owns this ticket; cannot release it")
+    wait = current_wait(it) or {}
+    if it.get("needs_input") and wait.get("on") != "dependency":
+        raise ValueError(f"{it.get('ref')}: resolve the existing human question before replacing it with a dependency")
+
+
+def _dependency_wait_unlocked(it: Dict[str, Any], now: str, *, worker_done: bool = True) -> None:
+    """Keep history/answers, release delivery ownership, and let blocked_by gate dispatch."""
+    holder = str(it.get("claimed_by") or "")
+    _release_claim_to_open_unlocked(it, now, "waiting on ticket dependencies")
+    _reopen_pending_unlocked(it, now, "handoff", "waiting on ticket dependencies")
+    it["claimed_session_id"] = None
+    it.pop("resume", None)
+    _clear_sent_back_unlocked(it)
+    for key in ("claim_heartbeat", "wait", "block_origin", "deferred_until", "defer_reason", "reserved_for",
+                "reserved_session_id", "reserved_until"):
+        it.pop(key, None)
+    if holder and worker_done:
+        _note_worker_ticket_done(holder)
+
+
 def _release_claim_to_open_unlocked(it: Dict[str, Any], now: str, reason: str) -> None:
     """Back to the claim pool as part of an answer handoff (keeps the
     session handle, drops the claim and the block)."""
@@ -8759,6 +8780,23 @@ def _github_park(ident: Any, session_id: str, item: Dict[str, Any]) -> Optional[
     if parked:
         _supersede_outbox(parked.get("ref"))
     return parked
+
+
+def dependency_only_question(question: str) -> List[str]:
+    """Conservatively catch wait-only prose, retaining real decisions mentioning refs."""
+    import re
+
+    text = str(question or "").strip()
+    refs = re.findall(r"\b[A-Z][A-Z0-9_-]*-\d+\b", text)
+    if not refs:
+        return []
+    target = r"(?:canonical\s+|ticket\s+)?[A-Z][A-Z0-9_-]*-\d+\b"
+    prefix = r"(?i:await(?:ing)?|wait(?:ing|s)?(?:\s+on|\s+for)?|blocked\s+(?:on|by)|depends\s+on)\s+"
+    if re.match(prefix + target, text) or re.fullmatch(target + r"[.?!]?", text):
+        return list(dict.fromkeys(refs))
+    if re.match(r"^[A-Z][A-Z0-9_-]*-\d+\s+(?:must|needs? to)\b", text):
+        return list(dict.fromkeys(refs))
+    return []
 
 
 def block(

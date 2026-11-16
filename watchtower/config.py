@@ -22,7 +22,8 @@ by ``queue._notify_ticket_event``, the same helper that pushes a ticket's own
 ``submitter`` its status changes.
 
 ``notify_events`` is the filter on that second (submitter) half: which events
-a filer hears about by default. See :data:`DEFAULT_NOTIFY_EVENTS`.
+a filer hears after opting in with ``wt add --subscribe``. Identity alone
+does not enable notices. See :data:`DEFAULT_NOTIFY_EVENTS`.
 
 Stored as ``queue-config.json`` in the persistent data directory, with
 ``~/.watchtower/queue-config.json`` imported automatically on first access.

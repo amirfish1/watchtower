@@ -434,9 +434,10 @@ ANNOUNCE_TICKET = (
 WAIT_TARGET_CONTRACT = (
     "WAIT TARGET: every `wt block` names who it waits on with `--wait-on`: "
     "`owner` for a decision only the owner can make; `external --wait-actor "
-    "NAME` for a client, staff member or vendor; `dependency --wait-ref REF` "
-    "for another ticket (add `--wait-ref-host` when that ticket lives on "
-    "another machine); `worker` for work another session is doing. Pick the "
+    "NAME` for a client, staff member or vendor; `worker` for work another "
+    "session is doing. For another ticket, use `wt edit REF --after DEP` "
+    "instead of blocking: it releases your claim and dispatch resumes when "
+    "DEP closes, without a human question or filer notice. Pick the "
     "one that is true; do not default to `owner`. For an owner wait also "
     "pass `--decide-by` (ISO time with a UTC offset, or `none`) and "
     "`--if-unanswered` (what happens if nobody answers, or `none`). This "

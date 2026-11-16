@@ -43,7 +43,7 @@ def test_claim_run_and_dispatch_boundaries(wt_env, monkeypatch):
 
 
 def test_tracker_comments_and_close_notices_are_silent(wt_env, monkeypatch):
-    item = q.enqueue(project='LOG', note='Legacy feature', submitter='filer', submitter_explicit=True)
+    item = q.enqueue(project='LOG', note='Legacy feature', submitter='filer', submitter_explicit=True, submitter_subscribed=True)
     q.claim_by_ref(item['ref'], 'legacy')
     # Even stale ownership cannot turn tracker comments into a wake.
     config.set_queue_kind('LOG', 'tracker')
@@ -108,7 +108,7 @@ def test_work_queue_can_depend_on_closed_tracker(wt_env):
 
 def test_tracker_needs_input_notifications_remain_available(wt_env, monkeypatch):
     config.set_queue_kind('LOG', 'tracker')
-    item = q.enqueue(project='LOG', note='Decision', submitter='filer', submitter_explicit=True)
+    item = q.enqueue(project='LOG', note='Decision', submitter='filer', submitter_explicit=True, submitter_subscribed=True)
     assert q._submitter_wants(item, 'needs_input', config)
     assert q._submitter_wants(item, 'awaits_decision', config)
 
