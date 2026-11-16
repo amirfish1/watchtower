@@ -261,27 +261,40 @@ def test_crash_reserved_receipt_never_reexecutes(env, monkeypatch):
 
 @pytest.mark.parametrize("op", ["ask", "tell"])
 def test_scoped_messages_preserve_reply_and_receipt_and_do_not_replay(env, monkeypatch, op):
-    from watchtower import messages
+    # WT-61 hardening: the bridge no longer calls messages.ask/send (both can
+    # fall through to an unsandboxed headless resume or the outbox). It hands
+    # the descriptor it verified against the claim-time pin to the live-only
+    # adapter chain, and returns a minimal schema.
+    from watchtower import messages, sender_envelope as envelope
     w = env
     destination = {"session_id": "11111111-2222-7333-8444-555555555555", "engine": "claude"}
     monkeypatch.setattr(messages, "resolve_target", lambda target: destination.copy())
     calls = []
-    def deliver(*a, **kw):
-        calls.append((a, kw))
-        return {"ok": True, "answer": "reply", "receipt_id": "receipt-1"}
-    monkeypatch.setattr(messages, "ask", deliver)
-    monkeypatch.setattr(messages, "send", deliver)
+    def deliver(resolved, text, mode="send", **kw):
+        calls.append((resolved, text, kw))
+        return {"ok": True, "transport": "uds", "receipt_id": "receipt-1",
+                "log": "/home/private/msg.log", "attr": resolved["attr"]}
+    monkeypatch.setattr(messages, "deliver", deliver)
+    for unsafe in ("ask", "send", "_deliver_resume", "_deliver_delegate", "outbox_add"):
+        monkeypatch.setattr(messages, unsafe, lambda *a, **k: pytest.fail("unsandboxed or queued delivery"))
     claim(w, submitter="@filer")
     key = uuid.uuid4().hex
     body = {"target": "@filer", "text": "What was expected?"}
     first = submit(w, op, body, w.claim, key)
-    assert first["ok"] and first["answer"] == "reply" and first["receipt_id"] == "receipt-1"
+    expected = {"ok": True, "delivered": True, "transport": "uds", "receipt_id": "receipt-1"}
+    if op == "ask":
+        expected["answer_pending"] = True
+    assert first == expected
     assert submit(w, op, body, w.claim, key) == first
     assert len(calls) == 1
-    if op == "tell":
-        assert calls[0][1]["queue_on_fail"] is False
-    assert calls[0][1]["attr"]["evidence"]["untrusted"] is True
-    assert calls[0][1]["attr"]["author"]["id"] == w.worker
+    resolved, text, kw = calls[0]
+    assert kw == {"live_only": True}
+    assert resolved["session_id"] == destination["session_id"]
+    assert resolved["attr"]["evidence"]["untrusted"] is True
+    assert resolved["attr"]["author"]["id"] == w.worker
+    assert resolved["attr"]["message_id"] == str(uuid.UUID(hex=key))
+    assert envelope._parse_line(envelope.header(resolved["attr"])) is not None
+    assert text.startswith("[Untrusted sandbox worker report")
     body["target"] = "@unrelated"
     assert not submit(w, op, body, w.claim)["ok"]
     body["target"] = "@filer"
