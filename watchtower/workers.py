@@ -255,6 +255,11 @@ def _spawn_env(worker_id: str = "", verify: bool = False, *, session_id: str = "
         account = antigravity_account_id or (antigravity_accounts.session_account(session_id)
                                              if session_id else antigravity_accounts.worker_account())
         env = antigravity_accounts.launch_env(account, env)
+    if engine == "codex" and queue and _config.codex_sandbox(queue) == "workspace-write":
+        # WT-61: allowlist only. No inherited credentials, proxies, agent
+        # sockets or daemon store paths; TMPDIR inside the worker's store.
+        from . import sandbox_policy
+        env = sandbox_policy.scrub_env(env, _codex_sandbox_store(queue, worker_id))
     return env
 
 
@@ -291,33 +296,51 @@ def codex_sandbox_env(queue: str, worker_id: str = "") -> Dict[str, str]:
     }
 
 
-def codex_sandbox_args(queue: str, repo_path: str, worker_id: str = "") -> List[str]:
-    """Codex CLI args for the ``workspace-write`` policy: no tool network, and
-    only ``repo_path`` and the isolated store writable (TMPDIR and /tmp are
-    excluded). Raises CodexSandboxError when the policy cannot be satisfied."""
+def _codex_sandbox_store(queue: str, worker_id: str = "") -> Path:
     from . import config as _cfg
+    from . import sandbox_bridge
+    try:
+        return (sandbox_bridge.worker_store(queue, worker_id) if worker_id
+                else _cfg.codex_sandbox_store(queue).expanduser().absolute())
+    except ValueError as e:
+        raise CodexSandboxError(f"codex sandbox for {queue}: {e}") from e
+
+
+def codex_sandbox_args(queue: str, repo_path: str, worker_id: str = "") -> List[str]:
+    """Codex CLI args for the ``workspace-write`` policy: a native permission
+    profile (see ``sandbox_policy``) with no tool network, reads limited to
+    the runtime, and only ``repo_path`` and the worker's isolated store
+    writable. Pure -- it creates nothing, so a dry run has no side effects;
+    ``codex_sandbox_prepare`` does the real-launch work. Raises
+    CodexSandboxError when the policy cannot be satisfied."""
+    from . import sandbox_policy
     if not repo_path or not Path(repo_path).is_dir():
         raise CodexSandboxError(
             f"codex sandbox for {queue}: workspace {repo_path!r} is not a directory")
-    from . import sandbox_bridge
-    store = sandbox_bridge.worker_store(queue, worker_id) if worker_id else _cfg.codex_sandbox_store(queue)
+    store = _codex_sandbox_store(queue, worker_id)
     try:
-        store.mkdir(parents=True, exist_ok=True)
-        probe = store / ".write-probe"
-        probe.write_text("ok")
-        probe.unlink()
-    except OSError as e:
-        raise CodexSandboxError(
-            f"codex sandbox for {queue}: isolated store {store} is not writable: {e}")
-    roots = json.dumps([str(Path(repo_path).resolve()), str(store.resolve())])
-    return [
-        "--sandbox", "workspace-write",
-        "-c", "sandbox_workspace_write.network_access=false",
-        "-c", f"sandbox_workspace_write.writable_roots={roots}",
-        "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-        "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
-        "-c", 'approval_policy="never"',
-    ]
+        hazards = sandbox_policy.project_config_hazards(repo_path)
+        if hazards:
+            raise sandbox_policy.SandboxPolicyError(
+                "untrusted Codex project config present: " + ", ".join(hazards))
+        return sandbox_policy.exec_args(repo_path, store)
+    except sandbox_policy.SandboxPolicyError as e:
+        raise CodexSandboxError(f"codex sandbox for {queue}: {e}") from e
+
+
+def codex_sandbox_prepare(queue: str, worker_id: str, repo_path: str) -> Dict[str, Any]:
+    """Real-launch step for a sandboxed worker: lay out its store, prove the
+    profile in the kernel (model-free), and bootstrap Git metadata inside the
+    store. The base commit is recorded outside the worker's writable roots for
+    later proof checks. Raises CodexSandboxError; the spawn must not proceed."""
+    from . import sandbox_policy
+    store = _codex_sandbox_store(queue, worker_id)
+    try:
+        info = sandbox_policy.prepare(repo_path, store)
+        sandbox_policy.record_launch(worker_id, repo_path, store, info.get("base") or "")
+        return info
+    except (sandbox_policy.SandboxPolicyError, OSError) as e:
+        raise CodexSandboxError(f"codex sandbox for {queue}: {e}") from e
 
 
 def ensure_codex_wt_execpolicy(codex_home: Optional[Path] = None) -> bool:
@@ -5569,12 +5592,15 @@ def build_drain_command(
     if engine == "codex":
         # Best-effort, idempotent: keep `wt` runnable in turns that do NOT
         # inherit the bypass flag below (see ensure_codex_wt_execpolicy).
-        ensure_codex_wt_execpolicy()
-        worker_home = config.codex_worker_home()
-        if worker_home is not None:
-            ensure_codex_wt_execpolicy(worker_home)
-        if config.codex_sandbox(queue) == "workspace-write":
-            # WT-61: restricted policy; fails closed (CodexSandboxError).
+        sandboxed = config.codex_sandbox(queue) == "workspace-write"
+        if not sandboxed:
+            ensure_codex_wt_execpolicy()
+            worker_home = config.codex_worker_home()
+            if worker_home is not None:
+                ensure_codex_wt_execpolicy(worker_home)
+        if sandboxed:
+            # WT-61: restricted policy; fails closed (CodexSandboxError). No
+            # execpolicy edit: approvals are "never" and exec ignores rules.
             argv = [bin_name, "exec", *codex_sandbox_args(queue, repo_path, worker_id)]
         else:
             argv = [
@@ -5596,7 +5622,9 @@ def build_drain_command(
         # An unresolvable codex keeps the exec argv so Popen itself fails and
         # the spawn reports "engine executable unavailable", not a wrapper death.
         if config.codex_transport(queue) == "app-server" and _resolve_engine_bin("codex"):
-            return codex_app_worker_command(argv, worker_id, repo_path, goal)
+            return codex_app_worker_command(
+                argv, worker_id, repo_path, goal,
+                sandbox_store=str(_codex_sandbox_store(queue, worker_id)) if sandboxed else "")
         argv.append(goal)
         return argv
     if engine == "kimi":
@@ -8326,7 +8354,8 @@ def spawn_workers(
             from . import sandbox_bridge
             try:
                 sandbox_bridge.register(queue, worker_id, repo_path)
-            except (ValueError, OSError) as exc:
+                codex_sandbox_prepare(queue, worker_id, repo_path)
+            except (ValueError, OSError, CodexSandboxError) as exc:
                 failure = _record_launch_failure(
                     queue=queue, engine=engine, worker_id=worker_id, pid=0,
                     log_path=log_dir / f"{worker_id}.log",
@@ -8507,6 +8536,7 @@ def spawn_run_once_worker(
             sandbox_bridge.register(queue, worker_id, repo_path, assigned_ref=ref)
         except (ValueError, OSError) as exc:
             raise CodexSandboxError(f"sandbox bridge policy: {exc}") from exc
+        codex_sandbox_prepare(queue, worker_id, repo_path)
     logical_bin = _ENGINE_BIN.get(engine, engine)
     if argv and argv[0] == logical_bin:
         resolved_bin = _resolve_engine_bin(engine)
@@ -8625,14 +8655,17 @@ def compact_env() -> Dict[str, str]:
 
 def codex_app_worker_command(
     exec_argv: List[str], worker_id: str, repo_path: str, goal: str,
+    sandbox_store: str = "",
 ) -> List[str]:
     """Re-express a ``codex exec`` argv as a steerable app-server worker.
 
     Same model/effort/compact settings: ``--model`` and every ``-c``/``--config``
     override carry over; the exec-only sandbox bypass becomes the thread's
-    ``danger-full-access`` sandbox + ``never`` approvals inside the worker. A
-    ``--sandbox MODE`` (WT-61 workspace-write policy) carries over as the
-    thread's sandbox instead."""
+    ``danger-full-access`` sandbox + ``never`` approvals inside the worker.
+    With ``sandbox_store`` (WT-61) the worker instead keeps the native
+    permission profile carried by the ``-c`` overrides: it never sends the
+    legacy thread ``sandbox`` field (which would replace the profile), starts
+    the server outside the untrusted workspace, and guards project config."""
     resolved = _resolve_engine_bin("codex") or exec_argv[0]
     # -c with an explicit sys.path entry: the worker's cwd is the queue repo,
     # and `-m` would import a `watchtower` package found there instead.
@@ -8643,11 +8676,15 @@ def codex_app_worker_command(
             pkg_parent, "run", "--codex-bin", resolved, "--worker-id", worker_id]
     if repo_path:
         argv += ["--cwd", repo_path]
+    if sandbox_store:
+        from . import sandbox_policy
+        argv += ["--permission-profile", sandbox_policy.PROFILE,
+                 "--sandbox-store", sandbox_store, "--server-cwd", "/"]
     rest = exec_argv[2:]
     i = 0
     while i < len(rest):
         flag = rest[i]
-        if flag in ("--model", "-c", "--config", "--sandbox") and i + 1 < len(rest):
+        if flag in ("--model", "-c", "--config") and i + 1 < len(rest):
             argv += ["-c" if flag == "--config" else flag, rest[i + 1]]
             i += 2
             continue

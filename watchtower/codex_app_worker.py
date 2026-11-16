@@ -380,12 +380,36 @@ def run(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--model", default="")
     p.add_argument("--sandbox", default="danger-full-access",
                    choices=["danger-full-access", "workspace-write", "read-only"],
-                   help="thread sandbox mode (workspace-write also needs the -c "
-                        "sandbox_workspace_write.* overrides for roots/network)")
+                   help="legacy thread sandbox mode; ignored with --permission-profile")
+    p.add_argument("--permission-profile", default="",
+                   help="WT-61: native permission profile defined by the -c overrides. "
+                        "The thread is started WITHOUT the legacy sandbox field, which "
+                        "would replace the profile.")
+    p.add_argument("--sandbox-store", default="",
+                   help="WT-61: the worker's isolated store (second writable root)")
+    p.add_argument("--server-cwd", default="",
+                   help="directory the app-server process starts in (default: --cwd). "
+                        "Sandboxed workers use a trusted one, not the workspace.")
     p.add_argument("-c", "--config", action="append", default=[],
                    help="codex config override passed to the app-server (repeatable)")
     p.add_argument("goal")
     args = p.parse_args(argv)
+    profiled = bool(args.permission_profile)
+    if profiled and not args.sandbox_store:
+        p.error("--permission-profile requires --sandbox-store")
+
+    def config_hazard() -> str:
+        """WT-61: a `.codex` in the untrusted workspace (or an ancestor) would
+        be loaded as project config -- MCP commands on the host, wider roots."""
+        if not profiled:
+            return ""
+        from . import sandbox_policy
+        return ", ".join(sandbox_policy.project_config_hazards(args.cwd))
+
+    hazard = config_hazard()
+    if hazard:
+        _emit({"type": "error", "error": f"sandbox policy: untrusted Codex project config present: {hazard}"})
+        return 1
 
     reg = registry_dir()
     (reg / "sock").mkdir(parents=True, exist_ok=True)
@@ -395,7 +419,7 @@ def run(argv: Optional[List[str]] = None) -> int:
     cmd = [args.codex_bin, "app-server", "--listen", f"unix://{sock}"]
     for override in args.config:
         cmd += ["-c", override]
-    server = subprocess.Popen(cmd, cwd=args.cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+    server = subprocess.Popen(cmd, cwd=args.server_cwd or args.cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               preexec_fn=_pdeathsig if os.name == "posix" else None)
     record_path: Optional[Path] = None
     state: Dict[str, Any] = {"turn_id": None, "status": None}
@@ -433,7 +457,15 @@ def run(argv: Optional[List[str]] = None) -> int:
                 return 1
             time.sleep(0.1)
         client = _Client(sock, on_note=on_note)
-        params: Dict[str, Any] = {"cwd": args.cwd, "approvalPolicy": "never", "sandbox": args.sandbox}
+        params: Dict[str, Any] = {"cwd": args.cwd, "approvalPolicy": "never"}
+        if profiled:
+            from . import sandbox_policy
+            # No "sandbox" key: it would swap the profile for a plain legacy
+            # policy. The thread-level untrusted-project entry is what keeps
+            # workspace config from loading.
+            params["config"] = sandbox_policy.thread_config(args.cwd, args.sandbox_store)
+        else:
+            params["sandbox"] = args.sandbox
         if args.model:
             params["model"] = args.model
         started = client.call("thread/start", params)
@@ -442,6 +474,18 @@ def run(argv: Optional[List[str]] = None) -> int:
         if not thread_id:
             _emit({"type": "error", "error": f"thread/start failed: {_error_text(started)}"})
             return 1
+        if profiled:
+            try:
+                sandbox_policy.check_thread_sandbox(
+                    (started.get("result") or {}).get("sandbox"), args.cwd, args.sandbox_store)
+            except sandbox_policy.SandboxPolicyError as exc:
+                # Fail closed before any model turn runs under a wrong policy.
+                _emit({"type": "error", "error": f"sandbox policy: {exc}"})
+                return 1
+            hazard = config_hazard()
+            if hazard:
+                _emit({"type": "error", "error": f"sandbox policy: untrusted Codex project config present: {hazard}"})
+                return 1
         # First log line: resolve_session_id_from_log reads session_id here.
         _emit({"type": "thread.started", "session_id": thread_id, "transport": "app-server",
                "pid": os.getpid(), "server_pid": server.pid, "sock": sock})
@@ -462,11 +506,20 @@ def run(argv: Optional[List[str]] = None) -> int:
             if client.closed.is_set() or server.poll() is not None:
                 state["status"] = "app-server-exited"
                 break
+            hazard = config_hazard()
+            if hazard:
+                # Appeared mid-turn (the profile keeps the worker itself from
+                # creating it): stop before another turn could load it.
+                _emit({"type": "error", "error": f"sandbox policy: untrusted Codex project config appeared: {hazard}"})
+                state["status"] = "signal:policy"
+                break
         if str(state["status"]).startswith("signal:") and not client.closed.is_set():
             client.call("turn/interrupt", {"threadId": thread_id, "turnId": state["turn_id"]}, timeout=10)
         _emit({"type": "turn.finished", "session_id": thread_id, "turn_id": state["turn_id"], "status": state["status"]})
         if state["status"] == "completed":
             return 0
+        if state["status"] == "signal:policy":
+            return 1
         return 143 if str(state["status"]).startswith("signal:") else 1
     finally:
         if record_path is not None:
