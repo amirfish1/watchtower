@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -6206,6 +6206,28 @@ def requeue_orphaned_tickets(
     return reopened
 
 
+@contextmanager
+def _startup_timing(queue: str, phase: str, ref: str = ""):
+    """Attribute live dispatch delays without changing dispatch decisions."""
+    started = time.monotonic()
+    outcome = "ok"
+    try:
+        yield
+    except BaseException:
+        outcome = "error"
+        raise
+    finally:
+        elapsed = time.monotonic() - started
+        try:
+            from .queue import _log
+            _log("STARTUP_TIMING", json.dumps({
+                "phase": phase, "ref": ref, "elapsed_s": round(elapsed, 6),
+                "outcome": outcome, "pid": os.getpid(),
+            }, sort_keys=True), queue=queue)
+        except Exception:
+            pass  # diagnostics must never prevent staffing
+
+
 def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
     """Decide + act on what a newly-filed ticket needs, and log the decision.
 
@@ -6242,11 +6264,12 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
         # read-your-own-writes fresh without costing an extra round trip.
         item = None
         if ref:
-            item = next(
-                (it for it in (_q.list_items(project=queue) or [])
-                 if str(it.get("ref") or "") == ref),
-                None,
-            )
+            with _startup_timing(queue, "ticket_read", ref):
+                item = next(
+                    (it for it in (_q.list_items(project=queue) or [])
+                     if str(it.get("ref") or "") == ref),
+                    None,
+                )
         if item and _q.plan_pending(item):
             # Plan-gated (WT-22): plan first; no worker until it is accepted
             # (cmd_plan's accept verdict dispatches again).
@@ -6311,12 +6334,14 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             # steers it off its claim, and it drains the queue on its own
             # when it finishes (WT-15). Idle workers get first shot; if none
             # is idle the reconcile below decides whether to staff up.
-            exclude |= {
-                str(it.get("claimed_by") or "")
-                for it in (_q.list_items(project=queue) or [])
-                if it.get("status") == "in_progress" and it.get("claimed_by")
-            }
-        delivered = notify_workers(queue, nudge, exclude=exclude)
+            with _startup_timing(queue, "busy_read", ref):
+                exclude |= {
+                    str(it.get("claimed_by") or "")
+                    for it in (_q.list_items(project=queue) or [])
+                    if it.get("status") == "in_progress" and it.get("claimed_by")
+                }
+        with _startup_timing(queue, "notify_workers", ref):
+            delivered = notify_workers(queue, nudge, exclude=exclude)
         if delivered:
             reason = f"nudged {delivered} live worker(s) — immediate pickup"
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
@@ -6324,7 +6349,8 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
         # No warm worker: reconcile just this queue (WT-2) -- its pass
         # releases workers past the separate lifecycle floor, then staffs it.
         # Cache coldness alone is not a release signal.
-        result = reconcile_once(only_queue=queue)
+        with _startup_timing(queue, "reconcile", ref):
+            result = reconcile_once(only_queue=queue)
         spawned = [r for r in result.get("spawned", []) if r.get("queue") == queue]
         if spawned:
             wids = ", ".join(r.get("worker_id", "?") for r in spawned)
@@ -6867,7 +6893,13 @@ def reconcile_once(dry_run: bool = False,
     # this queue's serial launch-failure observation windows.
     lock = (_staffing_lock(only_queue) if only_queue else
             _FileLock(WORKERS_FILE.parent / "reconcile-maintenance.lock"))
-    with lock:
+    # Measure acquisition separately from work under the lock. A completed
+    # reconcile duration alone cannot distinguish contention from slow reads.
+    with ExitStack() as stack:
+        timing = (_startup_timing(only_queue, "staffing_lock")
+                  if only_queue and not dry_run else nullcontext())
+        with timing:
+            stack.enter_context(lock)
         return _reconcile_once_locked(dry_run, only_queue=only_queue,
                                       supervise_stages=supervise_stages)
 
@@ -7080,9 +7112,10 @@ def _reconcile_once_locked(dry_run: bool = False,
         # replacement bookkeeping still sees them) and leave the fleet-wide
         # maintenance below to the periodic tick.
         try:
-            result["released"] = release_idle_workers(
-                queue=only_queue, reconcile_id=reconcile_id
-            )
+            with _startup_timing(only_queue, "idle_release"):
+                result["released"] = release_idle_workers(
+                    queue=only_queue, reconcile_id=reconcile_id
+                )
         except Exception:
             pass
     elif not dry_run:

@@ -410,6 +410,44 @@ def test_dispatch_after_enqueue_acts_on_a_requested_run_with_drain_off(wt, monke
     assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-manual"
 
 
+def test_dispatch_timings_attribute_a_slow_ticket_read(wt, monkeypatch):
+    wt.config.set_auto_drain("Q", True)
+    item = wt.q.enqueue(project="Q", note="measure startup")
+    monkeypatch.setattr(
+        wt.workers, "spawn_workers",
+        lambda queue, n=1, **kwargs: [{"worker_id": "q-timed", "queue": queue}],
+    )
+    real_list = wt.q.list_items
+
+    def slow_read(*args, **kwargs):
+        time.sleep(0.02)
+        return real_list(*args, **kwargs)
+
+    monkeypatch.setattr(wt.q, "list_items", slow_read)
+    assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-timed"
+    timings = [json.loads(line.split("STARTUP_TIMING", 1)[1])
+               for line in (wt.tmp / "activity.log").read_text().splitlines()
+               if "STARTUP_TIMING" in line]
+    phases = {row["phase"]: row for row in timings}
+    assert {"ticket_read", "busy_read", "notify_workers", "staffing_lock",
+            "idle_release", "reconcile"} <= phases.keys()
+    assert phases["ticket_read"]["elapsed_s"] >= 0.02
+    assert phases["ticket_read"]["ref"] == item["ref"]
+    assert all(row["outcome"] == "ok" and row["pid"] == os.getpid() for row in timings)
+
+
+def test_startup_timing_preserves_failure_when_logging_fails(wt, monkeypatch):
+    def broken_log(*args, **kwargs):
+        raise OSError("audit unavailable")
+
+    monkeypatch.setattr(wt.q, "_log", broken_log)
+    with pytest.raises(ValueError, match="original failure"):
+        with wt.workers._startup_timing("Q", "staffing_lock"):
+            raise ValueError("original failure")
+    with wt.workers._startup_timing("Q", "staffing_lock"):
+        pass
+
+
 @pytest.mark.parametrize("drain", [False, True])
 def test_dispatch_names_unready_readiness_not_auto_drain(wt, monkeypatch, drain):
     """An unclaimable readiness is the real blocker whatever the drain
