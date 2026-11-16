@@ -172,7 +172,8 @@ def test_cli_block_json_returns_the_blocked_ticket(wt, capsys):
     assert blocked["block_question"] == "approve the rollout?"
 
 
-def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsys):
+@pytest.mark.parametrize("author", ["human", "worker"])
+def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsys, author):
     item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
     sid = "11111111-2222-3333-4444-555555555555"
     claimed = wt.q.claim_by_ref(item["ref"], "worker-a", session_uuid=sid)
@@ -187,7 +188,10 @@ def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsy
         or {"ok": True, "transport": "fifo"},
     )
 
-    assert wt.cli.main(["comment", claimed["ref"], "Use the safer parser."]) == 0
+    assert wt.cli.main([
+        "comment", claimed["ref"], "Use the safer parser.",
+        "--by", author, "--worker", "reviewer",
+    ]) == 0
 
     assert len(calls) == 1
     target, text, kwargs = calls[0]
@@ -202,6 +206,30 @@ def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsy
     assert kwargs["mode"] == "steer"
     assert kwargs["force_queue"] is False
     assert "injected into claimed worker via fifo" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("with_session", [True, False])
+def test_cli_system_comment_is_recorded_without_waking_claimant(wt, monkeypatch, capsys, with_session):
+    import watchtower.messages as messages
+
+    monkeypatch.setattr(
+        messages, "deliver_message",
+        lambda *a, **kw: pytest.fail("system comments must never enter delivery"),
+    )
+    item = wt.q.enqueue(project="EVT", note="lineage", source="test")
+    wt.q.claim_by_ref(
+        item["ref"], "worker-a",
+        session_uuid="11111111-2222-3333-4444-555555555555" if with_session else None,
+    )
+    text = "Child session helper spawned by builder"
+    assert wt.cli.main([
+        "comment", item["ref"], text, "--by", "system", "--worker", "ccc",
+    ]) == 0
+    assert "system comment; not injected" in capsys.readouterr().out
+    event = wt.q.get(item["ref"])["history"][-1]
+    assert event["event"] == "comment"
+    assert event["text"] == text
+    assert event["by"]["kind"] == "system"
 
 
 def test_cli_comment_by_claimant_is_not_echoed_back(wt, monkeypatch, capsys):

@@ -4179,7 +4179,12 @@ def cmd_comment(args: argparse.Namespace) -> int:
     delivery = ""
     target = item.get("claimed_session_id") or item.get("claimed_by")
     live = item.get("status") == "in_progress" and target
-    if live and _comment_author_is_claimant(item, args):
+    if live and args.by == "system":
+        # Automatic lineage/status notes are durable context, not guidance.
+        # Waking the claimant here can turn helper spawns into a wake loop.
+        target = ""
+        delivery = " — system comment; not injected"
+    elif live and _comment_author_is_claimant(item, args):
         # Recorded on the ticket, but not echoed back at its own author.
         target = ""
         delivery = " — you are the claimant; not injected back at you"
