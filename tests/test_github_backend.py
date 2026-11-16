@@ -4677,3 +4677,23 @@ def test_client_id_github_cli_roundtrip_and_filter(tmp_path, monkeypatch, capsys
     assert json.loads(capsys.readouterr().out)['client_id'] == ''
     assert cli.main(['ls', '-q', 'GHI', '--client-id', '', '--json']) == 0
     assert len(json.loads(capsys.readouterr().out)) == 2
+
+
+def test_tracker_github_blocks_do_not_create_claims(tmp_path, monkeypatch):
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend('GHI', 'github')
+    config.set_github_repo('GHI', 'test-owner/test-repo')
+    config.set_queue_kind('GHI', 'tracker')
+    item = q.enqueue(project='GHI', note='Feature decision')
+    for operation in (
+        lambda: q.claim_next('worker', project='GHI'),
+        lambda: q.claim_by_ref(item['ref'], 'worker'),
+        lambda: q.mark_runnable(item['ref']),
+    ):
+        with pytest.raises(ValueError, match='tracker'):
+            operation()
+    blocked = q.block(item['ref'], session_id='worker', question='Choose an option')
+    assert blocked['needs_input'] and not blocked.get('claimed_by')
+    assert q.count_claimable('GHI') == q.count_manual_eligible('GHI') == 0
+    assert q.peek_next(project='GHI') is None

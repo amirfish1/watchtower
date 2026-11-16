@@ -1681,6 +1681,8 @@ def _notify_ticket_event(
             targets.append(t)
 
     project = str(item.get("project") or "")
+    if event == "closed" and _config.is_tracker(project):
+        return
     if _submitter_wants(item, event, _config):
         # Actor matching uses the bare id the actor would present; delivery
         # uses the node-qualified address when the filer lives elsewhere.
@@ -2295,6 +2297,32 @@ def _set_run_requested(ident: Any, requested: bool, event: str) -> Optional[Dict
     return None
 
 
+def detach_tracker_claims(project: str) -> List[str]:
+    """Remove legacy task ownership while preserving records, waits and supervision."""
+    from . import config
+    if not config.is_tracker(project):
+        raise ValueError("queue must be a tracker before detaching claims")
+    changed = []
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if it.get("project") != project or it.get("status") == "closed":
+                continue
+            if not any(it.get(k) for k in ("claimed_by", "claimed_session_id", "claim_proc", "parked", "run_requested")):
+                continue
+            it.update(claimed_by="", claimed_session_id="", claimed_at=None, claimed_machine="", run_requested=False)
+            it.pop("claim_proc", None)
+            it.pop("parked", None)
+            if it.get("status") in ("in_progress", PARKED_STATUS):
+                it["status"] = "open"
+            it["updated_at"] = _now_iso()
+            _append_history(it, "tracker_detach", by=_by("system"))
+            changed.append(it["ref"])
+        if changed:
+            _save_unlocked(data)
+    return changed
+
+
 def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
     """Request a run for this ticket — the ▶ / ``wt run`` path.
 
@@ -2314,6 +2342,8 @@ def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
     into its own `skipped` list (WT-131). auto_drain stays default-off; this
     only makes the queue exist for the reconciler to see.
     """
+    from . import config
+    config.require_work_queue(_project_from_ident(ident))
     proj = _project_from_ident(ident)
     if proj:
         try:
@@ -2330,6 +2360,7 @@ def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
     item = get(ident)
     if item is None:
         return None
+    config.require_work_queue(item.get("project", ""))
     if item.get("status") == "closed":
         update_status(ident, "open", reason="marked runnable")
     item = _set_run_requested(ident, True, "run_requested")
@@ -2726,7 +2757,9 @@ def _claim_candidates(
     machine are skipped, so a Mac-bound ticket waits for the Mac and an
     always-on VM only ever takes what it can actually run.
     """
-    candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of") and not it.get("supervision")]
+    from . import config
+    candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of") and not it.get("supervision")
+                  and not config.is_tracker(it.get("project", ""))]
     if requested_only:
         # OPS-1492: a dispatcher on a manually drained queue only wants what
         # a human pressed ▶ on (``run_requested``), not the whole open pool.
@@ -2810,6 +2843,9 @@ def count_claimable(
     can never think a ticket is spawn-worthy when a worker couldn't actually
     claim it (the WT SPAWN/REAP churn bug: needs-spec tickets counted as
     claimable depth even though claim_next excludes them by default)."""
+    from . import config
+    if config.is_tracker(project):
+        return 0
     backend = _github_backend_for_project(project)
     if backend is not None:
         return backend.count_claimable(lane=lane, item_types=item_types)
@@ -2835,6 +2871,9 @@ def count_manual_eligible(
     auto_drain=off means "no *automatic* work", not "ignore what I pressed".
     Same candidate filter as claim_next, so a run request on a ticket no worker
     could claim (wrong claim_type, needs-shaping) still spawns nothing."""
+    from . import config
+    if config.is_tracker(project):
+        return 0
     backend = _github_backend_for_project(project)
     if backend is not None:
         return backend.count_manual_eligible(lane=lane, item_types=item_types)
@@ -2990,6 +3029,8 @@ def claim_next(
     """
     if not session_id:
         raise ValueError("session_id is required")
+    from . import config
+    config.require_work_queue(project)
     _verify_worker_live(session_id, session_uuid)
     # A reconciler stop signal is a durable, queue-scoped release. It must win
     # over a racing enqueue: the released session must never claim more work,
@@ -3182,6 +3223,8 @@ def claim_by_ref(
     """
     if not session_id:
         raise ValueError("session_id is required")
+    from . import config
+    config.require_work_queue(_project_from_ident(ref))
     _verify_worker_live(session_id, session_uuid)
     backend = _github_backend_for_project(_project_from_ident(ref))
     if backend is not None:
@@ -3255,6 +3298,9 @@ def peek_next(
 
     Uses the same smart sort as claim_next (priority → type → age).
     Returns None when nothing is open and claimable."""
+    from . import config
+    if config.is_tracker(project):
+        return None
     backend = _github_backend_for_project(project)
     if backend is not None:
         return backend.peek_next(lane=lane, item_types=item_types)
@@ -3487,6 +3533,9 @@ def update_status(
     correctly. Ignored by the GitHub backend's history mirroring."""
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {VALID_STATUSES}")
+    from . import config
+    if status == "in_progress":
+        config.require_work_queue(_project_from_ident(ident))
     backend = _github_backend_for_project(_project_from_ident(ident))
     conditional = None
     if close_contract is not None:
@@ -3550,6 +3599,7 @@ def update_status(
                         f"{it.get('ref')} is a group parent: its status moves only through its "
                         f"plan and integration (`wt group show {it.get('ref')}`)")
                 if status == "in_progress":
+                    config.require_work_queue(it.get("project", ""))
                     _group_claim_check_unlocked(data["items"], it)
                 if it.get("duplicate_of"):
                     raise ValueError(f"{it.get('ref', ident)} follows duplicate original {it['duplicate_of']}; clear the link before changing status")
@@ -3588,7 +3638,7 @@ def update_status(
                         # consumers that attribute by claimant (wt find, the
                         # dashboard's in-progress column) don't show a blank.
                         # Never overwrites a real claimant (WT-81).
-                        if not it.get("claimed_by"):
+                        if not it.get("claimed_by") and not config.is_tracker(it.get("project", "")):
                             it["claimed_by"] = str(session_id)
                             it["claimed_machine"] = it["closed_machine"]
                             if real_sid and not it.get("claimed_session_id"):
@@ -6086,7 +6136,7 @@ def _group_due_unlocked(items: List[Dict[str, Any]], now: Optional[float] = None
     for it in items:
         if group_role(it) != "parent" or it.get("status") != "open" or it.get("needs_input"):
             continue
-        if config.ticket_is_archived(it):
+        if config.ticket_is_archived(it) or config.is_tracker(it.get("project", "")):
             continue
         if not group_plan_settled(it) or blocker_verdict(it, by_ref)[0] != "ok":
             continue
@@ -7241,7 +7291,10 @@ def assessment_targets_for_sweep(now_ts: Optional[float] = None) -> Dict[str, Li
             return 0.0
 
     res: Dict[str, List[Dict[str, Any]]] = {"due": [], "filing": [], "running": []}
+    from . import config
     for it in list_items():
+        if config.is_tracker(it.get("project", "")):
+            continue
         a = it.get("assessment") or {}
         st = a.get("status")
         if st == "due":
@@ -7438,6 +7491,8 @@ def reopen_and_claim(
     transition available server-side, so they fall back to the sequential
     reopen + claim (same residual race ``reopen`` already had there; this
     function only closes the window for the local file-backed store)."""
+    from . import config
+    config.require_work_queue(_project_from_ident(ident))
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         current = get(ident)
@@ -7454,6 +7509,7 @@ def reopen_and_claim(
         for it in data["items"]:
             if not _matches(it, ident):
                 continue
+            config.require_work_queue(it.get("project", ""))
             sup = it.get("supervision") or {}
             if sup and sup.get("session", {}).get("session_id") not in (str(session_id), str(real_sid or "")):
                 raise ValueError("ticket retains same-session takeover ownership")
@@ -8790,10 +8846,12 @@ def block(
                 park_worker = str(it.get("claimed_by") or session_id or "")
                 # WT-33 D7.5: a group parent's block never changes its status
                 # nor binds a claimant (it is never parked or in_progress).
+                from . import config
+                is_tracker = config.is_tracker(it.get("project", ""))
                 is_parent = group_role(it) == "parent"
                 # WT-31 D1a: under an active plan gate the plan stage owns the
                 # ticket, so a worker block stays legacy (needs_input).
-                park = (origin == "worker" and not was_parked and not is_parent
+                park = (origin == "worker" and not was_parked and not is_parent and not is_tracker
                         and it.get("status") in ("open", "in_progress") and bool(park_worker)
                         and not _plan_active_unlocked(it))
                 park_sid = str(it.get("claimed_session_id")
@@ -8818,9 +8876,9 @@ def block(
                     it["block_commit"] = commit
                 it.pop("resume", None)
                 _clear_sent_back_unlocked(it)
-                if it.get("status") == "open" and not park and not is_parent:
+                if it.get("status") == "open" and not park and not is_parent and not is_tracker:
                     it["status"] = "in_progress"
-                if session_id and not park and not was_parked and not is_parent:
+                if session_id and not park and not was_parked and not is_parent and not is_tracker:
                     real = _coerce_session_uuid(session_id)
                     if not it.get("claimed_by"):
                         it["claimed_by"] = str(session_id)
@@ -9020,6 +9078,12 @@ def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = 
                 if it.get("supervision"):
                     from . import takeover
                     takeover.answer_unlocked(it, text, now)
+                    _save_unlocked(data)
+                    return it
+                from . import config
+                if config.is_tracker(it.get("project", "")):
+                    _supersede_pending_unlocked(it, now)
+                    it.update(block_question="", block_kind="", blocked_at=None)
                     _save_unlocked(data)
                     return it
                 stage_retry = _stage_retry_reset(it, text, now)

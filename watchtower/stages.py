@@ -292,8 +292,11 @@ def _github_backed(item: Dict[str, Any]) -> bool:
 def desired(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The stage sessions the stored ticket states call for: one entry
     ``{ref, role, key, project}`` per ticket at most."""
+    from . import config
     out: List[Dict[str, Any]] = []
     for it in items:
+        if config.is_tracker(it.get("project", "")):
+            continue
         ref = str(it.get("ref") or "")
         if not ref or it.get("duplicate_of"):
             continue
@@ -682,6 +685,9 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
            cause: str, budget: _Budget) -> str:
     """Spawn one stage session. Returns a short action tag; never raises."""
     ref, project = str(item["ref"]), str(item.get("project") or "")
+    from . import config
+    if config.is_tracker(project):
+        return "tracker"
     attempt = int(ss.get("attempt") or 0) + 1
     engine = ""
     try:
@@ -1051,7 +1057,8 @@ def reconcile_stages(only_ref: str = "") -> List[Tuple[str, str]]:
             budget.acted.append((ref, f"integration:{outcome}"))
     except Exception as exc:  # noqa: BLE001 - one group never stops the pass
         _log("INTEGRATE", f"group sweep error: {exc}")
-    items = q.list_items() or []
+    from . import config
+    items = [it for it in (q.list_items() or []) if not config.is_tracker(it.get("project", ""))]
     try:
         from . import github_duplicates
         for ref in github_duplicates.sweep(items, only_ref):

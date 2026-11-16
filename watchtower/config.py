@@ -512,6 +512,33 @@ def queue_label(queue: str) -> str:
     return configured or f"{DEFAULT_QUEUE_LABEL_PREFIX}{queue}"
 
 
+def queue_kind(queue: str) -> str:
+    """Work queues staff workers; trackers store records and supervision only."""
+    return str(_queue_entry(queue).get("kind") or "work")
+
+
+def is_tracker(queue: str) -> bool:
+    return queue_kind(queue) == "tracker"
+
+
+def require_work_queue(queue: str) -> None:
+    if is_tracker(queue):
+        raise ValueError(f"{queue} is a tracker queue; worker claims and dispatch are disabled")
+
+
+def set_queue_kind(queue: str, kind: str) -> Dict[str, Any]:
+    if kind not in ("work", "tracker"):
+        raise ValueError("queue kind must be work or tracker")
+    data = _load()
+    entry = data.setdefault(queue, {})
+    entry["kind"] = kind
+    if kind == "tracker":
+        entry["auto_drain"] = False
+        entry.pop("auto_parked", None)
+    _save(data)
+    return entry
+
+
 def set_auto_drain(queue: str, enabled: bool, *, source: str = "",
                    auto_parked: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Turn auto-drain on/off.
@@ -520,6 +547,8 @@ def set_auto_drain(queue: str, enabled: bool, *, source: str = "",
     whose engine keeps failing at launch; the marker lets it unpark the queue
     once the cause is gone. Any other call is a deliberate choice and clears
     the marker, so a human ``drain off`` is never undone automatically."""
+    if enabled:
+        require_work_queue(queue)
     data = _load()
     q = data.setdefault(queue, {})
     q["auto_drain"] = bool(enabled)
@@ -561,7 +590,7 @@ def clear_auto_parked(queue: str) -> None:
 def auto_drain(queue: str) -> bool:
     """False unless explicitly opted in. Default-off so a fresh queue is a
     backlog until you run ``wt drain on <queue>``."""
-    return bool(_queue_entry(queue).get("auto_drain", False))
+    return not is_tracker(queue) and bool(_queue_entry(queue).get("auto_drain", False))
 
 
 def set_product_gate(queue: str, enabled: bool) -> Dict[str, Any]:

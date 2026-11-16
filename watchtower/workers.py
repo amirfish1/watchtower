@@ -6227,6 +6227,10 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
     from . import config, queue as _q
     from .queue import _log
     try:
+        if config.is_tracker(queue):
+            reason = "tracker queue — no worker dispatch"
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
         ref = ref or ""
         run_requested = False
         # One read of this ticket, from the cached list rather than a
@@ -6962,6 +6966,8 @@ def spawn_floor_routed_workers(
         if w.get("alive") or now - started < FLOOR_SPAWN_RETRY_S:
             routed_refs.add(str(w["ref"]))
     for queue_name in sorted(config.all_queues()):
+        if config.is_tracker(queue_name):
+            continue
         try:
             queue_model = config.queue_model_id(queue_name)
             types = config.claim_types(queue_name) or None
@@ -7635,6 +7641,9 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
     loop_queues = set(all_cfg) | set(released_by_q)
     loop_queues &= {staff_queue}
     for q_name in sorted(loop_queues):
+        if config.is_tracker(q_name):
+            result["skipped"].append({"queue": q_name, "reason": "tracker queue"})
+            continue
         if not dry_run:
             unpark_reason = _maybe_auto_unpark(q_name)
             if unpark_reason:
@@ -8251,6 +8260,8 @@ def spawn_workers(
     own default) instead of reading the queue's configured model -- for a
     worker substituted onto a different engine than the queue's own.
     """
+    from . import config
+    config.require_work_queue(queue)
     agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
     repo_path = repo_path or os.getcwd()
     if not model and inherit_queue_model:
@@ -8471,6 +8482,7 @@ def spawn_run_once_worker(
     tracked in ``workers.json`` like any other.
     """
     from . import config
+    config.require_work_queue(queue)
     repo_path = repo_path or config.repo_path(queue) or os.getcwd()
     engine = engine or config.engine(queue) or "claude"
     agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
@@ -8763,6 +8775,9 @@ def spawn_adhoc(
     `wt send` fails and silently drops the report -- unresolvable targets
     don't get parked in the outbox (nothing to retry against), so without
     this check the report is just lost (OPS-89)."""
+    from . import config
+    from . import queue as _queue
+    config.require_work_queue(ticket_queue or _queue._project_from_ident(ticket_ref))
     agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
     repo_path = repo_path or os.getcwd()
     if report_to:

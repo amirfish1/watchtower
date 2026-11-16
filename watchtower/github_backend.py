@@ -3930,7 +3930,8 @@ class GitHubIssuesBackend:
                                           extra=wait_extra)
         else:
             meta.pop("wait", None)
-        if session_id:
+        from . import config
+        if session_id and not config.is_tracker(self.queue):
             if not meta.get("claimed_by"):
                 meta["claimed_by"] = str(session_id)
                 meta["claimed_machine"] = machine_tag()

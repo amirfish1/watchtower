@@ -759,3 +759,60 @@ def test_generic_resume_refuses_unavailable_locks(env, monkeypatch):
     with pytest.raises(ValueError,match='exclusive'):
         t.resume(a['ticket'],a['generation'])
     assert q.get(a['ticket'])==before and not env[3]
+
+
+def test_tracker_takeover_supervises_without_claim_and_never_delivers_comments(env, monkeypatch):
+    from watchtower import config, cli, messages
+    config.set_queue_kind('TEST', 'tracker')
+    a = adopt(env)
+    ref = a['ticket']
+    assert a['claim']['status'] == 'open'
+    assert not a['claim']['claimed_by'] and not a['claim']['claimed_session_id']
+    assert a['comment_target'] == ''
+    assert q.count_claimable(project='TEST') == 0
+    monkeypatch.setattr(messages, 'deliver_message', lambda *a, **kw: pytest.fail('tracker comment delivered'))
+    assert cli.main(['comment', ref, 'Log update, no wake']) == 0
+    t.reconcile()
+    assert env[3] and env[3][0][0] == SID
+    assert not q.get(ref)['claimed_by']
+    t.cancel(SID)
+    q.answer(ref, 'Continue same authorized task')
+    assert not q.get(ref)['claimed_by']
+    assert t.status(SID)['supervision']['held_answer'] == 'Continue same authorized task'
+    t.takeover(SID, ref, engine='claude')
+    assert t.status(SID)['supervision']['intent']['kind'] == 'answer'
+    assert not q.get(ref)['claimed_by']
+
+
+def test_tracker_wait_resume_and_normal_completion(env):
+    from watchtower import config
+    config.set_queue_kind('TEST', 'tracker')
+    a = adopt(env)
+    ref = a['ticket']
+    def wait(it, s):
+        s.update(state='waiting', intent=None, wait_identity='external', wait_source='footer')
+    t._update(ref, a['generation'], wait)
+    assert t.resume(ref, a['generation'])['resumed']
+    assert not q.get(ref)['claimed_by']
+    q.close(ref, SID, resolution={'summary': 'Feature complete', 'no_code': True})
+    t.reconcile()
+    assert t.status(SID)['state'] == 'completed'
+    assert not q.get(ref)['claimed_by']
+
+
+def test_tracker_conversion_preserves_parked_question_and_supervision(env):
+    from watchtower import cli
+    a = adopt(env)
+    ref = a['ticket']
+    before = q.block(ref, SID, question='Keep the original decision?', wait_on='owner', origin='worker',
+                     wait_extra={'decide_by': 'none', 'if_unanswered': 'none'})
+    assert before.get('parked')
+    assert cli.main(['config', '-q', 'TEST', '--kind', 'tracker']) == 0
+    after = q.get(ref)
+    assert not after['claimed_by'] and not after.get('parked')
+    assert after['needs_input'] and after['block_question'] == before['block_question']
+    assert after['wait'] == before['wait']
+    assert after['supervision'] == before['supervision']
+    q.answer(ref, 'Continue the existing task')
+    assert not q.get(ref)['claimed_by']
+    assert t.status(SID)['supervision']['intent']['kind'] == 'answer'

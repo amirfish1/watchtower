@@ -15,7 +15,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from . import queue as q, observations, storage
+from . import queue as q, observations, storage, config
 
 SCHEMA_VERSION = 1
 IDLE_SECONDS = 1200
@@ -38,7 +38,7 @@ def comment_target(it):
     a replacement claimant. Derive this from durable state, including legacy
     cancellations and answers retained for explicit re-enrollment.
     """
-    if it.get('status') != 'in_progress':
+    if config.is_tracker(it.get('project', '')) or it.get('status') != 'in_progress':
         return ''
     target = it.get('claimed_session_id') or it.get('claimed_by') or ''
     s = it.get('supervision') or {}
@@ -87,6 +87,8 @@ def _intent(s, kind, text, turn=''):
 
 
 def _claim(it, s):
+    if config.is_tracker(it.get('project', '')):
+        return
     sid = s['session']['session_id']
     it.update(status='in_progress', claimed_by=sid, claimed_session_id=sid,
               claimed_machine=q.machine_tag(), claimed_at=q._now_iso(),
@@ -249,11 +251,17 @@ def takeover(session_id, ticket_ref='', *, queue='', title='', engine='', dry_ru
             if not isinstance(s['reminders'], int) or not 0 <= s['reminders'] <= MAX_REMINDERS:
                 raise ValueError('invalid legacy reminder count')
             s['legacy_import_id'] = legacy['migration_id']
-        else:
+        elif not config.is_tracker(it.get('project', '')):
             _intent(s, 'enroll', f"WatchTower now supervises your existing task as {it['ref']}. "
                     'Continue only already authorized work in this same conversation and repository. '
                     f"Use `wt block {it['ref']} --question ...` for owner input; use normal `wt close {it['ref']}` "
                     'with required proof and gates when done. Do not create a replacement worker. '
+                    'Ignore repeated takeover action keys already handled. Task: '+str(s['task_brief']))
+        if config.is_tracker(it.get('project', '')) and not legacy:
+            _intent(s, 'enroll', f"WatchTower supervises your existing session, logged under tracker {it['ref']}. "
+                    'Continue only already authorized work in this same conversation and repository. '
+                    'This tracker is a feature log: do not claim it or dispatch a replacement worker. '
+                    'Comments are durable log entries and do not wake this session. '
                     'Ignore repeated takeover action keys already handled. Task: '+str(s['task_brief']))
         if old.get('held_answer') and not legacy:
             _intent(s,'answer','Retained owner answer: '+str(old['held_answer']))
@@ -513,10 +521,11 @@ def resume(ref, expected_generation):
             raise ValueError('supervision is not waiting')
         if (s.get('intent') or {}).get('state', 'none') not in ('none','confirmed','cancelled'):
             raise ValueError('delivery is pending or unknown; reconcile receipt first')
-        if it.get('status') != 'in_progress' or it.get('duplicate_of'):
+        tracker = config.is_tracker(it.get('project', ''))
+        if (it.get('status') != ('open' if tracker else 'in_progress') or it.get('duplicate_of')):
             raise ValueError('ticket is not an active independent claim')
         sid=s['session']['session_id']
-        if it.get('claimed_session_id') != sid or it.get('claimed_by') != sid:
+        if not tracker and (it.get('claimed_session_id') != sid or it.get('claimed_by') != sid):
             raise ValueError('supervision no longer owns the claim')
         if it.get('parked') or q._plan_active_unlocked(it):
             raise ValueError('parked claim or active plan prevents resume')

@@ -1682,7 +1682,7 @@ def sweep(now: Optional[float] = None, only_ref: str = "") -> List[Dict[str, Any
     acted: List[Dict[str, Any]] = []
     spawned: set = set()
     for it in items:
-        if config.ticket_is_archived(it):
+        if config.ticket_is_archived(it) or config.is_tracker(it.get("project", "")):
             continue
         if only_ref and str(it.get("ref") or "") != only_ref:
             continue

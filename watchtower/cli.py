@@ -3988,6 +3988,10 @@ def _answer_and_deliver(args: argparse.Namespace, by_kind: str = "human",
 
 
 def _deliver_answer(args: argparse.Namespace, item: dict, by_kind: str) -> int:
+    from . import config
+    if config.is_tracker(item.get("project", "")) and not item.get("supervision"):
+        print(f"ANSWERED: {item['ref']} — decision recorded in tracker; no worker dispatched")
+        return 0
     if item.get("supervision"):
         print(f"ANSWERED: {item['ref']} — retained for same-session takeover delivery")
         return 0
@@ -4188,7 +4192,7 @@ def cmd_comment(args: argparse.Namespace) -> int:
         delivery = " — system comment; not injected"
     elif live and not takeover.comment_target(item):
         target = ""
-        delivery = " — cancelled takeover; comment delivery detached"
+        delivery = " — comment delivery detached (tracker or cancelled takeover)"
     elif live and _comment_author_is_claimant(item, args):
         # Recorded on the ticket, but not echoed back at its own author.
         target = ""
@@ -5620,6 +5624,16 @@ def cmd_config(args: argparse.Namespace) -> int:
     if not _validate_queue_worker_settings(args, config):
         return 1
     changed = []
+    kind = getattr(args, "kind", None)
+    # Validate the combined request before changing any settings.
+    if getattr(args, "auto_drain", None) == "on" and (kind or config.queue_kind(args.queue)) == "tracker":
+        print(f"error: {args.queue} is a tracker queue; auto-drain is disabled", file=sys.stderr)
+        return 1
+    if kind is not None:
+        config.set_queue_kind(args.queue, kind)
+        if kind == "tracker":
+            q.detach_tracker_claims(args.queue)
+        changed.append(f"kind={kind}")
     # Delegate drain-related flags first so enabling auto-drain also auto-starts.
     auto_drain = getattr(args, "auto_drain", None)
     if auto_drain is not None:
@@ -5793,6 +5807,7 @@ def cmd_config(args: argparse.Namespace) -> int:
         # grace_s is shown even when unset: it silently gates auto-drain, so
         # "why did nothing pick up my new ticket for 3 minutes" has to be
         # answerable from the queue's own config output.
+        cfg.setdefault("kind", config.queue_kind(args.queue))
         cfg.setdefault("grace_s", config.grace_s(args.queue))
         cfg.setdefault("sent_back_release_min", config.sent_back_release_min(args.queue))
         cfg.setdefault("headroom_dispatch", config.headroom_dispatch(args.queue))
@@ -8643,6 +8658,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true",
                    help="with no setting flags: print the queue config and "
                         "role table as JSON")
+    s.add_argument("--kind", choices=["work", "tracker"], default=None,
+                   help="work = worker queue; tracker = record log without worker claims or comment delivery")
     s.add_argument("--auto-drain", default=None, choices=["on", "off"],
                    dest="auto_drain",
                    help="on = auto-spawn workers; off = backlog mode")
