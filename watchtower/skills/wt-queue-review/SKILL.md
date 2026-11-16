@@ -15,6 +15,14 @@ deliver the answers a content review produces:
 
 **REQUIRED BACKGROUND:** the `watchtower` skill (lookup, filing, claiming, closing).
 
+Status notices are **opt-in**. `wt add` without `--subscribe` sends no status notices;
+add `--subscribe` when you want updates. For an existing ticket use
+`wt subscribe REF [target]` (target defaults to your session), or
+`wt edit REF --subscribe`. Stop updates with `wt unsubscribe REF [target]`
+or `wt edit REF --no-subscribe`. Subscriptions follow continued sessions;
+`wt find REF` shows ticket subscribers. `wt subscribe QUEUE target` still
+subscribes to the whole queue.
+
 ## Scope
 
 Review exactly what the caller names: one queue, several queues, a ticket

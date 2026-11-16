@@ -13,6 +13,14 @@ agent, or drain worker) can pick it up cold.
 **REQUIRED BACKGROUND:** the `watchtower` skill covers filing, claiming, and
 closing tickets. This skill is the discipline of *what to extract and when*.
 
+Status notices are **opt-in**. `wt add` without `--subscribe` sends no status notices;
+add `--subscribe` when you want updates. For an existing ticket use
+`wt subscribe REF [target]` (target defaults to your session), or
+`wt edit REF --subscribe`. Stop updates with `wt unsubscribe REF [target]`
+or `wt edit REF --no-subscribe`. Subscriptions follow continued sessions;
+`wt find REF` shows ticket subscribers. `wt subscribe QUEUE target` still
+subscribes to the whole queue.
+
 ## When to fire
 
 - Context is ~70%+ full, or the user asks "when should we compact?"

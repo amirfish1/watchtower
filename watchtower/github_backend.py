@@ -2493,6 +2493,7 @@ class GitHubIssuesBackend:
             "submitter_explicit": bool(meta.get("submitter_explicit", False)),
             "submitter_subscribed": bool(meta.get("submitter_subscribed", False)),
             "submitter_node": str(meta.get("submitter_node") or ""),
+            "ticket_subscribers": dict(meta.get("ticket_subscribers") or {}),
             "claimed_by": (
                 meta.get("claimed_by")
                 or (",".join(assignees) if queue_member and status == "in_progress" and assignees else None)
@@ -4251,7 +4252,10 @@ class GitHubIssuesBackend:
             from . import queue as _q
             _q._dependency_wait_check(item)
         for key, value in fields.items():
-            if key == "blocked_by":
+            if key == "_subscription":
+                from .queue import _apply_ticket_subscription
+                _apply_ticket_subscription(meta, *value)
+            elif key == "blocked_by":
                 blockers = self._validate_blockers(
                     str(item.get("ref") or ""), list(value or []))
                 if blockers:

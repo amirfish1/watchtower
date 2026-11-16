@@ -1593,6 +1593,44 @@ def submitter_address(item: Optional[Dict[str, Any]]) -> str:
         return sub
 
 
+def ticket_subscribers(item: Dict[str, Any]) -> List[str]:
+    """Explicit ticket targets, including the opt-in filer (not queue watchers)."""
+    targets = [submitter_address(item)] if item.get("submitter_subscribed") else []
+    from . import messages
+    targets.extend(messages.node_qualified(record.get("node"), target)
+                   for target, record in (item.get("ticket_subscribers") or {}).items()
+                   if record.get("enabled"))
+    return list(dict.fromkeys(t for t in targets if t))
+
+
+def _apply_ticket_subscription(item: Dict[str, Any], target: str, enabled: bool) -> None:
+    """Called under the backend's edit lock; preserve attribution and other targets.
+
+    Each target retains its owning node for cross-host delivery. Disabled
+    records remain explicit opt-outs, without touching queue subscriptions.
+    """
+    from . import messages
+    target = str(target or "").strip()
+    if not target:
+        raise ValueError("subscription target is required (pass a target outside a session)")
+    address = messages.node_qualified(_local_submitter_node(target), target)
+    # Reuse the legacy filer flag when addressing the original filing identity.
+    if address == submitter_address(item):
+        item["submitter_subscribed"] = enabled
+    else:
+        subs = dict(item.get("ticket_subscribers") or {})
+        matching = [key for key, record in subs.items()
+                    if messages.node_qualified(record.get("node"), key) == address]
+        if matching:
+            for key in matching:
+                subs[key] = dict(subs[key], enabled=enabled)
+        else:
+            subs[target] = {"enabled": enabled, "node": _local_submitter_node(target)}
+        item["ticket_subscribers"] = subs
+    _append_history(item, "subscribe" if enabled else "unsubscribe",
+                    by=_by("system"), target=address)
+
+
 def _notify_ticket_event(
     item: Optional[Dict[str, Any]], event: str, detail: str = "",
     actor: Any = None,
@@ -1601,8 +1639,8 @@ def _notify_ticket_event(
     change.
 
     Targets = {ticket's own ``submitter`` (captured at file time, see
-    ``enqueue``'s ``submitter`` param) -- but only for the events that
-    submitter wants, see ``_submitter_wants``} UNION {this queue's ``subscribers``
+    ``enqueue``'s ``submitter`` param) and explicit ticket subscriptions,
+    for queue-configured status events} UNION {this queue's ``subscribers``
     (``config.subscribers`` -- see ``wt subscribe``/``wt unsubscribe``)},
     MINUS ``actor`` -- the identity that performed this transition.
     Deduplicated so a target that is both gets exactly one send. Delivery
@@ -1660,11 +1698,12 @@ def _notify_ticket_event(
     project = str(item.get("project") or "")
     if event == "closed" and _config.is_tracker(project):
         return
-    if _submitter_wants(item, event, _config):
-        # Actor matching uses the bare id the actor would present; delivery
-        # uses the node-qualified address when the filer lives elsewhere.
-        if str(item.get("submitter") or "").strip() not in actors:
-            _add(submitter_address(item))
+    if event in _config.notify_events(project):
+        for target in ticket_subscribers(item):
+            # Match both the stored address and a local actor's bare identity.
+            _, native = messages.split_node_ref(target)
+            if native not in actors:
+                _add(target)
     try:
         for target in _config.subscribers(project):
             _add(target)
@@ -2472,6 +2511,8 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                                         fields={"depth": new.get("depth", "quick"),
                                                 **({"budget_min": new["budget_min"]}
                                                    if "budget_min" in new else {})})
+                if "_subscription" in fields:
+                    _apply_ticket_subscription(it, *fields["_subscription"])
                 if "gates" in fields:
                     fields = dict(fields)
                     fields["gates"] = (_parent_gates(fields["gates"]) if group_role(it) == "parent"

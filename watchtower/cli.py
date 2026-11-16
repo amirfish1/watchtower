@@ -763,7 +763,8 @@ def cmd_find(args: argparse.Namespace) -> int:
     )
     checks = q.checks_block(item)
     if args.json:
-        item_with_timeline = dict(item_with_timeline, effective_gates=q.effective_gates(item))
+        item_with_timeline = dict(item_with_timeline, effective_gates=q.effective_gates(item),
+                                  subscribed_targets=q.ticket_subscribers(item))
         if checks:
             item_with_timeline = dict(item_with_timeline, checks_after_close=checks)
         print(json.dumps(item_with_timeline, indent=2))
@@ -782,6 +783,7 @@ def cmd_find(args: argparse.Namespace) -> int:
         except Exception:
             forwarded = None
         print(f"  filed_by: {filer}" + (f" -> {forwarded}" if forwarded else ""))
+    print("  subscribed: " + (", ".join(q.ticket_subscribers(item)) or "none"))
     if q.group_role(item) == "parent":
         g = item.get("group") or {}
         print(f"  group: parent of {', '.join(q.group_children(item)) or '(none)'} "
@@ -921,6 +923,13 @@ def cmd_edit(args: argparse.Namespace) -> int:
             fields["_dependency_wait"] = True
     if getattr(args, "clear_gates", False) or getattr(args, "gate", None):
         fields["gates"] = list(getattr(args, "gate", None) or [])
+    subscription = getattr(args, "subscribe", None)
+    if subscription is not None:
+        target, _ = _default_report_to()
+        if not target:
+            print("error: cannot determine your session; use wt subscribe REF TARGET", file=sys.stderr)
+            return 1
+        fields["_subscription"] = (target, subscription)
     new_queue = getattr(args, "queue", None)
     if not fields and new_queue is None:
         print(
@@ -928,7 +937,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
             "--title/--note/--text/--url/--type/--readiness/--priority/"
             "--value/--confidence/--model-floor/--selector/"
             "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates/--accept/"
-            "--depth/--budget-min/--client-id",
+            "--depth/--budget-min/--client-id/--subscribe/--no-subscribe",
             file=sys.stderr,
         )
         return 1
@@ -1046,6 +1055,8 @@ def _cmd_add(args: argparse.Namespace) -> int:
     args._created_ref = item["ref"]
     print(f"FILED: {item['ref']}  {item.get('title') or item.get('note','')}"
           + (f"  [deep, {item.get('budget_min')}m budget]" if q.is_deep(item) else ""))
+    print("  you'll be notified" if getattr(args, "subscribe", False) else
+          f"  no updates to you; run wt subscribe {item['ref']} to hear back")
     if not getattr(args, "claim", False):
         _warn_floor_above_queue([item])
     if q.group_role(item) == "parent":
@@ -5570,6 +5581,31 @@ def cmd_drain(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ticket_subscription(args: argparse.Namespace, enabled: bool) -> int:
+    target = (args.target or "").strip() or _default_report_to()[0]
+    if not target:
+        print("error: cannot determine your session; pass a target", file=sys.stderr)
+        return 1
+    try:
+        item = q.update(args.queue, _subscription=(target, enabled))
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    if not item:
+        print(f"not found: {args.queue}", file=sys.stderr)
+        return 1
+    if getattr(args, "json", False):
+        print(json.dumps(q.ticket_subscribers(item), indent=2))
+    else:
+        verb = "SUBSCRIBED" if enabled else "UNSUBSCRIBED"
+        print(f"{verb}: {target} -> {item['ref']}")
+    return 0
+
+
+def _subscription_is_ticket(value: str) -> bool:
+    return bool(re.fullmatch(r".+-\d+", value.strip()))
+
+
 def cmd_subscribe(args: argparse.Namespace) -> int:
     """Register a target to hear about every enqueue/claim/close/needs-input
     event on a queue (`wt subscribe <queue> <target>`), or list current
@@ -5579,6 +5615,8 @@ def cmd_subscribe(args: argparse.Namespace) -> int:
     ``submitter`` (see ``cmd_add``'s ``--submitter``) is notified through --
     see ``queue._notify_ticket_event``, which unions the two so a target
     that's both gets one send, not two."""
+    if _subscription_is_ticket(args.queue):
+        return _ticket_subscription(args, True)
     from . import config
     queue = q._norm_project(args.queue)
     target = (args.target or "").strip()
@@ -5610,6 +5648,8 @@ def cmd_subscribe(args: argparse.Namespace) -> int:
 
 def cmd_unsubscribe(args: argparse.Namespace) -> int:
     """Remove a target's subscription to a queue (`wt unsubscribe <queue> <target>`)."""
+    if _subscription_is_ticket(args.queue):
+        return _ticket_subscription(args, False)
     from . import config
     queue = q._norm_project(args.queue)
     target = (args.target or "").strip()
@@ -7254,8 +7294,8 @@ COMMAND_HELP: Dict[str, str] = {
     "config": "recommended queue configuration: settings plus auto-drain policy",
     "set": "compatibility alias for basic queue settings; prefer `wt config`",
     "drain": "enable or disable auto-drain for a queue",
-    "subscribe": "register a target for every event on a queue (or list subscribers)",
-    "unsubscribe": "remove a target's subscription to a queue",
+    "subscribe": "subscribe to a ticket or queue (or list queue subscribers)",
+    "unsubscribe": "remove a target's ticket or queue subscription",
     "wait": "block until the queue is drained",
     "monitor": "run a check; file a ticket if it fails",
     "workers": "list workers this CLI started",
@@ -7747,6 +7787,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="move the ticket to a different queue in place, "
                         "reassigning its ref (WT-83); file-backed queues only")
     s.add_argument("--json", action="store_true")
+    subscriptions = s.add_mutually_exclusive_group()
+    subscriptions.add_argument("--subscribe", action="store_true", default=None,
+                               help="opt your session into this ticket's status notices")
+    subscriptions.add_argument("--no-subscribe", action="store_false", dest="subscribe",
+                               help="stop this ticket's status notices to your session")
     s.set_defaults(func=cmd_edit)
 
     s = sub.add_parser("claim")
@@ -8629,26 +8674,28 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser(
         "subscribe",
-        help="register a target for every event on a queue",
+        help="subscribe to a ticket or every event on a queue",
         description=(
             "Register a target (worker id / @agent name / session UUID) to "
             "hear about every enqueue/claim/close/needs-input event on a "
             "queue -- not just tickets it filed itself. Omit the target to "
-            "list current subscribers."
+            "list current queue subscribers. For a ticket REF (e.g. WT-79), "
+            "subscribe only to that ticket; target defaults to your session."
         ),
     )
-    s.add_argument("queue", metavar="QUEUE", help="queue name (e.g. CCC, WT)")
+    s.add_argument("queue", metavar="REF|QUEUE", help="ticket ref or queue name (e.g. WT-79, WT)")
     s.add_argument("target", nargs="?", default="",
-                   help="worker id / @agent name / session UUID; omit to list")
+                   help="worker id / @agent / session UUID; omit for self (ticket) or list (queue)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_subscribe)
 
     s = sub.add_parser(
         "unsubscribe",
-        help="remove a target's subscription to a queue",
+        help="remove a target's ticket or queue subscription",
     )
-    s.add_argument("queue", metavar="QUEUE", help="queue name (e.g. CCC, WT)")
-    s.add_argument("target", help="target previously passed to `wt subscribe`")
+    s.add_argument("queue", metavar="REF|QUEUE", help="ticket ref or queue name (e.g. WT-79, WT)")
+    s.add_argument("target", nargs="?", default="",
+                   help="target previously subscribed; defaults to your session for a ticket")
     s.set_defaults(func=cmd_unsubscribe)
 
     s = sub.add_parser(

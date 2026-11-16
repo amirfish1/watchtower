@@ -10,11 +10,17 @@ The only push emitter for ticket transitions (`claimed` / `closed` /
 `needs_input` / `awaits_decision`). Every other `[watchtower] ...` string in
 the codebase is stdout, not a push.
 
-- **Who hears it.** Only a ticket filed with `wt add --subscribe` includes
-  its `submitter`, UNION the queue's `subscribers`, MINUS the actor.
+- **Who hears it.** A ticket filed with `wt add --subscribe` includes its
+  `submitter`, UNION explicit ticket subscribers, UNION the queue's
+  `subscribers`, MINUS the actor. Opt in later with `wt subscribe REF [target]`
+  or `wt edit REF --subscribe`; opt out with `wt unsubscribe REF [target]` or
+  `wt edit REF --no-subscribe`. The default target is the caller session.
+  Filer attribution stays intact. `wt find REF` lists ticket subscribers;
+  JSON includes `subscribed_targets`. Queue subscriptions are independent: a
+  ticket opt-out does not stop events requested by a queue subscription.
   `--submitter` records identity; `--pre-ack` records a product decision.
-  Neither opts into notices. Existing tickets without `submitter_subscribed`
-  are silent. Successor following uses the same CCC forward map as before.
+  Neither opts into notices. Tickets without either form of explicit
+  ticket opt-in stay silent unless their queue has subscribers. Successor following uses the same CCC forward map as before.
 - **Which events.** Subscribed filers use `config.notify_events` (default:
   `closed`, `needs_input`, `awaits_decision`). Queue subscribers keep their
   existing event stream. Queue/steer delivery is unchanged.
