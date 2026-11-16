@@ -5288,6 +5288,9 @@ def link_duplicate(ident: Any, original_ref: str, worker: str = "", *,
             _append_history(it, "duplicate_link", by=_by("human", worker), at=_now_iso(),
                             original=original_ref)
         _drop_claim_proc_unlocked(it)
+        # Linking (or clearing) a duplicate leaves awaiting_answer. Its wait
+        # now belongs to the original, not the old parked worker session.
+        it.pop("parked", None)
         it["claimed_by"] = ""
         it["claimed_session_id"] = ""
         it["updated_at"] = _now_iso()
@@ -8223,7 +8226,7 @@ ANSWER_TRANSITIONS: Tuple[Dict[str, Any], ...] = (
      "status": (("in_progress", "open"), ("awaiting_answer", "open"), ("open", "open")),
      "writers": ("_reopen_pending_unlocked",),
      "callers": ("update_status", "release", "reopen", "requeue_orphaned_tickets",
-                 "_reopen_with_feedback", "close", "recover_claim", "sweep")},
+                 "_reopen_with_feedback", "close", "recover_claim", "sweep", "defer")},
     {"id": "E15", "from": _ANY_PA, "to": "none",
      "status": (("in_progress", "open"), ("awaiting_answer", "open")),
      "writers": ("_reopen_pending_unlocked",),
@@ -9456,6 +9459,9 @@ def defer(ident: Any, session_id: str, until: Any, reason: str,
                 _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
             if status == "in_progress":
                 _release_claim_to_open_unlocked(it, now, "deferred: " + reason)
+            # A deferred ticket has no delivery claim. Keep the answer for
+            # the next claimer, including legacy open records left in flight.
+            _reopen_pending_unlocked(it, now, "handoff", "deferred: " + reason)
             it["deferred_until"] = until_iso
             it["defer_reason"] = _clip(reason, 2000)
             it["updated_at"] = now
