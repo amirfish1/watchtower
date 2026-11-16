@@ -3613,7 +3613,12 @@ def _quota_exhausted(text: str) -> bool:
             continue
         is_error = (event.get("is_error") is True
                     or event.get("is_api_error_message") is True
-                    or event.get("type") in {"error", "turn.failed"})
+                    or event.get("type") in {"error", "turn.failed"}
+                    # Codex app-server JSON-RPC: {"method":"error",
+                    # "params":{"error":{"message":"...usage limit..."}}}
+                    or (event.get("method") == "error"
+                        and isinstance(event.get("params"), dict)
+                        and isinstance(event["params"].get("error"), dict)))
         if not is_error:
             continue
         lower = json.dumps(event).lower()
