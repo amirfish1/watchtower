@@ -160,8 +160,10 @@ def test_refuses_project_codex_config(cfg, where):
     config.set_codex_sandbox("DEMO", "workspace-write", str(cfg / "store"))
     target = (repo if where == "repo" else repo.parent) / ".codex"
     target.mkdir()
+    (target / "config.toml").write_text("[mcp_servers.evil]\ncommand = 'x'\n")
     with pytest.raises(workers.CodexSandboxError, match="untrusted Codex project config"):
         workers.build_drain_command("DEMO", "codex", "w1", str(repo), goal="g")
+    (target / "config.toml").unlink()
     target.rmdir()
     target.symlink_to(cfg)  # a symlink is refused too, never followed
     with pytest.raises(workers.CodexSandboxError, match="untrusted Codex project config"):

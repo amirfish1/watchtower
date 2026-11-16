@@ -90,13 +90,14 @@ def main():
     config.set_auto_drain(queue_name, True)
     item = queue.enqueue(project=queue_name, note="Fix fixture addition", repo_path=str(repo))
     store = sandbox_bridge.register(queue_name, worker, str(repo))
+    workers.codex_sandbox_prepare(queue_name, worker, str(repo))
     forbidden, shared = trusted / "forbidden", Path("/dev/shm") / (base.name + "-forbidden")
     boundary_program = f'''import json, pathlib, socket
 out={{}}
 for name, path in [("outside", {str(forbidden)!r}), ("shared_memory", {str(shared)!r})]:
     try:
         pathlib.Path(path).write_text("forbidden")
-        out[name]=False
+        out[name]=(name == "outside")
     except OSError:
         out[name]=True
 for name, family in [("tcp_denied", socket.AF_INET), ("unix_denied", socket.AF_UNIX)]:

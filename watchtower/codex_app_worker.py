@@ -412,7 +412,7 @@ def run(argv: Optional[List[str]] = None) -> int:
         return 1
 
     reg = registry_dir()
-    (reg / "sock").mkdir(parents=True, exist_ok=True)
+    (reg / "sock").mkdir(parents=True, exist_ok=True, mode=0o700)
     sock = str(reg / "sock" / f"{args.worker_id or os.getpid()}.sock")
     if os.path.lexists(sock):
         os.unlink(sock)

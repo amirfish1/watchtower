@@ -238,12 +238,18 @@ def test_launch_transports_same_store_and_no_network(env, monkeypatch, transport
     w = env
     w.config.set_codex_transport("SB", transport)
     monkeypatch.setattr(w.workers, "_resolve_engine_bin", lambda e: "/bin/codex")
+    # Launch profiles deny /dev/shm (this host's pytest temp directory).
+    # Construction only: roots validation has separate native-policy tests.
+    from watchtower import sandbox_policy
+    monkeypatch.setattr(sandbox_policy, "validate_roots", lambda *a: None)
     argv = w.workers.build_drain_command("SB", "codex", w.worker, str(w.repo), goal="work")
-    roots = next(a for a in argv if a.startswith("sandbox_workspace_write.writable_roots="))
-    assert json.loads(roots.split("=", 1)[1]) == [str(w.repo), str(w.store)]
+    profile = next(a for a in argv if a.startswith("permissions.wt-sandbox="))
+    assert json.dumps(str(w.repo)) + '="write"' in profile
+    assert json.dumps(str(w.store)) + '="write"' in profile
+    assert '"network"={"enabled"=false}' in profile
+    assert "--dangerously-bypass-approvals-and-sandbox" not in argv
     child = w.workers._spawn_env(w.worker, queue="SB", engine="codex")
     assert child["WT_SANDBOX_BRIDGE"] == str(w.store)
-    assert "sandbox_workspace_write.network_access=false" in argv
 
 
 def test_crash_reserved_receipt_never_reexecutes(env, monkeypatch):

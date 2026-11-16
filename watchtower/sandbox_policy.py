@@ -230,6 +230,15 @@ def project_config_hazards(repo: Any) -> List[str]:
             continue
         if not candidate.is_symlink() and _real(candidate) in homes:
             continue
+        # Codex temporarily materializes missing read-only mount targets on
+        # the host while a tool is running. Empty directories contain no
+        # executable config; rejecting them breaks a concurrent broker proof.
+        # Symlinks, non-directories, unreadable or populated entries fail shut.
+        try:
+            if not candidate.is_symlink() and candidate.is_dir() and not any(candidate.iterdir()):
+                continue
+        except OSError:
+            pass
         found.append(str(candidate))
     return found
 
@@ -394,7 +403,7 @@ def _user_mcp_servers() -> List[str]:
         except (OSError, ValueError):
             continue
         for name in (data.get("mcp_servers") or {}):
-            if re.fullmatch(r"[A-Za-z0-9_-]+", str(name)) and name not in names:
+            if str(name) not in names:
                 names.append(str(name))
     return names
 
@@ -418,7 +427,12 @@ def config_overrides(repo: Any, store: Any, *,
         f"shell_environment_policy.set={_toml(tool_env(repo, store))}",
     ]
     overrides += [f"features.{name}=false" for name in DISABLED_FEATURES]
-    overrides += [f"mcp_servers.{name}.enabled=false" for name in _user_mcp_servers()]
+    # Inline-table keys quote every name, including dots/spaces. Filtering
+    # names to identifiers would leave inherited non-identifier servers live.
+    servers = _user_mcp_servers()
+    if servers:
+        overrides.append("mcp_servers=" + _toml({name: {"enabled": False} for name in servers}))
+    overrides.append("agents.enabled=false")
     return overrides
 
 

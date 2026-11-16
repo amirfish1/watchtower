@@ -757,6 +757,15 @@ def cmd_find(args: argparse.Namespace) -> int:
     if not item:
         print(f"not found: {args.ref}", file=sys.stderr)
         return 1
+    if getattr(args, "field", None):
+        from . import sandbox_bridge
+        try:
+            page = sandbox_bridge._page(item, args.field, args.page)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(page, indent=2) if args.json or page["kind"] != "text" else page["text"])
+        return 0
     caller_worker, caller_session = _caller_identity(args)
     item_with_timeline = _mark_self(
         _with_timeline(item), caller_worker, caller_session
@@ -7541,6 +7550,8 @@ def build_parser() -> argparse.ArgumentParser:
              "another worker's (also honors $WT_WORKER and harness session env)",
     )
     s.add_argument("--json", action="store_true")
+    s.add_argument("--field", default="", help="page one ticket field (dotted path)")
+    s.add_argument("--page", type=int, default=0, help="zero-based field page")
     _add_redundant_queue_flag(s)
     s.set_defaults(func=cmd_find)
 

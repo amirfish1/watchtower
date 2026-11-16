@@ -1,170 +1,118 @@
 # Codex sandbox queue transport — WT-61 review checkpoint
 
 Status: **experimental source, not accepted, not enabled, not ready to merge**.
-The workspace-write launcher previously shipped in `dd3c3dc`; it redirects
-workers to an isolated empty store and therefore does not preserve real queue
-operations. This branch adds a candidate bridge. WT-61 stays open until its
-original workflow and security acceptance pass. Do not enable a queue policy
-or integrate this checkpoint as a finished fix.
+WT-61 remains open. Do not enable a live queue policy or describe this review
+branch as integrated. The complete candidate combines the earlier bridge,
+lifecycle fences, recovery and native-policy work with the integration fixes.
 
-## Implemented transport
+## Enforcement and authority
 
-Each worker receives a distinct directory beneath the queue's configured
-isolated store. Its only writable roots remain that directory and the assigned
-workspace; tool network stays disabled. Both exec and app-server receive the
-same environment and roots. `WT_SANDBOX_BRIDGE` routes supported CLI operations
-to request/response files instead of mutating a local shadow queue. `tell` is
-an alias for `send`. Other CLI verbs fail explicitly.
+Each registered worker gets two writable roots: its assigned workspace and a
+per-worker directory beneath the configured isolated store. Native Codex
+permissions start from `:minimal` read access, add explicit runtime paths and
+shared Git objects read-only, deny `/dev/shm`, and disable tool network.
+Workspace `.git`, `.codex` and `.agents` and store `.codex` remain read-only.
+The launcher runs a model-free kernel preflight before spawning. Both exec and
+app-server use this profile; sending the legacy thread `sandbox` field would
+replace it and is forbidden. App-server checks the returned policy before a
+model turn. Its Unix socket lives outside the writable roots, in a private
+directory. The host model process still uses existing Codex authentication;
+tool processes receive a scrubbed environment and private HOME/TMPDIR.
 
-The trusted launcher records worker, queue, source identity, workspace and
-optional single-ticket assignment under the daemon's data directory, outside
-both writable roots. Requests cannot choose those fields, a cwd, executable,
-environment or destination authority. Claims use the real queue APIs. Later
-requests must carry the assigned ref, worker/session identity, claim timestamp,
-claim-event count and answer generation. Close rechecks that fence and required
-gates inside the source write lock, retaining normal product/ownership guards.
+All workspace ancestors are pinned untrusted; populated or symlinked `.codex`
+entries refuse launch/proof and stop hosted turns. Empty directory mount
+targets are allowed: Codex temporarily creates them during tool execution,
+and rejecting those broke concurrent proof/turn guards. MCP, hooks, apps,
+plugins, web search, browser/computer tools and subagent tools are disabled by
+session overrides. Keep testing the actual runtime, not just constructed argv.
 
-The daemon opens every spool component without following symlinks; request
-files must be regular, single-link files under 128 KiB. Responses use an
-exclusive temporary file followed by rename, so a planted response symlink
-cannot redirect a privileged write. A source-side receipt is reserved before
-effects and bound to a payload hash. Matching replays return the same result;
-different content under the same ID is refused. An interrupted operation is
-indeterminate and is never blindly executed again. A worker has a 1,024-receipt
-budget. Disabled policies and dead worker registrations revoke dispatch.
+The spool broker's trusted scope lives outside both writable roots. It records
+worker, queue, source identity, workspace, store, optional ticket assignment
+and the current claim fence. The worker cannot choose those authorities.
+Claim/close/find/current/comment/block/ask/tell/send operate through bounded
+request/response files; other commands are refused. Tell aliases send.
+Close/comment/block recheck source identity and claim ownership/generation at
+the source mutation lock. Worker/session restriction tombstones survive registry
+pruning and later queue-policy changes, including sessions backfilled during
+the same pass that prunes a dead worker. A released or dead worker is refused.
 
-Messages can reach only the assigned ticket's submitter, resolved at claim
-time, with its identity rechecked before sending. Reports carry an untrusted
-sandbox label and attribution evidence; at most ten messages are accepted per
-claim. Tells cannot park in the outbox and later resolve a renamed recipient.
-Transport receipts and ask results are returned without treating them as
-delivery confirmation or permission to close anything.
+Every effect reserves a source-side receipt first. Matching replays return the
+same result; changed content under the same ID is refused. Interrupted effects
+remain indeterminate. Claim recovery adopts only that worker's outstanding
+claim and never repeats a claim event. Oversized tickets are explicitly
+projected; `wt find REF --field note --page N` retrieves the original text.
+Nonregular, linked, oversized or deeply nested spool entries are isolated and
+retired with bounded work. Responses, temporaries and dead-worker receipts
+have retention periods; permanent restriction tombstones are not retired.
 
-Commit proof disables Git transports, lazy fetch, replacement objects,
-filesystem monitors and hooks. A missing commit fails rather than asking an
-untrusted partial-clone configuration to fetch it. This addresses the concrete
-review exploit in which `remote.origin.uploadpack` executes a daemon-side shell
-command even during `rev-parse`.
+Messages pin the submitter's exact resolved session/engine/worker descriptor,
+label text as untrusted sandbox evidence and deliver only to the current live
+destination. They never resume/delegate or park in the outbox. Per-ticket
+message/comment budgets survive fence refresh. Minimal receipts/results avoid
+returning arbitrary adapter output or privileged logs.
 
-Command gates currently fail closed. Review/verify requirements retain their
-ordinary state and verify requests wake the stage supervisor, but full-access
-stage launches on sandbox queues are refused. Generic headless/RPC/delegate
-resumes cannot promote a sandbox worker; only steering its existing hosted
-turn is allowed. These refusals are safety boundaries, **not completed support**
-for those workflows.
+Git metadata for local commits lives in the isolated store (`GIT_DIR`), with
+read-only alternates to launch-time workspace objects. Bootstrap and proof
+run inside native Codex sandboxes, never host Git against worker config,
+`.git` pointers or alternates. Proof roots and base come from a trusted launch
+record and must match the bridge scope. Full SHAs must strictly descend from
+the assigned base. A read-only proof sandbox disables lazy fetch, replacements,
+hooks and transports. Patch export exists as inert data; a safe integration
+workflow is still missing (below).
 
-## Verification performed
+## Verification on 2026-11-16 — worker wt-039caa56
 
-`tests/test_sandbox_bridge.py` exercises real isolated queue effects, replay,
-cross-ticket/identity fields, claim/generation changes including an in-lock
-close race, link/FIFO/size attacks, destination changes, message receipts,
-policy revocation, single-ticket assignment and actual CLI subprocesses for
-both launch environments. Existing sandbox, app-server, RPC, messages and
-liveness-delivery suites cover adjacent behavior. The focused run of these
-six suites passed 251 tests on 2026-11-15 before the final documentation edits.
+Both actual-model disposable-queue acceptance runs now PASS. The runner uses
+production launch builders **and** `codex_sandbox_prepare`, an isolated source
+store/registry and a real spool broker; it never edits live queue settings.
+Each worker claims a fixture, fixes addition, runs unittest, checks boundaries,
+commits only its fix in the store, and closes the actual fixture ticket.
 
-A model-free Codex 0.169.0 app-server `command/exec` probe on this host showed
-ordinary workspace writes succeed and `.git` writes fail read-only under the
-legacy workspace-write policy. Explicitly adding `.git` as a nested root made
-it writable; that experiment was temporary and **is not in this patch**. The
-probe script is `/tmp/wt61-sandbox-probe.py` (temporary evidence, not a runtime
-dependency). Never broaden the roots to an external worktree Git directory.
+| Transport | Retained evidence | Worker commit |
+|---|---|---|
+| exec | `/home/hermes/wt-sandbox-acceptance-4d1jpezv/controller/verdict.json` | `4bd4edad240f83721926de1dd8e74be8cf348ce8` |
+| app-server | `/home/hermes/wt-sandbox-acceptance-mvdzr14b/controller/verdict.json` | `95c914d3f41637c8265248e0193a53b328362040` |
 
-An independent Claude review found the Git uploadpack escape and wrapper import
-escape, plus unsafe stage/resume paths. The corresponding focused fixes and
-regressions are included here. The second cross-family review completed; its
-report is `~/.watchtower/logs/critique-antigravity-9563be6a.log`. Its additional
-findings require fixes and review of the final combined diff.
+Both report closed fixture status, passing tests, changed source, denied
+AF_INET/AF_UNIX probes, denied shared-memory writes, and no host file written
+outside the roots. Unlisted ancestors may be private tmpfs overlays, so a
+successful write there inside the sandbox is not evidence of a host write;
+the runner checks the host view as well. The unit/kernel suites exercise
+IPv6, Unix bind/connect, credential canaries, shared worktrees, hostile Git
+configuration/alternates, project MCP configuration, claim races, replay,
+crash recovery, oversize paging and restriction persistence.
 
-### Second checkpoint (2026-11-15, worker wt-81a70df6)
+Earlier review reports are in `~/.watchtower/logs/critique-claude-9ae3e712.log`
+and `critique-antigravity-9563be6a.log`. The concrete host Git uploadpack and
+Python import escapes were addressed. The alleged unrestricted AF_UNIX escape
+did not reproduce on this host; native socket tests remain required. Revised
+combined-source security review is still required before integration.
 
-`4177768` on `origin/wt-61-wt-81a70df6` adds source-identity and claim-generation
-checks at the actual block/progress/close mutation lock; central gate refusal
-also covers group parents after a sandbox child finishes. Interactive
-`wt discuss` refuses an unrestricted resume of a restricted session. Assessors
-carry their stage and queue so they cannot bypass stage policy by using the
-ad-hoc launcher. The lifecycle/assessment/gates/groups run passed 146 tests;
-the related sandbox/app-worker/RPC/messages/liveness run passed 264 tests;
-the required push gate passed 420 tests. This is progress, not acceptance.
+## Remaining acceptance — keep WT-61 open
 
-Direct model-free Codex 0.169.0 `command/exec` kernel probes on this Linux host
-found `socket(AF_UNIX)` and `socket(AF_INET)` both refused with `EPERM` under
-`networkAccess=false`. The review's claimed immediate Unix-socket escape did
-**not** reproduce here. Keep a real socket probe in acceptance rather than
-assuming either safety or escape from mount permissions alone.
+1. **Safe gated workflows.** Command gates and full-access stage/assessment
+   launches currently refuse sandbox-origin work, including group-parent
+   gates after policy changes. This is a safety boundary, not completed
+   stage support. Implement isolated command/verification/assessment
+   transports with scoped verdicts; never skip a required gate or run hostile
+   tests with daemon authority. Generic resumed/delegated turns remain refused
+   unless the exact restricted policy is retained.
+2. **Integration handoff and worker contract.** Local commits are in the
+   isolated store; workers cannot push over the disabled network. The generic
+   drain/run-once prompt still asks for push, learns outside its read roots,
+   and has CLI verbs outside this bridge contract. Supply a restricted-worker
+   contract and a trusted, reviewable patch-adoption path before live use.
+   A fixture close proves bridge behavior, not release-branch integration of
+   a real fix. Do not close real work on an unintegrated store-only commit.
+3. **Combined security review.** Review final root/path/config races,
+   source replacement and launch/proof records; verify destination pinning
+   and protected runtime/control paths. Credentials must remain outside
+   explicit runtime read roots; operator-provided extra read roots require
+   review. Restriction tombstones and launch records still grow, and receipt
+   scans are capped. Mac trusted-prefix handling has unit coverage but no
+   native macOS acceptance; fail closed if enforcement cannot be established.
 
-The same probes found `/dev/shm` writable outside the two allowed roots with
-the legacy policy and even an explicit `/dev/shm = "read"` profile entry.
-An explicit `/dev/shm = "deny"` entry blocked the write. On this machine,
-`/tmp` resolves beneath `/dev/shm/hermes-tmp`: do not put native acceptance
-fixtures, trusted runtime code, or a writable root there and then reopen the
-denied subtree as read-only. The main review worktree was moved to
-`/home/hermes/Apps/watchtower-wt61-81a70df6` for this reason.
-
-`scripts/verify_codex_sandbox.py --transport exec|app-server` is an opt-in
-actual-model acceptance runner. It creates its own queue, registry, source
-store and Git fixture under the user's home, uses the production command/env
-builders and real spool broker, and requires the worker to claim, fix, test,
-commit and close one fixture ticket. It also checks forbidden ordinary and
-shared-memory writes and Unix/TCP socket denial. It references existing Codex
-authentication without copying it. It does not touch the real queue/settings.
-The runner is not passing acceptance evidence until both actual runs finish
-successfully against the final combined source.
-
-Parallel source work from this checkpoint is deliberately separate:
-
-- `wt61-bridge-hardening-claude-cbfd73aa`, session
-  `a1c42192-b7a7-4009-b27e-364760b97c5d`, tree
-  `/tmp/wt-61-bridge-81a70df6`, branch `wt-61-bridge-81a70df6`: bridge recovery,
-  durable restriction records, bounded responses/cleanup, scoped messaging and
-  fenced block/progress.
-- `wt61-policy-workflow-claude-1b9b2e05`, session
-  `1d842551-b8fc-4ceb-b241-737d0e4d85d7`, tree
-  `/tmp/wt-61-policy-81a70df6`, branch `wt-61-policy-81a70df6`: launch policy,
-  inherited environment/config, actual root/network enforcement and local Git
-  workflow. The two lanes were told to coordinate commit-proof verification.
-
-Their commits and reports must be checked before adoption. A successor must
-integrate their verified changes in a private worktree, run both real transport
-acceptance checks, and complete security review before any merge to main.
-Neither lane has authority to close WT-61 or change live policy.
-
-## Remaining original acceptance — keep WT-61 open
-
-1. **Local test/commit workflow.** Codex protects `.git`; ordinary commits fail.
-   Shared worktrees additionally reference metadata outside the assigned roots.
-   Select and verify a design that preserves roots, such as separate Git
-   metadata within the isolated store, bootstrapped inside the sandbox. Keep
-   proof verification unable to execute hostile Git configuration. A writable
-   nested `.git` root is not a safe blanket fix: replacing it with a symlink or
-   poisoning later privileged Git operations must be considered. Network-free
-   workers also cannot follow the generic drain prompt's push instruction;
-   their integration handoff needs an explicit safe contract.
-2. **Stages and handoff.** Implement scoped block/progress and safe command,
-   verification and assessment transports. They must neither run hostile tests
-   with full access nor skip a required gate. Current refusals are intentional
-   interim behavior. Generic resumes must retain policy or remain refused.
-3. **Actual engine acceptance.** The current subprocess test proves CLI bridge
-   routing, and argv tests prove construction. They do not prove a live exec
-   turn and app-server turn each enforce filesystem/network constraints while
-   editing, testing, committing and round-tripping claim/close. Run both in
-   isolated fixtures, including forbidden writes and outbound network probes.
-   Check interactions with inherited Codex execpolicy rules as well.
-4. **Crash/size recovery.** Reservation prevents duplicate effects, but a crash
-   between real claim and scope persistence can strand a live worker. Add
-   fenced adoption of its own outstanding claim and a recoverable current-claim
-   read. Bound/project oversized ticket responses explicitly; an item larger
-   than the response cap must not become an unreachable claim. Add metadata
-   and receipt retirement with bounded work per daemon tick.
-5. **Review remaining authority edges.** Finish the revised security review,
-   cover source-store replacement races and protected control/runtime paths,
-   destination re-resolution inside messaging adapters, and legitimate trusted
-   prefix symlinks on macOS. The workspace-write policy is write/network
-   isolation: it still permits broad filesystem reads, including credentials.
-   Scoped messaging is an egress channel; do not describe this as credential
-   read isolation. Evaluate a read-restricted policy separately without silently
-   changing this ticket's roots or approval requirements.
-
-No live queue settings, send switches or service restarts were changed for
-this checkpoint. Source is deliberately held off the release branch pending
-completion and review; a pushed review branch is not integrated or deployed.
+Review branch/worktree: `wt-61-wt-039caa56`,
+`/home/hermes/Apps/watchtower-wt61-039caa56`. No live policies, customer sends,
+credentials, send switches or services were changed. Source remains deliberately
+held off main until the remaining workflows and final review are complete.

@@ -148,12 +148,13 @@ def test_user_mcp_servers_are_disabled_by_name(base):
         '[mcp_servers.linear]\ncommand = "npx"\n[mcp_servers."bad name"]\ncommand = "x"\n')
     repo = base / "repo"; repo.mkdir()
     ov = sp.config_overrides(repo, base / "store")
-    assert "mcp_servers.linear.enabled=false" in ov
-    assert not any("bad name" in o for o in ov)
+    assert 'mcp_servers={"linear"={"enabled"=false},"bad name"={"enabled"=false}}' in ov
+    assert "agents.enabled=false" in ov
 
 
 def test_app_worker_refuses_project_config_before_starting_codex(base, monkeypatch, capsys):
     repo = base / "repo"; (repo / ".codex").mkdir(parents=True)
+    (repo / ".codex" / "config.toml").write_text("[mcp_servers.evil]\ncommand = 'x'\n")
     monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("codex must not start"))
     code = codex_app_worker.run(["--cwd", str(repo), "--permission-profile", sp.PROFILE,
                                  "--sandbox-store", str(base / "store"), "goal"])
@@ -322,6 +323,11 @@ def test_native_local_test_and_commit_workflow(native, fx):
     assert "Subject: [PATCH] sandbox: add test" in patch and "+def test_ok():" in patch
 
     sp.record_launch("w1", fx["repo"], fx["store"], base)
+    from watchtower import sandbox_bridge
+    scope = {"worker": "w1", "repo": str(fx["repo"]), "store": str(fx["store"])}
+    assert sandbox_bridge._commit_proof(scope, sha) == sha
+    with pytest.raises(ValueError, match="does not resolve"):
+        sandbox_bridge._commit_proof(scope, base)
     assert sp.verify_worker_commit("w1", sha)["ok"] is True
     assert sp.verify_worker_commit("w2", sha)["ok"] is False
     # Launch records live outside both writable roots.
@@ -523,3 +529,16 @@ def test_live_turn_edits_commits_and_stays_confined(native, base, monkeypatch, t
                           capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, proc.stdout[-1500:] + proc.stderr[-1500:]
     _assert_live_outcome(base, repo, store, head)
+
+
+def test_empty_mount_target_is_safe_but_content_and_links_are_not(base):
+    repo = base / "repo"
+    (repo / ".codex").mkdir(parents=True)
+    assert sp.project_config_hazards(repo) == []
+    (repo / ".codex" / "config.toml").write_text("# executable config surface")
+    assert sp.project_config_hazards(repo) == [str(repo / ".codex")]
+    (repo / ".codex" / "config.toml").unlink()
+    (repo / ".codex").rmdir()
+    (base / "empty").mkdir()
+    (repo / ".codex").symlink_to(base / "empty", target_is_directory=True)
+    assert sp.project_config_hazards(repo) == [str(repo / ".codex")]

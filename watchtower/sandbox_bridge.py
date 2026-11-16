@@ -759,30 +759,17 @@ def _resolution(body):
 
 
 def _commit_proof(scope, commit):
-    # No arbitrary repo search, cwd, hooks, ssh or user-provided git argv.
-    import subprocess
-    if not re.fullmatch(r"[a-fA-F0-9]{7,64}", commit):
-        raise ValueError("invalid commit SHA")
-    try:
-        if stat.S_ISLNK(os.lstat(os.path.join(scope["repo"], ".git")).st_mode):
-            raise ValueError("commit does not resolve in assigned workspace")
-    except FileNotFoundError:
-        pass
-    # Even rev-parse can start a lazy partial-clone fetch, executing a
-    # repository-selected uploadpack. Forbid every transport and hook;
-    # a missing object is a failed proof, never permission to fetch it.
-    result = subprocess.run(["git", "--no-optional-locks", "-c", "protocol.allow=never",
-                             "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
-                             "-C", scope["repo"],
-                             "rev-parse", "--verify", commit + "^{commit}"],
-                            env={"PATH": os.defpath, "HOME": "/nonexistent",
-                                 "GIT_CONFIG_NOSYSTEM": "1", "GIT_NO_LAZY_FETCH": "1",
-                                 "GIT_NO_REPLACE_OBJECTS": "1",
-                                 "GIT_CEILING_DIRECTORIES": os.path.dirname(scope["repo"])},
-                            capture_output=True, text=True, timeout=10)
-    if result.returncode or not re.fullmatch(r"[a-f0-9]{40,64}\n?", result.stdout):
-        raise ValueError("commit does not resolve in assigned workspace")
-    return result.stdout.strip()
+    # Both roots and the original base come from the trusted launch record.
+    # Never run host Git against worker-writable config, pointers or alternates.
+    from . import sandbox_policy
+    record = sandbox_policy.launch_record(scope["worker"])
+    if (not record or record.get("repo") != scope["repo"]
+            or record.get("store") != scope["store"]):
+        raise ValueError("commit does not resolve: missing or mismatched sandbox launch record")
+    result = sandbox_policy.verify_worker_commit(scope["worker"], commit)
+    if not result.get("ok"):
+        raise ValueError("commit does not resolve: " + str(result.get("error") or "invalid proof"))
+    return result["commit"]
 
 
 def _execute(scope, request, key):
@@ -979,7 +966,8 @@ def process(worker):
             bind_session(worker, record.get("session_id"))
             if config.codex_sandbox(scope["queue"]) != "workspace-write":
                 raise ValueError("sandbox bridge policy is disabled")
-            if not record.get("alive") or record.get("engine") != "codex" or record.get("queue") != scope["queue"]:
+            if (not record.get("alive") or record.get("released_at")
+                    or record.get("engine") != "codex" or record.get("queue") != scope["queue"]):
                 raise ValueError("sandbox worker is no longer live in its registered queue")
             with os.scandir(trusted) as entries:
                 state = {"receipts": sum(

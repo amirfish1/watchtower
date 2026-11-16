@@ -4975,6 +4975,8 @@ def record_worker(
     # If a session_id is somehow known at record time, ledger it (survives prune).
     _add_worker_session_id(rec.get("session_id", ""))
     if rec.get("session_id"):
+        from . import sandbox_bridge
+        sandbox_bridge.bind_session(worker_id, rec["session_id"])
         origins.note_spawn(
             rec["session_id"], role=stage or ("adhoc" if kind == "adhoc" else "worker"),
             ref=ref, queue=ticket_queue or queue, worker_id=worker_id, engine=engine,
@@ -5032,6 +5034,8 @@ def list_workers(prune: bool = True) -> List[Dict[str, Any]]:
                     if w.get("engine") == "antigravity":
                         antigravity_accounts.bind_pending(w["log"], w.get("antigravity_account_id") or "primary")
                         antigravity_accounts.finalize_pending(w["log"], sid)
+                    from . import sandbox_bridge
+                    sandbox_bridge.bind_session(str(w.get("worker_id") or ""), sid)
                     w["session_id"] = sid
                     backfilled = True
                     # Ledger it so it survives this worker being pruned later.
