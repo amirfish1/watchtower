@@ -111,3 +111,11 @@ def test_tracker_needs_input_notifications_remain_available(wt_env, monkeypatch)
     item = q.enqueue(project='LOG', note='Decision', submitter='filer', submitter_explicit=True)
     assert q._submitter_wants(item, 'needs_input', config)
     assert q._submitter_wants(item, 'awaits_decision', config)
+
+
+def test_direct_claim_rechecks_kind_after_concurrent_conversion(wt_env, monkeypatch):
+    item = q.enqueue(project='LOG', note='Feature record')
+    monkeypatch.setattr(q, '_verify_worker_live', lambda *a: config.set_queue_kind('LOG', 'tracker'))
+    with pytest.raises(ValueError, match='tracker'):
+        q.claim_by_ref(item['ref'], 'worker')
+    assert not q.get(item['ref'])['claimed_by']

@@ -3242,6 +3242,9 @@ def claim_by_ref(
         item = next((it for it in data["items"] if it.get("ref") == ref), None)
         if item is None:
             return None
+        # Recheck inside the store transaction: a concurrent kind conversion
+        # may have detached this ticket after the entry check above.
+        config.require_work_queue(item.get("project", ""))
         if item.get("supervision"):
             raise ValueError("ticket retains same-session takeover ownership")
         status = item.get("status", "open")
