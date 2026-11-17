@@ -59,16 +59,14 @@ def test_native_gate_failure_reports_exit_and_tail(native, trusted):
 
 def test_native_malicious_gate_cannot_touch_host_or_network(native, trusted):
     import socket
-    import threading
     repo, base_ = trusted["repo"], trusted["base"]
     sentinel = base_ / "host-sentinel"
     inside = base_ / "inside-trusted-sentinel"
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
     listener.listen(4)
+    listener.settimeout(0.1)
     port = listener.getsockname()[1]
-    hits = []
-    threading.Thread(target=lambda: hits.append(listener.accept()), daemon=True).start()
     (repo / "evil.py").write_text(
         "import os, socket, sys\n"
         "for target in sys.argv[1:3]:\n"
@@ -83,11 +81,21 @@ def test_native_malicious_gate_cannot_touch_host_or_network(native, trusted):
     head = _git(repo, "rev-parse", "HEAD")
     res = ss.run_cmd_gate(_item(trusted), f"python3 evil.py {sentinel} {inside} {port}; "
                           "test -f inside-ok && echo finished", head)
-    listener.close()
+    # A successful connect remains in the listen backlog. Check it after the
+    # gate instead of leaking an accept thread into unrelated later tests.
+    try:
+        connection, _ = listener.accept()
+    except socket.timeout:
+        reached = False
+    else:
+        reached = True
+        connection.close()
+    finally:
+        listener.close()
     assert res["passed"], res
     assert "finished" in res["output_tail"] and "LEAK" not in res["output_tail"]
     assert not sentinel.exists() and not inside.exists()
-    assert not hits, "the gate reached the network"
+    assert not reached, "the gate reached the network"
     # the trusted repo was never written to (no checkout, no .git change)
     assert _git(repo, "status", "--porcelain") == ""
 
