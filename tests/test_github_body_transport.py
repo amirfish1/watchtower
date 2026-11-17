@@ -383,7 +383,8 @@ def test_enqueue_with_flag_shaped_queue_label_reaches_gh(gh, monkeypatch, label,
 
     backend.enqueue(title="--label", note=note, text=text)
 
-    (call,) = gh.calls()
+    call, naming = gh.calls()
+    assert naming["opts"]["--title"] == ["BODY-7:label --label"]
     assert call["argv"] == ["issue", "create", "--body-file", "-", "--repo", REPO,
                             "--title", "--label", "--label", label]
     assert call["opts"]["--label"] == [label]
@@ -441,7 +442,9 @@ def test_enqueue_with_flag_shaped_title_keeps_title_and_body(gh, backend, monkey
 
     backend.enqueue(title=title, note=note, text=text)
 
-    (call,) = gh.calls()
+    call, naming = gh.calls()
+    from watchtower.refs import ticket_slug
+    assert naming["opts"]["--title"] == [f"BODY-7:{ticket_slug(title)} {title}"]
     assert call["opts"]["--title"] == [title]
     assert call["opts"]["--body-file"] == ["-"]
     assert "--body" not in call["opts"]

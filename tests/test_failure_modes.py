@@ -71,6 +71,18 @@ def test_missing_engine_binary_sets_a_cooldown_so_the_reconciler_stops_retrying(
             "engine authentication failed",
         ),
         ("You've hit your usage limit. Try again later.", "engine usage limit"),
+        (
+            # Codex app-server JSON-RPC shape: method-not-type envelope
+            # (2026-11-16: codex quota wall parked 5 queues with generic
+            # "engine exited immediately" cooldowns because this line was
+            # invisible to _quota_exhausted).
+            '{"t": 1, "method": "error", "params": {"error": {"message": '
+            '"You\\u2019ve hit your usage limit. Visit https://chatgpt.com/'
+            'settings/usage to purchase more credits or try again at Nov 18th, '
+            '2026 6:53 PM.", "codexErrorInfo": "usageLimitExceeded"}, '
+            '"willRetry": false}}',
+            "engine usage limit",
+        ),
         ("HTTP 503 upstream connect error", "engine api unavailable"),
         (
             'ERROR: {"type":"error","status":400,"error":{"type":"invalid_request_error",'

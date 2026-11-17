@@ -382,6 +382,7 @@ def queue_status(
         "in_progress": len(in_progress),
         "in_review": sum(1 for it in items if it.get("status") == "in_review"),
         "awaiting_answer": sum(1 for it in items if it.get("status") == "awaiting_answer"),
+        "awaiting_release": sum(1 for it in items if it.get("status") == "awaiting_release"),
         "closed": len(closed),
         "oldest_open_age_s": oldest_open_age,
         "oldest_open_age": _fmt_age(oldest_open_age),
@@ -433,7 +434,8 @@ def all_status(
     fetched = items if items is not None else q.list_items(project=project, fresh=fresh)
     # Archiving hides a dead queue, but a ticket filed into it afterwards
     # (automation, a stray `wt add`) must stay visible, not strand unseen (OPS-248).
-    unclosed = {it.get("project") or "GEN" for it in fetched if it.get("status") != "closed"}
+    unclosed = {it.get("project") or "GEN" for it in fetched
+                if it.get("status") != "closed" and not config.ticket_is_archived(it)}
     hidden = (
         set() if include_archived
         else {n for n in configured
@@ -448,6 +450,8 @@ def all_status(
             by_queue.setdefault(name, [])
     for it in fetched:
         if (it.get("project") or "GEN") in hidden:
+            continue
+        if not include_archived and not project and config.ticket_is_archived(it):
             continue
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
     by_ref = q._refs_index(fetched)

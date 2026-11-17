@@ -43,7 +43,7 @@ LOG_PATH = os.path.expanduser("~/.local/log/wt-imessage-router.log")
 # Machine-local path of the owner-notification pre-send check; never a literal here.
 PRESEND_CHECK = os.environ.get("WT_IMESSAGE_PRESEND_CHECK", "")
 HOLD_RETRY_S = 900
-REF_RE = re.compile(r"^\s*\[?([A-Za-z][A-Za-z0-9_-]*-\d+)\]?(?![\w-])[\s:,-]*(.*)$", re.S)
+REF_RE = re.compile(r"^\s*\[?([A-Za-z][A-Za-z0-9_]*(?:-[A-Za-z][A-Za-z0-9_]*)*-\d+)(?::[A-Za-z0-9_-]+|-[A-Za-z0-9_-]+)?\]?(?![\w-])[\s:,-]*(.*)$", re.S)
 TICKET_RE = re.compile(r"^\s*ticket\s*:\s*(.+)$", re.I | re.S)
 
 health = {"started": time.time(), "last_poll": None, "last_error": None,
@@ -151,8 +151,17 @@ def save_state(s: dict) -> None:
     STATE.write_text(json.dumps(s))
 
 
+def read_blocked() -> list:
+    base = os.environ.get("WATCHTOWER_API_URL", "http://127.0.0.1:8787").rstrip("/")
+    with urllib.request.urlopen(base + "/api/blocked", timeout=20) as response:
+        data = json.load(response)
+    if not isinstance(data, list) or any(not isinstance(t, dict) for t in data):
+        raise RuntimeError("WatchTower blocked API returned invalid tickets")
+    return data
+
+
 def tick(state: dict, queues: list[str], notify_queue: str) -> None:
-    blocked = [t for t in json.loads(wt("blocked", "--json").stdout or "[]")
+    blocked = [t for t in read_blocked()
                if t.get("project") in queues]
     first = not state["seeded"]
     for t in blocked:

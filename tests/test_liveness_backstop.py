@@ -707,7 +707,7 @@ def test_stages_tick_runs_the_sweep(lv, monkeypatch, capsys):
     monkeypatch.setattr(lv.liveness, "sweep", lambda only_ref="", **k: called.append(only_ref) or [
         {"ref": "LQ-9", "action": "reopen", "result": "done", "reason": "gone"}])
     assert lv.cli.main(["stages", "tick", "--ref", "LQ-9"]) == 0
-    assert called == ["LQ-9"] and "LQ-9: backstop reopen (done)" in capsys.readouterr().out
+    assert called == ["LQ-9"] and "LQ-9:ticket: backstop reopen (done)" in capsys.readouterr().out
 
 
 def test_wt_liveness_is_read_only(lv, capsys):

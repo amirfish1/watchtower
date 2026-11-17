@@ -424,7 +424,10 @@ def route_pending_answers(now: Optional[float] = None) -> List[str]:
             acted.append("migrated")
     except Exception:  # noqa: BLE001
         pass
+    from . import config
     for it in items:
+        if config.is_tracker(it.get("project", "")):
+            continue
         pa = it.get("pending_answer")
         ref = str(it.get("ref") or "")
         if not pa or not ref:

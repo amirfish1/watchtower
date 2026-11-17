@@ -25,6 +25,7 @@ import time
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from . import queue as q
+from . import config
 
 
 class UndeclaredState(ValueError):
@@ -52,7 +53,7 @@ _BOOLS = (False, True)
 # these; D2.4 holds them equal to the live tuples, so a value added there fails
 # until a row (or UNREACHABLE entry) covers it.
 _FROZEN: Dict[str, tuple] = {
-    "status": ("open", "in_progress", "in_review", "awaiting_answer", "closed"),
+    "status": ("open", "in_progress", "in_review", "awaiting_answer", "awaiting_release", "closed"),
     "gated": _BOOLS,
     "backend": ("file", "github"),
     "plan": ("", "planning", "reviewing", "discussing", "accepted", "failed", "blocked"),
@@ -187,6 +188,7 @@ ROWS: Tuple[Row, ...] = (
          status="closed", assessment=("due", "running"), backend="file"),
     _row("assess.run.github", "human", "-", "-",
          status="closed", assessment=("due", "running"), backend="github"),
+    _row("release.wait", "release", "event", "release_observed", status="awaiting_release"),
     _row("human.block", "human", "-", "-",
          status=("open", "in_progress", "in_review"), block=_not("block", "none")),
     _row("answer.await_human", "human", "-", "-",
@@ -1119,7 +1121,7 @@ def claim_owner(item: Dict[str, Any], ctx: Optional[ResolverContext] = None) -> 
 # Every write is a CAS (``queue.recover_claim`` / ``queue.pa_transition``).
 
 STALL_S = 1800.0
-_SKIP_OWNERS = ("human", "terminal", "dependency", "time")
+_SKIP_OWNERS = ("human", "terminal", "dependency", "time", "release")
 _LOOP_GUARDED = ("stage", "spawn", "reopen", "resume", "assessment_run_ops")
 # "1 tick" rows whose state can be transient between two writes of one
 # command (plan_verdict, then block) wait this long before acting.
@@ -1656,6 +1658,8 @@ def report(queue: str = "", ref: str = "", now: Optional[float] = None) -> List[
     ctx = ResolverContext(now)
     out = []
     for it in items:
+        if not ref and config.ticket_is_archived(it):
+            continue
         if ref and str(it.get("ref") or "") != ref:
             continue
         if queue and str(it.get("project") or "") != queue:
@@ -1679,6 +1683,8 @@ def sweep(now: Optional[float] = None, only_ref: str = "") -> List[Dict[str, Any
     acted: List[Dict[str, Any]] = []
     spawned: set = set()
     for it in items:
+        if config.ticket_is_archived(it) or config.is_tracker(it.get("project", "")):
+            continue
         if only_ref and str(it.get("ref") or "") != only_ref:
             continue
         if it.get("status") == "closed" and \

@@ -1,6 +1,6 @@
 ---
 name: watchtower
-description: Use when asked about a WatchTower ticket ref (e.g. WT-48, HERMES-20, any <PROJECT>-<N>), asked "is queue X stuck / drained", or asked to file/claim/close a ticket. WatchTower (`wt`) is a local CLI that tracks fleets of AI coding-agent workers across named queues.
+description: Use when asked about a WatchTower ticket ref (e.g. WT-48, HERMES-20, any PROJECT-N), asked "is queue X stuck / drained", or asked to file/claim/close a ticket. WatchTower (`wt`) is a local CLI that tracks fleets of AI coding-agent workers across named queues.
 ---
 
 # WatchTower
@@ -9,6 +9,20 @@ WatchTower is a local, stdlib-only CLI (`wt`) that tracks tickets in named
 queues and the agent workers draining them. Tickets are refs like `WT-48` or
 `HERMES-20` (`<PROJECT>-<N>`). If `wt` isn't on `$PATH`, WatchTower isn't
 installed here — say so rather than guessing at ticket state.
+
+Write named refs in prose: `WT-79:add-ticket-subscribe`. The numeric ref stays
+the identity; any colon or hyphen suffix is accepted and ignored on input,
+so stale names still work. A name is generated once from the filing title
+(up to four whole words / 30 characters); change it with `wt edit REF --slug NAME`.
+JSON keeps the bare `ref` plus a separate `slug` for joins and automation.
+
+Status notices are **opt-in**. `wt add` without `--subscribe` sends no status notices;
+add `--subscribe` when you want updates. For an existing ticket use
+`wt subscribe REF [target]` (target defaults to your session), or
+`wt edit REF --subscribe`. Stop updates with `wt unsubscribe REF [target]`
+or `wt edit REF --no-subscribe`. Subscriptions follow continued sessions;
+`wt find REF` shows ticket subscribers. `wt subscribe QUEUE target` still
+subscribes to the whole queue.
 
 ## Scope: what WatchTower is (and isn't)
 

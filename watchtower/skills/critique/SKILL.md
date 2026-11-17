@@ -5,6 +5,10 @@ description: Use when asked to "/critique" something, get a second opinion, or h
 
 # Critique
 
+Use named ticket refs in prose (`WT-79:add-ticket-subscribe`); JSON keeps the
+bare `ref` and separate `slug`. Commands accept bare refs and stale names.
+
+
 `wt critique` spawns two independent agents to critique a goal — a plan,
 design, diff, decision, or anything else you describe. Each spawned agent
 gets the same goal text plus baked-in ground rules (contrarian, no priors,

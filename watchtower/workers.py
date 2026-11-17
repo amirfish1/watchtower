@@ -30,7 +30,7 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
@@ -462,9 +462,10 @@ ANNOUNCE_TICKET = (
 WAIT_TARGET_CONTRACT = (
     "WAIT TARGET: every `wt block` names who it waits on with `--wait-on`: "
     "`owner` for a decision only the owner can make; `external --wait-actor "
-    "NAME` for a client, staff member or vendor; `dependency --wait-ref REF` "
-    "for another ticket (add `--wait-ref-host` when that ticket lives on "
-    "another machine); `worker` for work another session is doing. Pick the "
+    "NAME` for a client, staff member or vendor; `worker` for work another "
+    "session is doing. For another ticket, use `wt edit REF --after DEP` "
+    "instead of blocking: it releases your claim and dispatch resumes when "
+    "DEP closes, without a human question or filer notice. Pick the "
     "one that is true; do not default to `owner`. For an owner wait also "
     "pass `--decide-by` (ISO time with a UTC offset, or `none`) and "
     "`--if-unanswered` (what happens if nobody answers, or `none`). This "
@@ -478,8 +479,10 @@ INTEGRATION_CONTRACT = (
     "releases are cut from: `git fetch` then `git merge-base --is-ancestor "
     "SHA origin/BRANCH`. Never switch the branch of a shared checkout to get "
     "there; use your own worktree off the fresh release branch. To park a "
-    "merged fix until it ships: `wt defer --awaits release --commit SHA "
-    "--release-branch origin/BRANCH` (WatchTower checks it). If the fix is "
+    "merged fix until it ships: `wt await-release REF --commit SHA "
+    "--release-branch origin/BRANCH --target TARGET --reason REASON --live-check` "
+    "(untimed; WatchTower verifies integration and observes deployment/adoption). "
+    "See worker-runbook.md for targets. If the fix is "
     "not on that branch, say so: `wt defer --awaits integration "
     "--integration-owner WHO --integration-path HOW`, and if nobody owns "
     "landing it, `wt block --wait-on worker` naming the coordinator instead. "
@@ -3641,7 +3644,12 @@ def _quota_exhausted(text: str) -> bool:
             continue
         is_error = (event.get("is_error") is True
                     or event.get("is_api_error_message") is True
-                    or event.get("type") in {"error", "turn.failed"})
+                    or event.get("type") in {"error", "turn.failed"}
+                    # Codex app-server JSON-RPC: {"method":"error",
+                    # "params":{"error":{"message":"...usage limit..."}}}
+                    or (event.get("method") == "error"
+                        and isinstance(event.get("params"), dict)
+                        and isinstance(event["params"].get("error"), dict)))
         if not is_error:
             continue
         lower = json.dumps(event).lower()
@@ -6298,6 +6306,28 @@ def requeue_orphaned_tickets(
     return reopened
 
 
+@contextmanager
+def _startup_timing(queue: str, phase: str, ref: str = ""):
+    """Attribute live dispatch delays without changing dispatch decisions."""
+    started = time.monotonic()
+    outcome = "ok"
+    try:
+        yield
+    except BaseException:
+        outcome = "error"
+        raise
+    finally:
+        elapsed = time.monotonic() - started
+        try:
+            from .queue import _log
+            _log("STARTUP_TIMING", json.dumps({
+                "phase": phase, "ref": ref, "elapsed_s": round(elapsed, 6),
+                "outcome": outcome, "pid": os.getpid(),
+            }, sort_keys=True), queue=queue)
+        except Exception:
+            pass  # diagnostics must never prevent staffing
+
+
 def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
     """Decide + act on what a newly-filed ticket needs, and log the decision.
 
@@ -6320,6 +6350,10 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
     from . import config, queue as _q
     from .queue import _log
     try:
+        if config.is_tracker(queue):
+            reason = "tracker queue — no worker dispatch"
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
         ref = ref or ""
         run_requested = False
         # One read of this ticket, from the cached list rather than a
@@ -6330,11 +6364,12 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
         # read-your-own-writes fresh without costing an extra round trip.
         item = None
         if ref:
-            item = next(
-                (it for it in (_q.list_items(project=queue) or [])
-                 if str(it.get("ref") or "") == ref),
-                None,
-            )
+            with _startup_timing(queue, "ticket_read", ref):
+                item = next(
+                    (it for it in (_q.list_items(project=queue) or [])
+                     if str(it.get("ref") or "") == ref),
+                    None,
+                )
         if item and _q.plan_pending(item):
             # Plan-gated (WT-22): plan first; no worker until it is accepted
             # (cmd_plan's accept verdict dispatches again).
@@ -6383,13 +6418,15 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
             return reason
         claim_filter = "".join(f" --type {t}" for t in config.claim_types(queue))
+        from .refs import display_ref
+        label = display_ref(item) if item else ref
         nudge = (
-            f"A run was requested for {ref} on {queue} (its queue is not "
+            f"A run was requested for {label} on {queue} (its queue is not "
             f"auto-draining, so this ticket only). Claim it with "
             f"`wt claim -q {queue} {ref} --worker <your-id> --json`, work it, "
             f"and do not claim anything else on this queue."
             if run_requested else
-            f"New ticket {ref} filed on {queue}. Claim it with "
+            f"New ticket {label} filed on {queue}. Claim it with "
             f"`wt claim -q {queue} --worker <your-id>{claim_filter} --json` and drain the queue."
         )
         # ...and the session that filed it (or pressed ▶) already knows.
@@ -6399,12 +6436,14 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             # steers it off its claim, and it drains the queue on its own
             # when it finishes (WT-15). Idle workers get first shot; if none
             # is idle the reconcile below decides whether to staff up.
-            exclude |= {
-                str(it.get("claimed_by") or "")
-                for it in (_q.list_items(project=queue) or [])
-                if it.get("status") == "in_progress" and it.get("claimed_by")
-            }
-        delivered = notify_workers(queue, nudge, exclude=exclude)
+            with _startup_timing(queue, "busy_read", ref):
+                exclude |= {
+                    str(it.get("claimed_by") or "")
+                    for it in (_q.list_items(project=queue) or [])
+                    if it.get("status") == "in_progress" and it.get("claimed_by")
+                }
+        with _startup_timing(queue, "notify_workers", ref):
+            delivered = notify_workers(queue, nudge, exclude=exclude)
         if delivered:
             reason = f"nudged {delivered} live worker(s) — immediate pickup"
             _log("DISPATCH", f"{ref} — {reason}", queue=queue)
@@ -6412,7 +6451,8 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
         # No warm worker: reconcile just this queue (WT-2) -- its pass
         # releases workers past the separate lifecycle floor, then staffs it.
         # Cache coldness alone is not a release signal.
-        result = reconcile_once(only_queue=queue)
+        with _startup_timing(queue, "reconcile", ref):
+            result = reconcile_once(only_queue=queue)
         spawned = [r for r in result.get("spawned", []) if r.get("queue") == queue]
         if spawned:
             wids = ", ".join(r.get("worker_id", "?") for r in spawned)
@@ -6955,7 +6995,13 @@ def reconcile_once(dry_run: bool = False,
     # this queue's serial launch-failure observation windows.
     lock = (_staffing_lock(only_queue) if only_queue else
             _FileLock(WORKERS_FILE.parent / "reconcile-maintenance.lock"))
-    with lock:
+    # Measure acquisition separately from work under the lock. A completed
+    # reconcile duration alone cannot distinguish contention from slow reads.
+    with ExitStack() as stack:
+        timing = (_startup_timing(only_queue, "staffing_lock")
+                  if only_queue and not dry_run else nullcontext())
+        with timing:
+            stack.enter_context(lock)
         return _reconcile_once_locked(dry_run, only_queue=only_queue,
                                       supervise_stages=supervise_stages)
 
@@ -7055,6 +7101,8 @@ def spawn_floor_routed_workers(
         if w.get("alive") or now - started < FLOOR_SPAWN_RETRY_S:
             routed_refs.add(str(w["ref"]))
     for queue_name in sorted(config.all_queues()):
+        if config.is_tracker(queue_name):
+            continue
         try:
             queue_model = config.queue_model_id(queue_name)
             types = config.claim_types(queue_name) or None
@@ -7166,9 +7214,10 @@ def _reconcile_once_locked(dry_run: bool = False,
         # replacement bookkeeping still sees them) and leave the fleet-wide
         # maintenance below to the periodic tick.
         try:
-            result["released"] = release_idle_workers(
-                queue=only_queue, reconcile_id=reconcile_id
-            )
+            with _startup_timing(only_queue, "idle_release"):
+                result["released"] = release_idle_workers(
+                    queue=only_queue, reconcile_id=reconcile_id
+                )
         except Exception:
             pass
     elif not dry_run:
@@ -7233,6 +7282,13 @@ def _reconcile_once_locked(dry_run: bool = False,
                 expire_parked_retention()
             except Exception:
                 pass
+        if not dry_run:
+            try:
+                from . import releases as _releases
+                result["releases_observed"] = _releases.reconcile()
+            except Exception as exc:
+                from .queue import _log
+                _log("RELEASE_OBSERVER_ERROR", str(exc)[:200])
         # Single supervisor (WT-24): only a real auto-spawn daemon supervises stage
         # sessions -- never a --dry-run or spawn-less one.
         if supervise_stages and not dry_run:
@@ -7728,6 +7784,9 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
     loop_queues = set(all_cfg) | set(released_by_q)
     loop_queues &= {staff_queue}
     for q_name in sorted(loop_queues):
+        if config.is_tracker(q_name):
+            result["skipped"].append({"queue": q_name, "reason": "tracker queue"})
+            continue
         if not dry_run:
             unpark_reason = _maybe_auto_unpark(q_name)
             if unpark_reason:
@@ -8344,6 +8403,8 @@ def spawn_workers(
     own default) instead of reading the queue's configured model -- for a
     worker substituted onto a different engine than the queue's own.
     """
+    from . import config
+    config.require_work_queue(queue)
     agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
     repo_path = repo_path or os.getcwd()
     if not model and inherit_queue_model:
@@ -8580,6 +8641,7 @@ def spawn_run_once_worker(
     tracked in ``workers.json`` like any other.
     """
     from . import config
+    config.require_work_queue(queue)
     repo_path = repo_path or config.repo_path(queue) or os.getcwd()
     engine = engine or config.engine(queue) or "claude"
     agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
@@ -8888,6 +8950,9 @@ def spawn_adhoc(
     `wt send` fails and silently drops the report -- unresolvable targets
     don't get parked in the outbox (nothing to retry against), so without
     this check the report is just lost (OPS-89)."""
+    from . import config
+    from . import queue as _queue
+    config.require_work_queue(ticket_queue or _queue._project_from_ident(ticket_ref))
     agy_account = antigravity_accounts.worker_account() if engine == "antigravity" else ""
     repo_path = repo_path or os.getcwd()
     if stage and ticket_queue:

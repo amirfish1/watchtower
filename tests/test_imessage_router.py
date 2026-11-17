@@ -31,6 +31,12 @@ def test_bracketed_tag_answer():
     assert r.parse_reply("[A-1] yes", ["A-1"]) == ("answer", "A-1", "yes")
 
 
+def test_named_ref_answer():
+    for text in ("[SMALL-BUGS-7:old-name] yes", "SMALL-BUGS-7:anything yes", "SMALL-BUGS-7-old-name yes"):
+        assert r.parse_reply(text, ["SMALL-BUGS-7"]) == ("answer", "SMALL-BUGS-7", "yes")
+    assert r.parse_reply("A-1:only-a-name", ["A-1"]) is None
+
+
 def test_prefix_ref_not_matched():
     assert r.parse_reply("A-10 yes", ["A-1"]) is None
 
@@ -60,7 +66,7 @@ def test_question_wording_is_pinned():
     # for word; changing the format here must change it there too.
     assert r.format_question(T) == QUESTION
     assert r.parse_reply("PROJECTS-7 yes", ["PROJECTS-7"]) == ("answer", "PROJECTS-7", "yes")
-    assert r.REF_RE.pattern == r"^\s*\[?([A-Za-z][A-Za-z0-9_-]*-\d+)\]?(?![\w-])[\s:,-]*(.*)$"
+    assert r.REF_RE.match("PROJECTS-7:stale yes").groups() == ("PROJECTS-7", "yes")
 
 
 @pytest.fixture
@@ -71,6 +77,7 @@ def router(monkeypatch, tmp_path):
     monkeypatch.setattr(r, "bb_recent", lambda: [])
     monkeypatch.setattr(r, "log", logs.append)
     monkeypatch.setattr(r, "report", lambda *a: reports.append(a))
+    monkeypatch.setattr(r, "read_blocked", lambda: [T])
     monkeypatch.setattr(r, "wt", lambda *a: type("R", (), {"stdout": json.dumps([T]), "stderr": "", "returncode": 0})())
     state = {"seeded": True, "notified": [], "seen": []}
     return type("Ctx", (), {"sent": sent, "reports": reports, "logs": logs, "state": state,
@@ -138,3 +145,27 @@ def test_answer_is_reported(router, monkeypatch):
     router.tick()
     assert ("answer", "--ref", "PROJECTS-7", "--ok", "1") in router.reports
     assert router.sent == ["Answered PROJECTS-7"]
+
+
+def test_daemon_failure_preserves_notification_state(router, monkeypatch):
+    import copy
+    before = copy.deepcopy(router.state)
+    def fail():
+        raise OSError("daemon unavailable")
+    monkeypatch.setattr(r, "read_blocked", fail)
+    with pytest.raises(OSError):
+        router.tick()
+    assert router.state == before
+    assert router.sent == []
+
+
+def test_blocked_read_uses_http(monkeypatch):
+    import io
+    urls = []
+    def request(url, **kw):
+        urls.append(url)
+        return io.BytesIO(json.dumps([T]).encode())
+    monkeypatch.setattr(r.urllib.request, "urlopen", request)
+    monkeypatch.setattr(r, "wt", lambda *a: pytest.fail("poll must not spawn wt"))
+    assert r.read_blocked() == [T]
+    assert urls == ["http://127.0.0.1:8787/api/blocked"]

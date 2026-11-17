@@ -155,6 +155,72 @@ def test_close_clears_ledger_and_parked_ticket_closes(wt):
     assert wt.q.get(it["ref"])["status"] == "closed"
 
 
+def test_duplicate_link_clears_parked_session_and_preserves_wait(wt):
+    from watchtower import liveness
+
+    original = wt.q.enqueue(project="PK", note="original", source="test")
+    it = _parked(wt)
+    wt.q.set_wait(it["ref"], "dependency", ref=original["ref"])
+    wait = wt.q.get(it["ref"])["wait"]
+    linked = wt.q.link_duplicate(it["ref"], original["ref"])
+    assert linked["status"] == "open"
+    assert not linked.get("parked") and not linked.get("claim_proc")
+    assert linked["wait"] == wait
+    assert liveness.row_of(linked).id == "dep.waiting"
+    # Completion still depends on the original; the follower is never claimed.
+    wt.q.claim_by_ref(original["ref"], "w2")
+    assert wt.q.claim_next("w3", project="PK") is None
+    wt.q.update_status(original["ref"], "closed")
+    assert liveness.row_of(wt.q.get(it["ref"])).id == "closed"
+
+
+def test_relink_repairs_legacy_duplicate_without_changing_wait_or_history(wt):
+    from watchtower import liveness
+
+    original = wt.q.enqueue(project="PK", note="original", source="test")
+    parked = _parked(wt)
+    wt.q.link_duplicate(parked["ref"], original["ref"])
+    with wt.q._FileLock(wt.q._lock_path()):
+        data = wt.q._load_unlocked()
+        item = next(i for i in data["items"] if i["ref"] == parked["ref"])
+        item["parked"] = parked["parked"]  # Old duplicate-link behavior.
+        wt.q._save_unlocked(data)
+    before = wt.q.get(parked["ref"])
+    repaired = wt.q.link_duplicate(parked["ref"], original["ref"])
+    assert repaired["history"][:len(before["history"])] == before["history"]
+    assert repaired.get("wait") == before.get("wait")
+    assert repaired["duplicate_of"] == original["ref"]
+    assert not repaired.get("parked")
+    assert liveness.row_of(repaired).id == "dep.waiting"
+
+
+@pytest.mark.parametrize("state", ["delivering", "queued"])
+def test_redefer_repairs_legacy_answer_and_preserves_window_and_wait(wt, state):
+    from watchtower import liveness
+
+    parked = _parked(wt)
+    ans = wt.q.answer(parked["ref"], "observe real events; never manufacture them")
+    resumed = wt.q.resume_claim(parked["ref"], ans["pending_answer"]["gen"])
+    until = wt.q.defer(parked["ref"], "w1", "+2d", "collect observations")["deferred_until"]
+    with wt.q._FileLock(wt.q._lock_path()):
+        data = wt.q._load_unlocked()
+        item = next(i for i in data["items"] if i["ref"] == parked["ref"])
+        item["pending_answer"] = dict(resumed["pending_answer"], state=state)
+        item["wait"] = {"on": "worker", "at": "2026-11-14T00:05:42Z"}
+        wt.q._save_unlocked(data)
+    before = wt.q.get(parked["ref"])
+    fixed = wt.q.defer(parked["ref"], "w1", until, before["defer_reason"])
+    assert fixed["deferred_until"] == before["deferred_until"]
+    assert fixed["defer_reason"] == before["defer_reason"]
+    assert fixed["wait"] == before["wait"]
+    assert fixed["history"][:len(before["history"])] == before["history"]
+    assert fixed["pending_answer"]["state"] == "handed_off"
+    for field in ("gen", "answer", "question", "prior_session_id", "prior_worker_id"):
+        assert fixed["pending_answer"][field] == before["pending_answer"][field]
+    assert liveness.row_of(fixed).id == "time.deferred"
+    assert not fixed.get("claimed_by")
+
+
 def test_list_blocked_shows_parked_and_routing(wt):
     it = _parked(wt)
     assert any(x["ref"] == it["ref"] for x in wt.q.list_blocked())

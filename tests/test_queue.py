@@ -49,7 +49,7 @@ def test_notify_ticket_event_forwards_submitter_through_ccc(wt, monkeypatch):
     )
     item = {
         "project": "MEMORY", "ref": "MEMORY-1", "number": 1,
-        "submitter": "old-sid", "pre_ack": True,
+        "submitter": "old-sid", "submitter_subscribed": True,
     }
     wt.q._notify_ticket_event(item, "closed", detail="done")
     assert sent == ["new-sid"]
@@ -66,7 +66,7 @@ def test_notify_ticket_event_no_forward_uses_target_unchanged(wt, monkeypatch):
     )
     item = {
         "project": "MEMORY", "ref": "MEMORY-1", "number": 1,
-        "submitter": "still-here-sid", "pre_ack": True,
+        "submitter": "still-here-sid", "submitter_subscribed": True,
     }
     wt.q._notify_ticket_event(item, "closed", detail="done")
     assert sent == ["still-here-sid"]
@@ -172,7 +172,8 @@ def test_cli_block_json_returns_the_blocked_ticket(wt, capsys):
     assert blocked["block_question"] == "approve the rollout?"
 
 
-def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsys):
+@pytest.mark.parametrize("author", ["human", "worker"])
+def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsys, author):
     item = wt.q.enqueue(project="EVT", note="canonical log", source="test")
     sid = "11111111-2222-3333-4444-555555555555"
     claimed = wt.q.claim_by_ref(item["ref"], "worker-a", session_uuid=sid)
@@ -187,14 +188,17 @@ def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsy
         or {"ok": True, "transport": "fifo"},
     )
 
-    assert wt.cli.main(["comment", claimed["ref"], "Use the safer parser."]) == 0
+    assert wt.cli.main([
+        "comment", claimed["ref"], "Use the safer parser.",
+        "--by", author, "--worker", "reviewer",
+    ]) == 0
 
     assert len(calls) == 1
     target, text, kwargs = calls[0]
     assert target == sid
     assert text == (
         f"[WATCHTOWER] A new comment was added to your claimed ticket "
-        f"{claimed['ref']}:\n\nUse the safer parser."
+        f"{claimed['ref']}:canonical-log:\n\nUse the safer parser."
     )
     # A comment must not cost the worker its in-flight turn: the steer verb
     # prefers the peer socket, which cannot truncate one (CCC-1000).
@@ -202,6 +206,30 @@ def test_cli_comment_injects_guidance_into_claimed_worker(wt, monkeypatch, capsy
     assert kwargs["mode"] == "steer"
     assert kwargs["force_queue"] is False
     assert "injected into claimed worker via fifo" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("with_session", [True, False])
+def test_cli_system_comment_is_recorded_without_waking_claimant(wt, monkeypatch, capsys, with_session):
+    import watchtower.messages as messages
+
+    monkeypatch.setattr(
+        messages, "deliver_message",
+        lambda *a, **kw: pytest.fail("system comments must never enter delivery"),
+    )
+    item = wt.q.enqueue(project="EVT", note="lineage", source="test")
+    wt.q.claim_by_ref(
+        item["ref"], "worker-a",
+        session_uuid="11111111-2222-3333-4444-555555555555" if with_session else None,
+    )
+    text = "Child session helper spawned by builder"
+    assert wt.cli.main([
+        "comment", item["ref"], text, "--by", "system", "--worker", "ccc",
+    ]) == 0
+    assert "system comment; not injected" in capsys.readouterr().out
+    event = wt.q.get(item["ref"])["history"][-1]
+    assert event["event"] == "comment"
+    assert event["text"] == text
+    assert event["by"]["kind"] == "system"
 
 
 def test_cli_comment_by_claimant_is_not_echoed_back(wt, monkeypatch, capsys):
@@ -275,7 +303,7 @@ def test_cli_comment_on_unclaimed_ticket_does_not_send(wt, monkeypatch, capsys):
     )
 
     assert wt.cli.main(["comment", item["ref"], "For later."]) == 0
-    assert capsys.readouterr().out.strip() == f"COMMENTED: {item['ref']}"
+    assert capsys.readouterr().out.strip() == f"COMMENTED: {item['ref']}:canonical-log"
 
 
 def test_close_ownership_guard_blocks_reap_duplicate(wt):
@@ -765,7 +793,7 @@ def test_status_counts_blocked_separately_and_ls_shows_waiting(wt, capsys):
     row = next(r for r in rows if r["queue"] == "DEP")
     assert row["depth"] == 2 and row["claimable_depth"] == 1 and row["blocked"] == 1
     note = wt.cli._waiting_note(q.get(b["ref"]), q._refs_index(q.list_items()))
-    assert note == f"waiting on {a['ref']}"
+    assert note == f"waiting on {a['ref']}:first"
 
 
 def test_scoped_status_honours_an_open_blocker_in_another_queue(wt):

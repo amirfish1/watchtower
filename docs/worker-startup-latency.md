@@ -69,3 +69,49 @@ samples from the updated dispatcher under concurrent fleet activity. Attribute
 remaining long samples to their actual evidence, including engine failures,
 intentional grace/placement gates and occupied worker capacity; do not silently
 exclude them or claim the original symptom fixed from a code inspection.
+
+## November 16 live checkpoint: still open
+
+The activity log records adoption of d1c2343c at November 15 18:07:42 UTC
+(`DEPLOY_PICKUP` and `DAEMON_START`). Natural new-ticket samples after adoption
+include the following. These are individual timelines, not fleet percentiles;
+they do not establish that capacity was idle throughout every interval.
+
+| Ticket | Enqueue (UTC, Nov 16) | Process start | Claim | Enqueue to claim |
+| --- | --- | --- | --- | --- |
+| WT-75 | 14:34:59 | 14:35:04 | 14:35:24 | 25s |
+| CCC-556 | 14:35:19 | 14:35:25 | 14:35:48 | 29s |
+| DECISIONS-FIX-23 | 14:52:03 | 14:52:28 | 14:52:44 | 41s |
+| WT-77 | 15:16:41 | 15:16:44 | 15:17:00 | 19s |
+| WT-78 | 15:58:06 | 15:58:12 | 15:58:25 | 19s |
+| CCC-563 | 16:47:37 | 16:47:53 | 16:48:17 | 40s |
+| WT-79 | 16:53:24 | 16:53:29 | 16:53:52 | 28s |
+| CCC-564 | 16:57:31 | 16:58:05 | 16:58:25 | 54s |
+
+WT-75 was already running when CCC-556 started, so real cross-queue activity
+is present. Slow samples remain: DECISIONS-FIX-23 spent 25s before process
+creation, CCC-564 spent 34s. Their DISPATCH outcomes say a worker was spawned;
+neither timeline alone attributes the pre-plan delay to a particular function.
+Do not close WT-68 from the faster WT samples. Other tickets can wait behind
+occupied capacity, launch failures, grace or dependencies; second and later
+claims by an existing worker measure work backlog, not engine startup.
+
+Read-only scoped reconcile profiles on the current host took 1.317s for WT
+and 2.121s/1.356s for consecutive CCC passes. Local SQLite loading dominated;
+these profiles did not reproduce the 25–34s delay and exclude the non-dry-run
+idle-release path. They are not evidence that historical delays were DB time.
+
+`STARTUP_TIMING` now logs JSON with `phase`, `ref`, `elapsed_s` (monotonic),
+`outcome` and `pid` for ticket reads, busy-claim reads, worker notification,
+scoped staffing-lock acquisition, scoped idle release and total reconcile.
+Lock and idle-release records have an empty ref; join them by queue/PID/time
+to the enclosing dispatch. Reconcile includes its nested phases and launch
+observation, so durations must not be summed. Logging failures cannot stop
+dispatch. Dry runs do not emit lock or idle-release timings.
+
+Next bounded check: after natural adoption of this instrumentation, inspect
+the next day's natural fresh-ticket timelines, including all slow samples.
+Use phase records to isolate any remaining >30s eligible idle-capacity delay
+before choosing another repair. Do not create real work or extra model
+workers just to obtain samples. If none occurs, record the missing exposure
+and defer again; the original acceptance remains WT-68.

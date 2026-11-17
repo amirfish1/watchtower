@@ -130,6 +130,29 @@ def test_resume_in_flight_then_gives_up(wt, monkeypatch):
     g.step(wt.answers.route_pending_answers, edge="E10", row="work.open")
 
 
+@pytest.mark.parametrize("delivery", ["in_flight", "queued"])
+def test_defer_hands_resumed_answer_to_next_claim(wt, monkeypatch, delivery):
+    g = Golden(wt, _claimed(wt))
+    _resuming(wt, g, monkeypatch, delivery)
+    gen = _gen(wt, g.ref)
+    bound = g.step(wt.q.resume_claim, g.ref, gen, edge="E3", row="answer.delivering")
+    if delivery == "queued":
+        g.step(wt.answers._deliver_bound, bound, gen, edge="E6", row="answer.queued")
+    answer = dict(g.item()["pending_answer"])
+    g.step(wt.q.defer, g.ref, "w1", "+2d", "observe real events", edge="E14",
+           row="time.deferred", owner="time", desired=[])
+    saved = g.item()
+    assert not saved.get("claimed_by") and not saved.get("claim_proc")
+    assert saved["pending_answer"]["answer"] == answer["answer"]
+    assert saved["pending_answer"]["gen"] == answer["gen"]
+    assert wt.q.claim_next("w2", project=PQ) is None
+    # The clock owns the ticket until the window ends, then the claim output
+    # carries the same owner answer and is its delivery receipt.
+    monkeypatch.setattr(wt.q.time, "time", lambda: wt.q._iso_ts(saved["deferred_until"]) + 1)
+    got = g.step(wt.q.claim_next, "w2", project=PQ, edge="E12", row="work.claimed")
+    assert got["pending_answer"]["answer"] == answer["answer"]
+
+
 def test_queued_then_row_gone_then_redelivered(wt, monkeypatch):
     g = Golden(wt, _claimed(wt))
     _resuming(wt, g, monkeypatch, "queued")

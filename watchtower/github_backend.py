@@ -10,6 +10,8 @@ store for a queue configured with ``backend=github`` and uses the installed
 
 from __future__ import annotations
 
+from .refs import canonical_ref, display_ref, slug_of, ticket_slug
+
 import hashlib
 import json
 import sqlite3
@@ -1336,9 +1338,14 @@ def _defer_live(until: Any) -> bool:
 # knows ``pipeline_hold`` reads the human defer it saved instead and lets the
 # sidecar overlay decide the hold.
 PIPELINE_HOLD_UNTIL = "2099-12-31T00:00:00Z"
+# Wire fence for readers predating WT-82. Current readers use the distinct
+# release state, with no expiry; older readers must never claim these issues.
+RELEASE_COMPAT_HOLD = "9999-12-31T00:00:00Z"
 
 
 def _effective_defer(meta: Dict[str, Any]) -> str:
+    if meta.get("release_wait") and meta.get("deferred_until") == RELEASE_COMPAT_HOLD:
+        return ""
     until = str(meta.get("deferred_until") or "")
     hold = meta.get("pipeline_hold")
     if isinstance(hold, dict) and until == PIPELINE_HOLD_UNTIL:
@@ -2318,7 +2325,7 @@ class GitHubIssuesBackend:
         )
 
     def _issue_number(self, ident: Any) -> Optional[int]:
-        s = str(ident or "").strip()
+        s = canonical_ref(ident)
         if not s:
             return None
         if s.isdigit():
@@ -2416,6 +2423,8 @@ class GitHubIssuesBackend:
         number = int(issue.get("number") or 0)
         if state == "CLOSED":
             status = "closed"
+        elif meta.get("release_wait"):
+            status = "awaiting_release"
         elif queue_member and (meta.get("claimed_by") or self.in_progress_label in labels):
             status = "in_progress"
         else:
@@ -2458,6 +2467,11 @@ class GitHubIssuesBackend:
             "machine": meta.get("resolution_machine", ""),
         })
 
+        title = str(issue.get("title") or "")
+        # One fixed regex avoids compiling a different pattern for every ref.
+        named = re.match(r"([A-Z][A-Z0-9_-]*-\d+):[a-z0-9-]+\s+", title)
+        if named and named.group(1) == f"{self.queue}-{number}":
+            title = title[named.end():]
         item: Dict[str, Any] = {
             "number": number,
             "project": self.queue,
@@ -2470,7 +2484,8 @@ class GitHubIssuesBackend:
             "note": _clip(meta.get("note") or _first_line(body) or issue.get("title", ""), 4000),
             "text": _clip(text, 24000),
             "url": str(issue.get("url") or ""),
-            "title": _clip(issue.get("title", ""), 200),
+            "title": _clip(title, 200),
+            "slug": ticket_slug(meta.get("slug") or title),
             "selector": "",
             "screenshot_path": "",
             "repo_path": self.repo_path,
@@ -2491,7 +2506,9 @@ class GitHubIssuesBackend:
             "client_id": meta.get("client_id", ""),
             "submitter": str(meta.get("submitter") or ""),
             "submitter_explicit": bool(meta.get("submitter_explicit", False)),
+            "submitter_subscribed": bool(meta.get("submitter_subscribed", False)),
             "submitter_node": str(meta.get("submitter_node") or ""),
+            "ticket_subscribers": dict(meta.get("ticket_subscribers") or {}),
             "claimed_by": (
                 meta.get("claimed_by")
                 or (",".join(assignees) if queue_member and status == "in_progress" and assignees else None)
@@ -2551,6 +2568,10 @@ class GitHubIssuesBackend:
                 item["defer_reason"] = str(meta["pipeline_hold"].get("prev_reason") or "")
         if isinstance(meta.get("pipeline_hold"), dict):
             item["pipeline_hold"] = dict(meta["pipeline_hold"])
+        if isinstance(meta.get("release_wait"), dict):
+            item["release_wait"] = dict(meta["release_wait"])
+        if isinstance(meta.get("release_event"), dict):
+            item["release_event"] = dict(meta["release_event"])
         if isinstance(meta.get("wait"), dict):
             item["wait"] = dict(meta["wait"])
         if meta.get("duplicate_of"):
@@ -2977,6 +2998,7 @@ class GitHubIssuesBackend:
         confidence: str = "",
         submitter: str = "",
         submitter_explicit: bool = False,
+        submitter_subscribed: bool = False,
         blocked_by: Optional[List[str]] = None,
         depth_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -3007,10 +3029,9 @@ class GitHubIssuesBackend:
             # home (labels only carry booleans/enums cheaply; a free-form
             # target string belongs in the body, same as `note`/`resolution`).
             "submitter": str(submitter or ""),
-            # Was that submitter NAMED by the filer (`wt add --submitter`)
-            # rather than auto-detected? It decides whether they hear every
-            # event or only the default set -- see queue._submitter_wants.
+            # Named identity and notice subscription are separate (WT-78).
             "submitter_explicit": bool(submitter_explicit),
+            "submitter_subscribed": bool(submitter_subscribed),
         }
         # The filing host's CCC node: workers on OTHER hosts block/close this
         # issue too, and need it to reach a bare submitter id (WATCHTOWER-42).
@@ -3023,6 +3044,7 @@ class GitHubIssuesBackend:
         # Pre-validated by queue._depth_fields: {} for quick, else depth+budget_min.
         meta.update(depth_fields or {})
         issue_title = _clip(title or note or "WatchTower ticket", 200)
+        meta["slug"] = ticket_slug(issue_title)
         body = _body_with_metadata(text, meta)
         out = self._run([
             "issue", "create",
@@ -3034,6 +3056,9 @@ class GitHubIssuesBackend:
         match = _ISSUE_URL_RE.search(out.strip())
         if not match:
             raise GitHubBackendError("gh issue create did not print an issue URL")
+        named = display_ref({"ref": f"{self.queue}-{match.group(1)}", "slug": meta["slug"]})
+        self._run(["issue", "edit", match.group(1), *self._repo_args(),
+                   "--title", _Text(_clip(f"{named} {issue_title}", 256))])
         return self.get(f"{self.queue}-{match.group(1)}") or {
             "number": int(match.group(1)),
             "project": self.queue,
@@ -3043,6 +3068,7 @@ class GitHubIssuesBackend:
             "note": note,
             "text": text,
             "title": issue_title,
+            "slug": meta["slug"],
             "type": meta["type"],
             "readiness": meta["readiness"],
             "priority": meta["priority"],
@@ -3059,6 +3085,7 @@ class GitHubIssuesBackend:
         *,
         fresh: bool = False,
         strict: bool = False,
+        blocked_only: bool = False,
     ) -> List[Dict[str, Any]]:
         from . import usage
         open_raw = (
@@ -3076,7 +3103,7 @@ class GitHubIssuesBackend:
         from . import github_pipeline
         memo_key = (
             # OPS-201: a sidecar-only transition changes eligibility too.
-            self._memo_config(), status, lane, github_pipeline.signature(),
+            self._memo_config(), status, lane, blocked_only, github_pipeline.signature(),
         )
         ledger_stamp = None if strict else usage.ledger_dir_stamp()
         now = time.time()
@@ -3103,6 +3130,21 @@ class GitHubIssuesBackend:
                 issues.append(issue)
                 age = _age_seconds(issue.get("closedAt"))
                 valid_until = min(valid_until, now + retention_s - age)
+        if blocked_only:
+            # The issue metadata and local routing sidecar are sufficient to
+            # reject unrelated tickets before text/usage/history projection.
+            sidecar = github_pipeline._read_cached()
+            entries = (sidecar or {}).get("items", {})
+            def candidate(issue):
+                _, meta = _split_body_shared(str(issue.get("body") or ""))
+                if meta.get("needs_input"):
+                    return True
+                if (meta.get("pending_answer") or {}).get("state") == "routing":
+                    return True
+                entry = entries.get(f"{self.repo}#{issue.get('number')}") or {}
+                return (not entry.get("tombstone")
+                        and (entry.get("pending_answer") or {}).get("state") == "routing")
+            issues = [issue for issue in issues if candidate(issue)]
         items = [self._issue_to_item(issue) for issue in issues]
         if self.partition_by_label:
             # Two or more queues share this repo: each shows only its own
@@ -3179,6 +3221,13 @@ class GitHubIssuesBackend:
             raise GitHubBackendError("gh issue view returned invalid JSON") from exc
         if not isinstance(issue, dict) or not issue:
             return None
+        # Preserve full prose already paid for by this read. Recall never
+        # fetches comments on claim; a snapshot failure must not break get().
+        try:
+            from . import related_snapshots
+            related_snapshots.remember(self.repo, issue)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
         return self._issue_to_item(issue)
 
     def _claim_lock_path(self) -> Path:
@@ -3610,6 +3659,8 @@ class GitHubIssuesBackend:
         expect_owner: str = "",
         require_status: Optional[str] = None,
         expect: Optional[Dict[str, Any]] = None,
+        release_expect: Optional[Dict[str, Any]] = None,
+        extras: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if status not in ("open", "in_progress", "closed"):
             raise ValueError("status must be one of ('open', 'in_progress', 'closed')")
@@ -3628,6 +3679,13 @@ class GitHubIssuesBackend:
         # closed ticket and the worker had to close it twice).
         if require_status is not None and item.get("status") != require_status:
             return None
+        if release_expect is not None and (item.get("status") != "awaiting_release"
+                or item.get("release_wait") != release_expect):
+            return None
+        if release_expect is not None and status == "closed":
+            from . import queue as _q
+            if _q.effective_gates(item):
+                return None
         # WT-39: the claim identity the caller decided on (the orphan sweep's
         # dead local worker) must still be the one on the fresh read, else a
         # live claim taken since -- possibly on another host -- is cleared.
@@ -3659,6 +3717,12 @@ class GitHubIssuesBackend:
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
 
+        meta.pop("release_wait", None)
+        if meta.get("deferred_until") == RELEASE_COMPAT_HOLD:
+            meta.pop("deferred_until", None)
+            meta.pop("defer_reason", None)
+        if extras and extras.get("release_event"):
+            meta["release_event"] = extras["release_event"]
         if status == "open":
             for key in (
                 "claimed_by", "claimed_machine", "claimed_at",
@@ -3673,7 +3737,13 @@ class GitHubIssuesBackend:
             ):
                 meta.pop(key, None)
             self._usage_history(meta, number, "reopen", reason=reason)
-            self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
+            release_labels = (["--add-label", self.run_requested_label]
+                              if release_expect is not None and (extras or {}).get("run_requested") else [])
+            self._edit_body(item, body, meta, "--remove-label", self.in_progress_label, *release_labels)
+            if release_expect is not None:
+                fresh = self.get(ident)
+                if (fresh or {}).get("release_wait") or (fresh or {}).get("release_event") != (extras or {}).get("release_event"):
+                    return None
             self._run(["issue", "reopen", number, *self._repo_args()], check=False)
             return self.get(ident)
 
@@ -3729,6 +3799,10 @@ class GitHubIssuesBackend:
                          worker=str(session_id or meta.get("closed_by") or ""),
                          resolution=norm)
         self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
+        if release_expect is not None:
+            fresh = self.get(ident)
+            if (fresh or {}).get("release_wait") or (fresh or {}).get("release_event") != (extras or {}).get("release_event"):
+                return None
         # `gh issue close --comment` takes the text on argv only (no file or
         # stdin form), and a resolution with long caveats can pass the
         # per-argument limit (WT-40). So we make gh's own steps ourselves:
@@ -3842,6 +3916,26 @@ class GitHubIssuesBackend:
         return self.get(ident)
 
     @_serialized_body_write
+    def await_release(self, ident, *, session_id, wait, progress="", expected_defer=None):
+        from . import releases
+        item = self.get(ident)
+        if item is None:
+            return None
+        releases.require_parkable(item, session_id, expected_defer)
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        if progress:
+            _append_history(meta, "progress", worker=session_id, text=_clip(progress, 24000))
+        for key in (*_CLAIM_META_KEYS, "deferred_until", "defer_reason"):
+            meta.pop(key, None)
+        meta["release_wait"] = dict(wait)
+        meta["deferred_until"] = RELEASE_COMPAT_HOLD
+        meta["defer_reason"] = "Release wait compatibility fence; only a verified build event resumes it"
+        self._usage_history(meta, str(item["number"]), "await_release", worker=session_id,
+                            release_wait=dict(wait))
+        self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
+        return self.get(ident)
+
+    @_serialized_body_write
     def defer(
         self,
         ident: Any,
@@ -3930,7 +4024,8 @@ class GitHubIssuesBackend:
                                           extra=wait_extra)
         else:
             meta.pop("wait", None)
-        if session_id:
+        from . import config
+        if session_id and not config.is_tracker(self.queue):
             if not meta.get("claimed_by"):
                 meta["claimed_by"] = str(session_id)
                 meta["claimed_machine"] = machine_tag()
@@ -4244,8 +4339,16 @@ class GitHubIssuesBackend:
             return None
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         title = item.get("title", "")
+        meta.setdefault("slug", slug_of(item))
+        dependency_wait = bool(fields.pop("_dependency_wait", False))
+        if dependency_wait:
+            from . import queue as _q
+            _q._dependency_wait_check(item)
         for key, value in fields.items():
-            if key == "blocked_by":
+            if key == "_subscription":
+                from .queue import _apply_ticket_subscription
+                _apply_ticket_subscription(meta, *value)
+            elif key == "blocked_by":
                 blockers = self._validate_blockers(
                     str(item.get("ref") or ""), list(value or []))
                 if blockers:
@@ -4263,6 +4366,8 @@ class GitHubIssuesBackend:
                                     fields={"depth": value.get("depth", "quick"),
                                             **({"budget_min": value["budget_min"]}
                                                if "budget_min" in value else {})})
+            elif key == "slug":
+                meta["slug"] = ticket_slug(value)
             elif key == "title":
                 title = _clip(value, 200)
             elif key == "text":
@@ -4314,7 +4419,14 @@ class GitHubIssuesBackend:
             elif key == "_history":
                 event, extra = value
                 _append_history(meta, event, **extra)
-        self._edit_body(item, body, meta, "--title", _Text(title))
+        extra_args = []
+        if dependency_wait:
+            from . import queue as _q
+            _q._dependency_wait_unlocked(meta, _now_iso(),
+                                         worker_done=item.get("status") == "in_progress")
+            extra_args = ["--remove-label", self.in_progress_label]
+        named = display_ref(dict(item, slug=meta["slug"]))
+        self._edit_body(item, body, meta, "--title", _Text(_clip(f"{named} {title}", 256)), *extra_args)
         return self.get(ident)
 
     def peek_next(

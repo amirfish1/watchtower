@@ -47,7 +47,7 @@ def _record_sends(monkeypatch, messages):
 
 # --------------------------------------------------------------------- field
 def test_enqueue_stores_submitter_on_file_backed_ticket(wt):
-    item = wt.q.enqueue(project="SUB", note="filed by someone", submitter="worker-a")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="filed by someone", submitter="worker-a")
     assert item["submitter"] == "worker-a"
     assert wt.q.get(item["ref"])["submitter"] == "worker-a"
 
@@ -61,7 +61,7 @@ def test_enqueue_without_submitter_defaults_to_empty_string(wt):
 def test_claim_by_ref_notifies_the_submitter(wt, monkeypatch):
     wt.config.set_notify_events("SUB", ["claimed", "closed", "needs_input"])
     calls = _record_sends(monkeypatch, wt.messages)
-    item = wt.q.enqueue(project="SUB", note="claim me", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="claim me", submitter="worker-sub")
 
     claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
 
@@ -76,7 +76,7 @@ def test_claim_by_ref_notifies_the_submitter(wt, monkeypatch):
 def test_claim_next_notifies_the_submitter(wt, monkeypatch):
     wt.config.set_notify_events("SUB", ["claimed", "closed", "needs_input"])
     calls = _record_sends(monkeypatch, wt.messages)
-    item = wt.q.enqueue(project="SUB", note="claim next", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="claim next", submitter="worker-sub")
 
     claimed = wt.q.claim_next("worker-a", project="SUB")
 
@@ -87,7 +87,7 @@ def test_claim_next_notifies_the_submitter(wt, monkeypatch):
 
 # ------------------------------------------------------------- notify: close
 def test_close_notifies_submitter_with_resolution_summary(wt, monkeypatch):
-    item = wt.q.enqueue(project="SUB", note="close me", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="close me", submitter="worker-sub")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -102,7 +102,7 @@ def test_close_notifies_submitter_with_resolution_summary(wt, monkeypatch):
 
 
 def test_close_with_no_resolution_still_notifies(wt, monkeypatch):
-    item = wt.q.enqueue(project="SUB", note="close me plain", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="close me plain", submitter="worker-sub")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -114,7 +114,7 @@ def test_close_with_no_resolution_still_notifies(wt, monkeypatch):
 
 # ------------------------------------------------------------- notify: block
 def test_block_notifies_submitter_with_question(wt, monkeypatch):
-    item = wt.q.enqueue(project="SUB", note="needs a call", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="needs a call", submitter="worker-sub")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -134,7 +134,7 @@ def test_actionable_notice_keeps_full_multiline_detail(wt, monkeypatch, event):
     detail = "Choose a rollout:\n" + ("- Keep existing bookings; verify credits.\n" * 45)
     detail += "Recommendation: preserve credits. Approve option B? בדיקה"
     wt.q._notify_ticket_event(
-        {"ref": "SUB-1", "project": "SUB", "submitter": "worker-sub"},
+        {"ref": "SUB-1", "project": "SUB", "submitter": "worker-sub", "submitter_subscribed": True},
         event, detail=detail,
     )
     assert len(detail) > 1500
@@ -145,7 +145,7 @@ def test_clipped_claim_notice_has_lookup_pointer(wt, monkeypatch):
     calls = _record_sends(monkeypatch, wt.messages)
     wt.config.set_notify_events("SUB", ["claimed"])
     wt.q._notify_ticket_event(
-        {"ref": "SUB-1", "project": "SUB", "submitter": "worker-sub"},
+        {"ref": "SUB-1", "project": "SUB", "submitter": "worker-sub", "submitter_subscribed": True},
         "claimed", detail="long claim " * 30,
     )
     assert calls[0][1].endswith("… (full text: wt find SUB-1)")
@@ -160,7 +160,7 @@ def test_long_actionable_notice_arrives_intact_over_real_fifo(
     # Exercise real queue transitions, send(), JSON framing, and an OS FIFO,
     # without contacting another session or the optional CCC forward service.
     monkeypatch.setattr(wt.messages, "ccc_forward_target", lambda target: target)
-    item = wt.q.enqueue(project="SUB", note="long notice", submitter=recipient["worker_id"])
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="long notice", submitter=recipient["worker_id"])
     wt.q.claim_by_ref(item["ref"], "worker-a")
     detail = (
         'Approval needed before running the evaluation. Compare the two builds '
@@ -190,7 +190,7 @@ def test_self_claim_does_not_notify_the_claimer(wt, monkeypatch):
     """A session that filed a ticket and then claims it must not be told it
     claimed it -- that echo steers a worker with its own command."""
     calls = _record_sends(monkeypatch, wt.messages)
-    item = wt.q.enqueue(project="SUB", note="mine", submitter="worker-a")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="mine", submitter="worker-a")
 
     claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
 
@@ -200,7 +200,7 @@ def test_self_claim_does_not_notify_the_claimer(wt, monkeypatch):
 
 def test_self_claim_next_does_not_notify_the_claimer(wt, monkeypatch):
     calls = _record_sends(monkeypatch, wt.messages)
-    wt.q.enqueue(project="SUB", note="mine too", submitter="worker-a")
+    wt.q.enqueue(submitter_subscribed=True, project="SUB", note="mine too", submitter="worker-a")
 
     assert wt.q.claim_next("worker-a", project="SUB") is not None
     assert calls == []
@@ -211,7 +211,7 @@ def test_self_claim_matches_on_session_uuid_too(wt, monkeypatch):
     than the worker id; either name identifies the same actor."""
     sid = "11111111-2222-3333-4444-555555555555"
     calls = _record_sends(monkeypatch, wt.messages)
-    item = wt.q.enqueue(project="SUB", note="uuid submitter", submitter=sid)
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="uuid submitter", submitter=sid)
 
     wt.q.claim_by_ref(item["ref"], "worker-a", session_uuid=sid)
 
@@ -219,7 +219,7 @@ def test_self_claim_matches_on_session_uuid_too(wt, monkeypatch):
 
 
 def test_self_close_does_not_notify_the_closer(wt, monkeypatch):
-    item = wt.q.enqueue(project="SUB", note="close my own", submitter="worker-a")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="close my own", submitter="worker-a")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -230,7 +230,7 @@ def test_self_close_does_not_notify_the_closer(wt, monkeypatch):
 
 
 def test_self_block_does_not_notify_the_blocker(wt, monkeypatch):
-    item = wt.q.enqueue(project="SUB", note="block my own", submitter="worker-a")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="block my own", submitter="worker-a")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -255,7 +255,7 @@ def test_actor_is_dropped_from_subscribers_but_others_still_notified(wt, monkeyp
 def test_force_close_by_someone_else_still_notifies_the_claimant(wt, monkeypatch):
     """The suppressed identity is the ACTOR of this transition, not the
     ticket's claimant -- a human force-closing somebody's ticket is news."""
-    item = wt.q.enqueue(project="SUB", note="force closed", submitter="worker-a")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="force closed", submitter="worker-a")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -287,7 +287,7 @@ def test_notification_delivery_failure_never_blocks_the_transition(wt, monkeypat
         raise RuntimeError("delivery adapter exploded")
 
     monkeypatch.setattr(wt.messages, "send", _boom)
-    item = wt.q.enqueue(project="SUB", note="resilient", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="resilient", submitter="worker-sub")
 
     claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
     assert claimed["status"] == "in_progress"
@@ -303,6 +303,7 @@ def test_unresolvable_submitter_is_stored_but_swallowed_at_send_time(wt, monkeyp
     return {"ok": False} via resolve_target's ValueError -- notify must treat
     that the same as any other failed send: swallow it, no exception."""
     item = wt.q.enqueue(
+        submitter_subscribed=True,
         project="SUB", note="bogus submitter",
         submitter="totally-unknown-target-xyz",
     )
@@ -328,7 +329,7 @@ def test_submitter_and_subscriber_overlap_gets_exactly_one_send(wt, monkeypatch)
     must be notified once, not twice."""
     wt.config.add_subscriber("SUB", "same-target")
     calls = _record_sends(monkeypatch, wt.messages)
-    item = wt.q.enqueue(project="SUB", note="dedup me", submitter="same-target")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="dedup me", submitter="same-target")
 
     wt.q.claim_by_ref(item["ref"], "worker-a")
 
@@ -340,7 +341,7 @@ def test_submitter_and_subscriber_both_get_notified_when_distinct(wt, monkeypatc
     wt.config.set_notify_events("SUB", ["claimed", "closed", "needs_input"])
     wt.config.add_subscriber("SUB", "watcher-1")
     calls = _record_sends(monkeypatch, wt.messages)
-    item = wt.q.enqueue(project="SUB", note="two targets", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="two targets", submitter="worker-sub")
 
     wt.q.claim_by_ref(item["ref"], "worker-a")
 
@@ -476,7 +477,7 @@ def test_github_backend_submitter_round_trips_and_notifies_on_claim_close_block(
         lambda target, text, **kw: calls.append((target, text)) or {"ok": True},
     )
 
-    item = q.enqueue(project="GHI", note="gh submitter", submitter="worker-sub")
+    item = q.enqueue(submitter_subscribed=True, project="GHI", note="gh submitter", submitter="worker-sub")
     assert item["submitter"] == "worker-sub"
     assert q.get(item["ref"])["submitter"] == "worker-sub"
 
@@ -517,7 +518,7 @@ def test_notifications_are_sent_as_event_notices_not_ordinary_messages(
 
     monkeypatch.setattr(wt.messages, "send", _fake_send)
     wt.config.set_notify_events("SUB", ["claimed", "closed"])
-    item = wt.q.enqueue(project="SUB", note="notice class", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="notice class", submitter="worker-sub")
 
     wt.q.claim_by_ref(item["ref"], "worker-a")
     wt.q.close(item["ref"], "worker-a", resolution={"summary": "done"})
@@ -530,7 +531,7 @@ def test_a_claim_does_not_reach_the_submitter_by_default(wt, monkeypatch):
     """WATCHTOWER-23: filing a ticket opts you into nothing. A claim tells the
     filer nothing it can act on, and landing it costs that session a turn."""
     calls = _record_sends(monkeypatch, wt.messages)
-    item = wt.q.enqueue(project="SUB", note="quiet claim", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="quiet claim", submitter="worker-sub")
 
     claimed = wt.q.claim_by_ref(item["ref"], "worker-a")
 
@@ -539,12 +540,12 @@ def test_a_claim_does_not_reach_the_submitter_by_default(wt, monkeypatch):
 
 
 @pytest.mark.parametrize("event", ["closed", "needs_input"])
-def test_the_actionable_events_still_reach_the_submitter_by_default(
+def test_the_actionable_events_reach_a_subscribed_submitter(
     wt, monkeypatch, event
 ):
     """The default silences the claim and nothing else: closed carries the
     summary, needs_input carries a question only the filer can answer."""
-    item = wt.q.enqueue(project="SUB", note="still notified", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="still notified", submitter="worker-sub")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -557,27 +558,26 @@ def test_the_actionable_events_still_reach_the_submitter_by_default(
 
 
 @pytest.mark.parametrize("wait_on", ["owner", "external"])
-def test_a_block_waiting_on_someone_else_skips_the_auto_submitter(
+def test_a_subscribed_filer_hears_owner_and_external_questions(
     wt, monkeypatch, wait_on
 ):
-    """IDEAS-101: a question for the owner (or an outside party) gives the
-    filing session nothing to do; waking it only burns a turn. It still hears
-    the close."""
-    item = wt.q.enqueue(project="SUB", note="owner question", submitter="worker-sub")
+    """An explicit subscription opts into questions as well as closes."""
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="owner question", submitter="worker-sub")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
     wt.q.block(item["ref"], session_id="worker-a", question="unlock the phone?",
                wait_on=wait_on)
-    assert calls == []
+    assert [t for t, _ in calls] == ["worker-sub"]
+    calls.clear()
 
     wt.q.close(item["ref"], "worker-a", resolution={"summary": "done"})
     assert [t for t, _ in calls] == ["worker-sub"]
 
 
-@pytest.mark.parametrize("wait_on", ["dependency", "worker"])
+@pytest.mark.parametrize("wait_on", ["worker"])
 def test_a_block_waiting_on_work_still_reaches_the_submitter(wt, monkeypatch, wait_on):
-    item = wt.q.enqueue(project="SUB", note="dep wait", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="dep wait", submitter="worker-sub")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -588,7 +588,7 @@ def test_a_block_waiting_on_work_still_reaches_the_submitter(wt, monkeypatch, wa
 
 def test_an_owner_wait_still_reaches_an_explicit_submitter_and_subscribers(wt, monkeypatch):
     wt.config.add_subscriber("SUB", "watcher-1")
-    item = wt.q.enqueue(project="SUB", note="watched", submitter="worker-sub",
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="watched", submitter="worker-sub",
                         submitter_explicit=True)
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
@@ -598,11 +598,11 @@ def test_an_owner_wait_still_reaches_an_explicit_submitter_and_subscribers(wt, m
     assert sorted(t for t, _ in calls) == ["watcher-1", "worker-sub"]
 
 
-def test_awaits_decision_still_reaches_the_submitter_by_default(wt, monkeypatch):
+def test_awaits_decision_reaches_a_subscribed_submitter(wt, monkeypatch):
     """The product gate's ask is needs_input's sibling: muting it would leave
     a worker waiting on a decision nobody was told to make."""
     wt.config.set_product_gate("SUB", True)
-    item = wt.q.enqueue(project="SUB", note="gate me", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="gate me", submitter="worker-sub")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -618,40 +618,38 @@ def test_a_subscriber_still_hears_every_claim(wt, monkeypatch):
     applies to it (and `wt unsubscribe` is its off switch)."""
     wt.config.add_subscriber("SUB", "watcher-1")
     calls = _record_sends(monkeypatch, wt.messages)
-    item = wt.q.enqueue(project="SUB", note="watched", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="watched", submitter="worker-sub")
 
     wt.q.claim_by_ref(item["ref"], "worker-a")
 
     assert [t for t, _ in calls] == ["watcher-1"]
 
 
-def test_an_explicitly_named_submitter_hears_every_claim(wt, monkeypatch):
-    """`wt add --submitter X` attaches X to THIS ticket deliberately, unlike
-    the filing session recorded automatically -- so X gets the full stream."""
+def test_an_explicitly_named_submitter_does_not_subscribe(wt, monkeypatch):
+    """Naming a filer records attribution without opting into notices."""
     calls = _record_sends(monkeypatch, wt.messages)
     item = wt.q.enqueue(project="SUB", note="watch this one",
                         submitter="worker-sub", submitter_explicit=True)
 
     wt.q.claim_by_ref(item["ref"], "worker-a")
 
-    assert [t for t, _ in calls] == ["worker-sub"]
+    assert calls == []
 
 
-def test_a_pre_acked_ticket_notifies_its_submitter_on_claim(wt, monkeypatch):
-    """--pre-ack means the filer already made a call about this ticket, so it
-    is watching it -- same carve-out as an explicit submitter."""
+def test_a_pre_acked_ticket_does_not_subscribe(wt, monkeypatch):
+    """A product decision is independent of a notice subscription."""
     calls = _record_sends(monkeypatch, wt.messages)
     item = wt.q.enqueue(project="SUB", note="already acked",
                         submitter="worker-sub", pre_ack=True)
 
     wt.q.claim_by_ref(item["ref"], "worker-a")
 
-    assert [t for t, _ in calls] == ["worker-sub"]
+    assert calls == []
 
 
 def test_notify_events_can_be_opened_up_or_shut_off_per_queue(wt, monkeypatch):
     wt.config.set_notify_events("SUB", [])
-    item = wt.q.enqueue(project="SUB", note="silent queue", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="silent queue", submitter="worker-sub")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -664,7 +662,7 @@ def test_notify_events_is_scoped_per_queue(wt, monkeypatch):
     """One queue's preference must not mute another's."""
     wt.config.set_notify_events("SUB", [])
     calls = _record_sends(monkeypatch, wt.messages)
-    item = wt.q.enqueue(project="OTHER", note="other queue", submitter="worker-sub")
+    item = wt.q.enqueue(submitter_subscribed=True, project="OTHER", note="other queue", submitter="worker-sub")
     wt.q.claim_by_ref(item["ref"], "worker-a")
 
     wt.q.close(item["ref"], "worker-a", resolution={"summary": "done"})
@@ -714,7 +712,7 @@ def test_wt_config_notify_events_flag(wt_cli, capsys):
 # ------------------------------------------------- notify: accept (WATCHTOWER-37)
 def _in_review(wt, monkeypatch, submitter):
     monkeypatch.setattr(wt.q, "_notify_review", lambda *a, **k: None)
-    item = wt.q.enqueue(project="SUB", note="gated", submitter=submitter, gates=["review"])
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="gated", submitter=submitter, gates=["review"])
     wt.q.claim_by_ref(item["ref"], "builder")
     assert wt.q.close(item["ref"], "builder", resolution={"summary": "built"})["status"] == "in_review"
     return item

@@ -55,7 +55,8 @@ Item shape::
       "screenshot_path": "...", "repo_path": "...",
       "submitter": "",                    # addressable filer target (optional,
                                           # see enqueue's submitter param) --
-                                          # notified on claim/close/needs-input
+                                          # attribution only
+      "submitter_subscribed": false,      # explicit wt add --subscribe opt-in
       "claimed_by": null, "claimed_at": null, "closed_at": null,
       "claimed_session_id": null,        # real worker/session id, when known
       "claimed_machine": null,           # ~3-letter machine tag (machine_tag()),
@@ -79,6 +80,8 @@ The file holds ``{"counter": <int>, "items": [<item>, ...]}``.
 """
 
 from __future__ import annotations
+
+from .refs import canonical_ref, display_ref, slug_of, ticket_slug
 
 import copy
 import json
@@ -111,7 +114,7 @@ try:  # POSIX cross-process locking; degrade gracefully if unavailable.
 except Exception:  # pragma: no cover - non-POSIX
     fcntl = None  # type: ignore
 
-VALID_STATUSES = ("open", "in_progress", "in_review", "awaiting_answer", "closed")
+VALID_STATUSES = ("open", "in_progress", "in_review", "awaiting_answer", "awaiting_release", "closed")
 # WT-28: a worker-blocked ticket on the local store leaves the worker's claim and waits
 # as ``awaiting_answer`` with a ``parked`` record (who to route the answer to).
 PARKED_STATUS = "awaiting_answer"
@@ -642,7 +645,7 @@ def _project_for(source: str = "", repo_path: str = "", project: str = "") -> st
 
 def _project_from_ident(ident: Any) -> str:
     """Extract the queue prefix from a human ref like ``WT-20``."""
-    s = str(ident or "").strip()
+    s = canonical_ref(ident)
     m = _re.match(r"^([A-Za-z0-9_-]+)-\d+$", s)
     return _norm_project(m.group(1)) if m else ""
 
@@ -701,6 +704,8 @@ def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     used: Dict[str, set] = {}
     pending: List[Dict[str, Any]] = []
     for it in ordered:
+        if it.get("status") != "closed" and not it.get("slug"):
+            it["slug"] = slug_of(it)
         proj = it.get("project") or _project_for(
             it.get("source", ""), it.get("repo_path", ""), ""
         )
@@ -725,7 +730,7 @@ def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def _matches(it: Dict[str, Any], ident: Any) -> bool:
     """Match an item by global number or by ref ('DEMO-2', case-insensitive)."""
-    s = str(ident).strip()
+    s = canonical_ref(ident)
     if s.isdigit() and int(it.get("number", 0)) == int(s):
         return True
     return str(it.get("ref", "")).upper() == s.upper()
@@ -785,8 +790,14 @@ def _ensure_time_index_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE TABLE IF NOT EXISTS window_dirty (number INTEGER PRIMARY KEY)")
     for action in ("INSERT", "UPDATE OF item_json"):
         name = "window_insert" if action == "INSERT" else "window_update"
+        # Plain INSERT OR IGNORE here is overridden by the outer UPSERT's conflict
+        # mode and aborts when the row is already dirty; guard with NOT EXISTS.
+        if _meta_get(conn, "window_trigger_version") != "2":
+            conn.execute(f"DROP TRIGGER IF EXISTS {name}")
         conn.execute(f"CREATE TRIGGER IF NOT EXISTS {name} AFTER {action} ON items BEGIN "
-                     "INSERT OR IGNORE INTO window_dirty VALUES (NEW.number); END")
+                     "INSERT INTO window_dirty SELECT NEW.number WHERE NOT EXISTS "
+                     "(SELECT 1 FROM window_dirty WHERE number=NEW.number); END")
+    conn.execute(_META_UPSERT, ("window_trigger_version", "2"))
     conn.execute("CREATE TRIGGER IF NOT EXISTS window_delete AFTER DELETE ON items BEGIN "
                  "DELETE FROM item_events WHERE number=OLD.number; "
                  "DELETE FROM window_dirty WHERE number=OLD.number; END")
@@ -1099,6 +1110,9 @@ def _save_unlocked(data: Dict[str, Any]) -> None:
     the caller just loaded from the legacy JSON if one existed, so that
     build is the one-time migration. Callers hold ``_FileLock`` (same
     contract as the JSON era), so load→diff→write is race-free."""
+    for it in data.get("items", []):
+        if it.get("status") != "closed" and not it.get("slug"):
+            it["slug"] = slug_of(it)
     _sync_duplicates_unlocked(data)
     db = _db_path()
     if not db.exists():
@@ -1538,43 +1552,17 @@ def _actor_identities(*values: Any) -> set:
 
 
 def _submitter_wants(item: Dict[str, Any], event: str, _config: Any) -> bool:
-    """Should this ticket's ``submitter`` hear about ``event``? (WATCHTOWER-23)
+    """Filer identity is attribution; only --subscribe opts into notices.
 
-    Filing a ticket makes the filing session its submitter automatically --
-    nobody opted into anything -- so by default it hears only the events that
-    hand it something to act on (``config.DEFAULT_NOTIFY_EVENTS``: closed,
-    needs_input, awaits_decision). A claim tells the filer nothing it can use
-    while costing it a turn, which is the whole point of the setting.
-
-    Two ways to get the full stream back:
-
-    - per queue, ``wt config <q> --notify-events claimed,closed,...``;
-    - per ticket, filing it with an explicit ``--submitter`` or ``--pre-ack``.
-      Both mean a human/session deliberately attached itself to THIS ticket
-      (rather than being recorded as filer by ``_default_report_to``), so it
-      is treated as watching and gets everything.
-
-    A ``needs_input``/``awaits_decision`` whose current wait is ``owner`` or
-    ``external`` skips the automatic submitter: that question is not its to
-    answer (IDEAS-101).
-
-    Subscribers are not filtered here at all -- ``wt subscribe`` is itself the
-    explicit opt-in, and ``wt unsubscribe`` is its off switch.
+    Queue subscriptions and successor forwarding are independent of this flag.
+    Old tickets without it are silent too (WT-78).
     """
-    if item.get("submitter_explicit") or item.get("pre_ack"):
-        return True
-    # A block waiting on the owner or an outside party asks the filer nothing:
-    # waking it just spends a turn re-reading a question it cannot answer
-    # (IDEAS-101: drain workers woken for hours by their filed OPS tickets).
-    # It still hears ``closed``.
-    if event in ("needs_input", "awaits_decision"):
-        wait = current_wait(item)
-        if wait and wait.get("on") in ("owner", "external"):
-            return False
+    if not item.get("submitter_subscribed"):
+        return False
     try:
         return event in _config.notify_events(str(item.get("project") or ""))
     except Exception:
-        return True  # a config hiccup must never silently mute notifications
+        return False
 
 
 def _local_submitter_node(submitter: Any) -> str:
@@ -1612,6 +1600,44 @@ def submitter_address(item: Optional[Dict[str, Any]]) -> str:
         return sub
 
 
+def ticket_subscribers(item: Dict[str, Any]) -> List[str]:
+    """Explicit ticket targets, including the opt-in filer (not queue watchers)."""
+    targets = [submitter_address(item)] if item.get("submitter_subscribed") else []
+    from . import messages
+    targets.extend(messages.node_qualified(record.get("node"), target)
+                   for target, record in (item.get("ticket_subscribers") or {}).items()
+                   if record.get("enabled"))
+    return list(dict.fromkeys(t for t in targets if t))
+
+
+def _apply_ticket_subscription(item: Dict[str, Any], target: str, enabled: bool) -> None:
+    """Called under the backend's edit lock; preserve attribution and other targets.
+
+    Each target retains its owning node for cross-host delivery. Disabled
+    records remain explicit opt-outs, without touching queue subscriptions.
+    """
+    from . import messages
+    target = str(target or "").strip()
+    if not target:
+        raise ValueError("subscription target is required (pass a target outside a session)")
+    address = messages.node_qualified(_local_submitter_node(target), target)
+    # Reuse the legacy filer flag when addressing the original filing identity.
+    if address == submitter_address(item):
+        item["submitter_subscribed"] = enabled
+    else:
+        subs = dict(item.get("ticket_subscribers") or {})
+        matching = [key for key, record in subs.items()
+                    if messages.node_qualified(record.get("node"), key) == address]
+        if matching:
+            for key in matching:
+                subs[key] = dict(subs[key], enabled=enabled)
+        else:
+            subs[target] = {"enabled": enabled, "node": _local_submitter_node(target)}
+        item["ticket_subscribers"] = subs
+    _append_history(item, "subscribe" if enabled else "unsubscribe",
+                    by=_by("system"), target=address)
+
+
 def _notify_ticket_event(
     item: Optional[Dict[str, Any]], event: str, detail: str = "",
     actor: Any = None,
@@ -1620,8 +1646,8 @@ def _notify_ticket_event(
     change.
 
     Targets = {ticket's own ``submitter`` (captured at file time, see
-    ``enqueue``'s ``submitter`` param) -- but only for the events that
-    submitter wants, see ``_submitter_wants``} UNION {this queue's ``subscribers``
+    ``enqueue``'s ``submitter`` param) and explicit ticket subscriptions,
+    for queue-configured status events} UNION {this queue's ``subscribers``
     (``config.subscribers`` -- see ``wt subscribe``/``wt unsubscribe``)},
     MINUS ``actor`` -- the identity that performed this transition.
     Deduplicated so a target that is both gets exactly one send. Delivery
@@ -1659,6 +1685,8 @@ def _notify_ticket_event(
     """
     if not item or not event:
         return
+    if event in ("needs_input", "awaits_decision") and (current_wait(item) or {}).get("on") == "dependency":
+        return  # Legacy dependency blocks never ask anyone a question.
     try:
         from . import messages
         from . import config as _config
@@ -1675,11 +1703,14 @@ def _notify_ticket_event(
             targets.append(t)
 
     project = str(item.get("project") or "")
-    if _submitter_wants(item, event, _config):
-        # Actor matching uses the bare id the actor would present; delivery
-        # uses the node-qualified address when the filer lives elsewhere.
-        if str(item.get("submitter") or "").strip() not in actors:
-            _add(submitter_address(item))
+    if event == "closed" and _config.is_tracker(project):
+        return
+    if event in _config.notify_events(project):
+        for target in ticket_subscribers(item):
+            # Match both the stored address and a local actor's bare identity.
+            _, native = messages.split_node_ref(target)
+            if native not in actors:
+                _add(target)
     try:
         for target in _config.subscribers(project):
             _add(target)
@@ -1687,7 +1718,7 @@ def _notify_ticket_event(
         pass
     if not targets:
         return
-    ref = str(item.get("ref") or item.get("number") or "?")
+    ref = display_ref(item)
     verb = _NOTIFY_VERBS.get(event, event)
     text = f"[watchtower] {ref} {verb}"
     if detail:
@@ -1792,7 +1823,7 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
                        blocked_by: Optional[List[str]], gates: Optional[List[str]],
                        accept_line: str, assessment_origin: str = "",
                        placement: str = "", depth: str = "",
-                       budget_min: int = 0) -> Dict[str, Any]:
+                       budget_min: int = 0, submitter_subscribed: bool = False) -> Dict[str, Any]:
     """Append a new ``open`` item to an already-loaded local store (the caller
     holds the store lock and saves). Shared by :func:`enqueue` and the
     post-fix-assessment filer so both create identical tickets."""
@@ -1811,6 +1842,7 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
         "text": _clip(text or note, 24000),
         "url": _clip(url, 1000),
         "title": _clip(title, 200),
+        "slug": ticket_slug(title or note),
         "selector": _clip(selector, 1000),
         "screenshot_path": str(screenshot_path or ""),
         "repo_path": str(repo_path or ""),
@@ -1837,6 +1869,7 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
         **_placement_fields(placement, note, text, title),
         "submitter": str(submitter or ""),
         "submitter_explicit": bool(submitter_explicit),
+        "submitter_subscribed": bool(submitter_subscribed),
         **({"submitter_node": node} if (node := _local_submitter_node(submitter)) else {}),
         "claimed_by": None,
         "claimed_at": None,
@@ -1879,6 +1912,7 @@ def enqueue(
     verifier_model: str = "",
     submitter: str = "",
     submitter_explicit: bool = False,
+    submitter_subscribed: bool = False,
     pre_ack: bool = False,
     blocked_by: Optional[List[str]] = None,
     gates: Optional[List[str]] = None,
@@ -1919,10 +1953,9 @@ def enqueue(
     "" and the ticket simply gets no submitter notifications -- this never
     blocks filing.
 
-    ``submitter_explicit``: the caller NAMED this submitter (``wt add
-    --submitter``) rather than being auto-detected as the filing session, so
-    it is watching this ticket deliberately and hears every event
-    (``_submitter_wants``), not just the default set."""
+    ``submitter_explicit`` records attribution from ``--submitter``. Neither
+    it nor ``pre_ack`` enables notices. ``submitter_subscribed`` (``wt add
+    --subscribe``) opts into the queue-configured status events."""
     note = _clip(note, 4000)
     if not note and not text:
         raise ValueError("note or text is required")
@@ -1978,7 +2011,7 @@ def enqueue(
             value=value,
             confidence=confidence,
             submitter=submitter,
-            submitter_explicit=submitter_explicit,
+            submitter_explicit=submitter_explicit, submitter_subscribed=submitter_subscribed,
             blocked_by=blocked_by,
             depth_fields=_depth_fields(depth, budget_min),
         )
@@ -2005,7 +2038,7 @@ def enqueue(
             repo_path=repo_path, lane=lane, item_type=item_type, readiness=readiness,
             priority=priority, value=value, confidence=confidence, model_floor=model_floor,
             planner_model=planner_model, verifier_model=verifier_model, submitter=submitter,
-            submitter_explicit=submitter_explicit, pre_ack=pre_ack, blocked_by=blocked_by,
+            submitter_explicit=submitter_explicit, submitter_subscribed=submitter_subscribed, pre_ack=pre_ack, blocked_by=blocked_by,
             gates=gates, accept_line=accept_line, assessment_origin=assessment_origin,
             placement=placement, depth=depth, budget_min=budget_min)
         saved["client_id"] = client_id
@@ -2054,7 +2087,7 @@ class WindowSpec:
         self.updated_since = updated_since
         self.events = tuple(events or ())
         self.event_since, self.event_until = event_since, event_until
-        self.refs = tuple(str(r).upper() for r in (refs or ()))
+        self.refs = tuple(canonical_ref(r) for r in (refs or ()))
 
     def matches(self, it: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Reference evaluation for comparing indexed reads with full scans."""
@@ -2195,7 +2228,7 @@ def _window_from_index(db: Path, proj: str, spec: "WindowSpec", offset: int, lim
 
 def items_by_refs(refs: List[str]) -> Dict[str, Dict[str, Any]]:
     """Resolve only named dependencies from local stores and GitHub mirrors."""
-    wanted = {str(r).upper() for r in refs if r}
+    wanted = {canonical_ref(r) for r in refs if r}
     out = {}
     by_project = {}
     for ref in wanted:
@@ -2226,15 +2259,21 @@ def list_items(
     *,
     fresh: bool = False,
     strict: bool = False,
+    blocked_only: bool = False,
+    raise_on_error: bool = False,
 ) -> List[Dict[str, Any]]:
     if project:
         backend = _github_backend_for_project(project)
         if backend is not None:
             return backend.list_items(
-                status=status, lane=lane, fresh=fresh, strict=strict
+                status=status, lane=lane, fresh=fresh, strict=strict,
+                **({"blocked_only": True} if blocked_only else {}),
             )
-    data = _load_unlocked(strict=strict)
+    data = _load_unlocked(strict=strict or raise_on_error, **({"readonly": True} if blocked_only else {}))
     items = data.get("items", [])
+    if blocked_only:
+        import copy
+        items = [copy.deepcopy(it) for it in items if _is_blocked(it)]
     github_projects = set(_github_projects()) if not project else set()
     if github_projects:
         items = [
@@ -2255,11 +2294,12 @@ def list_items(
                 try:
                     items.extend(
                         backend.list_items(
-                            status=status, lane=lane, fresh=fresh, strict=strict
+                            status=status, lane=lane, fresh=fresh, strict=strict,
+                            **({"blocked_only": True} if blocked_only else {}),
                         )
                     )
                 except Exception as e:
-                    if strict:
+                    if strict or raise_on_error:
                         raise
                     if getattr(e, "cached", False):
                         continue
@@ -2289,6 +2329,32 @@ def _set_run_requested(ident: Any, requested: bool, event: str) -> Optional[Dict
     return None
 
 
+def detach_tracker_claims(project: str) -> List[str]:
+    """Remove legacy task ownership while preserving records, waits and supervision."""
+    from . import config
+    if not config.is_tracker(project):
+        raise ValueError("queue must be a tracker before detaching claims")
+    changed = []
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        for it in data["items"]:
+            if it.get("project") != project or it.get("status") == "closed":
+                continue
+            if not any(it.get(k) for k in ("claimed_by", "claimed_session_id", "claim_proc", "parked", "run_requested")):
+                continue
+            it.update(claimed_by="", claimed_session_id="", claimed_at=None, claimed_machine="", run_requested=False)
+            it.pop("claim_proc", None)
+            it.pop("parked", None)
+            if it.get("status") in ("in_progress", PARKED_STATUS):
+                it["status"] = "open"
+            it["updated_at"] = _now_iso()
+            _append_history(it, "tracker_detach", by=_by("system"))
+            changed.append(it["ref"])
+        if changed:
+            _save_unlocked(data)
+    return changed
+
+
 def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
     """Request a run for this ticket — the ▶ / ``wt run`` path.
 
@@ -2308,6 +2374,8 @@ def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
     into its own `skipped` list (WT-131). auto_drain stays default-off; this
     only makes the queue exist for the reconciler to see.
     """
+    from . import config
+    config.require_work_queue(_project_from_ident(ident))
     proj = _project_from_ident(ident)
     if proj:
         try:
@@ -2324,6 +2392,7 @@ def mark_runnable(ident: Any) -> Optional[Dict[str, Any]]:
     item = get(ident)
     if item is None:
         return None
+    config.require_work_queue(item.get("project", ""))
     if item.get("status") == "closed":
         update_status(ident, "open", reason="marked runnable")
     item = _set_run_requested(ident, True, "run_requested")
@@ -2360,7 +2429,9 @@ def queues() -> Dict[str, Dict[str, int]]:
             proj, {"open": 0, "in_progress": 0, "closed": 0, "total": 0}
         )
         st = it.get("status", "open")
-        if st in row:
+        if st == "awaiting_release":
+            row[st] = row.get(st, 0) + 1
+        elif st in row:
             row[st] += 1
         row["total"] += 1
     return out
@@ -2370,10 +2441,11 @@ def get(ident: Any) -> Optional[Dict[str, Any]]:
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         return backend.get(ident)
-    for it in _load_unlocked().get("items", []):
+    for it in _load_unlocked(readonly=True).get("items", []):
         if _matches(it, ident):
+            import copy
             from . import usage
-            return usage.attach(it)
+            return usage.attach(copy.deepcopy(it))
     return None
 
 
@@ -2410,13 +2482,27 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
             out = github_pipeline.set_gates(ident, list(fields.pop("gates") or []))
             if not fields or out is None:
                 return out
-        return backend.update(ident, **fields)
+        dependency_wait = bool(fields.get("_dependency_wait"))
+        saved = backend.update(ident, **fields)
+        if saved and dependency_wait:
+            if saved.get("pipeline_local"):
+                from . import github_pipeline
+                def release_park(cur):
+                    _reopen_pending_unlocked(cur, _now_iso(), "handoff", "waiting on ticket dependencies")
+                    cur.pop("parked", None)
+                github_pipeline.mutate(ident, release_park)
+                saved = backend.get(ident)
+            _supersede_outbox(ident)
+        return saved
+    dependency_wait = bool(fields.pop("_dependency_wait", False))
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
-        "note", "text", "title", "url", "selector", "screenshot_path", "repo_path",
+        "note", "text", "title", "slug", "url", "selector", "screenshot_path", "repo_path",
         "needs_input", "block_question", "model_floor", "blocked_by", "gates", "accept",
         "planner_model", "verifier_model", "placement", "client_id",
     })
+    if "slug" in fields:
+        fields["slug"] = ticket_slug(fields["slug"])
     if "placement" in fields:
         raw = str(fields["placement"] or "").strip().lower()
         if raw and raw not in VALID_PLACEMENTS:
@@ -2445,6 +2531,8 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                                         fields={"depth": new.get("depth", "quick"),
                                                 **({"budget_min": new["budget_min"]}
                                                    if "budget_min" in new else {})})
+                if "_subscription" in fields:
+                    _apply_ticket_subscription(it, *fields["_subscription"])
                 if "gates" in fields:
                     fields = dict(fields)
                     fields["gates"] = (_parent_gates(fields["gates"]) if group_role(it) == "parent"
@@ -2461,12 +2549,16 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                     if group_parent_ref(it) and group_parent_ref(it) in fields["blocked_by"]:
                         raise ValueError(f"{it.get('ref')} cannot be blocked by its own group "
                                          f"parent {group_parent_ref(it)}")
+                if dependency_wait:
+                    _dependency_wait_check(it)
                 edge_from = _pa_edge_start(it)
                 for k, v in fields.items():
                     if k in ALLOWED:
                         # "item_type" and "type" are aliases — store as "type"
                         key = "type" if k == "item_type" else k
                         it[key] = v
+                if dependency_wait:
+                    _dependency_wait_unlocked(it, now)
                 superseded = bool(fields.get("needs_input")) and edge_from is not None
                 if superseded:
                     # A new block supersedes the pending answer, as block() does (E17).
@@ -2481,7 +2573,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                     _append_history(it, "edit", by=_by("system"), at=now, fields=changed)
                 it["updated_at"] = now
                 _save_unlocked(data)
-                if superseded:
+                if superseded or dependency_wait:
                     _supersede_outbox(it.get("ref"))
                 return it
     return None
@@ -2720,7 +2812,9 @@ def _claim_candidates(
     machine are skipped, so a Mac-bound ticket waits for the Mac and an
     always-on VM only ever takes what it can actually run.
     """
-    candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of") and not it.get("supervision")]
+    from . import config
+    candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of") and not it.get("supervision")
+                  and not config.is_tracker(it.get("project", ""))]
     if requested_only:
         # OPS-1492: a dispatcher on a manually drained queue only wants what
         # a human pressed ▶ on (``run_requested``), not the whole open pool.
@@ -2804,6 +2898,9 @@ def count_claimable(
     can never think a ticket is spawn-worthy when a worker couldn't actually
     claim it (the WT SPAWN/REAP churn bug: needs-spec tickets counted as
     claimable depth even though claim_next excludes them by default)."""
+    from . import config
+    if config.is_tracker(project):
+        return 0
     backend = _github_backend_for_project(project)
     if backend is not None:
         return backend.count_claimable(lane=lane, item_types=item_types)
@@ -2829,6 +2926,9 @@ def count_manual_eligible(
     auto_drain=off means "no *automatic* work", not "ignore what I pressed".
     Same candidate filter as claim_next, so a run request on a ticket no worker
     could claim (wrong claim_type, needs-shaping) still spawns nothing."""
+    from . import config
+    if config.is_tracker(project):
+        return 0
     backend = _github_backend_for_project(project)
     if backend is not None:
         return backend.count_manual_eligible(lane=lane, item_types=item_types)
@@ -2984,6 +3084,8 @@ def claim_next(
     """
     if not session_id:
         raise ValueError("session_id is required")
+    from . import config
+    config.require_work_queue(project)
     _verify_worker_live(session_id, session_uuid)
     # A reconciler stop signal is a durable, queue-scoped release. It must win
     # over a racing enqueue: the released session must never claim more work,
@@ -3176,6 +3278,8 @@ def claim_by_ref(
     """
     if not session_id:
         raise ValueError("session_id is required")
+    from . import config
+    config.require_work_queue(_project_from_ident(ref))
     _verify_worker_live(session_id, session_uuid)
     backend = _github_backend_for_project(_project_from_ident(ref))
     if backend is not None:
@@ -3193,6 +3297,9 @@ def claim_by_ref(
         item = next((it for it in data["items"] if it.get("ref") == ref), None)
         if item is None:
             return None
+        # Recheck inside the store transaction: a concurrent kind conversion
+        # may have detached this ticket after the entry check above.
+        config.require_work_queue(item.get("project", ""))
         if item.get("supervision"):
             raise ValueError("ticket retains same-session takeover ownership")
         status = item.get("status", "open")
@@ -3249,6 +3356,9 @@ def peek_next(
 
     Uses the same smart sort as claim_next (priority → type → age).
     Returns None when nothing is open and claimable."""
+    from . import config
+    if config.is_tracker(project):
+        return None
     backend = _github_backend_for_project(project)
     if backend is not None:
         return backend.peek_next(lane=lane, item_types=item_types)
@@ -3413,6 +3523,7 @@ def update_status(
     expect: Optional[Dict[str, Any]] = None,
     close_contract: Optional[Dict[str, Any]] = None,
     sandbox_contract: Optional[Dict[str, Any]] = None,
+    release_expect: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """``close_contract``: a ``conditional_closes`` request for a close. Store
     identity, the observed question and the idempotency key are checked under
@@ -3482,6 +3593,9 @@ def update_status(
     correctly. Ignored by the GitHub backend's history mirroring."""
     if status not in VALID_STATUSES:
         raise ValueError(f"status must be one of {VALID_STATUSES}")
+    from . import config
+    if status == "in_progress":
+        config.require_work_queue(_project_from_ident(ident))
     backend = _github_backend_for_project(_project_from_ident(ident))
     if sandbox_contract is not None and backend is not None:
         raise ValueError("sandbox bridge requires a local file-backed queue")
@@ -3501,6 +3615,7 @@ def update_status(
             expect_owner=expect_owner,
             require_status=require_status,
             expect=expect,
+            **({"release_expect": release_expect, "extras": extras} if release_expect is not None else {}),
         )
         if item:
             verbs = {"open": "REOPEN", "in_progress": "CLAIM", "closed": "CLOSE"}
@@ -3547,6 +3662,13 @@ def update_status(
                     return None
                 if expect is not None and not claim_expect_holds(it, expect):
                     return None
+                if release_expect is not None and (it.get("status") != "awaiting_release"
+                        or it.get("release_wait") != release_expect):
+                    return None
+                if release_expect is not None and status == "closed" and effective_gates(it):
+                    return None
+                if status in ("open", "closed"):
+                    it.pop("release_wait", None)
                 # Ownership guard for close (see expect_owner docstring). Runs
                 # inside the lock against the fresh item, so it's race-free with
                 # a concurrent close by the fresh worker that re-drained the
@@ -3560,6 +3682,7 @@ def update_status(
                         f"{it.get('ref')} is a group parent: its status moves only through its "
                         f"plan and integration (`wt group show {it.get('ref')}`)")
                 if status == "in_progress":
+                    config.require_work_queue(it.get("project", ""))
                     _group_claim_check_unlocked(data["items"], it)
                 if it.get("duplicate_of"):
                     raise ValueError(f"{it.get('ref', ident)} follows duplicate original {it['duplicate_of']}; clear the link before changing status")
@@ -3598,7 +3721,7 @@ def update_status(
                         # consumers that attribute by claimant (wt find, the
                         # dashboard's in-progress column) don't show a blank.
                         # Never overwrites a real claimant (WT-81).
-                        if not it.get("claimed_by"):
+                        if not it.get("claimed_by") and not config.is_tracker(it.get("project", "")):
                             it["claimed_by"] = str(session_id)
                             it["claimed_machine"] = it["closed_machine"]
                             if real_sid and not it.get("claimed_session_id"):
@@ -4862,9 +4985,10 @@ def _notify_review(item: Dict[str, Any], reviewer: str, actor: Any,
         return None
     res = item.get("resolution") or {}
     deps = _dependents_of(ref)
-    text = (f"[watchtower] {ref} awaits your review -- "
+    label = display_ref(item)
+    text = (f"[watchtower] {label} awaits your review -- "
             f"{_clip(str(res.get('summary') or item.get('title') or ''), 200)}. "
-            f"Run `wt accept {ref}` or `wt reject {ref} --reason \"...\"`."
+            f"Run `wt accept {label}` or `wt reject {label} --reason \"...\"`."
             + (f" Accepting unblocks: {', '.join(deps)}." if deps else ""))
     try:
         from . import liveness, messages
@@ -5326,6 +5450,9 @@ def link_duplicate(ident: Any, original_ref: str, worker: str = "", *,
             _append_history(it, "duplicate_link", by=_by("human", worker), at=_now_iso(),
                             original=original_ref)
         _drop_claim_proc_unlocked(it)
+        # Linking (or clearing) a duplicate leaves awaiting_answer. Its wait
+        # now belongs to the original, not the old parked worker session.
+        it.pop("parked", None)
         it["claimed_by"] = ""
         it["claimed_session_id"] = ""
         it["updated_at"] = _now_iso()
@@ -6140,10 +6267,13 @@ def _group_due_unlocked(items: List[Dict[str, Any]], now: Optional[float] = None
     """Parents whose integration should run now (D7.1): open, sealed, plan
     settled, no open question, every child done, and idle/fixing with no
     open fix -- or gating with a lease past its TTL."""
+    from . import config
     by_ref = _refs_index(items)
     out: List[Dict[str, Any]] = []
     for it in items:
         if group_role(it) != "parent" or it.get("status") != "open" or it.get("needs_input"):
+            continue
+        if config.ticket_is_archived(it) or config.is_tracker(it.get("project", "")):
             continue
         if not group_plan_settled(it) or blocker_verdict(it, by_ref)[0] != "ok":
             continue
@@ -7323,7 +7453,10 @@ def assessment_targets_for_sweep(now_ts: Optional[float] = None) -> Dict[str, Li
             return 0.0
 
     res: Dict[str, List[Dict[str, Any]]] = {"due": [], "filing": [], "running": []}
+    from . import config
     for it in list_items():
+        if config.is_tracker(it.get("project", "")):
+            continue
         a = it.get("assessment") or {}
         st = a.get("status")
         if st == "due":
@@ -7520,6 +7653,8 @@ def reopen_and_claim(
     transition available server-side, so they fall back to the sequential
     reopen + claim (same residual race ``reopen`` already had there; this
     function only closes the window for the local file-backed store)."""
+    from . import config
+    config.require_work_queue(_project_from_ident(ident))
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         current = get(ident)
@@ -7536,6 +7671,7 @@ def reopen_and_claim(
         for it in data["items"]:
             if not _matches(it, ident):
                 continue
+            config.require_work_queue(it.get("project", ""))
             sup = it.get("supervision") or {}
             if sup and sup.get("session", {}).get("session_id") not in (str(session_id), str(real_sid or "")):
                 raise ValueError("ticket retains same-session takeover ownership")
@@ -8308,7 +8444,7 @@ ANSWER_TRANSITIONS: Tuple[Dict[str, Any], ...] = (
      "status": (("in_progress", "open"), ("awaiting_answer", "open"), ("open", "open")),
      "writers": ("_reopen_pending_unlocked",),
      "callers": ("update_status", "release", "reopen", "requeue_orphaned_tickets",
-                 "_reopen_with_feedback", "close", "recover_claim", "sweep")},
+                 "_reopen_with_feedback", "close", "recover_claim", "sweep", "defer")},
     {"id": "E15", "from": _ANY_PA, "to": "none",
      "status": (("in_progress", "open"), ("awaiting_answer", "open")),
      "writers": ("_reopen_pending_unlocked",),
@@ -8639,6 +8775,33 @@ def resume_claim(ident: Any, gen: int) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _dependency_wait_check(it: Dict[str, Any]) -> None:
+    if it.get("status") not in ("open", "in_progress", PARKED_STATUS):
+        raise ValueError(f"{it.get('ref')} is {it.get('status')}; cannot wait on a dependency")
+    if it.get("pipeline_foreign"):
+        raise ValueError(f"{it.get('ref')}: dependency edit must run on the pipeline owner host")
+    if group_role(it) == "parent" or _plan_active_unlocked(it) or it.get("supervision"):
+        raise ValueError(f"{it.get('ref')}: active plan owns this ticket; cannot release it")
+    wait = current_wait(it) or {}
+    if it.get("needs_input") and wait.get("on") != "dependency":
+        raise ValueError(f"{it.get('ref')}: resolve the existing human question before replacing it with a dependency")
+
+
+def _dependency_wait_unlocked(it: Dict[str, Any], now: str, *, worker_done: bool = True) -> None:
+    """Keep history/answers, release delivery ownership, and let blocked_by gate dispatch."""
+    holder = str(it.get("claimed_by") or "")
+    _release_claim_to_open_unlocked(it, now, "waiting on ticket dependencies")
+    _reopen_pending_unlocked(it, now, "handoff", "waiting on ticket dependencies")
+    it["claimed_session_id"] = None
+    it.pop("resume", None)
+    _clear_sent_back_unlocked(it)
+    for key in ("claim_heartbeat", "wait", "block_origin", "deferred_until", "defer_reason", "reserved_for",
+                "reserved_session_id", "reserved_until"):
+        it.pop(key, None)
+    if holder and worker_done:
+        _note_worker_ticket_done(holder)
+
+
 def _release_claim_to_open_unlocked(it: Dict[str, Any], now: str, reason: str) -> None:
     """Back to the claim pool as part of an answer handoff (keeps the
     session handle, drops the claim and the block)."""
@@ -8784,6 +8947,23 @@ def _github_park(ident: Any, session_id: str, item: Dict[str, Any]) -> Optional[
     return parked
 
 
+def dependency_only_question(question: str) -> List[str]:
+    """Conservatively catch wait-only prose, retaining real decisions mentioning refs."""
+    import re
+
+    text = str(question or "").strip()
+    refs = re.findall(r"\b[A-Z][A-Z0-9_-]*-\d+\b", text)
+    if not refs:
+        return []
+    target = r"(?:canonical\s+|ticket\s+)?[A-Z][A-Z0-9_-]*-\d+\b"
+    prefix = r"(?i:await(?:ing)?|wait(?:ing|s)?(?:\s+on|\s+for)?|blocked\s+(?:on|by)|depends\s+on)\s+"
+    if re.match(prefix + target, text) or re.fullmatch(target + r"[.?!]?", text):
+        return list(dict.fromkeys(refs))
+    if re.match(r"^[A-Z][A-Z0-9_-]*-\d+\s+(?:must|needs? to)\b", text):
+        return list(dict.fromkeys(refs))
+    return []
+
+
 def block(
     ident: Any,
     session_id: str = "",
@@ -8880,10 +9060,12 @@ def block(
                 park_worker = str(it.get("claimed_by") or session_id or "")
                 # WT-33 D7.5: a group parent's block never changes its status
                 # nor binds a claimant (it is never parked or in_progress).
+                from . import config
+                is_tracker = config.is_tracker(it.get("project", ""))
                 is_parent = group_role(it) == "parent"
                 # WT-31 D1a: under an active plan gate the plan stage owns the
                 # ticket, so a worker block stays legacy (needs_input).
-                park = (origin == "worker" and not was_parked and not is_parent
+                park = (origin == "worker" and not was_parked and not is_parent and not is_tracker
                         and it.get("status") in ("open", "in_progress") and bool(park_worker)
                         and not _plan_active_unlocked(it))
                 park_sid = str(it.get("claimed_session_id")
@@ -8908,9 +9090,9 @@ def block(
                     it["block_commit"] = commit
                 it.pop("resume", None)
                 _clear_sent_back_unlocked(it)
-                if it.get("status") == "open" and not park and not is_parent:
+                if it.get("status") == "open" and not park and not is_parent and not is_tracker:
                     it["status"] = "in_progress"
-                if session_id and not park and not was_parked and not is_parent:
+                if session_id and not park and not was_parked and not is_parent and not is_tracker:
                     real = _coerce_session_uuid(session_id)
                     if not it.get("claimed_by"):
                         it["claimed_by"] = str(session_id)
@@ -9110,6 +9292,12 @@ def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = 
                 if it.get("supervision"):
                     from . import takeover
                     takeover.answer_unlocked(it, text, now)
+                    _save_unlocked(data)
+                    return it
+                from . import config
+                if config.is_tracker(it.get("project", "")):
+                    _supersede_pending_unlocked(it, now)
+                    it.update(block_question="", block_kind="", blocked_at=None)
                     _save_unlocked(data)
                     return it
                 stage_retry = _stage_retry_reset(it, text, now)
@@ -9549,6 +9737,9 @@ def defer(ident: Any, session_id: str, until: Any, reason: str,
                 _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
             if status == "in_progress":
                 _release_claim_to_open_unlocked(it, now, "deferred: " + reason)
+            # A deferred ticket has no delivery claim. Keep the answer for
+            # the next claimer, including legacy open records left in flight.
+            _reopen_pending_unlocked(it, now, "handoff", "deferred: " + reason)
             it["deferred_until"] = until_iso
             it["defer_reason"] = _clip(reason, 2000)
             it["updated_at"] = now
@@ -9561,6 +9752,48 @@ def defer(ident: Any, session_id: str, until: Any, reason: str,
                 _note_worker_ticket_done(session_id)
             return it
     return None
+
+
+def await_release(ident: Any, session_id: str, wait: Dict[str, Any],
+                  progress: str = "", expected_defer: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Release a delivery claim into a persistent, untimed release wait.
+
+    The caller validates branch/target before entering. Migration fences the
+    original defer reason so a stale scan cannot park newly resumed work.
+    """
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        item = backend.await_release(ident, session_id=session_id, wait=wait,
+                                     progress=progress, expected_defer=expected_defer)
+    else:
+        item = None
+        with _FileLock(_lock_path()):
+            data = _load_unlocked()
+            for it in data["items"]:
+                if not _matches(it, ident):
+                    continue
+                from . import releases
+                releases.require_parkable(it, session_id, expected_defer)
+                now = _now_iso()
+                actor = _by("worker", session_id)
+                if progress:
+                    _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
+                if it.get("status") == "in_progress":
+                    _release_claim_to_open_unlocked(it, now, "awaiting release")
+                _reopen_pending_unlocked(it, now, "handoff", "awaiting release")
+                for key in ("deferred_until", "defer_reason", "claimed_by", "claimed_at",
+                            "claimed_machine", "claim_proc", "claim_heartbeat", "resume"):
+                    it.pop(key, None)
+                it.update(status="awaiting_release", release_wait=dict(wait), updated_at=now)
+                _append_history(it, "await_release", by=actor, at=now, release_wait=dict(wait))
+                _save_unlocked(data)
+                item = it
+                break
+    if item:
+        _note_worker_ticket_done(session_id)
+        _log("AWAIT_RELEASE", f"{item['ref']} {wait['commit'][:12]} -> {wait['target']}",
+             queue=item.get("project", ""))
+    return item
 
 
 def _require_rationale_block(it: Dict[str, Any], ident: Any) -> None:
@@ -9745,9 +9978,17 @@ def comment(ident: Any, text: str, by: str = "human", session_id: str = "", *,
     return None
 
 
+def _is_blocked(it: Dict[str, Any]) -> bool:
+    return bool(it.get("needs_input")
+                or (it.get("status") == PARKED_STATUS
+                    and (it.get("pending_answer") or {}).get("state") == "routing"))
+
+
 def list_blocked(
     project: Optional[str] = None,
     items: Optional[List[Dict[str, Any]]] = None,
+    *,
+    strict: bool = False,
 ) -> List[Dict[str, Any]]:
     """Tickets parked for a human (``needs_input`` truthy), optionally scoped to
     one queue. The CLI's ``wt blocked`` and CCC both read this.
@@ -9758,11 +9999,12 @@ def list_blocked(
     every worker holding a blocked ticket there read as fully productive to
     the reconciler's staffing math (see ``list_active_claims``), so a queue
     stuck entirely behind blocked tickets never got replacement workers."""
-    src = list_items(project=project) if items is None else items
+    from . import config
+    src = (list_items(project=project, blocked_only=True, **({"raise_on_error": True} if strict else {}))
+           if items is None else items)
     return [it for it in src
-            if it.get("needs_input")
-            or (it.get("status") == PARKED_STATUS
-                and (it.get("pending_answer") or {}).get("state") == "routing")]
+            if not config.ticket_is_archived(it)
+            and _is_blocked(it)]
 
 
 def list_active_claims(

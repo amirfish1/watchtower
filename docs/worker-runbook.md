@@ -124,6 +124,40 @@ The audit (Tier 2):
 
 ## Definition of done
 
+### Read related work before implementing (WT-83)
+
+Every successful `wt claim` includes `related` in JSON, or a related-work list
+in plain text. This searches full prose across all queues' recent local
+snapshots; candidates are suggestions, never proof that a feature shipped.
+An error or partial coverage is an evidence gap, not "nothing related".
+
+1. Run `wt related REF --triage --json` to have Jev classify candidates as
+   `already-shipped`, `earlier-attempt`, `in-progress`, or `unrelated`.
+   Set `TYPESAFE_API_KEY` (or `JEV_API_KEY`) from the authorized secret store;
+   never print it. Retrieval itself needs no key and makes no network calls.
+   If triage is unavailable, inspect the candidates yourself and record the gap.
+2. Read useful candidates and verify their evidence. Record confirmed links:
+   `wt related REF --confirm OTHER --kind earlier-attempt --worker ID
+   --evidence "specific facts checked"`. Jev advice alone is not confirmation.
+   Do not confirm a merely similar error in a different job.
+3. Already shipped: verify current integration/deployment and the reported
+   behavior, then resolve instead of rebuilding. Same bug recurring after a
+   closed repair: say "fix in OTHER did not hold", read that attempt first,
+   and treat the ticket as deep (confirmation sets its depth). Related active
+   work: coordinate or use a dependency; do not duplicate it.
+4. Three confirmed tickets for the same job within seven days mean "this job
+   is fragile; fix the design, not the latest error". The owner view supplies
+   one line per confirmed job to the decision desk morning digest.
+5. At close, pass `--related-feedback useful` or `not-useful`; use
+   `unavailable` for a recall failure. `wt related --feedback-report --since
+   ISO --json` reports the useful ratio and unavailable counts separately.
+
+`wt related --refresh-github` is an explicit maintenance/backfill command:
+it fetches full recent issues and comments outside the claim path. Ordinary
+GitHub detail reads retain prose they already fetched; claims never hydrate
+missing history. `wt related` also searches CCC's existing recent commit FTS
+under a bounded query deadline. An indexed commit is not deployment evidence.
+
 Applies to every ticket, quick or deep.
 
 - **Done means the reason the ticket was filed has gone away**: the symptom it
@@ -138,6 +172,56 @@ Applies to every ticket, quick or deep.
   data accumulates) instead of closing with the remainder in a follow-up.
 - **Partial is labelled partial**: a close that leaves part of the ask undone
   starts its `--summary` with `PARTIAL:` and cites the follow-up ref.
+
+## Code complete, awaiting release (WT-82)
+
+Use `wt await-release`, not a timed defer, when the code is merged and only
+release/adoption remains. Fetch the release branch first. The commit (or its
+identical cherry-picked patch) must be on that branch; a feature branch is
+still an integration wait. A release wait has distinct status `awaiting_release`,
+no timer, no worker slot, and no periodic reclaims. GitHub issues carry a
+non-expiring compatibility fence for older hosts; current readers expose
+only the release status and remove that fence when the event settles it.
+
+```bash
+wt await-release REF --worker ID --repo /path/to/repo --commit SHA \
+  --release-branch origin/next --target 'github:OWNER/REPO:Production – bookyourmat-app' \
+  --reason "merged; waiting for production adoption" --live-check \
+  --progress "Tests passed. After adoption check the reported booking flow."
+```
+
+Targets: `github:OWNER/REPO:EXACT_ENVIRONMENT` observes the latest successful
+GitHub deployment; BYM's environment is `Production – bookyourmat-app`.
+`ccc:dashboard` reads the running local dashboard's `/api/version` `code_rev`;
+`watchtower:local` uses the daemon's frozen boot revision. Other services/hosts
+can use an HTTP(S) JSON endpoint returning a frozen `code_rev` or `sha`.
+Do not use the checkout HEAD or a version string as running-build proof.
+A service reporter can explicitly submit a verified adoption event:
+`wt release-observe --target TARGET --build RUNNING_SHA --evidence "source and time"`.
+For CCC execution-worker adoption, require its own actual running commit
+report; dashboard adoption never proves the worker restarted.
+
+Default `--live-check`: the observed containing build reopens the ticket once
+for a worker to perform the progress note's live acceptance check, then close
+normally with its verified fix commit. Repeated build reports cannot reopen it
+again. If acceptance is fully proven before release, use `--close-on-release
+--summary "outcome and bullets" --verified "specific passing evidence"` instead;
+the event closes it with that stored summary and commit. Required gates force
+a worker check and ordinary `wt close`; automatic close never bypasses gates.
+
+Observer failures, unknown SHAs, unrelated builds and commits no longer on the
+release branch leave the ticket parked. `wt ls --status awaiting_release` lists
+them separately; default active lists omit them. `wt owner-view` counts them
+separately and surfaces those older than three days or with unproven branch
+reachability. These warnings never close a ticket or dispatch a timer check.
+Use `wt reopen REF --reason ...` to return an incorrectly parked wait to work.
+
+`wt release-migrate` previews typed release defers; `--apply` migrates verifiable
+BYM/WatchTower waits conservatively to one live check, preserving the old window
+in `release_wait.previous_defer`. It reports missing commits/paths and ambiguous
+targets rather than guessing; use `--repo`/`--target` to resolve those explicitly.
+Legacy `wt defer --awaits release` also enters the untimed status when a known
+BYM/WatchTower target can be inferred, or an explicit `--target` is supplied. Integration defers and data windows stay unchanged.
 
 ## Proportional verification and waits
 
@@ -253,10 +337,9 @@ check the commit is on the branch releases are cut from (`git fetch`, then
 `git merge-base --is-ancestor SHA origin/BRANCH`). Say which case you are in:
 
 ```bash
-# Merged, waiting to ship. WatchTower checks the commit (or the same patch
-# under another sha) is on the branch and refuses the defer if it is not.
-wt defer REF --worker ID --until +2d --reason "ships with the next release" \
-  --awaits release --commit SHA --release-branch origin/next
+# Merged, waiting to ship: no timer. The release target must report the build.
+wt await-release REF --worker ID --reason "ships with the next release" \
+  --commit SHA --release-branch origin/next --target TARGET --live-check
 
 # Fix exists but is not on the release branch. Name who lands it and how.
 wt defer REF --worker ID --until +1d --reason "needs re-landing on next" \

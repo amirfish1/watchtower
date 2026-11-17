@@ -1,4 +1,8 @@
 ---
+
+Use named ticket refs in prose (`WT-79:add-ticket-subscribe`); JSON keeps the
+bare `ref` and separate `slug`. Commands accept bare refs and stale names.
+
 name: group-chat-checkin
 description: Coordinate parallel sessions for discussion, task execution, and git commits.
 allowed-tools: Read, Edit, Write, Bash
