@@ -75,6 +75,7 @@ def inventory():
                 ref = f"{project}-{raw['number']}"
                 items[ref] = dict(meta, ref=ref, project=project, title=raw.get("title") or "",
                                   created_at=raw.get("createdAt"), closed_at=raw.get("closedAt"),
+                                  updated_at=raw.get("updatedAt") or meta.get("updated_at"),
                                   status=("closed" if raw.get("state") == "CLOSED" else
                                           "awaiting_release" if meta.get("release_wait") else
                                           "in_progress" if meta.get("claimed_by") or "watchtower:in-progress" in names else "open"),

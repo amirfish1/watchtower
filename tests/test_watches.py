@@ -179,3 +179,16 @@ def test_legacy_resolution_cannot_prevent_other_registered_checks_or_owner_view(
     assert len(results) == 1 and results[0]['origin'] == ref
     rows = watches.owner_rows([legacy, watched])
     assert len(rows) == 1 and rows[0]['ref'] == ref
+
+
+def test_inventory_retains_github_update_time_for_claim_lease(env, monkeypatch):
+    from watchtower import config, github_backend as gh
+    q, *_ = env
+    monkeypatch.setattr(config, 'all_queues', lambda: {'G': {'backend':'github','github_repo':'owner/repo'}})
+    monkeypatch.setattr(config, 'github_queues_for_repo', lambda repo: ['G'])
+    monkeypatch.setattr(gh, '_read_persisted_list_cache', lambda: {'owner/repo:open': {
+        'at': 0, 'data': [{'number':1, 'title':'Active claim', 'body':'', 'labels':[],
+                          'state':'OPEN', 'createdAt':'2026-01-01T00:00:00Z',
+                          'updatedAt':'2026-11-17T17:25:00Z'}]}})
+    items, _ = watches.inventory()
+    assert next(i for i in items if i['ref']=='G-1')['updated_at']=='2026-11-17T17:25:00Z'

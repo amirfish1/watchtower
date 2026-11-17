@@ -6081,7 +6081,7 @@ def requeue_orphaned_tickets(
         return _liveness._github(str(item.get("project") or ""))
 
     for it in items:
-        if it.get("supervision"):
+        if _q.supervision_owns(it):
             continue
         if it.get("status") != "in_progress":
             continue

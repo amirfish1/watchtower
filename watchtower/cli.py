@@ -4038,10 +4038,10 @@ def _answer_and_deliver(args: argparse.Namespace, by_kind: str = "human",
 
 def _deliver_answer(args: argparse.Namespace, item: dict, by_kind: str) -> int:
     from . import config
-    if config.is_tracker(item.get("project", "")) and not item.get("supervision"):
+    if config.is_tracker(item.get("project", "")) and not q.supervision_owns(item):
         print(f"ANSWERED: {_display_ref(item)} — decision recorded in tracker; no worker dispatched")
         return 0
-    if item.get("supervision"):
+    if q.supervision_owns(item):
         print(f"ANSWERED: {_display_ref(item)} — retained for same-session takeover delivery")
         return 0
     if (item.get("plan") or {}).get("status") == "blocked":

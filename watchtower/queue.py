@@ -180,6 +180,12 @@ BLOCK_KINDS = ("input", "rationale", "awaiting-client")
 WAIT_ON = ("owner", "external", "dependency", "worker")
 
 
+def supervision_owns(item: Dict[str, Any]) -> bool:
+    """Keep retired takeover provenance without retaining an expired claim."""
+    supervision = item.get("supervision") or {}
+    return bool(supervision and not supervision.get("ownership_released_at"))
+
+
 # Owner-wait context (optional, owner waits only): ``root`` = the ticket whose
 # decision this one really hangs on; ``decide_by`` = the latest safe moment to
 # act (ISO 8601 WITH a UTC offset, or the literal "none"); ``consequence`` =
@@ -2814,7 +2820,7 @@ def _claim_candidates(
     always-on VM only ever takes what it can actually run.
     """
     from . import config
-    candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of") and not it.get("supervision")
+    candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of") and not supervision_owns(it)
                   and not config.is_tracker(it.get("project", ""))]
     if requested_only:
         # OPS-1492: a dispatcher on a manually drained queue only wants what
@@ -3304,7 +3310,7 @@ def claim_by_ref(
         # Recheck inside the store transaction: a concurrent kind conversion
         # may have detached this ticket after the entry check above.
         config.require_work_queue(item.get("project", ""))
-        if item.get("supervision"):
+        if supervision_owns(item):
             raise ValueError("ticket retains same-session takeover ownership")
         status = item.get("status", "open")
         sb_held = _sent_back_held_unlocked(data["items"], str(session_id),
@@ -7601,7 +7607,7 @@ def reopen_and_claim(
                 continue
             config.require_work_queue(it.get("project", ""))
             sup = it.get("supervision") or {}
-            if sup and sup.get("session", {}).get("session_id") not in (str(session_id), str(real_sid or "")):
+            if supervision_owns(it) and sup.get("session", {}).get("session_id") not in (str(session_id), str(real_sid or "")):
                 raise ValueError("ticket retains same-session takeover ownership")
             if it.get("status") == "open":
                 raise ValueError(
@@ -8167,7 +8173,7 @@ RECOVER_ACTIONS = ("reopen", "resume", "escalate", "mark")
 def _recover_mismatch(it: Dict[str, Any], expect: Dict[str, Any],
                       items: List[Dict[str, Any]]) -> str:
     """Why ``it`` is no longer the snapshot the backstop decided on ('' = same)."""
-    for key in ("status", "claimed_by", "claimed_session_id", "claim_proc"):
+    for key in ("status", "claimed_by", "claimed_session_id", "claim_proc", "supervision"):
         if key in expect and (it.get(key) or None) != (expect.get(key) or None):
             return f"{key} changed"
     if it.get("needs_input"):
@@ -8186,6 +8192,14 @@ def _recover_reopen_unlocked(it: Dict[str, Any], now: str, reason: str) -> None:
     """Back to the claim pool (``update_status(open)`` parity, answer handoff
     E14), keeping ``gate_feedback`` and the session handle."""
     edge_from = _pa_edge_start(it)
+    supervision = it.get("supervision") or {}
+    if supervision.get("state") in ("cancelled", "completed") and supervision_owns(it):
+        supervision["ownership_released_at"] = now
+        _append_history(it, "supervision_lease_released", by=_by("system"), at=now,
+                        reason="Terminal supervision has no live worker; ordinary claim lease expired",
+                        generation=supervision.get("generation"),
+                        authorization_scope=supervision.get("authorization_scope"),
+                        held_answer=supervision.get("held_answer") or "")
     displaced = {"orphan": True,
                  "displaced_session_id": str(it.get("claimed_session_id") or ""),
                  "displaced_claimed_by": str(it.get("claimed_by") or "")}
@@ -8712,7 +8726,7 @@ def _dependency_wait_check(it: Dict[str, Any]) -> None:
         raise ValueError(f"{it.get('ref')} is {it.get('status')}; cannot wait on a dependency")
     if it.get("pipeline_foreign"):
         raise ValueError(f"{it.get('ref')}: dependency edit must run on the pipeline owner host")
-    if group_role(it) == "parent" or _plan_active_unlocked(it) or it.get("supervision"):
+    if group_role(it) == "parent" or _plan_active_unlocked(it) or supervision_owns(it):
         raise ValueError(f"{it.get('ref')}: active plan owns this ticket; cannot release it")
     wait = current_wait(it) or {}
     if it.get("needs_input") and wait.get("on") != "dependency":
@@ -9245,7 +9259,7 @@ def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = 
                          queue=it.get("project", ""))
                     _group_wake([str(it.get("ref"))], "integration")
                     return it
-                if it.get("supervision"):
+                if supervision_owns(it):
                     from . import takeover
                     takeover.answer_unlocked(it, text, now)
                     _save_unlocked(data)

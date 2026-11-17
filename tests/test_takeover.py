@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import pytest
 from watchtower import takeover as t, observations as o, queue as q, liveness
+from tests import legacy_blocks
 
 SID='11111111-2222-4333-8444-555555555555'
 OTHER='22222222-2222-4333-8444-555555555555'
@@ -352,7 +353,7 @@ def test_import_question_and_unfenced_import(env):
 def test_dependency_wake_uses_retained_answer_route(env):
     a=adopt(env)
     dep=q.enqueue(project='TEST',note='Dependency')
-    q.block(a['ticket'],session_id=SID,question='Wait',origin='worker',wait_on='dependency',wait_ref=dep['ref'])
+    legacy_blocks.block(q, a['ticket'],session_id=SID,question='Wait',origin='worker',wait_on='dependency',wait_ref=dep['ref'])
     t.reconcile()
     assert not env[3]
     q.close(dep['ref'],resolution={'summary':'done','no_code':True})
@@ -450,7 +451,7 @@ def test_gate_wait_and_resolution_do_not_remind_builder(env):
 
 def test_resolved_queue_wait_unpauses(env):
     a=adopt(env)
-    q.block(a['ticket'],session_id=SID,question='Wait externally',wait_on='external',origin='worker')
+    q.block(a['ticket'],session_id=SID,question='May the reviewed remedy proceed?',wait_on='external',wait_actor='Sonia',origin='worker')
     t.reconcile();assert t.status(SID)['state']=='waiting'
     t._update(a['ticket'],a['generation'],lambda i,s:i.update(needs_input=False,status='in_progress'))
     t.reconcile();assert t.status(SID)['state']!='waiting'
@@ -522,7 +523,7 @@ def test_identical_footer_question_after_answer_is_new_episode(env, monkeypatch)
 def test_footer_adoption_preserves_existing_source_wait(env, on):
     import copy
     a = adopt(env)
-    q.block(a['ticket'], session_id=SID, question='Existing source question', wait_on=on)
+    legacy_blocks.block(q, a['ticket'], session_id=SID, question='Existing source question', wait_on=on)
     before = q.get(a['ticket'])
     item = copy.deepcopy(before)
     footer = dict(next_step_user='A different footer question',
@@ -816,3 +817,39 @@ def test_tracker_conversion_preserves_parked_question_and_supervision(env):
     q.answer(ref, 'Continue the existing task')
     assert not q.get(ref)['claimed_by']
     assert t.status(SID)['supervision']['intent']['kind'] == 'answer'
+
+
+def test_terminal_supervision_claim_expires_but_suppression_and_scope_survive(env):
+    a=adopt(env); ref=a['ticket']
+    t.cancel(SID)
+    now=time.time()
+    item=q.get(ref)
+    assert liveness.assess(item,{ref:item},liveness.ResolverContext(now))['action']==''
+    later=now+liveness.stall_s()+liveness.RECENT_SESSION_S+120
+    action=liveness.assess(item,{ref:item},liveness.ResolverContext(later))
+    assert action['action']=='reopen'
+    recovered=q.recover_claim(ref,expect=liveness._expect(item,{ref:item}),action='reopen',reason=action['reason'])
+    assert recovered['supervision']['state']=='cancelled'
+    assert recovered['supervision']['ownership_released_at']
+    assert recovered['supervision']['authorization_scope']==item['supervision']['authorization_scope']
+    assert recovered['status']=='open' and not recovered.get('claimed_by')
+    assert q.count_claimable(project='TEST')==1
+    assert t.status(SID)['state']=='cancelled'  # automatic re-enrollment remains suppressed
+    claimed=q.claim_by_ref(ref,'replacement',session_uuid=OTHER)
+    assert claimed['claimed_by']=='replacement'
+    q.block(ref,'replacement',origin='worker',question='Approve the exact prepared draft?',wait_on='owner')
+    answered=q.answer(ref,'No sends; continue the authorized source work')
+    assert not answered['supervision'].get('held_answer')
+    assert answered.get('pending_answer')  # answer routes to the replacement, not the cancelled session
+
+
+def test_supervision_generation_change_fences_claim_recovery(env):
+    a=adopt(env); ref=a['ticket'];t.cancel(SID)
+    item=q.get(ref);expect=liveness._expect(item,{ref:item})
+    with q._FileLock(q._lock_path()):
+        data=q._load_unlocked();current=next(i for i in data['items'] if i['ref']==ref)
+        current['supervision']['generation']+=1
+        current['supervision']['state']='running'
+        q._save_unlocked(data)
+    assert q.recover_claim(ref,expect=expect,action='reopen',reason='stale snapshot') is None
+    assert q.get(ref)['status']=='in_progress'

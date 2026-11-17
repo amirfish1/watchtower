@@ -1306,7 +1306,9 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
                            "queue": str(item.get("project") or ""), "row": "", "owner": "",
                            "proof": "", "verdict": "", "evidence": "", "idle_s": 0,
                            "action": "", "reason": ""}
-    if item.get("supervision"):
+    supervision = item.get("supervision") or {}
+    if q.supervision_owns(item) and (supervision.get("state") not in ("cancelled", "completed")
+                                   or item.get("status") != "in_progress" or item.get("needs_input")):
         out.update(owner="takeover", verdict="retained", reason="Same-session supervision owns recovery")
         return out
     try:
@@ -1482,7 +1484,8 @@ def _escalation_question(item: Dict[str, Any], a: Dict[str, Any]) -> str:
 def _expect(item: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     return {"status": item.get("status"), "claimed_by": item.get("claimed_by"),
             "claimed_session_id": item.get("claimed_session_id"),
-            "claim_proc": item.get("claim_proc"), "fingerprint": fingerprint(item, by_ref)}
+            "claim_proc": item.get("claim_proc"), "supervision": item.get("supervision"),
+            "fingerprint": fingerprint(item, by_ref)}
 
 
 def _log_backstop(a: Dict[str, Any], result: str) -> None:

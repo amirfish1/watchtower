@@ -24,7 +24,10 @@ Local claims with no proven live worker expire at the existing liveness idle
 threshold (default 30 minutes). Live process identity, bound resumed-session
 proof and recent session activity still veto recovery. Recovery uses the
 existing fingerprint/claim CAS and preserves answers and review feedback;
-it does not manufacture an owner question. Foreign GitHub claims remain
+it does not manufacture an owner question. Cancelled/completed supervision
+also expires when its worker is absent. Its cancellation tombstone and
+authorization scope survive, while reply routing follows the new worker;
+a concurrent supervision generation change refuses recovery. Foreign GitHub claims remain
 subject to owning-host proof and identity fencing, rather than being declared
 dead from missing local processes.
 
