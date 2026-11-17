@@ -9162,19 +9162,18 @@ def _wait_gen_matches(it: Dict[str, Any], block_at: str) -> bool:
 
 
 def answer(ident: Any, text: str, session_id: str = "", **kwargs) -> Optional[Dict[str, Any]]:
-    # Serialize takeover answers with cancellation and dispatch, then acquire
-    # the ordinary store lock inside the implementation (one lock order).
+    # Answer acceptance uses only the source transaction. Takeover intents are
+    # replaced atomically there; never wait behind its transport dispatch lock.
     if kwargs.get("answer_contract") is not None:
         from . import conditional_answers
         conditional_answers.require_local(ident)
-    from . import takeover
-    with takeover._lock():
-        return _answer_impl(ident, text, session_id, **kwargs)
+    return _answer_impl(ident, text, session_id, **kwargs)
 
 
 def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = "human",
            expect_wait_block_at: Optional[str] = None,
-           answer_contract: Optional[dict] = None) -> Optional[Dict[str, Any]]:
+           answer_contract: Optional[dict] = None,
+           delivery: Optional[dict] = None) -> Optional[Dict[str, Any]]:
     """Record a human answer on a blocked ticket and clear ``needs_input`` so the
     resumed session can continue. Answers are append-only, preserving a
     back-and-forth. A ticket with a resumable worker stays ``in_progress``;
@@ -9200,7 +9199,8 @@ def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = 
             cur = backend.get(ident)
             if not cur or not _wait_gen_matches(cur, expect_wait_block_at):
                 return None
-        item = backend.answer(ident, text, session_id=session_id, kind=by_kind)
+        item = backend.answer(ident, text, session_id=session_id, kind=by_kind,
+                              **({"delivery": delivery} if delivery is not None else {}))
         if item and (item.get("stage_session") or {}).get("escalated"):
             # OPS-201: the stage retry lives in the pipeline sidecar.
             from . import github_pipeline
@@ -9296,6 +9296,9 @@ def _answer_impl(ident: Any, text: str, session_id: str = "", *, by_kind: str = 
                         at=now,
                         reason="answered_without_resumable_session",
                     )
+                if delivery is not None:
+                    from . import answer_dispatch
+                    answer_dispatch.record(it, text, session_id, by_kind, delivery)
                 _save_unlocked(data)
                 _log(
                     "ANSWER",

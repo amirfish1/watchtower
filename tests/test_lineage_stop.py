@@ -114,6 +114,8 @@ def test_cmd_answer_prompt_carries_the_ownership_check(wt, tmp_path, monkeypatch
     args = argparse.Namespace(ref=item["ref"], text="A", worker="human", engine="claude")
 
     assert cli.cmd_answer(args) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert prompts and f"`wt find {item['ref']} --json --worker w-1`" in prompts[0]
 
 

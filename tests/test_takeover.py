@@ -853,3 +853,26 @@ def test_supervision_generation_change_fences_claim_recovery(env):
         q._save_unlocked(data)
     assert q.recover_claim(ref,expect=expect,action='reopen',reason='stale snapshot') is None
     assert q.get(ref)['status']=='in_progress'
+
+
+def test_answer_is_accepted_during_slow_takeover_transport(env, monkeypatch):
+    a = adopt(env)
+    entered, release = threading.Event(), threading.Event()
+    def send(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return dict(ok=True)
+    monkeypatch.setattr(liveness, 'deliver', send)
+    with ThreadPoolExecutor(2) as pool:
+        sending = pool.submit(t.reconcile)
+        assert entered.wait(5)
+        try:
+            accepted = pool.submit(q.answer, a['ticket'], 'Continue with the new guidance').result(timeout=3)
+            intent = accepted['supervision']['intent']
+            assert intent['kind'] == 'answer' and intent['state'] == 'queued'
+            assert not accepted['needs_input']
+        finally:
+            release.set()
+        sending.result(timeout=5)
+    # The older transport outcome cannot mark the replacement intent as sent.
+    assert q.get(a['ticket'])['supervision']['intent'] == intent

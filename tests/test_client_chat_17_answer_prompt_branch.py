@@ -76,6 +76,8 @@ def test_default_block_kind_prompt_unchanged(wt, tmp_path, monkeypatch):
 
     args = argparse.Namespace(ref=claimed["ref"], text="B", worker="", engine=None, tid=False)
     assert cli.cmd_answer(args) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert "Apply it, finish the ticket, and close it" in captured["prompt"]
     assert "park again" not in captured["prompt"]
     assert "done with this topic" not in captured["prompt"]
@@ -92,6 +94,8 @@ def test_awaiting_client_ordinary_answer_says_park_again(wt, tmp_path, monkeypat
 
     args = argparse.Namespace(ref=claimed["ref"], text="make it lighter", worker="", engine=None, tid=False)
     assert cli.cmd_answer(args) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert "park again" in captured["prompt"]
     assert "wt block" in captured["prompt"]
     assert "awaiting-client" in captured["prompt"]
@@ -111,6 +115,8 @@ def test_awaiting_client_tid_answer_says_push_and_close(wt, tmp_path, monkeypatc
 
     args = argparse.Namespace(ref=claimed["ref"], text="that's everything, thanks", worker="", engine=None, tid=True)
     assert cli.cmd_answer(args) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     prompt = captured["prompt"]
     assert "done with this topic" in prompt or "topic is done" in prompt.lower()
     assert "push" in prompt.lower()
@@ -134,4 +140,6 @@ def test_tid_flag_without_awaiting_client_kind_falls_back_to_default(wt, tmp_pat
 
     args = argparse.Namespace(ref=claimed["ref"], text="A", worker="", engine=None, tid=True)
     assert cli.cmd_answer(args) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert "Apply it, finish the ticket, and close it" in captured["prompt"]

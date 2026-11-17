@@ -3934,26 +3934,7 @@ def cmd_answer_receipt(args: argparse.Namespace) -> int:
 
 
 def cmd_answer(args: argparse.Namespace) -> int:
-    """Inject a human answer onto a blocked ticket and hand it to the session.
-
-    Clears needs_input, then delivers the answer through the one liveness-aware
-    delivery primitive (``messages.deliver_message`` with ``verb="steer"``,
-    which prefers the peer socket and so cannot truncate a live turn): steer the
-    worker if its turn is live, resume it if idle, hold-and-retry via the
-    durable outbox if it is busy or momentarily unreachable. This replaces a
-    blind ``--resume`` fork, which for a Codex worker becomes a second
-    app-server owner on a session CCC may already be driving (WT-28, WT-90).
-    Only CCC knows a Codex session's liveness, so ``messages.send`` delegates
-    there; a genuinely unresolvable target still falls back to the headless
-    resume fork so the answer is never silently dropped.
-
-    The delivered prompt branches on ``block_kind`` (CLIENT-CHAT-17, same-topic
-    routing plan section 4): a ticket parked ``awaiting-client`` is a live
-    multi-turn conversation topic, not a one-shot blocked question, so
-    "answered -> close" is wrong for it. ``--tid`` marks this specific answer
-    as the client saying the topic itself is over (Topic-Is-Done, plan section
-    3b) rather than just the next turn in an ongoing exchange.
-    """
+    """Persist the answer now; the daemon owns session routing and delivery."""
     return _answer_and_deliver(args, by_kind=_answer_by_kind(args))[0]
 
 
@@ -3992,12 +3973,14 @@ def _answer_and_deliver(args: argparse.Namespace, by_kind: str = "human",
                         ) -> Tuple[int, Optional[dict]]:
     """`wt answer`'s body: ``(exit code, answered item or None)``."""
     item = q.answer(args.ref, args.text, session_id=args.worker, by_kind=by_kind,
-                    expect_wait_block_at=expect_wait_block_at)
+                    expect_wait_block_at=expect_wait_block_at,
+                    delivery={"engine": args.engine, "tid": bool(getattr(args, "tid", False))})
     if not item:
         if expect_wait_block_at is None:
             print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
         return 1, None
-    return _deliver_answer(args, item, by_kind), item
+    print(f"ANSWERED: {_display_ref(item)} — answer recorded; delivery queued for the daemon.")
+    return 0, item
 
 
 def _deliver_answer(args: argparse.Namespace, item: dict, by_kind: str) -> int:

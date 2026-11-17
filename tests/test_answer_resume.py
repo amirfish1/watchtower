@@ -122,6 +122,8 @@ def test_answer_delivers_via_messages_send_not_a_blind_fork(wt, tmp_path, monkey
     )
 
     assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     # Delivered through the one liveness-aware primitive, steering the session —
     # never a blind `codex exec resume` fork.
     assert calls["send"] == {
@@ -149,6 +151,8 @@ def test_answer_explicit_engine_overrides_primary_delivery(
     monkeypatch.setattr(messages, "send", fake_send)
 
     assert cli.cmd_answer(_answer_args(item["ref"], "A", engine="claude")) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert calls == ["claude"]
 
 
@@ -169,6 +173,8 @@ def test_answer_queued_delivery_does_not_fork(wt, tmp_path, monkeypatch):
     )
 
     assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     # Busy/held is delivered by the durable outbox, not a parallel fork.
     assert forked == []
 
@@ -190,6 +196,8 @@ def test_answer_falls_back_to_resume_when_target_unresolvable(wt, tmp_path, monk
     )
 
     assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     # Nothing queued -> preserve delivery via the headless resume fallback.
     assert len(forked) == 1
 
@@ -219,6 +227,8 @@ def test_answer_fallback_infers_codex_engine_from_blocked_session(
     monkeypatch.setattr(cli, "_resume_session_headless", fake_resume)
 
     assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert calls == [
         (
             sid,
@@ -250,6 +260,8 @@ def test_answer_infers_kimi_engine_after_worker_exit(wt, tmp_path, monkeypatch):
     )
 
     assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     # WT-31 D2.8: the engine is still inferred as kimi, but a kimi session has
     # no receipt source, so it is handed off BEFORE any resume (this test used
     # to require the headless kimi resume): no spawn, claim released, the
@@ -420,6 +432,8 @@ def test_answer_total_delivery_failure_releases_with_qa_embedded(
     monkeypatch.setattr(cli, "_resume_session_headless", lambda *a, **k: False)
 
     assert cli.cmd_answer(_answer_args(item["ref"], "A", engine=None)) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
 
     output = capsys.readouterr().out
     # WT-30 D7: every transport failed -> release the claim, no "resume manually".
@@ -496,6 +510,8 @@ def test_held_answer_is_cancelled_not_retried_after_ticket_closes(
     item = _blocked_codex_ticket(q, workers, tmp_path, worker_id="w-1", sid=sid)
 
     assert cli.cmd_answer(_answer_args(item["ref"], "A")) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     parked = messages.outbox_list(status="pending")
     assert [(m["ticket"], m["ticket_session"]) for m in parked] == [
         (item["ref"], sid)

@@ -249,6 +249,8 @@ def test_cli_answer_routes_parked_ticket(wt, monkeypatch, capsys):
     monkeypatch.setattr(wt.answers, "worker_alive", lambda wid: True)
     monkeypatch.setattr(wt.answers, "_wake", lambda *a, **k: None)
     assert wt.cli.main(["answer", it["ref"], "go left"]) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     out = capsys.readouterr().out
     assert "ANSWERED" in out and "affinity" in out
     assert wt.q.get(it["ref"])["pending_answer"]["state"] == "affinity"

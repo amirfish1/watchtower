@@ -50,6 +50,8 @@ def test_dependency_close_answers_and_routes(quiet):
     assert wt.answers.resume_dependency_waits() == []  # dep still open
     _close(wt, dep)
     assert wt.answers.resume_dependency_waits() == [f"{a}:{dep}"]
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     cur = wt.q.get(a)
     assert not cur.get("needs_input")
     pa = cur["pending_answer"]

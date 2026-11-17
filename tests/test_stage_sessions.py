@@ -406,6 +406,8 @@ def test_answer_on_a_normal_block_still_delivers(stg, monkeypatch):
     import argparse
     stg.cli.cmd_answer(argparse.Namespace(ref=ref, text="left", worker="", engine="",
                                           tid=False))
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert len(calls) == 1
 
 
