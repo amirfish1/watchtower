@@ -7590,6 +7590,7 @@ def reopen_and_claim(
         return claim_by_ref(reopened.get("ref", ident), session_id, session_uuid=session_uuid)
 
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
+    dependencies = _dependency_snapshot(ident=ident)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -7614,8 +7615,11 @@ def reopen_and_claim(
                 )
             # WT-33: the D9 child hook and the group claim check run before any
             # reset, so a refusal leaves the ticket untouched.
+            state, bref = blocker_verdict(it, _refs_index(data["items"] + dependencies))
+            if state != "ok":
+                raise ValueError(f"{it.get('ref')} waits on {bref} ({state})")
             _group_child_change_unlocked(data["items"], it, "reopen", force)
-            _group_claim_check_unlocked(data["items"], it)
+            _group_claim_check_unlocked(data["items"] + dependencies, it)
             now = _now_iso()
             # Reopen half: same field resets as update_status's "open" branch
             # (parity with reopen()/GitHub's reopen), except status lands on

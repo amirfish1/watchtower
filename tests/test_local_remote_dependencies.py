@@ -7,6 +7,7 @@ from test_github_backend import _install_fake_gh, _reload_isolated, _drainable
 @pytest.fixture
 def mixed(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
+    monkeypatch.setenv("WATCHTOWER_DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setenv("WATCHTOWER_GH_ISSUE_TRANSPORT", "graphql")
     monkeypatch.setenv("WT_NO_AUTOSTART", "1")
     config, q = _reload_isolated(tmp_path, monkeypatch)
@@ -210,3 +211,49 @@ def test_installed_cli_edit_wait_and_wake(mixed, tmp_path, monkeypatch):
     q.close(upstream, "synthetic-upstream", resolution={"summary": "accepted", "no_code": True})
     claimed = json.loads(cli("claim", "-q", "LOCAL", "--worker", "synthetic-wt85", "--json"))
     assert claimed["ref"] == ref
+
+
+def test_reopen_and_claim_cannot_bypass_remote_parent(mixed):
+    q, _ = mixed
+    upstream = parent(q)
+    ref = child(q, blocked_by=[upstream])
+    q.close(ref, force=True, resolution={"summary": "old closed child", "no_code": True})
+    with pytest.raises(ValueError, match="waiting"):
+        q.reopen_and_claim(ref, "rebound")
+    assert q.get(ref)["status"] == "closed"
+    q.claim_by_ref(upstream, "upstream")
+    q.close(upstream, "upstream", resolution={"summary": "accepted", "no_code": True})
+    assert q.reopen_and_claim(ref, "rebound")["status"] == "in_progress"
+
+
+def test_takeover_remote_parent_wait_and_wake(mixed, monkeypatch, tmp_path):
+    from watchtower import takeover as t
+    q, _ = mixed
+    upstream = parent(q)
+    ref = child(q, blocked_by=[upstream])
+    sid = "11111111-2222-4333-8444-555555555555"
+    obs = dict(session_id=sid, engine="claude", host="synthetic", repo_path=str(tmp_path),
+               completed_turn="turn-1", settings={}, native_store="synthetic")
+    monkeypatch.setattr(t.observations, "observe", lambda *a, **kw: obs)
+    with pytest.raises(ValueError, match="dependency gates"):
+        t.takeover(sid, ref)
+    q.claim_by_ref(upstream, "upstream")
+    q.close(upstream, "upstream", resolution={"summary": "accepted", "no_code": True})
+    result = t.takeover(sid, ref)
+    assert result["ticket"] == ref
+    assert q.get(ref)["status"] == "in_progress"
+
+    # Resume observes the same external gate after it changes again.
+    q.reopen(upstream, reason="synthetic acceptance withdrawn")
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked()
+        for it in data["items"]:
+            if it["ref"] == ref:
+                it["supervision"]["state"] = "waiting"
+                it["supervision"]["intent"]["state"] = "confirmed"
+        q._save_unlocked(data)
+    with pytest.raises(ValueError, match="dependency gates"):
+        t.resume(ref, result["generation"])
+    q.claim_by_ref(upstream, "upstream")
+    q.close(upstream, "upstream", resolution={"summary": "accepted again", "no_code": True})
+    assert t.resume(ref, result["generation"])["supervision"]["state"] == "running"

@@ -9,7 +9,8 @@ the snapshot) is refused rather than accepted without cycle validation.
 Local operations gather remote evidence **before** taking the local store
 lock. The transaction re-reads local records and combines them with the remote
 snapshot. Claims, explicit claims, peeks, stage retries and validation use
-single-issue fresh reads. Depth/manual/floor checks reuse the owning GitHub
+single-issue fresh reads. Atomic reopen-and-claim and takeover adoption/resume
+apply the same rule, including dependencies retained on closed tickets. Depth/manual/floor checks reuse the owning GitHub
 backend's bounded list cache. Only queues reached through named dependencies
 are contacted; an unrelated local operation performs no GitHub request.
 GitHub-dependent tickets use this same resolver in the opposite direction.

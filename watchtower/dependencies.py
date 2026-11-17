@@ -46,7 +46,7 @@ def resolve(items, refs, *, project="", fresh=True, transitive=False):
     return by_ref
 
 
-def local_snapshot(*, project=None, ident=None, refs=None, fresh=True, transitive=False):
+def local_snapshot(*, project=None, ident=None, session_id=None, refs=None, fresh=True, transitive=False):
     """Only fetch dependencies of this operation, never enumerate remote queues.
 
     Local records are re-read under the caller's lock. Unseen concurrent edges
@@ -58,9 +58,11 @@ def local_snapshot(*, project=None, ident=None, refs=None, fresh=True, transitiv
     items = q._load_unlocked(readonly=True).get("items", [])
     selected = [it for it in items
                 if (not project or it.get("project") == project)
-                and (ident is None or q._matches(it, ident))]
+                and (ident is None or q._matches(it, ident))
+                and (session_id is None or it.get("claimed_session_id") == session_id
+                     or (it.get("supervision") or {}).get("session", {}).get("session_id") == session_id)]
     wanted = refs if refs is not None else [
-        r for it in selected if it.get("status") != "closed"
+        r for it in selected if ident is not None or it.get("status") != "closed"
         for r in (it.get("blocked_by") or [])]
     if not wanted:
         return []

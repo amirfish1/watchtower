@@ -178,6 +178,8 @@ def takeover(session_id, ticket_ref='', *, queue='', title='', engine='', dry_ru
         raise ValueError('takeover supports local queue storage only')
     if legacy and (not legacy.get('migration_id') or legacy.get('owner_fenced') is not True):
         raise ValueError('legacy import requires migration_id and owner_fenced=true')
+    dependencies = (q._dependency_snapshot(ident=ticket_ref) if ticket_ref
+                    else q._dependency_snapshot(session_id=session_id))
     with _lock(), q._FileLock(q._lock_path()):
         data = q._load_unlocked(strict=True)
         rows = data['items']
@@ -229,8 +231,8 @@ def takeover(session_id, ticket_ref='', *, queue='', title='', engine='', dry_ru
             raise ValueError('duplicate or active plan gate prevents adoption')
         if (it.get('pending_answer') or {}).get('state') in ('routing','delivering','queued','affinity'):
             raise ValueError('settle existing pending answer delivery before takeover')
-        q._group_claim_check_unlocked(rows, it)
-        if q.blocker_verdict(it, q._refs_index(rows))[0] != 'ok':
+        q._group_claim_check_unlocked(rows + dependencies, it)
+        if q.blocker_verdict(it, q._refs_index(rows + dependencies))[0] != 'ok':
             raise ValueError('ticket has unresolved dependency gates')
 
         now = time.time()
@@ -505,6 +507,7 @@ def resume(ref, expected_generation):
         raise ValueError('expected generation must be positive')
     if q._github_backend_for_project(q._project_from_ident(ref)) is not None:
         raise ValueError('supervision resume supports local queue storage only')
+    dependencies = q._dependency_snapshot(ident=ref)
     with _lock() as dispatch_lock, q._FileLock(q._lock_path()) as queue_lock:
         if dispatch_lock._fh is None or queue_lock._fh is None:
             raise ValueError('recovery requires exclusive dispatch and queue locks')
@@ -539,7 +542,7 @@ def resume(ref, expected_generation):
                 or (other.get('claimed_session_id') == sid and other.get('status') == 'in_progress'))
                for other in data['items']):
             raise ValueError('ambiguous session ownership')
-        if q.blocker_verdict(it,q._refs_index(data['items']))[0] != 'ok':
+        if q.blocker_verdict(it,q._refs_index(data['items'] + dependencies))[0] != 'ok':
             raise ValueError('ticket has unresolved dependency gates')
         s.update(state='running',wait_identity='',wait_source='',reminders=0,
                  next_deadline=time.time()+IDLE_SECONDS,resumed_generation=expected_generation,
