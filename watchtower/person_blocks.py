@@ -90,12 +90,19 @@ def apply(operation, inventory, worker):
     backend = q._github_backend_for_project(q._project_from_ident(ident))
     if backend is not None:
         from .github_backend import _serialized_body_write, _split_body
+        from . import github_pipeline
+
+        delivery_fields = ("pipeline_gen", "parked", "pending_answer", "last_answer_gen")
+        delivery_before = {}
 
         @_serialized_body_write
         def write(backend):
             item = backend.get(ident)
             if item is None:
                 raise ValueError(f"missing {ident}")
+            github_pipeline._fence(item)
+            delivery_before.update({k: copy.deepcopy(item.get(k)) for k in delivery_fields})
+            delivery_before["pipeline_local"] = bool(item.get("pipeline_local"))
             body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
             checked = dict(meta, ref=ident, status=item.get("issue_status") or item.get("status"))
             if operation["action"] in ("dependency", "reopen"):
@@ -126,17 +133,30 @@ def apply(operation, inventory, worker):
             return result
 
         result = write(backend)
-        if result and result.get("pipeline_local") and operation["action"] in ("dependency", "reopen"):
-            from . import github_pipeline
-
+        if result and delivery_before.get("pipeline_local") and operation["action"] in ("dependency", "reopen"):
             def unpark(it):
                 # The issue write must have landed before dropping delivery
-                # ownership. A new block generation is never touched.
+                # ownership. A new block, pipeline, park or answer generation
+                # is never touched, including a route advanced during the write.
                 if it.get("needs_input") or it.get("blocked_at"):
                     raise ValueError(f"{ident}: reblocked during sidecar cleanup")
+                if it.get("issue_status") != "open":
+                    raise ValueError(f"{ident}: issue changed during sidecar cleanup")
+                if any(it.get(k) != delivery_before[k] for k in delivery_fields):
+                    raise ValueError(f"{ident}: delivery changed during sidecar cleanup")
+                edge_from = q._pa_edge_start(it)
+                now = q._now_iso()
+                q._reopen_pending_unlocked(it, now, "handoff", "reviewed person-block migration")
                 it.pop("parked", None)
-                it.pop("pending_answer", None)
-            github_pipeline.mutate(ident, unpark)
+                it["status"] = "open"
+                if edge_from and edge_from[0] != "handed_off":
+                    q._check_answer_edge_from(it, edge_from)
+                q._append_history(it, "person_block_delivery_released", by=q._by("worker", worker),
+                                  at=now, action=operation["action"],
+                                  gen=(it.get("pending_answer") or {}).get("gen"))
+            if github_pipeline.mutate(ident, unpark) is None:
+                raise ValueError(f"{ident}: sidecar disappeared during cleanup")
+            q._supersede_outbox(ident)
         return backend.get(ident)
     with q._FileLock(q._lock_path()):
         data = q._load_unlocked()

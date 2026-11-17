@@ -108,6 +108,94 @@ def test_migration_fences_changed_question_and_preserves_real_gate(env):
     assert q.get(ref)['needs_input'] and '[Q11:money]' in q.get(ref)['block_question']
 
 
+def _sidecar_migration(tmp_path, monkeypatch):
+    from tests.test_github_pipeline_sidecar import _claimed_gated, _park_in_sidecar
+
+    q, ref = _claimed_gated(tmp_path, monkeypatch)
+    legacy_block(q, ref, 'w1', origin='worker', question='Await coordinator; no sends authorized',
+                 wait_on='worker')
+    carried = [{'gen': 3, 'question': 'Earlier gate?', 'answer': 'Source only'}]
+    pending = dict(state='routing', gen=4, question='Reviewed gate?', answer='Keep all guards',
+                   carried=carried)
+    _park_in_sidecar(q, ref, pending_answer=pending, last_answer_gen=4)
+    return q, ref, pending
+
+
+@pytest.mark.parametrize('action', ['dependency', 'reopen'])
+@pytest.mark.parametrize('state', ['routing', 'delivering', 'queued', 'delivered', 'affinity', 'handed_off'])
+def test_sidecar_migration_hands_off_answer_with_history(tmp_path, monkeypatch, action, state):
+    from watchtower import github_pipeline
+    q, ref, pending = _sidecar_migration(tmp_path, monkeypatch)
+    pending['state'] = state
+    github_pipeline.mutate(ref, lambda it: it['pending_answer'].update(state=state))
+    monkeypatch.setenv('WATCHTOWER_STRICT_EDGES', '1')
+    dep = q.enqueue(project='GHI', note='Owning prerequisite', source='test')
+    op = _operation(q, ref, action, **({'after': [dep['ref']]} if action == 'dependency' else {}))
+    history = list(q.get(ref)['history'])
+    cancelled = []
+    monkeypatch.setattr(q, '_supersede_outbox', cancelled.append)
+    migration.apply(op, q.list_items(), 'migration-worker')
+    item = q.get(ref)
+    assert item['status'] == 'open' and not item.get('parked') and not item.get('needs_input')
+    assert item['pending_answer']['state'] == 'handed_off'
+    for field in ('gen', 'question', 'answer', 'carried'):
+        assert item['pending_answer'][field] == pending[field]
+    assert item['last_answer_gen'] == 4
+    assert all(event in item['history'] for event in history)
+    assert any(h['event'] == 'person_block_delivery_released' and h['gen'] == 4 for h in item['history'])
+    assert cancelled == [ref]
+    if action == 'dependency':
+        assert q.blocker_verdict(item, {i['ref']: i for i in q.list_items()})[0] == 'waiting'
+    else:
+        claimed = q.claim_by_ref(ref, 'replacement-worker')
+        assert claimed['pending_answer']['answer'] == pending['answer']
+        assert claimed['pending_answer']['carried'] == pending['carried']
+
+
+@pytest.mark.parametrize('change', ['answer', 'answer-state', 'park', 'pipeline', 'reblock', 'foreign', 'missing'])
+def test_sidecar_migration_refuses_changed_delivery(tmp_path, monkeypatch, change):
+    import copy
+    from watchtower import github_pipeline
+    q, ref, _ = _sidecar_migration(tmp_path, monkeypatch)
+    op = _operation(q, ref, 'reopen')
+    real_mutate = github_pipeline.mutate
+    retained = {}
+
+    def raced(ident, fn, **kwargs):
+        def replace(it):
+            if change == 'answer':
+                it['pending_answer'].update(gen=5, answer='New answer')
+            elif change == 'answer-state':
+                it['pending_answer']['state'] = 'delivering'
+            elif change == 'park':
+                it['parked']['session_id'] = 'replacement-session'
+        if change in ('answer', 'answer-state', 'park'):
+            real_mutate(ident, replace)
+        else:
+            from tests.test_github_pipeline_sidecar import _sidecar
+            import json
+            p = _sidecar(q)
+            data = json.loads(p.read_text())
+            if change == 'pipeline':
+                next(iter(data['items'].values()))['gen'] += 1
+                p.write_text(json.dumps(data))
+            elif change == 'missing':
+                data['items'].clear()
+                p.write_text(json.dumps(data))
+            elif change == 'foreign':
+                q._github_backend_for_project('GHI').update(ref, pipeline_host='another-host/owner')
+            else:
+                q._github_backend_for_project('GHI').update(ref, needs_input=True,
+                                                         block_question='Approve the exact new gate?')
+        retained.update(copy.deepcopy(github_pipeline._read_strict()))
+        return real_mutate(ident, fn, **kwargs)
+
+    monkeypatch.setattr(github_pipeline, 'mutate', raced)
+    with pytest.raises(ValueError, match='changed during|reblocked during|owned by host|missing'):
+        migration.apply(op, q.list_items(), 'migration-worker')
+    assert github_pipeline._read_strict() == retained
+
+
 def test_cycle_refused_before_ticket_changes(env):
     q, _, _, _, name = env
     ref = _ticket(q, name)
