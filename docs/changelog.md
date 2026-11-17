@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-11-17 — GitHub input waits
+
+- Keep open GitHub tickets awaiting input out of worker claims and staffing
+  depth, including explicit run requests; answer the question before running.
+
 ## 2026-11-15 — external client primitives
 
 - Preserve an opaque `client_id` on local and GitHub-backed tickets; add, edit,

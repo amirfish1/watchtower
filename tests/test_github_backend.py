@@ -1808,6 +1808,35 @@ def test_github_backend_refuses_direct_claim_until_a_run_is_requested(tmp_path, 
     assert claimed["status"] == "in_progress"
 
 
+@pytest.mark.parametrize("requested", [False, True])
+def test_input_wait_is_never_claimable_before_an_answer(tmp_path, monkeypatch, requested):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    from watchtower.github_backend import _body_with_metadata
+
+    question = "Which rollout should we use?"
+    labels = ["watchtower:play"] if requested else []
+    _write_fake_issues(state, [
+        _fake_issue(1, "Older input wait", labels=labels, body=_body_with_metadata(
+            "Waiting for a decision", {"needs_input": True, "block_question": question})),
+        _fake_issue(2, "Ready work"),
+    ])
+    waiting = q.get("GHI-1")
+    assert waiting["status"] == "open"
+    assert waiting["needs_input"] is True
+    for field in ("auto_eligible", "manual_eligible", "work_it", "claimable"):
+        assert waiting[field] is False
+    assert q.count_claimable(project="GHI") == 1
+    with pytest.raises(ValueError, match="waiting for input"):
+        q.claim_by_ref("GHI-1", "worker-1")
+    claimed = q.claim_next("worker-1", project="GHI")
+    assert claimed["ref"] == "GHI-2"
+    assert q.get("GHI-1")["block_question"] == question
+
+
 def test_github_drain_off_issues_are_visible_but_not_spawn_worthy(tmp_path, monkeypatch):
     state = _install_fake_gh(tmp_path, monkeypatch)
     config, q = _reload_isolated(tmp_path, monkeypatch)

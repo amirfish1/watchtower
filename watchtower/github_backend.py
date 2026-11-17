@@ -2388,6 +2388,7 @@ class GitHubIssuesBackend:
         # Explicit gates survive across hosts; legacy timer fields have no
         # admission semantics and cannot wake a ticket when a clock passes.
         workable = (queue_member and status == "open"
+                    and not meta.get("needs_input")
                     and not meta.get("duplicate_of") and not meta.get("pipeline_hold"))
         auto_eligible = bool(
             workable
@@ -3512,6 +3513,8 @@ class GitHubIssuesBackend:
             status = item.get("status", "open")
             if status != "open":
                 raise ValueError(f"{ref} is not open (status={status})")
+            if item.get("needs_input"):
+                raise ValueError(f"{ref} is waiting for input; use `wt answer {ref}` first")
             # No whitelist to fail any more: the only way to be ineligible is
             # to be opted out, inside the grace period, or on a queue that is
             # not draining. `wt run` (run_requested) overrides all three.
