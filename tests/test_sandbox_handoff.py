@@ -10,6 +10,17 @@ from watchtower import sandbox_bridge as bridge, sandbox_handoff as handoff, san
 from tests.test_sandbox_bridge import env, claim, close_body, submit  # noqa: F401
 
 
+@pytest.fixture(autouse=True)
+def _isolated_git_config(tmp_path, monkeypatch):
+    """Adoption inspects the real Git hook chain; keep a developer's global
+    core.hooksPath out of these fixtures (tests/test_sandbox_adoption_safety.py
+    covers the hook policy itself)."""
+    home = tmp_path / "gitconfig-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "xdg"))
+
+
 def git(repo, *args):
     return subprocess.check_output(["/usr/bin/git", "-c", "core.hooksPath=/dev/null",
                                    "-C", str(repo), *args], text=True).strip()

@@ -5,10 +5,54 @@
 # `pytest tests -q` covers the rest.
 #
 # Install pytest before pushing; an unavailable gate must stop the push.
+#
+# wt-sandbox-aware-prepush (marker read by watchtower.sandbox_handoff): commits
+# adopted from a sandbox builder carry a "WT-Sandbox-Adopted:" trailer. Their
+# bytes are untrusted, so they are tested ONLY in the restricted sandbox via the
+# deployed WatchTower (never this worktree's code), and a sandbox that cannot
+# run them blocks the push. There is no host fallback and no --no-verify path.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+
+ZERO="0000000000000000000000000000000000000000"
+adopted_sha=""
+while read -r _lref local_sha _rref remote_sha || [ -n "${local_sha:-}" ]; do
+  [ -n "${local_sha:-}" ] && [ "$local_sha" != "$ZERO" ] || continue
+  if [ "${remote_sha:-$ZERO}" = "$ZERO" ]; then
+    range=("$local_sha" --not --remotes)
+  else
+    range=("${remote_sha}..${local_sha}")
+  fi
+  # An unreadable range is treated as adopted: fail toward the sandbox.
+  if ! msgs="$(git log --format=%B "${range[@]}" 2>/dev/null)" \
+     || printf '%s\n' "$msgs" | grep -q '^WT-Sandbox-Adopted: '; then
+    adopted_sha="$local_sha"
+    break
+  fi
+done
+
+if [ -n "$adopted_sha" ]; then
+  echo "pre-push: adopted sandbox commit in range; testing in the restricted sandbox…"
+  TRUSTED="$(wt deploy --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' 2>/dev/null || true)"
+  if [ -z "$TRUSTED" ] || [ ! -f "$TRUSTED/scripts/sandbox_test_commit.py" ]; then
+    echo "pre-push: no trusted WatchTower deployment found (wt deploy --json); push blocked." >&2
+    exit 1
+  fi
+  [ -n "$(git rev-parse --verify -q "$adopted_sha^{commit}")" ] || { echo "pre-push: cannot resolve $adopted_sha; push blocked." >&2; exit 1; }
+  if ! (cd "$TRUSTED" && python3 -I scripts/sandbox_test_commit.py --repo "$REPO_ROOT" \
+        --commit "$(git -C "$REPO_ROOT" rev-parse "$adopted_sha^{commit}")" \
+        --command "${WT_SANDBOX_GATE_COMMAND:-python3 -m pytest tests/test_queue.py tests/test_smoke.py -q --tb=short}"); then
+    echo "❌ pre-push sandbox gate FAILED or could not run — push blocked (no host fallback)." >&2
+    echo "   If the sandbox's system python3 lacks pytest, install it system-wide (outside the" >&2
+    echo "   sandbox roots) or set WT_SANDBOX_GATE_COMMAND to a command the sandbox can run." >&2
+    echo "   Never --no-verify; see docs/sandbox-adoption-safety.md." >&2
+    exit 1
+  fi
+  echo "pre-push: sandbox gate passed ✓"
+  exit 0
+fi
 
 if [ ! -d tests ]; then
   exit 0  # nothing to gate on this checkout
