@@ -3294,46 +3294,8 @@ def cmd_gate_check(args: argparse.Namespace) -> int:
 
 
 def cmd_undo(args: argparse.Namespace) -> int:
-    """Revert the commit behind the latest auto-decision on <ref> and verify it (CCC-370)."""
-    import subprocess
-    from . import autodecide
-    item = q.get(args.ref)
-    if not item:
-        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
-        return 1
-    rows = [r for r in q.auto_decisions(item.get("project", "")) if r["ref"] == item["ref"]]
-    live = [r for r in rows if not r["reversed"]]
-    if not live:
-        print(f"error: {_display_ref(item)} has no un-reversed auto-decision", file=sys.stderr)
-        return 1
-    ev = live[-1]["event"]
-    sha = str(ev.get("commit") or "")
-    if (ev.get("class") != "code-change-revertable" or not sha):
-        print("error: only code-change-revertable decisions with a recorded commit can be undone here",
-              file=sys.stderr)
-        return 1
-    from . import config
-    repo = str(item.get("repo_path") or config.repo_path(item.get("project", "")) or os.getcwd())
-    def git(*a):
-        return subprocess.run(["git", "-C", repo, *a], capture_output=True, text=True)
-    if git("cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
-        print(f"error: commit {sha[:10]} not found in {repo}", file=sys.stderr)
-        return 1
-    before = git("rev-parse", "HEAD").stdout.strip()
-    r = git("revert", "--no-edit", sha)
-    after = git("rev-parse", "HEAD").stdout.strip()
-    if r.returncode != 0 or not after or after == before:
-        git("revert", "--abort")
-        print(f"error: git revert failed, decision NOT marked reversed:\n{r.stderr.strip()}", file=sys.stderr)
-        return 1
-    subj = git("log", "-1", "--format=%s%n%b", after).stdout
-    if sha[:7] not in subj and "Revert" not in subj:
-        print("error: revert commit not verified, decision NOT marked reversed", file=sys.stderr)
-        return 1
-    q.note_auto_reversed(item["ref"], ev.get("decision_id", ""), original=sha, revert=after,
-                         by=args.worker or _default_worker_id())
-    print(f"REVERTED: {_display_ref(item)} — {sha[:10]} undone by {after[:10]} (not pushed; push it yourself)")
-    return 0
+    from .decision_undo import run
+    return run(args, args.worker or _default_worker_id())
 
 
 def cmd_policy(args: argparse.Namespace) -> int:
@@ -3345,6 +3307,8 @@ def cmd_policy(args: argparse.Namespace) -> int:
         for r in rows:
             ft = r.get("followthrough") or {}
             rev = " reversed" if r.get("reversed") else ""
+            for outcome in r.get("outcomes") or []:
+                rev += " " + outcome["event"].removeprefix("auto_decision_")
             print(f"{_display_ref(r)}\t{ft.get('state', '?')}{rev}\t{ft.get('reason', '')}")
         if not rows:
             print("(no auto-decisions)")
@@ -8304,9 +8268,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("legacy", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_defer)
 
-    s = sub.add_parser("undo", help="revert the commit behind a ticket's latest auto-decision and verify it")
+    s = sub.add_parser("undo", help="verify a selected decision outcome: revert, consumed replay, or cancellation")
     s.add_argument("ref")
     s.add_argument("--worker", default="")
+    s.add_argument("--decision", default="", help="exact decision_id; required when multiple approvals exist")
+    outcome = s.add_mutually_exclusive_group()
+    outcome.add_argument("--consumed", action="store_true", help="record spent requests as non-reversible; preserve evidence")
+    outcome.add_argument("--cancel", action="store_true", help="cancel a supported ReplayControl runner; never execute undo text")
+    s.add_argument("--evidence", default="", help="existing JSON evidence or supported runner control ledger")
+    s.add_argument("--note", default="", help="explain how historical evidence belongs to the selected decision")
     s.set_defaults(func=cmd_undo)
 
     s = sub.add_parser("gate-check", help="re-evaluate a blocked ticket's auto-approval proposal, read-only, "
