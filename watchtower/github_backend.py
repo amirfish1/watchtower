@@ -2451,6 +2451,7 @@ class GitHubIssuesBackend:
             "blocked_at": str(meta.get("blocked_at") or ""),
             # The orphan sweep's answer grace keys on this (OPS-200).
             "answered_at": meta.get("answered_at"),
+            "answer_dispatch": meta.get("answer_dispatch"),
             "blocked_by": [str(r) for r in (meta.get("blocked_by") or []) if r]
             if isinstance(meta.get("blocked_by"), list) else [],
             "client_id": meta.get("client_id", ""),
@@ -4081,6 +4082,7 @@ class GitHubIssuesBackend:
         post_comment: bool = True,
         source_comment_key: str = "",
         kind: str = "human",
+        delivery: Optional[dict] = None,
     ) -> Optional[Dict[str, Any]]:
         """Record a human answer on a blocked GitHub-backed ticket and post it
         as an issue comment. ``kind`` attributes it (``system`` for the
@@ -4130,6 +4132,9 @@ class GitHubIssuesBackend:
                     return "skip"
                 pa = _q._write_pending_answer_unlocked(it, answer_text, now, by_kind=kind,
                                                        clip=_COMMENT_MAX_CHARS)
+                if delivery is not None:
+                    from . import answer_dispatch
+                    answer_dispatch.pending_options(pa, delivery)
                 if route_key:
                     pa["entry_key"] = route_key
                 return None
@@ -4170,6 +4175,13 @@ class GitHubIssuesBackend:
                 worker=str(session_id or ""),
                 reason="answered_without_resumable_session",
             )
+        if delivery is not None:
+            from . import answer_dispatch
+            answer_dispatch.record(item, answer_text, session_id, kind, delivery)
+            job = item["answer_dispatch"]
+            if text_ref:
+                job.update(text="", text_ref=text_ref, text_sha256=_text_sha256(answer_text))
+            meta["answer_dispatch"] = job
         self._edit_body(item, body, meta)
         if releasing:
             self._run([

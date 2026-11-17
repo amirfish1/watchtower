@@ -489,6 +489,8 @@ def test_answer_on_blocked_plan_warns(plan_cli, capsys):
     q, cli = plan_cli.q, plan_cli.cli
     ref = _block_plan(plan_cli)
     cli.cmd_answer(argparse.Namespace(ref=ref, text="ok", worker="", engine="", tid=False))
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert "plan gate is STILL BLOCKED" in capsys.readouterr().out
 
 

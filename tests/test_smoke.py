@@ -2284,6 +2284,8 @@ def test_answer_requeues_when_session_over_context_budget(store, tmp_path, monke
     rc = cli.main(["answer", "ANSQ-1", "--worker", "human",
                    "the answer is B"])
     assert rc == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     out = capsys.readouterr().out
     assert "fresh worker" in out
 
