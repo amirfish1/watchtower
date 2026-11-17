@@ -130,6 +130,20 @@ def test_resume_in_flight_then_gives_up(wt, monkeypatch):
     g.step(wt.answers.route_pending_answers, edge="E10", row="work.open")
 
 
+@pytest.mark.parametrize("delivery", ["in_flight", "queued"])
+def test_retired_defer_preserves_resumed_answer(wt, monkeypatch, delivery):
+    g = Golden(wt, _claimed(wt))
+    _resuming(wt, g, monkeypatch, delivery)
+    gen = _gen(wt, g.ref)
+    bound = g.step(wt.q.resume_claim, g.ref, gen, edge="E3", row="answer.delivering")
+    if delivery == "queued":
+        g.step(wt.answers._deliver_bound, bound, gen, edge="E6", row="answer.queued")
+    before = g.item()
+    with pytest.raises(ValueError, match="retired"):
+        wt.q.defer(g.ref, "w1", "+2d", "observe real events")
+    assert g.item() == before
+
+
 def test_queued_then_row_gone_then_redelivered(wt, monkeypatch):
     g = Golden(wt, _claimed(wt))
     _resuming(wt, g, monkeypatch, "queued")

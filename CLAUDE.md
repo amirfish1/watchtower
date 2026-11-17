@@ -4,6 +4,13 @@ Run fleets of AI coding-agent workers, unattended: tickets go into named
 queues on a durable append-only JSON store; workers drain them automatically.
 Stdlib-only Python, zero runtime dependencies — keep it that way.
 
+Use named ticket refs in prose, for example `WT-79:add-ticket-subscribe`.
+The number is the stable identity; names are up to four whole words and 30
+characters, generated at filing and editable with `wt edit REF --slug NAME`.
+Commands accept bare refs or any colon/hyphen suffix, including stale names.
+Keep `ref` bare in JSON, dependency keys, receipts and transport identifiers;
+use `watchtower.refs.display_ref(item)` at human-facing output boundaries.
+
 ## Shared clone rules
 
 This checkout is a shared clone on `main`; several agent sessions work in it

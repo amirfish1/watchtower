@@ -1454,7 +1454,7 @@ def test_cli_can_configure_and_use_github_backend(tmp_path, monkeypatch, capsys)
 
     assert main(["claim", "-q", "GHCLI", "--worker", "cli-worker"]) == 0
     out = capsys.readouterr().out
-    assert "CLAIMED: GHCLI-1 -> cli-worker" in out
+    assert "CLAIMED: GHCLI-1:cli-issue -> cli-worker" in out
 
     assert main([
         "close", "GHCLI-1",
@@ -1806,6 +1806,35 @@ def test_github_backend_refuses_direct_claim_until_a_run_is_requested(tmp_path, 
 
     claimed = q.claim_by_ref("GHI-1", "worker-1")
     assert claimed["status"] == "in_progress"
+
+
+@pytest.mark.parametrize("requested", [False, True])
+def test_input_wait_is_never_claimable_before_an_answer(tmp_path, monkeypatch, requested):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("GHI", "github")
+    config.set_github_repo("GHI", "test-owner/test-repo")
+    _drainable(config)
+    from watchtower.github_backend import _body_with_metadata
+
+    question = "Which rollout should we use?"
+    labels = ["watchtower:play"] if requested else []
+    _write_fake_issues(state, [
+        _fake_issue(1, "Older input wait", labels=labels, body=_body_with_metadata(
+            "Waiting for a decision", {"needs_input": True, "block_question": question})),
+        _fake_issue(2, "Ready work"),
+    ])
+    waiting = q.get("GHI-1")
+    assert waiting["status"] == "open"
+    assert waiting["needs_input"] is True
+    for field in ("auto_eligible", "manual_eligible", "work_it", "claimable"):
+        assert waiting[field] is False
+    assert q.count_claimable(project="GHI") == 1
+    with pytest.raises(ValueError, match="waiting for input"):
+        q.claim_by_ref("GHI-1", "worker-1")
+    claimed = q.claim_next("worker-1", project="GHI")
+    assert claimed["ref"] == "GHI-2"
+    assert q.get("GHI-1")["block_question"] == question
 
 
 def test_github_drain_off_issues_are_visible_but_not_spawn_worthy(tmp_path, monkeypatch):
@@ -3924,11 +3953,16 @@ def _cmds(state, verb):
 
 
 def _assert_no_content_leak(tmp_path, state, text):
-    """Only the fake GitHub state may hold the resolution text: no error,
-    log, cache or connectivity file the backend wrote may echo it."""
+    """No error/log/connectivity leak. WT-83 deliberately retains fetched
+    prose in its private full-text source snapshots; only that cache is exempt.
+    """
     assert _SENTINEL not in text
     for f in tmp_path.rglob("*"):
         if f.is_file() and f != state and f.suffix != ".py" and f.name != "gh":
+            from watchtower import related_snapshots
+            if f.is_relative_to(related_snapshots.directory()) and f.suffix == ".json":
+                assert f.stat().st_mode & 0o077 == 0, f
+                continue
             assert _SENTINEL not in f.read_text(errors="replace"), f
 
 
@@ -4677,3 +4711,46 @@ def test_client_id_github_cli_roundtrip_and_filter(tmp_path, monkeypatch, capsys
     assert json.loads(capsys.readouterr().out)['client_id'] == ''
     assert cli.main(['ls', '-q', 'GHI', '--client-id', '', '--json']) == 0
     assert len(json.loads(capsys.readouterr().out)) == 2
+
+
+def test_tracker_github_blocks_do_not_create_claims(tmp_path, monkeypatch):
+    _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend('GHI', 'github')
+    config.set_github_repo('GHI', 'test-owner/test-repo')
+    config.set_queue_kind('GHI', 'tracker')
+    item = q.enqueue(project='GHI', note='Feature decision')
+    for operation in (
+        lambda: q.claim_next('worker', project='GHI'),
+        lambda: q.claim_by_ref(item['ref'], 'worker'),
+        lambda: q.mark_runnable(item['ref']),
+    ):
+        with pytest.raises(ValueError, match='tracker'):
+            operation()
+    blocked = q.block(item['ref'], session_id='worker', question='Choose an option')
+    assert blocked['needs_input'] and not blocked.get('claimed_by')
+    assert q.count_claimable('GHI') == q.count_manual_eligible('GHI') == 0
+    assert q.peek_next(project='GHI') is None
+
+
+def test_named_refs_round_trip_github_titles_and_metadata(tmp_path, monkeypatch):
+    state = _install_fake_gh(tmp_path, monkeypatch)
+    config, q = _reload_isolated(tmp_path, monkeypatch)
+    config.set_backend("SMALL-BUGS", "github")
+    config.set_github_repo("SMALL-BUGS", "test-owner/test-repo")
+    item = q.enqueue(project="SMALL-BUGS", title="Fix ticket names", note="Details")
+    assert item["ref"] == "SMALL-BUGS-1"
+    assert item["title"] == "Fix ticket names"
+    assert item["slug"] == "fix-ticket-names"
+    issue = json.loads(state.read_text())["issues"][0]
+    assert issue["title"] == "SMALL-BUGS-1:fix-ticket-names Fix ticket names"
+    assert q.get("SMALL-BUGS-1:mistyped")["ref"] == item["ref"]
+    assert q.get("SMALL-BUGS-1-old-name")["ref"] == item["ref"]
+    edited = q.update("SMALL-BUGS-1:old", title="New title", slug="Renamed ticket")
+    assert edited["slug"] == "renamed-ticket"
+    assert edited["title"] == "New title"
+    issue = json.loads(state.read_text())["issues"][0]
+    assert issue["title"] == "SMALL-BUGS-1:renamed-ticket New title"
+    assert 'slug: "renamed-ticket"' in issue["body"]
+    q.update("SMALL-BUGS-1:anything", title="Another title")
+    assert q.get("SMALL-BUGS-1")["slug"] == "renamed-ticket"

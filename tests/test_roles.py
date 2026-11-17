@@ -82,4 +82,4 @@ def test_edit_clear_then_apply_replaces(wt_env, run_cli):
     assert run_cli("edit", ra, "--clear-gates", "--gate", "plan", "--gate", "verify").code == 0
     assert wt_env.queue.get(ra)["gates"] == ["plan", "verify"]
     assert run_cli("edit", rc, "--clear-after", "--after", rb).code == 0
-    assert wt_env.queue.get(rc)["blocked_by"] == [rb]
+    assert wt_env.queue.get(rc)["blocked_by"] == [wt_env.queue.get(rb)["ref"]]

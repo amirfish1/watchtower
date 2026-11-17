@@ -23,7 +23,7 @@ SKILL_NAMES: Tuple[str, ...] = (
     "watchtower", "group-chat-checkin", "critique", "wt-triage-queue",
     "wt-queue-sweep", "wt-queue-review", "wt-queue-care", "compact-to-queue", "add-annotate-widget",
     "auto-snapshot-on", "auto-snapshot-off", "snapshot-now",
-    "resume-from-snapshot", "resume-from-session",
+    "resume-from-snapshot", "resume-from-session", "superpowers-to-watchtower",
 )
 
 # One entry per agent harness this machine might have. A harness is skipped

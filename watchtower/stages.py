@@ -292,8 +292,11 @@ def _github_backed(item: Dict[str, Any]) -> bool:
 def desired(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """The stage sessions the stored ticket states call for: one entry
     ``{ref, role, key, project}`` per ticket at most."""
+    from . import config
     out: List[Dict[str, Any]] = []
     for it in items:
+        if config.is_tracker(it.get("project", "")):
+            continue
         ref = str(it.get("ref") or "")
         if not ref or it.get("duplicate_of"):
             continue
@@ -682,6 +685,9 @@ def _spawn(item: Dict[str, Any], role: str, key: str, ss: Dict[str, Any],
            cause: str, budget: _Budget) -> str:
     """Spawn one stage session. Returns a short action tag; never raises."""
     ref, project = str(item["ref"]), str(item.get("project") or "")
+    from . import config
+    if config.is_tracker(project):
+        return "tracker"
     attempt = int(ss.get("attempt") or 0) + 1
     engine = ""
     try:
@@ -891,6 +897,7 @@ def _supervise(d: Dict[str, Any], rows: List[Dict[str, Any]], budget: _Budget) -
         legacy = _legacy_meta(item, role)
         retired = q.stage_retired_ids(item)   # WT-33 D10: never adopt a retired session
         if (not ss and legacy.get("worker_id") and legacy["worker_id"] not in retired
+                and q.RETIRED_UNKNOWN not in retired
                 and (not legacy.get("stage_key") or legacy.get("stage_key") == key)):
             adopted = True
             ss = {"key": key, "role": role, "attempt": 1, "worker_id": legacy["worker_id"],
@@ -1036,11 +1043,14 @@ def reconcile_stages(only_ref: str = "") -> List[Tuple[str, str]]:
     ``(ref, action)`` pairs: spawned / respawn-related / blocked / resumed / wait.
     Plan-group integrations (WT-33) run first, then retired stage sessions
     are stopped, then the stage sessions the states call for are supervised."""
-    from . import usage
-    try:
-        usage.reconcile()
-    except Exception as exc:  # One corrupt telemetry record cannot stop stages.
-        _log("USAGE", type(exc).__name__)
+    # Late accounting scans all sessions; leave it to unscoped daemon passes
+    # so a ticket-specific repair never waits on unrelated transcripts.
+    if not only_ref:
+        from . import usage
+        try:
+            usage.reconcile()
+        except Exception as exc:  # One corrupt telemetry record cannot stop stages.
+            _log("USAGE", type(exc).__name__)
     budget = _Budget(spawns_per_tick())
     try:
         _filing_maintenance(budget, only_ref)
@@ -1051,7 +1061,13 @@ def reconcile_stages(only_ref: str = "") -> List[Tuple[str, str]]:
             budget.acted.append((ref, f"integration:{outcome}"))
     except Exception as exc:  # noqa: BLE001 - one group never stops the pass
         _log("INTEGRATE", f"group sweep error: {exc}")
-    items = q.list_items() or []
+    try:
+        for ref in q.sync_duplicates(only_ref):
+            budget.acted.append((ref, "duplicate:synced"))
+    except Exception as exc:  # one broken local link must not stop stage supervision
+        _log("DUPLICATE", f"local duplicate sweep error: {exc}")
+    from . import config
+    items = [it for it in (q.list_items() or []) if not config.is_tracker(it.get("project", ""))]
     try:
         from . import github_duplicates
         for ref in github_duplicates.sweep(items, only_ref):

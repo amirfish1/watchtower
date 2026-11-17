@@ -65,6 +65,9 @@ OWN_SPEND_DEFAULT_MAX_USD = 25.0
 _DOLLAR_FIGURE = re.compile(r"\$\s?(\d+(?:\.\d+)?)")
 # Words that are not real money when the replay is zero-dollar on the subscription proxy.
 _BENIGN_MONEY = re.compile(r"\bsubscription(?:\s+(?:proxy|auth|plan|quota|token))?|\$0(?:\.0+)?(?![\d.])", re.I)
+# A desk may exempt replay wording as internal engineering work. Explicit paid
+# execution still contradicts a zero-dollar replay, regardless of that exemption.
+_PAID_REPLAY = re.compile(r"\bpaid\s+(?:tests?|runs?|evals?|evaluations?|replays?)\b", re.I)
 
 # Global defaults. A queue may add classes / attestations and tighten numbers
 # (queue-config.json -> "auto_decision"), never remove a class's requirements
@@ -408,6 +411,9 @@ def evaluate(item: Dict[str, Any], p: Dict[str, Any], *, items: Optional[List[Di
         if len(hits2) < len(hits):
             res["exempted"] = [h for h in hits if h not in hits2]
             hits = hits2
+    if spec and spec.get("replay") and _PAID_REPLAY.search(text):
+        if not any(h.startswith("money") for h in hits):
+            hits.append("money or prices")
     res["matched"] = hits
     if err:
         chk("hard-stop floor", False, err, "retry; the floor must load")

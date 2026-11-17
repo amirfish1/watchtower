@@ -29,7 +29,7 @@ def test_follower_is_held_and_inherits_only_a_proven_verify(tmp_path, monkeypatc
 
     f = q.get(dup)
     assert f["duplicate_of"] == orig and f["status"] == "open" and not f["work_it"]
-    assert "2099-12-31" in _issue(state, dup)["body"]  # fenced for hosts without OPS-208
+    assert f["pipeline_hold"]["why"] == "duplicate"
     assert q.claim_next("builder-3", project="GHI")["ref"] == orig
     with pytest.raises(ValueError, match="follows duplicate original"):
         q.close(dup, "builder-3", resolution="independent")
@@ -40,8 +40,11 @@ def test_follower_is_held_and_inherits_only_a_proven_verify(tmp_path, monkeypatc
     github_duplicates.sync(dup)
     assert q.get(dup)["status"] == "open"              # force-accept skipped verify: no proof
     assert _issue(state, dup)["state"] == "OPEN"
+    assert not q.get(dup).get("duplicate_of")  # terminal unproven wait is released
+    assert q.get(dup)["gates"] == ["verify"]
 
     q.update_status(orig, "open", reason="redo")
+    q.link_duplicate(dup, orig)  # explicitly follow the reopened primary
     assert q.claim_by_ref(orig, "builder-3")
     q.close(orig, "builder-3", resolution={"summary": "fixed", "commit": "abc123"})
     cycle = q.get(orig)["verify_cycle"]
@@ -91,3 +94,30 @@ def test_close_duplicate_of_cli_tolerates_item_without_duplicate_of(tmp_path, mo
     args = argparse.Namespace(ref=dup, duplicate_of=orig, commit="", no_code=True, worker="w")
     assert cli.cmd_close(args) == 0
     assert f"DUPLICATE: {dup} follows {orig} (closed)" in capsys.readouterr().out
+
+
+def test_closed_unproven_primary_rejects_new_link_and_sweep_releases_legacy(tmp_path, monkeypatch):
+    state, q, orig, dup = _pair(tmp_path, monkeypatch, ["verify"])
+    q.close(orig, resolution={"summary": "stopped", "commit": "abc"})
+    q.accept(orig, by="amir", force=True)
+    from watchtower import github_duplicates
+    github_duplicates.sweep(q.list_items())
+    f = q.get(dup)
+    assert not f.get("duplicate_of") and f["status"] == "open"
+    assert f["gates"] == ["verify"] and not f.get("pipeline_hold")
+    assert f["duplicate_result"]["released"]
+    assert any(h["event"] == "duplicate_release" for h in f["history"])
+    assert "2099-12-31" not in _issue(state, dup)["body"]
+    assert github_duplicates.sweep(q.list_items()) == []
+    assert q.claim_by_ref(dup, "builder-2")
+    with pytest.raises(ValueError, match="closed without passing all required gates"):
+        q.link_duplicate(dup, orig, worker="builder-2")
+    assert q.get(dup)["status"] == "in_progress"
+
+
+def test_link_to_closed_ungated_primary_closes_immediately(tmp_path, monkeypatch):
+    _state, _config, q, orig = _setup(tmp_path, monkeypatch)
+    q.close(orig, resolution={"summary": "done", "commit": "abc"})
+    dup = q.enqueue(project="GHI", note="same incident")["ref"]
+    assert q.link_duplicate(dup, orig)["status"] == "closed"
+    assert q.get(dup)["resolution"]["commit"] == "abc"

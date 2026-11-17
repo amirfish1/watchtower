@@ -11,7 +11,7 @@ pin it.
 
 | Owned by the GitHub issue (unchanged)                  | Owned by the sidecar                         |
 |---------------------------------------------------------|----------------------------------------------|
-| title, body, note, status (open/closed), claim fields, close + resolution, defer, history of ticket events, labels | `gates`, `plan` (status/round/text/reviews/discussion/planner/reviewer), `stage_session`, the review hold (`review_hold`, `gate_pending`, `gate_stages`, `gate_results`, `verify_cycle`, `verifier`, `gate_feedback`, `gate_accepted_by`), `gen`, pipeline history events |
+| title, body, note, status (open/closed), claim fields, close + resolution, history of ticket events, labels | `gates`, `plan` (status/round/text/reviews/discussion/planner/reviewer), `stage_session`, the review hold (`review_hold`, `gate_pending`, `gate_stages`, `gate_results`, `verify_cycle`, `verifier`, `gate_feedback`, `gate_accepted_by`), `gen`, pipeline history events |
 
 - The sidecar never stores ticket state; GitHub never stores pipeline state.
 - **One GitHub write** belongs to the pipeline: the meta key
@@ -85,8 +85,8 @@ Reader check (OPS-203, strict contract restored by WT-54): every GitHub claim st
 refused while another machine's latest claim in the last 14 days is below
 **READER_MIN_PROTO = PIPELINE_PROTO (2)**. This applies to all gate sets,
 including plan-only, model-qualified plan and mixed plan/verify/review gates.
-The issue-level defer protects against older readers, but does not substitute
-for evidence of a current-protocol claim. The error names the host, required
+The explicit issue-level hold does not substitute for evidence of a
+current-protocol claim. The error names the host, required
 protocol and last claim. Once that host runs the required version, its next
 claim clears the check. A retired host ages out after 14 days. Crash between
 the two ⇒ marker without entry ⇒ fail-closed `pipeline_missing`, never an
@@ -96,8 +96,7 @@ builder would not pause for the planner. Gate it once it is released.
 
 WT-54 policy review (2026-11-02): the OPS-221 proto-1 exception in 73e7380 /
 f529e49 did **not** satisfy OPS-219's standing strict-reader requirement.
-Compatibility with a defer sentinel is distinct from the supported proto-2
-claim lifecycle. Restore the uniform reader check; resolve stale claims only
+The supported proto-2 claim lifecycle remains mandatory. Restore the uniform reader check; resolve stale claims only
 through supported lifecycle tooling, preserving ownership and history.
 The OPS-322 read-only audit (`~/.watchtower/evidence/OPS-322/audit.json`)
 records real proto-2 claims from ami at 2026-11-01 15:40:36 UTC (BECKY-3055)
@@ -172,21 +171,13 @@ CAS reopen after the sidecar write.
 
 ## Cross-host limits (honest remainder)
 
-- **Issue-level hold (OPS-215).** While a ticket is plan-pending or held in
-  review, the owner also writes `pipeline_hold: {why, prev_defer, prev_reason}`
-  and `deferred_until: 2099-12-31T00:00:00Z` into the issue meta. The hold
-  rides on the marker write at gate time, and every pipeline mutation resyncs
-  it afterwards. Every `wt` since OPS-100 keeps a deferred ticket out of
-  `claim_next`, `claim_by_ref` and `wt run`, so a host that cannot read the
-  sidecar is refused from the issue alone. That includes a host older than
-  OPS-201, a downgraded host, or one first claiming after the ticket was gated.
-  A held in_review issue that is reopened stays deferred too. A `wt` at
-  `PIPELINE_PROTO` 2 or later sees through the sentinel to the saved human
-  defer and lets the overlay decide. Lifting the hold restores that defer;
-  a `wt defer` made during the hold is kept. Limits:
-  - a `wt` older than OPS-100 (2026-10-25) is not fenced;
-  - a crash between the sidecar write and the issue write leaves the issue
-    fence one step behind until the next mutation.
+- **Issue-level hold (OPS-215, WT-87).** While a ticket is plan-pending or held
+  in review, the owner writes `pipeline_hold: {why}` into issue metadata.
+  Admission honors this explicit gate even without the local sidecar. Lifting
+  the hold removes this metadata; no artificial expiry or saved data timer
+  exists. WT-87 retires year-2099/year-9999 wire sentinels. All active hosts
+  must adopt this release; pre-WT-87 readers are unsupported. A crash between
+  sidecar and issue writes can leave the issue fence one mutation behind.
 - A current `wt` on another host fails closed: the marker makes the ticket
   `pipeline_foreign` (no claim, no stage). Its orphan sweep may still reopen
   a held issue whose builder is gone; the owning host keeps showing it

@@ -5,6 +5,10 @@ description: Use to review WatchTower queues end to end - "triage", "sweep", "qu
 
 # Queue review: health first, then content
 
+Use named ticket refs in prose (`WT-79:add-ticket-subscribe`); JSON keeps the
+bare `ref` and separate `slug`. Commands accept bare refs and stale names.
+
+
 One workflow. Two levels, always in this order, because a stuck queue can't
 deliver the answers a content review produces:
 
@@ -14,6 +18,14 @@ deliver the answers a content review produces:
   stays `in_progress`, `needs_input: true`).
 
 **REQUIRED BACKGROUND:** the `watchtower` skill (lookup, filing, claiming, closing).
+
+Status notices are **opt-in**. `wt add` without `--subscribe` sends no status notices;
+add `--subscribe` when you want updates. For an existing ticket use
+`wt subscribe REF [target]` (target defaults to your session), or
+`wt edit REF --subscribe`. Stop updates with `wt unsubscribe REF [target]`
+or `wt edit REF --no-subscribe`. Subscriptions follow continued sessions;
+`wt find REF` shows ticket subscribers. `wt subscribe QUEUE target` still
+subscribes to the whole queue.
 
 ## Scope
 

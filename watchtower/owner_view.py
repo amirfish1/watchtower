@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from . import queue as q
+from . import config
 
 KINDS = ("owner", "unclassified", "system", "external", "dependency", "worker")
 # Blocks WatchTower raised itself (a stage could not start, a plan discussion
@@ -132,7 +133,7 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
     want = q._norm_project(project) if project else ""
     rows: Dict[str, Dict[str, Any]] = {}
     for it in items:
-        if _is_blocked(it):
+        if _is_blocked(it) and not config.ticket_is_archived(it):
             rows[str(it.get("ref") or "").upper()] = _row(it, classify(it), now)
 
     def root_of(ref: str) -> Dict[str, Any]:
@@ -216,7 +217,15 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
     stuck = [dep_line(r) for r in shown if r.get("dependency", {}).get("state") == "stuck"]
     unresolved = [dep_line(r) for r in shown
                   if r.get("dependency", {}).get("state") in ("not_found_here", "other_host", "no_ref")]
+    from . import releases, watches
+    source_warnings = []
+    watched = watches.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want], project=want, source_warnings=source_warnings)
+    release_rows = releases.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want], now=now)
     return {
+        "watched": watched,
+        "watch_source_warnings": source_warnings,
+        "awaiting_release": release_rows,
+        "release_attention": [r for r in release_rows if r["attention"]],
         "generated_at": now.isoformat(timespec="seconds"),
         "queue": want or "",
         "counts": {k: sum(1 for r in shown if r["wait"] == k) for k in KINDS},
@@ -240,6 +249,7 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
                      for r in sorted(shown, key=lambda r: r.get("decide_by_utc") or "")
                      if r["wait"] == "owner" and r.get("decide_by_utc") and not r["recheck_due"]],
         "incomplete": False, "warnings": [],
+        "fragile_jobs": _fragile_jobs(items, want, now),
         "owner_missing_context": [{"ref": r["ref"], "missing": r["missing"]} for r in shown
                                   if r["wait"] == "owner" and r.get("missing")],
         "stuck_dependencies": stuck,
@@ -262,9 +272,42 @@ def snapshot(project: Optional[str] = None) -> Dict[str, Any]:
                         f"{' '.join(str(e).split())[:200]}")
         items = q.list_items()
     view = build(items, project=project)
+    # GitHub's shallow list intentionally omits comments. Read retained local
+    # prose for confirmed links, without hydrating or adding a GitHub call.
+    try:
+        from . import related
+        cached, _ = related.cached_tickets()
+        combined = {it["ref"]: dict(it) for it in items}
+        for it in cached:
+            if it["ref"] in combined and it.get("comments"):
+                combined[it["ref"]]["comments"] = it["comments"]
+        view["fragile_jobs"] = _fragile_jobs(list(combined.values()),
+                                            q._norm_project(project) if project else "",
+                                            datetime.now(timezone.utc))
+    except (OSError, ValueError) as exc:
+        warnings.append(f"Confirmed repeat-job history could not be read: {exc}")
+    # The decision desk's existing morning digest renders owner-view warnings.
+    # One connected confirmed job produces one line, never one line per filing.
+    warnings.extend(view.get("watch_source_warnings") or [])
     view["incomplete"] = bool(warnings)
+    warnings.extend("Fragile job: " + job["title"][:50] + "; " +
+                    ", ".join(job["refs"]) + ". Fix the design, not the latest error."
+                    for job in view.get("fragile_jobs") or [])
+    warnings.extend(f"Watching closed {r['ref']}: {r['check']} at {r['where']} "
+                    f"({r['schedule']}); last {r['last'].get('status', 'not-run')}: "
+                    f"{str(r['last'].get('evidence') or '')[:160]} {r.get('warning', '')}"
+                    for r in view.get("watched") or [])
     view["warnings"] = warnings
     return view
+
+
+def _fragile_jobs(items, project, now):
+    from . import related
+    jobs = related.fragile_jobs([it for it in items if not config.ticket_is_archived(it)],
+                               now=now.timestamp())
+    if project:
+        jobs = [j for j in jobs if any(r.startswith(project + "-") for r in j["refs"])]
+    return jobs
 
 
 def render(view: Dict[str, Any]) -> str:
@@ -273,7 +316,16 @@ def render(view: Dict[str, Any]) -> str:
              + (f" in {view['queue']}" if view["queue"] else "")
              + f"  (owner {c['owner']}, unclassified {c['unclassified']}, dependency "
                f"{c['dependency']}, external {c['external']}, worker {c['worker']})"]
-    for w in view.get("warnings") or []:
+    lines.append(f"Closed tickets being watched: {len(view.get('watched') or [])}")
+    for row in view.get("watched") or []:
+        lines.append(f"  {row['ref']} {row['check']} at {row['where']} ({row['schedule']}); "
+                     f"last {row['last'].get('status', 'not-run')}: "
+                     f"{str(row['last'].get('evidence') or '')[:160]} {row.get('warning', '')}")
+    release_rows = view.get("awaiting_release") or []
+    lines.append(f"Awaiting release: {len(release_rows)} (untimed release gate)")
+    for row in view.get("release_attention") or []:
+        lines.append(f"  CHECK RELEASE: {row['ref']} {row['age_days']} days; {row['target']}; branch {row['branch_state']}")
+    for w in dict.fromkeys((view.get("warnings") or []) + (view.get("watch_source_warnings") or [])):
         lines.append(f"WARNING: {w}")
     if view["recheck_due"]:
         lines.append("")

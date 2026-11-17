@@ -10,15 +10,30 @@ The only push emitter for ticket transitions (`claimed` / `closed` /
 `needs_input` / `awaits_decision`). Every other `[watchtower] ...` string in
 the codebase is stdout, not a push.
 
-- **Who hears it.** The ticket's `submitter` UNION the queue's `subscribers`,
-  MINUS the `actor` who performed the transition (`_actor_identities`
-  matches both worker id and session UUID).
-- **Which events.** The submitter is filtered by `config.notify_events`
-  (default: everything but `claimed` — a claim tells the filer nothing it can
-  act on and costs it a turn). Two carve-outs get the full stream:
-  `submitter_explicit` (the filer named a submitter with `wt add --submitter`)
-  and `pre_ack`. Subscribers are never filtered — `wt subscribe` IS the
-  explicit opt-in, `wt unsubscribe` is its off switch.
+- **Who hears it.** A ticket filed with `wt add --subscribe` includes its
+  `submitter`, UNION explicit ticket subscribers, UNION the queue's
+  `subscribers`, MINUS the actor. Opt in later with `wt subscribe REF [target]`
+  or `wt edit REF --subscribe`; opt out with `wt unsubscribe REF [target]` or
+  `wt edit REF --no-subscribe`. The default target is the caller session.
+  Filer attribution stays intact. `wt find REF` lists ticket subscribers;
+  JSON includes `subscribed_targets`. Queue subscriptions are independent: a
+  ticket opt-out does not stop events requested by a queue subscription.
+  `--submitter` records identity; `--pre-ack` records a product decision.
+  Neither opts into notices. Tickets without either form of explicit
+  ticket opt-in stay silent unless their queue has subscribers. Successor following uses the same CCC forward map as before.
+- **Which events.** Subscribed filers use `config.notify_events` (default:
+  `closed`, `needs_input`, `awaits_decision`). Queue subscribers keep their
+  existing event stream. Queue/steer delivery is unchanged.
+- **Dependencies.** File with `wt add --after DEP` or release current work
+  with `wt edit REF --after DEP` (repeatable). The edit preserves history and
+  answers, clears the old dependency question/park/claim, and leaves an open
+  ticket gated by `blocked_by`. The dependency must close cleanly before
+  dispatch can claim it. Starting or satisfying this wait emits no notice.
+  `wt block --wait-on dependency` and recognizable wait-only questions are
+  refused with the edit command; real human questions can mention refs.
+  Legacy dependency blocks remain readable/resumable and emit no question
+  notices. Existing human questions and active plans cannot be silently
+  replaced by the dependency edit.
 - **How it travels.** `messages.send(..., notify=True)`, i.e. the
   `_deliver_notify` chain: **uds → fifo → delegate, and nothing else**. A
   notice must never be worth a model turn, so `_deliver_resume`

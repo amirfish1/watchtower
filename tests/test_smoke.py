@@ -1012,7 +1012,7 @@ def test_cli_edit_moves_queue_without_refiling(store, capsys):
 
     assert main(["edit", "MVSRC-1", "--queue", "MVDST"]) == 0
     out = capsys.readouterr().out
-    assert "EDITED: MVDST-1 (moved MVSRC-1 -> MVDST-1)" in out
+    assert "EDITED: MVDST-1:orig (moved MVSRC-1 -> MVDST-1:orig)" in out
 
     assert q.get("MVSRC-1") is None
     moved = q.get("MVDST-1")
@@ -1022,7 +1022,7 @@ def test_cli_edit_moves_queue_without_refiling(store, capsys):
     # --queue combined with a field edit applies both in one call.
     assert main(["edit", "MVDST-1", "--queue", "MVDST2", "--priority", "p0"]) == 0
     out = capsys.readouterr().out
-    assert "EDITED: MVDST2-1 (moved MVDST-1 -> MVDST2-1)" in out
+    assert "EDITED: MVDST2-1:orig (moved MVDST-1 -> MVDST2-1:orig)" in out
     combined = q.get("MVDST2-1")
     assert combined["priority"] == "p0"
 
@@ -1394,7 +1394,7 @@ def test_cli_close_builds_resolution(store, capsys):
     ])
     assert rc == 0
     out = capsys.readouterr().out
-    assert "CLOSED: CLIRES-1 — did X" in out
+    assert "CLOSED: CLIRES-1:work — did X" in out
 
     it = q.get("CLIRES-1")
     assert it["resolution"]["summary"] == "did X"
@@ -2284,6 +2284,8 @@ def test_answer_requeues_when_session_over_context_budget(store, tmp_path, monke
     rc = cli.main(["answer", "ANSQ-1", "--worker", "human",
                    "the answer is B"])
     assert rc == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     out = capsys.readouterr().out
     assert "fresh worker" in out
 

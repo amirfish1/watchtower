@@ -174,12 +174,13 @@ def test_cli_interrupt_by_ticket_ref(wt_env, run_cli, fifo_readers):
     assert msg["request"] == {"subtype": "interrupt"}
 
 
-def test_cli_interrupt_ref_resolution_is_case_insensitive(wt_env, run_cli, fifo_readers):
+@pytest.mark.parametrize("suffix", ["", ":stale-name", "-stale-name"])
+def test_cli_interrupt_ref_resolution_is_case_insensitive(wt_env, run_cli, fifo_readers, suffix):
     rec, fd = _live_worker(wt_env, fifo_readers, queue="BE")
     item = wt_env.queue.enqueue(project="BE", title="t", note="t", text="")
     wt_env.queue.claim_by_ref(item["ref"], rec["worker_id"])
 
-    r = run_cli("interrupt", item["ref"].lower())
+    r = run_cli("interrupt", item["ref"].lower() + suffix)
 
     assert r.code == 0
     assert f"INTERRUPTED: {rec['worker_id']}" in r.out

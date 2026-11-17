@@ -1,0 +1,50 @@
+[
+  {
+    "ref": "OPS-2",
+    "expected": "19c8eb4e34cbdfd0eaf480dbbfbdc5293dd5db1a45bf0822915036383819847e",
+    "action": "person",
+    "on": "owner",
+    "question": "[Q785:chuck-smoke-resend] Please run the existing phone smoke test and report its result, or explicitly retire that acceptance request. This requires your phone; no customer sends or replay are authorized by this routing repair.",
+    "reason": "Clarify the existing immediate owner-only action; retain its Q tag and original full receipt. No future event, new permission, answer or acceptance is implied."
+  },
+  {
+    "ref": "OPS-264",
+    "expected": "b986118f5666a263cf7c6600b32de49c719180ca96715da023c08feb793d9784",
+    "action": "person",
+    "on": "owner",
+    "question": "[Q536:fub-cross-agent-access] Can you obtain broker-authorized access to the three contacts, or choose to retire this access-dependent task? Existing cross-agent privacy limits remain; no outreach is authorized for workers.",
+    "reason": "Clarify the existing immediate owner-only action; retain its Q tag and original full receipt. No future event, new permission, answer or acceptance is implied."
+  },
+  {
+    "ref": "OPS-285",
+    "expected": "398399f33c46725b36396ea07a22fe0e5fa8e990899171c493c4552b69cee619",
+    "action": "person",
+    "on": "owner",
+    "question": "[Q574:mac-gh-reauth] Please authenticate GitHub CLI on the Mac, or choose to retire this access-dependent task. Workers cannot supply your interactive sign-in.",
+    "reason": "Clarify the existing immediate owner-only action; retain its Q tag and original full receipt. No future event, new permission, answer or acceptance is implied."
+  },
+  {
+    "ref": "OPS-361",
+    "expected": "d85f10e105c346c7949e53a2ab7ed4838eb123039cfab9aba9e3cf38e0d6aba8",
+    "action": "person",
+    "on": "owner",
+    "question": "[Q677:fb-relogin] Please restore the existing Facebook account login on the server, or choose to retire this access-dependent task. No account switching or outreach is authorized.",
+    "reason": "Clarify the existing immediate owner-only action; retain its Q tag and original full receipt. No future event, new permission, answer or acceptance is implied."
+  },
+  {
+    "ref": "OPS-396",
+    "expected": "a18f88be89cef5bf2054b50ddf81da9c995cb75f9a55068ff1d9b1a64b02c8d1",
+    "action": "person",
+    "on": "owner",
+    "question": "[Q816:deepgram-key] Please provision the required Deepgram key through the existing secret store, or choose to retire this credential-dependent task. No purchase, calls or spend are authorized by this routing repair.",
+    "reason": "Clarify the existing immediate owner-only action; retain its Q tag and original full receipt. No future event, new permission, answer or acceptance is implied."
+  },
+  {
+    "ref": "SMALL-BUGS-87",
+    "expected": "cb3ad1016c30c33b8a40cc9bb40973821e642ceebb5d6440e748f6e1b302edbb",
+    "action": "person",
+    "on": "owner",
+    "question": "[Q722:desktop-render-result] Please inspect the existing test message in Claude Desktop and supply the render result, or explicitly retire this subjective acceptance request. No new messages are authorized.",
+    "reason": "Clarify the existing immediate owner-only action; retain its Q tag and original full receipt. No future event, new permission, answer or acceptance is implied."
+  }
+]

@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import pytest
 from watchtower import takeover as t, observations as o, queue as q, liveness
+from tests import legacy_blocks
 
 SID='11111111-2222-4333-8444-555555555555'
 OTHER='22222222-2222-4333-8444-555555555555'
@@ -85,6 +86,87 @@ def test_cancel_keeps_claim_and_fences_pending(env):
     b=t.takeover(SID,a['ticket'],engine='claude')
     assert b['generation']>c['generation']
     assert b['supervision']['intent']['key']!=a['supervision']['intent']['key']
+
+
+def test_cancel_detaches_comments_and_reenrollment_restores_them(env, monkeypatch, capsys):
+    from watchtower import cli, messages
+    calls = []
+    monkeypatch.setattr(messages, 'deliver_message',
+                        lambda target, text, **kw: calls.append(target) or {'ok': True})
+    monkeypatch.setattr(cli, '_comment_author_is_claimant', lambda *a: False)
+    a = adopt(env)
+    ref = a['ticket']
+
+    def comment():
+        assert cli.main(['comment', ref, 'Guidance from coordinator']) == 0
+        capsys.readouterr()
+
+    comment()
+    assert calls == [SID]
+    preview = t.cancel(SID, dry_run=True)
+    assert preview['comment_target'] == ''
+    assert t.status(SID)['comment_target'] == SID
+    cancelled = t.cancel(SID)
+    assert cancelled['claim']['claimed_session_id'] == SID
+    assert cancelled['comment_target'] == ''
+    assert cancelled['comments_detached'] is True
+    comment()
+    assert calls == [SID]
+    assert q.get(ref)['history'][-1]['text'] == 'Guidance from coordinator'
+    # Answers retained for explicit recovery must not resubscribe comments.
+    q.answer(ref, 'Retained guidance')
+    comment()
+    assert calls == [SID]
+    t.cancel(SID)  # idempotent, including across module reloads
+    importlib.reload(t)
+    assert t.status(SID)['comments_detached'] is True
+    t.takeover(SID, ref, engine='claude')
+    comment()
+    assert calls == [SID, SID]
+
+
+def test_cancel_does_not_detach_replacement_claimant(env, monkeypatch, capsys):
+    from watchtower import cli, messages
+    a = adopt(env)
+    # Model a recovery replacing ownership after enrollment. Normal fleet
+    # claiming deliberately refuses tickets retaining supervision affinity.
+    with q._FileLock(q._lock_path()):
+        data = q._load_unlocked(strict=True)
+        it = next(it for it in data['items'] if it['ref'] == a['ticket'])
+        it.update(claimed_by='replacement', claimed_session_id=OTHER)
+        q._save_unlocked(data)
+    result = t.cancel(SID)
+    assert result['comment_target'] == OTHER
+    assert result['comments_detached'] is False
+    calls = []
+    monkeypatch.setattr(messages, 'deliver_message',
+                        lambda target, text, **kw: calls.append(target) or {'ok': True})
+    assert cli.main(['comment', a['ticket'], 'Guidance for replacement']) == 0
+    assert calls == [OTHER]
+
+
+def test_status_exposes_failed_attempts_even_without_confirmed_reminders(env, monkeypatch):
+    adopt(env)
+    monkeypatch.setattr(liveness, 'deliver', lambda *a, **kw: {'ok': False, 'error': 'unreachable'})
+    t.reconcile()
+    result = t.status(SID)
+    assert result['delivery_attempts'] == 1
+    assert result['state'] == 'paused_unreachable'
+    assert result['confirmed_reminders'] == 0
+    assert result['comment_target'] == SID
+    assert result['claim']['status'] == 'in_progress'
+
+
+def test_cancel_preserves_owner_wait_and_answer_does_not_resubscribe(env):
+    a = adopt(env)
+    q.block(a['ticket'], session_id=SID, question='Choose the next step?', origin='worker')
+    t.cancel(SID)
+    it = q.get(a['ticket'])
+    assert it['needs_input'] and it['block_question'] == 'Choose the next step?'
+    assert it['status'] == q.PARKED_STATUS
+    q.answer(a['ticket'], 'Keep this for explicit re-enrollment')
+    assert t.status(SID)['comment_target'] == ''
+    assert t.status(SID)['comments_detached'] is True
 
 
 def test_cancel_serializes_dispatch(env,monkeypatch):
@@ -271,7 +353,7 @@ def test_import_question_and_unfenced_import(env):
 def test_dependency_wake_uses_retained_answer_route(env):
     a=adopt(env)
     dep=q.enqueue(project='TEST',note='Dependency')
-    q.block(a['ticket'],session_id=SID,question='Wait',origin='worker',wait_on='dependency',wait_ref=dep['ref'])
+    legacy_blocks.block(q, a['ticket'],session_id=SID,question='Wait',origin='worker',wait_on='dependency',wait_ref=dep['ref'])
     t.reconcile()
     assert not env[3]
     q.close(dep['ref'],resolution={'summary':'done','no_code':True})
@@ -369,7 +451,7 @@ def test_gate_wait_and_resolution_do_not_remind_builder(env):
 
 def test_resolved_queue_wait_unpauses(env):
     a=adopt(env)
-    q.block(a['ticket'],session_id=SID,question='Wait externally',wait_on='external',origin='worker')
+    q.block(a['ticket'],session_id=SID,question='May the reviewed remedy proceed?',wait_on='external',wait_actor='Sonia',origin='worker')
     t.reconcile();assert t.status(SID)['state']=='waiting'
     t._update(a['ticket'],a['generation'],lambda i,s:i.update(needs_input=False,status='in_progress'))
     t.reconcile();assert t.status(SID)['state']!='waiting'
@@ -441,7 +523,7 @@ def test_identical_footer_question_after_answer_is_new_episode(env, monkeypatch)
 def test_footer_adoption_preserves_existing_source_wait(env, on):
     import copy
     a = adopt(env)
-    q.block(a['ticket'], session_id=SID, question='Existing source question', wait_on=on)
+    legacy_blocks.block(q, a['ticket'], session_id=SID, question='Existing source question', wait_on=on)
     before = q.get(a['ticket'])
     item = copy.deepcopy(before)
     footer = dict(next_step_user='A different footer question',
@@ -678,3 +760,119 @@ def test_generic_resume_refuses_unavailable_locks(env, monkeypatch):
     with pytest.raises(ValueError,match='exclusive'):
         t.resume(a['ticket'],a['generation'])
     assert q.get(a['ticket'])==before and not env[3]
+
+
+def test_tracker_takeover_supervises_without_claim_and_never_delivers_comments(env, monkeypatch):
+    from watchtower import config, cli, messages
+    config.set_queue_kind('TEST', 'tracker')
+    a = adopt(env)
+    ref = a['ticket']
+    assert a['claim']['status'] == 'open'
+    assert not a['claim']['claimed_by'] and not a['claim']['claimed_session_id']
+    assert a['comment_target'] == ''
+    assert q.count_claimable(project='TEST') == 0
+    monkeypatch.setattr(messages, 'deliver_message', lambda *a, **kw: pytest.fail('tracker comment delivered'))
+    assert cli.main(['comment', ref, 'Log update, no wake']) == 0
+    t.reconcile()
+    assert env[3] and env[3][0][0] == SID
+    assert not q.get(ref)['claimed_by']
+    t.cancel(SID)
+    q.answer(ref, 'Continue same authorized task')
+    assert not q.get(ref)['claimed_by']
+    assert t.status(SID)['supervision']['held_answer'] == 'Continue same authorized task'
+    t.takeover(SID, ref, engine='claude')
+    assert t.status(SID)['supervision']['intent']['kind'] == 'answer'
+    assert not q.get(ref)['claimed_by']
+
+
+def test_tracker_wait_resume_and_normal_completion(env):
+    from watchtower import config
+    config.set_queue_kind('TEST', 'tracker')
+    a = adopt(env)
+    ref = a['ticket']
+    def wait(it, s):
+        s.update(state='waiting', intent=None, wait_identity='external', wait_source='footer')
+    t._update(ref, a['generation'], wait)
+    assert t.resume(ref, a['generation'])['resumed']
+    assert not q.get(ref)['claimed_by']
+    q.close(ref, SID, resolution={'summary': 'Feature complete', 'no_code': True})
+    t.reconcile()
+    assert t.status(SID)['state'] == 'completed'
+    assert not q.get(ref)['claimed_by']
+
+
+def test_tracker_conversion_preserves_parked_question_and_supervision(env):
+    from watchtower import cli
+    a = adopt(env)
+    ref = a['ticket']
+    before = q.block(ref, SID, question='Keep the original decision?', wait_on='owner', origin='worker',
+                     wait_extra={'decide_by': 'none', 'if_unanswered': 'none'})
+    assert before.get('parked')
+    assert cli.main(['config', '-q', 'TEST', '--kind', 'tracker']) == 0
+    after = q.get(ref)
+    assert not after['claimed_by'] and not after.get('parked')
+    assert after['needs_input'] and after['block_question'] == before['block_question']
+    assert after['wait'] == before['wait']
+    assert after['supervision'] == before['supervision']
+    q.answer(ref, 'Continue the existing task')
+    assert not q.get(ref)['claimed_by']
+    assert t.status(SID)['supervision']['intent']['kind'] == 'answer'
+
+
+def test_terminal_supervision_claim_expires_but_suppression_and_scope_survive(env):
+    a=adopt(env); ref=a['ticket']
+    t.cancel(SID)
+    now=time.time()
+    item=q.get(ref)
+    assert liveness.assess(item,{ref:item},liveness.ResolverContext(now))['action']==''
+    later=now+liveness.stall_s()+liveness.RECENT_SESSION_S+120
+    action=liveness.assess(item,{ref:item},liveness.ResolverContext(later))
+    assert action['action']=='reopen'
+    recovered=q.recover_claim(ref,expect=liveness._expect(item,{ref:item}),action='reopen',reason=action['reason'])
+    assert recovered['supervision']['state']=='cancelled'
+    assert recovered['supervision']['ownership_released_at']
+    assert recovered['supervision']['authorization_scope']==item['supervision']['authorization_scope']
+    assert recovered['status']=='open' and not recovered.get('claimed_by')
+    assert q.count_claimable(project='TEST')==1
+    assert t.status(SID)['state']=='cancelled'  # automatic re-enrollment remains suppressed
+    claimed=q.claim_by_ref(ref,'replacement',session_uuid=OTHER)
+    assert claimed['claimed_by']=='replacement'
+    q.block(ref,'replacement',origin='worker',question='Approve the exact prepared draft?',wait_on='owner')
+    answered=q.answer(ref,'No sends; continue the authorized source work')
+    assert not answered['supervision'].get('held_answer')
+    assert answered.get('pending_answer')  # answer routes to the replacement, not the cancelled session
+
+
+def test_supervision_generation_change_fences_claim_recovery(env):
+    a=adopt(env); ref=a['ticket'];t.cancel(SID)
+    item=q.get(ref);expect=liveness._expect(item,{ref:item})
+    with q._FileLock(q._lock_path()):
+        data=q._load_unlocked();current=next(i for i in data['items'] if i['ref']==ref)
+        current['supervision']['generation']+=1
+        current['supervision']['state']='running'
+        q._save_unlocked(data)
+    assert q.recover_claim(ref,expect=expect,action='reopen',reason='stale snapshot') is None
+    assert q.get(ref)['status']=='in_progress'
+
+
+def test_answer_is_accepted_during_slow_takeover_transport(env, monkeypatch):
+    a = adopt(env)
+    entered, release = threading.Event(), threading.Event()
+    def send(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return dict(ok=True)
+    monkeypatch.setattr(liveness, 'deliver', send)
+    with ThreadPoolExecutor(2) as pool:
+        sending = pool.submit(t.reconcile)
+        assert entered.wait(5)
+        try:
+            accepted = pool.submit(q.answer, a['ticket'], 'Continue with the new guidance').result(timeout=3)
+            intent = accepted['supervision']['intent']
+            assert intent['kind'] == 'answer' and intent['state'] == 'queued'
+            assert not accepted['needs_input']
+        finally:
+            release.set()
+        sending.result(timeout=5)
+    # The older transport outcome cannot mark the replacement intent as sent.
+    assert q.get(a['ticket'])['supervision']['intent'] == intent

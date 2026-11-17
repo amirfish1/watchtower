@@ -270,6 +270,11 @@ Stage sessions are owned by the reconciler, not by whichever build worker ran
 or respawns. The daemon sleeps in 0.5 s chunks and runs a stage pass as soon as
 the wake file's mtime advances; a lost wake is caught by the next full tick.
 
+`wt stages tick --ref REF` skips the global late-usage reconciliation so
+unrelated session transcripts cannot delay ticket-specific supervision.
+Unscoped passes still reconcile usage; stage lifecycle events still capture
+their own usage on either path.
+
 Supervision key per stage: `plan:r<round>`, `review:r<round>`,
 `verify:<verify_cycle>`, `assess:<assessment.cycle>`. Two attempts per key: the
 first death respawns, the second escalates to `needs_input` (`wt answer REF

@@ -410,6 +410,44 @@ def test_dispatch_after_enqueue_acts_on_a_requested_run_with_drain_off(wt, monke
     assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-manual"
 
 
+def test_dispatch_timings_attribute_a_slow_ticket_read(wt, monkeypatch):
+    wt.config.set_auto_drain("Q", True)
+    item = wt.q.enqueue(project="Q", note="measure startup")
+    monkeypatch.setattr(
+        wt.workers, "spawn_workers",
+        lambda queue, n=1, **kwargs: [{"worker_id": "q-timed", "queue": queue}],
+    )
+    real_list = wt.q.list_items
+
+    def slow_read(*args, **kwargs):
+        time.sleep(0.02)
+        return real_list(*args, **kwargs)
+
+    monkeypatch.setattr(wt.q, "list_items", slow_read)
+    assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-timed"
+    timings = [json.loads(line.split("STARTUP_TIMING", 1)[1])
+               for line in (wt.tmp / "activity.log").read_text().splitlines()
+               if "STARTUP_TIMING" in line]
+    phases = {row["phase"]: row for row in timings}
+    assert {"ticket_read", "busy_read", "notify_workers", "staffing_lock",
+            "idle_release", "reconcile"} <= phases.keys()
+    assert phases["ticket_read"]["elapsed_s"] >= 0.02
+    assert phases["ticket_read"]["ref"] == item["ref"]
+    assert all(row["outcome"] == "ok" and row["pid"] == os.getpid() for row in timings)
+
+
+def test_startup_timing_preserves_failure_when_logging_fails(wt, monkeypatch):
+    def broken_log(*args, **kwargs):
+        raise OSError("audit unavailable")
+
+    monkeypatch.setattr(wt.q, "_log", broken_log)
+    with pytest.raises(ValueError, match="original failure"):
+        with wt.workers._startup_timing("Q", "staffing_lock"):
+            raise ValueError("original failure")
+    with wt.workers._startup_timing("Q", "staffing_lock"):
+        pass
+
+
 @pytest.mark.parametrize("drain", [False, True])
 def test_dispatch_names_unready_readiness_not_auto_drain(wt, monkeypatch, drain):
     """An unclaimable readiness is the real blocker whatever the drain
@@ -1083,6 +1121,42 @@ def test_prune_postmortem_records_late_quota_failure(wt):
     cooldown = wt.workers.active_launch_failure_cooldown("Q", "kimi")
     assert cooldown and cooldown["reason"] == "engine usage limit"
     assert cooldown["worker_id"] == "q-late"
+
+
+def test_prune_postmortem_records_codex_socket_timeout(wt):
+    log = json.dumps({"type": "error", "error":
+        "app-server did not open /tmp/wt.sock within 60s"}) + "\n"
+    _dead_launch_worker(wt, worker_id="q-socket", engine="codex", log_text=log)
+
+    wt.workers.list_workers(prune=True)
+
+    cooldown = wt.workers.active_launch_failure_cooldown("Q", "codex")
+    assert cooldown and cooldown["reason"] == "engine app-server socket timeout"
+    assert cooldown["worker_id"] == "q-socket"
+    assert cooldown["consecutive"] == 1
+    assert "LAUNCH_FAIL" in (wt.tmp / "activity.log").read_text()
+
+
+def test_socket_timeout_text_and_warnings_are_not_terminal_failures(wt):
+    log = wt.tmp / "warning.log"
+    for text in (
+        "app-server did not open /tmp/wt.sock within 60s",
+        json.dumps({"type": "warning", "error":
+                    "app-server did not open /tmp/wt.sock within 60s"}),
+        json.dumps({"type": "error", "error":
+                    "ticket mentions: app-server did not open /tmp/wt.sock within 60s"}),
+    ):
+        log.write_text(text)
+        assert wt.workers._classify_launch_failure_log(log) is None
+
+
+def test_socket_timeout_after_established_session_is_not_launch_failure(wt):
+    _dead_launch_worker(wt, worker_id="q-ran", engine="codex",
+        session_id="11111111-1111-1111-1111-111111111111",
+        log_text=json.dumps({"type": "error", "error":
+            "app-server did not open /tmp/wt.sock within 60s"}))
+    wt.workers.list_workers(prune=True)
+    assert wt.workers.active_launch_failure_cooldown("Q", "codex") is None
 
 
 def test_prune_postmortem_skips_workers_that_actually_ran(wt):

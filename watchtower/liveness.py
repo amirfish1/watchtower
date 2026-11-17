@@ -25,6 +25,7 @@ import time
 from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
 
 from . import queue as q
+from . import config
 
 
 class UndeclaredState(ValueError):
@@ -52,7 +53,7 @@ _BOOLS = (False, True)
 # these; D2.4 holds them equal to the live tuples, so a value added there fails
 # until a row (or UNREACHABLE entry) covers it.
 _FROZEN: Dict[str, tuple] = {
-    "status": ("open", "in_progress", "in_review", "awaiting_answer", "closed"),
+    "status": ("open", "in_progress", "in_review", "awaiting_answer", "awaiting_release", "closed"),
     "gated": _BOOLS,
     "backend": ("file", "github"),
     "plan": ("", "planning", "reviewing", "discussing", "accepted", "failed", "blocked"),
@@ -61,8 +62,7 @@ _FROZEN: Dict[str, tuple] = {
     "gate_pending": ("none", "verify", "review"),
     "assessment": ("none", "due", "running", "filing", "done", "failed"),
     "block": ("none", "input", "rationale", "awaiting-client"),
-    # "deferred" is projection-only: inside a `wt defer` window (WT-15).
-    "readiness": ("claimable", "needs-shaping", "needs-spec", "needs-rationale", "deferred"),
+    "readiness": ("claimable", "needs-shaping", "needs-spec", "needs-rationale"),
     "dep": ("ok", "waiting", "stuck"),
     "claimed": _BOOLS,
     "parked": _BOOLS,
@@ -97,7 +97,7 @@ def live_vocab() -> Dict[str, tuple]:
         "disc": tuple(q.DISC_STATUSES), "awaiting": tuple(q.DISC_AWAITING),
         "gate_pending": tuple(q.GATE_KINDS), "assessment": tuple(q.ASSESSMENT_STATUSES),
         "block": ("none",) + tuple(q.BLOCK_KINDS),
-        "readiness": ("claimable",) + tuple(q.UNCLAIMABLE_READINESS) + ("deferred",),
+        "readiness": ("claimable",) + tuple(q.UNCLAIMABLE_READINESS),
         "dep": tuple(q.DEP_VERDICTS), "claimed": _BOOLS, "parked": _BOOLS,
         "answer": tuple(q.ANSWER_STATES),
         "group": ("none",) + tuple(q.GROUP_ROLES),
@@ -187,6 +187,7 @@ ROWS: Tuple[Row, ...] = (
          status="closed", assessment=("due", "running"), backend="file"),
     _row("assess.run.github", "human", "-", "-",
          status="closed", assessment=("due", "running"), backend="github"),
+    _row("release.wait", "release", "event", "release_observed", status="awaiting_release"),
     _row("human.block", "human", "-", "-",
          status=("open", "in_progress", "in_review"), block=_not("block", "none")),
     _row("answer.await_human", "human", "-", "-",
@@ -248,12 +249,8 @@ ROWS: Tuple[Row, ...] = (
           {"plan": "discussing", "disc": "active", "awaiting": ("none", "reviewer")}),
          status=_LIVE, gated=True, backend="file", block="none", answer=SETTLED),
     _row("human.readiness", "human", "-", "-", NOT_PA,
-         status="open", readiness=_not("readiness", "claimable", "deferred"), block="none",
+         status="open", readiness=_not("readiness", "claimable"), block="none",
          answer=SETTLED),
-    # `wt defer`: open but unclaimable until deferred_until, on purpose (WT-15).
-    # claim_next and health skip it too; the clock, not the pool, owns it.
-    _row("time.deferred", "time", "-", "-", NOT_PA,
-         status="open", readiness="deferred", block="none", answer=SETTLED),
     _row("dep.waiting", "dependency", "-", "-", _and(NOT_PA, _POOL_GROUP),
          status="open", readiness="claimable", dep="waiting", block="none", answer=SETTLED),
     _row("dep.stuck", "reconciler", "system_op", "_escalate_stuck_blockers", NOT_PA,
@@ -495,8 +492,6 @@ def project(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = 
         if readiness not in q.VALID_READINESS:
             raise UndeclaredState(f"undeclared readiness value {readiness!r}")
         readiness = "claimable"
-    if q.deferred_now(item, now):
-        readiness = "deferred"   # outranks shaping: nothing to do until it ends
     if item.get("blocked_by") or item.get("duplicate_of"):
         if by_ref is None:
             by_ref = q._refs_index(q.list_items())
@@ -936,13 +931,11 @@ Steps (request {n} of at most {OWNER_ROUTE_MAX}):
      (WT-39; `wt deploy --json`, then `wt deploy --sync`), so its sweep renews
      it. Close this request once a fresh heartbeat shows on {ref}.
    - Dead: {host}'s own backstop recovers it. Close this request once it has.
-3. {host} unreachable (ssh or `wt` there fails): an external wait, not a
-   question. `wt defer` this request `--until +2h --reason "{host} unreachable:
-   <error>"` and redo steps 1-2 when it returns. After 3 such defers, close it
-   with `--unresolved "{host} unreachable since <first attempt>"`; the backstop
-   files the next request a stall window later.{last} Ask a human (`wt block`)
-   only for a credential or device you established is missing, never for
-   reachability alone.
+3. {host} unreachable (ssh or `wt` there fails): record the evidence gap,
+   preserve any existing credential/device owner decision, and close this
+   recovery request with an unresolved item if no runnable permanent connectivity
+   check exists. Never park it on a timer. A permanent monitor must file a new
+   linked request on failure.{last}
 
 Safe stop. This request does not authorize `wt release --force`, closing or
 editing {ref}, stopping its worker, or resetting or extending any budget,
@@ -998,9 +991,10 @@ Steps (request {n} of at most {OWNER_ROUTE_MAX}):
    - Dead: hand it back explicitly with `wt release {ref}` from {host}
      (it refuses a ticket with an open question; leave that one alone), then
      close this request citing the release.
-3. Unsure: `wt defer` this request `--until +2h --reason "<what is unclear>"`
-   and redo steps 1-2. Ask a human (`wt block`) only for a credential or device
-   you established is missing.{last}
+3. Unsure: record the evidence gap and preserve a real named-person or ticket
+   gate. Future evidence needs a permanent check on a close, never a timer.
+   Ask a human (`wt block`) only for a credential or device you established
+   is missing.{last}
 
 Safe stop. This request does not authorize closing or editing {ref}'s body,
 stopping a worker you have not proven dead, or resetting or extending any
@@ -1119,7 +1113,7 @@ def claim_owner(item: Dict[str, Any], ctx: Optional[ResolverContext] = None) -> 
 # Every write is a CAS (``queue.recover_claim`` / ``queue.pa_transition``).
 
 STALL_S = 1800.0
-_SKIP_OWNERS = ("human", "terminal", "dependency", "time")
+_SKIP_OWNERS = ("human", "terminal", "dependency", "time", "release")
 _LOOP_GUARDED = ("stage", "spawn", "reopen", "resume", "assessment_run_ops")
 # "1 tick" rows whose state can be transient between two writes of one
 # command (plan_verdict, then block) wait this long before acting.
@@ -1147,24 +1141,12 @@ def fingerprint(item: Dict[str, Any],
     except Exception as exc:  # noqa: BLE001 - an unprojectable state still fingerprints
         dims = ["unprojectable", str(exc)]
     bs = item.get("backstop") if isinstance(item.get("backstop"), dict) else {}
-    payload = [dims, item.get("updated_at"), len(item.get("history") or []),
+    payload = [dims, item.get("updated_at"), q.history_total(item),
                item.get("answered_at"), item.get("pending_answer"),
                [bs.get("state"), bs.get("action"), bs.get("count")],
                (item.get("stage_session") or {}).get("key")]
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()
                         ).hexdigest()[:16]
-
-
-def _post_defer_unclaimed(item: Dict[str, Any]) -> bool:
-    """True when the ticket's last lifecycle event is a `wt defer` (nothing has
-    claimed it since the window was set)."""
-    for h in reversed(item.get("history") or []):
-        t = h.get("type") or h.get("event") if isinstance(h, dict) else None
-        if t == "defer":
-            return True
-        if t in ("claim", "close", "block", "answer"):
-            return False
-    return False
 
 
 def _store_activity(item: Dict[str, Any]) -> float:
@@ -1324,9 +1306,24 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
                            "queue": str(item.get("project") or ""), "row": "", "owner": "",
                            "proof": "", "verdict": "", "evidence": "", "idle_s": 0,
                            "action": "", "reason": ""}
-    if item.get("supervision"):
+    supervision = item.get("supervision") or {}
+    if q.supervision_owns(item) and (supervision.get("state") not in ("cancelled", "completed")
+                                   or item.get("status") != "in_progress" or item.get("needs_input")):
         out.update(owner="takeover", verdict="retained", reason="Same-session supervision owns recovery")
         return out
+    if (item.get("status") == "in_progress" and item.get("needs_input") and item.get("claimed_by")
+            and _github(out["queue"]) and item.get("claimed_machine") == q.machine_tag()
+            and callable(getattr(q._github_backend_for_project(out["queue"]), "park_expired_person_claim", None))):
+        v = claim_owner(item, ctx)
+        if v.verdict == "alive":
+            out.update(row="human.block", owner="human", verdict="alive", proof="claim_owner", evidence=v.evidence)
+            return out  # keep owning-host heartbeat evidence current
+        idle = now-max(_store_activity(item), _file_activity(item, ctx))
+        if ctx.ps() is not None and idle >= stall:
+            out.update(row="human.block", owner="human", verdict=v.verdict,
+                       evidence=v.evidence, idle_s=int(idle), action="park_person_claim",
+                       reason="Expired claim on an unanswered person decision")
+            return out
     try:
         row = row_of(item, by_ref, now)
     except (UndeclaredState, UnreachableState, UnclassifiedState) as exc:
@@ -1398,9 +1395,14 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
             evidence = "sent back; inside its release window (WT-34)"
         elif v.verdict == "alive":
             pass
+        elif (github and item.get("claimed_machine") == q.machine_tag()
+              and callable(getattr(q._github_backend_for_project(out["queue"]), "recover_expired_claim", None))):
+            # Cross-host body exclusion now fences the fresh re-read and
+            # release. The owning host still re-proves liveness inside it.
+            action, reason = "reopen", f"owning-host GitHub claim lease expired ({v.evidence})"
         elif github:
-            # WT-39: no automatic block or reopen of a GitHub claim (no
-            # conditional write); an explicit recovery request instead.
+            # Old/unknown host or backend without serialized lease recovery:
+            # preserve the claim and request owning-host evidence.
             due, routed = _owner_route_due(item, by_ref, now, stall)
             evidence += f"; {routed}" if routed else ""
             if due:
@@ -1408,8 +1410,13 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
         elif v.verdict == "dead":
             action = "resume" if _resume_first(item) else "reopen"
             reason = f"claim owner dead ({v.evidence})"
+        elif ctx.ps() is None:
+            evidence += "; process scan unavailable; lease recovery needs readable liveness evidence"
         else:
-            action, reason = "escalate", f"claim owner unproven ({v.evidence})"
+            # An unobserved local claim is a lease, not permanent ownership.
+            # The ordinary idle threshold and recent bound-session evidence
+            # still protect active work. No fictional person question is made.
+            action, reason = "reopen", f"unobserved local claim lease expired ({v.evidence})"
     elif proof["kind"] == "staffing":
         from . import config, workers
         queue = out["queue"]
@@ -1442,12 +1449,7 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
     if action in _LOOP_GUARDED:
         bs = item.get("backstop") if isinstance(item.get("backstop"), dict) else {}
         if bs.get("state") == row.id and bs.get("fingerprint") == fingerprint(item, by_ref):
-            if action == "spawn" and _post_defer_unclaimed(item):
-                # A `wt defer` window ended and the pool has not picked the
-                # ticket up yet: that is staffing latency, not a stall the
-                # owner can fix. Keep spawning instead of raising a block.
-                pass
-            elif bs.get("action") == "resume" and action in ("resume", "reopen"):
+            if bs.get("action") == "resume" and action in ("resume", "reopen"):
                 action, reason = "reopen", "resumed builder made no progress"
             else:
                 action = "escalate"
@@ -1502,7 +1504,8 @@ def _escalation_question(item: Dict[str, Any], a: Dict[str, Any]) -> str:
 def _expect(item: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     return {"status": item.get("status"), "claimed_by": item.get("claimed_by"),
             "claimed_session_id": item.get("claimed_session_id"),
-            "claim_proc": item.get("claim_proc"), "fingerprint": fingerprint(item, by_ref)}
+            "claim_proc": item.get("claim_proc"), "supervision": item.get("supervision"),
+            "fingerprint": fingerprint(item, by_ref)}
 
 
 def _log_backstop(a: Dict[str, Any], result: str) -> None:
@@ -1548,6 +1551,11 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
     """Carry out one decided action; returns ``done`` or why it did not."""
     ref, action, reason = a["ref"], a["action"], a["reason"]
     evidence = f"{a['verdict']}: {a['evidence']}"
+    if action == "park_person_claim":
+        backend = q._github_backend_for_project(a["queue"])
+        expect = {key: item.get(key) for key in (*_CLAIM_KEYS, "claimed_at", "blocked_at", "block_question", "wait")}
+        result = backend.park_expired_person_claim(ref, expect=expect)
+        return "done" if result else "race or live proof"
     if action in ("answer_handoff", "answer_plan_conflict"):
         ok = _answer_handoff(item, reason)
         if ok:
@@ -1656,6 +1664,8 @@ def report(queue: str = "", ref: str = "", now: Optional[float] = None) -> List[
     ctx = ResolverContext(now)
     out = []
     for it in items:
+        if not ref and config.ticket_is_archived(it):
+            continue
         if ref and str(it.get("ref") or "") != ref:
             continue
         if queue and str(it.get("project") or "") != queue:
@@ -1679,6 +1689,8 @@ def sweep(now: Optional[float] = None, only_ref: str = "") -> List[Dict[str, Any
     acted: List[Dict[str, Any]] = []
     spawned: set = set()
     for it in items:
+        if config.ticket_is_archived(it) or config.is_tracker(it.get("project", "")):
+            continue
         if only_ref and str(it.get("ref") or "") != only_ref:
             continue
         if it.get("status") == "closed" and \

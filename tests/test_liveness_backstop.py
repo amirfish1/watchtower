@@ -134,7 +134,7 @@ def test_recover_claim_race_is_a_noop(lv, race):
         q.release(ref)
         q.claim_by_ref(ref, "w2", session_uuid=SID2)
     elif race == "block":
-        q.block(ref, "", question="?", origin="system")
+        q.block(ref, "", question="Approve the prepared source repair?", origin="system")
     elif race == "answer":
         q.answer(ref, "go on")
     elif race == "comment":
@@ -160,7 +160,7 @@ def test_recover_claim_is_local_only(lv, monkeypatch):
 
 def test_recover_claim_reopen_hands_off_a_delivered_answer(lv):
     g = Golden(lv, _claimed(lv))
-    g.step(lv.q.block, g.ref, session_id="w1", question="?", origin="worker")
+    g.step(lv.q.block, g.ref, session_id="w1", question="Approve the prepared source repair?", origin="worker")
     g.step(lv.q.answer, g.ref, "yes", edge="E1")
     g.step(lv.answers.route_answer, g.ref, int(g.item()["pending_answer"]["gen"]), edge="E5")
     lv.q.claim_next("w2", project=PQ)
@@ -193,15 +193,15 @@ def test_alive_owner_is_never_touched(lv):
     assert lv.q.get(ref)["status"] == "in_progress"
 
 
-def test_unproven_owner_escalates_then_stays_human(lv):
-    ref = _claimed(lv, worker="someone", sid=SID2)            # ambient: never dead
+def test_unobserved_local_claim_lease_expires_without_person_question(lv):
+    ref = _claimed(lv, worker="someone", sid=SID2)
+    assert _sweep(lv, off=60) == []   # normal spawn grace/idle lease
     acted = _sweep(lv)
-    assert [a["action"] for a in acted] == ["escalate"]
+    assert [a["action"] for a in acted] == ["reopen"]
     it = lv.q.get(ref)
-    assert it["needs_input"] and "backstop" in it["block_question"]
-    assert it["status"] == "in_progress" and it["claimed_by"] == "someone"
-    assert lv.liveness.row_of(it).id == "human.block"
-    assert _sweep(lv) == []
+    assert not it.get("needs_input") and not it.get("claimed_by")
+    assert it["status"] == "open"
+    assert "lease expired" in it["history"][-1]["reason"]
 
 
 def test_github_claim_routes_recovery_never_blocks(lv, monkeypatch):
@@ -355,7 +355,7 @@ def test_local_legacy_claim_with_bound_resumed_session(lv):
     assert _sweep(lv) == [] and lv.q.get(ref)["status"] == "in_progress"
     os.utime(transcript, (now - LATER, now - LATER))
     assert _owner(lv, lv.q.get(ref), now).verdict == "unproven"
-    assert [a["action"] for a in _sweep(lv)] == ["escalate"]
+    assert [a["action"] for a in _sweep(lv)] == ["reopen"]
 
 
 def test_unowned_in_progress_is_reopened_after_stall(lv):
@@ -619,7 +619,7 @@ def test_unblocked_plan_is_escalated_after_one_tick(lv):
 # ---------------------------------------------------------- answer floors
 def _parked_routing(wt):
     g = Golden(wt, _claimed(wt))
-    g.step(wt.q.block, g.ref, session_id="w1", question="?", origin="worker")
+    g.step(wt.q.block, g.ref, session_id="w1", question="Approve the prepared source repair?", origin="worker")
     g.step(wt.q.answer, g.ref, "left", edge="E1", row="answer.routing")
     return g
 
@@ -676,7 +676,7 @@ def test_plan_conflict_floor(lv):
 
 def test_parked_bare_is_reopened(lv):
     ref = _claimed(lv)
-    lv.q.block(ref, session_id="w1", question="?", origin="worker")
+    lv.q.block(ref, session_id="w1", question="Approve the prepared source repair?", origin="worker")
     data = lv.q._load_unlocked()
     for it in data["items"]:
         if it["ref"] == ref:
@@ -707,7 +707,7 @@ def test_stages_tick_runs_the_sweep(lv, monkeypatch, capsys):
     monkeypatch.setattr(lv.liveness, "sweep", lambda only_ref="", **k: called.append(only_ref) or [
         {"ref": "LQ-9", "action": "reopen", "result": "done", "reason": "gone"}])
     assert lv.cli.main(["stages", "tick", "--ref", "LQ-9"]) == 0
-    assert called == ["LQ-9"] and "LQ-9: backstop reopen (done)" in capsys.readouterr().out
+    assert called == ["LQ-9"] and "LQ-9:ticket: backstop reopen (done)" in capsys.readouterr().out
 
 
 def test_wt_liveness_is_read_only(lv, capsys):
@@ -1296,8 +1296,7 @@ def test_owner_route_request_states_checks_and_safe_stop(lv, monkeypatch):
     for want in ("becky-1", SID2, "host zz9", f"Observed by host {lv.q.machine_tag()}",
                  "Re-read GH-1 first", "does not authorize `wt release --force`",
                  "budget", "deadline", "grant", "proves the claimed", "Done when:",
-                 "an external wait, not a", "`wt defer`", "--unresolved",
-                 "never for\n   reachability alone"):
+                 "Never park it on a timer", "permanent monitor", "unresolved item"):
         assert want in text, want
     assert "block this request on" not in text      # unreachable is not a question
     assert r["readiness"] == "ready"
@@ -1320,5 +1319,12 @@ def test_owner_route_files_a_real_local_ops_request_once(lv, monkeypatch):
     # Filed ready to work, not as a question: no needs-you state moves to OPS.
     assert (row["status"], row.get("readiness")) == ("open", "ready")
     assert not row.get("needs_input") and not row.get("wait")
-    assert "`wt defer`" in row["text"] and "wt block" in row["text"]
+    assert "permanent monitor" in row["text"] and "unresolved item" in row["text"]
     assert row["dedupe_key"] == lv.liveness._owner_route_key(item) + "#1"
+
+
+def test_unobserved_claim_does_not_expire_when_process_scan_fails(lv,monkeypatch):
+    ref=_claimed(lv,worker='legacy-worker',sid=SID2)
+    monkeypatch.setattr(lv.liveness.ResolverContext,'ps',lambda ctx:None)
+    assert _sweep(lv)==[]
+    assert lv.q.get(ref)['claimed_by']=='legacy-worker'

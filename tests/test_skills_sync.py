@@ -23,6 +23,7 @@ EXPECTED_SKILLS = (
     "snapshot-now",
     "resume-from-snapshot",
     "resume-from-session",
+    "superpowers-to-watchtower",
 )
 ALL_ENGINES = ("claude", "codex", "antigravity", "kimi", "grok", "devin")
 

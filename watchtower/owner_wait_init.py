@@ -48,7 +48,9 @@ def _source(apply):
             if not isinstance(items, list) or any(not isinstance(i, dict) or not i.get("project") for i in items):
                 raise ValueError("invalid source items")
             normalized = copy.deepcopy(items)
-            q._normalize_items(normalized)
+            # A generated display name does not change source identity. Keep
+            # the frozen source untouched, including records predating slugs.
+            q._normalize_items(normalized, backfill_slugs=False)
             if normalized != items:
                 raise Unsupported("source ref normalization required before initialization")
             version = {"revision": revision, "snapshot_sha256": export._digest([items, settings])}

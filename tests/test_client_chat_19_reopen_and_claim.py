@@ -65,7 +65,8 @@ def test_reopen_and_claim_rebinds_blocked_awaiting_client_ticket(q):
     sid = "11111111-2222-3333-4444-555555555555"
     item = q.enqueue(project="CLIENTCHAT19TEST", note="topic work")
     claimed = q.claim_next(worker_id, project="CLIENTCHAT19TEST", session_uuid=sid)
-    q.block(claimed["ref"], session_id=worker_id, question="awaiting client", kind="awaiting-client")
+    q.block(claimed["ref"], session_id=worker_id, question="awaiting client", kind="awaiting-client",
+            wait_on="external", wait_actor="Sonia")
     q.update_status(claimed["ref"], "closed", worker_id, resolution={"summary": "topic done"})
 
     rebind = q.reopen_and_claim(claimed["ref"], worker_id, session_uuid=sid, force=True)

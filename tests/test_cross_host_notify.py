@@ -114,7 +114,7 @@ def test_remote_notice_parks_with_the_qualified_address(wt, tmp_path, monkeypatc
 # ------------------------------------------------- file time + notify time
 def test_enqueue_records_the_filing_node(wt, tmp_path):
     _set_ccc_node(tmp_path, REMOTE)
-    item = wt.q.enqueue(project="SUB", note="filed here", submitter=SID)
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="filed here", submitter=SID)
     assert item["submitter_node"] == REMOTE
     assert wt.q.get(item["ref"])["submitter_node"] == REMOTE
 
@@ -127,7 +127,7 @@ def test_enqueue_without_submitter_records_no_node(wt, tmp_path):
 
 def test_notice_from_another_host_is_node_qualified(wt, tmp_path, monkeypatch):
     _set_ccc_node(tmp_path, REMOTE)              # filed on the VM ...
-    item = wt.q.enqueue(project="SUB", note="cross host", submitter=SID)
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="cross host", submitter=SID)
     wt.q.claim_by_ref(item["ref"], "worker-a")
     _set_ccc_node(tmp_path, "157eb096-890c-42b2-a78a-097e444c307c")  # ... blocked on the Mac
     calls = _record_sends(monkeypatch, wt.messages)
@@ -143,7 +143,7 @@ def test_notice_from_another_host_is_node_qualified(wt, tmp_path, monkeypatch):
 
 def test_notice_on_the_filing_host_stays_bare(wt, tmp_path, monkeypatch):
     _set_ccc_node(tmp_path, REMOTE)
-    item = wt.q.enqueue(project="SUB", note="same host", submitter=SID)
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="same host", submitter=SID)
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
@@ -154,7 +154,7 @@ def test_notice_on_the_filing_host_stays_bare(wt, tmp_path, monkeypatch):
 
 def test_remote_submitter_that_is_the_actor_gets_no_echo(wt, tmp_path, monkeypatch):
     _set_ccc_node(tmp_path, REMOTE)
-    item = wt.q.enqueue(project="SUB", note="self", submitter=SID)
+    item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="self", submitter=SID)
     wt.q.claim_by_ref(item["ref"], "worker-a")
     _set_ccc_node(tmp_path, "157eb096-890c-42b2-a78a-097e444c307c")
     calls = _record_sends(monkeypatch, wt.messages)
@@ -176,7 +176,7 @@ def test_github_ticket_filed_on_one_host_notifies_from_another(tmp_path, monkeyp
     calls = _record_sends(monkeypatch, messages)
 
     _set_ccc_node(tmp_path, REMOTE)
-    item = q.enqueue(project="GHI", note="gh cross host", submitter=SID)
+    item = q.enqueue(submitter_subscribed=True, project="GHI", note="gh cross host", submitter=SID)
     assert q.get(item["ref"])["submitter_node"] == REMOTE
     q.claim_by_ref(item["ref"], "worker-a")
 

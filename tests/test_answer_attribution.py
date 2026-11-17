@@ -20,6 +20,8 @@ def test_explicit_by_worker_records_kind_worker(wt, monkeypatch):
     _quiet_routing(wt, monkeypatch)
     assert wt.cli.main(["answer", it["ref"], "go left", "--worker", "wt-root",
                         "--by", "worker"]) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     by = _answer_entry(wt, it["ref"])["by"]
     assert by["kind"] == "worker" and by["worker"] == "wt-root"
     assert wt.q.get(it["ref"])["pending_answer"]["by_kind"] == "worker"
@@ -30,6 +32,8 @@ def test_service_answer_with_worker_flag_stays_human(wt, monkeypatch):
     it = _parked(wt)
     _quiet_routing(wt, monkeypatch)
     assert wt.cli.main(["answer", it["ref"], "go left", "--worker", "bridge"]) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert _answer_entry(wt, it["ref"])["by"]["kind"] == "human"
     assert wt.q.get(it["ref"])["pending_answer"]["by_kind"] == "human"
 
@@ -38,6 +42,8 @@ def test_dashboard_style_answer_stays_human(wt, monkeypatch):
     it = _parked(wt)
     _quiet_routing(wt, monkeypatch)
     assert wt.cli.main(["answer", it["ref"], "go left"]) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert _answer_entry(wt, it["ref"])["by"]["kind"] == "human"
 
 
@@ -46,6 +52,8 @@ def test_answer_inside_agent_session_defaults_to_worker(wt, monkeypatch):
     _quiet_routing(wt, monkeypatch)
     monkeypatch.setenv("CODEX_THREAD_ID", "01a18042-0000-0000-0000-000000000000")
     assert wt.cli.main(["answer", it["ref"], "go left", "--worker", "wt-d8587d34"]) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert _answer_entry(wt, it["ref"])["by"]["kind"] == "worker"
 
 
@@ -54,6 +62,8 @@ def test_explicit_by_human_overrides_agent_env(wt, monkeypatch):
     _quiet_routing(wt, monkeypatch)
     monkeypatch.setenv("WT_WORKER_ID", "wt-relay")
     assert wt.cli.main(["answer", it["ref"], "owner said go left", "--by", "human"]) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert _answer_entry(wt, it["ref"])["by"]["kind"] == "human"
 
 
@@ -81,5 +91,7 @@ def test_held_block_prompt_names_an_agent_sender(wt, monkeypatch):
     monkeypatch.setattr(wt.cli, "_deliver_to_blocked_session",
                         lambda it, text, prompt, *a: sent.setdefault("p", prompt) and 0)
     assert wt.cli.main(["answer", item["ref"], "do it", "--by", "worker"]) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert sent["p"].startswith("An agent session (not a human) answered")
     assert _answer_entry(wt, item["ref"])["by"]["kind"] == "worker"

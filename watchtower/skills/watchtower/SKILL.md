@@ -1,6 +1,6 @@
 ---
 name: watchtower
-description: Use when asked about a WatchTower ticket ref (e.g. WT-48, HERMES-20, any <PROJECT>-<N>), asked "is queue X stuck / drained", or asked to file/claim/close a ticket. WatchTower (`wt`) is a local CLI that tracks fleets of AI coding-agent workers across named queues.
+description: Use when asked about a WatchTower ticket ref (e.g. WT-48, HERMES-20, any PROJECT-N), asked "is queue X stuck / drained", or asked to file/claim/close a ticket. WatchTower (`wt`) is a local CLI that tracks fleets of AI coding-agent workers across named queues.
 ---
 
 # WatchTower
@@ -9,6 +9,20 @@ WatchTower is a local, stdlib-only CLI (`wt`) that tracks tickets in named
 queues and the agent workers draining them. Tickets are refs like `WT-48` or
 `HERMES-20` (`<PROJECT>-<N>`). If `wt` isn't on `$PATH`, WatchTower isn't
 installed here — say so rather than guessing at ticket state.
+
+Write named refs in prose: `WT-79:add-ticket-subscribe`. The numeric ref stays
+the identity; any colon or hyphen suffix is accepted and ignored on input,
+so stale names still work. A name is generated once from the filing title
+(up to four whole words / 30 characters); change it with `wt edit REF --slug NAME`.
+JSON keeps the bare `ref` plus a separate `slug` for joins and automation.
+
+Status notices are **opt-in**. `wt add` without `--subscribe` sends no status notices;
+add `--subscribe` when you want updates. For an existing ticket use
+`wt subscribe REF [target]` (target defaults to your session), or
+`wt edit REF --subscribe`. Stop updates with `wt unsubscribe REF [target]`
+or `wt edit REF --no-subscribe`. Subscriptions follow continued sessions;
+`wt find REF` shows ticket subscribers. `wt subscribe QUEUE target` still
+subscribes to the whole queue.
 
 ## Scope: what WatchTower is (and isn't)
 
@@ -108,3 +122,18 @@ Use `wt duplicate <ref> --clear` to reopen it for independent work.
 Links are local-queue only; chains, cycles, plan groups, and weaker original
 gates are refused. Only link tickets whose acceptance criteria are covered by
 the original, and include every affected route in its verification evidence.
+
+
+## Future evidence (WT-87)
+
+`wt defer` and timed ticket parking are retired. Work, close, use `--after` for
+a ticket dependency, block on a named person, or await-release for integrated
+code. Never replace a timer with an event-wait ticket. For future natural
+evidence, install a permanent registered check and close with `--caveat` and
+repeatable `--watch NAME`. Register with `wt monitor --register NAME --cmd CMD
+--cwd PATH --where HOST --schedule TEXT --every SECONDS -q OPS`. Check receipts
+need JSON status/pass|fail|pending, real_data and evidence; only a first real-data
+pass clears the owner's watching list. A failure files a new deduplicated
+ticket linked to the closed original. If no runnable check exists, record the
+unverified part as an unresolved item under the owner's policy, preserving
+genuine remaining actions and their tracking refs. See docs/worker-runbook.md.

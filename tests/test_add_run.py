@@ -154,8 +154,10 @@ def test_claim_requested_only_skips_unrequested_higher_priority(wt_env, run_cli)
 
     result = run_cli("claim", "-q", "Q", "--worker", "w1", "--requested-only", "--json")
     assert result.code == 0, result.output
-    assert asked["ref"] in result.out
-    assert other["ref"] not in result.out
+    # Related-work suggestions may mention other refs without claiming them.
+    import json
+    assert json.loads(result.out)["ref"] == asked["ref"]
+    assert not wt_env.queue.get(other["ref"]).get("claimed_by")
 
     result = run_cli("claim", "-q", "Q", "--worker", "w2", "--requested-only", "--json")
     assert other["ref"] not in result.out

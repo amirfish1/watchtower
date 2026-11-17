@@ -108,7 +108,10 @@ def read_source():
         if any(not isinstance(item, dict) or not isinstance(item.get("project"), str)
                or not item["project"] for item in items):
             raise ValueError("source items require explicit project identities")
-        q._normalize_items(items)
+        # Export snapshots describe the source, not generated display names.
+        # Adding a slug here would change frozen initialization request hashes
+        # for legacy records that have never stored one.
+        q._normalize_items(items, backfill_slugs=False)
         return base, items, revision, settings, identity
 
 

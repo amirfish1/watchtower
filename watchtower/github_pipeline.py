@@ -117,6 +117,12 @@ def stale_readers(items: List[Dict[str, Any]], now: Optional[float] = None) -> D
                            time.gmtime((now or time.time()) - READER_WINDOW_S))
     latest: Dict[str, Any] = {}
     for it in items:
+        # WT-47: an unresolved archive may hide a claim. Only a valid digest
+        # proving the last archived claim predates the window clears gating.
+        if it.get("history_resolved") is False:
+            claim_at = (q.history_digest(it) or {}).get("counts", {}).get("claim", [0, ""])[1]
+            if q.history_digest(it) is None or claim_at >= cutoff:
+                latest[f"?unresolved:{it.get('ref')}"] = (claim_at or cutoff, None)
         for h in it.get("history") or []:
             at, machine = str(h.get("at") or ""), str(h.get("machine") or "")
             if h.get("event") != "claim" or not machine or at < cutoff:
@@ -241,6 +247,7 @@ def _apply(item: Dict[str, Any], entry: Dict[str, Any]) -> None:
             item[f] = None
     extra = entry.get("history") or []
     if extra:
+        item["history_overlay"] = len(extra)
         item["history"] = sorted(list(item.get("history") or []) + copy.deepcopy(extra),
                                  key=lambda h: str(h.get("at") or ""))
 

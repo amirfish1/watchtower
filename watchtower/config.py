@@ -22,7 +22,8 @@ by ``queue._notify_ticket_event``, the same helper that pushes a ticket's own
 ``submitter`` its status changes.
 
 ``notify_events`` is the filter on that second (submitter) half: which events
-a filer hears about by default. See :data:`DEFAULT_NOTIFY_EVENTS`.
+a filer hears after opting in with ``wt add --subscribe``. Identity alone
+does not enable notices. See :data:`DEFAULT_NOTIFY_EVENTS`.
 
 Stored as ``queue-config.json`` in the persistent data directory, with
 ``~/.watchtower/queue-config.json`` imported automatically on first access.
@@ -512,6 +513,33 @@ def queue_label(queue: str) -> str:
     return configured or f"{DEFAULT_QUEUE_LABEL_PREFIX}{queue}"
 
 
+def queue_kind(queue: str) -> str:
+    """Work queues staff workers; trackers store records and supervision only."""
+    return str(_queue_entry(queue).get("kind") or "work")
+
+
+def is_tracker(queue: str) -> bool:
+    return queue_kind(queue) == "tracker"
+
+
+def require_work_queue(queue: str) -> None:
+    if is_tracker(queue):
+        raise ValueError(f"{queue} is a tracker queue; worker claims and dispatch are disabled")
+
+
+def set_queue_kind(queue: str, kind: str) -> Dict[str, Any]:
+    if kind not in ("work", "tracker"):
+        raise ValueError("queue kind must be work or tracker")
+    data = _load()
+    entry = data.setdefault(queue, {})
+    entry["kind"] = kind
+    if kind == "tracker":
+        entry["auto_drain"] = False
+        entry.pop("auto_parked", None)
+    _save(data)
+    return entry
+
+
 def set_auto_drain(queue: str, enabled: bool, *, source: str = "",
                    auto_parked: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Turn auto-drain on/off.
@@ -520,6 +548,8 @@ def set_auto_drain(queue: str, enabled: bool, *, source: str = "",
     whose engine keeps failing at launch; the marker lets it unpark the queue
     once the cause is gone. Any other call is a deliberate choice and clears
     the marker, so a human ``drain off`` is never undone automatically."""
+    if enabled:
+        require_work_queue(queue)
     data = _load()
     q = data.setdefault(queue, {})
     q["auto_drain"] = bool(enabled)
@@ -561,7 +591,7 @@ def clear_auto_parked(queue: str) -> None:
 def auto_drain(queue: str) -> bool:
     """False unless explicitly opted in. Default-off so a fresh queue is a
     backlog until you run ``wt drain on <queue>``."""
-    return bool(_queue_entry(queue).get("auto_drain", False))
+    return not is_tracker(queue) and bool(_queue_entry(queue).get("auto_drain", False))
 
 
 def set_product_gate(queue: str, enabled: bool) -> Dict[str, Any]:
@@ -1763,11 +1793,50 @@ def desired_workers(queue: str) -> int:
     return int(_queue_entry(queue).get("desired_workers", 1))
 
 
+def history_archive_on(queue: str) -> bool:
+    """WT-47 release 2: GitHub history archival for this queue. On only with
+    the recorded attestation; a bare ``true`` in a hand-edited file is off."""
+    entry = _queue_entry(queue).get("history_archive")
+    return (isinstance(entry, dict) and entry.get("on") is True
+            and bool(entry.get("attested_by")) and bool(entry.get("hosts")))
+
+
+def set_history_archive(queue: str, on: bool, attested_by: str = "",
+                        hosts: Any = ()) -> Dict[str, Any]:
+    """Record the flag. Off stops new archives; existing ones are still read."""
+    data = _load()
+    q = data.get(queue)
+    if not isinstance(q, dict):
+        q = data[queue] = {}
+    if on:
+        if not attested_by or not hosts:
+            raise ValueError("turning history archival on needs an attestation and host list")
+        q["history_archive"] = {
+            "on": True, "attested_by": attested_by, "hosts": list(hosts),
+            "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    else:
+        q.pop("history_archive", None)
+    _save(data)
+    return q
+
+
 def is_archived(queue: str) -> bool:
     return bool(_queue_entry(queue).get("archived", False))
 
 
-def set_archived(queue: str, archived: bool) -> Dict[str, Any]:
+def ticket_is_archived(item: Dict[str, Any]) -> bool:
+    """A forced archive retires its recorded tickets, without closing them.
+
+    Later tickets are deliberately not hidden. Unarchive restores the whole
+    queue, including outstanding questions and unchanged acceptance gates.
+    """
+    entry = _queue_entry(str(item.get("project") or ""))
+    return bool(entry.get("archived") and item.get("ref")
+                and item["ref"] in (entry.get("archived_ticket_refs") or []))
+
+
+def set_archived(queue: str, archived: bool, *,
+                 ticket_refs: Optional[List[str]] = None) -> Dict[str, Any]:
     """Retire (or restore) a queue. Archiving also turns auto_drain off and
     records when; the queue's tickets are untouched."""
     data = _load()
@@ -1778,9 +1847,12 @@ def set_archived(queue: str, archived: bool) -> Dict[str, Any]:
         q["archived"] = True
         q["archived_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         q["auto_drain"] = False
+        if ticket_refs is not None:
+            q["archived_ticket_refs"] = list(ticket_refs)
     else:
         q.pop("archived", None)
         q.pop("archived_at", None)
+        q.pop("archived_ticket_refs", None)
     _save(data)
     return q
 

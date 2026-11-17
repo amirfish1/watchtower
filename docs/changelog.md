@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-11-06 — bounded GitHub issue history (WT-47)
+
+- Move the oldest history entries into hash-chained comment segments, so a long
+  ticket's issue body stays bounded instead of refusing writes at GitHub's cap.
+- Readers rebuild full history; an unverifiable chain is reported and each
+  consumer fails closed.
+- Off by default: `wt history-archive` turns it on per queue, with an attestation.
+  See [history archive](github-history-archive.md).
+
+## 2026-11-17 — GitHub input waits
+
+- Keep open GitHub tickets awaiting input out of worker claims and staffing
+  depth, including explicit run requests; answer the question before running.
+
 ## 2026-11-15 — external client primitives
 
 - Preserve an opaque `client_id` on local and GitHub-backed tickets; add, edit,

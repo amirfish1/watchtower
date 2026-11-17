@@ -489,6 +489,8 @@ def test_answer_on_blocked_plan_warns(plan_cli, capsys):
     q, cli = plan_cli.q, plan_cli.cli
     ref = _block_plan(plan_cli)
     cli.cmd_answer(argparse.Namespace(ref=ref, text="ok", worker="", engine="", tid=False))
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     assert "plan gate is STILL BLOCKED" in capsys.readouterr().out
 
 
@@ -954,3 +956,57 @@ def test_duplicate_cli_and_worker_close_alias(wt_env, run_cli, monkeypatch):
     result = run_cli("close", b["ref"], "--worker", "owner", "--duplicate-of", a["ref"], "--no-code")
     assert result.code == 0, result.err
     assert q.get(b["ref"])["duplicate_of"] == a["ref"]
+
+
+def test_closed_primary_links_complete_or_reject_without_losing_claim(wt):
+    q = wt.q
+    a = _file(q, "unproven", gates=["verify"])
+    b = _file(q, "independent")
+    q.close(a["ref"], force=True, resolution="owner stopped original")
+    q.claim_by_ref(b["ref"], "builder")
+    with pytest.raises(ValueError, match="closed without passing all required gates"):
+        q.link_duplicate(b["ref"], a["ref"], worker="builder")
+    saved = q.get(b["ref"])
+    assert saved["status"] == "in_progress" and saved["claimed_by"] == "builder"
+    assert not saved.get("duplicate_of")
+    q.update_status(a["ref"], "open")
+    q.close(a["ref"], resolution="fixed")
+    q.verdict(a["ref"], True, "verified")
+    assert q.link_duplicate(b["ref"], a["ref"], worker="builder")["status"] == "closed"
+
+
+def test_duplicate_sweep_releases_legacy_closed_unproven_wait_once(wt):
+    q = wt.q
+    a = _file(q, "original", gates=["cmd:false", "verify"])
+    b = _file(q, "legacy follower")
+    # Seed old data without calling the new save-time repair.
+    data = {"items": [dict(a, status="closed", resolution={"summary": "stopped"}),
+                      dict(b, duplicate_of=a["ref"], status="open")]}
+    with q._FileLock(q._lock_path()):
+        q._create_db(q._db_path(), data)
+    assert q.sync_duplicates() == [b["ref"]]
+    f = q.get(b["ref"])
+    assert f["status"] == "open" and not f.get("duplicate_of")
+    assert f["gates"] == ["cmd:false", "verify"]
+    assert f["duplicate_result"]["released"] and not f["duplicate_result"]["complete"]
+    assert "stopped" in f["gate_feedback"]
+    assert f["history"][-1]["event"] == "duplicate_release"
+    assert q.sync_duplicates() == []
+    assert q.claim_by_ref(b["ref"], "independent")
+    assert q.close(b["ref"], "independent", resolution="not fixed")["status"] == "open"
+
+
+def test_close_duplicate_cli_rejects_unproven_and_inherits_ungated_result(wt_env, run_cli, monkeypatch):
+    q = wt_env.queue
+    monkeypatch.setattr(wt_env.cli.stages, "request", lambda *a, **kw: None)
+    a = q.enqueue(project="DP", note="unverified", gates=["verify"])
+    b = q.enqueue(project="DP", note="follower")
+    q.close(a["ref"], force=True, resolution="stopped")
+    result = run_cli("close", b["ref"], "--duplicate-of", a["ref"], "--no-code", "--force")
+    assert result.code == 1 and "closed without passing" in result.err
+    assert not q.get(b["ref"]).get("duplicate_of")
+    c = q.enqueue(project="DP", note="completed")
+    q.close(c["ref"], resolution={"summary": "done", "commit": "abc"})
+    result = run_cli("close", b["ref"], "--duplicate-of", c["ref"], "--no-code", "--force")
+    assert result.code == 0 and "(closed)" in result.out
+    assert q.get(b["ref"])["resolution"]["commit"] == "abc"

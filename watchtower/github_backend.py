@@ -10,8 +10,11 @@ store for a queue configured with ``backend=github`` and uses the installed
 
 from __future__ import annotations
 
+from .refs import canonical_ref, display_ref, slug_of, ticket_slug
+
 import hashlib
 import json
+import sqlite3
 import os
 import re
 import subprocess
@@ -24,6 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from . import github_history_archive as gha
 from .config import CATCH_ALL_LABEL
 from .queue import (
     UNCLAIMABLE_READINESS, _FileLock, _refs_index, _validate_blocked_by,
@@ -47,7 +51,7 @@ RUN_REQUESTED_LABEL = "watchtower:play"
 # Mirrors config.DEFAULT_GRACE_S; duplicated only as the fallback for a backend
 # built without a readable config (embedders, tests).
 DEFAULT_GRACE_S = 180
-VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "")
+VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "needs-rationale", "")
 VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
 VALID_VALUES = ("H", "M", "L", "")
 VALID_CONFIDENCES = ("H", "M", "L", "")
@@ -345,13 +349,15 @@ def _read_persisted_list_cache() -> Dict[str, Any]:
         return dict(data)
 
 
-def _rewrite_persisted_list_cache(mutate) -> None:
+def _rewrite_persisted_list_cache(mutate, *, changed_repos=None) -> None:
     """Load-modify-atomic-write the persisted cache file under its lock.
 
     ``mutate(data) -> bool`` edits ``data`` in place and returns whether
     anything actually changed (skipping the write entirely when it didn't)."""
     path = _list_cache_path()
     with _FileLock(path.with_suffix(".lock")):
+        from . import reporting_cache
+        previous_stamp = reporting_cache._stamp(path) if path.exists() else None
         data = _read_persisted_list_cache()
         if not mutate(data):
             return
@@ -360,6 +366,14 @@ def _rewrite_persisted_list_cache(mutate) -> None:
         with open(tmp, "w") as f:
             json.dump(data, f)
         os.replace(tmp, path)
+        # Reporting reads stay local and bounded; the existing writer maintains
+        # projections only for queues that have requested them.
+        try:
+            reporting_cache.publish_existing(data, path, changed_repos=changed_repos,
+                                             previous_stamp=previous_stamp)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
+            _log_quota("report_index_error", error=str(exc))
+
 
 
 def _write_persisted_list_entry(key: str, entry: Dict[str, Any]) -> None:
@@ -367,7 +381,7 @@ def _write_persisted_list_entry(key: str, entry: Dict[str, Any]) -> None:
         data[key] = entry
         return True
 
-    _rewrite_persisted_list_cache(mutate)
+    _rewrite_persisted_list_cache(mutate, changed_repos={key.rsplit(":", 1)[0]})
 
 
 def _invalidate_list_cache(repo: str) -> None:
@@ -423,7 +437,7 @@ def _invalidate_list_cache(repo: str) -> None:
                 changed = True
         return changed
 
-    _rewrite_persisted_list_cache(mutate)
+    _rewrite_persisted_list_cache(mutate, changed_repos={repo})
 
 
 def refresh_persisted_list_cache(repo: str) -> None:
@@ -1315,64 +1329,18 @@ def _claim_predates_close(meta: Dict[str, Any]) -> bool:
     return claimed is None or claimed <= closed
 
 
-def _defer_live(until: Any) -> bool:
-    parsed = _parse_iso(until) if until else None
-    return parsed is not None and parsed.timestamp() > time.time()
-
-
-# OPS-215: while a gated ticket is plan-pending or in review, its issue carries
-# this defer window. Every wt since OPS-100 keeps a deferred ticket out of
-# claim_next / claim_by_ref / `wt run`, so a host that cannot read the pipeline
-# (older than OPS-201, or no sidecar) is fenced by the issue alone. A wt that
-# knows ``pipeline_hold`` reads the human defer it saved instead and lets the
-# sidecar overlay decide the hold.
-PIPELINE_HOLD_UNTIL = "2099-12-31T00:00:00Z"
-
-
-def _effective_defer(meta: Dict[str, Any]) -> str:
-    until = str(meta.get("deferred_until") or "")
-    hold = meta.get("pipeline_hold")
-    if isinstance(hold, dict) and until == PIPELINE_HOLD_UNTIL:
-        return str(hold.get("prev_defer") or "")
-    return until
-
-
 def _set_pipeline_hold(meta: Dict[str, Any], why: str) -> None:
-    """Write (``why`` = plan|review) or lift the issue-level pipeline hold. A
-    human defer is kept in the hold and restored when it lifts; one set during
-    the hold (it replaced the sentinel) is re-saved on the next write."""
-    hold = meta.get("pipeline_hold")
+    """Pipeline admission is explicit metadata, never a year-2099 timer."""
     if why:
-        if not isinstance(hold, dict) or meta.get("deferred_until") != PIPELINE_HOLD_UNTIL:
-            hold = {"prev_defer": str(meta.get("deferred_until") or ""),
-                    "prev_reason": str(meta.get("defer_reason") or "")}
-        meta["pipeline_hold"] = dict(hold, why=why)
-        meta["deferred_until"] = PIPELINE_HOLD_UNTIL
-        meta["defer_reason"] = (
-            f"duplicate hold: it completes with {meta.get('duplicate_of') or 'its original'}"
-            if why == "duplicate" else
-            f"pipeline hold ({why}): it settles on the host that "
-            f"owns its gates; a wt without that pipeline must not claim it")
-        return
-    if not isinstance(hold, dict):
-        return
-    meta.pop("pipeline_hold", None)
-    if meta.get("deferred_until") == PIPELINE_HOLD_UNTIL:
-        if hold.get("prev_defer"):
-            meta["deferred_until"] = hold["prev_defer"]
-            meta["defer_reason"] = hold.get("prev_reason") or ""
-        else:
-            meta.pop("deferred_until", None)
-            meta.pop("defer_reason", None)
+        meta["pipeline_hold"] = dict(meta.get("pipeline_hold") or {}, why=why)
+    else:
+        meta.pop("pipeline_hold", None)
+    # Retire only old wire sentinels here. Real legacy data windows are
+    # migrated separately with their exact reason and reversal receipt.
+    if meta.get("deferred_until") in ("2099-12-31T00:00:00Z", "9999-12-31T00:00:00Z"):
+        meta.pop("deferred_until", None)
+        meta.pop("defer_reason", None)
 
-
-_DEFER_MARKER_RE = re.compile(r'^deferred_until:\s*"([^"]+)"', re.MULTILINE)
-
-
-def _defer_marker_live(body: Any) -> bool:
-    """Cheap pre-parse check for a live defer window in an issue body."""
-    m = _DEFER_MARKER_RE.search(str(body or ""))
-    return bool(m) and _defer_live(m.group(1))
 
 
 def _age_seconds(created_at: Any, *, now: Optional[datetime] = None) -> float:
@@ -1469,11 +1437,28 @@ _ISSUE_BODY_MAX_BYTES = 262144
 # (_merge_body_write) appends its own entries on top of ours.
 _ISSUE_BODY_BUDGET_BYTES = 250000
 _COMMENT_MAX_CHARS = 65536
-_HISTORY_TEXT_INLINE_MAX = 1000
+# WT-45: 1000 left BECKY-2966's 59 referenced answers at 91 KB of excerpts.
+_HISTORY_TEXT_INLINE_MAX = 300
+# A reference costs ~290 bytes (excerpt suffix, ref, sha256, length), so a
+# text this short or shorter stays inline: referencing it would grow the body.
+_HISTORY_REF_MIN = 600
 _COMMENTED_EVENTS = ("answer", "comment")
 _ENTRY_MARKER = "\n\n<!-- watchtower-entry: {} -->"
 _ENTRY_MARKER_RE = re.compile(r"\n\n<!-- watchtower-entry: ([0-9a-f]{16}) -->\s*$")
 _TEXT_REF_KEYS = ("text", "text_len", "text_sha256", "text_ref")
+# WT-45: progress notes and block questions are referenced the same way. Each
+# event keeps its long text in one field; a reference adds <field>_len,
+# <field>_sha256 and <field>_ref beside it.
+_REF_FIELD_BY_EVENT = {"answer": "text", "comment": "text", "progress": "text",
+                       "block": "question"}
+_REF_FIELDS = ("text", "question")
+_ALL_REF_KEYS = tuple(f"{f}{s}" for f in _REF_FIELDS for s in ("", "_len", "_sha256", "_ref"))
+# Comments that mirror a block question or a progress note open with this
+# prefix, so they read as WatchTower's on the issue; the text after it is the
+# exact original (the sha256 on the history entry proves it).
+_BLOCK_COMMENT_PREFIX = "[watchtower] Needs input from {}:\n\n"
+_PROGRESS_COMMENT_PREFIX = "[watchtower] Progress from {}:\n\n"
+_MIRROR_PREFIX_RE = re.compile(r"\A\[watchtower\] (?:Needs input|Progress) from [^\n]*:\n\n")
 
 
 def _text_sha256(text: str) -> str:
@@ -1482,6 +1467,47 @@ def _text_sha256(text: str) -> str:
 
 def _body_bytes(raw: str) -> int:
     return len(raw.encode("utf-8"))
+
+
+_ARCHIVE_MISSES: Dict[tuple, float] = {}
+_ARCHIVE_MISS_TTL_S = 300.0
+_ARCHIVE_CACHE_MEMO: Dict[str, tuple] = {}
+
+
+def _archive_cache_entries(path: Any, meta: Dict[str, Any], repo: str,
+                           number: Any) -> Optional[List[Any]]:
+    """Archived entries from the local cache, re-verified whenever the file
+    changed; None on a miss or a file that no longer verifies."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    stamp = (st.st_mtime_ns, st.st_size)
+    hit = _ARCHIVE_CACHE_MEMO.get(str(path))
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    entries, _err, _ids = gha.verify_chain(meta, gha.cache_load(path), repo, number)
+    if entries is None:
+        return None
+    if len(_ARCHIVE_CACHE_MEMO) >= 256:
+        _ARCHIVE_CACHE_MEMO.clear()
+    _ARCHIVE_CACHE_MEMO[str(path)] = (stamp, entries)
+    return entries
+
+
+def _stale_archive_reader(meta: Dict[str, Any], now: Optional[float] = None) -> bool:
+    """A recent claim on this ticket from another host below the reader
+    protocol. An observation, not a fence (plan §4.2)."""
+    from . import github_pipeline
+    from . import queue as _q
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+        (time.time() if now is None else now) - github_pipeline.READER_WINDOW_S))
+    hist = meta.get("history") if isinstance(meta.get("history"), list) else []
+    return any(isinstance(h, dict) and h.get("event") == "claim"
+               and str(h.get("at") or "") >= cutoff
+               and str(h.get("machine") or "") not in ("", _q.machine_tag())
+               and int(h.get("hist_proto") or 0) < gha.HIST_PROTO
+               for h in hist)
 
 
 def _strip_entry_marker(body: str) -> "tuple[str, str]":
@@ -1496,36 +1522,59 @@ def _comment_ref(comment: Dict[str, Any]) -> str:
     return str(comment.get("url") or comment.get("id") or "").strip()
 
 
-def _entry_key(number: str, event: str, meta: Dict[str, Any], text: str) -> str:
+def _entry_key(number: str, event: str, meta: Dict[str, Any], text: str,
+               archive_view: "gha.ArchiveView") -> str:
     """Idempotency key for one answer/comment write, recorded on its history
     entry as ``entry_key``. It depends only on this write (issue, event,
     block generation, text) and on how many entries already carry the same
     write, never on unrelated history: a retry after a failed body edit gets
     the same key even if other entries landed in between, finds the comment
     the failed attempt posted and adopts it; once the entry lands, the same
-    words again get the next key and a comment of their own."""
+    words again get the next key and a comment of their own.
+
+    ``archive_view`` is required (WT-47): an entry archived out of the body
+    still holds its key, so the index comes from the high-water fold over the
+    archive too. Never-archived issues get exactly the count above."""
     raw = f"{number}|{event}|{meta.get('blocked_at') or ''}|{text}"
     base = _text_sha256(raw)[:12]
     hist = meta.get("history") if isinstance(meta.get("history"), list) else []
-    seen = sum(1 for e in hist
-               if isinstance(e, dict) and str(e.get("entry_key") or "").startswith(base))
+    try:
+        seen = gha.next_key_index(base, hist, archive_view)
+    except gha.ArchiveError as exc:
+        raise GitHubBackendError(str(exc)) from exc
+    if seen >= 0xffff:
+        raise GitHubBackendError(f"entry key index exhausted for {base}; nothing written")
     return f"{base}{seen:04x}"
 
 
-def _referenced_text(entry: Dict[str, Any], text: str, ref: str) -> None:
+def _referenced_text(entry: Dict[str, Any], text: str, ref: str,
+                     field: str = "text") -> None:
     """Store ``text`` on a history entry by reference when it is long: the
     excerpt says how long the full text is and where it lives, and the
-    sha256 lets a reader verify the comment it points at."""
+    sha256 lets a reader verify the comment it points at. ``field`` is the
+    entry key holding the text (``question`` for a block, WT-45)."""
     if not text:
         return
-    if len(text) <= _HISTORY_TEXT_INLINE_MAX or not ref:
-        entry["text"] = text
+    if len(text) <= _HISTORY_REF_MIN or not ref:
+        entry[field] = text
         return
     head = text[:_HISTORY_TEXT_INLINE_MAX].rstrip()
-    entry["text"] = f"{head} ... [{len(text)} chars; full text: {ref}]"
-    entry["text_len"] = len(text)
-    entry["text_sha256"] = _text_sha256(text)
-    entry["text_ref"] = ref
+    entry[field] = f"{head} ... [{len(text)} chars; full text: {ref}]"
+    entry[f"{field}_len"] = len(text)
+    entry[f"{field}_sha256"] = _text_sha256(text)
+    entry[f"{field}_ref"] = ref
+
+
+def _set_history_text(entry: Dict[str, Any], text: str, ref: str, field: str) -> None:
+    """(Re)store ``text`` on ``entry``: by reference when long and ``ref``
+    is set, else inline."""
+    for k in (field, f"{field}_len", f"{field}_sha256", f"{field}_ref"):
+        entry.pop(k, None)
+    _referenced_text(entry, text, ref, field)
+
+
+def _is_referenced(entry: Any) -> bool:
+    return isinstance(entry, dict) and any(entry.get(f"{f}_ref") for f in _REF_FIELDS)
 
 
 def _history_id(entry: Any) -> str:
@@ -1533,49 +1582,114 @@ def _history_id(entry: Any) -> str:
     event before and after its text moved to a comment compares equal."""
     if not isinstance(entry, dict):
         return json.dumps(entry, sort_keys=True, default=str)
-    digest = entry.get("text_sha256") or (
-        _text_sha256(str(entry["text"])) if "text" in entry else "")
-    rest = {k: v for k, v in entry.items() if k not in _TEXT_REF_KEYS}
+    digests = [entry.get(f"{f}_sha256") or (
+        _text_sha256(str(entry[f])) if f in entry else "") for f in _REF_FIELDS]
+    rest = {k: v for k, v in entry.items() if k not in _ALL_REF_KEYS}
     if entry.get("event") == "auto_decision" and entry.get("decision_id"):
         # The same receipt retried on another host has a new recording time;
         # retain one exact payload when the body writer merges their history.
         rest.pop("at", None)
-    return json.dumps([rest, digest], sort_keys=True, default=str)
+    return json.dumps([rest, *digests], sort_keys=True, default=str)
+
+
+def _comment_texts(comment: Any) -> List[str]:
+    """Texts a comment holds exactly: its body without the entry marker and,
+    for a block/progress mirror, the same without the mirror prefix."""
+    if not isinstance(comment, dict):
+        return []
+    text, _key = _strip_entry_marker(str(comment.get("body") or ""))
+    out = [text]
+    bare = _MIRROR_PREFIX_RE.sub("", text, count=1)
+    if bare != text:
+        out.append(bare)
+    return out
+
+
+def _resolve_history(history: List[Any], comments: List[Any]) -> List[Any]:
+    """WT-45 reader: ``history`` with each referenced text restored to the
+    exact original from the comment it points at, verified by sha256. An
+    entry whose comment is missing or no longer matches keeps its excerpt and
+    is marked ``<field>_unresolved``; an excerpt is never presented as the
+    text. Returns new entry dicts; the input is not modified."""
+    by_ref: Dict[str, Any] = {}
+    for c in comments or []:
+        if not isinstance(c, dict):
+            continue
+        # url, then id: an ingested owner answer references its comment by
+        # _owner_answer_comment_key (id first), a posted one by url.
+        for ref in (_comment_ref(c), _owner_answer_comment_key(c)):
+            if ref:
+                by_ref.setdefault(ref, c)
+        _text, key = _strip_entry_marker(str(c.get("body") or ""))
+        if key:
+            by_ref.setdefault(f"comment:{key}", c)
+    out: List[Any] = []
+    for entry in history:
+        if not _is_referenced(entry):
+            out.append(entry)
+            continue
+        entry = dict(entry)
+        for field in _REF_FIELDS:
+            ref, digest = entry.get(f"{field}_ref"), entry.get(f"{field}_sha256")
+            if not ref:
+                continue
+            comment = by_ref.get(str(ref))
+            if comment is None and entry.get("entry_key"):
+                comment = by_ref.get(f"comment:{entry['entry_key']}")
+            full = next((t for t in _comment_texts(comment) if _text_sha256(t) == digest), None)
+            if full is None:
+                entry[f"{field}_unresolved"] = True
+            else:
+                entry[field] = full
+        out.append(entry)
+    return out
 
 
 def _compact_history(meta: Dict[str, Any], comments: List[Dict[str, Any]],
                      human_body: str) -> int:
-    """Move long answer/comment texts already posted as issue comments out of
-    the body, oldest first, until it fits the budget. Lossless: an entry moves
-    only when an issue comment holds exactly its text. Returns entries moved."""
+    """Move long history texts that issue comments already hold out of the
+    body, oldest first, until it fits the budget. Lossless: an entry moves
+    only when an issue comment holds exactly its text (answer/comment/
+    progress text, block question, WT-45), and an entry already referenced
+    is re-excerpted only after its comment is found and matches its sha256.
+    Returns entries changed."""
     hist = meta.get("history")
     if not isinstance(hist, list):
         return 0
     by_text: Dict[str, str] = {}
     for c in comments or []:
-        if not isinstance(c, dict):
-            continue
-        text, _key = _strip_entry_marker(str(c.get("body") or ""))
-        ref = _comment_ref(c)
+        ref = _comment_ref(c) if isinstance(c, dict) else ""
         if ref:
-            by_text.setdefault(text, ref)
+            for text in _comment_texts(c):
+                by_text.setdefault(text, ref)
+    resolved = _resolve_history(hist, comments)
     moved = 0
     size = _body_bytes(_body_with_metadata(human_body, meta))
     for i, entry in enumerate(hist):
         if size <= _ISSUE_BODY_BUDGET_BYTES:
             break
-        if (not isinstance(entry, dict) or entry.get("event") not in _COMMENTED_EVENTS
-                or entry.get("text_ref")):
+        field = _REF_FIELD_BY_EVENT.get(entry.get("event")) if isinstance(entry, dict) else None
+        if not field:
             continue
-        text = str(entry.get("text") or "")
-        ref = by_text.get(text)  # exact: a comment that differs at all is not this text
-        if len(text) <= _HISTORY_TEXT_INLINE_MAX or not ref:
+        if entry.get(f"{field}_ref"):
+            if resolved[i].get(f"{field}_unresolved"):
+                continue
+            text, ref = str(resolved[i].get(field) or ""), str(entry[f"{field}_ref"])
+        else:
+            text = str(entry.get(field) or "")
+            ref = by_text.get(text, "")  # exact: a comment that differs at all is not this text
+        if len(text) <= _HISTORY_REF_MIN or not ref:
             continue
-        compact = {k: v for k, v in entry.items() if k != "text"}
-        _referenced_text(compact, text, ref)
+        compact = {k: v for k, v in entry.items()
+                   if k not in (field, f"{field}_len", f"{field}_sha256", f"{field}_ref")}
+        _referenced_text(compact, text, ref, field)
         # The metadata line is ASCII JSON (ensure_ascii), so the entry's
-        # serialized length change is the body's byte change.
-        size -= len(json.dumps(entry)) - len(json.dumps(compact))
+        # serialized length change is the body's byte change. Move only
+        # what shrinks (a heavily escaped short text can grow).
+        saved = len(json.dumps(entry)) - len(json.dumps(compact))
+        if saved <= 0:
+            continue
+        size -= saved
         hist[i] = compact
         moved += 1
     return moved
@@ -1656,6 +1770,8 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
         val = _clip(resolution.get(field, ""), max_len)
         if val:
             out[field] = val
+    if resolution.get("watches"):
+        out["watches"] = [dict(w) for w in resolution["watches"]]
     for field in ("caveats", "follow_ups", "unresolved"):
         raw = resolution.get(field)
         if raw is None:
@@ -1701,13 +1817,13 @@ def _resolution_comment(resolution: Optional[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _meta_block(meta: Dict[str, Any]) -> str:
+def _meta_block(meta: Dict[str, Any], *, compact: bool = False) -> str:
     lines = [_META_START]
     for key in sorted(meta):
         value = meta.get(key)
         if value in (None, ""):
             continue
-        lines.append(f"{key}: {json.dumps(value)}")
+        lines.append(f"{key}: {json.dumps(value, separators=(',', ':') if compact else None)}")
     lines.append(_META_END)
     return "\n".join(lines)
 
@@ -1779,11 +1895,11 @@ def _split_body_uncached(body: str) -> tuple[str, Dict[str, Any]]:
     return human, meta
 
 
-def _body_with_metadata(human_body: str, meta: Dict[str, Any]) -> str:
+def _body_with_metadata(human_body: str, meta: Dict[str, Any], *, compact: bool = False) -> str:
     human_body = (human_body or "").rstrip()
     if human_body:
-        return f"{human_body}\n\n{_meta_block(meta)}"
-    return _meta_block(meta)
+        return f"{human_body}\n\n{_meta_block(meta, compact=compact)}"
+    return _meta_block(meta, compact=compact)
 
 
 _UNSET = object()
@@ -1796,6 +1912,54 @@ def _log_body_reapply(repo: str, number: str, conflicts: List[str]) -> None:
         from . import queue as _q
         _q._log("GH-REAPPLY", f"{repo}#{number} concurrent body write dropped our change; "
                 f"re-applied" + (f" (theirs kept: {', '.join(conflicts)})" if conflicts else ""))
+    except Exception:  # noqa: BLE001 - logging never breaks a write
+        pass
+
+
+def _merge_archive(base_m: Dict[str, Any], ours_m: Dict[str, Any],
+                   fresh_m: Dict[str, Any]) -> Dict[str, Any]:
+    """Decide the archive index of a three-way merge, whole (plan §4.3). An
+    archive change is applied whole or dropped whole; the result never lowers
+    ``n`` or removes the index, and archived entries are never re-inlined by
+    us. Returns ``index`` (to set on the merged meta), ``drop`` (entries to
+    remove from the head of fresh's tail) and ``conflict``."""
+    b, o, f = (gha.index_of(m) for m in (base_m, ours_m, fresh_m))
+    bn, on, fn = (gha.index_n(m) for m in (base_m, ours_m, fresh_m))
+    btail = base_m.get("history") if isinstance(base_m.get("history"), list) else []
+    ftail = fresh_m.get("history") if isinstance(fresh_m.get("history"), list) else []
+    high = max(bn, on)
+    if fn < high:
+        # Fresh lost archive state. Entries back inline mean a legacy writer
+        # restored a pre-archival snapshot: restoring the index on top would
+        # count them twice, so fresh stands and the next archival adopts the
+        # same segments. Otherwise only the index went missing: keep it.
+        known = {_history_id(e) for e in btail} | {
+            _history_id(e) for e in (ours_m.get("history") or [])}
+        inlined = len(ftail) >= high - fn and bool(ftail) and _history_id(ftail[0]) not in known
+        if b is not None and (f is None or fn < bn) and inlined:
+            _log_archive_reverted(fn, high)
+            return {}
+        if o is not None and o != b and f == b:
+            pass  # R1 below: our own archival, fresh never moved
+        else:
+            return {"index": o if on >= bn else b}
+    if o == b or f == o:
+        return {}                      # R2: only they archived, or we agree
+    if f != b:
+        return {"conflict": True}      # R3: both archived, theirs stands
+    move = on - bn                     # R1: only we archived
+    prefix = [_history_id(e) for e in btail[:move]]
+    if [_history_id(e) for e in ftail[:move]] == prefix:
+        return {"index": o, "drop": move}
+    return {}                          # the prefix moved under us: drop our archival
+
+
+def _log_archive_reverted(fresh_n: int, high: int) -> None:
+    try:
+        from . import queue as _q
+        _q._log("GH-ARCHIVE-REVERTED",
+                f"index n={high} replaced by n={fresh_n}: archived entries are back "
+                f"inline (a writer below the minimum reader); segments stay immutable")
     except Exception:  # noqa: BLE001 - logging never breaks a write
         pass
 
@@ -1819,23 +1983,45 @@ def _merge_body_write(base_raw: str, ours_raw: str,
     merged_h, merged_m = fresh_h, fresh_m
     conflicts: List[str] = []
     dirty = False
+    arch = _merge_archive(base_m, ours_m, fresh_m)
+    if arch.get("index") is not None:
+        merged_m["history_archive"] = copy.deepcopy(arch["index"])
+        dirty = True
     for key in list(base_m) + [k for k in ours_m if k not in base_m]:
         b, o = base_m.get(key, _UNSET), ours_m.get(key, _UNSET)
         f = fresh_m.get(key, _UNSET)
-        if b == o or f == o:
+        if key == "history_archive":
+            if arch.get("conflict"):
+                conflicts.append(key)
+            continue  # decided whole by _merge_archive
+        if b == o or (f == o and not arch.get("drop")):
             continue
         if key == "history" and isinstance(o, list):
             have = f if isinstance(f, list) else []
             old = b if isinstance(b, list) else []
+            if arch.get("drop"):
+                have = have[arch["drop"]:]
+                dirty = True
             # Compare by _history_id: an entry ours moved to a comment
             # (WT-44) is the same entry, not a new one to append twice.
             seen = {_history_id(e) for e in old} | {_history_id(e) for e in have}
             add = [e for e in o if _history_id(e) not in seen]
+            # Ours may hold an entry referenced (or re-excerpted, WT-45)
+            # where fresh still has it longer: same entry, keep the smaller.
+            # Only an entry ours actually changed counts; an unchanged one
+            # never undoes fresh's own compaction of it.
+            base_by = {_history_id(e): e for e in old}
             moved = {_history_id(e): e for e in o
-                     if isinstance(e, dict) and e.get("text_ref")}
-            kept = [e if isinstance(e, dict) and e.get("text_ref")
-                    else moved.get(_history_id(e), e) for e in have]
-            if add or kept != have:
+                     if _is_referenced(e) and base_by.get(_history_id(e)) != e}
+
+            def smaller(e: Any) -> Any:
+                mine = moved.get(_history_id(e))
+                if mine is None or len(json.dumps(mine)) >= len(json.dumps(e)):
+                    return e
+                return mine
+
+            kept = [smaller(e) for e in have]
+            if add or kept != have or arch.get("drop"):
                 merged_m["history"] = kept + add
                 dirty = True
         elif f == b:
@@ -1909,6 +2095,8 @@ def _issue_comments_text(raw: Any) -> str:
     comments: List[str] = []
     for comment in raw:
         if isinstance(comment, dict):
+            if gha.is_archive_comment(comment.get("body")):
+                continue  # archived history (WT-47): storage, not discussion
             body = _strip_entry_marker(str(comment.get("body") or ""))[0].strip()
             author = comment.get("author")
             login = str(author.get("login") or "").strip() if isinstance(author, dict) else ""
@@ -2028,6 +2216,7 @@ class GitHubIssuesBackend:
         _append_history(meta, event, **fields)
         from . import usage
         tracking = dict(meta, ref=f"{self.queue}-{number}",
+                        history_base=gha.index_n(meta),
                         _usage_namespace=f"github:{self.repo}:{self.queue}")
         entry = dict(meta["history"][-1], by={"worker": fields.get("worker", ""),
                                               "session_id": fields.get("session_id", "")})
@@ -2309,7 +2498,7 @@ class GitHubIssuesBackend:
         )
 
     def _issue_number(self, ident: Any) -> Optional[int]:
-        s = str(ident or "").strip()
+        s = canonical_ref(ident)
         if not s:
             return None
         if s.isdigit():
@@ -2342,7 +2531,10 @@ class GitHubIssuesBackend:
 
     def _issue_to_item(self, issue: Dict[str, Any]) -> Dict[str, Any]:
         comments_raw = issue.get("comments")
-        has_comments = isinstance(comments_raw, list) and bool(comments_raw)
+        # A fetched list, even an empty one (every comment deleted), is not
+        # an omitted one: get() must resolve against it, so it is never
+        # memoized beside the list path's comment-less conversion (WT-45).
+        has_comments = isinstance(comments_raw, list)
         created_at = issue.get("createdAt")
         state = str(issue.get("state") or "").upper()
         age_settled = (
@@ -2352,9 +2544,9 @@ class GitHubIssuesBackend:
             or _age_seconds(created_at) >= self.grace_s
         )
         memo_key = None
-        # A `wt defer` window ends by the clock alone, with no issue edit to
-        # bust the memo, so a still-deferred issue is never memoized.
-        if age_settled and not has_comments and not _defer_marker_live(issue.get("body")):
+        # An archived issue's history depends on the cache, not on the body alone.
+        if (age_settled and not has_comments
+                and "\nhistory_archive: " not in str(issue.get("body") or "")):
             # Content, not id(issue): a freed dict's id is reused, and
             # updatedAt is per-second, so an edit plus a re-read in the same
             # second served the pre-edit item (two claim winners, WT-10).
@@ -2407,6 +2599,8 @@ class GitHubIssuesBackend:
         number = int(issue.get("number") or 0)
         if state == "CLOSED":
             status = "closed"
+        elif meta.get("release_wait"):
+            status = "awaiting_release"
         elif queue_member and (meta.get("claimed_by") or self.in_progress_label in labels):
             status = "in_progress"
         else:
@@ -2418,13 +2612,11 @@ class GitHubIssuesBackend:
         #   work_it         = auto_eligible OR manual_eligible
         no_auto_drain = self.no_auto_drain_label in labels
         run_requested = self.run_requested_label in labels
-        deferred_until = _effective_defer(meta)
-        # `wt defer`: inside its data window a ticket is out of the pool for
-        # claims and spawn depth alike, ▶ included (queue._claim_candidates).
-        deferred = _defer_live(deferred_until)
-        # A duplicate follower waits on its original (OPS-208), whatever the defer says.
-        workable = (queue_member and status == "open" and not deferred
-                    and not meta.get("duplicate_of"))
+        # Explicit gates survive across hosts; legacy timer fields have no
+        # admission semantics and cannot wake a ticket when a clock passes.
+        workable = (queue_member and status == "open"
+                    and not meta.get("needs_input")
+                    and not meta.get("duplicate_of") and not meta.get("pipeline_hold"))
         auto_eligible = bool(
             workable
             and self.auto_drain
@@ -2440,6 +2632,7 @@ class GitHubIssuesBackend:
             "caveats": meta.get("resolution_caveats", []),
             "follow_ups": meta.get("resolution_follow_ups", []),
             "unresolved": meta.get("resolution_unresolved", []),
+            "watches": meta.get("resolution_watches", []),
             "caveats_ack": meta.get("resolution_caveats_ack") or {},
             "follow_ups_ack": meta.get("resolution_follow_ups_ack") or {},
             "unresolved_ack": meta.get("resolution_unresolved_ack") or {},
@@ -2449,6 +2642,11 @@ class GitHubIssuesBackend:
             "machine": meta.get("resolution_machine", ""),
         })
 
+        title = str(issue.get("title") or "")
+        # One fixed regex avoids compiling a different pattern for every ref.
+        named = re.match(r"([A-Z][A-Z0-9_-]*-\d+):[a-z0-9-]+\s+", title)
+        if named and named.group(1) == f"{self.queue}-{number}":
+            title = title[named.end():]
         item: Dict[str, Any] = {
             "number": number,
             "project": self.queue,
@@ -2461,7 +2659,8 @@ class GitHubIssuesBackend:
             "note": _clip(meta.get("note") or _first_line(body) or issue.get("title", ""), 4000),
             "text": _clip(text, 24000),
             "url": str(issue.get("url") or ""),
-            "title": _clip(issue.get("title", ""), 200),
+            "title": _clip(title, 200),
+            "slug": ticket_slug(meta.get("slug") or title),
             "selector": "",
             "screenshot_path": "",
             "repo_path": self.repo_path,
@@ -2477,12 +2676,15 @@ class GitHubIssuesBackend:
             "blocked_at": str(meta.get("blocked_at") or ""),
             # The orphan sweep's answer grace keys on this (OPS-200).
             "answered_at": meta.get("answered_at"),
+            "answer_dispatch": meta.get("answer_dispatch"),
             "blocked_by": [str(r) for r in (meta.get("blocked_by") or []) if r]
             if isinstance(meta.get("blocked_by"), list) else [],
             "client_id": meta.get("client_id", ""),
             "submitter": str(meta.get("submitter") or ""),
             "submitter_explicit": bool(meta.get("submitter_explicit", False)),
+            "submitter_subscribed": bool(meta.get("submitter_subscribed", False)),
             "submitter_node": str(meta.get("submitter_node") or ""),
+            "ticket_subscribers": dict(meta.get("ticket_subscribers") or {}),
             "claimed_by": (
                 meta.get("claimed_by")
                 or (",".join(assignees) if queue_member and status == "in_progress" and assignees else None)
@@ -2535,23 +2737,30 @@ class GitHubIssuesBackend:
         if str(meta.get("depth") or "").lower() == "deep":
             item["depth"] = "deep"
             item["budget_min"] = meta.get("budget_min")
-        if deferred_until:
-            item["deferred_until"] = deferred_until
-            item["defer_reason"] = str(meta.get("defer_reason") or "")
-            if isinstance(meta.get("pipeline_hold"), dict) and deferred_until != meta.get("deferred_until"):
-                item["defer_reason"] = str(meta["pipeline_hold"].get("prev_reason") or "")
         if isinstance(meta.get("pipeline_hold"), dict):
             item["pipeline_hold"] = dict(meta["pipeline_hold"])
+        if isinstance(meta.get("release_wait"), dict):
+            item["release_wait"] = dict(meta["release_wait"])
+        if isinstance(meta.get("release_event"), dict):
+            item["release_event"] = dict(meta["release_event"])
         if isinstance(meta.get("wait"), dict):
             item["wait"] = dict(meta["wait"])
         if meta.get("duplicate_of"):
             item["duplicate_of"] = str(meta["duplicate_of"])
             item["duplicate_gen"] = int(meta.get("duplicate_gen") or 0)
-            if isinstance(meta.get("duplicate_result"), dict):
-                item["duplicate_result"] = dict(meta["duplicate_result"])
+        if isinstance(meta.get("duplicate_result"), dict):
+            item["duplicate_result"] = dict(meta["duplicate_result"])
         history = meta.get("history")
         if isinstance(history, list):
-            item["history"] = list(history)
+            # WT-45: get() carries the comments, so readers see the exact
+            # referenced texts (marked unresolved when a comment is gone, even
+            # all of them); the list path (no comments) keeps excerpts.
+            if gha.index_of(meta) is not None:
+                self._attach_archive(item, meta, comments_raw if has_comments else None)
+            else:
+                item["history"] = (_resolve_history(history, comments_raw)
+                                   if isinstance(comments_raw, list)
+                                   else list(history))
         if meta.get("token_usage"):
             item["token_usage"] = copy.copy(meta["token_usage"])
         if memo_key is not None:
@@ -2620,6 +2829,7 @@ class GitHubIssuesBackend:
         fresh: bool = False,
         strict: bool = False,
         poller: bool = False,
+        snapshot_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """Read the issue list for ``state``.
 
@@ -2630,6 +2840,10 @@ class GitHubIssuesBackend:
         AND no poll is in flight. ``strict=True`` (claim/close, about to write)
         is exempt -- correctness of a write outranks quota."""
         key = f"{self.repo}:{state}"
+        if snapshot_only:
+            # Post-write wake hints must never start unrelated remote reads.
+            # Missing/stale snapshots are repaired by the normal poller.
+            return (_read_persisted_list_cache().get(key) or {}).get("data") or []
         now = time.time()
         cached = _LIST_CACHE.get(key)
         backoff_active = False
@@ -2968,6 +3182,7 @@ class GitHubIssuesBackend:
         confidence: str = "",
         submitter: str = "",
         submitter_explicit: bool = False,
+        submitter_subscribed: bool = False,
         blocked_by: Optional[List[str]] = None,
         depth_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -2998,10 +3213,9 @@ class GitHubIssuesBackend:
             # home (labels only carry booleans/enums cheaply; a free-form
             # target string belongs in the body, same as `note`/`resolution`).
             "submitter": str(submitter or ""),
-            # Was that submitter NAMED by the filer (`wt add --submitter`)
-            # rather than auto-detected? It decides whether they hear every
-            # event or only the default set -- see queue._submitter_wants.
+            # Named identity and notice subscription are separate (WT-78).
             "submitter_explicit": bool(submitter_explicit),
+            "submitter_subscribed": bool(submitter_subscribed),
         }
         # The filing host's CCC node: workers on OTHER hosts block/close this
         # issue too, and need it to reach a bare submitter id (WATCHTOWER-42).
@@ -3014,6 +3228,7 @@ class GitHubIssuesBackend:
         # Pre-validated by queue._depth_fields: {} for quick, else depth+budget_min.
         meta.update(depth_fields or {})
         issue_title = _clip(title or note or "WatchTower ticket", 200)
+        meta["slug"] = ticket_slug(issue_title)
         body = _body_with_metadata(text, meta)
         out = self._run([
             "issue", "create",
@@ -3025,6 +3240,9 @@ class GitHubIssuesBackend:
         match = _ISSUE_URL_RE.search(out.strip())
         if not match:
             raise GitHubBackendError("gh issue create did not print an issue URL")
+        named = display_ref({"ref": f"{self.queue}-{match.group(1)}", "slug": meta["slug"]})
+        self._run(["issue", "edit", match.group(1), *self._repo_args(),
+                   "--title", _Text(_clip(f"{named} {issue_title}", 256))])
         return self.get(f"{self.queue}-{match.group(1)}") or {
             "number": int(match.group(1)),
             "project": self.queue,
@@ -3034,6 +3252,7 @@ class GitHubIssuesBackend:
             "note": note,
             "text": text,
             "title": issue_title,
+            "slug": meta["slug"],
             "type": meta["type"],
             "readiness": meta["readiness"],
             "priority": meta["priority"],
@@ -3050,14 +3269,18 @@ class GitHubIssuesBackend:
         *,
         fresh: bool = False,
         strict: bool = False,
+        blocked_only: bool = False,
+        snapshot_only: bool = False,
     ) -> List[Dict[str, Any]]:
         from . import usage
         open_raw = (
-            self._list_issues("open", fresh=fresh, strict=strict)
+            self._list_issues("open", fresh=fresh, strict=strict,
+                              **({"snapshot_only": True} if snapshot_only else {}))
             if status != "closed" else None
         )
         closed_raw = (
-            self._list_issues("closed", fresh=fresh, strict=strict)
+            self._list_issues("closed", fresh=fresh, strict=strict,
+                              **({"snapshot_only": True} if snapshot_only else {}))
             if status in (None, "closed") else None
         )
         # A tick lists every GitHub queue dozens of times off the same cached
@@ -3067,7 +3290,7 @@ class GitHubIssuesBackend:
         from . import github_pipeline
         memo_key = (
             # OPS-201: a sidecar-only transition changes eligibility too.
-            self._memo_config(), status, lane, github_pipeline.signature(),
+            self._memo_config(), status, lane, blocked_only, github_pipeline.signature(),
         )
         ledger_stamp = None if strict else usage.ledger_dir_stamp()
         now = time.time()
@@ -3094,6 +3317,21 @@ class GitHubIssuesBackend:
                 issues.append(issue)
                 age = _age_seconds(issue.get("closedAt"))
                 valid_until = min(valid_until, now + retention_s - age)
+        if blocked_only:
+            # The issue metadata and local routing sidecar are sufficient to
+            # reject unrelated tickets before text/usage/history projection.
+            sidecar = github_pipeline._read_cached()
+            entries = (sidecar or {}).get("items", {})
+            def candidate(issue):
+                _, meta = _split_body_shared(str(issue.get("body") or ""))
+                if meta.get("needs_input"):
+                    return True
+                if (meta.get("pending_answer") or {}).get("state") == "routing":
+                    return True
+                entry = entries.get(f"{self.repo}#{issue.get('number')}") or {}
+                return (not entry.get("tombstone")
+                        and (entry.get("pending_answer") or {}).get("state") == "routing")
+            issues = [issue for issue in issues if candidate(issue)]
         items = [self._issue_to_item(issue) for issue in issues]
         if self.partition_by_label:
             # Two or more queues share this repo: each shows only its own
@@ -3170,6 +3408,13 @@ class GitHubIssuesBackend:
             raise GitHubBackendError("gh issue view returned invalid JSON") from exc
         if not isinstance(issue, dict) or not issue:
             return None
+        # Preserve full prose already paid for by this read. Recall never
+        # fetches comments on claim; a snapshot failure must not break get().
+        try:
+            from . import related_snapshots
+            related_snapshots.remember(self.repo, issue)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
         return self._issue_to_item(issue)
 
     def _claim_lock_path(self) -> Path:
@@ -3223,21 +3468,29 @@ class GitHubIssuesBackend:
                 f"gh issue view {number} returned unknown state {state!r}")
         return state
 
-    def _fit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any]) -> str:
+    def _fit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any], *,
+                  publish: bool = False) -> str:
         """The issue body for ``body``+``meta``, kept under GitHub's size cap
         (WT-44). Over budget, long answer/comment texts that issue comments
-        already hold move out of the body (`_compact_history`); if it still
-        does not fit under the hard cap, raise before writing anything rather
-        than let GitHub refuse it mid-operation: nothing is truncated,
-        and the caller's write stays undone and safe to retry."""
+        already hold move out of the body (`_compact_history`). Where history
+        archival is on (WT-47) the oldest entries then move to comment
+        segments: ``publish`` posts them, otherwise (a preflight, on a copy of
+        the metadata) the same plan is only sized. If it still does not fit
+        under the hard cap, raise before writing anything rather than let
+        GitHub refuse it mid-operation: nothing is truncated, and the caller's
+        write stays undone and safe to retry."""
         ours = _body_with_metadata(body, meta)
-        if _body_bytes(ours) <= _ISSUE_BODY_BUDGET_BYTES:
-            return ours
         hist = meta.get("history") if isinstance(meta.get("history"), list) else []
-        movable = any(isinstance(e, dict) and e.get("event") in _COMMENTED_EVENTS
-                      and not e.get("text_ref")
-                      and len(str(e.get("text") or "")) > _HISTORY_TEXT_INLINE_MAX
-                      for e in hist)
+        archiving = self._history_archive_on(meta)
+        if _body_bytes(ours) <= _ISSUE_BODY_BUDGET_BYTES and not (
+                archiving and gha.needs_archive(hist, _body_bytes(ours),
+                                                _ISSUE_BODY_BUDGET_BYTES)):
+            return ours
+        movable = _body_bytes(ours) > _ISSUE_BODY_BUDGET_BYTES and any(
+            isinstance(e, dict) and e.get("event") in _REF_FIELD_BY_EVENT
+            and len(str(e.get(_REF_FIELD_BY_EVENT[e["event"]]) or ""))
+            > _HISTORY_TEXT_INLINE_MAX
+            for e in hist)  # a WT-44 1,000-char excerpt counts: re-excerpt it
         moved = 0
         if movable:
             comments = item.get("_github_comments")
@@ -3246,48 +3499,268 @@ class GitHubIssuesBackend:
                 comments = (fresh or {}).get("_github_comments") or []
             moved = _compact_history(meta, comments, body)
             ours = _body_with_metadata(body, meta)
+        why = ""
+        if archiving:
+            why = self._archive_into(item, body, meta, publish)
+            ours = _body_with_metadata(body, meta)
         size = _body_bytes(ours)
+        if size > _ISSUE_BODY_MAX_BYTES:
+            # JSON separator whitespace carries no authority or data. Large
+            # unmovable histories still need room for a routing receipt; keep
+            # every value and human-body byte before considering refusal.
+            ours = _body_with_metadata(body, meta, compact=True)
+            size = _body_bytes(ours)
         if size > _ISSUE_BODY_MAX_BYTES:
             raise GitHubBackendError(
                 f"{self.repo}#{item['number']} issue body would be {size} bytes; GitHub "
-                f"refuses more than {_ISSUE_BODY_MAX_BYTES}. Moved {moved} answer/comment "
-                f"history text(s) to their issue comments and it still does not fit. "
+                f"refuses more than {_ISSUE_BODY_MAX_BYTES}. Moved {moved} history "
+                f"text(s) to their issue comments and it still does not fit. "
+                f"{why + ' ' if why else ''}"
                 f"Nothing was written; the change is safe to retry once it fits.")
         if moved:
             try:
                 from . import queue as _q
                 _q._log("GH-COMPACT", f"{self.repo}#{item['number']} moved {moved} "
-                        f"answer/comment history text(s) to their issue comments "
+                        f"history text(s) to their issue comments "
                         f"({size} bytes)")
             except Exception:  # noqa: BLE001 - logging never breaks a write
                 pass
         return ours
 
+    def _archive_log(self, kind: str, number: Any, message: str) -> None:
+        try:
+            from . import queue as _q
+            _q._log(kind, f"{self.repo}#{number} {message}")
+        except Exception:  # noqa: BLE001 - logging never breaks a write
+            pass
+
+    def _history_archive_on(self, meta: Dict[str, Any]) -> bool:
+        """Archival runs only behind the queue flag, which needs the §4.2
+        attestation, and never while this ticket shows a recent claim from a
+        host that does not stamp the reader protocol. Reading archives needs
+        none of this."""
+        try:
+            from . import config
+            if not config.history_archive_on(self.queue):
+                return False
+        except Exception:  # noqa: BLE001 - config trouble means off
+            return False
+        return not _stale_archive_reader(meta)
+
+    def _attach_archive(self, item: Dict[str, Any], meta: Dict[str, Any],
+                        comments: Optional[List[Any]]) -> None:
+        """Rebuild ``item["history"]`` from the chain, or mark it degraded."""
+        view = self._archive_read(item.get("number"), meta, comments)
+        tail = meta.get("history") if isinstance(meta.get("history"), list) else []
+        idx = gha.index_of(meta) or {}
+        if view.resolved:
+            full = list(view.entries) + list(tail)
+            item["history"] = (_resolve_history(full, comments)
+                               if isinstance(comments, list) else full)
+            item["history_base"] = 0
+            item["history_resolved"] = True
+            return
+        item["history"] = (_resolve_history(tail, comments)
+                           if isinstance(comments, list) else list(tail))
+        item["history_base"] = view.n
+        item["history_resolved"] = False
+        state = gha.digest_state(idx)
+        digest = idx.get("digest") if state == "ok" else None
+        if digest is not None and digest.get("cv") != gha.CLASSIFIER_VERSION:
+            digest = {k: v for k, v in digest.items() if k != "clocks"}
+        item["history_archive_state"] = {"n": view.n, "err": view.err, "dstate": state,
+                                         "digest": digest}
+        self._archive_log("GH-ARCHIVE-DEGRADED", item.get("number"), view.err)
+
+    def _archive_read(self, number: Any, meta: Dict[str, Any],
+                      comments: Optional[List[Any]]) -> "gha.ArchiveView":
+        """Verify the chain against ``comments`` when fetched, else the
+        re-verified cache, else one fetch per issue per new root. A cache hit
+        is resolved but not ``live``: a writer never extends a chain from it."""
+        idx = gha.index_of(meta) or {}
+        n, root = gha.index_n(meta), str(idx.get("root") or "")
+        path = gha.cache_path(self.repo, number, root)
+        err = ""
+        if comments is not None:
+            entries, err, ids = gha.verify_chain(meta, comments, self.repo, number)
+            if entries is not None:
+                if not path.exists():
+                    on_chain = set(ids)
+                    gha.cache_store(path, [c for c in comments if isinstance(c, dict)
+                                           and (c.get("id") or c.get("url")) in on_chain])
+                return gha.ArchiveView(n, True, True, entries)
+        cached = _archive_cache_entries(path, meta, self.repo, number)
+        if cached is not None:
+            return gha.ArchiveView(n, True, False, cached, err)
+        if comments is None:
+            miss_key = (self.repo, str(number), root)
+            if time.monotonic() - _ARCHIVE_MISSES.get(miss_key, -1e9) >= _ARCHIVE_MISS_TTL_S:
+                _ARCHIVE_MISSES[miss_key] = time.monotonic()
+                try:
+                    return self._archive_read(number, meta, self._fetch_comments(number))
+                except GitHubBackendError as exc:
+                    err = f"comments unavailable: {exc}"
+            err = err or "comments not fetched"
+        return gha.ArchiveView(n, False, False, [], err)
+
+    def _fetch_comments(self, number: Any) -> List[Any]:
+        raw = self._run(["issue", "view", str(number), *self._repo_args(), "--json", "comments"])
+        try:
+            comments = (json.loads(raw or "{}") or {}).get("comments")
+        except (json.JSONDecodeError, AttributeError) as exc:
+            raise GitHubBackendError(f"gh issue view {number} returned invalid JSON") from exc
+        if not isinstance(comments, list):
+            raise GitHubBackendError(f"gh issue view {number} returned no comment list")
+        return comments
+
+    def _archive_view(self, item: Dict[str, Any], meta: Dict[str, Any]) -> "gha.ArchiveView":
+        """This write's view of the archive; never-archived issues cost nothing."""
+        if gha.index_of(meta) is None:
+            return gha.ArchiveView()
+        comments = item.get("_github_comments")
+        if not isinstance(comments, list):
+            try:
+                comments = item["_github_comments"] = self._fetch_comments(item["number"])
+            except GitHubBackendError as exc:
+                return gha.ArchiveView(gha.index_n(meta), False, False, [],
+                                       f"comments unavailable: {exc}")
+        return self._archive_read(item["number"], meta, comments)
+
+    def _archive_into(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
+                      publish: bool) -> str:
+        """Move the oldest entries into comment segments (plan §1.4): verify
+        the whole chain live, publish every part, then let the caller's single
+        body edit land the tail and index. Returns why it did not, if it was
+        needed; a write that fits proceeds without it."""
+        number = item["number"]
+        hist = meta.get("history") if isinstance(meta.get("history"), list) else []
+        size = _body_bytes(_body_with_metadata(body, meta))
+        if not gha.needs_archive(hist, size, _ISSUE_BODY_BUDGET_BYTES):
+            return ""
+        view = self._archive_view(item, meta)
+        if not (view.resolved and view.live):
+            why = f"archive chain unresolved: {view.err}; nothing written"
+            self._archive_log("GH-ARCHIVE-DEFERRED", number, why)
+            return why
+        base_hist = _split_body_shared(item.get("_github_body") or "")[1].get("history")
+        landed = {_history_id(e) for e in (base_hist if isinstance(base_hist, list) else [])}
+        own = sum(1 for e in hist if _history_id(e) not in landed)
+        fixed = _body_bytes(_body_with_metadata(
+            body, {k: v for k, v in meta.items() if k not in ("history", "history_archive")}))
+        try:
+            plan = gha.plan_archive(meta, fixed, view, self.repo, number,
+                                    _ISSUE_BODY_BUDGET_BYTES, own)
+        except gha.ArchiveError as exc:
+            self._archive_log("GH-ARCHIVE-DEFERRED", number, str(exc))
+            return str(exc)
+        if plan is None:
+            return ""
+        if plan.floored:
+            self._archive_log("GH-ARCHIVE-KMIN-FLOOR", number,
+                              f"{len(hist) - plan.move} entries stay in the tail")
+        if not plan.move:
+            return "live history alone does not fit"
+        ref = self._probe_ref(item)
+        if publish:
+            try:
+                if not isinstance(item.get("_github_comments"), list):
+                    # Adoption needs them: a first archival, or a re-apply after
+                    # a revert, has no index that made _archive_view fetch.
+                    item["_github_comments"] = self._fetch_comments(number)
+                for seg in plan.segments:
+                    for i, part in enumerate(seg.parts):
+                        posted = self._post_keyed_comment(item, seg.part_key(i), part)
+                        if seg is plan.head and i == 0:
+                            ref = posted
+            except GitHubBackendError as exc:
+                why = f"archive publish failed: {exc}"
+                self._archive_log("GH-ARCHIVE-DEFERRED", number, why)
+                return why
+        try:
+            gha.apply_plan(meta, plan, view, ref)
+        except gha.ArchiveError as exc:
+            self._archive_log("GH-ARCHIVE-DEFERRED", number, str(exc))
+            return str(exc)
+        return ""
+
     def _post_entry_comment(self, item: Dict[str, Any], body: str,
-                            meta: Dict[str, Any], event: str, text: str) -> str:
+                            meta: Dict[str, Any], event: str, text: str, *,
+                            comment_text: Optional[str] = None,
+                            field: str = "text") -> str:
         """Post ``text`` as an issue comment tagged with an entry key. A comment already carrying the key --
         posted by an attempt whose body edit then failed -- is adopted, not
         reposted. Returns (entry key, reference). Refuses up front, posting nothing, when the text exceeds a
-        comment or its history entry could never fit the body."""
-        if len(text) > _COMMENT_MAX_CHARS - 64:
+        comment or its history entry could never fit the body. ``comment_text``
+        is what is posted when it differs from ``text`` (a block/progress
+        mirror's prefix, WT-45); ``field`` is the history key holding it."""
+        comment_text = text if comment_text is None else comment_text
+        if len(comment_text) > _COMMENT_MAX_CHARS - 64:
             raise GitHubBackendError(
                 f"text is {len(text)} chars; a GitHub comment holds at most "
                 f"{_COMMENT_MAX_CHARS - 64} here. Nothing was written: shorten it "
                 f"or put the full text in a file and reference it.")
-        key = _entry_key(str(item["number"]), event, meta, text)
+        key = _entry_key(str(item["number"]), event, meta, text,
+                         self._archive_view(item, meta))
         projected = copy.deepcopy(meta)
         _append_history(projected, event, entry_key=key)
-        _referenced_text(projected["history"][-1], text, f"{item.get('url', '')}#issuecomment-0")
+        _referenced_text(projected["history"][-1], text, self._probe_ref(item), field)
         self._fit_body(item, body, projected)
+        return key, self._post_keyed_comment(item, key, comment_text)
+
+    @staticmethod
+    def _probe_ref(item: Dict[str, Any]) -> str:
+        """A reference as long as a real comment url, for size checks."""
+        return f"{item.get('url', '')}#issuecomment-{'0' * 12}"
+
+    def _post_keyed_comment(self, item: Dict[str, Any], key: str, comment_text: str) -> str:
+        """Post ``comment_text`` tagged with ``key``, or adopt the comment an
+        earlier attempt already posted with that key and text. Returns its
+        reference."""
         for c in item.get("_github_comments") or []:
             if isinstance(c, dict):
                 found_text, found = _strip_entry_marker(str(c.get("body") or ""))
-                if found == key and found_text == text:
-                    return key, _comment_ref(c) or f"comment:{key}"
+                if found == key and found_text == comment_text:
+                    return _comment_ref(c) or f"comment:{key}"
         out = self._run(["issue", "comment", str(item["number"]), *self._repo_args()],
-                        body=text + _ENTRY_MARKER.format(key))
+                        body=comment_text + _ENTRY_MARKER.format(key))
         url = (out or "").strip().splitlines()[-1:] or [""]
-        return key, url[0] if url[0].startswith("http") else f"comment:{key}"
+        return url[0] if url[0].startswith("http") else f"comment:{key}"
+
+    def _post_mirrors(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
+                      mirrors: List[tuple]) -> None:
+        """WT-45: post block questions and progress notes as keyed issue
+        comments BEFORE the body edit, the same contract as an answer: the
+        comment is the durable full copy and a retry adopts it.
+
+        ``meta`` is the complete post-operation metadata and each mirror is
+        (history entry in it, field, text, comment prefix, entry key), the
+        key derived from the pre-operation metadata so a retry derives it
+        again. The final body is size-checked first, with every live change
+        of the operation in it, so a write that can never fit posts nothing
+        and one that shrinks the body is not refused. The entry keeps its
+        key even when the post fails, so the same words later get the next
+        key instead of adopting a comment whose reply was lost. A comment
+        that does not hold the text exactly (the owner-answer marker
+        defused) or was not posted leaves the text inline: best-effort like
+        the old after-the-edit mirror."""
+        if not mirrors:
+            return
+        staged = []
+        for entry, field, text, prefix, key in mirrors:
+            shown = re.sub(re.escape(_OWNER_ANSWER_MARKER), "owner-answer", text,
+                           flags=re.IGNORECASE)
+            exact = shown == text
+            _set_history_text(entry, text, self._probe_ref(item) if exact else "", field)
+            staged.append((entry, field, text, prefix + shown, key, exact))
+        self._fit_body(item, body, copy.deepcopy(meta))
+        for entry, field, text, comment_text, key, exact in staged:
+            ref = ""
+            if len(comment_text) <= _COMMENT_MAX_CHARS - 64:
+                try:
+                    ref = self._post_keyed_comment(item, key, comment_text)
+                except GitHubBackendError:
+                    ref = ""
+            _set_history_text(entry, text, ref if exact else "", field)
 
     def _edit_body(self, item: Dict[str, Any], body: str, meta: Dict[str, Any],
                    *extra: str) -> List[str]:
@@ -3299,7 +3772,7 @@ class GitHubIssuesBackend:
         precondition on issue edits, so this narrows the window only."""
         number = str(item["number"])
         base = item.get("_github_body") or item.get("text", "")
-        ours = self._fit_body(item, body, meta)
+        ours = self._fit_body(item, body, meta, publish=True)
         self._run(["issue", "edit", number, *self._repo_args(), *extra], body=ours)
         conflicts: List[str] = []
         for _ in range(_BODY_WRITE_RETRIES):
@@ -3314,7 +3787,20 @@ class GitHubIssuesBackend:
                 return conflicts
             _log_body_reapply(self.repo, number, conflicts)
             merged_h, merged_m = _split_body(merged)
-            merged = self._fit_body(item, merged_h, merged_m)
+            archiving = self._history_archive_on(merged_m)
+            if archiving:  # a different plan re-verifies on a fresh fetch; own
+                # entries are those not in the body this merge ran against
+                item = {k: v for k, v in item.items() if k != "_github_comments"}
+                item["_github_body"] = fresh
+            try:
+                merged = self._fit_body(item, merged_h, merged_m, publish=True)
+            except GitHubBackendError as exc:
+                if not archiving:
+                    raise
+                raise GitHubBackendError(
+                    f"re-apply refused: archive publish failed; your change may have "
+                    f"been overwritten by {', '.join(conflicts) or 'a concurrent writer'}"
+                    f": {exc}") from exc
             self._run(["issue", "edit", number, *self._repo_args()], body=merged)
             base, ours = fresh, merged
         return conflicts
@@ -3338,41 +3824,9 @@ class GitHubIssuesBackend:
         and validation request fresh state. Missing runtime refs stay waiting
         rather than accidentally releasing a dependent after a lookup miss.
         """
-        from . import queue as q
-
-        by_ref = _refs_index(items)
-        loaded = {self.queue}
-        seen = set()
-        pending = list(refs)
-        while pending:
-            raw = str(pending.pop())
-            ref = f"{self.queue}-{raw}" if raw.isdigit() else raw
-            if ref in seen:
-                continue
-            seen.add(ref)
-            project = q._project_from_ident(ref)
-            if project and project not in loaded:
-                backend = q._github_backend_for_project(project)
-                others = (backend.list_items(fresh=fresh) if backend is not None
-                          else q.list_items(project=project))
-                by_ref.update(_refs_index(others))
-                loaded.add(project)
-            if ref not in by_ref:
-                try:
-                    item = q.get(ref)
-                except GitHubBackendError as exc:
-                    detail = str(exc).lower()
-                    if "not found" not in detail and "could not resolve to an issue" not in detail:
-                        raise
-                    item = None
-                if item is not None:
-                    by_ref[ref] = item
-            item = by_ref.get(ref)
-            if item is not None and transitive:
-                pending.extend(item.get("blocked_by") or [])
-            elif item is None and not transitive:
-                by_ref[ref] = {"ref": ref, "status": "open"}
-        return by_ref
+        from .dependencies import resolve
+        return resolve(items, refs, project=self.queue, fresh=fresh,
+                       transitive=transitive)
 
     def _validate_blockers(self, ref: str, blocked_by: List[str]) -> List[str]:
         items = self.list_items(fresh=True)
@@ -3538,6 +3992,8 @@ class GitHubIssuesBackend:
             status = item.get("status", "open")
             if status != "open":
                 raise ValueError(f"{ref} is not open (status={status})")
+            if item.get("needs_input"):
+                raise ValueError(f"{ref} is waiting for input; use `wt answer {ref}` first")
             # No whitelist to fail any more: the only way to be ineligible is
             # to be opted out, inside the grace period, or on a queue that is
             # not draining. `wt run` (run_requested) overrides all three.
@@ -3569,7 +4025,8 @@ class GitHubIssuesBackend:
             from .github_pipeline import PIPELINE_PROTO
             # Tells gating hosts this claimant honors the plan hold (OPS-203).
             self._usage_history(meta, number, "claim", session_id=str(session_uuid or ""),
-                                worker=str(session_id), pipeline=PIPELINE_PROTO)
+                                worker=str(session_id), pipeline=PIPELINE_PROTO,
+                                hist_proto=gha.HIST_PROTO)
             self._ensure_labels()
             self._edit_body(item, body, meta,
                             "--add-assignee", self.assignee,
@@ -3601,6 +4058,8 @@ class GitHubIssuesBackend:
         expect_owner: str = "",
         require_status: Optional[str] = None,
         expect: Optional[Dict[str, Any]] = None,
+        release_expect: Optional[Dict[str, Any]] = None,
+        extras: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         if status not in ("open", "in_progress", "closed"):
             raise ValueError("status must be one of ('open', 'in_progress', 'closed')")
@@ -3619,6 +4078,13 @@ class GitHubIssuesBackend:
         # closed ticket and the worker had to close it twice).
         if require_status is not None and item.get("status") != require_status:
             return None
+        if release_expect is not None and (item.get("status") != "awaiting_release"
+                or item.get("release_wait") != release_expect):
+            return None
+        if release_expect is not None and status == "closed":
+            from . import queue as _q
+            if _q.effective_gates(item):
+                return None
         # WT-39: the claim identity the caller decided on (the orphan sweep's
         # dead local worker) must still be the one on the fresh read, else a
         # live claim taken since -- possibly on another host -- is cleared.
@@ -3650,12 +4116,18 @@ class GitHubIssuesBackend:
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
 
+        meta.pop("release_wait", None)
+        if meta.get("deferred_until") == "9999-12-31T00:00:00Z":
+            meta.pop("deferred_until", None)
+            meta.pop("defer_reason", None)
+        if extras and extras.get("release_event"):
+            meta["release_event"] = extras["release_event"]
         if status == "open":
             for key in (
                 "claimed_by", "claimed_machine", "claimed_at",
                 "closed_by", "closed_machine", "closed_at",
                 "resolution_summary", "resolution_commit", "resolution_caveats",
-                "resolution_follow_ups", "resolution_unresolved",
+                "resolution_follow_ups", "resolution_unresolved", "resolution_watches",
                 "resolution_caveats_ack", "resolution_follow_ups_ack",
                 "resolution_unresolved_ack",
                 "resolution_session_id", "resolution_engine",
@@ -3664,7 +4136,13 @@ class GitHubIssuesBackend:
             ):
                 meta.pop(key, None)
             self._usage_history(meta, number, "reopen", reason=reason)
-            self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
+            release_labels = (["--add-label", self.run_requested_label]
+                              if release_expect is not None and (extras or {}).get("run_requested") else [])
+            self._edit_body(item, body, meta, "--remove-label", self.in_progress_label, *release_labels)
+            if release_expect is not None:
+                fresh = self.get(ident)
+                if (fresh or {}).get("release_wait") or (fresh or {}).get("release_event") != (extras or {}).get("release_event"):
+                    return None
             self._run(["issue", "reopen", number, *self._repo_args()], check=False)
             return self.get(ident)
 
@@ -3703,6 +4181,7 @@ class GitHubIssuesBackend:
             meta["resolution_caveats"] = norm.get("caveats", [])
             meta["resolution_follow_ups"] = norm.get("follow_ups", [])
             meta["resolution_unresolved"] = norm.get("unresolved", [])
+            meta["resolution_watches"] = norm.get("watches", [])
             meta["resolution_session_id"] = norm.get("session_id", "")
             meta["resolution_engine"] = norm.get("engine", "")
             meta["resolution_transcript_path"] = norm.get("transcript_path", "")
@@ -3720,6 +4199,10 @@ class GitHubIssuesBackend:
                          worker=str(session_id or meta.get("closed_by") or ""),
                          resolution=norm)
         self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
+        if release_expect is not None:
+            fresh = self.get(ident)
+            if (fresh or {}).get("release_wait") or (fresh or {}).get("release_event") != (extras or {}).get("release_event"):
+                return None
         # `gh issue close --comment` takes the text on argv only (no file or
         # stdin form), and a resolution with long caveats can pass the
         # per-argument limit (WT-40). So we make gh's own steps ourselves:
@@ -3833,41 +4316,29 @@ class GitHubIssuesBackend:
         return self.get(ident)
 
     @_serialized_body_write
-    def defer(
-        self,
-        ident: Any,
-        *,
-        session_id: str,
-        until_iso: str,
-        reason: str,
-        progress: str = "",
-    ) -> Optional[Dict[str, Any]]:
-        """`wt defer` on a GitHub-backed ticket (OPS-100): release the claim
-        and park the issue out of the pool until ``until_iso``. Same rules as
-        the local queue.defer; the window lives in the metadata block, so it
-        survives across hosts and expires by the clock with no further edit."""
+    def await_release(self, ident, *, session_id, wait, progress="", expected_defer=None):
+        from . import releases
         item = self.get(ident)
         if item is None:
             return None
-        status = item.get("status")
-        if status not in ("open", "in_progress"):
-            raise ValueError(f"{item.get('ref')} is {status}; only an open or in-progress "
-                             "ticket can be deferred")
-        holder = str(item.get("claimed_by") or "")
-        if status == "in_progress" and holder and session_id and holder != str(session_id):
-            raise ValueError(f"{item.get('ref')} is claimed by {holder}, not {session_id}")
-        number = str(item["number"])
+        releases.require_parkable(item, session_id, expected_defer)
+        releases.validate_wait(item, wait)
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        pre, mirrors = copy.deepcopy(meta), []
         if progress:
-            _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
-        for key in ("claimed_by", "claimed_machine", "claimed_at", "claimed_session_id"):
+            self._append_progress(item, pre, meta, session_id, progress, mirrors)
+        for key in (*_CLAIM_META_KEYS, "deferred_until", "defer_reason"):
             meta.pop(key, None)
-        meta["deferred_until"] = until_iso
-        meta["defer_reason"] = _clip(reason, 2000)
-        self._usage_history(meta, number, "defer", worker=str(session_id),
-                            until=until_iso, reason=_clip(reason, 2000))
+        meta["release_wait"] = dict(wait)
+        self._usage_history(meta, str(item["number"]), "await_release", worker=session_id,
+                            release_wait=dict(wait))
+        self._post_mirrors(item, body, meta, mirrors)
         self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
         return self.get(ident)
+
+    def defer(self, *args, **kwargs):
+        from .release_wait import DEFER_GUIDANCE
+        raise ValueError(DEFER_GUIDANCE)
 
     @_serialized_body_write
     def block(
@@ -3902,6 +4373,10 @@ class GitHubIssuesBackend:
         backstop only asks this for a claim held on this host; a claim held
         elsewhere is routed to its owner, never blocked (WT-38)."""
         from . import queue as _q
+        effective_on = _q.validate_person_block(wait_on, wait_actor, question,
+                                                 require_question=True)
+        if origin not in ("stage", "plan_gate"):
+            wait_on = effective_on
         item = self.get(ident)
         if item is None:
             return None
@@ -3910,8 +4385,16 @@ class GitHubIssuesBackend:
         number = str(item["number"])
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         now = _now_iso()
+        question = _clip(question, 4000)
+        # WT-45: comments first, keyed on the pre-block metadata so a retry
+        # after a failed body edit derives the same keys and adopts them.
+        pre, mirrors = copy.deepcopy(meta), []
+        q_key = (_entry_key(number, "block", pre, question, self._archive_view(item, pre))
+                 if question.strip() else "")
+        if progress:
+            self._append_progress(item, pre, meta, session_id, progress, mirrors)
         meta["needs_input"] = True
-        meta["block_question"] = _clip(question, 4000)
+        meta["block_question"] = question
         meta["blocked_at"] = now
         meta["block_kind"] = kind if kind in _q.BLOCK_KINDS else "input"
         meta["block_origin"] = str(origin or "")       # metadata only (owner view)
@@ -3921,30 +4404,119 @@ class GitHubIssuesBackend:
                                           extra=wait_extra)
         else:
             meta.pop("wait", None)
-        if session_id:
+        from . import config
+        if session_id and not config.is_tracker(self.queue):
             if not meta.get("claimed_by"):
                 meta["claimed_by"] = str(session_id)
                 meta["claimed_machine"] = machine_tag()
-        if progress:
-            _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
         # The writing host, so a system (backstop) block is attributable (WT-39).
-        self._usage_history(meta, number, "block", worker=str(session_id), question=_clip(question, 4000),
+        self._usage_history(meta, number, "block", worker=str(session_id), question=question,
                             kind=meta["block_kind"], wait_on=wait_on, wait_actor=wait_actor,
-                            wait_ref=wait_ref, machine=machine_tag())
+                            wait_ref=wait_ref, machine=machine_tag(), entry_key=q_key)
+        # The live question stays whole in block_question; only the history
+        # copy is referenced (WT-45). The mirror comment (WT-37) is what makes
+        # the question visible on GitHub; its owner-answer marker is defused
+        # so it can never be ingested as its own answer.
+        if q_key:
+            block_entry = next(e for e in reversed(meta["history"]) if e.get("event") == "block")
+            mirrors.insert(0, (block_entry, "question", question,
+                               _BLOCK_COMMENT_PREFIX.format(session_id or "worker"), q_key))
+        self._post_mirrors(item, body, meta, mirrors)
         self._edit_body(item, body, meta)
-        # Mirror the question onto the issue discussion (WT-37): the metadata
-        # block is invisible to anyone reading the issue on GitHub. Best-effort,
-        # the block itself is already recorded. The owner-answer marker is
-        # defused so the question can never be ingested as its own answer.
-        if question.strip():
-            shown = re.sub(re.escape(_OWNER_ANSWER_MARKER), "owner-answer",
-                           _clip(question, 4000), flags=re.IGNORECASE)
-            self._run([
-                "issue", "comment", number,
-                *self._repo_args(),
-            ], check=False,
-                body=f"[watchtower] Needs input from {session_id or 'worker'}:\n\n{shown}")
         return self.get(ident)
+
+    def _append_progress(self, item: Dict[str, Any], pre: Dict[str, Any],
+                         meta: Dict[str, Any], session_id: str, progress: str,
+                         mirrors: List[tuple]) -> None:
+        """A progress history entry (wt block/defer --progress). A long note
+        is queued in ``mirrors`` to be posted as a keyed comment first and
+        referenced (WT-45), keyed on the pre-operation ``pre``; a short one
+        stays inline and posts nothing."""
+        text = _clip(progress, 24000)
+        key = (_entry_key(str(item["number"]), "progress", pre, text,
+                          self._archive_view(item, pre))
+               if len(text) > _HISTORY_REF_MIN else "")
+        _append_history(meta, "progress", worker=str(session_id), entry_key=key)
+        meta["history"][-1]["text"] = text
+        if key:
+            mirrors.append((meta["history"][-1], "text", text,
+                            _PROGRESS_COMMENT_PREFIX.format(session_id or "worker"), key))
+
+    @_serialized_body_write
+    def park_expired_person_claim(self, ident, *, expect):
+        """Retire an idle legacy human-block claim without answering its gate."""
+        from . import queue as q, liveness as lv
+        item = self.get(ident)
+        if (not item or item.get("status") != "in_progress" or not item.get("needs_input")
+                or not item.get("claimed_by") or item.get("claimed_machine") != q.machine_tag()
+                or item.get("pipeline_foreign") or not q.claim_expect_holds(item, expect)):
+            return None
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        if any((source.get("pending_answer") or {}).get("state") in q.ANSWER_INFLIGHT
+               for source in (item, meta)):
+            return None
+        wait = item.get("wait") or {}
+        q.validate_person_block(wait.get("on"), wait.get("actor", ""), item.get("block_question"))
+        ctx = lv.ResolverContext()
+        if ctx.ps() is None or lv.claim_owner(item, ctx).verdict == "alive":
+            return None
+        hb = lv.claim_heartbeat_age(item, ctx.now)
+        if (hb is not None and hb < lv.stall_s()) or ctx.now-max(
+                lv._store_activity(item), lv._file_activity(item, ctx)) < lv.stall_s():
+            return None
+        worker, sid = item["claimed_by"], item.get("claimed_session_id") or ""
+        parked = dict(meta, ref=item["ref"], status="in_progress")
+        q._park_unlocked(parked, worker, sid, item.get("claimed_machine"), q._now_iso(),
+                         q._by("system"), reason="Expired person-block claim; original question remains unanswered")
+        parked.pop("ref", None)
+        parked.pop("status", None)
+        parked["claimed_session_id"] = sid  # legacy replies retain their original context
+        self._edit_body(item, body, parked, "--remove-label", self.in_progress_label)
+        if item.get("pipeline_local"):
+            q._github_park(ident, worker, item)
+        result = self.get(ident)
+        return result if result and result.get("needs_input") and not result.get("claimed_by") else None
+
+    @_serialized_body_write
+    def recover_expired_claim(self, ident, *, expect, reason):
+        """Own-host lease recovery under the cross-host GitHub body lock.
+
+        Unlike WT-39's old unlocked sweep, replacement claims cannot land
+        between this fresh decision and the write. Unknown/foreign hosts,
+        live sessions, fresh activity, human questions and answer delivery
+        remain protected. No owner question or permission is synthesized.
+        """
+        from . import queue as q, liveness as lv, watches
+        item = self.get(ident)
+        if not item or item.get("claimed_machine") != q.machine_tag() or item.get("pipeline_foreign"):
+            return None
+        # Legacy issue-body answers may be hidden by the modern sidecar
+        # projection. They still own delivery and cannot be reaped.
+        raw_meta = _split_body(item.get("_github_body") or item.get("text", ""))[1]
+        if (raw_meta.get("pending_answer") or {}).get("state") in q.ANSWER_INFLIGHT:
+            return None
+        items = watches.inventory()[0]
+        items = [i for i in items if i.get("ref") != item.get("ref")] + [item]
+        if q._recover_mismatch(item, expect, items) or q.supervision_owns(item):
+            return None
+        if item.get("status") != "in_progress" or not item.get("claimed_by"):
+            return None
+        ctx = lv.ResolverContext()
+        if ctx.ps() is None or lv.claim_owner(item, ctx).verdict == "alive":
+            return None
+        heartbeat_age = lv.claim_heartbeat_age(item, ctx.now)
+        if heartbeat_age is not None and heartbeat_age < lv.stall_s():
+            return None
+        if ctx.now-max(lv._store_activity(item), lv._file_activity(item, ctx)) < lv.stall_s():
+            return None
+        fence = {key: item.get(key) for key in (
+            "claimed_by", "claimed_session_id", "claimed_machine", "claimed_at",
+            "needs_input", "block_question", "answered_at", "claim_heartbeat", "pending_answer")}
+        result = self.update_status(ident, "open", session_id="liveness", require_status="in_progress",
+                                    expect=fence, reason=reason +
+                                    "; routing repair only; existing approval/source/send limits remain. Prior question: " +
+                                    str(item.get("block_question") or ""))
+        return result if result and result.get("status") == "open" and not result.get("claimed_by") else None
 
     @_serialized_body_write
     def renew_claim_heartbeat(self, ident: Any, *, claimed_by: str,
@@ -3980,12 +4552,14 @@ class GitHubIssuesBackend:
         """Say who the current block waits on, without re-blocking (CCC-244).
         Body metadata only: no issue comment, the question stays as asked."""
         from . import queue as _q
+        _q.validate_person_block(on, actor, require_question=False)
         item = self.get(ident)
         if item is None:
             return None
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         if not meta.get("needs_input") or item.get("status") == "closed":
             raise ValueError(f"{item.get('ref', ident)} is not blocked; nothing is waiting")
+        _q.validate_person_block(on, actor, meta.get("block_question") or "")
         meta["wait"] = _q.wait_record(on, actor, ref, note,
                                       block_at=str(meta.get("blocked_at") or ""), by=by,
                                       extra=extra)
@@ -4007,6 +4581,7 @@ class GitHubIssuesBackend:
         post_comment: bool = True,
         source_comment_key: str = "",
         kind: str = "human",
+        delivery: Optional[dict] = None,
     ) -> Optional[Dict[str, Any]]:
         """Record a human answer on a blocked GitHub-backed ticket and post it
         as an issue comment. ``kind`` attributes it (``system`` for the
@@ -4056,6 +4631,9 @@ class GitHubIssuesBackend:
                     return "skip"
                 pa = _q._write_pending_answer_unlocked(it, answer_text, now, by_kind=kind,
                                                        clip=_COMMENT_MAX_CHARS)
+                if delivery is not None:
+                    from . import answer_dispatch
+                    answer_dispatch.pending_options(pa, delivery)
                 if route_key:
                     pa["entry_key"] = route_key
                 return None
@@ -4096,6 +4674,13 @@ class GitHubIssuesBackend:
                 worker=str(session_id or ""),
                 reason="answered_without_resumable_session",
             )
+        if delivery is not None:
+            from . import answer_dispatch
+            answer_dispatch.record(item, answer_text, session_id, kind, delivery)
+            job = item["answer_dispatch"]
+            if text_ref:
+                job.update(text="", text_ref=text_ref, text_sha256=_text_sha256(answer_text))
+            meta["answer_dispatch"] = job
         self._edit_body(item, body, meta)
         if releasing:
             self._run([
@@ -4149,6 +4734,8 @@ class GitHubIssuesBackend:
                 return False
             if _OWNER_ANSWER_MARKER not in str(c.get("body") or "").upper():
                 return False
+            if gha.is_archive_comment(c.get("body")):
+                return False  # archived history is never an answer (WT-47)
             created = str(c.get("createdAt") or "")
             # A comment from before the block can't be answering it. Only
             # enforce this when both timestamps are present.
@@ -4235,8 +4822,16 @@ class GitHubIssuesBackend:
             return None
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         title = item.get("title", "")
+        meta.setdefault("slug", slug_of(item))
+        dependency_wait = bool(fields.pop("_dependency_wait", False))
+        if dependency_wait:
+            from . import queue as _q
+            _q._dependency_wait_check(item)
         for key, value in fields.items():
-            if key == "blocked_by":
+            if key == "_subscription":
+                from .queue import _apply_ticket_subscription
+                _apply_ticket_subscription(meta, *value)
+            elif key == "blocked_by":
                 blockers = self._validate_blockers(
                     str(item.get("ref") or ""), list(value or []))
                 if blockers:
@@ -4254,6 +4849,8 @@ class GitHubIssuesBackend:
                                     fields={"depth": value.get("depth", "quick"),
                                             **({"budget_min": value["budget_min"]}
                                                if "budget_min" in value else {})})
+            elif key == "slug":
+                meta["slug"] = ticket_slug(value)
             elif key == "title":
                 title = _clip(value, 200)
             elif key == "text":
@@ -4305,7 +4902,14 @@ class GitHubIssuesBackend:
             elif key == "_history":
                 event, extra = value
                 _append_history(meta, event, **extra)
-        self._edit_body(item, body, meta, "--title", _Text(title))
+        extra_args = []
+        if dependency_wait:
+            from . import queue as _q
+            _q._dependency_wait_unlocked(meta, _now_iso(),
+                                         worker_done=item.get("status") == "in_progress")
+            extra_args = ["--remove-label", self.in_progress_label]
+        named = display_ref(dict(item, slug=meta["slug"]))
+        self._edit_body(item, body, meta, "--title", _Text(_clip(f"{named} {title}", 256)), *extra_args)
         return self.get(ident)
 
     def peek_next(

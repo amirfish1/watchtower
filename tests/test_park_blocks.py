@@ -2,6 +2,8 @@
 released) and the human's answer is routed back to the parking session."""
 
 from __future__ import annotations
+from tests.legacy_blocks import block as legacy_block, set_wait as legacy_wait
+
 
 import importlib
 import json
@@ -43,7 +45,7 @@ def wt(tmp_path, monkeypatch):
 def _parked(wt, worker="w1", sid=SID, project="PK", note="ticket"):
     item = wt.q.enqueue(project=project, note=note, source="test")
     wt.q.claim_by_ref(item["ref"], worker, session_uuid=sid)
-    blocked = wt.q.block(item["ref"], session_id=worker, question="which way?",
+    blocked = legacy_block(wt.q, item["ref"], session_id=worker, question="which way?",
                          progress="half done", origin="worker")
     return blocked
 
@@ -63,7 +65,7 @@ def test_worker_block_parks_and_releases_claim(wt):
 def test_legacy_origin_keeps_hold_while_blocked(wt):
     item = wt.q.enqueue(project="PK", note="x", source="test")
     wt.q.claim_by_ref(item["ref"], "w1", session_uuid=SID)
-    it = wt.q.block(item["ref"], session_id="w1", question="q?", origin="plan_gate")
+    it = legacy_block(wt.q, item["ref"], session_id="w1", question="q?", origin="plan_gate")
     assert it["status"] == "in_progress"
     assert it.get("needs_input")
 
@@ -155,6 +157,61 @@ def test_close_clears_ledger_and_parked_ticket_closes(wt):
     assert wt.q.get(it["ref"])["status"] == "closed"
 
 
+def test_duplicate_link_clears_parked_session_and_preserves_wait(wt):
+    from watchtower import liveness
+
+    original = wt.q.enqueue(project="PK", note="original", source="test")
+    it = _parked(wt)
+    legacy_wait(wt.q, it["ref"], "dependency", ref=original["ref"])
+    wait = wt.q.get(it["ref"])["wait"]
+    linked = wt.q.link_duplicate(it["ref"], original["ref"])
+    assert linked["status"] == "open"
+    assert not linked.get("parked") and not linked.get("claim_proc")
+    assert linked["wait"] == wait
+    assert liveness.row_of(linked).id == "dep.waiting"
+    # Completion still depends on the original; the follower is never claimed.
+    wt.q.claim_by_ref(original["ref"], "w2")
+    assert wt.q.claim_next("w3", project="PK") is None
+    wt.q.update_status(original["ref"], "closed")
+    assert liveness.row_of(wt.q.get(it["ref"])).id == "closed"
+
+
+def test_relink_repairs_legacy_duplicate_without_changing_wait_or_history(wt):
+    from watchtower import liveness
+
+    original = wt.q.enqueue(project="PK", note="original", source="test")
+    parked = _parked(wt)
+    wt.q.link_duplicate(parked["ref"], original["ref"])
+    with wt.q._FileLock(wt.q._lock_path()):
+        data = wt.q._load_unlocked()
+        item = next(i for i in data["items"] if i["ref"] == parked["ref"])
+        item["parked"] = parked["parked"]  # Old duplicate-link behavior.
+        wt.q._save_unlocked(data)
+    before = wt.q.get(parked["ref"])
+    repaired = wt.q.link_duplicate(parked["ref"], original["ref"])
+    assert repaired["history"][:len(before["history"])] == before["history"]
+    assert repaired.get("wait") == before.get("wait")
+    assert repaired["duplicate_of"] == original["ref"]
+    assert not repaired.get("parked")
+    assert liveness.row_of(repaired).id == "dep.waiting"
+
+
+@pytest.mark.parametrize("state", ["delivering", "queued"])
+def test_retired_defer_cannot_drop_or_rewrite_pending_answers(wt, state):
+    parked = _parked(wt)
+    ans = wt.q.answer(parked["ref"], "observe real events; never manufacture them")
+    wt.q.resume_claim(parked["ref"], ans["pending_answer"]["gen"])
+    with wt.q._FileLock(wt.q._lock_path()):
+        data = wt.q._load_unlocked()
+        item = next(i for i in data["items"] if i["ref"] == parked["ref"])
+        item["pending_answer"]["state"] = state
+        wt.q._save_unlocked(data)
+    before = wt.q.get(parked["ref"])
+    with pytest.raises(ValueError, match="retired"):
+        wt.q.defer(parked["ref"], "w1", "+2d", "collect observations")
+    assert wt.q.get(parked["ref"]) == before
+
+
 def test_list_blocked_shows_parked_and_routing(wt):
     it = _parked(wt)
     assert any(x["ref"] == it["ref"] for x in wt.q.list_blocked())
@@ -179,7 +236,7 @@ def test_outbox_rows_are_generation_bound(wt):
 def test_migrate_legacy_blocks_parks_worker_blocks(wt):
     item = wt.q.enqueue(project="PK", note="x", source="test")
     wt.q.claim_by_ref(item["ref"], "w1", session_uuid=SID)
-    wt.q.block(item["ref"], session_id="w1", question="q?", origin="system")
+    legacy_block(wt.q, item["ref"], session_id="w1", question="q?", origin="system")
     picked = wt.q.migrate_legacy_blocks(queue="PK", dry_run=True)
     assert wt.q.get(item["ref"])["status"] == "in_progress"
     assert isinstance(picked, list)
@@ -192,6 +249,8 @@ def test_cli_answer_routes_parked_ticket(wt, monkeypatch, capsys):
     monkeypatch.setattr(wt.answers, "worker_alive", lambda wid: True)
     monkeypatch.setattr(wt.answers, "_wake", lambda *a, **k: None)
     assert wt.cli.main(["answer", it["ref"], "go left"]) == 0
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     out = capsys.readouterr().out
     assert "ANSWERED" in out and "affinity" in out
     assert wt.q.get(it["ref"])["pending_answer"]["state"] == "affinity"

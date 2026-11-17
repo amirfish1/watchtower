@@ -188,7 +188,9 @@ def test_answer_that_cannot_fit_is_refused_before_any_write(tmp_path, monkeypatc
     post nothing, leave the block in place; the retry is refused the same way."""
     state, q, gb = _blocked(tmp_path, monkeypatch)
     monkeypatch.setenv("FAKE_GH_BODY_MAX", str(GITHUB_CAP))
-    _seed_legacy(state, gb, target=GITHUB_CAP - 2000, event="progress", commented=False)
+    # 400 bytes of headroom: a referenced answer entry needs more (WT-45's
+    # 300-char excerpt plus its ref/sha keys), so nothing but a move could fit it.
+    _seed_legacy(state, gb, target=GITHUB_CAP - 400, event="progress", commented=False)
     body_before = _issue(state)["body"]
     comments_before = len(_issue(state)["comments"])
     commands_before = len(json.loads(state.read_text())["commands"])
@@ -472,3 +474,27 @@ def test_parked_second_distinct_answer_still_supersedes(tmp_path, monkeypatch):
     assert pa["gen"] == 2 and pa["answer"] == "actually mysql"
     assert q.resume_claim(ref, 1) is None
     assert q.resume_claim(ref, 2)["claimed_by"] == "w1"
+
+
+@pytest.mark.parametrize('fits',[True,False])
+def test_unmovable_history_can_use_separator_whitespace_but_never_lose_values(monkeypatch,fits):
+    import watchtower.github_backend as gb
+    human='Original human request: keep "quotes", é中 and every guard.'
+    meta={'needs_input':True,'block_question':'[Q12:grant] Approve this exact grant?',
+          'history':[{'event':'reopen','reason':'No production, money or sends authorized.',
+                      'at':f'2026-11-17T00:{n:02}:00Z'} for n in range(40)]}
+    compact=gb._body_with_metadata(human,meta,compact=True)
+    pretty=gb._body_with_metadata(human,meta)
+    assert len(compact.encode())<len(pretty.encode())
+    monkeypatch.setattr(gb,'_ISSUE_BODY_BUDGET_BYTES',0)
+    monkeypatch.setattr(gb,'_ISSUE_BODY_MAX_BYTES',len(compact.encode())+(1 if fits else -1))
+    backend=gb.GitHubIssuesBackend('GHI',repo=REPO)
+    monkeypatch.setattr(backend,'_run',lambda *a,**k:pytest.fail('whitespace compaction must not send or truncate history'))
+    item={'number':1,'url':'https://example.invalid/1'}
+    if fits:
+        result=backend._fit_body(item,human,meta)
+        assert gb._split_body(result)==(human,meta)
+        assert len(result.encode())<=gb._ISSUE_BODY_MAX_BYTES
+    else:
+        with pytest.raises(gb.GitHubBackendError,match='Nothing was written'):
+            backend._fit_body(item,human,meta)

@@ -15,7 +15,7 @@ import os
 import time
 import uuid
 from pathlib import Path
-from . import queue as q, observations, storage
+from . import queue as q, observations, storage, config
 
 SCHEMA_VERSION = 1
 IDLE_SECONDS = 1200
@@ -31,13 +31,37 @@ def _items():
     return q._load_unlocked(strict=True).get('items', [])
 
 
+def comment_target(it):
+    """A cancelled takeover retains task ownership, not a comment subscription.
+
+    Match the retained session so cancelling stale supervision cannot silence
+    a replacement claimant. Derive this from durable state, including legacy
+    cancellations and answers retained for explicit re-enrollment.
+    """
+    if config.is_tracker(it.get('project', '')) or it.get('status') != 'in_progress':
+        return ''
+    target = it.get('claimed_session_id') or it.get('claimed_by') or ''
+    s = it.get('supervision') or {}
+    if s.get('state') in TERMINAL and target == s.get('session', {}).get('session_id'):
+        return ''
+    return target
+
+
 def _response(it):
     s = copy.deepcopy(it['supervision'])
+    target = comment_target(it)
     return dict(schema_version=1, supervision_id=s['id'], generation=s['generation'],
                 ticket=it['ref'], session=s['session'], state=s['state'],
                 delivery_state=(s.get('intent') or {}).get('state', 'none'),
                 reason=s.get('reason',''), question=it.get('block_question','') if it.get('needs_input') else '',
-                wait_identity=s.get('wait_identity',''), supervision=s)
+                wait_identity=s.get('wait_identity',''), supervision=s,
+                claim={key: it.get(key) for key in
+                       ('status', 'claimed_by', 'claimed_session_id', 'claimed_at')},
+                comment_target=target,
+                comments_detached=bool(it.get('status') == 'in_progress'
+                    and (it.get('claimed_session_id') or it.get('claimed_by')) and not target),
+                delivery_attempts=(s.get('intent') or {}).get('attempts', 0),
+                confirmed_reminders=s.get('reminders', 0))
 
 
 def status(session_id):
@@ -63,6 +87,8 @@ def _intent(s, kind, text, turn=''):
 
 
 def _claim(it, s):
+    if config.is_tracker(it.get('project', '')):
+        return
     sid = s['session']['session_id']
     it.update(status='in_progress', claimed_by=sid, claimed_session_id=sid,
               claimed_machine=q.machine_tag(), claimed_at=q._now_iso(),
@@ -152,6 +178,8 @@ def takeover(session_id, ticket_ref='', *, queue='', title='', engine='', dry_ru
         raise ValueError('takeover supports local queue storage only')
     if legacy and (not legacy.get('migration_id') or legacy.get('owner_fenced') is not True):
         raise ValueError('legacy import requires migration_id and owner_fenced=true')
+    dependencies = (q._dependency_snapshot(ident=ticket_ref) if ticket_ref
+                    else q._dependency_snapshot(session_id=session_id))
     with _lock(), q._FileLock(q._lock_path()):
         data = q._load_unlocked(strict=True)
         rows = data['items']
@@ -203,8 +231,8 @@ def takeover(session_id, ticket_ref='', *, queue='', title='', engine='', dry_ru
             raise ValueError('duplicate or active plan gate prevents adoption')
         if (it.get('pending_answer') or {}).get('state') in ('routing','delivering','queued','affinity'):
             raise ValueError('settle existing pending answer delivery before takeover')
-        q._group_claim_check_unlocked(rows, it)
-        if q.blocker_verdict(it, q._refs_index(rows))[0] != 'ok':
+        q._group_claim_check_unlocked(rows + dependencies, it)
+        if q.blocker_verdict(it, q._refs_index(rows + dependencies))[0] != 'ok':
             raise ValueError('ticket has unresolved dependency gates')
 
         now = time.time()
@@ -225,11 +253,17 @@ def takeover(session_id, ticket_ref='', *, queue='', title='', engine='', dry_ru
             if not isinstance(s['reminders'], int) or not 0 <= s['reminders'] <= MAX_REMINDERS:
                 raise ValueError('invalid legacy reminder count')
             s['legacy_import_id'] = legacy['migration_id']
-        else:
+        elif not config.is_tracker(it.get('project', '')):
             _intent(s, 'enroll', f"WatchTower now supervises your existing task as {it['ref']}. "
                     'Continue only already authorized work in this same conversation and repository. '
                     f"Use `wt block {it['ref']} --question ...` for owner input; use normal `wt close {it['ref']}` "
                     'with required proof and gates when done. Do not create a replacement worker. '
+                    'Ignore repeated takeover action keys already handled. Task: '+str(s['task_brief']))
+        if config.is_tracker(it.get('project', '')) and not legacy:
+            _intent(s, 'enroll', f"WatchTower supervises your existing session, logged under tracker {it['ref']}. "
+                    'Continue only already authorized work in this same conversation and repository. '
+                    'This tracker is a feature log: do not claim it or dispatch a replacement worker. '
+                    'Comments are durable log entries and do not wake this session. '
                     'Ignore repeated takeover action keys already handled. Task: '+str(s['task_brief']))
         if old.get('held_answer') and not legacy:
             _intent(s,'answer','Retained owner answer: '+str(old['held_answer']))
@@ -473,6 +507,7 @@ def resume(ref, expected_generation):
         raise ValueError('expected generation must be positive')
     if q._github_backend_for_project(q._project_from_ident(ref)) is not None:
         raise ValueError('supervision resume supports local queue storage only')
+    dependencies = q._dependency_snapshot(ident=ref)
     with _lock() as dispatch_lock, q._FileLock(q._lock_path()) as queue_lock:
         if dispatch_lock._fh is None or queue_lock._fh is None:
             raise ValueError('recovery requires exclusive dispatch and queue locks')
@@ -489,10 +524,11 @@ def resume(ref, expected_generation):
             raise ValueError('supervision is not waiting')
         if (s.get('intent') or {}).get('state', 'none') not in ('none','confirmed','cancelled'):
             raise ValueError('delivery is pending or unknown; reconcile receipt first')
-        if it.get('status') != 'in_progress' or it.get('duplicate_of'):
+        tracker = config.is_tracker(it.get('project', ''))
+        if (it.get('status') != ('open' if tracker else 'in_progress') or it.get('duplicate_of')):
             raise ValueError('ticket is not an active independent claim')
         sid=s['session']['session_id']
-        if it.get('claimed_session_id') != sid or it.get('claimed_by') != sid:
+        if not tracker and (it.get('claimed_session_id') != sid or it.get('claimed_by') != sid):
             raise ValueError('supervision no longer owns the claim')
         if it.get('parked') or q._plan_active_unlocked(it):
             raise ValueError('parked claim or active plan prevents resume')
@@ -506,7 +542,7 @@ def resume(ref, expected_generation):
                 or (other.get('claimed_session_id') == sid and other.get('status') == 'in_progress'))
                for other in data['items']):
             raise ValueError('ambiguous session ownership')
-        if q.blocker_verdict(it,q._refs_index(data['items']))[0] != 'ok':
+        if q.blocker_verdict(it,q._refs_index(data['items'] + dependencies))[0] != 'ok':
             raise ValueError('ticket has unresolved dependency gates')
         s.update(state='running',wait_identity='',wait_source='',reminders=0,
                  next_deadline=time.time()+IDLE_SECONDS,resumed_generation=expected_generation,

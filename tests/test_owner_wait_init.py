@@ -51,6 +51,31 @@ def read(source):
     return export.read_source()[1][0]
 
 
+@pytest.mark.parametrize('slug', [None, '', 'a-stored-name'])
+def test_display_name_never_changes_frozen_source_or_request(source, slug):
+    def set_slug(item):
+        item.pop('slug', None)
+        if slug is not None:
+            item['slug'] = slug
+    edit(source, set_slug)
+    before = read(source)
+    snapshot = export.snapshot()
+    request = migration.initialize('EXAMPLE-1')['request']
+    assert request['expected_store_version'] == snapshot['store_version']
+    assert request['expected_item'] == before
+    migration.initialize('EXAMPLE-1', request, apply=True)
+    after = read(source)
+    assert ('slug' in after) == ('slug' in before)
+    assert after.get('slug') == before.get('slug')
+
+
+def test_display_name_exception_does_not_allow_ref_repair(source):
+    edit(source, lambda item: item.update(ref='EXAMPLE-999'))
+    from watchtower.conditional_answers import Unsupported
+    with pytest.raises(Unsupported, match='ref normalization'):
+        migration.initialize('EXAMPLE-1')
+
+
 def test_dry_run_apply_export_replay_and_preservation(source):
     before = read(source)
     snapshot = export.snapshot()

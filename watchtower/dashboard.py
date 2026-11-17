@@ -44,6 +44,8 @@ the same way (see docs/messaging-design.md).
 
 from __future__ import annotations
 
+from .refs import display_ref
+
 import hmac
 import html
 import json
@@ -167,6 +169,25 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
                 f"{model or f'{engine} default model'} does not support effort {effort!r}"
             )
     return {"queues": rows, "workers": wrows, "github": health.github_connectivity()}
+
+
+BLOCKED_CACHE_TTL_S = 5.0
+_blocked_cache: Dict[str, Any] = {"at": 0.0, "payload": None}
+_blocked_compute = threading.Lock()
+
+
+def cached_blocked_payload() -> List[Dict[str, Any]]:
+    """Share one blocked projection across pollers, with bounded staleness.
+
+    Failures propagate as 503, never an empty or indefinitely stale snapshot:
+    callers must preserve their notification/answer state on a failed read.
+    """
+    with _blocked_compute:
+        if (_blocked_cache["payload"] is None
+                or time.monotonic() - _blocked_cache["at"] >= BLOCKED_CACHE_TTL_S):
+            payload = q.list_blocked(strict=True)
+            _blocked_cache.update(payload=payload, at=time.monotonic())
+        return _blocked_cache["payload"]
 
 
 STATUS_CACHE_TTL_S = 5.0
@@ -477,7 +498,7 @@ _STYLE = """
     }
     .thead { color: var(--muted); font-size: 11px; letter-spacing: .1em;
              text-transform: uppercase; }
-    .tref { font-size: 13px; color: var(--beam); }
+    .tref { font-size: 13px; color: var(--beam); overflow-wrap: anywhere; }
     .tstatus { font-size: 12px; }
     .tstatus.open { color: var(--muted); }
     .tstatus.in_progress { color: var(--calm); }
@@ -959,7 +980,7 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
         qn = str(w.get("queue", ""))
         workers_by_queue.setdefault(qn, []).append(w)
 
-    # Get closed/total counts per queue from one pass over all items
+    # Get completed/total counts per queue from one pass over all items
     closed_by_q: Dict[str, int] = {}
     total_by_q: Dict[str, int] = {}
     try:
@@ -968,7 +989,7 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
             if not qn:
                 continue
             total_by_q[qn] = total_by_q.get(qn, 0) + 1
-            if it.get("status") == "closed":
+            if it.get("status") in ("closed", "awaiting_release"):
                 closed_by_q[qn] = closed_by_q.get(qn, 0) + 1
     except Exception:
         pass
@@ -1205,7 +1226,7 @@ def _closed_block(closed: List[Dict[str, Any]], total_closed: int) -> str:
         crows.append(
             f'      <div class="crow">\n'
             f'        <div class="crow-top">\n'
-            f'          <span class="tref mono">{ref}</span>\n'
+            f'          <span class="tref mono">{html.escape(display_ref(it))}</span>\n'
             f'          <span class="tworker mono">{worker}</span>\n'
             f'          {summary_html}\n'
             f'        </div>\n'
@@ -1418,7 +1439,7 @@ def render_queue(
         status_text = "awaiting decision" if gated else status
         trows.append(
             f'      <div class="trow">\n'
-            f'        <span class="tref mono">{ref}</span>\n'
+            f'        <span class="tref mono">{html.escape(display_ref(it))}</span>\n'
             f'        <span class="tstatus {status_class} mono">{html.escape(status_text)}</span>\n'
             f'        <span class="tworker mono">{worker}</span>\n'
             f'        <span class="ttitle">{title}</span>\n'
@@ -1629,6 +1650,27 @@ class _Handler(BaseHTTPRequestHandler):
                 norm, payload, queue_tickets(norm),
                 closed=closed_tickets(norm), total_closed=len(all_closed),
             ))
+        elif path == "/api/blocked":
+            params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+            project = params.get("queue", [""])[0]
+            try:
+                rows = cached_blocked_payload()
+                if project:
+                    project = q._norm_project(project)
+                    rows = [it for it in rows if it.get("project") == project]
+                self._json(200, rows)
+            except Exception as exc:
+                self._json(503, {"error": str(exc)})
+        elif path.startswith("/api/ticket/"):
+            ref = urllib.parse.unquote(path[len("/api/ticket/"):])
+            try:
+                item = q.get(ref)
+                self._json(200 if item else 404, item if item else {"error": "not found"})
+            except Exception as exc:
+                self._json(503, {"error": str(exc)})
+        elif path == "/api/version":
+            from . import releases
+            self._json(200, {"code_rev": releases.RUNTIME_BUILD, "pid": os.getpid()})
         elif path == "/api/status":
             self._json(200, cached_status_payload())
         elif path == "/api/queues":

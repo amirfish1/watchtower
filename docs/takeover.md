@@ -26,8 +26,9 @@ When the engine is omitted, an ambiguous identity is rejected. Registered
 reused without `--ticket`; otherwise specify a ticket or both queue and title.
 There is no default queue. GitHub mutation backends are not supported in v1.
 
-Enrollment atomically creates/adopts a ticket, records an ambient claim and
-persists the first instruction. Repeated identical enrollment returns the same
+Enrollment atomically creates/adopts a ticket and persists the first instruction.
+Work queues also record an ambient claim. Tracker queues retain supervision
+without claiming the ticket. Repeated identical enrollment returns the same
 generation. **Accepted means durable intent, not delivery.** Busy sessions wait;
 unknown observations pause intervention. Only a receipt proving the message
 landed advances delivery to confirmed. Intents are stored on the ticket and
@@ -46,6 +47,10 @@ persists an answer for the same session; missing transcripts and failed delivery
 never reopen it for another worker. Cancelled supervision retains answers for
 explicit re-enrollment. Cancel increments the generation, fences future sends,
 preserves the ticket and its question, and suppresses automatic re-enrollment.
+The retained claim no longer subscribes the cancelled session to ticket comments;
+comments remain in ticket history. Explicit re-enrollment restores that subscription
+on work queues. Tracker comments never subscribe or deliver to any session.
+Cancelling an old supervision does not detach a replacement claimant.
 It cannot retract an instruction already delivered or interrupt a running turn.
 The dispatch lock means cancel may wait for an in-flight transport to return.
 
@@ -68,6 +73,10 @@ Enrollment/status/cancel return `schema_version`, `supervision_id`, `generation`
 `ticket`, `session: {engine, session_id, host, repo_path}`, `state`,
 `delivery_state`, `reason`, `question`, `wait_identity`, and a `supervision`
 record. Batch status returns `{schema_version, capabilities, supervisions}`.
+Responses also expose the retained `claim`, effective `comment_target` (empty
+when detached or inactive), `comments_detached`, current-intent `delivery_attempts`,
+and `confirmed_reminders`. Zero confirmed reminders does not mean zero delivery
+attempts or zero comment notifications while supervision was active.
 States include `pending_delivery`, `running`, `waiting`, `needs_input`,
 `paused_unreachable`, `cancelled`, and `completed`.
 
@@ -177,3 +186,21 @@ resumed without CCC, with receipt confirmation after supervisor reload and
 normal no-code closure; Claude additionally exercised an owner question/answer.
 Production deployment, legacy cutover and managed CCC transport verification
 remain separate integration steps.
+
+## Tracker queues
+
+`wt config -q IDEAS --kind tracker` makes a queue a durable feature log.
+The default kind is `work`; `--kind work` restores ordinary queue behavior,
+with auto-drain still off until explicitly enabled.
+
+Trackers reject `drain on`, `config --auto-drain on`, claims, run requests and
+worker dispatch, including manual runs and planner/verifier/assessor stages.
+Comments remain in history and never wake a session, even if legacy claim
+metadata exists. Closed notices are suppressed regardless of notification opt-ins;
+`needs_input` and `awaits_decision` notifications remain available.
+
+Changing a local queue to tracker detaches existing live and parked ownership,
+retaining ticket history, supervision and outstanding questions. Closed tickets
+retain historical claim attribution. Explicit takeover still supervises the same
+session and sends its instructions and answers using the supervision identity;
+it never writes a tracker claim. Cancelling and re-enrolling preserve this rule.

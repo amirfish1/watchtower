@@ -417,13 +417,12 @@ def test_gating_waits_until_every_claiming_host_honors_the_hold(
 
 @contextlib.contextmanager
 def _other_host(monkeypatch, q, sidecar):
-    """Another machine running a wt from before OPS-215: it ignores
-    ``pipeline_hold`` and honors a defer literally (OPS-100 on). Without the
-    sidecar it predates OPS-201 too and ignores ``pipeline_host``."""
-    from watchtower import github_backend, github_pipeline
+    """Another current host, with or without the pipeline sidecar.
+
+    The explicit pipeline_hold protects admission in both cases (WT-87).
+    """
+    from watchtower import github_pipeline
     with monkeypatch.context() as m:
-        m.setattr(github_backend, "_effective_defer",
-                  lambda meta: str(meta.get("deferred_until") or ""), raising=False)
         if not sidecar:
             m.setattr(github_pipeline, "overlay", lambda item: item)
         q._MACHINE_TAG_CACHE = "ami"

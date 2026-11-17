@@ -76,6 +76,8 @@ def test_failed_inject_redelivers_same_answer_and_never_reasks(tmp_path, monkeyp
     monkeypatch.setattr(messages, "send", lambda *a, **k: {"ok": False, "error": "unresolvable target"})
     monkeypatch.setattr(cli, "_resume_session_headless", lambda *a, **k: False)
     cli.cmd_answer(_answer_args(item["ref"], "A", engine=None))
+    from watchtower import answer_dispatch
+    answer_dispatch.reconcile()
     after = q.get(item["ref"])
     # The saved answer travels with the ticket for the next worker; no new owner question.
     assert "[ANSWERED while blocked" in after["text"]

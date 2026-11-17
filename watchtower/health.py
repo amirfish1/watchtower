@@ -55,7 +55,22 @@ def _last_event_at(it: Dict[str, Any], stage_only: bool = False) -> Optional[str
         if (str(ev or "").startswith("stage_") if stage_only else _progress_event(ev)):
             if best is None or h["at"] > best:
                 best = h["at"]
+    if best is None and it.get("history_resolved") is False:
+        # WT-47: None never reads fresh, so an unknown clock stays stale.
+        best = q.history_last_at(it, "stage" if stage_only else "progress")[0]
     return best
+
+
+def _stage_clock(it: Dict[str, Any]) -> str:
+    """Latest stage event, else ``updated_at``. An unresolved archive makes the
+    clock unknown: read it as stale so the stage alerts (WT-47), since
+    ``updated_at`` would read fresh on any comment."""
+    at = _last_event_at(it, stage_only=True)
+    if at:
+        return at
+    if it.get("history_resolved") is False and not q.history_last_at(it, "stage")[1]:
+        return "1970-01-01T00:00:00Z"
+    return str(it.get("updated_at") or "")
 
 
 # History events that cannot put a ticket back into the claim pool, so they
@@ -71,13 +86,11 @@ def _fmt_iso(ts: float) -> str:
 def _claimable_since(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
                      now_ts: float) -> Optional[str]:
     """ISO time a currently claimable ticket entered the claim pool (WT-22):
-    the latest of its filing, an expired defer or answer-affinity window, a
+    the latest of its filing, an answer-affinity window, a
     blocker's close, and any history event that could release it (reopen,
-    answer, release, edit, plan step). A ticket waking from a defer is not
-    "work waiting since it was filed"."""
+    answer, release, edit, plan step)."""
     stamps = [it.get("created_at")]
-    for until in (it.get("deferred_until"),
-                  (it.get("pending_answer") or {}).get("affinity_until")):
+    for until in ((it.get("pending_answer") or {}).get("affinity_until"),):
         if until and 0 < q._iso_ts(until) <= now_ts:
             stamps.append(_fmt_iso(q._iso_ts(until)))
     for b in it.get("blocked_by") or []:
@@ -86,6 +99,8 @@ def _claimable_since(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
         if (isinstance(h, dict) and isinstance(h.get("at"), str)
                 and h.get("event") not in _NOT_READINESS_EVENTS):
             stamps.append(h["at"])
+    if it.get("history_resolved") is False:
+        stamps.append(q.history_last_at(it, "readiness")[0])
     return max((s for s in stamps if isinstance(s, str) and _parse_iso(s)),
                default=None)
 
@@ -236,8 +251,6 @@ def queue_status(
         # WT-28/31: an answer reserved for its parked worker is claimable by
         # that worker only, so it is not open work for the pool.
         and not q._affinity_reserved(it, now_ts)
-        # `wt defer`: a ticket inside its data window is out of the pool.
-        and not q.deferred_now(it, now_ts)
         # Placement: a ticket pinned to the other kind of machine is not open
         # work for this machine's pool either.
         and q.placement_allows(it)
@@ -296,9 +309,7 @@ def queue_status(
     stage_stuck = False
     if owned:
         by_ref = {str(it.get("ref")): it for it in items}
-        last_stage = max((_last_event_at(by_ref[d["ref"]], stage_only=True)
-                          or str(by_ref[d["ref"]].get("updated_at") or "")
-                          for d in owned), default="")
+        last_stage = max((_stage_clock(by_ref[d["ref"]]) for d in owned), default="")
         stage_age = _age_seconds(last_stage, now)
         stage_stuck = stage_age is not None and stage_age >= stage_stuck_after_s(stuck_minutes)
 
@@ -382,6 +393,7 @@ def queue_status(
         "in_progress": len(in_progress),
         "in_review": sum(1 for it in items if it.get("status") == "in_review"),
         "awaiting_answer": sum(1 for it in items if it.get("status") == "awaiting_answer"),
+        "awaiting_release": sum(1 for it in items if it.get("status") == "awaiting_release"),
         "closed": len(closed),
         "oldest_open_age_s": oldest_open_age,
         "oldest_open_age": _fmt_age(oldest_open_age),
@@ -433,7 +445,8 @@ def all_status(
     fetched = items if items is not None else q.list_items(project=project, fresh=fresh)
     # Archiving hides a dead queue, but a ticket filed into it afterwards
     # (automation, a stray `wt add`) must stay visible, not strand unseen (OPS-248).
-    unclosed = {it.get("project") or "GEN" for it in fetched if it.get("status") != "closed"}
+    unclosed = {it.get("project") or "GEN" for it in fetched
+                if it.get("status") != "closed" and not config.ticket_is_archived(it)}
     hidden = (
         set() if include_archived
         else {n for n in configured
@@ -449,15 +462,17 @@ def all_status(
     for it in fetched:
         if (it.get("project") or "GEN") in hidden:
             continue
+        if not include_archived and not project and config.ticket_is_archived(it):
+            continue
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
     by_ref = q._refs_index(fetched)
-    # A project-scoped list lacks cross-queue blockers, and blocker_verdict
-    # ignores a missing one, so a ticket waiting on another queue read as
-    # claimable ("stuck") here while the claim path waits (WT-21).
-    if project and any(
-            str(b) not in by_ref for it in fetched
-            if it.get("status") == "open" for b in (it.get("blocked_by") or [])):
-        by_ref = q._refs_index(q.list_items(fresh=fresh))
+    # Resolve only named parents for scoped health; never enumerate unrelated
+    # GitHub queues just to explain a local dependency.
+    if project:
+        from .dependencies import resolve
+        by_ref = resolve(fetched, [b for it in fetched
+                         if it.get("status") == "open"
+                         for b in (it.get("blocked_by") or [])], fresh=fresh)
     waiting_refs = {
         str(it.get("ref")) for it in fetched
         if it.get("status") == "open" and (it.get("blocked_by") or it.get("duplicate_of"))
