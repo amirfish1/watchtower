@@ -52,6 +52,35 @@ probe take 42 seconds. Commit search is off the claim critical path.
 
 `wt related REF --triage` needs `TYPESAFE_API_KEY` or `JEV_API_KEY`, supplied
 from the authorized secret store. The API key is neither persisted nor logged.
+
+On the hermes VM, workers do not inherit the Jev key. The supported invocation
+loads the existing key from Bitwarden for this command only (OPS-630):
+
+```bash
+(
+  set +x
+  set -o pipefail
+  set -a
+  source ~/.config/bws/token.env
+  set +a
+  JEV_API_KEY=$(bws secret get 363f445c-1fd1-4785-80cf-b4c8011831a9 |
+    python3 -c 'import json,sys; key=json.load(sys.stdin)["value"]; assert key; print(key)') || exit 1
+  export JEV_API_KEY
+  unset BWS_ACCESS_TOKEN
+  wt related REF --triage --worker WORKER_ID --json
+)
+```
+
+Replace `REF` and `WORKER_ID`; do not paste key values into tickets, shell
+profiles or tracked files. The subshell leaves the caller environment unchanged,
+and `pipefail` prevents a failed secret fetch from running triage. This uses the
+existing machine-account permission; it creates or rotates no credentials.
+If the vault or Jev is unavailable, use `wt related REF --json`, inspect useful
+candidates with `wt find OTHER --json`, and verify their source evidence manually.
+Record the triage error in ticket progress, confirm only checked relationships
+with `--confirm`, and report recall coverage gaps rather than treating missing
+context as no related work. Local retrieval itself requires no credential.
+
 Jev Choice questions are independent and share state only within a bounded
 batch. Long documents supply selected matching passages, original request and
 resolution, with `partial_context: true`; retrieval itself remains full-text.
