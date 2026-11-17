@@ -43,3 +43,34 @@ def test_timer_audit_reads_raw_issue_metadata_including_closed_and_release_recor
     assert ticket_timers([item])['status'] == 'pass'
     assert ticket_timers([item])['real_data'] is True
     assert ticket_timers([dict(ref='LOCAL-1', deferred_until='2026-01-01')])['status'] == 'fail'
+
+
+def test_timer_audit_never_passes_incomplete_poller_coverage(monkeypatch):
+    from watchtower import watches
+    from watchtower.watch_checks import ticket_timers
+    monkeypatch.setattr(watches, 'inventory', lambda: ([dict(ref='REAL-1')],
+        [dict(source='repo:open', missing=False, stale=True)]))
+    result = ticket_timers()
+    assert result['status'] == 'pending' and result['real_data'] is False
+    monkeypatch.setattr(watches, 'inventory', lambda: ([dict(ref='REAL-1',deferred_until='tomorrow')],
+        [dict(source='repo:open', missing=True, stale=True)]))
+    assert ticket_timers()['status'] == 'fail'
+
+
+def test_raw_inventory_preserves_watches_and_timer_fields_without_conversion(monkeypatch):
+    import time
+    from watchtower import watches, queue as q, config, github_backend as gh
+    monkeypatch.setattr(q, '_load_unlocked', lambda **kw: {'items': []})
+    monkeypatch.setattr(q, 'list_items', lambda *a, **k: (_ for _ in ()).throw(AssertionError('slow conversion')))
+    monkeypatch.setattr(config, 'all_queues', lambda: {'GHI': {'backend':'github','github_repo':'test/repo'}})
+    monkeypatch.setattr(config, 'github_queues_for_repo', lambda repo: ['GHI'])
+    raw = dict(number=42,state='CLOSED',body=gh._body_with_metadata('prose',
+        dict(deferred_until='9999-12-31',resolution_watches=[{'name':'registered'}])))
+    monkeypatch.setattr(gh, '_read_persisted_list_cache', lambda: {
+        'test/repo:open':dict(at=time.time(),data=[]),
+        'test/repo:closed':dict(at=time.time(),data=[raw])})
+    items, coverage = watches.inventory()
+    assert items[0]['ref'] == 'GHI-42' and items[0]['status'] == 'closed'
+    assert items[0]['deferred_until'] == '9999-12-31'
+    assert items[0]['resolution']['watches'] == [{'name':'registered'}]
+    assert not any(c['missing'] or c['stale'] for c in coverage)

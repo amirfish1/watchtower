@@ -41,6 +41,45 @@ def _lock():
     return storage.file_lock(_path().with_suffix(".lock"))
 
 
+def inventory():
+    """Read current raw metadata without usage conversion or network calls.
+
+    The daemon's existing poller owns GitHub freshness. Missing/stale coverage
+    is explicit; historical prose snapshots cannot masquerade as live state.
+    """
+    from . import queue as q, config, github_backend as gh
+    projects = config.all_queues()
+    github = {p: cfg for p, cfg in projects.items()
+              if isinstance(cfg, dict) and cfg.get("backend") == "github"}
+    items = {it["ref"]: it for it in q._load_unlocked(readonly=True)["items"]
+             if it.get("project") not in github}
+    cache = gh._read_persisted_list_cache()
+    coverage = []
+    for project, cfg in github.items():
+        repo = cfg.get("github_repo") or ""
+        labels = config.github_queues_for_repo(repo)
+        for state in ("open", "closed"):
+            entry = cache.get(f"{repo}:{state}") or {}
+            age = time.time()-float(entry.get("at") or 0)
+            coverage.append(dict(source=f"{repo}:{state}", missing="data" not in entry,
+                                 stale=bool(entry.get("stale")) or age > gh._persisted_list_ttl_s()))
+            for raw in entry.get("data") or []:
+                names = {v.get("name", "") for v in raw.get("labels") or [] if isinstance(v, dict)}
+                if len(labels) > 1:
+                    if config.is_catch_all(project):
+                        if names.intersection(config.sibling_queue_labels(project, repo)):
+                            continue
+                    elif config.queue_label(project) not in names:
+                        continue
+                _body, meta = gh._split_body(str(raw.get("body") or ""))
+                ref = f"{project}-{raw['number']}"
+                items[ref] = dict(meta, ref=ref, project=project, title=raw.get("title") or "",
+                                  created_at=raw.get("createdAt"), closed_at=raw.get("closedAt"),
+                                  status="closed" if raw.get("state") == "CLOSED" else "open",
+                                  resolution={"watches": meta.get("resolution_watches") or []})
+    return list(items.values()), coverage
+
+
 def register(name, *, command, cwd, where, schedule, queue, every=300):
     from . import config
     if not re.fullmatch(r"[a-zA-Z0-9][\w.-]{0,99}", name):
@@ -93,11 +132,13 @@ def sync(items):
                 if key not in data["bindings"]:
                     data["bindings"][key] = dict(spec=spec, attached_at=item.get("closed_at"),
                                                 last={}, first_real_pass="", episode=0)
+                data["bindings"][key]["origin_item"] = {
+                    k: item[k] for k in ("ref", "project", "title", "created_at", "status") if k in item}
         _save(data)
         return data
 
 
-def owner_rows(items):
+def owner_rows(items, project=""):
     """Read-only projection; also show closes not yet picked up by the scheduler."""
     data = _load()
     rows = []
@@ -110,6 +151,18 @@ def owner_rows(items):
                 rows.append(dict(ref=item["ref"], check=spec["name"], command=spec["command"],
                                  where=spec["where"], schedule=spec["schedule"],
                                  last=bound.get("last") or {"status": "not-run"}))
+    # Durable registrations outlive the display list's closed-ticket retention.
+    visible = {it["ref"] for it in items}
+    for bound in data["bindings"].values():
+        spec = bound["spec"]
+        if project:
+            from .queue import _project_from_ident
+            if _project_from_ident(spec["origin"]) != project:
+                continue
+        if spec["origin"] not in visible and not bound.get("first_real_pass"):
+            rows.append(dict(ref=spec["origin"], check=spec["name"], command=spec["command"],
+                             where=spec["where"], schedule=spec["schedule"],
+                             last=bound.get("last") or {"status": "not-run"}))
     return rows
 
 
@@ -148,7 +201,7 @@ def run(name="", *, now=None, items=None, limit=1):
     """Run due permanent checks with a bounded per-tick budget, not ticket timers."""
     from . import queue as q, related
     now = time.time() if now is None else now
-    items = q.list_items() if items is None else items
+    items = inventory()[0] if items is None else items
     data = sync(items)
     if name and name not in data["checks"]:
         raise ValueError(f"watch {name!r} is not registered")
@@ -167,7 +220,8 @@ def run(name="", *, now=None, items=None, limit=1):
         ordered = sorted(data["bindings"].items(), key=lambda kv: kv[1].get("last", {}).get("at", 0))
         for key, bound in ordered:
             spec = bound["spec"]
-            original = by_ref.get(spec["origin"])
+            original = by_ref.get(spec["origin"], bound.get("origin_item") or
+                                  dict(ref=spec["origin"], status="closed"))
             if not original or original.get("status") != "closed":
                 continue
             if name and spec["name"] != name:

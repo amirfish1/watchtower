@@ -218,7 +218,7 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
     unresolved = [dep_line(r) for r in shown
                   if r.get("dependency", {}).get("state") in ("not_found_here", "other_host", "no_ref")]
     from . import releases, watches
-    watched = watches.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want])
+    watched = watches.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want], project=want)
     release_rows = releases.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want], now=now)
     return {
         "watched": watched,

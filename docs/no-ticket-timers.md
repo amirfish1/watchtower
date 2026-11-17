@@ -217,3 +217,19 @@ ami local mapping (21 historical closed fields; one existing owner money gate):
 
 Final zero-field census and frozen daemon revision are recorded in the ticket's
 close evidence after final source adoption; checkout HEAD alone is not proof.
+
+
+Runtime acceptance found and fixed two additional limits before closure:
+full `list_items(strict=True)` audit conversion took minutes on live data, and
+GitHub's normal closed display retains only 14 days. The watch runner/audit now
+reads raw SQLite/poller metadata without usage conversion or network work
+(measured 1.21 seconds here). Stale/missing poller coverage yields pending,
+never a false real-data pass. The final fresh live CLI census independently
+proved zero fields in 4,163 currently visible records, and ami local storage
+proved zero in 3,954. Older closed prose snapshots are historical evidence,
+not current metadata, and are excluded from live acceptance claims.
+
+Durable bindings retain original link identity and continue checking when the
+original ages out of the display. Pending owner visibility also survives that
+retention boundary, honors queue filters, and clears only after a real pass.
+The runner's registry authority check still applies before any binding exists.

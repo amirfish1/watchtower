@@ -55,7 +55,10 @@ def ticket_timers(items=None):
     """Audit real ticket storage, including hidden GitHub compatibility fields."""
     from . import queue as q
     from .github_backend import _split_body
-    items = q.list_items(strict=True) if items is None else items
+    coverage = []
+    if items is None:
+        from .watches import inventory
+        items, coverage = inventory()
     bad = []
     for item in items:
         meta = _split_body(item["_github_body"])[1] if item.get("_github_body") else item
@@ -64,8 +67,12 @@ def ticket_timers(items=None):
     if bad:
         return dict(status="fail", real_data=True,
                     evidence=f"Retired timer fields remain on {len(bad)} tickets: " + ", ".join(bad[:20]))
+    gaps = sorted({c["source"] for c in coverage if c["missing"] or c["stale"]})
+    if gaps:
+        return dict(status="pending", real_data=False,
+                    evidence=f"Zero timers in {len(items)} available records; poller coverage incomplete/stale: " + ", ".join(gaps))
     return dict(status="pass" if items else "pending", real_data=bool(items),
-                evidence=f"Audited {len(items)} real tickets: zero raw deferred_until fields, including closed records and release/pipeline fences")
+                evidence=f"Audited {len(items)} current raw ticket records: zero deferred_until fields, including release/pipeline fences. Older closed history is outside the live poller inventory.")
 
 
 def main(argv=None):

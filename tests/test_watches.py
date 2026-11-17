@@ -140,3 +140,29 @@ def test_custom_queue_store_isolates_watch_registry(tmp_path, monkeypatch):
     monkeypatch.setenv('WATCHTOWER_STORE', str(tmp_path/'isolated.json'))
     assert watches._path() == tmp_path/'isolated.watches.json'
     assert not watches._load()['bindings']
+
+
+def test_checks_and_owner_visibility_outlive_closed_display_retention(env, tmp_path):
+    q, *_ = env
+    receipt = check(tmp_path)
+    ref = close(env, tmp_path)
+    watches.run('natural-check', items=[q.get(ref)])
+    assert watches.owner_rows([])[0]['ref'] == ref
+    assert watches.owner_rows([], project='OTHER') == []
+    # The original ages out of the poller's closed list; registration is durable.
+    receipt.write_text(json.dumps(dict(status='fail', real_data=True, evidence='new natural regression')))
+    result = watches.run('natural-check', items=[])[0]
+    new = q.get(result['failure_ref'])
+    from watchtower import related
+    assert any(link['ref'] == ref for link in related.links(new))
+    assert q.get(ref)['status'] == 'closed'
+
+
+def test_default_run_uses_raw_inventory_without_ticket_conversion(env, tmp_path, monkeypatch):
+    q, *_ = env
+    check(tmp_path)
+    ref = close(env, tmp_path)
+    item = q.get(ref)
+    monkeypatch.setattr(watches, 'inventory', lambda: ([item], []))
+    monkeypatch.setattr(q, 'list_items', lambda *a, **k: pytest.fail('full ticket conversion on watch path'))
+    assert watches.run('natural-check')[0]['status'] == 'pending'
