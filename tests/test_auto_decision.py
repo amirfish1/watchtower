@@ -87,7 +87,10 @@ def test_clean_proposal_is_auto_decided_with_audit(env):
 def test_plain_block_stays_a_card(env):
     it = env.queue.enqueue(project="T", note="x", source="t")
     env.queue.claim_by_ref(it["ref"], "w1")
-    assert env.cli.main(["block", it["ref"], "--worker", "w1", "--question", "?"]) == 0
+    assert env.cli.main(["block", it["ref"], "--worker", "w1",
+                         "--question", "Which helper name should we keep?",
+                         "--wait-on", "owner", "--decide-by", "none",
+                         "--if-unanswered", "none"]) == 0
     got = env.queue.get(it["ref"])
     assert got["needs_input"] is True and "auto_decision" not in _events(env, it["ref"])
 
@@ -306,6 +309,25 @@ def test_replay_subscription_word_does_not_veto_but_real_money_does(renv):
         ref2, _ = _replay(renv, progress=bad)
         assert "auto_decision_eligible" not in _events(renv, ref2)
         assert "matched hard stop" in renv.queue.get(ref2)["block_question"]
+
+
+@pytest.mark.parametrize("field", ["question", "recommend", "progress", "undo"])
+@pytest.mark.parametrize("wording", ["paid run on openrouter", "PAID evaluation on OpenRouter",
+                                     "paid replay on openrouter"])
+def test_paid_replay_cannot_hide_behind_desk_replay_exemption(renv, monkeypatch, field, wording):
+    # Model a desk that treats replay/file-only language as benign. The replay
+    # gate must retain an explicit paid-execution veto even when that desk misses it.
+    monkeypatch.setattr(autodecide, "floor_hits", lambda text: ([], ""))
+    data = renv.config._load()
+    data["T"]["auto_decision"]["enabled_classes"].append("capped-replay-spend")
+    data["T"]["auto_decision"]["dry_run_classes"] = []
+    renv.config._save(data)
+    text = f"rm /tmp/replay-out.json # {wording}" if field == "undo" else wording
+    ref, rc = _replay(renv, **{field: text})
+    assert rc == 0
+    events = _events(renv, ref)
+    assert "auto_decision" not in events and "auto_decision_eligible" not in events
+    assert "matched hard stop: money" in renv.queue.get(ref)["block_question"]
 
 
 @pytest.mark.parametrize("over,needle", [
