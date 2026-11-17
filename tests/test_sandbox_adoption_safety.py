@@ -247,6 +247,37 @@ def test_prepush_sandbox_failure_blocks_without_host_fallback(push_repo):
     assert not fx["canary"].exists()
 
 
+def test_prepush_large_adopted_history_cannot_hide_trailer(push_repo):
+    # grep -q under pipefail can SIGPIPE printf after an early match, causing
+    # the old hook to miss the trailer and execute adopted tests on the host.
+    fx = push_repo
+    run, _ = _push_gate(fx, "Adopt fix\n\nWT-Sandbox-Adopted: WT-1\n" + "x" * 100000)
+    assert run.returncode == 0, run.stderr
+    assert fx["calls"].exists() and not fx["canary"].exists()
+
+
+def test_prepush_checks_each_adopted_ref_and_preserves_required_gate(push_repo):
+    fx = push_repo
+    run, first = _push_gate(fx, "First\n\nWT-Sandbox-Adopted: WT-1")
+    assert run.returncode == 0
+    run, second = _push_gate(fx, "Second\n\nWT-Sandbox-Adopted: WT-2")
+    assert run.returncode == 0
+    fx["calls"].unlink()
+    env = {"PATH": f"{fx['bin']}:/usr/bin:/bin", "HOME": str(fx['repo'].parent),
+           "WT_SANDBOX_GATE_COMMAND": "true"}
+    stdin = "".join(f"refs/heads/{n} {sha} refs/heads/{n} {fx['base']}\n"
+                    for n, sha in (("first", first), ("second", second)))
+    run = subprocess.run(["bash", str(fx["repo"] / "scripts/pre-push.sh")],
+                         cwd=fx["repo"], env=env, input=stdin, text=True, capture_output=True)
+    assert run.returncode == 0, run.stderr
+    calls = fx["calls"].read_text().splitlines()
+    assert len(calls) == 2 and first in calls[0] and second in calls[1]
+    for call in calls:
+        for suite in ("test_workers_lifecycle", "test_smoke", "test_queue", "test_argparse_ux"):
+            assert suite in call
+    assert not fx["canary"].exists()
+
+
 def test_prepush_without_trusted_deployment_blocks_adopted_push(push_repo):
     fx = push_repo
     run, _ = _push_gate(fx, "Adopt fix\n\nWT-Sandbox-Adopted: WT-1 worker=w patch-sha256=ab",
@@ -274,6 +305,20 @@ def test_prepush_ordinary_commits_keep_the_host_gate(push_repo):
     run, _ = _push_gate(fx, "Ordinary reviewed change")
     assert run.returncode == 0, run.stderr + run.stdout
     assert fx["canary"].exists() and not fx["calls"].exists()
+
+
+def test_prepush_sticky_origin_survives_dropped_trailer_and_linked_worktree(push_repo):
+    fx = push_repo
+    (fx["repo"] / ".git" / handoff.ORIGIN_MARKER).write_text("restricted")
+    # No commit message carries the trailer: provenance is in trusted metadata.
+    run, _ = _push_gate(fx, "Rewritten history without trailer")
+    assert run.returncode == 0 and not fx["canary"].exists(), run.stderr
+    fx["calls"].unlink()
+    linked = fx["repo"].parent / "linked"
+    git(fx["repo"], "worktree", "add", "-q", "-b", "linked", str(linked))
+    linked_fx = dict(fx, repo=linked)
+    run, _ = _push_gate(linked_fx, "Also no trailer in linked worktree")
+    assert run.returncode == 0 and fx["calls"].exists() and not fx["canary"].exists(), run.stderr
 
 
 # ------------------------------------------------------------- F4 scan

@@ -68,6 +68,7 @@ def test_code_close_exports_and_parks_until_trusted_adoption(env, monkeypatch, b
     assert current["wait"]["on"] == "worker"
     assert not current.get("resolution")
     adopted = handoff.adopt(w.worker, sha, trusted)
+    assert (trusted / ".git" / handoff.ORIGIN_MARKER).is_file()
     assert (trusted / "sum.py").read_text() == "answer = 5\n"
     if binary:
         assert (trusted / "payload.bin").read_bytes() == b"\x00new\xfe"

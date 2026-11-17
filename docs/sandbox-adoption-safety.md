@@ -60,7 +60,11 @@ commit. It never runs proposed code. It now also:
   it carries the marker `wt-sandbox-aware-prepush` or delegates to a committed
   `scripts/pre-push.sh` that does.
 - Writes a trailer to the adoption commit:
-  `WT-Sandbox-Adopted: REF worker=W patch-sha256=…`.
+  `WT-Sandbox-Adopted: REF worker=W patch-sha256=…`. Before applying bytes,
+  it also writes a sticky `watchtower-sandbox-origin` marker into the trusted
+  common Git directory. This is outside commit history and shared by linked
+  worktrees, so rewriting/dropping the trailer cannot remove the restriction
+  within that destination repository.
 
 ### Supported workflow
 
@@ -73,8 +77,9 @@ commit. It never runs proposed code. It now also:
    It materializes the commit from trusted objects into a fresh sandbox
    (no network, only scratch writable) and never falls back to the host.
 4. Push with the repository's real hooks (never `--no-verify`). The sandbox-aware
-   `scripts/pre-push.sh` reads the pushed ranges, and for any range containing a
-   `WT-Sandbox-Adopted:` trailer — or whose range it cannot read — runs the gate
+   `scripts/pre-push.sh` checks every pushed ref. A sticky repository origin marker, a range containing
+   a `WT-Sandbox-Adopted:` trailer, or an unreadable range runs the full required
+   workers lifecycle, smoke, queue and argparse UX gate
    through the deployed WatchTower (`wt deploy --json`) in the sandbox. A missing
    deployment, an unusable sandbox or a failing gate blocks the push.
 5. Resolve the original ticket with the integrated commit; its required gates
@@ -88,14 +93,15 @@ commit. It never runs proposed code. It now also:
   hook chain covers pushes only.
 - **Sandbox cannot run this repo's pytest suite on a host whose system
   `python3` has no pytest** (observed on this host). The adopted-push gate then
-  fails closed. Fixes: install pytest system-wide outside the sandbox roots, set
-  `WT_SANDBOX_GATE_COMMAND`, or add a reviewed operator read root (widening
-  roots needs its own review and was not done here).
-- **Trailer evasion.** A squash or cherry-pick by the integration worker that
-  drops the trailer removes the hook's signal. The range check also treats an
-  unreadable range as adopted, but a clean rewritten history is not detected.
-  A ledger-based ancestry check against `handoffs/*.json` is the next
-  hardening.
+  fails closed. Fixes: install pytest system-wide outside the sandbox roots or provide a reviewed offline runtime
+  within the existing disposable roots. Tracked as OPS-643; native evidence is
+  `/home/hermes/wt61-c670215d-pytest-runtime.log`. No roots were widened and no
+  packages installed. An environment override cannot replace required suites.
+- **Cross-repository manual copying.** The sticky Git metadata marker survives
+  history rewriting and linked worktrees in the supported destination. An
+  unrestricted operator manually copying the bytes into a different repository
+  is outside that boundary; it still requires the same sandboxed test workflow.
+  A marker must not be removed while adopted bytes remain.
 - **Semantic review remains required.** Adopted source that changes
   application logic runs with host authority once integrated and deployed. The
   protected-path list only keeps it from auto-loading into privileged contexts

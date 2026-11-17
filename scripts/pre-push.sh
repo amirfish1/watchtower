@@ -17,7 +17,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
 ZERO="0000000000000000000000000000000000000000"
-adopted_sha=""
+adopted_shas=()
+common="$(git rev-parse --git-common-dir)"
+[[ "$common" == /* ]] || common="$REPO_ROOT/$common"
+sandbox_origin=false
+# Sticky metadata survives amend/squash and applies to every linked worktree.
+# An unreadable or linked marker still means restricted.
+if [ -e "$common/watchtower-sandbox-origin" ] || [ -L "$common/watchtower-sandbox-origin" ]; then
+  sandbox_origin=true
+fi
 while read -r _lref local_sha _rref remote_sha || [ -n "${local_sha:-}" ]; do
   [ -n "${local_sha:-}" ] && [ "$local_sha" != "$ZERO" ] || continue
   if [ "${remote_sha:-$ZERO}" = "$ZERO" ]; then
@@ -26,30 +34,32 @@ while read -r _lref local_sha _rref remote_sha || [ -n "${local_sha:-}" ]; do
     range=("${remote_sha}..${local_sha}")
   fi
   # An unreadable range is treated as adopted: fail toward the sandbox.
-  if ! msgs="$(git log --format=%B "${range[@]}" 2>/dev/null)" \
-     || printf '%s\n' "$msgs" | grep -q '^WT-Sandbox-Adopted: '; then
-    adopted_sha="$local_sha"
-    break
+  if [ "$sandbox_origin" = true ] \
+     || ! msgs="$(git log --format=%B "${range[@]}" 2>/dev/null)" \
+     || [[ $'\n'"$msgs" == *$'\nWT-Sandbox-Adopted: '* ]]; then
+    adopted_shas+=("$local_sha")
   fi
 done
 
-if [ -n "$adopted_sha" ]; then
+if [ "${#adopted_shas[@]}" -gt 0 ]; then
   echo "pre-push: adopted sandbox commit in range; testing in the restricted sandbox…"
   TRUSTED="$(wt deploy --json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' 2>/dev/null || true)"
   if [ -z "$TRUSTED" ] || [ ! -f "$TRUSTED/scripts/sandbox_test_commit.py" ]; then
     echo "pre-push: no trusted WatchTower deployment found (wt deploy --json); push blocked." >&2
     exit 1
   fi
+  for adopted_sha in "${adopted_shas[@]}"; do
   [ -n "$(git rev-parse --verify -q "$adopted_sha^{commit}")" ] || { echo "pre-push: cannot resolve $adopted_sha; push blocked." >&2; exit 1; }
   if ! (cd "$TRUSTED" && python3 -I scripts/sandbox_test_commit.py --repo "$REPO_ROOT" \
         --commit "$(git -C "$REPO_ROOT" rev-parse "$adopted_sha^{commit}")" \
-        --command "${WT_SANDBOX_GATE_COMMAND:-python3 -m pytest tests/test_queue.py tests/test_smoke.py -q --tb=short}"); then
+        --command 'python3 -m pytest tests/test_workers_lifecycle.py tests/test_smoke.py tests/test_queue.py tests/test_argparse_ux.py -q --tb=short'); then
     echo "❌ pre-push sandbox gate FAILED or could not run — push blocked (no host fallback)." >&2
     echo "   If the sandbox's system python3 lacks pytest, install it system-wide (outside the" >&2
-    echo "   sandbox roots) or set WT_SANDBOX_GATE_COMMAND to a command the sandbox can run." >&2
+    echo "   sandbox roots). The required four-suite gate cannot be replaced by an environment override." >&2
     echo "   Never --no-verify; see docs/sandbox-adoption-safety.md." >&2
     exit 1
   fi
+  done
   echo "pre-push: sandbox gate passed ✓"
   exit 0
 fi

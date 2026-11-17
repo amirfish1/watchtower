@@ -5,6 +5,60 @@ WT-61 remains open. Do not enable a live queue policy or describe this review
 branch as integrated. The complete candidate combines the earlier bridge,
 lifecycle fences, recovery and native-policy work with the integration fixes.
 
+## Security review continuation — 2026-11-17, wt-c670215d
+
+Claude's final review of cba8ce3 is blocking; full report:
+`/home/hermes/wt61-final-review-claude-cba8ce3.md`. The independent Antigravity
+report is still pending. Keep the candidate off main and live policies off.
+
+- F1: e66b700 replaces stage spool verdict/assessment authority with the final
+  model response captured by the trusted parent outside both tool roots.
+  Exec uses `--output-last-message` plus a strict output schema; app-server
+  captures only the assigned thread/turn's final agent message. Tool output,
+  commentary, forged spool requests and writable shims cannot submit a verdict.
+  Ticket context and the materialization manifest are under the read-only
+  store `.agents` subtree. Real gated exec and app-server runs passed on this
+  revision: `/home/hermes/wt61-trusted-capture-{exec,app-server}.log`.
+- F2: 83a0763 (adopted as 68ae0a7 on this worker's branch) stamps sticky
+  `sandbox_origin` under the claim lock and checks legacy history tombstones.
+  Trusted reclaim and a disabled policy cannot promote command gates,
+  verifier/assessor launch or group integration to host authority.
+  `tests/test_sandbox_origin.py` exercises these consumers and ledger failures.
+- F5: tool environment overrides exclude `WATCHTOWER_*` and `CODEX_HOME` while
+  retaining the scoped `WT_SANDBOX_*` bridge transport. The acceptance runner
+  checks this from a real tool process, alongside filesystem/network probes.
+- F6: stage root validation now precedes context creation (included in e66b700).
+- F7: peer workspaces can overlap: shared queue checkouts are the current
+  topology. Their source bytes are mutually untrusted; a local commit is not
+  an independent source attestation. Handoff, restricted gates and independent
+  model review must still validate the pinned adopted commit.
+
+F3/F4 source from the implementation lane is now combined: b6c9cd6 adopted as
+3b46a97 adds protected patch paths, bounded no-follow ledger scans, restricted
+adoption testing and a sandbox-aware pre-push hook. This worker additionally
+keeps the complete four-suite gate for every pushed adopted ref, avoids
+pipefail/SIGPIPE trailer misses, and stamps sticky provenance in the common Git
+directory before applying bytes; history rewriting and linked worktrees retain
+the sandbox requirement. Adoption/hook regressions: 73 passed in
+`/home/hermes/wt61-c670215d-adoption-v2.log`. Required gate runtime is blocked
+by missing system pytest (OPS-643); no host fallback or gate override is allowed.
+Assess both security reports and remaining gaps, and obtain final revised
+security review before integration. Existing honest-builder acceptance does not prove
+that a malicious builder cannot forge a verifier result; retain the hostile
+spool/native-boundary regressions and test an adversarial gated run.
+
+This worker's real honest-builder gated runs passed on both transports, with
+`controller_env_hidden=true`: `/home/hermes/wt61-c670215d-{exec,app}.log`.
+Real adversarial runs also passed their expected-rejection check on both
+transports: `/home/hermes/wt61-c670215d-hostile-{exec,app}-v4.log`. Each records
+an actual forged PASS request and replaced shim inside the real verifier
+store, followed by the model's own FAIL and the ticket reopening. No assessor
+runs after the failed verification gate. Earlier fixture runs are retained:
+v2 encountered the newly enforced global-hook refusal; v3 verifiers mocked
+the writes, so those runs intentionally failed the attack-attempt acceptance.
+The final fixture isolates only its own local hook lookup and explicitly
+authorizes adversarial writes inside its disposable roots. It never pushes.
+
 ## Enforcement and authority
 
 Each registered worker gets two writable roots: its assigned workspace and a

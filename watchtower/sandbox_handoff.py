@@ -23,6 +23,7 @@ MAX_PATCH = 8 << 20
 MAX_HOOK = 1 << 16
 HOOK_MARKER = "wt-sandbox-aware-prepush"
 TRAILER = "WT-Sandbox-Adopted"
+ORIGIN_MARKER = "watchtower-sandbox-origin"
 
 # F3: bytes from a sandbox builder must never reach a privileged reader or
 # runner. Anything an agent, editor, hook runner, CI service or shell loads
@@ -286,6 +287,28 @@ def _check_destination_overlap(destination):
         raise ValueError(f"cannot read the sandbox scope ledger: {exc}") from exc
 
 
+def _mark_destination_origin(destination):
+    """Sticky repository provenance, outside the adopted tree and history.
+
+    Rewording/squashing a commit cannot remove the sandbox requirement in this
+    destination or its linked worktrees. Write BEFORE applying untrusted bytes;
+    interrupted adoption may retain a conservative marker, never miss one.
+    """
+    common = Path(_git(destination, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = destination / common
+    with bridge.directory(common.resolve(strict=True)) as fd:
+        try:
+            out = os.open(ORIGIN_MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                          | os.O_NOFOLLOW, 0o400, dir_fd=fd)
+        except FileExistsError:
+            return  # Any existing object is a restriction, never permission.
+        with os.fdopen(out, "w") as stream:
+            stream.write("Sandbox-origin bytes adopted here; keep pushes sandboxed.\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+
+
 def adopt(worker, commit, destination):
     """Operator-only: apply the reviewed patch in a clean trusted checkout.
 
@@ -344,6 +367,7 @@ def adopt(worker, commit, destination):
             _git(destination, "apply", "--check", "--index", "--binary", "-", input_bytes=raw)
             names = _git(destination, "apply", "--numstat", "-z", "-", input_bytes=raw)
             check_patch_paths(raw, names)
+            _mark_destination_origin(destination)
             _git(destination, "apply", "--index", "--binary", "-", input_bytes=raw)
             _git(destination, "-c", "user.name=WatchTower Integration", "-c",
                  "user.email=watchtower@localhost", "commit", "-m",

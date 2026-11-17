@@ -892,6 +892,10 @@ def config_overrides(repo: Any, store: Any, *, read_roots: Optional[Iterable[Any
         "check_for_update_on_startup=false",
         "analytics.enabled=false",
         "feedback.enabled=false",
+        # Controller paths are needed by the host app-server collector, never
+        # by tools. Preserve the scoped WT_SANDBOX_* client transport while
+        # excluding real-store paths and the host's Codex authentication home.
+        'shell_environment_policy.exclude=["WATCHTOWER_*","CODEX_HOME"]',
         f"shell_environment_policy.set={_toml(tool_env(repo_c, store_c))}",
     ]
     overrides += [f"features.{name}=false" for name in DISABLED_FEATURES]
