@@ -192,7 +192,8 @@ are preserved. The source materializer is `27a61ec`, stage/result transport is
 `502070f`, and command gate integration is `7869d43` (child `72bf494`). Required
 push checks passed for each checkpoint (425 tests). The stage lane
 `ce5712aa-033c-4afc-861c-d89d0f17d4c7` also pushed gate snapshot hardening
-`db06309`, pending adoption into the parent candidate at this writing.
+`db06309`, adopted as `71014c8`. Later hardening pins source directory identities
+for gates and stages and rejects edited ticket requirements during slow gates.
 
 Command gates materialize a full commit from the trusted integration checkout's
 object stores inside a fresh native sandbox, never the worker's writable Git

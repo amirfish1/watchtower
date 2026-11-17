@@ -72,7 +72,11 @@ def guard(scope, item, *, data, launch=False):
                    and session.get("worker_id") == scope["worker"])
     if not matches:
         raise ValueError("sandbox stage attempt was superseded")
-    if not contract["epoch"]["commit"]:
+    if contract.get("source_pin"):
+        why = source.source_unchanged(contract["source_pin"])
+        if why:
+            raise ValueError("sandbox stage source changed: " + why)
+    elif not contract["epoch"]["commit"]:
         meta, _ = source.source_objects(item.get("repo_path"))
         if source.resolve_commit(meta, "") != contract["commit"]:
             raise ValueError("sandbox stage source HEAD changed")
@@ -105,6 +109,7 @@ def _register(item, role, worker, src):
                     "attempt": reserved["attempt"], "epoch": epoch(item), "commit": src["commit"],
                     "token": a.get("token", ""), "assessment_cycle": a.get("cycle"),
                     "assessment_attempt": a.get("attempt"),
+                    "source_pin": src.get("pin"),
                     "context_digest": _digest(context(current, data))}
         scope = {"worker": worker, "queue": item["project"], "repo": str(src["workspace"]),
                  "store": str(src["store"]), "source": str(q._db_path().resolve()),
@@ -170,7 +175,9 @@ def launch(item, role, engine, model, *, dry_run=False):
     if dry_run:
         return {"engine": engine, "model": model, "stage": role, "sandboxed": True}
     worker = "sb-" + role + "-" + uuid.uuid4().hex[:12]
-    src = source.prepared_source(item.get("repo_path"), (item.get("resolution") or {}).get("commit", ""), role)
+    pin = source.pin_source(item, (item.get("resolution") or {}).get("commit", ""))
+    src = source.prepared_source(item.get("repo_path"), pin["commit"], role)
+    src["pin"] = pin
     proc = None
     try:
         policy.write_wt_shim(src["store"])

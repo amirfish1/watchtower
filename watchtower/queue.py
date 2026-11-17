@@ -5333,6 +5333,12 @@ def _effective_repo_path(item: Dict[str, Any]) -> str:
         return ""
 
 
+def _sandbox_request_context(item: Dict[str, Any]) -> str:
+    import hashlib
+    fields = {k: item.get(k) for k in ("title", "note", "text", "accept", "accept_line", "plan")}
+    return hashlib.sha256(json.dumps(fields, sort_keys=True, default=str).encode()).hexdigest()
+
+
 def _sandbox_snapshot_contract(item: Dict[str, Any], resolution: Any,
                                fence: Optional[Dict[str, Any]] = None,
                                store_id: Optional[str] = None) -> Dict[str, Any]:
@@ -5350,7 +5356,8 @@ def _sandbox_snapshot_contract(item: Dict[str, Any], resolution: Any,
     return {"fence": fence if fence is not None else sandbox_bridge._fence(item),
             "gates": effective_gates(item), "store_id": store_id,
             "status": item.get("status"), "needs_input": bool(item.get("needs_input")),
-            "repo_path": _effective_repo_path(item), "request": _request_digest(resolution)}
+            "repo_path": _effective_repo_path(item), "request": _request_digest(resolution),
+            "request_context": _sandbox_request_context(item)}
 
 
 def _sandbox_contract_problem_unlocked(it: Dict[str, Any], status: str,
@@ -5366,6 +5373,9 @@ def _sandbox_contract_problem_unlocked(it: Dict[str, Any], status: str,
         return "sandbox claim or gates changed during close"
     if "repo_path" in contract and _effective_repo_path(it) != contract["repo_path"]:
         return "sandbox source repository changed during close"
+    if ("request_context" in contract
+            and _sandbox_request_context(it) != contract["request_context"]):
+        return "sandbox ticket request changed during close"
     if status == "closed" and "request" in contract \
             and _request_digest(resolution) != contract["request"]:
         return "sandbox close request changed during close"

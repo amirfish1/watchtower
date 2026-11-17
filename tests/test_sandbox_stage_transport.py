@@ -224,6 +224,34 @@ def test_scope_survives_live_policy_disable_without_granting_builder_verbs(env):
     assert w.queue.get(item["ref"])["status"] == "closed"
 
 
+def test_replaced_stage_source_never_accepts_a_result(env, monkeypatch):
+    w = env
+    item, scope = scoped(w)
+    scope["stage"]["source_pin"] = {"commit": "a" * 40}
+    with bridge.directory(bridge.authority_dir()) as fd:
+        bridge._write(fd, w.worker + ".json", scope)
+    monkeypatch.setattr(stage.source, "source_unchanged", lambda *a: "repository was replaced")
+    result = submit(w, "verdict", verdict(item))
+    assert not result["ok"] and "replaced" in result["error"]
+    assert w.queue.get(item["ref"]) == item
+
+
+def test_registration_writes_full_clarification_context_before_launch(env):
+    import json
+    w = env
+    item, _ = scoped(w)
+    item = change(w, item["ref"], pending_answer={"gen": 7, "question": "Scope?",
+        "answer": "Preserve all original requirements."},
+        stage_session={"reserved": {"key": "verifier:1", "attempt": 1}})
+    scope = stage._register(item, "verifier", w.worker,
+        {"workspace": w.repo, "store": w.store, "commit": "a" * 40})
+    stored = json.loads((w.store / "ticket-context.json").read_text())
+    assert stored["pending_answer"]["answer"] == "Preserve all original requirements."
+    assert stored["resolution"] == item["resolution"]
+    assert scope["stage"]["context_digest"] == stage._digest(stored)
+    assert w.queue.get(item["ref"])["stage_session"]["worker_id"] == w.worker
+
+
 @pytest.mark.parametrize("transport", ["exec", "app-server"])
 def test_stage_launch_always_uses_native_profile_and_scoped_store(env, base, monkeypatch, transport):
     from types import SimpleNamespace
@@ -235,6 +263,7 @@ def test_stage_launch_always_uses_native_profile_and_scoped_store(env, base, mon
     roots["workspace"].mkdir()
     roots["store"].mkdir()
     monkeypatch.setattr(stage.source, "prepared_source", lambda *a: roots)
+    monkeypatch.setattr(stage.source, "pin_source", lambda *a: {"commit": "a" * 40})
     monkeypatch.setattr(stage.policy, "write_wt_shim", lambda *a: None)
     monkeypatch.setattr(stage, "_register", lambda *a: {
         "stage": {"ref": item["ref"], "role": "verifier", "commit": "a" * 40},

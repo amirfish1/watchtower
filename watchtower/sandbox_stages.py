@@ -314,7 +314,19 @@ def pin_source(item: Dict[str, Any], commit: str = "") -> Dict[str, Any]:
     meta, _stores = source_objects(repo_path)
     full = resolve_commit(meta, commit)
     return {"repo_path": repo_path, "common": os.path.realpath(str(meta["common"])),
+            "identity": _source_identity(meta),
             "commit": full, "head": "" if str(commit or "").strip() else full}
+
+
+def _source_identity(meta: Dict[str, Any]) -> Dict[str, Any]:
+    # Paths alone cannot detect a repository replaced at the same location.
+    # Ignore mtimes: ordinary commits and object packing must remain valid.
+    result = {}
+    for key in ("gitdir", "common", "objects"):
+        path = os.path.realpath(str(meta[key]))
+        st = os.stat(path, follow_symlinks=False)
+        result[key] = [path, st.st_dev, st.st_ino]
+    return result
 
 
 def source_unchanged(pin: Dict[str, Any]) -> str:
@@ -327,6 +339,8 @@ def source_unchanged(pin: Dict[str, Any]) -> str:
             return "the trusted source repository is gone"
         if os.path.realpath(str(meta["common"])) != pin.get("common"):
             return "the trusted source repository changed identity"
+        if pin.get("identity") and _source_identity(meta) != pin["identity"]:
+            return "the trusted source repository was replaced"
         if pin.get("head") and _head_from_files(meta) != pin["head"]:
             return "the trusted source HEAD moved while the gates ran"
     except (StageSandboxError, policy.SandboxPolicyError, OSError) as exc:

@@ -61,6 +61,16 @@ def _no_stage_dirs():
     return not root.exists() or not any(root.iterdir())
 
 
+def test_source_pin_detects_same_path_object_store_replacement(env, trusted_repo):
+    pin = sandbox_stages.pin_source({"repo_path": str(trusted_repo["repo"])}, trusted_repo["first"])
+    assert not sandbox_stages.source_unchanged(pin)
+    objects = trusted_repo["repo"] / ".git" / "objects"
+    old = objects.with_name("objects-old")
+    objects.rename(old)
+    shutil.copytree(old, objects)
+    assert "replaced" in sandbox_stages.source_unchanged(pin)
+
+
 # ------------------------------------------------------------- native
 
 
@@ -300,6 +310,18 @@ def test_changed_request_is_refused_at_the_write_lock(env):
                                  resolution={"summary": "what was gated"},
                                  expect_owner=cur["claimed_by"], sandbox_contract=contract)
     assert done["status"] == "closed"
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_ticket_requirements_changed_during_gate_cannot_be_closed_or_reopened(env, monkeypatch, passed):
+    w = env
+    item = _claim(w, w.repo, ["cmd:true"])
+    _fake_gate(monkeypatch, lambda: _edit(w, item["ref"], lambda it: it.update(
+        text="A new acceptance requirement, added while the gate ran.")), passed)
+    result = submit(w, "close", close_body(item["ref"]), w.claim)
+    assert not result["ok"] and "ticket request changed" in result["error"]
+    current = w.queue.get(item["ref"])
+    assert current["status"] == "in_progress" and not current.get("gate_feedback")
 
 
 # -------------------------- trusted adoption close of a sandbox-origin item
