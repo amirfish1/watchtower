@@ -82,6 +82,7 @@ The file holds ``{"counter": <int>, "items": [<item>, ...]}``.
 from __future__ import annotations
 
 from .refs import canonical_ref, display_ref, slug_of, ticket_slug
+from .dependencies import local_snapshot as _dependency_snapshot
 
 import copy
 import json
@@ -1823,11 +1824,12 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
                        blocked_by: Optional[List[str]], gates: Optional[List[str]],
                        accept_line: str, assessment_origin: str = "",
                        placement: str = "", depth: str = "",
-                       budget_min: int = 0, submitter_subscribed: bool = False) -> Dict[str, Any]:
+                       budget_min: int = 0, submitter_subscribed: bool = False,
+                       dependency_items: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """Append a new ``open`` item to an already-loaded local store (the caller
     holds the store lock and saves). Shared by :func:`enqueue` and the
     post-fix-assessment filer so both create identical tickets."""
-    blockers = _validate_blocked_by(data["items"], "", list(blocked_by or []))
+    blockers = _validate_blocked_by(data["items"] + (dependency_items or []), "", list(blocked_by or []))
     data["counter"] = int(data.get("counter", 0)) + 1
     number = data["counter"]
     now = _now_iso()
@@ -2025,6 +2027,7 @@ def enqueue(
                                  f"retry with `wt edit {saved.get('ref')} --gate ...`") from exc
         _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
         return saved
+    dependencies = _dependency_snapshot(refs=blocked_by or [], transitive=True)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         if dedupe_key:
@@ -2040,7 +2043,8 @@ def enqueue(
             planner_model=planner_model, verifier_model=verifier_model, submitter=submitter,
             submitter_explicit=submitter_explicit, submitter_subscribed=submitter_subscribed, pre_ack=pre_ack, blocked_by=blocked_by,
             gates=gates, accept_line=accept_line, assessment_origin=assessment_origin,
-            placement=placement, depth=depth, budget_min=budget_min)
+            placement=placement, depth=depth, budget_min=budget_min,
+            dependency_items=dependencies)
         saved["client_id"] = client_id
         if dedupe_key:
             saved["dedupe_key"] = dedupe_key
@@ -2515,6 +2519,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
         depth_edit = (fields.pop("depth", None), fields.pop("budget_min", None))
         if depth_edit[0] is not None:
             norm_depth(depth_edit[0])
+    dependencies = _dependency_snapshot(refs=fields.get("blocked_by") or [], transitive=True)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -2543,7 +2548,7 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                                          "are its members (wt group attach / detach)")
                     fields = dict(fields)
                     fields["blocked_by"] = _validate_blocked_by(
-                        data["items"], str(it.get("ref") or ""),
+                        data["items"] + dependencies, str(it.get("ref") or ""),
                         list(fields["blocked_by"] or []),
                     )
                     if group_parent_ref(it) and group_parent_ref(it) in fields["blocked_by"]:
@@ -2661,7 +2666,7 @@ def blocker_verdict(
     blocker closed declined/unresolved). ``stuck`` wins over ``waiting``. A
     stuck blocker a human already answered for (``blocker_escalated`` and
     ``needs_input`` cleared) counts as satisfied; a blocker that no longer
-    exists is ignored. An unfinished duplicate follower (``duplicate_of``)
+    exists keeps the dependent waiting. An unfinished duplicate follower (``duplicate_of``)
     waits on its original, whatever that original's state (WT-49): it
     completes only through the duplicate sync, never by claim."""
     waiting = ""
@@ -2669,9 +2674,7 @@ def blocker_verdict(
         waiting = str(it["duplicate_of"])
     for ref in it.get("blocked_by") or []:
         blocker = by_ref.get(str(ref))
-        if blocker is None:
-            continue
-        state = _blocker_state(blocker)
+        state = _blocker_state(blocker or {})
         if state == "stuck":
             if str(ref) in (it.get("blocker_escalated") or []) and not it.get("needs_input"):
                 continue
@@ -2687,16 +2690,14 @@ def waiting_on(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]) -> List[st
     Uses ``_blocker_state`` so display and the claim gate share one rule: a
     blocker counts as completed only when closed, not declined, and with no
     unresolved items. A stuck blocker a human already answered for counts as
-    completed (same as ``blocker_verdict``); a missing blocker is ignored.
+    completed (same as ``blocker_verdict``); a missing blocker keeps the dependent waiting.
     Empty when unblocked and for tickets that are not open/in-flight."""
     if it.get("status") == "closed":
         return []
     out: List[str] = [str(it["duplicate_of"])] if it.get("duplicate_of") else []
     for ref in it.get("blocked_by") or []:
         blocker = by_ref.get(str(ref))
-        if blocker is None:
-            continue
-        state = _blocker_state(blocker)
+        state = _blocker_state(blocker or {})
         if state == "satisfied":
             continue
         if (
@@ -2713,12 +2714,13 @@ def _refs_index(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     return {str(it.get("ref")): it for it in items if it.get("ref")}
 
 
-def _escalate_stuck_blockers(items: List[Dict[str, Any]]) -> bool:
+def _escalate_stuck_blockers(items: List[Dict[str, Any]],
+                             dependencies: Optional[List[Dict[str, Any]]] = None) -> bool:
     """Flag every open ticket whose blocker closed declined/unresolved as
     ``needs_input`` (once per blocker) so it shows under ``wt blocked``
     instead of silently never being claimed. Mutates ``items``; returns
     whether anything changed. Caller holds the lock and saves."""
-    by_ref = _refs_index(items)
+    by_ref = _refs_index(items + (dependencies or []))
     changed = False
     for it in items:
         if it.get("status") != "open" or it.get("needs_input") or not it.get("blocked_by"):
@@ -2776,7 +2778,9 @@ def _validate_blocked_by(
             if cur in seen:
                 continue
             seen.add(cur)
-            stack.extend(str(x) for x in (by_ref.get(cur, {}).get("blocked_by") or []))
+            if cur not in by_ref:
+                raise ValueError(f"blocker {cur} does not exist in the dependency snapshot; retry")
+            stack.extend(str(x) for x in (by_ref[cur].get("blocked_by") or []))
     return out
 
 
@@ -2905,10 +2909,12 @@ def count_claimable(
     if backend is not None:
         return backend.count_claimable(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
+    dependencies = _dependency_snapshot(project=proj, fresh=False)
     with _FileLock(_lock_path()):
         data = _load_unlocked(readonly=True)
         return len(_claim_candidates(
-            data["items"], project=proj, lane=lane, item_types=item_types,
+            data["items"], all_items=data["items"] + dependencies,
+            project=proj, lane=lane, item_types=item_types,
             worker_model=worker_model,
         ))
 
@@ -2933,10 +2939,12 @@ def count_manual_eligible(
     if backend is not None:
         return backend.count_manual_eligible(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
+    dependencies = _dependency_snapshot(project=proj, fresh=False)
     with _FileLock(_lock_path()):
         data = _load_unlocked(readonly=True)
         candidates = _claim_candidates(
-            data["items"], project=proj, lane=lane, item_types=item_types
+            data["items"], all_items=data["items"] + dependencies,
+            project=proj, lane=lane, item_types=item_types
         )
         return len([it for it in candidates if it.get("run_requested", False)])
 
@@ -3199,9 +3207,10 @@ def claim_next(
         return item
 
     proj = _norm_project(project) if project else None
+    dependencies = _dependency_snapshot(project=proj)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
-        if _escalate_stuck_blockers(data["items"]):
+        if _escalate_stuck_blockers(data["items"], dependencies):
             _save_unlocked(data)
         # WT-28: one-ticket-at-a-time re-checked inside the lock (the pre-lock
         # read above can be stale when a resume/affinity claim lands between).
@@ -3216,7 +3225,8 @@ def claim_next(
         if sb_now:
             return _handback_unlocked(data, sb_now[0])
         candidates = _claim_candidates(
-            data["items"], project=proj, lane=lane, shaping=shaping, oldest=oldest,
+            data["items"], all_items=data["items"] + dependencies,
+            project=proj, lane=lane, shaping=shaping, oldest=oldest,
             item_types=item_types, readiness_filters=readiness_filters,
             worker_model=worker_model, claimer=(str(session_id), str(real_sid or "")),
             requested_only=requested_only,
@@ -3292,6 +3302,7 @@ def claim_by_ref(
             )
         return item
     real_sid = _coerce_session_uuid(session_uuid) or _coerce_session_uuid(session_id)
+    dependencies = _dependency_snapshot(ident=ref)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         item = next((it for it in data["items"] if it.get("ref") == ref), None)
@@ -3314,7 +3325,10 @@ def claim_by_ref(
         if item.get("duplicate_of"):   # WT-49: an open follower is not work
             raise ValueError(f"{ref} follows duplicate original {item['duplicate_of']}; "
                              "clear the link before independent work")
-        _group_claim_check_unlocked(data["items"], item)   # WT-33
+        state, bref = blocker_verdict(item, _refs_index(data["items"] + dependencies))
+        if state != "ok":
+            raise ValueError(f"{ref} waits on {bref} ({state})")
+        _group_claim_check_unlocked(data["items"] + dependencies, item)   # WT-33
         reserved = _affinity_gate_unlocked(item, str(session_id), str(real_sid or ""), time.time())
         if reserved:
             raise ValueError(reserved)
@@ -3363,10 +3377,12 @@ def peek_next(
     if backend is not None:
         return backend.peek_next(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
+    dependencies = _dependency_snapshot(project=proj)
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         candidates = _claim_candidates(
-            data["items"], project=proj, lane=lane, item_types=item_types,
+            data["items"], all_items=data["items"] + dependencies,
+            project=proj, lane=lane, item_types=item_types,
             worker_model=worker_model,
         )
         return dict(candidates[0]) if candidates else None
@@ -3384,13 +3400,14 @@ def floor_routed_candidates(
     if _github_backend_for_project(project) is not None:
         return []
     proj = _norm_project(project)
+    dependencies = _dependency_snapshot(project=proj, fresh=False)
     with _FileLock(_lock_path()):
         # Read-only snapshot: the reconciler calls this once per queue per
         # tick, and a private copy each time was ~4 s of CPU (WT-12).
         data = _load_unlocked(readonly=True)
         every = _claim_candidates(
             data["items"], project=proj, item_types=item_types,
-            all_items=data["items"],
+            all_items=data["items"] + dependencies,
         )
         from . import config
         return [
@@ -4771,6 +4788,7 @@ def retry_stage(ident: Any, expected_cycle: int) -> Dict[str, Any]:
     if _github_backend_for_project(_project_from_ident(ident)) is not None:
         raise ValueError("stage retry supports local queue storage only")
     from . import stages, workers
+    dependencies = _dependency_snapshot(ident=ident)
     with (_FileLock(workers.WORKERS_FILE.parent / "reconcile-maintenance.lock") as maintenance_lock,
           _FileLock(workers.WORKERS_FILE.parent / "reconcile.lock") as dispatch_lock,
           _FileLock(_lock_path()) as queue_lock):
@@ -4800,7 +4818,7 @@ def retry_stage(ident: Any, expected_cycle: int) -> Dict[str, Any]:
             raise ValueError("stage session is still alive")
         if ss.get("pid") and workers._pid_alive(int(ss["pid"])):
             raise ValueError("stage process is still alive")
-        if blocker_verdict(it, _refs_index(data["items"]))[0] != "ok":
+        if blocker_verdict(it, _refs_index(data["items"] + dependencies))[0] != "ok":
             raise ValueError("ticket has unresolved dependency gates")
         now = _now_iso()
         _stage_retry_reset(it, "Explicit stage retry", now)
@@ -8258,9 +8276,10 @@ def recover_claim(ident: Any, *, expect: Dict[str, Any], action: str, reason: st
 def escalate_stuck_blockers() -> bool:
     """``_escalate_stuck_blockers`` over the whole store, in its own lock
     (the backstop's system_op for ``dep.stuck``; claims run it too)."""
+    dependencies = _dependency_snapshot()
     with _FileLock(_lock_path()):
         data = _load_unlocked()
-        if _escalate_stuck_blockers(data["items"]):
+        if _escalate_stuck_blockers(data["items"], dependencies):
             _save_unlocked(data)
             return True
     return False

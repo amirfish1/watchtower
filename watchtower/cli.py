@@ -589,10 +589,13 @@ def cmd_ls(args: argparse.Namespace) -> int:
         items = q.list_items(project=args.queue, fresh=True)
         if getattr(args, "client_id", None) is not None:
             items = [i for i in items if i.get("client_id", "") == args.client_id]
-        all_items = items
+        from .dependencies import resolve
+        all_items = list(resolve(items, [b for it in items
+                              for b in (it.get("blocked_by") or [])],
+                                 fresh=True).values())
         # Counted over the WHOLE queue, before the status filter, so the default
         # (active) view still surfaces that closed-but-unresolved work exists.
-        unresolved_total = len(_unresolved_items(all_items))
+        unresolved_total = len(_unresolved_items(items))
     want = args.status or ("all" if windowed else "active")
     if getattr(args, "unresolved", False):
         want = "unresolved"
@@ -619,8 +622,8 @@ def cmd_ls(args: argparse.Namespace) -> int:
             rows = [dict(i, waiting_on=q.waiting_on(i, by_ref)) for i in items]
             print(json.dumps({**wmeta, "items": rows}, indent=2))
             return 0
-        # Blockers may live in other queues, so resolve against every queue.
-        by_ref = q._refs_index(q.list_items(fresh=True) + all_items)
+        # all_items includes only this queue and its named parents.
+        by_ref = q._refs_index(all_items)
         page = items[offset:offset + limit]
         rows = [dict(i, waiting_on=q.waiting_on(i, by_ref)) for i in page]
         if offset:

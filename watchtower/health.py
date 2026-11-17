@@ -455,13 +455,13 @@ def all_status(
             continue
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
     by_ref = q._refs_index(fetched)
-    # A project-scoped list lacks cross-queue blockers, and blocker_verdict
-    # ignores a missing one, so a ticket waiting on another queue read as
-    # claimable ("stuck") here while the claim path waits (WT-21).
-    if project and any(
-            str(b) not in by_ref for it in fetched
-            if it.get("status") == "open" for b in (it.get("blocked_by") or [])):
-        by_ref = q._refs_index(q.list_items(fresh=fresh))
+    # Resolve only named parents for scoped health; never enumerate unrelated
+    # GitHub queues just to explain a local dependency.
+    if project:
+        from .dependencies import resolve
+        by_ref = resolve(fetched, [b for it in fetched
+                         if it.get("status") == "open"
+                         for b in (it.get("blocked_by") or [])], fresh=fresh)
     waiting_refs = {
         str(it.get("ref")) for it in fetched
         if it.get("status") == "open" and (it.get("blocked_by") or it.get("duplicate_of"))

@@ -3396,41 +3396,9 @@ class GitHubIssuesBackend:
         and validation request fresh state. Missing runtime refs stay waiting
         rather than accidentally releasing a dependent after a lookup miss.
         """
-        from . import queue as q
-
-        by_ref = _refs_index(items)
-        loaded = {self.queue}
-        seen = set()
-        pending = list(refs)
-        while pending:
-            raw = str(pending.pop())
-            ref = f"{self.queue}-{raw}" if raw.isdigit() else raw
-            if ref in seen:
-                continue
-            seen.add(ref)
-            project = q._project_from_ident(ref)
-            if project and project not in loaded:
-                backend = q._github_backend_for_project(project)
-                others = (backend.list_items(fresh=fresh) if backend is not None
-                          else q.list_items(project=project))
-                by_ref.update(_refs_index(others))
-                loaded.add(project)
-            if ref not in by_ref:
-                try:
-                    item = q.get(ref)
-                except GitHubBackendError as exc:
-                    detail = str(exc).lower()
-                    if "not found" not in detail and "could not resolve to an issue" not in detail:
-                        raise
-                    item = None
-                if item is not None:
-                    by_ref[ref] = item
-            item = by_ref.get(ref)
-            if item is not None and transitive:
-                pending.extend(item.get("blocked_by") or [])
-            elif item is None and not transitive:
-                by_ref[ref] = {"ref": ref, "status": "open"}
-        return by_ref
+        from .dependencies import resolve
+        return resolve(items, refs, project=self.queue, fresh=fresh,
+                       transitive=transitive)
 
     def _validate_blockers(self, ref: str, blocked_by: List[str]) -> List[str]:
         items = self.list_items(fresh=True)
