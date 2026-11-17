@@ -1668,13 +1668,13 @@ def _resolution_comment(resolution: Optional[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _meta_block(meta: Dict[str, Any]) -> str:
+def _meta_block(meta: Dict[str, Any], *, compact: bool = False) -> str:
     lines = [_META_START]
     for key in sorted(meta):
         value = meta.get(key)
         if value in (None, ""):
             continue
-        lines.append(f"{key}: {json.dumps(value)}")
+        lines.append(f"{key}: {json.dumps(value, separators=(',', ':') if compact else None)}")
     lines.append(_META_END)
     return "\n".join(lines)
 
@@ -1746,11 +1746,11 @@ def _split_body_uncached(body: str) -> tuple[str, Dict[str, Any]]:
     return human, meta
 
 
-def _body_with_metadata(human_body: str, meta: Dict[str, Any]) -> str:
+def _body_with_metadata(human_body: str, meta: Dict[str, Any], *, compact: bool = False) -> str:
     human_body = (human_body or "").rstrip()
     if human_body:
-        return f"{human_body}\n\n{_meta_block(meta)}"
-    return _meta_block(meta)
+        return f"{human_body}\n\n{_meta_block(meta, compact=compact)}"
+    return _meta_block(meta, compact=compact)
 
 
 _UNSET = object()
@@ -3248,6 +3248,12 @@ class GitHubIssuesBackend:
             ours = _body_with_metadata(body, meta)
         size = _body_bytes(ours)
         if size > _ISSUE_BODY_MAX_BYTES:
+            # JSON separator whitespace carries no authority or data. Large
+            # unmovable histories still need room for a routing receipt; keep
+            # every value and human-body byte before considering refusal.
+            ours = _body_with_metadata(body, meta, compact=True)
+            size = _body_bytes(ours)
+        if size > _ISSUE_BODY_MAX_BYTES:
             raise GitHubBackendError(
                 f"{self.repo}#{item['number']} issue body would be {size} bytes; GitHub "
                 f"refuses more than {_ISSUE_BODY_MAX_BYTES}. Moved {moved} answer/comment "
@@ -3930,6 +3936,41 @@ class GitHubIssuesBackend:
             ], check=False,
                 body=f"[watchtower] Needs input from {session_id or 'worker'}:\n\n{shown}")
         return self.get(ident)
+
+    @_serialized_body_write
+    def park_expired_person_claim(self, ident, *, expect):
+        """Retire an idle legacy human-block claim without answering its gate."""
+        from . import queue as q, liveness as lv
+        item = self.get(ident)
+        if (not item or item.get("status") != "in_progress" or not item.get("needs_input")
+                or not item.get("claimed_by") or item.get("claimed_machine") != q.machine_tag()
+                or item.get("pipeline_foreign") or not q.claim_expect_holds(item, expect)):
+            return None
+        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
+        if any((source.get("pending_answer") or {}).get("state") in q.ANSWER_INFLIGHT
+               for source in (item, meta)):
+            return None
+        wait = item.get("wait") or {}
+        q.validate_person_block(wait.get("on"), wait.get("actor", ""), item.get("block_question"))
+        ctx = lv.ResolverContext()
+        if ctx.ps() is None or lv.claim_owner(item, ctx).verdict == "alive":
+            return None
+        hb = lv.claim_heartbeat_age(item, ctx.now)
+        if (hb is not None and hb < lv.stall_s()) or ctx.now-max(
+                lv._store_activity(item), lv._file_activity(item, ctx)) < lv.stall_s():
+            return None
+        worker, sid = item["claimed_by"], item.get("claimed_session_id") or ""
+        parked = dict(meta, ref=item["ref"], status="in_progress")
+        q._park_unlocked(parked, worker, sid, item.get("claimed_machine"), q._now_iso(),
+                         q._by("system"), reason="Expired person-block claim; original question remains unanswered")
+        parked.pop("ref", None)
+        parked.pop("status", None)
+        parked["claimed_session_id"] = sid  # legacy replies retain their original context
+        self._edit_body(item, body, parked, "--remove-label", self.in_progress_label)
+        if item.get("pipeline_local"):
+            q._github_park(ident, worker, item)
+        result = self.get(ident)
+        return result if result and result.get("needs_input") and not result.get("claimed_by") else None
 
     @_serialized_body_write
     def recover_expired_claim(self, ident, *, expect, reason):

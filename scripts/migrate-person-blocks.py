@@ -11,6 +11,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from watchtower import person_blocks, watches
+from watchtower.github_backend import GitHubBackendError
 
 
 def main():
@@ -39,7 +40,7 @@ def main():
                 result = copy.deepcopy(by_ref[operation['ref']])
                 person_blocks.transform(result, operation, list(by_ref.values()), args.worker)
             results.append(dict(ref=operation['ref'], action=operation['action'], status='applied' if args.apply else 'validated'))
-        except (ValueError, KeyError) as exc:
+        except (ValueError, KeyError, GitHubBackendError) as exc:
             results.append(dict(ref=operation['ref'], status='refused', error=str(exc)))
         args.receipts.write_text(json.dumps(dict(results=results, coverage=coverage), indent=2)+'\n')
     print(json.dumps({'processed':len(results), 'refused':[r for r in results if r['status']=='refused']}))

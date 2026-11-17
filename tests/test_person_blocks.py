@@ -232,12 +232,14 @@ def test_github_lease_recovery_rechecks_proof_under_serialized_writer(env,monkey
     ('here',True,False,'pass'),('here',False,False,'fail'),
     ('remote',False,False,'fail'),('remote',False,True,'pass'),
 ])
-def test_permanent_audit_cannot_pass_without_current_claim_liveness(wt_env,monkeypatch,host,alive,heartbeat,expected):
+@pytest.mark.parametrize('needs_input',[False,True])
+def test_permanent_audit_cannot_pass_without_current_claim_liveness(wt_env,monkeypatch,host,alive,heartbeat,expected,needs_input):
     import runpy,time
     from pathlib import Path
     from datetime import datetime,timezone
     from watchtower import queue as q,liveness as lv,watches,config
     item=dict(ref='AUDIT-1',project='AUDIT',status='in_progress',claimed_by='worker',
+              needs_input=needs_input,block_question='Approve the exact proposed operation?',wait={'on':'owner'},
               claimed_machine=q.machine_tag() if host=='here' else 'another-host',
               claimed_session_id='bound-session',claimed_at='2000-01-01T00:00:00Z',updated_at='2000-01-01T00:00:00Z')
     if heartbeat:
@@ -248,3 +250,50 @@ def test_permanent_audit_cannot_pass_without_current_claim_liveness(wt_env,monke
     monkeypatch.setattr(lv,'claim_owner',lambda i,ctx:lv.Verdict('alive' if alive else 'unproven','','proof',None))
     namespace=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/audit-no-parking.py'))
     assert namespace['audit']()['status']==expected
+
+
+@pytest.mark.parametrize('protection',['expired','alive','recent','foreign','new-question','answer'])
+def test_expired_github_person_claim_parks_without_answering_or_losing_gate(env,monkeypatch,protection):
+    from watchtower import liveness as lv
+    q,_,_,_,name=env;backend=q._github_backend_for_project(name)
+    if backend is None:
+        pytest.skip('GitHub legacy human claim')
+    ref=_ticket(q,name)
+    q.block(ref,'w1',question='[Q42:release] Approve this exact production release?',wait_on='owner',origin='worker')
+    before=q.get(ref)
+    fields=('status','claimed_by','claimed_session_id','claimed_machine','needs_input','claimed_at','blocked_at','block_question','wait')
+    expect={k:before.get(k) for k in fields}
+    monkeypatch.setattr(lv,'_store_activity',lambda i:0 if protection!='recent' else __import__('time').time())
+    monkeypatch.setattr(lv,'_file_activity',lambda i,c:0)
+    monkeypatch.setattr(lv,'claim_heartbeat_age',lambda i,now:None)
+    monkeypatch.setattr(lv.ResolverContext,'ps',lambda ctx:[])
+    monkeypatch.setattr(lv,'claim_owner',lambda i,c:lv.Verdict('alive' if protection=='alive' else 'unproven','','proof',None))
+    if protection=='alive':
+        assert lv.assess(before,{ref:before},lv.ResolverContext())['verdict']=='alive'
+    if protection=='foreign':
+        monkeypatch.setattr(q,'machine_tag',lambda:'other-host')
+    if protection=='new-question':
+        expect['block_question']='An obsolete question'
+    if protection=='answer':
+        from watchtower.github_backend import _split_body,_serialized_body_write
+        @_serialized_body_write
+        def pending(b):
+            i=b.get(ref);body,meta=_split_body(i['_github_body'])
+            meta['pending_answer']={'state':'routing','gen':7}
+            b._edit_body(i,body,meta)
+        pending(backend)
+    if protection=='expired':
+        action=lv.assess(before,{ref:before},lv.ResolverContext())
+        assert action['action']=='park_person_claim'
+        assert lv._apply(before,action,{ref:before},set())=='done'
+        result=q.get(ref)
+    else:
+        result=backend.park_expired_person_claim(ref,expect=expect)
+    if protection=='expired':
+        assert result and result['needs_input'] and not result.get('claimed_by')
+        assert result['block_question']==before['block_question'] and result['wait']==before['wait']
+        assert result['claimed_session_id']==before['claimed_session_id']
+        assert not any(h['event']=='answer' for h in result['history'])
+    else:
+        assert result is None
+        assert q.get(ref)['claimed_by']=='w1'

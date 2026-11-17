@@ -1311,6 +1311,19 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
                                    or item.get("status") != "in_progress" or item.get("needs_input")):
         out.update(owner="takeover", verdict="retained", reason="Same-session supervision owns recovery")
         return out
+    if (item.get("status") == "in_progress" and item.get("needs_input") and item.get("claimed_by")
+            and _github(out["queue"]) and item.get("claimed_machine") == q.machine_tag()
+            and callable(getattr(q._github_backend_for_project(out["queue"]), "park_expired_person_claim", None))):
+        v = claim_owner(item, ctx)
+        if v.verdict == "alive":
+            out.update(row="human.block", owner="human", verdict="alive", proof="claim_owner", evidence=v.evidence)
+            return out  # keep owning-host heartbeat evidence current
+        idle = now-max(_store_activity(item), _file_activity(item, ctx))
+        if ctx.ps() is not None and idle >= stall:
+            out.update(row="human.block", owner="human", verdict=v.verdict,
+                       evidence=v.evidence, idle_s=int(idle), action="park_person_claim",
+                       reason="Expired claim on an unanswered person decision")
+            return out
     try:
         row = row_of(item, by_ref, now)
     except (UndeclaredState, UnreachableState, UnclassifiedState) as exc:
@@ -1538,6 +1551,11 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
     """Carry out one decided action; returns ``done`` or why it did not."""
     ref, action, reason = a["ref"], a["action"], a["reason"]
     evidence = f"{a['verdict']}: {a['evidence']}"
+    if action == "park_person_claim":
+        backend = q._github_backend_for_project(a["queue"])
+        expect = {key: item.get(key) for key in (*_CLAIM_KEYS, "claimed_at", "blocked_at", "block_question", "wait")}
+        result = backend.park_expired_person_claim(ref, expect=expect)
+        return "done" if result else "race or live proof"
     if action in ("answer_handoff", "answer_plan_conflict"):
         ok = _answer_handoff(item, reason)
         if ok:

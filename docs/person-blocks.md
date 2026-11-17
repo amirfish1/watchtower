@@ -27,9 +27,14 @@ existing fingerprint/claim CAS and preserves answers and review feedback;
 it does not manufacture an owner question. Cancelled/completed supervision
 also expires when its worker is absent. Its cancellation tombstone and
 authorization scope survive, while reply routing follows the new worker;
-a concurrent supervision generation change refuses recovery. Foreign GitHub claims remain
-subject to owning-host proof and identity fencing, rather than being declared
-dead from missing local processes.
+a concurrent supervision generation change refuses recovery. GitHub claims
+recorded on this host use the cross-host body lock: re-read the exact claim,
+re-prove local liveness and idle/heartbeat age, then release under that same
+lock. A fresh claim, answer in flight, recent session or failed process scan
+refuses recovery. Ordinary work reopens; a legacy held human block releases
+only its claim and keeps the question, wait generation and reply context.
+A live human-block worker keeps publishing its owning-host heartbeat. Foreign/unknown hosts still need
+owning-host proof; missing local processes do not establish remote death.
 
 `awaiting_release` means only that an integrated commit needs a containing
 release. The observer verifies branch reachability and the actual running
@@ -46,7 +51,13 @@ The baseline was **260 active blocks** on host `her`: 119 dependency, 44
 worker, 70 owner, 16 external and 11 unclassified. A raw extra SBQ fixture
 record was archived and excluded. Reviewed operations are recorded in
 [person-block-migration.json](person-block-migration.json); the final mapping
-and runtime verification are added below after application.
+is listed below; runtime verification accompanies the completed migration.
+
+Six older immediate human actions also receive explicit wording repairs in
+[person-block-wording-migration.json](person-block-wording-migration.json),
+retaining their original Q tags and full question receipts. New convenience
+parking is refused; real sign-in, credential and subjective acceptance
+requests remain human gates.
 
 The migration is explicit, not a prose classifier. `scripts/migrate-person-blocks.py`
 is dry-run by default. Every operation fences the reviewed question, block
@@ -326,3 +337,75 @@ sends. Stale/missing open-source coverage is pending, never a real pass.
 | STRAMP-199 | external | person |  |
 | PROJECTS-101 | external | icebox |  |
 | PROJECTS-100 | external | icebox |  |
+
+
+## Execution evidence
+
+- Initial reviewed dispositions: 130 dependency dispositions, 73 existing human
+  gates retained, 28 returned to work, 24 human routes corrected, four explicit
+  owner pauses iceboxed, one already-resolved record verified untouched.
+- Six immediate owner-action questions clarified with their original Q tags:
+  OPS-2, OPS-264, OPS-285, OPS-361, OPS-396 and SMALL-BUGS-87. No question
+  answered and no new send, sign-in or spend authority granted.
+- Eighteen existing release waits normalized to release-only reasons; their
+  full original acceptance survives in progress/history. Observed commit/target
+  generations cannot re-park. This migration does not claim those releases or
+  their live acceptance have occurred.
+- SMALL-BUGS-130: expired cancelled supervision released; cancellation,
+  authorization scope and original transcript provenance retained.
+- STRAMP-242: stale owning-host lease explicitly released after a fresh local
+  process/session/activity check. The old Q636 was already answered and was
+  not restored as unanswered. Later Q760–Q764/Q762 billing/source/release holds
+  remain in the original record and recovery receipt; no production or Stripe
+  action occurred.
+- Passing evidence: required push gate 425; takeover/liveness/reclaim 175;
+  inventory/watch 23; person writer/migration 44; expanded GitHub lease/liveness
+  132 (eight backend-specific skips). Additional final edge checks cover raw
+  answer protection, fresh heartbeat, failed process scan, post-write conflict
+  and foreign-host audit coverage. Passing evidence is reused for unchanged
+  source; every pushed commit also runs the repository's required hook.
+- Permanent registered check: `wt89-no-parking-v1`, every 300 seconds on `her`,
+  runs `scripts/audit-no-parking.py` against real local and GitHub metadata.
+  Forbidden blocks, stale local claims and missing remote heartbeat evidence
+  fail; stale/missing open-source coverage is pending. Failure files a new
+  linked OPS ticket rather than reopening or parking WT-89.
+
+The migration initially stopped at BECKY-2966 because its existing body was
+262,030 bytes and the new receipt exceeded GitHub's 262,144-byte hard cap.
+The storage writer now removes optional JSON separator spaces only as a
+last capacity fallback. The original human text and every metadata value
+round-trip identically; a still-oversized payload is refused without a write.
+Body-capacity/transport/concurrency compatibility: 122 passed, plus two new
+lossless-fallback/hard-limit checks. The resumed operations retained their
+original reviewed fingerprints; already-applied records are not replayed.
+
+
+## What the routing changes mean
+
+IDEAS-96 originally waited for a colleague's UI draft PR to appear. It is
+reopened for the remaining authorized preparation, source identification and
+review work. The missing PR and outreach/review-posting limits are retained;
+no review is claimed complete and no message was sent. If work reaches a real
+missing-person-information or send-approval gate, the worker must ask that
+concrete question rather than park on the PR appearing.
+
+IDEAS-48 originally asked whether to wait for a natural VM reboot. It is
+reopened for finishing the authorized verification/check work. Reboot recovery
+is still unproven; its worker must implement and run a permanent check for
+future evidence. A deliberate VM reboot remains a separately authorized
+operation. Neither routing change closes the original ticket or certifies
+its original acceptance complete.
+
+
+Final migration receipts: **260/260 verified/applied**, no outstanding
+refusals: 130 dependency dispositions (138 named edges), 73 unchanged human
+gates verified, 28 reopened work items, 24 corrected human routes, four owner
+pauses iceboxed, one already-resolved record preserved. Six wording repairs
+and 18 release-reason repairs also applied. BECKY-2966 live re-read verified
+all 279 prior history entries and the human text unchanged at 259,766 bytes.
+
+Live real-data audit after all mutations: **PASS**, zero violations and zero
+stale/missing open-source cache coverage. The deployed owner-view command
+returned 106 person blocks: 100 owner and six named external; zero worker,
+dependency, unclassified or system blocks. These counts are a point-in-time
+census; the permanent check enforces the invariant as other workers act.
