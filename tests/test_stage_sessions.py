@@ -967,6 +967,38 @@ def test_request_flags_a_spawn_less_watcher(stg):
     assert stg.stages.request(ref, "test")["supervised"]  # older daemon: no marker
 
 
+def test_scoped_supplement_review_does_not_reconcile_global_usage(stg, monkeypatch):
+    from watchtower import usage
+
+    calls = []
+    monkeypatch.setattr(usage, "reconcile", lambda: calls.append("global"))
+    ref = _plan_ticket(stg)
+    stg.q.plan_start(ref)
+    stg.q.plan_submit(ref, "the plan")
+    stg.q.plan_verdict(ref, True, "ok", by="rev-1")
+    assert stg.q.claim_by_ref(ref, "builder-1")
+    stg.q.plan_supplement_submit(ref, "the addendum", by="builder-1")
+
+    _tick(stg, ref)
+
+    assert calls == []
+    assert _ss(stg, ref)["key"] == "supplement:s1"
+    assert stg.workers._pid_alive(int(_ss(stg, ref)["pid"]))
+    item = stg.q.get(ref)
+    assert item["plan"]["status"] == "accepted"
+    assert item["plan"]["accepted_version"] == 1
+    assert item["claimed_by"] == "builder-1"
+
+
+def test_unscoped_stage_tick_still_reconciles_usage(stg, monkeypatch):
+    from watchtower import usage
+
+    calls = []
+    monkeypatch.setattr(usage, "reconcile", lambda: calls.append("global"))
+    _tick(stg)
+    assert calls == ["global"]
+
+
 def test_supplement_reviewer_dying_twice_fails_only_the_supplement(stg):
     """OPS-232: a review-only stage never blocks the accepted plan or the build."""
     ref = _plan_ticket(stg)
