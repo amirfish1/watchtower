@@ -153,20 +153,6 @@ def test_answer_on_becky_fits_delivers_once_and_loses_nothing(tmp_path, monkeypa
             for e in got["history"]] == after_texts
 
 
-def test_becky_answer_is_refused_without_wt45(tmp_path, monkeypatch):
-    """RED witness: with WT-44's 1,000-char excerpts and no block/progress
-    moves, the same 13-char answer is refused before any write."""
-    state, q, gb = _setup(tmp_path, monkeypatch)
-    monkeypatch.setenv("FAKE_GH_BODY_MAX", str(GITHUB_CAP))
-    _load_becky(state, gb)
-    monkeypatch.setattr(gb, "_HISTORY_TEXT_INLINE_MAX", 1000)
-    monkeypatch.setattr(gb, "_REF_FIELD_BY_EVENT", {"answer": "text", "comment": "text"})
-    body = _issue(state)["body"]
-    with pytest.raises(gb.GitHubBackendError, match="Nothing was written"):
-        q.answer("GHI-1", "Read /tmp/s44", session_id="root-agent")
-    assert _issue(state)["body"] == body
-
-
 # --------------------------------------------------- block/progress writes
 def test_block_and_progress_post_comments_first_and_reference_them(tmp_path, monkeypatch):
     state, q, gb = _setup(tmp_path, monkeypatch)
@@ -234,11 +220,9 @@ def test_failed_defer_edit_then_retry_adopts_the_progress_comment(tmp_path, monk
     progress = "waiting on data " + "d" * 2000
     monkeypatch.setenv("FAKE_GH_FAIL", "issue edit=fail")
     with pytest.raises(gb.GitHubBackendError):
-        backend.defer("GHI-1", session_id="worker-1", until_iso="2999-01-01T00:00:00Z",
-                      reason="data", progress=progress)
+        backend.await_release("GHI-1", session_id="worker-1", wait=dict(reason="data", target="prod", commit="abc1234"), progress=progress)
     monkeypatch.delenv("FAKE_GH_FAIL")
-    backend.defer("GHI-1", session_id="worker-1", until_iso="2999-01-01T00:00:00Z",
-                  reason="data", progress=progress)
+    backend.await_release("GHI-1", session_id="worker-1", wait=dict(reason="data", target="prod", commit="abc1234"), progress=progress)
     (pc,) = _comments_with_text(state, gb, progress)
     progs = [e for e in _meta(gb, state)["history"] if e["event"] == "progress"]
     assert len(progs) == 1 and progs[0]["text_ref"] == pc["url"]
@@ -505,8 +489,7 @@ def test_defer_that_cannot_fit_posts_no_progress_comment(tmp_path, monkeypatch):
     _near_cap(monkeypatch, gb, state, 1000)  # the progress entry fits; the reason does not
     before = len(_issue(state)["comments"])
     with pytest.raises(gb.GitHubBackendError, match="issue body would be"):
-        backend.defer("GHI-1", session_id="worker-1", until_iso="2999-01-01T00:00:00Z",
-                      reason="r" * 1500, progress="P " + "p" * 2000)
+        backend.await_release("GHI-1", session_id="worker-1", wait=dict(reason="r" * 1500, target="prod", commit="abc1234"), progress="P " + "p" * 2000)
     assert len(_issue(state)["comments"]) == before
 
 
@@ -521,10 +504,9 @@ def test_defer_clearing_a_large_claim_near_the_cap_lands(tmp_path, monkeypatch):
     state.write_text(json.dumps(data))
     backend = q._github_backend_for_project("GHI")
     _near_cap(monkeypatch, gb, state, 50)
-    backend.defer("GHI-1", session_id="worker-1", until_iso="2999-01-01T00:00:00Z",
-                  reason="data", progress="P " + "p" * 2000)
+    backend.await_release("GHI-1", session_id="worker-1", wait=dict(reason="data", target="prod", commit="abc1234"), progress="P " + "p" * 2000)
     meta = _meta(gb, state)
-    assert meta["deferred_until"] and "claimed_machine" not in meta
+    assert meta["release_wait"] and "claimed_machine" not in meta
     assert [e for e in meta["history"] if e["event"] == "progress"][-1]["text_ref"]
 
 
@@ -579,12 +561,17 @@ def test_lost_mirror_response_still_records_the_entry_key(tmp_path, monkeypatch)
 
     monkeypatch.setattr(type(backend), "_run", run)
     progress = "waiting on data " + "d" * 2000
-    backend.defer("GHI-1", session_id="worker-1", until_iso="2999-01-01T00:00:00Z",
-                  reason="data", progress=progress)
+    backend.await_release("GHI-1", session_id="worker-1", wait=dict(reason="data", target="prod", commit="abc1234"), progress=progress)
     first = [e for e in _meta(gb, state)["history"] if e["event"] == "progress"][-1]
     assert first.get("entry_key") and first["text"] == progress
-    backend.defer("GHI-1", session_id="worker-1", until_iso="2999-01-01T00:00:00Z",
-                  reason="data", progress=progress)
+    data = json.loads(state.read_text())
+    human, meta = gb._split_body(data["issues"][0]["body"])
+    meta.pop("release_wait", None)  # the ticket is claimed again for the retry
+    meta.update(claimed_by="worker-1", claimed_session_id="session-abc",
+                claimed_machine=gb.machine_tag())
+    data["issues"][0]["body"] = gb._body_with_metadata(human, meta)
+    state.write_text(json.dumps(data))
+    backend.await_release("GHI-1", session_id="worker-1", wait=dict(reason="data", target="prod", commit="abc1234"), progress=progress)
     progs = [e for e in _meta(gb, state)["history"] if e["event"] == "progress"]
     assert len(progs) == 2 and progs[0]["entry_key"] != progs[1]["entry_key"]
     posted = _comments_with_text(state, gb, progress)

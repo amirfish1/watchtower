@@ -102,8 +102,8 @@ def _witness():
 
 
 # ------------------------------------------------------------------ capacity
-@pytest.mark.parametrize("op", ["block", "defer"])
-def test_1_witness_block_and_defer_land(tmp_path, monkeypatch, op):
+@pytest.mark.parametrize("op", ["block", "release"])
+def test_1_witness_block_and_release_wait_land(tmp_path, monkeypatch, op):
     state, q, gb, _c = _setup(tmp_path, monkeypatch)
     entries = _witness()
     start = len(_meta(gb, state)["history"])
@@ -112,7 +112,9 @@ def test_1_witness_block_and_defer_land(tmp_path, monkeypatch, op):
     if op == "block":
         q.block("GHI-1", session_id="worker-1", question="Grant?")
     else:
-        q.defer("GHI-1", "worker-1", "2h", "waiting on data")
+        q._github_backend_for_project("GHI").await_release(
+            "GHI-1", session_id="worker-1",
+            wait=dict(reason="waiting on release", target="prod", commit="abc1234"))
     meta = _meta(gb, state)
     body = len(_issue(state)["body"].encode())
     assert body < 30 * 1024
