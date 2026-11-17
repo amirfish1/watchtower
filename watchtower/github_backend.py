@@ -3221,6 +3221,13 @@ class GitHubIssuesBackend:
             raise GitHubBackendError("gh issue view returned invalid JSON") from exc
         if not isinstance(issue, dict) or not issue:
             return None
+        # Preserve full prose already paid for by this read. Recall never
+        # fetches comments on claim; a snapshot failure must not break get().
+        try:
+            from . import related_snapshots
+            related_snapshots.remember(self.repo, issue)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
         return self._issue_to_item(issue)
 
     def _claim_lock_path(self) -> Path:

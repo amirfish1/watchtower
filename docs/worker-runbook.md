@@ -124,6 +124,40 @@ The audit (Tier 2):
 
 ## Definition of done
 
+### Read related work before implementing (WT-83)
+
+Every successful `wt claim` includes `related` in JSON, or a related-work list
+in plain text. This searches full prose across all queues' recent local
+snapshots; candidates are suggestions, never proof that a feature shipped.
+An error or partial coverage is an evidence gap, not "nothing related".
+
+1. Run `wt related REF --triage --json` to have Jev classify candidates as
+   `already-shipped`, `earlier-attempt`, `in-progress`, or `unrelated`.
+   Set `TYPESAFE_API_KEY` (or `JEV_API_KEY`) from the authorized secret store;
+   never print it. Retrieval itself needs no key and makes no network calls.
+   If triage is unavailable, inspect the candidates yourself and record the gap.
+2. Read useful candidates and verify their evidence. Record confirmed links:
+   `wt related REF --confirm OTHER --kind earlier-attempt --worker ID
+   --evidence "specific facts checked"`. Jev advice alone is not confirmation.
+   Do not confirm a merely similar error in a different job.
+3. Already shipped: verify current integration/deployment and the reported
+   behavior, then resolve instead of rebuilding. Same bug recurring after a
+   closed repair: say "fix in OTHER did not hold", read that attempt first,
+   and treat the ticket as deep (confirmation sets its depth). Related active
+   work: coordinate or use a dependency; do not duplicate it.
+4. Three confirmed tickets for the same job within seven days mean "this job
+   is fragile; fix the design, not the latest error". The owner view supplies
+   one line per confirmed job to the decision desk morning digest.
+5. At close, pass `--related-feedback useful` or `not-useful`; use
+   `unavailable` for a recall failure. `wt related --feedback-report --since
+   ISO --json` reports the useful ratio and unavailable counts separately.
+
+`wt related --refresh-github` is an explicit maintenance/backfill command:
+it fetches full recent issues and comments outside the claim path. Ordinary
+GitHub detail reads retain prose they already fetched; claims never hydrate
+missing history. `wt related` also searches CCC's existing recent commit FTS
+under a bounded query deadline. An indexed commit is not deployment evidence.
+
 Applies to every ticket, quick or deep.
 
 - **Done means the reason the ticket was filed has gone away**: the symptom it

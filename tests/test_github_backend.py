@@ -3924,11 +3924,16 @@ def _cmds(state, verb):
 
 
 def _assert_no_content_leak(tmp_path, state, text):
-    """Only the fake GitHub state may hold the resolution text: no error,
-    log, cache or connectivity file the backend wrote may echo it."""
+    """No error/log/connectivity leak. WT-83 deliberately retains fetched
+    prose in its private full-text source snapshots; only that cache is exempt.
+    """
     assert _SENTINEL not in text
     for f in tmp_path.rglob("*"):
         if f.is_file() and f != state and f.suffix != ".py" and f.name != "gh":
+            from watchtower import related_snapshots
+            if f.is_relative_to(related_snapshots.directory()) and f.suffix == ".json":
+                assert f.stat().st_mode & 0o077 == 0, f
+                continue
             assert _SENTINEL not in f.read_text(errors="replace"), f
 
 

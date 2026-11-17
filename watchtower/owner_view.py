@@ -245,6 +245,7 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
                      for r in sorted(shown, key=lambda r: r.get("decide_by_utc") or "")
                      if r["wait"] == "owner" and r.get("decide_by_utc") and not r["recheck_due"]],
         "incomplete": False, "warnings": [],
+        "fragile_jobs": _fragile_jobs(items, want, now),
         "owner_missing_context": [{"ref": r["ref"], "missing": r["missing"]} for r in shown
                                   if r["wait"] == "owner" and r.get("missing")],
         "stuck_dependencies": stuck,
@@ -267,9 +268,37 @@ def snapshot(project: Optional[str] = None) -> Dict[str, Any]:
                         f"{' '.join(str(e).split())[:200]}")
         items = q.list_items()
     view = build(items, project=project)
+    # GitHub's shallow list intentionally omits comments. Read retained local
+    # prose for confirmed links, without hydrating or adding a GitHub call.
+    try:
+        from . import related
+        cached, _ = related.cached_tickets()
+        combined = {it["ref"]: dict(it) for it in items}
+        for it in cached:
+            if it["ref"] in combined and it.get("comments"):
+                combined[it["ref"]]["comments"] = it["comments"]
+        view["fragile_jobs"] = _fragile_jobs(list(combined.values()),
+                                            q._norm_project(project) if project else "",
+                                            datetime.now(timezone.utc))
+    except (OSError, ValueError) as exc:
+        warnings.append(f"Confirmed repeat-job history could not be read: {exc}")
+    # The decision desk's existing morning digest renders owner-view warnings.
+    # One connected confirmed job produces one line, never one line per filing.
     view["incomplete"] = bool(warnings)
+    warnings.extend("Fragile job: " + job["title"][:50] + "; " +
+                    ", ".join(job["refs"]) + ". Fix the design, not the latest error."
+                    for job in view.get("fragile_jobs") or [])
     view["warnings"] = warnings
     return view
+
+
+def _fragile_jobs(items, project, now):
+    from . import related
+    jobs = related.fragile_jobs([it for it in items if not config.ticket_is_archived(it)],
+                               now=now.timestamp())
+    if project:
+        jobs = [j for j in jobs if any(r.startswith(project + "-") for r in j["refs"])]
+    return jobs
 
 
 def render(view: Dict[str, Any]) -> str:

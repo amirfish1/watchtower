@@ -1374,12 +1374,14 @@ def cmd_claim(args: argparse.Namespace) -> int:
 
     _rename_claiming_session(item)
     item = _start_plan_stage(item)
+    from . import related_cli
+    recall = related_cli.claim_context(item, worker)
 
     if args.json:
         # The claim just made is by definition the caller's; marking history
         # events under the same identity keeps a re-claimed ticket's earlier
         # activity from reading as another worker's (CCC-675).
-        shown = _mark_self(item, worker, session_uuid)
+        shown = dict(_mark_self(item, worker, session_uuid), related=recall)
         brief = answers.claim_brief(item, worker, str(item.get("claimed_session_id") or ""))
         if brief:
             shown = dict(shown, answer_brief=brief)
@@ -1407,6 +1409,7 @@ def cmd_claim(args: argparse.Namespace) -> int:
         else:
             print(f"CLAIMED: {_display_ref(item)} -> {worker}")
         print(item.get("text") or item.get("note") or "")
+        print("\n" + related_cli.render(recall))
         if fb:
             print(f"\nSENT BACK by {fb['by']} {fb['age']}m ago: {fb['reason']}")
             if item.get("handed_back") and fb.get("deadline"):
@@ -2643,6 +2646,9 @@ def cmd_close(args: argparse.Namespace) -> int:
               f"  fix it, then run `wt close {_display_ref(item)} ...` again.\n"
               f"{q.checks_block(item)}", file=sys.stderr)
         return 1
+    if getattr(args, "related_feedback", ""):
+        from . import related
+        related.feedback(args.ref, worker, args.related_feedback)
     res = item.get("resolution") or {}
     summary = res.get("summary", "")
     if item.get("status") == "in_review":
@@ -7856,6 +7862,9 @@ def build_parser() -> argparse.ArgumentParser:
                                help="stop this ticket's status notices to your session")
     s.set_defaults(func=cmd_edit)
 
+    from . import related_cli
+    related_cli.add_parser(sub)
+
     s = sub.add_parser("claim")
     s.add_argument("-q", "--queue", required=True)
     s.add_argument("ref", nargs="?", default="",
@@ -7898,6 +7907,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_duplicate)
 
     s = sub.add_parser("close")
+    s.add_argument("--related-feedback", choices=["useful", "not-useful", "unavailable"], default="",
+                   help="whether claim-time related work helped resolve this ticket")
     s.add_argument("--duplicate-of", default="", metavar="REF", help="link to the original instead of running another verification (requires --no-code)")
     s.add_argument("ref")
     s.add_argument("--worker", default="")
