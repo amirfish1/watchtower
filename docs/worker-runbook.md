@@ -162,6 +162,23 @@ future data: if necessary evidence is pending, record the exact trigger and
 success check, use a bounded `wt defer`, then claim the next ready ticket.
 Do not mark an unresolved acceptance criterion complete to free a slot.
 
+## Keeping a claim alive through a long silent step (OPS-1744)
+
+The backstop reopens a claim whose owner is not proven at work once the ticket
+has had no store activity for `STALL_S` (30 min). A session blocked in one long
+foreground command (a full test run, a build) writes no transcript, so after
+`RECENT_SESSION_S` (10 min) its local proof can read `unproven`, and a manual
+claim that never reaches a proven state is reopened and reassigned while the
+work is still running (BYMOPS-3629, 2026-11-17).
+
+The visible heartbeat is `wt comment REF "still running <what>" --worker ID`.
+It appends a history event and bumps `updated_at`, which resets the store-idle
+clock. Before any step that may run longer than ~20 minutes, run it, then run
+the long step backgrounded and poll it with short commands (each poll writes
+the transcript too). A comment is not proof of life to a foreign observer: the
+GitHub `claim_heartbeat` is renewed only by the owning host's sweep while its
+local proof reads alive.
+
 ## Customer reports: sentence coverage and action coverage
 
 Keep evidence proportional to the report. For a single symptom or simple
