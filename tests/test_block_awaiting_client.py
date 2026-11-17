@@ -92,6 +92,7 @@ def test_cli_block_kind_awaiting_client_end_to_end(wt, capsys):
         "block", item["ref"], "--worker", "worker-a",
         "--question", "awaiting client reply",
         "--kind", "awaiting-client",
+        "--wait-on", "external", "--wait-actor", "Sonia",
         "--json",
     ]) == 0
 
@@ -121,6 +122,7 @@ def test_cli_block_with_valid_commit_verifies_and_records_it(
         "block", item["ref"], "--worker", "worker-a",
         "--question", "waiting on client",
         "--kind", "awaiting-client",
+        "--wait-on", "external", "--wait-actor", "Sonia",
         "--commit", sha[:10],
         "--json",
     ]) == 0
@@ -185,7 +187,8 @@ def test_requeue_orphaned_tickets_does_not_reopen_awaiting_client_block(
     item = wt.q.enqueue(project="Q", note="client thread", source="test")
     claimed = wt.q.claim_by_ref(item["ref"], "dead-worker")
     wt.q.block(claimed["ref"], session_id="dead-worker",
-               question="waiting on client", kind="awaiting-client")
+               question="waiting on client", kind="awaiting-client",
+               wait_on="external", wait_actor="Sonia")
 
     # Backdate the claim so it is well past any orphan grace window, and make
     # the claimer a KNOWN-but-dead worker so the sweep would otherwise treat
@@ -232,7 +235,7 @@ def test_release_idle_workers_does_not_release_awaiting_client_worker(
     item = wt.q.enqueue(project="Q", note="client thread", source="test")
     wt.q.claim_by_ref(item["ref"], rec["worker_id"])
     wt.q.block(item["ref"], rec["worker_id"], "waiting on client",
-               kind="awaiting-client")
+               kind="awaiting-client", wait_on="external", wait_actor="Sonia")
 
     import os
     import time

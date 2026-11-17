@@ -247,7 +247,7 @@ def test_cli_owner_view_and_hints(env, capsys):
     ref = _ticket(q, name)
     assert cli.main(["block", ref, "--worker", "w1", "--question", "Approve?"]) == 0
     out = capsys.readouterr()
-    assert "no --wait-on given" in out.err and "BLOCKED" in out.out     # a note, not an error
+    assert "--decide-by" in out.err and "BLOCKED" in out.out  # default owner context hint
     ref2 = _ticket(q, name)
     assert cli.main(["block", ref2, "--worker", "w1", "--question", "Approve?",
                      "--wait-on", "owner"]) == 0

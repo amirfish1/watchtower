@@ -92,7 +92,7 @@ def legacy_source(store):
 def test_snapshot_uses_backend_isolation_and_no_mutating_resolvers(store, monkeypatch, legacy):
     base = legacy_source(store) if legacy else store[0]
     original = q._normalize_items
-    def check_lock(items):
+    def check_lock(items, **kwargs):
         # Legacy reads exclude writers; SQLite reads use their own snapshot.
         with base.with_suffix(".lock").open("r") as other:
             if legacy:
@@ -100,7 +100,7 @@ def test_snapshot_uses_backend_isolation_and_no_mutating_resolvers(store, monkey
                     q.fcntl.flock(other.fileno(), q.fcntl.LOCK_EX | q.fcntl.LOCK_NB)
             else:
                 q.fcntl.flock(other.fileno(), q.fcntl.LOCK_EX | q.fcntl.LOCK_NB)
-        return original(items)
+        return original(items, **kwargs)
     def forbidden(*args, **kwargs):
         pytest.fail("mutating resolver/store helper used")
     monkeypatch.setattr(q, "_normalize_items", check_lock)

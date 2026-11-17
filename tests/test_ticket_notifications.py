@@ -138,7 +138,7 @@ def test_actionable_notice_keeps_full_multiline_detail(wt, monkeypatch, event):
         event, detail=detail,
     )
     assert len(detail) > 1500
-    assert calls == [("worker-sub", f"[watchtower] SUB-1 {wt.q._NOTIFY_VERBS[event]} — {detail}")]
+    assert calls == [("worker-sub", f"[watchtower] SUB-1:ticket {wt.q._NOTIFY_VERBS[event]} — {detail}")]
 
 
 def test_clipped_claim_notice_has_lookup_pointer(wt, monkeypatch):
@@ -148,7 +148,7 @@ def test_clipped_claim_notice_has_lookup_pointer(wt, monkeypatch):
         {"ref": "SUB-1", "project": "SUB", "submitter": "worker-sub", "submitter_subscribed": True},
         "claimed", detail="long claim " * 30,
     )
-    assert calls[0][1].endswith("… (full text: wt find SUB-1)")
+    assert calls[0][1].endswith("… (full text: wt find SUB-1:ticket)")
 
 
 @pytest.mark.parametrize("event", ["needs_input", "closed"])
@@ -182,7 +182,7 @@ def test_long_actionable_notice_arrives_intact_over_real_fifo(
         else:
             wt.q.close(item["ref"], "worker-a", resolution={"summary": detail})
         received = frame.result(timeout=6)["message"]["content"][0]["text"]
-    assert received == f"[watchtower] {item['ref']} {wt.q._NOTIFY_VERBS[event]} — {detail}"
+    assert received == f"[watchtower] {item['ref']}:long-notice {wt.q._NOTIFY_VERBS[event]} — {detail}"
 
 
 # --------------------------------------------------- no self-notify (actor)
@@ -567,7 +567,7 @@ def test_a_subscribed_filer_hears_owner_and_external_questions(
     calls = _record_sends(monkeypatch, wt.messages)
 
     wt.q.block(item["ref"], session_id="worker-a", question="unlock the phone?",
-               wait_on=wait_on)
+               wait_on=wait_on, wait_actor="Sonia" if wait_on == "external" else "")
     assert [t for t, _ in calls] == ["worker-sub"]
     calls.clear()
 
@@ -576,14 +576,16 @@ def test_a_subscribed_filer_hears_owner_and_external_questions(
 
 
 @pytest.mark.parametrize("wait_on", ["worker"])
-def test_a_block_waiting_on_work_still_reaches_the_submitter(wt, monkeypatch, wait_on):
+def test_a_block_waiting_on_work_is_rejected_without_notifying(wt, monkeypatch, wait_on):
     item = wt.q.enqueue(submitter_subscribed=True, project="SUB", note="dep wait", submitter="worker-sub")
     wt.q.claim_by_ref(item["ref"], "worker-a")
     calls = _record_sends(monkeypatch, wt.messages)
 
-    wt.q.block(item["ref"], session_id="worker-a", question="waiting", wait_on=wait_on)
+    with pytest.raises(ValueError, match="worker/dependency parking is retired"):
+        wt.q.block(item["ref"], session_id="worker-a", question="waiting", wait_on=wait_on)
 
-    assert [t for t, _ in calls] == ["worker-sub"]
+    assert calls == []
+    assert not wt.q.get(item["ref"]).get("needs_input")
 
 
 def test_an_owner_wait_still_reaches_an_explicit_submitter_and_subscribers(wt, monkeypatch):

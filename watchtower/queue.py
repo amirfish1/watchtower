@@ -697,18 +697,19 @@ def _github_projects() -> List[str]:
         return []
 
 
-def _normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def _normalize_items(items: List[Dict[str, Any]], *, backfill_slugs: bool = True) -> List[Dict[str, Any]]:
     """Ensure every item has project/seq/ref. seq is assigned once (next free
     number in the item's queue) and then persisted, so refs stay stable when
     other tickets move in/out of a queue. An item keeps its stored seq only if
     its stored ref still belongs to its current project and the seq is unique
     there; otherwise (new item, moved item, collision) it gets max+1.
+    Frozen source readers disable display-name backfill to preserve raw snapshots.
     """
     ordered = sorted(items, key=lambda x: int(x.get("number", 0)))
     used: Dict[str, set] = {}
     pending: List[Dict[str, Any]] = []
     for it in ordered:
-        if it.get("status") != "closed" and not it.get("slug"):
+        if backfill_slugs and it.get("status") != "closed" and not it.get("slug"):
             it["slug"] = slug_of(it)
         proj = it.get("project") or _project_for(
             it.get("source", ""), it.get("repo_path", ""), ""

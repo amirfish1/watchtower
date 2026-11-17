@@ -9068,8 +9068,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 setattr(args, name, canonical_ref(value))
             elif isinstance(value, list):
                 setattr(args, name, [canonical_ref(v) for v in value])
-        if getattr(args, "command", "") == "interrupt":
-            args.target = canonical_ref(args.target)
+        # interrupt accepts either a ref or an opaque, case-sensitive worker
+        # ID. cmd_interrupt's q.get normalizes the ticket lookup separately.
         if getattr(args, "command", "") in ("subscribe", "unsubscribe"):
             args.queue = canonical_ref(args.queue)
     args.message_attr = incoming_attr

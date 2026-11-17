@@ -46,7 +46,8 @@ def test_block_kind_awaiting_client_is_stored_and_survives_reload(wt_env):
     not degrade to the `input` fallback for unknown kinds."""
     it = _file_ticket(wt_env)
     wt_env.queue.block(it["ref"], session_id="w1",
-                       question="waiting on client reply", kind="awaiting-client")
+                       question="waiting on client reply", kind="awaiting-client",
+                       wait_on="external", wait_actor="Sonia")
     fresh = wt_env.queue.get(it["ref"])
     assert fresh["block_kind"] == "awaiting-client"
     assert fresh["needs_input"] is True

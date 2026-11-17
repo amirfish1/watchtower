@@ -333,7 +333,7 @@ def test_failing_gate_close_cannot_touch_parked_ticket_of_another_worker(wt):
     q = wt.q
     item = q.enqueue(project="Q", note="w", source="test", gates=["cmd:exit 1"])
     q.claim_by_ref(item["ref"], "wt-y")
-    q.block(item["ref"], session_id="wt-y", question="?", origin="worker")
+    q.block(item["ref"], session_id="wt-y", question="Which option should we ship?", origin="worker")
     assert q.get(item["ref"])["status"] == q.PARKED_STATUS
     with pytest.raises(ValueError, match="parked by wt-y"):
         q.close(item["ref"], session_id=W, resolution={"summary": "x"})

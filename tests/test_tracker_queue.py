@@ -78,7 +78,7 @@ def test_tracker_blocks_and_answers_never_create_worker_ownership(wt_env, monkey
     config.set_queue_kind('LOG', 'tracker')
     item = q.enqueue(project='LOG', note='Decision log')
     monkeypatch.setattr(q, '_notify_ticket_event', lambda *a, **kw: None)
-    blocked = q.block(item['ref'], session_id='worker', question='Which option?', wait_on='worker', origin='worker')
+    blocked = q.block(item['ref'], session_id='worker', question='Which option?', wait_on='owner', origin='worker')
     assert blocked['needs_input'] and blocked['status'] == 'open'
     assert not blocked['claimed_by'] and not blocked.get('parked')
     monkeypatch.setattr(messages, 'deliver_message', lambda *a, **kw: pytest.fail('tracker answer dispatched'))

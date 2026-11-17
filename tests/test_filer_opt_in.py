@@ -7,6 +7,7 @@ import pytest
 
 from test_ticket_notifications import wt_cli, wt, _record_sends  # noqa: F401
 from test_github_backend import _install_fake_gh, _reload_isolated, _drainable
+from tests.legacy_blocks import block as seed_legacy_block
 
 
 @pytest.mark.parametrize('subscribe', [False, True])
@@ -61,7 +62,7 @@ def test_edit_after_releases_claim_or_old_block_without_notices(wt_cli, monkeypa
     wt.q.claim_by_ref(item['ref'], 'builder')
     calls = _record_sends(monkeypatch, wt.messages)
     if legacy_block:
-        wt.q.block(item['ref'], 'builder', question='Waiting on dependency', origin='worker',
+        seed_legacy_block(wt.q, item['ref'], 'builder', question='Waiting on dependency', origin='worker',
                    wait_on='dependency', wait_ref=dep['ref'])
     assert calls == []
     assert wt.cli.main(['edit', item['ref'], '--after', dep['ref']]) == 0
@@ -92,7 +93,7 @@ def test_block_refuses_dependency_only_questions(wt_cli, capsys, question):
     item = wt_cli.q.enqueue(project='SUB', note='dependent')
     wt_cli.q.claim_by_ref(item['ref'], 'builder')
     assert wt_cli.cli.main(['block', item['ref'], '--worker', 'builder', '--question', question]) == 1
-    assert f"wt edit {item['ref']} --after SUB-1" in capsys.readouterr().err
+    assert f"wt edit {item['ref']}:dependent --after SUB-1:dependent" in capsys.readouterr().err
     assert not wt_cli.q.get(item['ref']).get('needs_input')
 
 
@@ -154,7 +155,7 @@ def test_github_dependency_edit_clears_sidecar_park(tmp_path, monkeypatch):
     q.update(ref, gates=['review'])
     dep = q.enqueue(project='GHI', note='dependency')
     q.claim_by_ref(ref, 'builder')
-    q.block(ref, 'builder', question='Waiting on ' + dep['ref'], origin='worker',
+    seed_legacy_block(q, ref, 'builder', question='Waiting on ' + dep['ref'], origin='worker',
             wait_on='dependency', wait_ref=dep['ref'])
     assert q.get(ref)['status'] == 'awaiting_answer'
     done = []
