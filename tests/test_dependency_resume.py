@@ -2,6 +2,8 @@
 by the reconciler (attributed to the system) once B closes cleanly."""
 
 from __future__ import annotations
+from tests.legacy_blocks import block as legacy_block, set_wait as legacy_wait
+
 
 
 import importlib
@@ -30,7 +32,7 @@ def _waiting(wt, wait_on="dependency", wait_ref="", origin="worker"):
         kw["wait_actor"] = "amir"
     elif wait_on == "external":
         kw["wait_actor"] = "vendor"
-    wt.q.block(a["ref"], session_id="w1", question="waiting on dep",
+    legacy_block(wt.q, a["ref"], session_id="w1", question="waiting on dep",
                progress="half", origin=origin, **kw)
     return a["ref"], dep["ref"]
 
@@ -131,7 +133,7 @@ def test_github_dependency_wait_is_answered(tmp_path, monkeypatch):
     dep = q.enqueue(project="GHI", note="dependency")
     a = q.enqueue(project="GHI", note="dependent")
     q.claim_by_ref(a["ref"], "worker-1")
-    q.block(a["ref"], session_id="worker-1", question="wait",
+    legacy_block(q, a["ref"], session_id="worker-1", question="wait",
             wait_on="dependency", wait_ref=dep["ref"])
     assert answers.resume_dependency_waits() == []
     q.claim_by_ref(dep["ref"], "worker-2")
@@ -169,7 +171,7 @@ def test_local_ref_resolves_only_on_the_host_that_recorded_the_wait(tmp_path, mo
         a = q.enqueue(project="GHI", note="shared dependent")
         monkeypatch.setattr(q, "_MACHINE_TAG_CACHE", "her")
         q.claim_by_ref(a["ref"], "worker-1")
-        q.block(a["ref"], session_id="worker-1", question="wait",
+        legacy_block(q, a["ref"], session_id="worker-1", question="wait",
                 wait_on="dependency", wait_ref=dep["ref"])
         if legacy:
             q._github_backend_for_project("GHI").update(

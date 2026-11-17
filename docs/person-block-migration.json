@@ -1,0 +1,2275 @@
+[
+  {
+    "ref": "OPS-2",
+    "expected": "0f143de95a1e16973a7b16023b7f9a1cc2eb8849df0b83fa1d88b34ab33a48a8",
+    "previous": "external",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "IDEAS-6",
+    "expected": "47972b3d5e5f8838a0c4a8fbbd7cb33778855317ffbad272ab1a82c27ff7034f",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "IDEAS-48",
+    "expected": "42653b17a7b0a140ba8229c4f248e88edb7506baa8f63e7645ab86cbfbf6d25a",
+    "previous": "owner",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "IDEAS-59",
+    "expected": "01def7d1d8fa70b094fe0cad2035c962e988c6e67ae7d9244b77a40df292e51a",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-545"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-210",
+    "expected": "3011f0d1d77638c7320c8d9f3a61e2ef9d650d98c7498fe15fcf64a9014191d2",
+    "previous": "external",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "REPO-FIXER-213",
+    "expected": "039722b3baf2baa22d7d1216fa60602814497c5502d17e81d53755cb4d09beed",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "STRAMP-242"
+    ]
+  },
+  {
+    "ref": "CHUCK-307",
+    "expected": "efe04add7aebdaeb59725489f966ff3b23f632715dfebaede52bac5f33795352",
+    "previous": "external",
+    "action": "person",
+    "reason": "Name the actual human supplying the existing requested facts/approval; no outreach or sends authorized.",
+    "on": "external",
+    "actor": "Chuck"
+  },
+  {
+    "ref": "IDEAS-96",
+    "expected": "244d93071bb291314e43ecee0ab060fb4cab1492a910de609285930924c422c0",
+    "previous": "external",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "WT-32",
+    "expected": "9adb23dbdd08c42b6f2884400769cb1984b76428fc5a78775597364e1968065e",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-264"
+    ]
+  },
+  {
+    "ref": "IOS_US-13",
+    "expected": "c741654d9de50a00f5dcdd931240e88da18bf061028c659e0ddf3c7a470f7c4e",
+    "previous": "worker",
+    "action": "icebox",
+    "reason": "Owner explicitly paused this work pending a new business rationale or separate resumption instruction. Iceboxed under needs-rationale; no active block, sends, activation or acceptance claim. Existing limits remain; revival requires an explicit new rationale."
+  },
+  {
+    "ref": "CCC-251",
+    "expected": "bbf4e24f9ec91bce6eb178d020396aab49afee825b8879cc0bf7c3fa4b83ef63",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "WT-41",
+    "expected": "22eb833616469b13a1cb37e9abba4f4d2558c61bd78346ff7bd7502978d09094",
+    "previous": "worker",
+    "action": "person",
+    "reason": "Existing explicit owner approval/STOP or owner-only acceptance; reclassify without answering or lifting its hold.",
+    "on": "owner"
+  },
+  {
+    "ref": "VM-NEXT-37",
+    "expected": "013d3028f5307d75f6a7f6535916e1740c89703e6f37b08cd212161c284b01d5",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-264"
+    ]
+  },
+  {
+    "ref": "VM-NEXT-39",
+    "expected": "40957e35b7c5640e1b032ecb9b1dbdf0afae29c58441d1bd7f33d267011ae10e",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-264"
+    ]
+  },
+  {
+    "ref": "OPS-264",
+    "expected": "3cf7516ecbd42b6770978c34a66cc0e1c413d4782270ea9b4d9965e31ea7a83a",
+    "previous": "external",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "WT-45",
+    "expected": "3f7966e63496b80e30ab25aa4cb721c0c01f8b9899b1597dfb58d13963f7decb",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "WT-47",
+      "WT-57"
+    ]
+  },
+  {
+    "ref": "IDEAS-111",
+    "expected": "29cb086fe74b123d730f2ecbf35ffd090c33ead2b3a1a58a108f2632f5950dd0",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-279",
+    "expected": "f675a63e6d5f60654105427264d49afb91f85b8a1177f0f4e485624a8ac6fd32",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-285",
+    "expected": "c2da02db9f72a38b7047e0c39bfb15234fb1608b8acd106e07e8c07612b53b9c",
+    "previous": "external",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "OPS-289",
+    "expected": "39d448a877a591e13d9a298077a36abbc18fea6c2541a6161f8be8ee0e5ca576",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "REPO-FIXER-326",
+    "expected": "b82686b4689077fce1ec7bd4f20dedf93bd5f071d45590195f677f6ba0304f53",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-2995"
+    ]
+  },
+  {
+    "ref": "OPS-301",
+    "expected": "21ad1a56df4e574f98b95542cd1dfc7edd3b29fe91740f2329aef01909e00f30",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "REPO-FIXER-333",
+    "expected": "99148c6cbec7c75e6b9d49d43ec5913271347c5fd28c007cac54902bd4d889df",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-2995"
+    ]
+  },
+  {
+    "ref": "OPS-310",
+    "expected": "a6eed4176fe141a0e7a2cc5c35571275bdfe8a41a18e6a45666bd39e277aa7f6",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "REPO-FIXER-349",
+    "expected": "08a160b6071dfeb4e0c8a1a13866bd6f048323e8b77c1767a59ecf4f29616ab8",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-2995"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-354",
+    "expected": "803402b8b72dd169ab9b400eb1103dfe9ec96b3f401a7e54aa18f4664aa6eb47",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3000"
+    ]
+  },
+  {
+    "ref": "OPS-361",
+    "expected": "951f0d08f0624804f41bb25ac3d47c9508175b1195f6d8bb280186e11bbfa29f",
+    "previous": "external",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "IDEAS-164",
+    "expected": "c8ae66825a7f319801b706ff4db569fb79e103684be68a94e2193f048733958b",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "IDEAS-165",
+    "expected": "f8ba9537ad8cd3669415d64fa78c50f9b0405add0fefe3fb70d7a6b88332f30d",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "IDEAS-167",
+    "expected": "f602f52f4692a76ca3cdb6ff035938d5ec979cfb5c5e94f9ce2e99dc5dc0cf3a",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-543"
+    ]
+  },
+  {
+    "ref": "OPS-380",
+    "expected": "986e861b52f2f0a84e04f3665bc9a3e7fe3513363c47e772ae7f747d5c3786c5",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "CCC-343",
+    "expected": "154e4f8be7285603bfe5b0f366765a455b4b11c3a27dfca2c408cb27fe6db75a",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-395",
+    "expected": "0cdc71b32f8263ba3b988608198513e64481e2be24acf4860d838cb8550dbd7c",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-396",
+    "expected": "e7e3c3be808d20786e01e332c9603bf65de51815ac2ce4203849ad07ae2b6b08",
+    "previous": "external",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "SMALL-BUGS-87",
+    "expected": "979af7b387e9b9aded3753d772767eeaaf23a219aa701f53880971433f091e1a",
+    "previous": "external",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "WT-57",
+    "expected": "0a4acec9f6e52a0b4f357f1b0cec9d17149034ae32afd369fff5910fe27ef004",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-404",
+    "expected": "538c8cae22b25e10d93e2d23b445fc4a563e7d3570af494932778f71f5a357ad",
+    "previous": "unset",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "REPO-FIXER-471",
+    "expected": "e47a8028c6f2a86e34872f7364b140a725a80bcc1193f354b5004d9568eedb8d",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "CCC-390",
+    "expected": "4371c12695363c81b1f204a5016680fea91c5c9eb6309594c7c96b20c56a5e0c",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "WT-61",
+    "expected": "14317e159efcf17d20937bea91c253f1ec6c0458bc1bc05506b857159d00ecc6",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BYM-UX-2",
+    "expected": "6f13be12724aa0d7eba23d6f9697b1b143d0b79a5141c446c4fdb4c8cb5bcc46",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-4",
+    "expected": "a82454df60fe186b903bff2ef08703656d5df3a2cb69f81afece4d1f0887cd8f",
+    "previous": "unset",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "BYM-UX-7",
+    "expected": "6a018362fd2c8ee6a63b5fdfb6de23442209066a13a25f43237d20d36ff8d3d9",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-22",
+    "expected": "d844bf36e157fc27daebdc34032fc16dcb43d4e8b081c8de4667a271a269d8b4",
+    "previous": "unset",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "BYM-UX-27",
+    "expected": "b8085c1ac7ac0c9471266edc0dd244712d97e9bd7d7ed52a5c913a3a57f20111",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-28",
+    "expected": "72fcc8265e97a97e559fdc3847efe303d0583d4d7b8f56f1a978225122338ff7",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-29",
+    "expected": "dc2e427064f5d10f8dc781f88288bd74ac56f9aee9ae1ed5a3ac9077183cda25",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-32",
+    "expected": "11efc96e2783f7de45a1e1bade04c815bf60239903d3cedb46e53c68167dc303",
+    "previous": "unset",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "BYM-UX-34",
+    "expected": "729dfa4a7aef6e45071f9eedf54f4c10ef416af62147fb059906989333e8c355",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-37",
+    "expected": "f1f4e54a40e65cfdd3b427ce4f191a412e605900a896b25b8f00825cc6949bd2",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-38",
+    "expected": "7a82cf511a3bfa303682a44cdf5a6923b0c4c17fdef1bca7d908f224c8bd7ad9",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-44",
+    "expected": "c5f7c56dee307a6be1b797f8abf985822c659672fb736f6f9c00ea25df3f2fab",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-47",
+    "expected": "63fab9a304e11be599ef6c1971b161d2d0ea110767f5e76a8b0b7959d8f22dbc",
+    "previous": "unset",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-53",
+    "expected": "5cfff37856759662f4a01a118d1930f9162ba060ff389a04ead594b4110dbd10",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-58",
+    "expected": "ff78b12a10b1cf570830cf92af94e1141d89035cc541c3b45af460de2c0eb8a5",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-UX-64",
+    "expected": "08b5651c6a210569e231be560e0db9a669f19b3571bd22c051e8013f5b91a88f",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-435",
+    "expected": "22d38ba8bd13694c9eb7b91edbcdffe8c7d6315f228fe2a3d23212a383167a97",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-285"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-513",
+    "expected": "ed2c02459c9b17616215767f33c9c75e1a25f7bdbfa29fa45af4563fec45c569",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "REPO-FIXER-514",
+    "expected": "df796d99d0148242a65ea50658e1ba40d63ae6a80599950a1182e815e9377858",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "WT-57"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-515",
+    "expected": "6cbe5b6baf5c1fba78d9ca75793202795397cdcc67cc231f8dd5ee0f7bce664c",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BYM-UX-7",
+      "BECKY-3480"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-518",
+    "expected": "ce98076975cd1e06432fce788f42a2bcd38017be763291f33580c475e92d5454",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BYM-UX-7"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-522",
+    "expected": "6031fceee9db845b1d18780e41f5993afb54f2ce16a0f31f1e1bd708067f2ec9",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "REPO-FIXER-525",
+    "expected": "3a47ec136d3a60ca3f76b7876f707fdfbac51c056dce506b22cd3f4cf8789b14",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "REPO-FIXER-527",
+    "expected": "25bee0ceaa3eaeb79e20c5bc7846cd1e1a65c8cb83ac38d499204e3efdfacf79",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BYM-UX-2"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-528",
+    "expected": "a58908e8b99fbc50642926dd0adb22ac6d5233d10c3db5ebb00d2825d3afb710",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "PR-SWEEP-6"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-551",
+    "expected": "2844abb8c16cb20f23f45c018a4a1521235338a969c7b10a96ec132d0a8434be",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-552",
+    "expected": "29497b6b53f54b681120af9b24d0c841e3d8759612f573910381b8577f5ee50f",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-553",
+    "expected": "8a9190fd179e1ca4faa29a8171f9e30d37d40e96de7a9b8d651bd688bf6f09b0",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-554",
+    "expected": "fe01dbe10a68800b23ec35d98b8e37c179f22a92a79023bf3e1750477aebcc86",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-557",
+    "expected": "9525d3a1c54509bd08d93fd0aefb9169cf220d409eb1f3133700b91043403b4f",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-561",
+    "expected": "ac971722ac870029a5563dac3937553415431689834ea386a3f29f372f171527",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "BYM-UX-71",
+    "expected": "749007cde4ea6a1b3438b2909324799a79c019a97772e87e5bc7ff0c2a34c8f7",
+    "previous": "unset",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "OPS-447",
+    "expected": "51bda685a9b00e9be3b0e4a20a84ff061c9e7029449831b0b6673564f583cab0",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-547"
+    ]
+  },
+  {
+    "ref": "IDEAS-208",
+    "expected": "8c4c955123b4984d22bab62181cceb601e26a9ba1d5378bc3cb5f01d6e105cc1",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-144"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-565",
+    "expected": "00a6e7395c84a25deeab5c8cf784a631c8549a5ef7defe4c6985fa110d99b80a",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-566",
+    "expected": "d8a6a7a0378401f35f63a7f82213cf4f9a52d0d115907a54a657a7ce4852e96b",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "WT-57"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-567",
+    "expected": "1e765aba0e1dc6eb89d61040f637b20af0540acbf66b705028c0bcf96704f4a7",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "PR-SWEEP-6"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-577",
+    "expected": "eb1caf036636f440046038dc19c346e01570a1f5a13d9cd4a7dba4352a47d90b",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BYM-UX-71"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-588",
+    "expected": "b5a52d0c54c1d90cbb777b951777134cfebaf8f458e98cf348ea3b59db485648",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-589",
+    "expected": "0d7a7184bb97179ad3b7a350b14aaee64a9bfef3438d05992b1038dbda7ba4d8",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-590",
+    "expected": "ec6f0f16eeea5b22ba33256d5acf1ce474da0f164ad9c0dbac90ce81337d9761",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "OPS-452",
+    "expected": "b75b0dc3e2fe3d307d8d836dbad0cf073fd1760df8ab3a03fdd21fdbfc2b5ff4",
+    "previous": "unset",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "BYM-UX-84",
+    "expected": "c6f96e0ccb99d0121cad01ec68efb8917795a43a7dc1cf961dc7dbd20707795d",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-547"
+    ]
+  },
+  {
+    "ref": "OPS-463",
+    "expected": "55a5fc23837e528ed91ba3222fa81408da0401be24786465466dde9a0f6fffbc",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-538"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-591",
+    "expected": "9a496879821eda21a8f0a3317887aa19b560e587eb5ed90b0dc67ad6b91c9b96",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-593",
+    "expected": "2cd4357d0fcafb9395a9ec8176ac9c1ea70e726ac5bd1c9726d6057e1643fad8",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "REPO-FIXER-594",
+    "expected": "a19f1b0d3e4bcd4e54fcebb75b81272edb80c7abbaf7702442d9526491be0c7b",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3480"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-597",
+    "expected": "fb63443f32c1fd07e7c4dc07c5525f131ea9f7d7f3acff75fff8f087cb4bbeae",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-2995"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-598",
+    "expected": "247323b337bcbb4728f88706afd4256968e48a9313995d1bf3511f366c99d845",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-2995"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-599",
+    "expected": "1d413412cfbdf37ce14aeeff941ecab4857a9c1bd670aa015f77d4cec1c82874",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "REPO-FIXER-600",
+    "expected": "1002eba48c702068751f0f8c97a02dea9cb0884832f8e2ae6f16eb2360713772",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "REPO-FIXER-601",
+    "expected": "b625bf677f70451324710eb561187c37031a6757116d7d7aeeee12ea79485551",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3480"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-604",
+    "expected": "ef3a34b93a981ad7ac16dfd5cfc76d088fb781da3e9ac5eb0d3be3f22db846f8",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3480"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-606",
+    "expected": "0a3d05d13b812f8093b48a872b0d0c2e1f04b10b19635335d67e721ea9a894ee",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "OPS-469",
+    "expected": "46776b3622145102c83f4df09194ab6f1235b1594f427ea9f39f8128771ac23d",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "CCC-463",
+    "expected": "ce3be5b3469c0a558a88c32b884015604846293280b70b598e4a7c07fb876cee",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-465",
+      "CCC-462"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-607",
+    "expected": "6935021ffc131f5201dd89137e0afa1d9f893db9b9908f687ea3bf9d5f3b2fd8",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-608",
+    "expected": "1a2e0e46bca4610dc58d2ed62de8ef79e8b7bdb68dc3e5c60e82d0c9d40b58c6",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "WT-57"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-619",
+    "expected": "6d09091e9248f3d6eaae9cae5b45133999a9661d5f684dc874ebd39275a2dbd2",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "WT-57"
+    ]
+  },
+  {
+    "ref": "OPS-496",
+    "expected": "4c5b20ad52e9ce5191122e6aa097240c303ce6807adac60cbef277f5e607e63d",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-507",
+    "expected": "8115f3ae26bd5ee251f4b7efe8822146f8c081cc49b8c29f7b4b08bf3b88af2e",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "IDEAS-331",
+    "expected": "fada34e144cfbb376b576ffa1bd03f311e6e74e994888f305ebf3f1105694c4e",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "CCC-538",
+    "expected": "8707981dbc9fc751473a95fc711ee0fe00ce0504ab9ef58d7e629d38422c8148",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-517",
+    "expected": "5ca75de2df12628371c8a890a8b99c62296159d14de29399e0555918b917c8aa",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BYM-UX-93",
+      "BYM-UX-94",
+      "BYM-UX-95",
+      "BYM-UX-96"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-621",
+    "expected": "6b99d9fe000b6a6026b61e05f247d16d4edf99cff3fdcdf1a0d292a191be4c64",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-622",
+    "expected": "3b436f9551a7002c7a83677b5e0a5d17b831a38106764ed8053ec236f7e95d64",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-623",
+    "expected": "c99cbfdac7463894df56e68994b634b379aa332ab150e1af4d14d4189e51aca1",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "PR-SWEEP-7",
+      "PR-SWEEP-8"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-635",
+    "expected": "f361a1073e816da6c1a2f3b2d464f85ea39f7111e931962e698f45b7098dc728",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3548"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-637",
+    "expected": "d53e1629a454761b96fcff4ac58deb4953ba235fb239b403fe878a151652bf1f",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-515"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-638",
+    "expected": "bcc42fc3f81741cd54d211f9c3f9745f98174477a3820d54c835cc4ccb4a068b",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-600"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-642",
+    "expected": "fc64c34c8f492621a6542807c11bb439dc3478ecda06b190a02b0af8b1d0aad3",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3483"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-643",
+    "expected": "e1ace211fe2a215d7e41db486952061e06ed70ede478bb08ae0b40bd58364a27",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3514"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-651",
+    "expected": "183a88f0871087a8bd54cdcf2a1e72da01019d0449873cf497321fd1ddf69fa7",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3532"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-652",
+    "expected": "192faf063d1ca99182b369c8e3dbae4cb553ec653f76beb0d858b61e5d7f4c7d",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3532"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-653",
+    "expected": "d82b2c005c7faf83897693e3bfe4c8082830e39ba09c35cd21d40827e7b2a02b",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "PR-SWEEP-7"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-658",
+    "expected": "9f6665dcb8288303d6d9a249b2301590e3995ee1ff4ab13ccb7b625e00dd1f7d",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "PR-SWEEP-8"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-659",
+    "expected": "798fc69a2b63854150a6e67c96f41a0843004ad4b9df3c3947c4b25c52d30048",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "PR-SWEEP-8"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-664",
+    "expected": "17f633cc3fd201d01f689a50c579d62e2e50e76452e8030cba28b77b272b8b8b",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-671",
+    "expected": "6cb28d039bca741f660df5fd210ee93fbc04e782753b8daa90bc9748bf6f5821",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-672",
+    "expected": "4df60a85c28cb7dc7edad703bb0f9ebe1c7ca359fd9b6e5a00e2d52abc65a192",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-673",
+    "expected": "a073466f3c231b7fca71e560425e79f63923ac3b90a108f8541fc528721011ae",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-674",
+    "expected": "817e45befb194a4a76b2b5f012906d78357afb4d8b998018be66666a1bf1ace9",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-675",
+    "expected": "8365b60fc01aa5499e2180ee69769c700f804451659cc4cf4a4078e713f8b3b2",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-676",
+    "expected": "24b9108ef591abac96d3acb47daebb6d1248b3a4972011480604d1a05218ecdb",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "OPS-523",
+    "expected": "329080331aa632c14511777932b9619613fd65d64df0d6d7afa000ec755b3242",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-452"
+    ]
+  },
+  {
+    "ref": "CHUCK-320",
+    "expected": "07f6609da45a85d642aa0de56f928e95aac90ae86337f222cf748ef30273a81d",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "VM-NEXT-48",
+    "expected": "fd3064c4e8cdc4426ed4fc7bd1898c3b74d0e3007d38cccb27c554ace126b323",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CHUCK-320"
+    ]
+  },
+  {
+    "ref": "OPS-530",
+    "expected": "3d0b95b5a1701fe804df9e0cb9dee4a0b237deba59d7f88c1aae39713c509b50",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-452"
+    ]
+  },
+  {
+    "ref": "OPS-532",
+    "expected": "6183fbd9ac9f5acf339922cb27fa50589630eb352dd5865dff43a9fd46099e14",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-534",
+    "expected": "69f17d292ffc3a2d79ae19ace1a4c14fed39434ebab7c0047e6349959a1e0fce",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "WT-45"
+    ]
+  },
+  {
+    "ref": "OPS-536",
+    "expected": "e9a6d059978e4919ac952e06dec9b2623e2b3419370044eea6132268461e43bc",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-537",
+    "expected": "b01b4a0708b7bf9f422016ec30d6b6a862baf8745acd321835dd940c17a1f1f3",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-452"
+    ]
+  },
+  {
+    "ref": "OPS-538",
+    "expected": "af11cc5080b3bdf8309eb9c4114b35073f82e283303ab6c77d3dc7a698eb52cc",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-285"
+    ]
+  },
+  {
+    "ref": "OPS-541",
+    "expected": "e78af2e471ea82f6311028658cdb714a7948810eb5945441af7c0899a0e60cac",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-452"
+    ]
+  },
+  {
+    "ref": "OPS-542",
+    "expected": "7550bfae1059652ab100aed1de7d5a363222577632b4a811838f24923e68f5e5",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-538"
+    ]
+  },
+  {
+    "ref": "OPS-543",
+    "expected": "b346cfd39c5b91a67b9dd4bc9b6b12b7732af80d355b723bc045f49e04972aea",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-538"
+    ]
+  },
+  {
+    "ref": "OPS-545",
+    "expected": "006306a8aa09c01efc2c2f9b770a690e68f61b86765f3e68b284f4e80df71b32",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-538"
+    ]
+  },
+  {
+    "ref": "OPS-547",
+    "expected": "bad9ef1b4a48c4b7c3efaab666096f3af154d4c69ea908183d290dffe2dc4f20",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-549",
+    "expected": "b75a2deee4ebfa60760f855824565534cd044cd5c8878e41bc911c238ccb5867",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-285"
+    ]
+  },
+  {
+    "ref": "OPS-550",
+    "expected": "75078fed9d98e7a5a2f9062415765e5c5c58e72eb638e5e8a8fdd16c3875e6e3",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-452"
+    ]
+  },
+  {
+    "ref": "OPS-551",
+    "expected": "f62d96b325694f1e03a6778fbe644931d3c6dc6701bf58f2738b65a662806a00",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-452"
+    ]
+  },
+  {
+    "ref": "OPS-553",
+    "expected": "ceb6dde3231bf06d673f4844fb33a57de4f4084eac738cb94a4e87997a345297",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-452"
+    ]
+  },
+  {
+    "ref": "OPS-558",
+    "expected": "ff71b9c9224c1b5288cb65eb4bbe36003bf015ab8ed45c1978c6d648f8d4c614",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-452"
+    ]
+  },
+  {
+    "ref": "OPS-559",
+    "expected": "d66776cbb55ae1c22667d4054285beba56c996958c6eee8176a52f24a82ee846",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-553"
+    ]
+  },
+  {
+    "ref": "OPS-562",
+    "expected": "4b0f2ee3c601bc05da52a66a0d8730752978e57c7d184aba2d259da113007d19",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-553"
+    ]
+  },
+  {
+    "ref": "OPS-567",
+    "expected": "5dc2bfc14758a8a9b462307295ae79dd280257cd7310bd13a840f758956dd957",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-553"
+    ]
+  },
+  {
+    "ref": "OPS-568",
+    "expected": "6f2a78cb5afcc03197f8ffc309a9d88d05e6c46a8c873094d911ccbe9f8bd9a0",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-553"
+    ]
+  },
+  {
+    "ref": "OPS-569",
+    "expected": "4e901c82001532bb1e718a0a35588d259da3fde54e71f3a4fcb519358ce9842b",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "CCC-547",
+    "expected": "7d4d7e0ba45db59340a5ae45093fdbf7056f35080b913801b06821287425aa64",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "OPS-575",
+    "expected": "04b3d3a6eb31e3b01a8f0f4f066f5cacab01871bd1df1707380e559e1ea06e73",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-553"
+    ]
+  },
+  {
+    "ref": "OPS-582",
+    "expected": "70a59ef392a87eeeffc0998914713fe9843eb4a6d7953beb9af17cbdf0d5bdc3",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-553"
+    ]
+  },
+  {
+    "ref": "OPS-583",
+    "expected": "4f5181ac2474d0cdb76f326e9be7ae9642cb86fe29600966de5174dddb0dcd0c",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-517"
+    ]
+  },
+  {
+    "ref": "OPS-584",
+    "expected": "5ea4852f8936d3f9640ca401996986fad211c9db70f3a000953d01f9f2259e6b",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-517"
+    ]
+  },
+  {
+    "ref": "OPS-585",
+    "expected": "884f4c580db8a7cf8c342eadc0a366f948d760c4d52aa49c912afd46e171410f",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-553"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-682",
+    "expected": "4b8ce7412da539b86998b30a1f7295f86fe69a899ec12b114aa237530bb87f1f",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "REPO-FIXER-513"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-683",
+    "expected": "a0f3ac14befac79c7d0ad24d389c32a4cefb854b992a40b54af3db1a4c40d9db",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "WT-61"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-684",
+    "expected": "b00100969156040966bc75f78af990a0d5383d1d16f3d36924e6fdc7e38fe368",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "OPS-588",
+    "expected": "68e50e97f3e6034e3cb0dc64dfe6bd00bbfde20b9d53e4b414244781c16d5f75",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-517"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-689",
+    "expected": "7bd9c4c7fd8736f528395ed3b9eb44cc34870f5e4b194a07ae6d00f5603ea49a",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3480"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-692",
+    "expected": "71d0b623db2c3173e3d59786d7980c572d95027c1b7b9967f5f14a2a718f1c24",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3565"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-693",
+    "expected": "7103bf971ac5c7600cbbd840df8c0b61740bc7191876e413898eca1a5377bb6e",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3566"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-700",
+    "expected": "6f60b9bfd46f55cbba4eed2913e4c5ae19410d4c03b0962fd25403ac5138bba4",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3470"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-702",
+    "expected": "ade5240ee0fb48005257bca4da7e514d378ec7ed42bddac624610eba7a05b6d7",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3532"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-703",
+    "expected": "90c1c9c54d31803dbd5c8aba55a81898ee0bc631702ace4c46ef8bf3fd034c80",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BYM-UX-78"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-705",
+    "expected": "b7512a1cf7852305cdfb5cd7b4d18e0a681467cf1f6a91a956eed5f49af77079",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-536"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-707",
+    "expected": "86cdeab42ddeeb475389e5c18308107e382922d1be95d5d59d678a7a64e1bf3f",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-709",
+    "expected": "f7ff73ca3a8126343a9a796173fcd697145b8423b0fc63d05857e0d16c7d2d18",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BYM-UX-84"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-712",
+    "expected": "0598cd9553971268d385692c72646ac6af4268e9aa1e7eb4ab73b7264ccc92ba",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-713",
+    "expected": "dfec122d84fb301e3b80d360d41e8e3bc5a2e06f078969dc14b611ff86861c29",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-714",
+    "expected": "dbad10956f65da89408a43bfc862508ad55bb045a784b7f48062a4b46f0b7f4c",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-715",
+    "expected": "18ef3a8f668795c772a3166f9cfdbf6559374a981f74269ff981b6ec3b60c1e3",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-716",
+    "expected": "6822e90a05b42397d2d4fae4f62ace5e016c0c0699ad173de9f3450948965d9a",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-717",
+    "expected": "c40e14283f10e5ac5f3edbcb9361a9a42dc52f39e7dfbc1d096a20d9cd3e8978",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-251"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-718",
+    "expected": "55db122bbaeea92b7e9879bd209c7690ab5ba6350b6f2a0b33a35036b8b1f44c",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "CCC-462"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-719",
+    "expected": "00ee1e8183b12a92da844ce6f7d3b9f69b3f062a745be0d6b1f277f920b915e7",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "WT-61"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-720",
+    "expected": "322be9638a0f599047ff9dd007bb282f18447132fb9635756be771d916cf51a2",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-463"
+    ]
+  },
+  {
+    "ref": "OPS-590",
+    "expected": "1af49017075384ce922b4078666ae3ca3ce642cb1cd9ad91bb8f25e69b60bf7a",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-553"
+    ]
+  },
+  {
+    "ref": "OPS-593",
+    "expected": "3ee7db610ae07204de90153445fbc059ac6897d6b03f3d3cf5de14804267a375",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-553"
+    ]
+  },
+  {
+    "ref": "BYM-UX-97",
+    "expected": "eabc7dc294c01dcf4cc6eeffbc2963c7e77603d7780ff55ad88742a20a9b5418",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-594"
+    ]
+  },
+  {
+    "ref": "OPS-594",
+    "expected": "303eca088b191aaaf40d7322e62c93d95ea0216bc243e44d4f51b5cf0590ed6e",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-517"
+    ]
+  },
+  {
+    "ref": "OPS-596",
+    "expected": "38a80daef8cd8f9e5446da5811572ccf19c250a3c82aaf5cdcb1ca73794eae65",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-553"
+    ]
+  },
+  {
+    "ref": "OPS-599",
+    "expected": "5eb9f40a9989289870e6f84385d6cf4fda6f88d1613cfcc301a1dda38eb98962",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "OPS-611",
+    "expected": "3202d6a7c35c80f9ae4d9ee8f0ad86a73d96ae99f15f6476a0b31d6ac76cdd70",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-627",
+    "expected": "d2660dc0ca4009a14375871df562c53ba097b293f1a58a4c3b2a31e7f39aad52",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "OPS-633",
+    "expected": "540cea144637b44c516ebe09ae33e82b3e2b4c9fc600b821e154f43587c396f1",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BE-86",
+    "expected": "0da6d3bdf9652492939f32f677cf3b9f6deb7007459517b77f5f684e243c814e",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "IDEAS-355",
+    "expected": "adb4e7ffd56f7af73bd61f984f704eee84e4c6cbad8779d54d02dee71471783c",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "REPO-FIXER-724",
+    "expected": "99dc87c5ce0b53c4a1db57dc397970132a75a163e132db40681ffe980dcabdce",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-641"
+    ]
+  },
+  {
+    "ref": "REPO-FIXER-730",
+    "expected": "cde39426513bfe7c045ff2ff613af125310aa24a100470e541ec8883a5cd8426",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3569"
+    ]
+  },
+  {
+    "ref": "BECKY-3613",
+    "expected": "fe6b5023d40560bad7b53edbb5cd325e5c40885c8f6153aea8dd1526cc05b170",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3608",
+    "expected": "2c282a584181cbe338ba78d53aea125b1916af337cd86aef5b4821116f8e3aa6",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3607",
+    "expected": "9581a13e31a421cd05b5b722315d4a42111e785ad083651699da706ea7d7682a",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3595",
+    "expected": "21f2259c7a62b5a343efb3de77edf6a92e852b9b3b4439155293737f2cd45353",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3579",
+    "expected": "7709d985cf4ccfb32069bdc5f40973c36ef19490251a4165ff10c9ee60b564e5",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3577",
+    "expected": "f7247171e2ab6c596ea27f4d9858961bed92400949b506c46fc6585daaf24d4e",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3576",
+    "expected": "8554e366459f197dad04ca8e5c156709b2448efcd2f00ae866ccdfa346d2ba63",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3575",
+    "expected": "4e2b896494c3ac89ebcd8c74fdd1bf4bd05bc515e4ea0a5ea1e25e7ae78b0ed0",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3553",
+    "expected": "95e5e0bbf72aad15b2158ec39ba3f1c8d9b575040cefd07fdceb7aacea667735",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3548",
+    "expected": "15ed25d6daf972ee04c3d8e335e64bbce118e9dbe6e16f5d635cd9b33317571f",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3541",
+    "expected": "1773e2974ce1d01d0d39c82f5fb55925cc4ac300217c8bc937acfdc1ec461d11",
+    "previous": "external",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3540",
+    "expected": "13e926da9967ca2c5f5769f58667222d5832e33991ec07e5d1097352f4a1f75f",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "PR-SWEEP-8"
+    ]
+  },
+  {
+    "ref": "BECKY-3537",
+    "expected": "beee5c9211671e59331d1d790339093c90573eef990400cab7b387770d039e9a",
+    "previous": "external",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3532",
+    "expected": "5b22ded142e0e58dcefcd5194a8bf866b581fb90422547b5ab5a473dd1a92566",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BECKY-3525",
+    "expected": "1b9d1a800e2217abb84ee7590e6c8fb69c0c67023a608d9d7f62d4aac0f52e97",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3524",
+    "expected": "a507780e12dab2f87a500372d42663e18185c662578ffa6a973718394c59dfaf",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3523",
+    "expected": "a32fa900862ee645f8876cafa22c0572c66240b208b7bcd8a29abe711e5d946c",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3516",
+    "expected": "121349e9177ca7a85a6b91bbe58953e26b5d205a8f4d2f2d745d743bf2e75822",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3510"
+    ]
+  },
+  {
+    "ref": "BECKY-3514",
+    "expected": "c3aa7c4681fc559131cc5e9906727f8d118d5bc73b6da76ad248a93e98483e25",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BECKY-3513",
+    "expected": "526549abbc534bc2f668127851889abd4dd66d1285d4b650e9762bc9af1b40b6",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BECKY-3510",
+    "expected": "61c85a580fbcdddadb7ed77eb3c0e2937229c5d2e75def5d5879ca1532e24458",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3509",
+    "expected": "cf3b1b4c1e496df02a1bfb0bef1217b70a34c08aabf40e111c8a6ef943e3a303",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3492",
+    "expected": "a82258418f72600b31373350979e1f321da1007cf9388dcd587e26240ae24411",
+    "previous": "worker",
+    "action": "person",
+    "reason": "Existing explicit owner approval/STOP or owner-only acceptance; reclassify without answering or lifting its hold.",
+    "on": "owner"
+  },
+  {
+    "ref": "BECKY-3487",
+    "expected": "0923d670d6cfc70708d47d3701ce3045dd8f4e9bcb95ef710f3b9e0d267289f6",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-496"
+    ]
+  },
+  {
+    "ref": "BECKY-3483",
+    "expected": "bc4f14193d49fee809d48744b2c9fac9860fb3ddd799f150b11fc31eda470736",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3480",
+    "expected": "77763be21f360b72bc3957cf05dde2f52923b8a74f3b4b605085266e9e84744d",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3477",
+    "expected": "6a12a7be2bfa46f0eaa7bb1918c850ec2f22966da51af72dd76978397d8c1096",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3473",
+    "expected": "d211356638cb16307afe76a0358dc0197a117b2e014ccbe0e902c4e0913c4db2",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3470",
+    "expected": "012ee731a225bd67cf1b0411a2e6c5b7a206e74c646622908485c74e9b4aec95",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BECKY-3462",
+    "expected": "8e9badfff48ee0d9cdb62cba973a65bfa8f563b63c3a470ac8563e55254b4dc6",
+    "previous": "external",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3448",
+    "expected": "4d7df3e1234ad759586cfd7712e2f547241f25a127260aea265634007d825fc3",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-599"
+    ]
+  },
+  {
+    "ref": "BECKY-3447",
+    "expected": "2ad9833c6e47cf5be0e6d64f3f6b3bac8311407928b554e288597fafcac7fe62",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3444",
+    "expected": "30f8fb57b79030a211a6d5d679cb68825bcd1dfa919fa5d30271bfb8620a66ea",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3422",
+    "expected": "1c3dce614ff1019935ef530c5ec81d0546c64ba062512cb394c6286160fbf6cd",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3409",
+    "expected": "c7beb9d753b93579e5c16e215bc65bda5fbbfba37c901c8c9294fc6ae1ec5eb6",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3398",
+    "expected": "73cd1f90297c3e7e6ddfc58418d28bdfbc840d88552c10d6eb3af2aff238c601",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3395",
+    "expected": "16e57d891db12a49a84fdb33e6d4ea5129db27b5700ff5455c3ed6e863c9a4f8",
+    "previous": "worker",
+    "action": "person",
+    "reason": "Existing explicit owner approval/STOP or owner-only acceptance; reclassify without answering or lifting its hold.",
+    "on": "owner"
+  },
+  {
+    "ref": "BECKY-3369",
+    "expected": "4d7d8e8653e2ac06a06a179b2e9f5a66a043bba3007b28cfc49c5d840cdf92a4",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "OPS-536"
+    ]
+  },
+  {
+    "ref": "BECKY-3361",
+    "expected": "4bbf191c39f33adafea26435ccd6fa41619a54f0d868dd2815c52eaef7ed39bf",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3328",
+    "expected": "cfe7a7b68383422b6f494c42de7c9d77eb4dfe31d54a1c69dcd8ace31041ac83",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3322",
+    "expected": "7bd9627a74e99fb724538a502b51fc850d22bba766d67f90cde2948b02da9625",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3298",
+    "expected": "061399ec794a379f380deb2f2d0dff65e7cdbbe45a7c4ec7c92eaa28c3592a58",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-2966"
+    ]
+  },
+  {
+    "ref": "BECKY-3296",
+    "expected": "0186e48f375fa356b93d2dda5149be520a7cfae49b9cc272119217a774ca321f",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-3328"
+    ]
+  },
+  {
+    "ref": "BECKY-3277",
+    "expected": "79538b85870fe297048c45690b364f5aa221ee386170cd25ed7184d456a05e0d",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3233",
+    "expected": "c404334b2688f5cb208d85a2f7e2c77a3942de040f710423099224e3ab62b3e6",
+    "previous": "worker",
+    "action": "person",
+    "reason": "Existing explicit owner approval/STOP or owner-only acceptance; reclassify without answering or lifting its hold.",
+    "on": "owner"
+  },
+  {
+    "ref": "BECKY-3192",
+    "expected": "53342c27dd90d7568cbb01aa7712774d5d6ad751d78a78351e7fbf7338cdc0dc",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-3000",
+    "expected": "601555d7c6367e3753425201b0e58a75547886d298c8a2477a8fec5e8f0ced95",
+    "previous": "worker",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-2995"
+    ]
+  },
+  {
+    "ref": "BECKY-2995",
+    "expected": "5fbbd9dbf8284e3547cbed33f0ded4a6c8291480da1c2861e5e8ec6751614576",
+    "previous": "worker",
+    "action": "person",
+    "reason": "Existing explicit owner approval/STOP or owner-only acceptance; reclassify without answering or lifting its hold.",
+    "on": "owner"
+  },
+  {
+    "ref": "BECKY-2968",
+    "expected": "1c08162b1cbb1f97c1b6e4903dd6e7d1fd415e77e10dfbb1151a930ed5d07356",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-2886",
+      "BECKY-2995"
+    ]
+  },
+  {
+    "ref": "BECKY-2966",
+    "expected": "daa3917447fc93c54bd7264209760a04f90b3a46558ac1bbcab633183679c204",
+    "previous": "worker",
+    "action": "person",
+    "reason": "Existing explicit owner approval/STOP or owner-only acceptance; reclassify without answering or lifting its hold.",
+    "on": "owner"
+  },
+  {
+    "ref": "BECKY-2884",
+    "expected": "c3e0b439e81c077120079b717e478f3800e1142b166bb39491d69c252d2f7240",
+    "previous": "worker",
+    "action": "icebox",
+    "reason": "Owner explicitly paused this work pending a new business rationale or separate resumption instruction. Iceboxed under needs-rationale; no active block, sends, activation or acceptance claim. Existing limits remain; revival requires an explicit new rationale."
+  },
+  {
+    "ref": "BECKY-2331",
+    "expected": "5bddc77b248ffffcc6e96f25412bb3950829ea4348b1673e76582a0bb2c7b324",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "BYM-FUTURE-3330",
+    "expected": "70ea6a90d1535fcae63082f4591915cac81739701872c43eff575ce6f7c99c51",
+    "previous": "unset",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "BYM-FUTURE-3326",
+    "expected": "fe7882f231b73c98da748bebda9d1e2e0592dbcb4e07817fdea08672c4cd9ccc",
+    "previous": "unset",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "BYM-FUTURE-3324",
+    "expected": "e42ee89cae37178b8ef8d3f9678454d7c67237a06a27296b09a0894b5862d611",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BYM-FUTURE-3299",
+    "expected": "09e754908b4f13d8f970a1f959fec2570cabc4d69c48993c104579b4c633c61d",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BYM-FUTURE-3297",
+    "expected": "a70c8fc6d7e236f091f3cf0f351682ffe1b1c830dc7ea88812231e3b165d95e9",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BYM-FUTURE-3289",
+    "expected": "30aa3797c6a75be363b03b99bbb8161b5c1d5e63e0d9872824f0f74f166e2df7",
+    "previous": "unset",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "BYM-FUTURE-2868",
+    "expected": "aa0dba59c9c1ec602bdac0c53ce6b3c99679c7f758a693f35b756c15cabc00fb",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BYMOPS-3054",
+    "expected": "64bde37df98b4c3ed9be9415719ec6508d952241a81ae6d6fa5b2added572554",
+    "previous": "external",
+    "action": "already-resolved",
+    "reason": "Closed by bymops-eb196bd7 during review; verify the terminal record and preserve its existing resolution, never overwrite it.",
+    "after": []
+  },
+  {
+    "ref": "BECKY-DESIGN-3494",
+    "expected": "22a33c9dd488793a1abd076abb5a02fd974e56edaf5f707215dad3e7c0d25aed",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-DESIGN-3249",
+    "expected": "da6f7798e6422f18420471e3c01fa60a55f36a6b9cc11830cadd098fbbf6a7e9",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-DESIGN-3246",
+    "expected": "ec9580449f5eecf76a956976cdd0697b13dba223d413b8f0fcf9b9fedc266676",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-2995"
+    ]
+  },
+  {
+    "ref": "BECKY-DESIGN-3088",
+    "expected": "d315fc2e6e9ad6478f4a16a7d0cc86bd67305b66ed1e2a2cf1c21c1870a3456d",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "BECKY-DESIGN-2844",
+    "expected": "0273f04ba94da033037563d82bff5ee74b71b2abfe67dbbf0d1a1ed9f7150ef6",
+    "previous": "dependency",
+    "action": "dependency",
+    "reason": "Represent the named owning work as real --after edges; original acceptance and all source/security/send holds remain binding.",
+    "after": [
+      "BECKY-2884"
+    ]
+  },
+  {
+    "ref": "STRAMP-315",
+    "expected": "42d28af879296a8c3ee60fdd5aa30484915ae8f134e56d3c66b84e5837e92f5d",
+    "previous": "worker",
+    "action": "reopen",
+    "reason": "Return unfinished source/review/evidence work to its worker. Preserve all existing no-send/no-production/no-replay/owner-pause limits; finish authorized work or install a real permanent watch, never infer permission from reopening.",
+    "after": []
+  },
+  {
+    "ref": "STRAMP-265",
+    "expected": "a6347fd87509959a98528da767082163bb9f8ca83cd433a8ed21800a7c0e1b8a",
+    "previous": "unset",
+    "action": "person",
+    "reason": "Existing owner-only sign-in, credential, approval or missing-information question; remove synthetic external/unclassified routing without changing the question.",
+    "on": "owner"
+  },
+  {
+    "ref": "STRAMP-211",
+    "expected": "274d7d27393f5ae251af08cae44d4faf203c136b0a497a96e39534ece9bf1d96",
+    "previous": "owner",
+    "action": "retain",
+    "reason": "Concrete existing person approval/information gate; preserve question, Q tag and authorization limits."
+  },
+  {
+    "ref": "STRAMP-199",
+    "expected": "9a2f1bb7d3d251ae5aee1d4cb8b3f53f3c26367b25e11a021a9dac8fc70bfc46",
+    "previous": "external",
+    "action": "person",
+    "reason": "Name the actual human supplying the existing requested facts/approval; no outreach or sends authorized.",
+    "on": "external",
+    "actor": "John Clark"
+  },
+  {
+    "ref": "PROJECTS-101",
+    "expected": "667b4362a8202146582e5a48812988277e5cebbc003f97e701a32ce1d10a3152",
+    "previous": "external",
+    "action": "icebox",
+    "reason": "Owner explicitly paused this work pending a new business rationale or separate resumption instruction. Iceboxed under needs-rationale; no active block, sends, activation or acceptance claim. Existing limits remain; revival requires an explicit new rationale."
+  },
+  {
+    "ref": "PROJECTS-100",
+    "expected": "496d2a35746e738431da461359764b4d08707eac412bcad0dde41a1aa62066bb",
+    "previous": "external",
+    "action": "icebox",
+    "reason": "Owner explicitly paused this work pending a new business rationale or separate resumption instruction. Iceboxed under needs-rationale; no active block, sends, activation or acceptance claim. Existing limits remain; revival requires an explicit new rationale."
+  }
+]

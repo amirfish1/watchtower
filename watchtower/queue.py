@@ -175,6 +175,8 @@ BLOCK_KINDS = ("input", "rationale", "awaiting-client")
 # ticket or handoff (``ref``); ``worker`` = the decision is already made and
 # the work is waiting on a worker. Stored as ``item["wait"]`` and stamped with
 # the ``blocked_at`` it describes, so a newer block generation always wins.
+# Legacy values remain readable for history/recovery. New blocks and wait
+# corrections accept only person decisions via validate_person_block.
 WAIT_ON = ("owner", "external", "dependency", "worker")
 
 
@@ -8894,6 +8896,32 @@ def dependency_only_question(question: str) -> List[str]:
     return []
 
 
+def validate_person_block(on: str, actor: str = "", question: str = "", *,
+                          require_question: bool = True) -> str:
+    """New blocks are person decisions. Legacy wait records remain readable."""
+    import re
+
+    on = str(on or "owner").strip().lower()
+    if on in ("worker", "dependency"):
+        raise ValueError("worker/dependency parking is retired; do the work or use wt edit REF --after DEP")
+    if on not in ("owner", "external"):
+        raise ValueError("wait-on must be owner or external (a named human)")
+    if on == "external" and (str(actor).strip().lower() in ("", "vendor", "client", "staff", "owner", "worker") or re.search(
+            r"(?i)\b(worker|coordinator|maintainer|next natural|first real|when-convenient)\b", actor)):
+        raise ValueError("external blocks need a named human --wait-actor, not a worker or future event")
+    if require_question:
+        text = str(question or "").strip()
+        if not text or text in ("?", "..."):
+            raise ValueError("a person block needs a concrete question")
+        if re.search(r"(?i)\b(?:await(?:ing)?|wait(?:ing)? for) (?:a |the |next )*(?:natural|future)\b", text):
+            raise ValueError("future evidence is not a person decision; close + --watch")
+        if (on == "owner" and re.match(r"(?i)^(?:\[Q[^]]+\]\s*)?(?:await(?:ing)?|wait(?:ing)? (?:for|on))\b", text)) or dependency_only_question(text) or re.match(
+                r"(?i)^(?:\[Q[^]]+\]\s*)?(?:await(?:ing)?|wait(?:ing)? (?:for|on))\s+"
+                r"(?:the )?(?:coordinator|worker|implementation|source.owner|next |a natur|future |existing sprint)", text):
+            raise ValueError("work/future evidence is not a person decision; do the work, use --after, or close + --watch")
+    return on
+
+
 def block(
     ident: Any,
     session_id: str = "",
@@ -8942,8 +8970,12 @@ def block(
     requiring the ticket to close -- the point of `--kind awaiting-client`.
     """
     kind = kind if kind in ("input", "rationale", "awaiting-client") else "input"
+    effective_on = validate_person_block(wait_on, wait_actor, question,
+                                         require_question=True)
+    if origin not in ("stage", "plan_gate"):
+        wait_on = effective_on
     if wait_on:
-        wait_record(wait_on, extra=wait_extra)   # validate before any write
+        wait_record(wait_on, wait_actor, extra=wait_extra)   # validate before any write
     else:
         wait_owner_fields("", wait_extra)   # owner context without an owner wait: refuse
     backend = _github_backend_for_project(_project_from_ident(ident))
@@ -9069,7 +9101,8 @@ def set_wait(ident: Any, on: str, actor: str = "", ref: str = "", note: str = ""
     current ``blocked_at`` so a later block generation supersedes it. Raises
     ValueError when the ticket is not blocked or ``on`` is invalid.
     """
-    wait_record(on, extra=extra)
+    validate_person_block(on, actor, require_question=False)
+    wait_record(on, actor, extra=extra)
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         item = backend.set_wait(ident, on, actor=actor, ref=ref, note=note, by=by, extra=extra)
@@ -9083,6 +9116,7 @@ def set_wait(ident: Any, on: str, actor: str = "", ref: str = "", note: str = ""
             if _matches(it, ident):
                 if not it.get("needs_input") or it.get("status") == "closed":
                     raise ValueError(f"{it.get('ref', ident)} is not blocked; nothing is waiting")
+                validate_person_block(on, actor, it.get("block_question") or "")
                 now = _now_iso()
                 it["wait"] = wait_record(on, actor, ref, note,
                                          block_at=str(it.get("blocked_at") or ""), by=by,
@@ -9601,6 +9635,7 @@ def await_release(ident: Any, session_id: str, wait: Dict[str, Any],
                     continue
                 from . import releases
                 releases.require_parkable(it, session_id, expected_defer)
+                releases.validate_wait(it, wait)
                 now = _now_iso()
                 actor = _by("worker", session_id)
                 if progress:

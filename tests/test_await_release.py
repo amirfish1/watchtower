@@ -1,4 +1,6 @@
 """Release waits never expire into the pool; only a containing build moves them."""
+from tests.legacy_blocks import block as legacy_block, set_wait as legacy_wait
+
 import importlib
 from datetime import datetime, timedelta, timezone
 
@@ -313,9 +315,9 @@ def test_new_release_commit_is_fetched_before_build_comparison(env, repo, tmp_pa
     assert r.release_wait.on_branch(repo["path"], repo["merged"], build)["state"] == "unknown"
     assert r.observe("ccc:dashboard", build, evidence="new running release") == [dict(ref=ref, status="open")]
     # A deleted release branch must not keep a stale origin/next as proof.
-    q.claim_by_ref(ref, "w2")
+    ref = _ticket(q, name, worker="w2")
     r.park(ref, "w2", repo=repo["path"], commit=repo["merged"], branch="origin/next",
-           target="ccc:dashboard", reason="another release check")
+           target="ccc:dashboard", reason="another ticket release check")
     _git(builder, "push", "origin", "--delete", "next")
     assert r.observe("ccc:dashboard", build, evidence="branch was deleted") == []
     assert r.owner_rows([q.get(ref)])[0]["branch_state"] == "unknown"
@@ -384,7 +386,7 @@ def test_legacy_dependency_wait_resumes_on_release_completion(env, repo, monkeyp
     q, cli, answers, _ov, name, r = env
     parent = park(env, repo)
     child = _ticket(q, name, worker="w2")
-    q.block(child, session_id="w2", question="wait for prerequisite",
+    legacy_block(q, child, session_id="w2", question="wait for prerequisite",
             wait_on="dependency", wait_ref=parent)
     calls = []
     monkeypatch.setattr(cli, "deliver_dependency_answer", lambda *args: calls.append(args) or True)
@@ -400,3 +402,28 @@ def test_dashboard_progress_counts_release_wait_as_complete(env, monkeypatch):
     monkeypatch.setattr(q, "list_items", lambda **_: rows)
     page = dashboard.render_index(dict(queues=[dict(queue=name)], workers=[]), chat_rows=[])
     assert '<span>2/3</span>' in page
+
+
+@pytest.mark.parametrize("reason", ["wait for natural QA acceptance", "post-release evidence window", "hosted acceptance remains open"])
+def test_release_rejects_evidence_parking(env, repo, reason):
+    q, _, _, _, name, r = env
+    ref = _ticket(q, name)
+    with pytest.raises(ValueError, match="release-only"):
+        r.park(ref, "w1", repo=repo["path"], commit=repo["merged"], branch="origin/next",
+               target="ccc:dashboard", reason=reason)
+    assert q.get(ref)["status"] == "in_progress"
+
+
+def test_observed_generation_gets_one_live_check_and_cannot_repark(env, repo):
+    q, _, _, _, name, r = env
+    ref = park(env, repo)
+    r.observe("ccc:dashboard", repo["merged"], evidence="real containing build")
+    q.claim_by_ref(ref, "live-check")
+    with pytest.raises(ValueError, match="already observed"):
+        r.park(ref, "live-check", repo=repo["path"], commit=repo["merged"], branch="origin/next",
+               target="ccc:dashboard", reason="wait for another release")
+    # The direct backend/API path must enforce the same generation guard.
+    previous = q.get(ref)["release_event"]["wait"]
+    with pytest.raises(ValueError, match="already observed"):
+        q.await_release(ref, "live-check", previous)
+    assert q.get(ref)["status"] == "in_progress"

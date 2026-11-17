@@ -1,4 +1,6 @@
 """Real local persistence + offline GitHub issues, for both dependency directions."""
+from tests.legacy_blocks import block as legacy_block, set_wait as legacy_wait
+
 import pytest
 
 from test_github_backend import _install_fake_gh, _reload_isolated, _drainable
@@ -44,7 +46,7 @@ def test_local_dependency_waits_then_wakes(mixed, edit):
     ref = child(q, blocked_by=[] if edit else [upstream])
     if edit:
         q.claim_by_ref(ref, "parked")
-        q.block(ref, "parked", "existing dependency wait",
+        legacy_block(q, ref, "parked", "existing dependency wait",
                 wait_on="dependency", wait_ref=upstream)
         q.update(ref, blocked_by=[upstream], _dependency_wait=True)
     assert q.get(ref)["blocked_by"] == [upstream]
@@ -52,7 +54,7 @@ def test_local_dependency_waits_then_wakes(mixed, edit):
     assert_waiting(q, ref)
     # Owner-held remote parent must not wake its child.
     q.claim_by_ref(upstream, "upstream")
-    q.block(upstream, "upstream", "owner acceptance remains outstanding")
+    legacy_block(q, upstream, "upstream", "owner acceptance remains outstanding")
     assert_waiting(q, ref)
     q.close(upstream, "upstream", resolution={"summary": "accepted", "no_code": True})
     assert q.count_claimable(project="LOCAL") == 1

@@ -17,7 +17,7 @@ INTEGRATION_GUIDANCE = (
     "If a parent must compose branches, close the source-complete child only when "
     "its own acceptance is met and make the parent depend on it with "
     "`wt edit PARENT --after CHILD`. For a real gate (owner approval, customer/money "
-    "hard stop, or named reviewer), use `wt block --wait-on owner|worker "
+    "hard stop, or named reviewer), use `wt block --wait-on owner|external "
     "--wait-actor WHO`; preserve that gate."
 )
 

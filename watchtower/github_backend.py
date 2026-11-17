@@ -50,7 +50,7 @@ RUN_REQUESTED_LABEL = "watchtower:play"
 # Mirrors config.DEFAULT_GRACE_S; duplicated only as the fallback for a backend
 # built without a readable config (embedders, tests).
 DEFAULT_GRACE_S = 180
-VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "")
+VALID_READINESS = ("ready", "needs-shaping", "needs-spec", "needs-rationale", "")
 VALID_PRIORITIES = ("p0", "p1", "p2", "p3", "p4", "")
 VALID_VALUES = ("H", "M", "L", "")
 VALID_CONFIDENCES = ("H", "M", "L", "")
@@ -3833,6 +3833,7 @@ class GitHubIssuesBackend:
         if item is None:
             return None
         releases.require_parkable(item, session_id, expected_defer)
+        releases.validate_wait(item, wait)
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         if progress:
             _append_history(meta, "progress", worker=session_id, text=_clip(progress, 24000))
@@ -3881,6 +3882,10 @@ class GitHubIssuesBackend:
         backstop only asks this for a claim held on this host; a claim held
         elsewhere is routed to its owner, never blocked (WT-38)."""
         from . import queue as _q
+        effective_on = _q.validate_person_block(wait_on, wait_actor, question,
+                                                 require_question=True)
+        if origin not in ("stage", "plan_gate"):
+            wait_on = effective_on
         item = self.get(ident)
         if item is None:
             return None
@@ -3960,12 +3965,14 @@ class GitHubIssuesBackend:
         """Say who the current block waits on, without re-blocking (CCC-244).
         Body metadata only: no issue comment, the question stays as asked."""
         from . import queue as _q
+        _q.validate_person_block(on, actor, require_question=False)
         item = self.get(ident)
         if item is None:
             return None
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
         if not meta.get("needs_input") or item.get("status") == "closed":
             raise ValueError(f"{item.get('ref', ident)} is not blocked; nothing is waiting")
+        _q.validate_person_block(on, actor, meta.get("block_question") or "")
         meta["wait"] = _q.wait_record(on, actor, ref, note,
                                       block_at=str(meta.get("blocked_at") or ""), by=by,
                                       extra=extra)

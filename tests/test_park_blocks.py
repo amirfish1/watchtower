@@ -2,6 +2,8 @@
 released) and the human's answer is routed back to the parking session."""
 
 from __future__ import annotations
+from tests.legacy_blocks import block as legacy_block, set_wait as legacy_wait
+
 
 import importlib
 import json
@@ -43,7 +45,7 @@ def wt(tmp_path, monkeypatch):
 def _parked(wt, worker="w1", sid=SID, project="PK", note="ticket"):
     item = wt.q.enqueue(project=project, note=note, source="test")
     wt.q.claim_by_ref(item["ref"], worker, session_uuid=sid)
-    blocked = wt.q.block(item["ref"], session_id=worker, question="which way?",
+    blocked = legacy_block(wt.q, item["ref"], session_id=worker, question="which way?",
                          progress="half done", origin="worker")
     return blocked
 
@@ -63,7 +65,7 @@ def test_worker_block_parks_and_releases_claim(wt):
 def test_legacy_origin_keeps_hold_while_blocked(wt):
     item = wt.q.enqueue(project="PK", note="x", source="test")
     wt.q.claim_by_ref(item["ref"], "w1", session_uuid=SID)
-    it = wt.q.block(item["ref"], session_id="w1", question="q?", origin="plan_gate")
+    it = legacy_block(wt.q, item["ref"], session_id="w1", question="q?", origin="plan_gate")
     assert it["status"] == "in_progress"
     assert it.get("needs_input")
 
@@ -160,7 +162,7 @@ def test_duplicate_link_clears_parked_session_and_preserves_wait(wt):
 
     original = wt.q.enqueue(project="PK", note="original", source="test")
     it = _parked(wt)
-    wt.q.set_wait(it["ref"], "dependency", ref=original["ref"])
+    legacy_wait(wt.q, it["ref"], "dependency", ref=original["ref"])
     wait = wt.q.get(it["ref"])["wait"]
     linked = wt.q.link_duplicate(it["ref"], original["ref"])
     assert linked["status"] == "open"
@@ -234,7 +236,7 @@ def test_outbox_rows_are_generation_bound(wt):
 def test_migrate_legacy_blocks_parks_worker_blocks(wt):
     item = wt.q.enqueue(project="PK", note="x", source="test")
     wt.q.claim_by_ref(item["ref"], "w1", session_uuid=SID)
-    wt.q.block(item["ref"], session_id="w1", question="q?", origin="system")
+    legacy_block(wt.q, item["ref"], session_id="w1", question="q?", origin="system")
     picked = wt.q.migrate_legacy_blocks(queue="PK", dry_run=True)
     assert wt.q.get(item["ref"])["status"] == "in_progress"
     assert isinstance(picked, list)

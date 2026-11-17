@@ -434,14 +434,18 @@ ANNOUNCE_TICKET = (
 WAIT_TARGET_CONTRACT = (
     "WAIT TARGET: every `wt block` names who it waits on with `--wait-on`: "
     "`owner` for a decision only the owner can make; `external --wait-actor "
-    "NAME` for a client, staff member or vendor; `worker` for work another "
-    "session is doing. For another ticket, use `wt edit REF --after DEP` "
+    "NAME` for a named human client, staff member or vendor. Worker waits "
+    "and text-only dependency blocks are forbidden. Do the work yourself; "
+    "for another ticket, use `wt edit REF --after DEP` "
     "instead of blocking: it releases your claim and dispatch resumes when "
     "DEP closes, without a human question or filer notice. Pick the "
     "one that is true; do not default to `owner`. For an owner wait also "
     "pass `--decide-by` (ISO time with a UTC offset, or `none`) and "
     "`--if-unanswered` (what happens if nobody answers, or `none`). This "
     "does not change what needs the owner's approval. "
+    "After a release is observed, perform one live acceptance check. Keep "
+    "working on a reproducible failure; future natural evidence belongs to "
+    "close + a registered --watch. Never repark an observed release. "
 )
 # A pushed commit is not a shipped fix. Wording only. No braces (see above).
 INTEGRATION_CONTRACT = (
@@ -459,7 +463,7 @@ INTEGRATION_CONTRACT = (
     "rules. If a parent must compose branches, close the source-complete child "
     "only after its own acceptance is met, then make the parent depend on it "
     "with `wt edit PARENT --after CHILD`. Real owner/customer/money/reviewer "
-    "gates stay `wt block --wait-on owner|worker --wait-actor WHO`. "
+    "gates stay `wt block --wait-on owner|external --wait-actor WHO`. "
     "A hold on source that is deliberately not merged yet stays a plain "
     "ticket dependency or named-person `wt block` with its real reason. "
 )

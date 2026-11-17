@@ -1,4 +1,6 @@
 """WT-84 migration preserves real gates and refuses stale or ungated edits."""
+from tests.legacy_blocks import block as legacy_block, set_wait as legacy_wait
+
 import pytest
 
 from tests.legacy_defer import seed as seed_defer, snapshot
@@ -27,7 +29,7 @@ def test_migration_requires_a_real_gate_and_exact_snapshot(env):
     with pytest.raises(ValueError, match="real block or dependency"):
         migration.retire(ref, expected_reason=before["defer_reason"], worker="migration")
     assert snapshot(q, ref) == before
-    q.block(ref, "reviewer", "Review existing source", wait_on="worker", wait_actor="reviewer")
+    legacy_block(q, ref, "reviewer", "Review existing source", wait_on="worker", wait_actor="reviewer")
     blocked = q.get(ref)
     with pytest.raises(ValueError, match="changed"):
         migration.retire(ref, expected_reason=before["defer_reason"] + " stale", worker="migration")
@@ -39,7 +41,7 @@ def test_migration_clears_only_timer_preserving_question_claim_and_gate(env, wai
     q, *_ = env
     ref, before = legacy(env)
     extra = {"decide_by": "none", "consequence": "Original acceptance remains open"} if wait_on == "owner" else {}
-    q.block(ref, "reviewer", "[Q1:existing-check] Existing acceptance question",
+    legacy_block(q, ref, "reviewer", "[Q1:existing-check] Existing acceptance question",
             wait_on=wait_on, wait_actor="reviewer", wait_extra=extra)
     blocked = q.get(ref)
     after = migration.retire(ref, expected_reason=before["defer_reason"], worker="migration")

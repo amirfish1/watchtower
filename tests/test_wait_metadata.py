@@ -8,6 +8,8 @@ import json
 
 import pytest
 
+from tests.legacy_blocks import block as legacy_block, set_wait as legacy_wait
+
 from tests.test_github_backend import (  # noqa: F401 (fixtures/helpers)
     _drainable, _install_fake_gh, _reload_isolated,
 )
@@ -49,8 +51,8 @@ def test_newer_block_without_wait_supersedes_old_wait(wt):
     q.answer(ref, "Sonia replied")
     q.claim_by_ref(ref, "w1") if q.get(ref)["status"] == "open" else None
     it = q.block(ref, session_id="w1", question="Owner: approve the budget?")
-    assert "wait" not in it
-    assert q.current_wait(it) is None
+    assert q.current_wait(it)["on"] == "owner"
+    assert "actor" not in it["wait"]
 
 
 def test_stale_wait_record_is_ignored(wt):
@@ -67,15 +69,17 @@ def test_stale_wait_record_is_ignored(wt):
 def test_set_wait_corrects_legacy_block_without_unblocking(wt):
     q, _ = wt
     ref = _blocked(q)
-    q.block(ref, session_id="w1", question="Awaiting OPS-193 credential")
-    it = q.set_wait(ref, "dependency", ref="OPS-193", note="credential handoff", by="ops-1")
+    legacy_block(q, ref, session_id="w1", question="Awaiting OPS-193 credential")
+    it = legacy_wait(q, ref, "dependency", ref="OPS-193", note="credential handoff", by="ops-1")
     assert it["needs_input"] is True
     assert it["block_question"] == "Awaiting OPS-193 credential"
     assert q.current_wait(it)["ref"] == "OPS-193"
     events = [e["event"] for e in it["history"]]
     assert events[-2:] == ["block", "wait"]
     # A second correction appends; history keeps both.
-    it = q.set_wait(ref, "owner")
+    with pytest.raises(ValueError, match="person decision"):
+        q.set_wait(ref, "owner")
+    it = legacy_wait(q, ref, "owner")
     assert [e["event"] for e in it["history"]].count("wait") == 2
     assert q.current_wait(it)["on"] == "owner"
 
@@ -84,9 +88,9 @@ def test_set_wait_rejects_unblocked_and_bad_values(wt):
     q, _ = wt
     item = q.enqueue(project="T", note="open", source="test")
     with pytest.raises(ValueError, match="not blocked"):
-        q.set_wait(item["ref"], "external")
+        q.set_wait(item["ref"], "external", actor="Sonia")
     ref = _blocked(q)
-    q.block(ref, session_id="w1", question="?")
+    q.block(ref, session_id="w1", question="Approve the prepared draft?")
     with pytest.raises(ValueError, match="wait-on"):
         q.set_wait(ref, "sonia")
     with pytest.raises(ValueError):
@@ -100,9 +104,9 @@ def test_cli_wait_and_block_flags(wt, capsys):
                      "--wait-on", "external", "--wait-actor", "Sonia", "--json"]) == 0
     out = json.loads(capsys.readouterr().out)
     assert out["wait"]["actor"] == "Sonia"
-    assert cli.main(["wait-on", ref, "--on", "dependency", "--ref", "OPS-167"]) == 0
-    assert "WAITING: " + ref + " on dependency" in capsys.readouterr().out
-    assert q.current_wait(q.get(ref))["ref"] == "OPS-167"
+    with pytest.raises(SystemExit):
+        cli.main(["wait-on", ref, "--on", "dependency", "--ref", "OPS-167"])
+    assert q.current_wait(q.get(ref))["actor"] == "Sonia"
 
 
 def test_github_block_persists_kind_and_wait(tmp_path, monkeypatch):
@@ -114,7 +118,7 @@ def test_github_block_persists_kind_and_wait(tmp_path, monkeypatch):
     item = q.enqueue(project="GHI", note="client question")
     q.claim_by_ref(item["ref"], "worker-1")
 
-    it = q.block("GHI-1", session_id="worker-1", question="Await Sonia",
+    it = q.block("GHI-1", session_id="worker-1", question="May we proceed with the reviewed remedy?",
                  kind="awaiting-client", wait_on="external", wait_actor="Sonia")
     assert it["block_kind"] == "awaiting-client"
     assert it["blocked_at"]

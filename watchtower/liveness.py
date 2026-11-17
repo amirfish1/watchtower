@@ -1391,7 +1391,10 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
             action = "resume" if _resume_first(item) else "reopen"
             reason = f"claim owner dead ({v.evidence})"
         else:
-            action, reason = "escalate", f"claim owner unproven ({v.evidence})"
+            # An unobserved local claim is a lease, not permanent ownership.
+            # The ordinary idle threshold and recent bound-session evidence
+            # still protect active work. No fictional person question is made.
+            action, reason = "reopen", f"unobserved local claim lease expired ({v.evidence})"
     elif proof["kind"] == "staffing":
         from . import config, workers
         queue = out["queue"]

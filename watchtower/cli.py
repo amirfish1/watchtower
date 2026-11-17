@@ -3394,11 +3394,11 @@ def _wait_target_hint(args: argparse.Namespace, item: dict) -> str:
     context-free block looks like in the owner view."""
     if getattr(args, "kind", "input") != "input":
         return ""
-    on = getattr(args, "wait_on", "") or ""
+    on = getattr(args, "wait_on", "") or (item.get("wait") or {}).get("on") or ""
     if not on:
         return ("note: no --wait-on given. Older readers treat this as waiting on the owner; "
                 "`wt owner-view` lists it as unclassified. Say who it waits on: "
-                f"wt wait-on {_display_ref(item)} --on owner|external|dependency|worker")
+                f"wt wait-on {_display_ref(item)} --on owner|external")
     if on == "owner":
         w = item.get("wait") or {}
         missing = [flag for key, flag in (("decide_by", "--decide-by"), ("consequence", "--if-unanswered"))
@@ -3485,8 +3485,8 @@ def cmd_block(args: argparse.Namespace) -> int:
 def cmd_wait_on(args: argparse.Namespace) -> int:
     """Say who a blocked ticket is waiting on, without re-blocking (CCC-244):
     the owner, an external actor (client, studio owner, vendor), another
-    ticket/handoff, or a worker that already has its decision. Corrects a
-    legacy block in place; history keeps every earlier record."""
+    named human. Work dependencies use edit --after. History keeps every
+    earlier record."""
     try:
         item = q.set_wait(args.ref, args.on, actor=args.actor, ref=args.wait_ref,
                           note=args.note, by=args.worker, extra=_wait_extra(args))
@@ -7320,7 +7320,7 @@ COMMAND_HELP: Dict[str, str] = {
     "unresolved-ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
     "block": "park a ticket that needs a human decision",
     "defer": "retired: work, close with a permanent check, or record a real gate",
-    "wait-on": "say who a blocked ticket waits on: owner, external actor, dependency or worker",
+    "wait-on": "say who a blocked ticket waits on: owner or named external human; work dependencies use edit --after",
     "owner-view": "blocked tickets by who they really wait on, grouped by root (any backend, read-only)",
     "blocked": "list tickets parked for a human",
     "gated": "product-gate pitches awaiting your Ack/Nack",
@@ -8213,12 +8213,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--major-detail", dest="major_detail", default="",
                    help="required with --weight major: one concrete sentence (>=40 chars) on what goes "
                         "wrong or what exactly only the owner can do; vague words are rejected")
-    s.add_argument("--wait-on", dest="wait_on", default="", choices=list(q.WAIT_ON),
-                   help="who this block waits on: owner = a decision only the owner "
+    s.add_argument("--wait-on", dest="wait_on", default="", choices=["owner", "external"],
+                   help="who must decide: owner = a decision only the owner "
                         "can make (red 'needs you'); external = a client/studio/vendor "
-                        "(name it with --wait-actor); dependency = another ticket or "
-                        "handoff (--wait-ref); worker = decision made, awaiting a worker. "
-                        "Unset reads as owner.")
+                        "(name the human with --wait-actor). Work dependencies use wt edit --after.")
     s.add_argument("--wait-actor", dest="wait_actor", default="",
                    help="who, for --wait-on external (e.g. the client's name)")
     s.add_argument("--wait-ref", dest="wait_ref", default="",
@@ -8241,8 +8239,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("wait-on", help=COMMAND_HELP.get("wait-on", ""))
     s.add_argument("ref")
-    s.add_argument("--on", required=True, choices=list(q.WAIT_ON),
-                   help="owner | external | dependency | worker")
+    s.add_argument("--on", required=True, choices=["owner", "external"],
+                   help="owner | external (named human); dependencies use wt edit --after")
     s.add_argument("--actor", default="", help="who, for an external wait")
     s.add_argument("--ref", dest="wait_ref", default="",
                    help="blocking ticket/handoff ref, for a dependency wait")

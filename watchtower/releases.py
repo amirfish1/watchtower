@@ -63,6 +63,18 @@ def validate_target(target):
     raise ValueError("--target needs github:OWNER/REPO:ENV, ccc:dashboard, watchtower:local, or a build JSON URL")
 
 
+def validate_wait(item, wait):
+    """A release generation cannot turn into a future-evidence holding pen."""
+    reason = str(wait.get("reason") or "")
+    if re.search(r"(?i)natural|future (?:event|evidence)|post.release|acceptance remains|evidence window", reason):
+        raise ValueError("awaiting_release is release-only; natural/future evidence needs close + --watch")
+    prior = (item.get("release_event") or {}).get("wait") or {}
+    commit = str(wait.get("commit") or "")
+    if (commit and prior.get("target") == wait.get("target")
+            and str(prior.get("commit") or "").startswith(commit)):
+        raise ValueError("this release was already observed: complete its one live check; do not repark it")
+
+
 def park(ref, worker, *, repo, commit, branch, target, reason, summary="", verified="",
          live_check=True, progress="", expected_defer=None):
     item = q.get(ref)
@@ -72,6 +84,7 @@ def park(ref, worker, *, repo, commit, branch, target, reason, summary="", verif
     if not reason.strip():
         raise ValueError("--reason is required")
     target = validate_target(target)
+    validate_wait(item, dict(reason=reason, target=target, commit=commit))
     proof = release_wait.check("release", repo, commit, branch)
     full = release_wait.on_branch(repo, commit, branch)["sha"]
     if not live_check:
