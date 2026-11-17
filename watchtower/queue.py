@@ -2639,13 +2639,13 @@ def move(ident: Any, new_project: str) -> Optional[Dict[str, Any]]:
 def _blocker_state(blocker: Dict[str, Any]) -> str:
     """The ONE predicate for "is this blocker satisfied" (WT-4).
 
-    ``satisfied``: closed as completed -- not declined at the product gate,
-    and its resolution has no ``unresolved`` items. ``waiting``: not closed
-    yet. ``stuck``: closed, but declined or with unresolved items, so the
-    dependent must NOT auto-unblock; a human decides. Unresolved items the owner
+    ``satisfied``: closed or code complete awaiting release -- not declined
+    at the product gate, and its resolution has no ``unresolved`` items.
+    ``waiting``: work is not complete yet. ``stuck``: complete, but declined
+    or with unresolved items, so the dependent must NOT auto-unblock; a human decides. Unresolved items the owner
     already acknowledged (`wt unresolved-ack`) no longer count. Extend here (e.g. with
     a review/accept state), nowhere else."""
-    if blocker.get("status") != "closed":
+    if blocker.get("status") not in ("closed", "awaiting_release"):
         return "waiting"
     if blocker.get("product_nack"):
         return "stuck"
@@ -2688,11 +2688,11 @@ def waiting_on(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]) -> List[st
     """Blocker refs of ``it`` not yet completed (WT-9), in ``blocked_by`` order.
 
     Uses ``_blocker_state`` so display and the claim gate share one rule: a
-    blocker counts as completed only when closed, not declined, and with no
-    unresolved items. A stuck blocker a human already answered for counts as
+    blocker counts as completed when closed or awaiting release, not declined,
+    and with no unresolved items. A stuck blocker a human already answered for counts as
     completed (same as ``blocker_verdict``); a missing blocker keeps the dependent waiting.
     Empty when unblocked and for tickets that are not open/in-flight."""
-    if it.get("status") == "closed":
+    if it.get("status") in ("closed", "awaiting_release"):
         return []
     out: List[str] = [str(it["duplicate_of"])] if it.get("duplicate_of") else []
     for ref in it.get("blocked_by") or []:
@@ -3668,8 +3668,6 @@ def update_status(
                     return None
                 if release_expect is not None and status == "closed" and effective_gates(it):
                     return None
-                if status in ("open", "closed"):
-                    it.pop("release_wait", None)
                 # Ownership guard for close (see expect_owner docstring). Runs
                 # inside the lock against the fresh item, so it's race-free with
                 # a concurrent close by the fresh worker that re-drained the
@@ -3688,6 +3686,8 @@ def update_status(
                 if it.get("duplicate_of"):
                     raise ValueError(f"{it.get('ref', ident)} follows duplicate original {it['duplicate_of']}; clear the link before changing status")
                 _group_child_change_unlocked(data["items"], it, status, group_force)
+                if status in ("open", "closed"):
+                    it.pop("release_wait", None)
                 gfields: Dict[str, Any] = {}
                 it["status"] = status
                 now = _now_iso()
@@ -4937,7 +4937,8 @@ def _reviewer_target(item: Dict[str, Any], stage: str) -> str:
 def _dependents_of(ref: str) -> List[str]:
     try:
         return [str(i.get("ref")) for i in list_items(fresh=True)
-                if ref in (i.get("blocked_by") or []) and i.get("status") != "closed"]
+                if ref in (i.get("blocked_by") or [])
+                and i.get("status") not in ("closed", "awaiting_release")]
     except Exception:
         return []
 
@@ -5710,15 +5711,18 @@ def group_parent_of(item: Dict[str, Any],
 def group_current_map(parent: Dict[str, Any],
                       by_ref: Optional[Dict[str, Dict[str, Any]]] = None) -> Dict[str, Any]:
     """``{child: commit}`` for every member and fix: the closing commit, ``""``
-    for a no-code close, None while the child is not closed."""
+    for a no-code close, None while the child is not complete. A child
+    awaiting release contributes its verified release commit."""
     out: Dict[str, Any] = {}
     for ref in group_children(parent):
         ch = _group_lookup(ref, by_ref)
-        if ch is None or ch.get("status") != "closed":
+        if ch is None or ch.get("status") not in ("closed", "awaiting_release"):
             out[ref] = None
             continue
-        res = ch.get("resolution") if isinstance(ch.get("resolution"), dict) else {}
-        out[ref] = str(res.get("commit") or "")
+        res = (ch.get("release_wait") if ch.get("status") == "awaiting_release"
+               else ch.get("resolution"))
+        commit = str(res.get("commit") or "") if isinstance(res, dict) else ""
+        out[ref] = (commit or None) if ch.get("status") == "awaiting_release" else commit
     return out
 
 
@@ -6004,7 +6008,7 @@ def _group_child_change_unlocked(items: List[Dict[str, Any]], child: Dict[str, A
     rewrite its resolution). During an integration that is refused
     (``GroupChildLocked``, nothing written) unless forced, which invalidates
     the integration in the same write. A finished group only notes it."""
-    if group_role(child) != "child" or child.get("status") != "closed":
+    if group_role(child) != "child" or child.get("status") not in ("closed", "awaiting_release"):
         return
     parent = _refs_index(items).get(group_parent_ref(child))
     if parent is None:
@@ -6228,7 +6232,7 @@ def _group_due_unlocked(items: List[Dict[str, Any]], now: Optional[float] = None
             continue
         st = group_integration_state(it, now)
         if st in ("idle", "fixing"):
-            if any((by_ref.get(f) or {}).get("status") != "closed"
+            if any(_blocker_state(by_ref.get(f) or {}) != "satisfied"
                    for f in (it.get("group") or {}).get("fixes") or []):
                 continue
             out.append(it)
@@ -9714,6 +9718,21 @@ def await_release(ident: Any, session_id: str, wait: Dict[str, Any],
         _note_worker_ticket_done(session_id)
         _log("AWAIT_RELEASE", f"{item['ref']} {wait['commit'][:12]} -> {wait['target']}",
              queue=item.get("project", ""))
+        _group_wake([str(p.get("ref")) for p in _group_due_for(item)], "integration")
+        # Run outside the store lock, on either backend. Dispatch uses the
+        # normal eligibility gates, including any other incomplete parents.
+        if _blocker_state(item) == "satisfied":
+            from . import workers
+            dispatched = set()
+            for ref in _dependents_of(str(item["ref"])):
+                try:
+                    dependent = get(ref) or {}
+                    project = dependent.get("project", "")
+                    if dependent.get("status") == "open" and project not in dispatched:
+                        workers.dispatch_after_enqueue(project, ref)
+                        dispatched.add(project)
+                except Exception:  # best effort; the daemon tick also recovers
+                    pass
     return item
 
 

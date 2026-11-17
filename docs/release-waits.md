@@ -78,3 +78,18 @@ commits resolved on fresh `origin/next` once the latter used an explicit BYM
 checkout. Migration/adoption results and the post-change daily counts must be
 recorded in ticket progress. A full after-day cannot be inferred from passing
 tests or a partial-day counter; retain WT-82 for that bounded measurement.
+
+## Dependency completion (WT-88)
+
+An `awaiting_release` ticket counts as completed for `--after` dependents;
+those tickets can proceed before the build ships. The release wait itself
+remains unclaimable and keeps its build/adoption check. Declined or unresolved
+completion records still hold dependents, and missing prerequisites fail closed.
+Entering the wait dispatches dependent queues immediately through the ordinary
+eligibility gates. Existing waits need no data migration: claim and display
+projections use the same completion predicate.
+
+Group integration uses the parked release commit as the child's commit proof;
+it still requires the containing integration commit and the group's gates.
+The dashboard completion fraction includes parked release work, while actual
+closed-ticket history and release-wait inventory keep their distinct statuses.

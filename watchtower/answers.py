@@ -472,12 +472,13 @@ def route_pending_answers(now: Optional[float] = None) -> List[str]:
 
 
 def dependency_answer_text(dep: Dict[str, Any]) -> str:
-    """The system answer for a closed dependency (WT-37): says it is not a
+    """The system answer for a completed dependency (WT-37): says it is not a
     human, names the ref, and carries the first line of its resolution."""
     res = dep.get("resolution") if isinstance(dep.get("resolution"), dict) else {}
     first = next((ln.strip() for ln in str(res.get("summary") or "").splitlines()
                   if ln.strip()), "")
-    return (f"WatchTower (system, not a human): dependency {dep.get('ref')} closed"
+    state = "code complete, awaiting release" if dep.get("status") == "awaiting_release" else "closed"
+    return (f"WatchTower (system, not a human): dependency {dep.get('ref')} {state}"
             + (f": {q._clip(first, 300)}" if first else "."))
 
 
@@ -542,7 +543,7 @@ def resume_dependency_waits(items: Optional[List[Dict[str, Any]]] = None) -> Lis
             from . import cli as _cli
             if _cli.deliver_dependency_answer(ref, dependency_answer_text(dep),
                                               str(it.get("blocked_at") or "")):
-                q._log("DEP-RESUME", f"{ref} — dependency {dep_ref} closed; answered",
+                q._log("DEP-RESUME", f"{ref} — dependency {dep_ref} complete; answered",
                        queue=str(it.get("project") or ""))
                 acted.append(f"{ref}:{dep_ref}")
         except Exception:  # noqa: BLE001 - one ticket never stops the pass

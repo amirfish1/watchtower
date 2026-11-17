@@ -319,3 +319,84 @@ def test_new_release_commit_is_fetched_before_build_comparison(env, repo, tmp_pa
     _git(builder, "push", "origin", "--delete", "next")
     assert r.observe("ccc:dashboard", build, evidence="branch was deleted") == []
     assert r.owner_rows([q.get(ref)])[0]["branch_state"] == "unknown"
+
+
+def test_release_wait_satisfies_dependents_and_dispatches_once_per_queue(env, repo, monkeypatch, capsys):
+    import json
+    from watchtower import workers
+    q, cli, _a, _ov, name, r = env
+    parent = _ticket(q, name)
+    children = [q.enqueue(project=name, note="dependent", blocked_by=[parent])["ref"]
+                for _ in range(2)]
+    assert q.count_claimable(project=name) == 0
+    calls = []
+
+    def dispatch(project, ref):
+        # The transition must be persisted and its lock released first.
+        assert q.get(parent)["status"] == "awaiting_release"
+        assert q.count_claimable(project=name) == 2
+        calls.append((project, ref))
+
+    monkeypatch.setattr(workers, "dispatch_after_enqueue", dispatch)
+    r.park(parent, "w1", repo=repo["path"], commit=repo["merged"],
+           branch="origin/next", target="ccc:dashboard", reason="adoption")
+    assert calls == [(name, children[0])]
+    assert q.get(parent)["status"] == "awaiting_release"
+    assert cli.main(["ls", "-q", name, "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert {row["ref"] for row in rows} == set(children)
+    assert all(not row["waiting_on"] for row in rows)
+    assert q.claim_by_ref(children[0], "w2")
+    assert q.claim_next("w3", project=name)["ref"] == children[1]
+
+
+@pytest.mark.parametrize("status", ["closed", "awaiting_release"])
+def test_release_completion_preserves_stuck_and_missing_blockers(env, status):
+    q, *_ = env
+    parent = dict(ref="T-1", status=status)
+    child = dict(ref="T-2", status="open", blocked_by=["T-1"])
+    assert q._blocker_state(parent) == "satisfied"
+    assert q.blocker_verdict(child, {"T-1": parent}) == ("ok", "")
+    for flags in ({"product_nack": True}, {"resolution": {"unresolved": ["T-3 remaining"]}}):
+        stuck = dict(parent, **flags)
+        assert q._blocker_state(stuck) == "stuck"
+        assert q.blocker_verdict(child, {"T-1": stuck}) == ("stuck", "T-1")
+        assert q.waiting_on(child, {"T-1": stuck}) == ["T-1"]
+    assert q.blocker_verdict(child, {}) == ("waiting", "T-1")
+    assert q.waiting_on(dict(child, status="awaiting_release"), {}) == []
+
+
+def test_completed_dependents_do_not_appear_in_unblock_notifications(env, monkeypatch):
+    q, *_ = env
+    rows = [dict(ref=f"T-{i}", status=status, blocked_by=["T-1"])
+            for i, status in enumerate(("open", "closed", "awaiting_release"), 2)]
+    monkeypatch.setattr(q, "list_items", lambda **_: rows)
+    assert q._dependents_of("T-1") == ["T-2"]
+
+
+def test_legacy_dependency_answer_names_release_state(env):
+    q, _cli, answers, *_ = env
+    assert "code complete, awaiting release" in answers.dependency_answer_text(
+        dict(ref="T-1", status="awaiting_release"))
+
+
+def test_legacy_dependency_wait_resumes_on_release_completion(env, repo, monkeypatch):
+    q, cli, answers, _ov, name, r = env
+    parent = park(env, repo)
+    child = _ticket(q, name, worker="w2")
+    q.block(child, session_id="w2", question="wait for prerequisite",
+            wait_on="dependency", wait_ref=parent)
+    calls = []
+    monkeypatch.setattr(cli, "deliver_dependency_answer", lambda *args: calls.append(args) or True)
+    assert answers.resume_dependency_waits() == [f"{child}:{parent}"]
+    assert "code complete, awaiting release" in calls[0][1]
+
+
+def test_dashboard_progress_counts_release_wait_as_complete(env, monkeypatch):
+    from watchtower import dashboard
+    q, _cli, _a, _ov, name, _r = env
+    rows = [dict(ref=f"{name}-{i}", project=name, status=status)
+            for i, status in enumerate(("open", "closed", "awaiting_release"), 1)]
+    monkeypatch.setattr(q, "list_items", lambda **_: rows)
+    page = dashboard.render_index(dict(queues=[dict(queue=name)], workers=[]), chat_rows=[])
+    assert '<span>2/3</span>' in page

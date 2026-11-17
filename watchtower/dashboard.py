@@ -980,7 +980,7 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
         qn = str(w.get("queue", ""))
         workers_by_queue.setdefault(qn, []).append(w)
 
-    # Get closed/total counts per queue from one pass over all items
+    # Get completed/total counts per queue from one pass over all items
     closed_by_q: Dict[str, int] = {}
     total_by_q: Dict[str, int] = {}
     try:
@@ -989,7 +989,7 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
             if not qn:
                 continue
             total_by_q[qn] = total_by_q.get(qn, 0) + 1
-            if it.get("status") == "closed":
+            if it.get("status") in ("closed", "awaiting_release"):
                 closed_by_q[qn] = closed_by_q.get(qn, 0) + 1
     except Exception:
         pass

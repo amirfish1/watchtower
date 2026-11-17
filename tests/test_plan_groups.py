@@ -823,3 +823,34 @@ def test_cli_group_show_and_ls(wt, repo, capsys):
     assert wt.cli.main(["ls", "-q", PQ]) == 0
     out = capsys.readouterr().out
     assert "[group: 2 members" in out and f"[group {P}]" in out
+
+
+def test_release_wait_child_supplies_group_commit_and_wakes_integration(wt, repo, monkeypatch):
+    from watchtower import releases
+    P, kids = _group(wt, repo, n=2, gates=["cmd:true"])
+    _accept_plan(wt, P)
+    other_sha = _commit(repo, kids[1])
+    _build(wt, kids[1], other_sha)
+    sha = _commit(repo, kids[0])
+    _git(repo, "update-ref", "refs/remotes/origin/main", sha)
+    wt.q.claim_by_ref(kids[0], "w1", session_uuid=SID)
+    wakes = []
+    monkeypatch.setattr(wt.q, "_group_wake", lambda refs, why: wakes.extend(refs))
+    monkeypatch.setattr(wt.workers, "dispatch_after_enqueue", lambda *_: None)
+    releases.park(kids[0], "w1", repo=str(repo), commit=sha, branch="origin/main",
+                  target="ccc:dashboard", reason="adoption")
+    assert P in wakes
+    assert wt.q.group_current_map(wt.q.get(P)) == {kids[0]: sha, kids[1]: other_sha}
+    assert wt.q.group_sweep(only_ref=P)
+    assert wt.q.get(P)["status"] == "closed"
+    assert wt.q.get(kids[0])["status"] == "awaiting_release"
+
+
+def test_release_wait_child_reopen_is_fenced_during_group_integration(wt, monkeypatch):
+    q = wt.q
+    child = dict(ref="GQ-1", status="awaiting_release", release_wait={"commit": "a" * 40},
+                 group={"role": "child", "parent": "GQ-2"})
+    parent = dict(ref="GQ-2", status="open", group={"role": "parent",
+                  "integration": {"state": "gating", "commits": {"GQ-1": "a" * 40}}})
+    with pytest.raises(q.GroupChildLocked):
+        q._group_child_change_unlocked([child, parent], child, "open", False)
