@@ -341,19 +341,26 @@ check the commit is on the branch releases are cut from (`git fetch`, then
 wt await-release REF --worker ID --reason "ships with the next release" \
   --commit SHA --release-branch origin/next --target TARGET --live-check
 
-# Fix exists but is not on the release branch. Name who lands it and how.
-wt defer REF --worker ID --until +1d --reason "needs re-landing on next" \
-  --awaits integration --commit SHA \
-  --integration-owner "session 01a1dafb" --integration-path "cherry-pick to next via PR"
+# Authoring worker lands the fix in its own worktree, under repo rules.
+git fetch origin
+# Review/merge or cherry-pick the fix onto the fresh release branch worktree;
+# run that repo's required checks and push next/main as its rules require.
+git merge-base --is-ancestor SHA origin/BRANCH
+wt await-release REF --worker ID --commit SHA --release-branch origin/BRANCH \
+  --target TARGET --reason "integrated; waiting for adoption" --live-check
 ```
 
-- Nobody owns landing it? That is a blocker, not a wait: `wt block --wait-on
-  worker --wait-actor COORDINATOR` (or `--wait-on owner` if no coordinator
-  exists).
-- A deliberate hold on unmerged source (waiting for data, an approval, a
-  dependency) is unchanged: plain `wt defer` or `wt block` with the real reason.
+- `--awaits integration` is retired: authoring workers land their own fixes.
+- If a parent must compose branches, close the source-complete child only when
+  its own acceptance is met, and make the parent depend on it with
+  `wt edit PARENT --after CHILD`. Never close away the child's original symptom.
+- A real gate (owner approval, customer/money hard stop, named reviewer) stays
+  `wt block --wait-on owner|worker --wait-actor WHO`. Preserve required review;
+  this policy grants no new access or approval.
 - Never switch the branch of a shared checkout to get onto the release branch.
   Work in your own worktree off a fresh copy of it.
+- A deliberate hold on unmerged source (waiting for data, an approval, a
+  dependency) stays a plain `wt defer` or `wt block` with its real reason.
 - A plain `wt defer` whose reason mentions a release still works but prints a
   note asking for `--awaits`.
 

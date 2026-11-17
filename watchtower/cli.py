@@ -3559,6 +3559,8 @@ def cmd_defer(args: argparse.Namespace) -> int:
     awaits = str(getattr(args, "awaits", "") or "")
     reason = args.reason
     try:
+        if awaits == "integration":
+            raise ValueError(release_wait.INTEGRATION_GUIDANCE)
         if awaits and awaits != "data":
             # Checked before anything is written: a fix that is not on the
             # release branch is refused as "awaiting release".
@@ -8328,19 +8330,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="what data you are waiting for and why it is needed")
     s.add_argument("--progress", default="",
                    help="what you built and what the resuming worker should analyse")
+    # Parse the retired spelling only to return actionable migration guidance.
     s.add_argument("--awaits", default="", choices=["data", "release", "integration"],
+                   metavar="{data,release}",
                    help="what the ticket waits for. release: the fix is already on the release "
-                        "branch (checked; needs --commit and --release-branch). integration: "
-                        "the fix is not on it yet (needs --integration-owner and "
-                        "--integration-path). data (default): a data window or source-only hold")
-    s.add_argument("--commit", default="", help="the fix commit (with --awaits release|integration)")
+                        "branch (checked; needs --commit and --release-branch). "
+                        "data (default): a data window or source-only hold. "
+                        "integration is retired and rejected with landing guidance")
+    s.add_argument("--commit", default="", help="the fix commit (with --awaits release)")
     s.add_argument("--target", default="", help="release/adoption target; redirects --awaits release to an untimed wait")
     s.add_argument("--release-branch", default="", dest="release_branch",
                    help="the branch releases are cut from, e.g. origin/next (with --awaits release)")
     s.add_argument("--integration-owner", default="", dest="integration_owner",
-                   help="who will land the fix on the release branch (with --awaits integration)")
+                   help=argparse.SUPPRESS)
     s.add_argument("--integration-path", default="", dest="integration_path",
-                   help="how it lands: the branch, PR or ticket (with --awaits integration)")
+                   help=argparse.SUPPRESS)
     s.add_argument("--repo", default="",
                    help="checkout to check the commit in (default: the ticket's repo)")
     s.add_argument("--json", action="store_true")

@@ -2,10 +2,10 @@
 
 A ticket deferred "for release" only wakes usefully if a release can actually
 carry its fix. A commit that sits on some other branch is not waiting for a
-release: no release reads that branch, so nothing will ever move it. That
-ticket is waiting for *integration*, which needs a named owner and path.
+release: no release reads that branch, so nothing will ever move it. The
+authoring worker must land it under the repo rules, or record the real gate.
 
-Three kinds of wait:
+Two kinds of wait:
 
 * ``data``        -- the default: a data window, a source-only hold, anything
                      that is not a claim about a release. Unchanged.
@@ -13,8 +13,6 @@ Three kinds of wait:
                      release". Needs ``--commit`` and ``--release-branch``,
                      and the commit (or an identical patch) must already be on
                      that branch. Otherwise the defer is refused.
-* ``integration`` -- the fix exists but is not on the release branch yet.
-                     Needs ``--integration-owner`` and ``--integration-path``.
 
 Stdlib only; reads git, never writes it, never fetches.
 """
@@ -26,9 +24,19 @@ import re
 import subprocess
 from typing import Dict, Tuple
 
-AWAITS = ("data", "release", "integration")
+AWAITS = ("data", "release")
 
-# A reason that talks about shipping without saying which of the three it is.
+INTEGRATION_GUIDANCE = (
+    "--awaits integration is retired. Land it yourself on the release branch "
+    "(push next/main per repo rules), then use wt await-release (code complete). "
+    "If a parent must compose branches, close the source-complete child only when "
+    "its own acceptance is met and make the parent depend on it with "
+    "`wt edit PARENT --after CHILD`. For a real gate (owner approval, customer/money "
+    "hard stop, or named reviewer), use `wt block --wait-on owner|worker "
+    "--wait-actor WHO`; preserve that gate."
+)
+
+# A reason that talks about shipping without saying which kind it is.
 _RELEASE_WORDS = re.compile(
     r"\b(release[ds]?|ship(s|ped|ping)?|deploy(s|ed|ment)?|rollout|goes live|"
     r"reach(es)? (prod|production|main)|merge[ds]? to (main|next))\b", re.I)
@@ -82,21 +90,14 @@ def check(awaits: str, repo: str, commit: str = "", branch: str = "",
     ``tag`` is the text recorded in front of the defer reason; raises
     ``ValueError`` (nothing is written) when the claim does not hold."""
     awaits = str(awaits or "data").strip().lower()
+    if awaits == "integration":
+        raise ValueError(INTEGRATION_GUIDANCE)
     if awaits not in AWAITS:
         raise ValueError(f"--awaits must be one of {', '.join(AWAITS)}")
     commit, branch = str(commit or "").strip(), str(branch or "").strip()
     owner, path = " ".join(str(owner or "").split()), " ".join(str(path or "").split())
     if awaits == "data":
         return {"awaits": "data", "tag": ""}
-    if awaits == "integration":
-        if not owner or not path:
-            raise ValueError(
-                "--awaits integration needs --integration-owner (the session, worker or person "
-                "who will land it) and --integration-path (how: the branch, PR or ticket). "
-                "A fix nobody is assigned to land is not waiting, it is stranded.")
-        where = f" {commit[:12]}" if commit else ""
-        return {"awaits": "integration",
-                "tag": f"[awaits integration{where}: owner {owner}; path {path}]"}
     if not commit or not branch:
         raise ValueError(
             "--awaits release needs --commit SHA and --release-branch REF (the branch releases "
@@ -105,12 +106,11 @@ def check(awaits: str, repo: str, commit: str = "", branch: str = "",
     if found["state"] == "unknown":
         raise ValueError(
             f"cannot confirm {commit[:12]} is on {branch}: {found['detail']}. Not recorded as "
-            f"awaiting release. Fix the check, or defer with --awaits integration.")
+            f"awaiting release. Fix the check. {INTEGRATION_GUIDANCE}")
     if found["state"] == "missing":
         raise ValueError(
             f"{found['sha'][:12]} is not on {branch}, so no release will carry it. Pushing a "
-            f"feature branch is not integration. Either land it on {branch} first, or defer "
-            f"with `--awaits integration --integration-owner WHO --integration-path HOW`.")
+            f"feature branch is not integration. {INTEGRATION_GUIDANCE}")
     how = "on" if found["state"] == "contained" else "same patch on"
     return {"awaits": "release", "tag": f"[awaits release: {found['sha'][:12]} {how} {branch}]"}
 
@@ -122,6 +122,5 @@ def hint(awaits: str, reason: str) -> str:
         return ""
     return ("note: this reason mentions a release but the defer does not say what it waits on. "
             "If the fix is already on the release branch, use `--awaits release --commit SHA "
-            "--release-branch REF` so that is checked. If it is not there yet, use `--awaits "
-            "integration --integration-owner WHO --integration-path HOW`. A pushed feature "
-            "branch is not awaiting release.")
+            "--release-branch REF` so that is checked. A pushed feature branch is not "
+            f"awaiting release. {INTEGRATION_GUIDANCE}")

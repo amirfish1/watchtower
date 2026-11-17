@@ -62,7 +62,7 @@ def test_on_branch_tells_contained_equivalent_missing_and_unknown(repo, tmp_path
     assert release_wait.on_branch(str(tmp_path / "gone"), repo["merged"], "origin/next")["state"] == "unknown"
 
 
-def test_release_claim_needs_proof_and_integration_needs_an_owner(repo):
+def test_release_claim_needs_proof_and_integration_is_retired(repo):
     ok = release_wait.check("release", repo["path"], repo["merged"], "origin/next")
     assert ok["tag"].startswith("[awaits release: ") and "on origin/next" in ok["tag"]
     assert "same patch on" in release_wait.check("release", repo["path"], repo["relanded"], "origin/next")["tag"]
@@ -72,11 +72,10 @@ def test_release_claim_needs_proof_and_integration_needs_an_owner(repo):
         release_wait.check("release", repo["path"], repo["merged"], "origin/nope")
     with pytest.raises(ValueError, match="--commit SHA and --release-branch"):
         release_wait.check("release", repo["path"])
-    with pytest.raises(ValueError, match="stranded"):
-        release_wait.check("integration", repo["path"], repo["stranded"], owner="session 01a1dafb")
-    tag = release_wait.check("integration", repo["path"], repo["stranded"],
-                             owner="session 01a1dafb", path="cherry-pick to next")["tag"]
-    assert "owner session 01a1dafb" in tag and "path cherry-pick to next" in tag
+    assert "integration" not in release_wait.AWAITS
+    for extra in ({}, {"owner": "session 01a1dafb", "path": "cherry-pick to next"}):
+        with pytest.raises(ValueError, match="Land it yourself"):
+            release_wait.check("integration", repo["path"], repo["stranded"], **extra)
     assert release_wait.check("", repo["path"]) == {"awaits": "data", "tag": ""}
 
 
@@ -95,18 +94,16 @@ def test_defer_refuses_awaiting_release_for_a_commit_not_on_the_release_branch(e
     item = q.get(ref)
     assert item["status"] == "in_progress" and not item.get("deferred_until")     # nothing written
 
-    rc = cli.main(base + ["--reason", "needs re-landing", "--awaits", "integration",
-                          "--commit", repo["stranded"]])
-    assert rc == 1 and "integration-owner" in capsys.readouterr().err
-    assert not q.get(ref).get("deferred_until")
-
-    rc = cli.main(base + ["--reason", "needs re-landing", "--awaits", "integration",
-                          "--commit", repo["stranded"], "--integration-owner", "session 01a1dafb",
-                          "--integration-path", "cherry-pick to next via PR"])
-    assert rc == 0
-    reason = q.get(ref)["defer_reason"]
-    assert reason.startswith("[awaits integration") and "owner session 01a1dafb" in reason
-    assert reason.endswith("needs re-landing")
+    before = q.get(ref)
+    for extra in ([], ["--integration-owner", "session 01a1dafb",
+                       "--integration-path", "cherry-pick to next via PR"]):
+        rc = cli.main(base + ["--reason", "needs re-landing", "--awaits", "integration",
+                              "--commit", repo["stranded"], *extra])
+        err = capsys.readouterr().err
+        assert rc == 1 and "Land it yourself" in err
+        assert "wt edit PARENT --after CHILD" in err
+        assert "wt block --wait-on owner|worker --wait-actor WHO" in err
+        assert q.get(ref) == before  # reject without mutating either backend
 
 
 def test_defer_accepts_awaiting_release_when_the_fix_is_on_the_release_branch(env, repo, capsys):
@@ -142,18 +139,15 @@ def test_plain_and_source_only_defers_still_work(env, repo, capsys):
 
 
 @pytest.mark.parametrize("repo_source", ["queue", "cwd"])
-@pytest.mark.parametrize("awaits", ["release", "integration"])
-def test_defer_cli_resolves_repo_without_an_explicit_path(wt_env, repo, repo_source, awaits):
+def test_defer_cli_resolves_repo_without_an_explicit_path(wt_env, repo, repo_source):
     """Workers can defer pathless tickets using queue config or their checkout."""
+    awaits = "release"
     ref = _ticket(wt_env.queue, "T")
     assert not wt_env.queue.get(ref).get("repo_path")
     if repo_source == "queue":
         wt_env.config.set_repo_path("T", repo["path"])
     cwd = wt_env.tmp if repo_source == "queue" else Path(repo["path"])
-    flags = (["--commit", repo["merged"], "--release-branch", "origin/next"]
-             if awaits == "release" else
-             ["--commit", repo["stranded"], "--integration-owner", "worker-2",
-              "--integration-path", "cherry-pick to next"])
+    flags = ["--commit", repo["merged"], "--release-branch", "origin/next"]
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
     done = subprocess.run(
         [sys.executable, "-m", "watchtower.cli", "defer", ref, "--worker", "w1",
