@@ -1326,69 +1326,18 @@ def _claim_predates_close(meta: Dict[str, Any]) -> bool:
     return claimed is None or claimed <= closed
 
 
-def _defer_live(until: Any) -> bool:
-    parsed = _parse_iso(until) if until else None
-    return parsed is not None and parsed.timestamp() > time.time()
-
-
-# OPS-215: while a gated ticket is plan-pending or in review, its issue carries
-# this defer window. Every wt since OPS-100 keeps a deferred ticket out of
-# claim_next / claim_by_ref / `wt run`, so a host that cannot read the pipeline
-# (older than OPS-201, or no sidecar) is fenced by the issue alone. A wt that
-# knows ``pipeline_hold`` reads the human defer it saved instead and lets the
-# sidecar overlay decide the hold.
-PIPELINE_HOLD_UNTIL = "2099-12-31T00:00:00Z"
-# Wire fence for readers predating WT-82. Current readers use the distinct
-# release state, with no expiry; older readers must never claim these issues.
-RELEASE_COMPAT_HOLD = "9999-12-31T00:00:00Z"
-
-
-def _effective_defer(meta: Dict[str, Any]) -> str:
-    if meta.get("release_wait") and meta.get("deferred_until") == RELEASE_COMPAT_HOLD:
-        return ""
-    until = str(meta.get("deferred_until") or "")
-    hold = meta.get("pipeline_hold")
-    if isinstance(hold, dict) and until == PIPELINE_HOLD_UNTIL:
-        return str(hold.get("prev_defer") or "")
-    return until
-
-
 def _set_pipeline_hold(meta: Dict[str, Any], why: str) -> None:
-    """Write (``why`` = plan|review) or lift the issue-level pipeline hold. A
-    human defer is kept in the hold and restored when it lifts; one set during
-    the hold (it replaced the sentinel) is re-saved on the next write."""
-    hold = meta.get("pipeline_hold")
+    """Pipeline admission is explicit metadata, never a year-2099 timer."""
     if why:
-        if not isinstance(hold, dict) or meta.get("deferred_until") != PIPELINE_HOLD_UNTIL:
-            hold = {"prev_defer": str(meta.get("deferred_until") or ""),
-                    "prev_reason": str(meta.get("defer_reason") or "")}
-        meta["pipeline_hold"] = dict(hold, why=why)
-        meta["deferred_until"] = PIPELINE_HOLD_UNTIL
-        meta["defer_reason"] = (
-            f"duplicate hold: it completes with {meta.get('duplicate_of') or 'its original'}"
-            if why == "duplicate" else
-            f"pipeline hold ({why}): it settles on the host that "
-            f"owns its gates; a wt without that pipeline must not claim it")
-        return
-    if not isinstance(hold, dict):
-        return
-    meta.pop("pipeline_hold", None)
-    if meta.get("deferred_until") == PIPELINE_HOLD_UNTIL:
-        if hold.get("prev_defer"):
-            meta["deferred_until"] = hold["prev_defer"]
-            meta["defer_reason"] = hold.get("prev_reason") or ""
-        else:
-            meta.pop("deferred_until", None)
-            meta.pop("defer_reason", None)
+        meta["pipeline_hold"] = dict(meta.get("pipeline_hold") or {}, why=why)
+    else:
+        meta.pop("pipeline_hold", None)
+    # Retire only old wire sentinels here. Real legacy data windows are
+    # migrated separately with their exact reason and reversal receipt.
+    if meta.get("deferred_until") in ("2099-12-31T00:00:00Z", "9999-12-31T00:00:00Z"):
+        meta.pop("deferred_until", None)
+        meta.pop("defer_reason", None)
 
-
-_DEFER_MARKER_RE = re.compile(r'^deferred_until:\s*"([^"]+)"', re.MULTILINE)
-
-
-def _defer_marker_live(body: Any) -> bool:
-    """Cheap pre-parse check for a live defer window in an issue body."""
-    m = _DEFER_MARKER_RE.search(str(body or ""))
-    return bool(m) and _defer_live(m.group(1))
 
 
 def _age_seconds(created_at: Any, *, now: Optional[datetime] = None) -> float:
@@ -1672,6 +1621,8 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
         val = _clip(resolution.get(field, ""), max_len)
         if val:
             out[field] = val
+    if resolution.get("watches"):
+        out["watches"] = [dict(w) for w in resolution["watches"]]
     for field in ("caveats", "follow_ups", "unresolved"):
         raw = resolution.get(field)
         if raw is None:
@@ -2368,9 +2319,7 @@ class GitHubIssuesBackend:
             or _age_seconds(created_at) >= self.grace_s
         )
         memo_key = None
-        # A `wt defer` window ends by the clock alone, with no issue edit to
-        # bust the memo, so a still-deferred issue is never memoized.
-        if age_settled and not has_comments and not _defer_marker_live(issue.get("body")):
+        if age_settled and not has_comments:
             # Content, not id(issue): a freed dict's id is reused, and
             # updatedAt is per-second, so an edit plus a re-read in the same
             # second served the pre-edit item (two claim winners, WT-10).
@@ -2436,13 +2385,10 @@ class GitHubIssuesBackend:
         #   work_it         = auto_eligible OR manual_eligible
         no_auto_drain = self.no_auto_drain_label in labels
         run_requested = self.run_requested_label in labels
-        deferred_until = _effective_defer(meta)
-        # `wt defer`: inside its data window a ticket is out of the pool for
-        # claims and spawn depth alike, ▶ included (queue._claim_candidates).
-        deferred = _defer_live(deferred_until)
-        # A duplicate follower waits on its original (OPS-208), whatever the defer says.
-        workable = (queue_member and status == "open" and not deferred
-                    and not meta.get("duplicate_of"))
+        # Explicit gates survive across hosts; legacy timer fields have no
+        # admission semantics and cannot wake a ticket when a clock passes.
+        workable = (queue_member and status == "open"
+                    and not meta.get("duplicate_of") and not meta.get("pipeline_hold"))
         auto_eligible = bool(
             workable
             and self.auto_drain
@@ -2458,6 +2404,7 @@ class GitHubIssuesBackend:
             "caveats": meta.get("resolution_caveats", []),
             "follow_ups": meta.get("resolution_follow_ups", []),
             "unresolved": meta.get("resolution_unresolved", []),
+            "watches": meta.get("resolution_watches", []),
             "caveats_ack": meta.get("resolution_caveats_ack") or {},
             "follow_ups_ack": meta.get("resolution_follow_ups_ack") or {},
             "unresolved_ack": meta.get("resolution_unresolved_ack") or {},
@@ -2561,11 +2508,6 @@ class GitHubIssuesBackend:
         if str(meta.get("depth") or "").lower() == "deep":
             item["depth"] = "deep"
             item["budget_min"] = meta.get("budget_min")
-        if deferred_until:
-            item["deferred_until"] = deferred_until
-            item["defer_reason"] = str(meta.get("defer_reason") or "")
-            if isinstance(meta.get("pipeline_hold"), dict) and deferred_until != meta.get("deferred_until"):
-                item["defer_reason"] = str(meta["pipeline_hold"].get("prev_reason") or "")
         if isinstance(meta.get("pipeline_hold"), dict):
             item["pipeline_hold"] = dict(meta["pipeline_hold"])
         if isinstance(meta.get("release_wait"), dict):
@@ -3686,7 +3628,7 @@ class GitHubIssuesBackend:
         body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
 
         meta.pop("release_wait", None)
-        if meta.get("deferred_until") == RELEASE_COMPAT_HOLD:
+        if meta.get("deferred_until") == "9999-12-31T00:00:00Z":
             meta.pop("deferred_until", None)
             meta.pop("defer_reason", None)
         if extras and extras.get("release_event"):
@@ -3696,7 +3638,7 @@ class GitHubIssuesBackend:
                 "claimed_by", "claimed_machine", "claimed_at",
                 "closed_by", "closed_machine", "closed_at",
                 "resolution_summary", "resolution_commit", "resolution_caveats",
-                "resolution_follow_ups", "resolution_unresolved",
+                "resolution_follow_ups", "resolution_unresolved", "resolution_watches",
                 "resolution_caveats_ack", "resolution_follow_ups_ack",
                 "resolution_unresolved_ack",
                 "resolution_session_id", "resolution_engine",
@@ -3750,6 +3692,7 @@ class GitHubIssuesBackend:
             meta["resolution_caveats"] = norm.get("caveats", [])
             meta["resolution_follow_ups"] = norm.get("follow_ups", [])
             meta["resolution_unresolved"] = norm.get("unresolved", [])
+            meta["resolution_watches"] = norm.get("watches", [])
             meta["resolution_session_id"] = norm.get("session_id", "")
             meta["resolution_engine"] = norm.get("engine", "")
             meta["resolution_transcript_path"] = norm.get("transcript_path", "")
@@ -3896,49 +3839,14 @@ class GitHubIssuesBackend:
         for key in (*_CLAIM_META_KEYS, "deferred_until", "defer_reason"):
             meta.pop(key, None)
         meta["release_wait"] = dict(wait)
-        meta["deferred_until"] = RELEASE_COMPAT_HOLD
-        meta["defer_reason"] = "Release wait compatibility fence; only a verified build event resumes it"
         self._usage_history(meta, str(item["number"]), "await_release", worker=session_id,
                             release_wait=dict(wait))
         self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
         return self.get(ident)
 
-    @_serialized_body_write
-    def defer(
-        self,
-        ident: Any,
-        *,
-        session_id: str,
-        until_iso: str,
-        reason: str,
-        progress: str = "",
-    ) -> Optional[Dict[str, Any]]:
-        """`wt defer` on a GitHub-backed ticket (OPS-100): release the claim
-        and park the issue out of the pool until ``until_iso``. Same rules as
-        the local queue.defer; the window lives in the metadata block, so it
-        survives across hosts and expires by the clock with no further edit."""
-        item = self.get(ident)
-        if item is None:
-            return None
-        status = item.get("status")
-        if status not in ("open", "in_progress"):
-            raise ValueError(f"{item.get('ref')} is {status}; only an open or in-progress "
-                             "ticket can be deferred")
-        holder = str(item.get("claimed_by") or "")
-        if status == "in_progress" and holder and session_id and holder != str(session_id):
-            raise ValueError(f"{item.get('ref')} is claimed by {holder}, not {session_id}")
-        number = str(item["number"])
-        body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
-        if progress:
-            _append_history(meta, "progress", worker=str(session_id), text=_clip(progress, 24000))
-        for key in ("claimed_by", "claimed_machine", "claimed_at", "claimed_session_id"):
-            meta.pop(key, None)
-        meta["deferred_until"] = until_iso
-        meta["defer_reason"] = _clip(reason, 2000)
-        self._usage_history(meta, number, "defer", worker=str(session_id),
-                            until=until_iso, reason=_clip(reason, 2000))
-        self._edit_body(item, body, meta, "--remove-label", self.in_progress_label)
-        return self.get(ident)
+    def defer(self, *args, **kwargs):
+        from .release_wait import DEFER_GUIDANCE
+        raise ValueError(DEFER_GUIDANCE)
 
     @_serialized_body_write
     def block(

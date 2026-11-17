@@ -122,3 +122,18 @@ Use `wt duplicate <ref> --clear` to reopen it for independent work.
 Links are local-queue only; chains, cycles, plan groups, and weaker original
 gates are refused. Only link tickets whose acceptance criteria are covered by
 the original, and include every affected route in its verification evidence.
+
+
+## Future evidence (WT-87)
+
+`wt defer` and timed ticket parking are retired. Work, close, use `--after` for
+a ticket dependency, block on a named person, or await-release for integrated
+code. Never replace a timer with an event-wait ticket. For future natural
+evidence, install a permanent registered check and close with `--caveat` and
+repeatable `--watch NAME`. Register with `wt monitor --register NAME --cmd CMD
+--cwd PATH --where HOST --schedule TEXT --every SECONDS -q OPS`. Check receipts
+need JSON status/pass|fail|pending, real_data and evidence; only a first real-data
+pass clears the owner's watching list. A failure files a new deduplicated
+ticket linked to the closed original. If no runnable check exists, record the
+unverified part as an unresolved item under the owner's policy, preserving
+genuine remaining actions and their tracking refs. See docs/worker-runbook.md.

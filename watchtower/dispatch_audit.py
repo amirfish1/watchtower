@@ -30,7 +30,7 @@ def record(queue: str, *, items: list[dict], depth: int | None,
         return None
     fields = ("ref", "created_at", "updated_at", "auto_eligible",
               "manual_eligible", "work_it", "claimable", "no_auto_drain",
-              "run_requested", "readiness", "model_floor", "deferred_until",
+              "run_requested", "readiness", "model_floor",
               "pipeline_foreign", "pipeline_missing", "needs_input",
               "watchtower_runnable", "watchtower_label", "type", "placement",
               "duplicate_of")

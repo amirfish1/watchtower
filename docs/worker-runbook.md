@@ -168,8 +168,8 @@ Applies to every ticket, quick or deep.
   when the evidence requires it. For measured problems, re-measure under the
   conditions that produced them (cold paths, cache misses, real load).
 - **A follow-up carries separate work, never the ticket's own goal.** If the
-  symptom still reproduces, keep the ticket open (`wt block`, or `wt defer` while
-  data accumulates) instead of closing with the remainder in a follow-up.
+  symptom still reproduces, continue working or preserve a genuine person/ticket
+  gate. For future natural evidence, use the permanent-watch policy below.
 - **Partial is labelled partial**: a close that leaves part of the ask undone
   starts its `--summary` with `PARTIAL:` and cites the follow-up ref.
 
@@ -220,8 +220,8 @@ Use `wt reopen REF --reason ...` to return an incorrectly parked wait to work.
 BYM/WatchTower waits conservatively to one live check, preserving the old window
 in `release_wait.previous_defer`. It reports missing commits/paths and ambiguous
 targets rather than guessing; use `--repo`/`--target` to resolve those explicitly.
-Legacy `wt defer --awaits release` also enters the untimed status when a known
-BYM/WatchTower target can be inferred, or an explicit `--target` is supplied. Integration defers and data windows stay unchanged.
+`wt defer` is retired, including its former release spelling. Use
+`wt await-release` explicitly; historical fields exist only in migration receipts.
 
 ## Proportional verification and waits
 
@@ -243,7 +243,8 @@ adoption check. Communicate using actual session IDs, not reply aliases that
 the chosen transport cannot resolve. Once adoption evidence covers your
 commit, use it and move on. Do not hold a worker slot for peer watches or
 future data: if necessary evidence is pending, record the exact trigger and
-success check, use a bounded `wt defer`, then claim the next ready ticket.
+success check as a registered permanent watch on the close, then claim the
+next ready ticket. Never create a ticket timer or replacement event-wait state.
 Do not mark an unresolved acceptance criterion complete to free a slot.
 
 ## Customer reports: sentence coverage and action coverage
@@ -304,10 +305,9 @@ quality standard required on every ticket. Set by owners and system filers
 that know what they file, not by workers filing follow-ups. A deep claim's JSON
 carries `deep_brief`; follow it:
 
-1. **Evidence first.** If you lack the data to know the cause, build the
-   logging, ship it, decide how much data and how long, then
-   `wt defer REF --until +24h --reason "..." --progress "..."`. The ticket leaves
-   your claim and the pool, and returns when the window ends.
+1. **Evidence first.** Build logging and permanent checks when future natural
+   evidence is needed. Finish what can be verified now and use the permanent-watch
+   close policy below; never park a ticket for a later data window.
 2. **Options memo** with 3-5 candidates, at least one a *product* option (cut
    scope, tier the data, change the UX). Read the queue learnings' *Product
    constraints* first; if the best option needs an owner decision, `wt block`
@@ -320,14 +320,37 @@ carries `deep_brief`; follow it:
    work and next checkpoint plan. Continue authorized work while evidence
    supports progress, including across sessions or days. After two attempts
    in a row with no measured gain, stop repeating that approach and reassess
-   evidence/options before changing approach. Defer for data; block only for
+   evidence/options before changing approach. Watch future evidence; block only for
    a genuine decision, access or authorization gap. Leave resumable progress
    before ending a session. A checkpoint/session ending never makes incomplete
    work done; exceeding an explicit cap still requires approval.
 5. **Close** only when the goal is met, with the measurement in the summary.
 
-`wt defer` is not `wt block`: defer waits for *data* (no human involved, the
-ticket returns on its own); block waits for a *decision*.
+### Future evidence belongs to permanent checks
+
+`wt defer` and ticket `--until` windows are retired. There is no replacement
+`await event` mechanism. Tickets are being worked, closed, dependent on another
+ticket (`--after`), blocked on a named person, or code complete awaiting release.
+A short wait for an already-running check belongs inside the worker's turn.
+
+For natural customer behavior, scheduled QA, recurrence or other future evidence:
+finish what can be verified now, install a permanent check, and close with
+`--caveat "what remains unverified" --watch NAME` (repeatable). The registered
+check specifies its command, working directory, where/how often it runs and the
+original ticket. Use `wt monitor --register NAME --cmd CMD --cwd PATH --where HOST
+--schedule TEXT --every SECONDS -q OPS`, then `wt close REF ... --watch NAME`.
+The daemon schedules checks, never tickets. A check emits JSON with `status`
+(`pass`, `fail`, `pending`), `real_data` and `evidence`. Only an explicit real-data
+pass clears the owner's watching list. Fixture-only success or no qualifying
+records stays pending. The check continues after its first pass; failures file a
+new deduplicated ticket linked to the closed original, which is never reopened.
+
+Owner view and the morning digest list closed tickets whose watch has not yet
+passed on real data, including check, location, schedule and last result. Never
+register an invented or nonrunnable check just to close. If no runnable check
+can be installed, close with an honest unresolved item under the owner's WT-87
+policy, preserving any genuine remaining action and its tracking ref. Never
+waive customer-send, money, privacy, model-spend or other approval gates.
 
 ### "Waiting for release" must be true
 
@@ -359,10 +382,9 @@ wt await-release REF --worker ID --commit SHA --release-branch origin/BRANCH \
   this policy grants no new access or approval.
 - Never switch the branch of a shared checkout to get onto the release branch.
   Work in your own worktree off a fresh copy of it.
-- A deliberate hold on unmerged source (waiting for data, an approval, a
-  dependency) stays a plain `wt defer` or `wt block` with its real reason.
-- A plain `wt defer` whose reason mentions a release still works but prints a
-  note asking for `--awaits`.
+- Preserve actual approval and named-person holds with `wt block`; use
+  `--after` for ticket dependencies. Future natural evidence uses permanent
+  watches on a close, never a source/data timer.
 
 ### Say who a block waits on
 

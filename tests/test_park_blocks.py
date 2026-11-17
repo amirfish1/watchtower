@@ -195,30 +195,19 @@ def test_relink_repairs_legacy_duplicate_without_changing_wait_or_history(wt):
 
 
 @pytest.mark.parametrize("state", ["delivering", "queued"])
-def test_redefer_repairs_legacy_answer_and_preserves_window_and_wait(wt, state):
-    from watchtower import liveness
-
+def test_retired_defer_cannot_drop_or_rewrite_pending_answers(wt, state):
     parked = _parked(wt)
     ans = wt.q.answer(parked["ref"], "observe real events; never manufacture them")
-    resumed = wt.q.resume_claim(parked["ref"], ans["pending_answer"]["gen"])
-    until = wt.q.defer(parked["ref"], "w1", "+2d", "collect observations")["deferred_until"]
+    wt.q.resume_claim(parked["ref"], ans["pending_answer"]["gen"])
     with wt.q._FileLock(wt.q._lock_path()):
         data = wt.q._load_unlocked()
         item = next(i for i in data["items"] if i["ref"] == parked["ref"])
-        item["pending_answer"] = dict(resumed["pending_answer"], state=state)
-        item["wait"] = {"on": "worker", "at": "2026-11-14T00:05:42Z"}
+        item["pending_answer"]["state"] = state
         wt.q._save_unlocked(data)
     before = wt.q.get(parked["ref"])
-    fixed = wt.q.defer(parked["ref"], "w1", until, before["defer_reason"])
-    assert fixed["deferred_until"] == before["deferred_until"]
-    assert fixed["defer_reason"] == before["defer_reason"]
-    assert fixed["wait"] == before["wait"]
-    assert fixed["history"][:len(before["history"])] == before["history"]
-    assert fixed["pending_answer"]["state"] == "handed_off"
-    for field in ("gen", "answer", "question", "prior_session_id", "prior_worker_id"):
-        assert fixed["pending_answer"][field] == before["pending_answer"][field]
-    assert liveness.row_of(fixed).id == "time.deferred"
-    assert not fixed.get("claimed_by")
+    with pytest.raises(ValueError, match="retired"):
+        wt.q.defer(parked["ref"], "w1", "+2d", "collect observations")
+    assert wt.q.get(parked["ref"]) == before
 
 
 def test_list_blocked_shows_parked_and_routing(wt):

@@ -1,8 +1,7 @@
 # Event-driven release waits (WT-82)
 
 `awaiting_release` means the fix is already integrated, with acceptance evidence
-or an explicit live-check instruction. It is independent of `deferred`, whose
-clock is for accumulating data. The operational commands and targets are in
+or an explicit live-check instruction. Timed ticket parking is retired by WT-87. The operational commands and targets are in
 [the worker runbook](worker-runbook.md#code-complete-awaiting-release-wt-82).
 
 ## Event sources and completion
@@ -33,10 +32,9 @@ wait record fence an event against newer claims, closes and replacement waits.
 GitHub writes also re-read the event before reopening/closing; GitHub has no
 server-side compare-and-swap, so its existing cross-host write limitation remains.
 
-An old GitHub reader would otherwise interpret an unclaimed open issue as ready.
-A wire-level year-9999 defer sentinel prevents that. Current readers suppress
-this compatibility field and expose the distinct, untimed release state; the
-event or a manual reopen removes it. There is no scheduled worker check.
+GitHub stores an explicit `release_wait` gate, without a synthetic expiry.
+All active hosts must run WT-87 or later; older readers are unsupported.
+A release event or a manual reopen removes the explicit gate.
 
 ## Migration and reversal
 
@@ -44,15 +42,13 @@ event or a manual reopen removes it. There is no scheduled worker check.
 release branch. It validates reachability and target, fences the old defer
 reason, and keeps `previous_defer` for reversal. It never migrates integration
 holds, untyped data waits, or active claims. Unknown paths/targets are reported
-and accept explicit `--repo`/`--target` overrides. Legacy typed release defers
-with a known target now enter the new state directly, avoiding new timer churn
-from warm workers using an older prompt.
+and accept explicit `--repo`/`--target` overrides. Legacy typed release defers can only be imported by the explicit migration
+command; `wt defer` always refuses, including the former release spelling.
 
-To reverse a migration, `wt reopen REF --reason 'restore legacy release wait'`,
-then `wt defer REF --until ORIGINAL_UNTIL --reason ORIGINAL_REASON` **without**
-`--awaits release` (which redirects to the new state). The originals live in
-`release_wait.previous_defer` and the `await_release` history entry. Restore
-an elapsed window using a newly bounded data/check window rather than a past date.
+To reverse a migration, use `wt reopen REF --reason 'release wait correction'`
+and record the genuine dependency/person gate or correct `wt await-release`.
+The originals remain in `release_wait.previous_defer` and history for audit;
+never restore a ticket timer.
 
 Owner inventory is separate (`wt ls --status awaiting_release`, owner-view's
 `awaiting_release`, health/queue counts). Default active lists omit it. Owner

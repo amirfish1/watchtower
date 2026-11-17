@@ -47,7 +47,6 @@ Item shape::
       "lane": "normal",                  # normal | express
       "depth": "deep",                   # only when deep (absent = quick);
                                          # + "budget_min": 90
-      "deferred_until": "...",           # `wt defer`: unclaimable until then
       "source": "wt",                    # which tool created it
       "note": "...",                     # short request
       "text": "...",                     # full prompt for a worker
@@ -126,10 +125,6 @@ VALID_LANES = ("normal", "express")
 # ``budget_min`` is an active-work checkpoint interval for deep tickets only.
 VALID_DEPTHS = ("quick", "deep")
 DEEP_DEFAULT_BUDGET_MIN = 90
-# `wt defer`: the longest a ticket may sit out of the claim pool waiting for
-# data. Longer waits are a human decision (`wt block`), not a data window.
-DEFER_MAX_S = 7 * 24 * 3600
-
 VALID_ITEM_TYPES = ("bug", "feature", "")
 # An item with no (or unknown) type is a bug by default. A ticket filed without
 # a type must never silently vanish from a type-restricted queue (e.g. a
@@ -2833,10 +2828,6 @@ def _claim_candidates(
     candidates = [it for it in candidates
                   if not _affinity_reserved(it, _now_ts)
                   or (claimer is not None and _affinity_owner(it, claimer[0], claimer[1]))]
-    # `wt defer`: a ticket waiting for its data window is out of the pool (and
-    # out of count_claimable, so nothing is spawned for it) until the window
-    # ends; then it is ordinary open work again.
-    candidates = [it for it in candidates if not deferred_now(it, _now_ts)]
     # Plan gate (WT-22): a ticket is planned BEFORE a build worker claims it,
     # so one whose plan has not settled is not claimable yet.
     candidates = [it for it in candidates if not plan_pending(it)]
@@ -3453,6 +3444,8 @@ def _normalize_resolution(resolution: Any) -> Optional[Dict[str, Any]]:
         val = _clip(resolution.get(field, ""), max_len)
         if val:
             out[field] = val
+    if resolution.get("watches"):
+        out["watches"] = [dict(w) for w in resolution["watches"]]
     for field in ("caveats", "follow_ups", "unresolved"):
         raw = resolution.get(field)
         if raw is None:
@@ -5506,6 +5499,10 @@ def close(
     (e.g. dedup-close) pass no ``session_id`` and are unaffected. ``force=True``
     bypasses the guard for a human deliberately force-closing someone's ticket."""
     cur = get(ident)
+    if isinstance(resolution, dict) and resolution.get("watches"):
+        from . import watches
+        resolution = dict(resolution, watches=watches.snapshots(
+            [w["name"] for w in resolution["watches"]], (cur or {}).get("ref", str(ident))))
     if cur is not None and cur.get("duplicate_of"):
         raise ValueError(f"{cur.get('ref', ident)} follows duplicate original {cur['duplicate_of']}; clear the link before independent work")
     if _github_backend_for_project(_project_from_ident(ident)) is None:
@@ -9578,105 +9575,10 @@ def auto_decisions(queue: str = "") -> List[Dict[str, Any]]:
     return out
 
 
-_DEFER_REL_RE = _re.compile(r"^\+?(\d+)\s*([mhd])$", _re.IGNORECASE)
-
-
-def parse_defer_until(value: Any, now: Optional[float] = None) -> float:
-    """Epoch seconds for a `wt defer --until` value: relative ``+90m`` /
-    ``+24h`` / ``+2d``, or an ISO-8601 timestamp (naive = UTC). Must be in
-    the future and within DEFER_MAX_S. Raises ValueError otherwise."""
-    now = time.time() if now is None else now
-    raw = str(value or "").strip()
-    if not raw:
-        raise ValueError("--until is required (e.g. +24h or 2026-10-24T09:00Z)")
-    m = _DEFER_REL_RE.match(raw)
-    if m:
-        ts = now + int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2).lower()]
-    else:
-        try:
-            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-        except ValueError:
-            raise ValueError(f"unrecognised --until {raw!r}: use +90m/+24h/+2d or an ISO time")
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        ts = dt.timestamp()
-    if ts <= now:
-        raise ValueError("--until must be in the future")
-    if ts - now > DEFER_MAX_S:
-        raise ValueError(f"--until is more than {DEFER_MAX_S // 86400} days away; a wait that "
-                         "long is a human decision -- use `wt block` instead")
-    return ts
-
-
-def deferred_now(item: Dict[str, Any], now: Optional[float] = None) -> bool:
-    """True while ``item`` is inside a `wt defer` window."""
-    until = (item or {}).get("deferred_until")
-    if not until:
-        return False
-    return _iso_ts(until) > (time.time() if now is None else now)
-
-
-def defer(ident: Any, session_id: str, until: Any, reason: str,
-          progress: str = "") -> Optional[Dict[str, Any]]:
-    """Take a claimed ticket out of the claim pool until ``until`` while data
-    accumulates (`wt defer`). The ticket goes back to ``open`` -- not
-    blocked: no human question is pending -- but is unclaimable and uncounted
-    for staffing until the window ends, then any worker picks it up again
-    with the ``progress``/``reason`` notes in its history. Only the claimant
-    of an in_progress ticket (or anyone, on an open one) may defer it.
-    GitHub-backed queues keep the window in the issue's metadata block."""
-    reason = str(reason or "").strip()
-    if not reason:
-        raise ValueError("--reason is required: say what data you are waiting for")
-    ts = parse_defer_until(until)
-    until_iso = datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    backend = _github_backend_for_project(_project_from_ident(ident))
-    if backend is not None:
-        before = backend.get(ident)
-        it = backend.defer(ident, session_id=str(session_id or ""), until_iso=until_iso,
-                           reason=reason, progress=str(progress or ""))
-        if it:
-            _log("DEFER", f"{it.get('ref', '?')} until {until_iso} — {_clip(reason, 200)}",
-                 queue=it.get("project", ""))
-            if (before or {}).get("status") == "in_progress":
-                _note_worker_ticket_done(session_id)
-        return it
-    with _FileLock(_lock_path()):
-        data = _load_unlocked()
-        for it in data["items"]:
-            if not _matches(it, ident):
-                continue
-            status = it.get("status")
-            if status not in ("open", "in_progress"):
-                raise ValueError(f"{it.get('ref')} is {status}; only an open or in-progress "
-                                 "ticket can be deferred")
-            if group_role(it) == "parent":
-                raise ValueError(f"{it.get('ref')} is a group parent; defer its members")
-            holder = str(it.get("claimed_by") or "")
-            if status == "in_progress" and holder and session_id and holder != str(session_id):
-                raise ValueError(f"{it.get('ref')} is claimed by {holder}, not {session_id}")
-            now = _now_iso()
-            actor = _by("worker", str(session_id or ""),
-                        str(_coerce_session_uuid(session_id) or ""))
-            if progress:
-                _append_history(it, "progress", by=actor, at=now, text=_clip(progress, 24000))
-            if status == "in_progress":
-                _release_claim_to_open_unlocked(it, now, "deferred: " + reason)
-            # A deferred ticket has no delivery claim. Keep the answer for
-            # the next claimer, including legacy open records left in flight.
-            _reopen_pending_unlocked(it, now, "handoff", "deferred: " + reason)
-            it["deferred_until"] = until_iso
-            it["defer_reason"] = _clip(reason, 2000)
-            it["updated_at"] = now
-            _append_history(it, "defer", by=actor, at=now, until=until_iso,
-                            reason=_clip(reason, 2000))
-            _save_unlocked(data)
-            _log("DEFER", f"{it.get('ref', '?')} until {until_iso} — {_clip(reason, 200)}",
-                 queue=it.get("project", ""))
-            if status == "in_progress":
-                _note_worker_ticket_done(session_id)
-            return it
-    return None
+def defer(*args, **kwargs):
+    """Retired API: never create a ticket timer, including from old callers."""
+    from .release_wait import DEFER_GUIDANCE
+    raise ValueError(DEFER_GUIDANCE)
 
 
 def await_release(ident: Any, session_id: str, wait: Dict[str, Any],

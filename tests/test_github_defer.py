@@ -26,33 +26,15 @@ def _github_queue(tmp_path, monkeypatch):
     return state, q
 
 
-def test_github_defer_releases_claim_and_holds_ticket_out_of_pool(tmp_path, monkeypatch):
-    state, q = _github_queue(tmp_path, monkeypatch)
-    item = q.enqueue(project="GHI", note="wait for deploy")
-    q.claim_by_ref(item["ref"], "worker-1")
-
-    deferred = q.defer("GHI-1", "worker-1", "+90m", "waiting for prod deploy",
-                       progress="pushed to next")
-
-    assert deferred["status"] == "open"
-    assert not deferred.get("claimed_by")
-    assert q.deferred_now(deferred)
-    assert deferred["defer_reason"] == "waiting for prod deploy"
-    assert [e["event"] for e in deferred["history"]] == ["claim", "progress", "defer"]
-    assert q.claim_next("worker-2", project="GHI") is None
-    assert q.count_claimable(project="GHI") == 0
-    issue = json.loads(state.read_text())["issues"][0]
-    assert "deferred_until:" in issue["body"]
-
-
-def test_github_defer_window_lapses_without_an_issue_edit(tmp_path, monkeypatch):
+def test_github_defer_api_refuses_without_releasing_claim(tmp_path, monkeypatch):
+    import pytest
     _state, q = _github_queue(tmp_path, monkeypatch)
-    item = q.enqueue(project="GHI", note="wait for data")
-    q.defer(item["ref"], "worker-1", "+1h", "waiting for data")
-    assert q.claim_next("worker-2", project="GHI") is None
-
-    real_time = time.time
-    monkeypatch.setattr(time, "time", lambda: real_time() + 2 * 3600)
-
-    claimed = q.claim_next("worker-2", project="GHI")
-    assert claimed and claimed["ref"] == "GHI-1"
+    item = q.enqueue(project="GHI", note="future evidence")
+    q.claim_by_ref(item["ref"], "worker-1")
+    before = q.get(item["ref"])
+    with pytest.raises(ValueError, match="retired"):
+        q.defer(item["ref"], "worker-1", "+90m", "waiting for data")
+    backend = q._github_backend_for_project("GHI")
+    with pytest.raises(ValueError, match="retired"):
+        backend.defer(item["ref"], session_id="worker-1", until_iso="2099-01-01T00:00:00Z", reason="data")
+    assert q.get(item["ref"]) == before

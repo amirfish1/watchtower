@@ -84,7 +84,7 @@ def observe(target, build, *, evidence, items=None):
     """Apply a successful release/adoption report once to each matching wait.
 
     A CAS includes the whole wait generation. Repeated reports do nothing after
-    it leaves this status, including when a live check later defers for data.
+    it leaves this status, including when a live check later closes with a permanent watch.
     """
     validate_target(target)
     if not _SHA.fullmatch(build or "") or not str(evidence or "").strip():

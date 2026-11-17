@@ -62,8 +62,7 @@ _FROZEN: Dict[str, tuple] = {
     "gate_pending": ("none", "verify", "review"),
     "assessment": ("none", "due", "running", "filing", "done", "failed"),
     "block": ("none", "input", "rationale", "awaiting-client"),
-    # "deferred" is projection-only: inside a `wt defer` window (WT-15).
-    "readiness": ("claimable", "needs-shaping", "needs-spec", "needs-rationale", "deferred"),
+    "readiness": ("claimable", "needs-shaping", "needs-spec", "needs-rationale"),
     "dep": ("ok", "waiting", "stuck"),
     "claimed": _BOOLS,
     "parked": _BOOLS,
@@ -98,7 +97,7 @@ def live_vocab() -> Dict[str, tuple]:
         "disc": tuple(q.DISC_STATUSES), "awaiting": tuple(q.DISC_AWAITING),
         "gate_pending": tuple(q.GATE_KINDS), "assessment": tuple(q.ASSESSMENT_STATUSES),
         "block": ("none",) + tuple(q.BLOCK_KINDS),
-        "readiness": ("claimable",) + tuple(q.UNCLAIMABLE_READINESS) + ("deferred",),
+        "readiness": ("claimable",) + tuple(q.UNCLAIMABLE_READINESS),
         "dep": tuple(q.DEP_VERDICTS), "claimed": _BOOLS, "parked": _BOOLS,
         "answer": tuple(q.ANSWER_STATES),
         "group": ("none",) + tuple(q.GROUP_ROLES),
@@ -250,12 +249,8 @@ ROWS: Tuple[Row, ...] = (
           {"plan": "discussing", "disc": "active", "awaiting": ("none", "reviewer")}),
          status=_LIVE, gated=True, backend="file", block="none", answer=SETTLED),
     _row("human.readiness", "human", "-", "-", NOT_PA,
-         status="open", readiness=_not("readiness", "claimable", "deferred"), block="none",
+         status="open", readiness=_not("readiness", "claimable"), block="none",
          answer=SETTLED),
-    # `wt defer`: open but unclaimable until deferred_until, on purpose (WT-15).
-    # claim_next and health skip it too; the clock, not the pool, owns it.
-    _row("time.deferred", "time", "-", "-", NOT_PA,
-         status="open", readiness="deferred", block="none", answer=SETTLED),
     _row("dep.waiting", "dependency", "-", "-", _and(NOT_PA, _POOL_GROUP),
          status="open", readiness="claimable", dep="waiting", block="none", answer=SETTLED),
     _row("dep.stuck", "reconciler", "system_op", "_escalate_stuck_blockers", NOT_PA,
@@ -497,8 +492,6 @@ def project(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = 
         if readiness not in q.VALID_READINESS:
             raise UndeclaredState(f"undeclared readiness value {readiness!r}")
         readiness = "claimable"
-    if q.deferred_now(item, now):
-        readiness = "deferred"   # outranks shaping: nothing to do until it ends
     if item.get("blocked_by") or item.get("duplicate_of"):
         if by_ref is None:
             by_ref = q._refs_index(q.list_items())
@@ -938,13 +931,11 @@ Steps (request {n} of at most {OWNER_ROUTE_MAX}):
      (WT-39; `wt deploy --json`, then `wt deploy --sync`), so its sweep renews
      it. Close this request once a fresh heartbeat shows on {ref}.
    - Dead: {host}'s own backstop recovers it. Close this request once it has.
-3. {host} unreachable (ssh or `wt` there fails): an external wait, not a
-   question. `wt defer` this request `--until +2h --reason "{host} unreachable:
-   <error>"` and redo steps 1-2 when it returns. After 3 such defers, close it
-   with `--unresolved "{host} unreachable since <first attempt>"`; the backstop
-   files the next request a stall window later.{last} Ask a human (`wt block`)
-   only for a credential or device you established is missing, never for
-   reachability alone.
+3. {host} unreachable (ssh or `wt` there fails): record the evidence gap,
+   preserve any existing credential/device owner decision, and close this
+   recovery request with an unresolved item if no runnable permanent connectivity
+   check exists. Never park it on a timer. A permanent monitor must file a new
+   linked request on failure.{last}
 
 Safe stop. This request does not authorize `wt release --force`, closing or
 editing {ref}, stopping its worker, or resetting or extending any budget,
@@ -1000,9 +991,10 @@ Steps (request {n} of at most {OWNER_ROUTE_MAX}):
    - Dead: hand it back explicitly with `wt release {ref}` from {host}
      (it refuses a ticket with an open question; leave that one alone), then
      close this request citing the release.
-3. Unsure: `wt defer` this request `--until +2h --reason "<what is unclear>"`
-   and redo steps 1-2. Ask a human (`wt block`) only for a credential or device
-   you established is missing.{last}
+3. Unsure: record the evidence gap and preserve a real named-person or ticket
+   gate. Future evidence needs a permanent check on a close, never a timer.
+   Ask a human (`wt block`) only for a credential or device you established
+   is missing.{last}
 
 Safe stop. This request does not authorize closing or editing {ref}'s body,
 stopping a worker you have not proven dead, or resetting or extending any
@@ -1155,18 +1147,6 @@ def fingerprint(item: Dict[str, Any],
                (item.get("stage_session") or {}).get("key")]
     return hashlib.sha1(json.dumps(payload, sort_keys=True, default=str).encode()
                         ).hexdigest()[:16]
-
-
-def _post_defer_unclaimed(item: Dict[str, Any]) -> bool:
-    """True when the ticket's last lifecycle event is a `wt defer` (nothing has
-    claimed it since the window was set)."""
-    for h in reversed(item.get("history") or []):
-        t = h.get("type") or h.get("event") if isinstance(h, dict) else None
-        if t == "defer":
-            return True
-        if t in ("claim", "close", "block", "answer"):
-            return False
-    return False
 
 
 def _store_activity(item: Dict[str, Any]) -> float:
@@ -1444,12 +1424,7 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
     if action in _LOOP_GUARDED:
         bs = item.get("backstop") if isinstance(item.get("backstop"), dict) else {}
         if bs.get("state") == row.id and bs.get("fingerprint") == fingerprint(item, by_ref):
-            if action == "spawn" and _post_defer_unclaimed(item):
-                # A `wt defer` window ended and the pool has not picked the
-                # ticket up yet: that is staffing latency, not a stall the
-                # owner can fix. Keep spawning instead of raising a block.
-                pass
-            elif bs.get("action") == "resume" and action in ("resume", "reopen"):
+            if bs.get("action") == "resume" and action in ("resume", "reopen"):
                 action, reason = "reopen", "resumed builder made no progress"
             else:
                 action = "escalate"

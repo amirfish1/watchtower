@@ -819,8 +819,6 @@ def cmd_find(args: argparse.Namespace) -> int:
         print(f"  accept: {item['accept']}")
     if q.is_deep(item):
         print(f"  depth: deep ({item.get('budget_min') or q.DEEP_DEFAULT_BUDGET_MIN}m budget)")
-    if q.deferred_now(item):
-        print(f"  deferred until {item.get('deferred_until')}: {item.get('defer_reason') or ''}")
     if checks:
         print("  " + checks.replace("\n", "\n  "))
     if worker:
@@ -2277,6 +2275,8 @@ def _resolution_from_args(
         "follow_ups": list(args.follow_up or []),
         "unresolved": list(args.unresolved or []),
     }
+    if getattr(args, "_watch_specs", None):
+        res["watches"] = args._watch_specs
     if getattr(args, "commit", ""):
         res["commit"] = args.commit
     if getattr(args, "no_code", False):
@@ -2617,6 +2617,13 @@ def cmd_close(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    if getattr(args, "watch", None):
+        try:
+            from . import watches
+            args._watch_specs = watches.snapshots(args.watch, args.ref)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     if args.commit:
         verified, error = _verify_close_commit(args.ref, args.commit)
         if error:
@@ -3551,59 +3558,11 @@ def cmd_release_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+
 def cmd_defer(args: argparse.Namespace) -> int:
-    """Wait for data, not for a human: the ticket leaves your claim and the
-    claim pool until --until, then any worker resumes it from your progress
-    note. For a decision you need from a human, use `wt block`."""
-    from . import config, release_wait
-    awaits = str(getattr(args, "awaits", "") or "")
-    reason = args.reason
-    try:
-        if awaits == "integration":
-            raise ValueError(release_wait.INTEGRATION_GUIDANCE)
-        if awaits and awaits != "data":
-            # Checked before anything is written: a fix that is not on the
-            # release branch is refused as "awaiting release".
-            item = q.get(args.ref)
-            if not item:
-                print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
-                return 1
-            repo = str(getattr(args, "repo", "") or item.get("repo_path")
-                       or config.repo_path(item.get("project", "")) or os.getcwd())
-            claim = release_wait.check(
-                awaits, repo, commit=getattr(args, "commit", ""),
-                branch=getattr(args, "release_branch", ""),
-                owner=getattr(args, "integration_owner", ""),
-                path=getattr(args, "integration_path", ""))
-            if awaits == "release":
-                from . import releases
-                target = getattr(args, "target", "") or releases.migration_target(repo)
-                if target:
-                    item = releases.park(args.ref, args.worker or _default_worker_id(),
-                                         repo=repo, commit=args.commit, branch=args.release_branch,
-                                         target=target, reason=args.reason, progress=args.progress)
-                    print(json.dumps(item, indent=2) if args.json else
-                          f"AWAITING RELEASE: {_display_ref(item)} → {target} (no timer wake)")
-                    return 0
-            reason = f"{claim['tag']} {reason}".strip()
-        item = q.defer(args.ref, args.worker or _default_worker_id(), args.until,
-                       reason, progress=args.progress)
-    except ValueError as e:
-        print(f"error: {e}", file=sys.stderr)
-        return 1
-    if not item:
-        print(f"(no item {_display_ref(args.ref)})", file=sys.stderr)
-        return 1
-    note = release_wait.hint(awaits, args.reason)
-    if note:
-        print(note, file=sys.stderr)
-    if args.json:
-        print(json.dumps(item, indent=2))
-        return 0
-    print(f"DEFERRED: {_display_ref(item)} until {item['deferred_until']} — {item.get('defer_reason')}")
-    print("  the ticket left your claim; it returns to the pool when the window ends. "
-          "You may claim the next ticket now.")
-    return 0
+    from .release_wait import DEFER_GUIDANCE
+    print("error: " + DEFER_GUIDANCE, file=sys.stderr)
+    return 1
 
 
 def cmd_blocked(args: argparse.Namespace) -> int:
@@ -5411,6 +5370,25 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     (non-zero exit), file a ticket into the queue so a worker drains it. Pair
     with cron/launchd for scheduled sanity checks (e.g. a landing page)."""
     from . import queue as q
+    if getattr(args, "register", "") or getattr(args, "run", "") or getattr(args, "list", False):
+        from . import watches
+        try:
+            if args.register:
+                result = watches.register(args.register, command=args.cmd, cwd=args.cwd,
+                                          where=args.where, schedule=args.schedule,
+                                          queue=args.queue, every=args.every)
+            elif args.run:
+                result = watches.run(args.run, limit=1000)
+            else:
+                result = watches._load()["checks"]
+            print(json.dumps(result, indent=2))
+            return 0
+        except (ValueError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+    if not args.cmd or not args.queue:
+        print("error: monitor needs --cmd and -q, or --register/--run/--list", file=sys.stderr)
+        return 1
     rc = os.system(args.cmd) >> 8
     if rc == 0:
         print(f"OK: `{args.cmd}` passed (rc=0); no ticket filed")
@@ -7341,7 +7319,7 @@ COMMAND_HELP: Dict[str, str] = {
     "close": "close a ticket (record how you fixed it)",
     "unresolved-ack": "acknowledge a closed ticket's caveat/unresolved chips (no history rewrite)",
     "block": "park a ticket that needs a human decision",
-    "defer": "take a ticket out of the pool until a data window ends (no human needed)",
+    "defer": "retired: work, close with a permanent check, or record a real gate",
     "wait-on": "say who a blocked ticket waits on: owner, external actor, dependency or worker",
     "owner-view": "blocked tickets by who they really wait on, grouped by root (any backend, read-only)",
     "blocked": "list tickets parked for a human",
@@ -7912,6 +7890,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_duplicate)
 
     s = sub.add_parser("close")
+    s.add_argument("--watch", action="append", default=[], help="registered permanent check (repeatable)")
     s.add_argument("--related-feedback", choices=["useful", "not-useful", "unavailable"], default="",
                    help="whether claim-time related work helped resolve this ticket")
     s.add_argument("--duplicate-of", default="", metavar="REF", help="link to the original instead of running another verification (requires --no-code)")
@@ -8320,35 +8299,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--json", action="store_true")
     s.set_defaults(func=cmd_owner_view)
 
-    s = sub.add_parser("defer", help=COMMAND_HELP.get("defer", ""))
-    s.add_argument("ref")
-    s.add_argument("--worker", default="", help="your session/worker id")
-    s.add_argument("--until", required=True,
-                   help="when the data window ends: +90m, +24h, +2d, or an ISO time "
-                        f"(at most {q.DEFER_MAX_S // 86400} days)")
-    s.add_argument("--reason", required=True,
-                   help="what data you are waiting for and why it is needed")
-    s.add_argument("--progress", default="",
-                   help="what you built and what the resuming worker should analyse")
-    # Parse the retired spelling only to return actionable migration guidance.
-    s.add_argument("--awaits", default="", choices=["data", "release", "integration"],
-                   metavar="{data,release}",
-                   help="what the ticket waits for. release: the fix is already on the release "
-                        "branch (checked; needs --commit and --release-branch). "
-                        "data (default): a data window or source-only hold. "
-                        "integration is retired and rejected with landing guidance")
-    s.add_argument("--commit", default="", help="the fix commit (with --awaits release)")
-    s.add_argument("--target", default="", help="release/adoption target; redirects --awaits release to an untimed wait")
-    s.add_argument("--release-branch", default="", dest="release_branch",
-                   help="the branch releases are cut from, e.g. origin/next (with --awaits release)")
-    s.add_argument("--integration-owner", default="", dest="integration_owner",
-                   help=argparse.SUPPRESS)
-    s.add_argument("--integration-path", default="", dest="integration_path",
-                   help=argparse.SUPPRESS)
-    s.add_argument("--repo", default="",
-                   help="checkout to check the commit in (default: the ticket's repo)")
-    s.add_argument("--json", action="store_true")
-    _add_redundant_queue_flag(s)
+    s = sub.add_parser("defer", help="retired: tickets never wait on a clock")
+    s.add_argument("legacy", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
     s.set_defaults(func=cmd_defer)
 
     s = sub.add_parser("undo", help="revert the commit behind a ticket's latest auto-decision and verify it")
@@ -8951,8 +8903,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_config)
 
     s = sub.add_parser("monitor")
-    s.add_argument("-q", "--queue", required=True)
-    s.add_argument("--cmd", required=True, help="shell command; non-zero exit = fail")
+    s.add_argument("--register", default="", metavar="NAME")
+    s.add_argument("--run", default="", metavar="NAME")
+    s.add_argument("--list", action="store_true")
+    s.add_argument("--cwd", default="", help="registered check working directory")
+    s.add_argument("--where", default="", help="execution host/service")
+    s.add_argument("--schedule", default="", help="human-readable cadence/location")
+    s.add_argument("--every", type=int, default=300, help="daemon check cadence in seconds (never a ticket timer)")
+    s.add_argument("-q", "--queue", default="")
+    s.add_argument("--cmd", default="", help="shell command; registered checks emit JSON status/real_data/evidence")
     s.add_argument("--title", default="", help="ticket title on failure")
     s.add_argument("--note", default="", help="ticket note on failure")
     s.set_defaults(func=cmd_monitor)

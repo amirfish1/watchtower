@@ -46,13 +46,11 @@ def deep_brief(item: Dict[str, Any]) -> str:
     lines += [
         "",
         "1. EVIDENCE FIRST. Before changing behaviour, check you have the data to "
-        "know the cause: per-phase timings, enough samples, the failing case "
-        "captured. If you don't: build the logging/instrumentation, commit and "
-        "push it, decide how much data you need and how long it takes to collect "
-        "(e.g. 24h of normal use incl. 3 restarts), then run "
-        f"`wt defer {ref} --until +24h --reason \"what data, why\" --progress "
-        "\"what you built, what to analyse next\"`. The ticket returns to the pool "
-        "when the window ends; whoever resumes reads your progress note.",
+        "know the cause. Build instrumentation and permanent checks when needed. "
+        "Never park a ticket for future data. Finish what can be verified now; "
+        "close with a caveat and a registered --watch NAME for the natural check. "
+        "If no runnable check can be installed, record an unresolved item honestly. "
+        "A watch failure files a new linked ticket; it never reopens the original.",
         "",
         "2. OPTIONS MEMO before building. List 3-5 candidate solutions with "
         "expected gain and risk. At least one MUST be a product option, not a "
@@ -74,7 +72,7 @@ def deep_brief(item: Dict[str, Any]) -> str:
         "while evidence supports progress, including across sessions or days. "
         "After two attempts in a row with no measured gain, stop repeating "
         "that approach: reassess the evidence and options before trying a "
-        "different approach. Defer when waiting for data; block only for a "
+        "different approach. Use permanent watches for future evidence; block only for a "
         "genuine decision, access or authorization gap. Preserve a resumable "
         "progress note before a session ends. Never close because a checkpoint "
         "or session ended, and never exceed an explicit cap without approval.",
@@ -88,7 +86,7 @@ def deep_brief(item: Dict[str, Any]) -> str:
         last = defers[-1]
         lines += [
             "",
-            f"RESUMING: deferred {len(defers)}x; last until {last.get('until') or '?'} "
+            f"LEGACY HISTORY: deferred {len(defers)}x (timers retired); "
             f"-- {last.get('reason') or ''}. Read the latest progress note in the "
             "ticket history and analyse the collected data before changing anything.",
         ]

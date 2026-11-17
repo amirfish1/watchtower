@@ -4,6 +4,8 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from tests.legacy_defer import seed as seed_defer
+
 from tests.test_owner_view import _load, _ticket
 from tests.test_release_wait import repo  # noqa: F401
 
@@ -115,9 +117,9 @@ def test_migration_preserves_old_window_and_never_touches_integration(env, repo,
     q, _cli, _a, _ov, name, r = env
     good = _ticket(q, name)
     reason = f"[awaits release: {repo['merged'][:12]} on origin/next] next release"
-    old = q.defer(good, "w1", "+1d", reason)
+    old = seed_defer(q, good, "w1", "+1d", reason)
     other = _ticket(q, name, worker="w2")
-    q.defer(other, "w2", "+1d", "[awaits integration: owner s; path PR] waiting")
+    seed_defer(q, other, "w2", "+1d", "[awaits integration: owner s; path PR] waiting")
     monkeypatch.setattr(r.config, "repo_path", lambda _: repo["path"])
     monkeypatch.setattr(r, "migration_target", lambda _: "ccc:dashboard")
     # GitHub backend config supplies its own path; fixture's is empty.
@@ -221,20 +223,17 @@ def test_github_production_environment_is_exact_and_url_encoded(env, monkeypatch
     assert "environment=Production%20%E2%80%93%20bookyourmat-app" in calls[0]
 
 
-def test_github_wait_is_fenced_from_older_readers(env, repo):
+def test_github_wait_uses_explicit_state_without_a_clock_sentinel(env, repo):
     q, _cli, _a, _ov, name, r = env
     if name != "GHI":
         pytest.skip("GitHub wire compatibility")
     ref = park(env, repo)
-    from watchtower.github_backend import _split_body, _effective_defer, _defer_live, RELEASE_COMPAT_HOLD
+    from watchtower.github_backend import _split_body
     item = q.get(ref)
     _, meta = _split_body(item["_github_body"])
-    assert meta["deferred_until"] == RELEASE_COMPAT_HOLD
-    assert not _effective_defer(meta)  # new readers expose no timed window
-    # Readers predating release_wait only see the immutable wire fence.
-    legacy_meta = dict(meta)
-    legacy_meta.pop("release_wait")
-    assert _defer_live(_effective_defer(legacy_meta))
+    assert "deferred_until" not in meta
+    assert meta["release_wait"] and item["status"] == "awaiting_release"
+    assert not item["work_it"] and q.claim_next("other", project=name) is None
     r.observe("ccc:dashboard", repo["merged"], evidence="process")
     item = q.get(ref)
     _, meta = _split_body(item["_github_body"])
@@ -267,15 +266,16 @@ def test_daemon_version_endpoint_reports_frozen_boot_build(env, monkeypatch, tmp
         thread.join(timeout=2)
 
 
-def test_legacy_release_defer_redirects_when_target_is_known(env, repo, monkeypatch, capsys):
+def test_legacy_release_defer_is_retired_even_when_target_is_known(env, repo, monkeypatch, capsys):
     q, cli, _a, _ov, name, r = env
     ref = _ticket(q, name)
     monkeypatch.setattr(r, "migration_target", lambda _: "ccc:dashboard")
+    before = q.get(ref)
     assert cli.main(["defer", ref, "--worker", "w1", "--until", "+1d", "--reason", "adoption",
                      "--awaits", "release", "--commit", repo["merged"],
-                     "--release-branch", "origin/next", "--repo", repo["path"], "--json"]) == 0
-    assert q.get(ref)["status"] == "awaiting_release"
-    assert not q.get(ref).get("deferred_until")
+                     "--release-branch", "origin/next", "--repo", repo["path"], "--json"]) == 1
+    assert "wt await-release" in capsys.readouterr().err
+    assert q.get(ref) == before
 
 
 def test_await_release_and_observe_cli_round_trip(env, repo, capsys):

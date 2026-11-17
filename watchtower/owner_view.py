@@ -217,9 +217,11 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
     stuck = [dep_line(r) for r in shown if r.get("dependency", {}).get("state") == "stuck"]
     unresolved = [dep_line(r) for r in shown
                   if r.get("dependency", {}).get("state") in ("not_found_here", "other_host", "no_ref")]
-    from . import releases
+    from . import releases, watches
+    watched = watches.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want])
     release_rows = releases.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want], now=now)
     return {
+        "watched": watched,
         "awaiting_release": release_rows,
         "release_attention": [r for r in release_rows if r["attention"]],
         "generated_at": now.isoformat(timespec="seconds"),
@@ -288,6 +290,9 @@ def snapshot(project: Optional[str] = None) -> Dict[str, Any]:
     warnings.extend("Fragile job: " + job["title"][:50] + "; " +
                     ", ".join(job["refs"]) + ". Fix the design, not the latest error."
                     for job in view.get("fragile_jobs") or [])
+    warnings.extend(f"Watching closed {r['ref']}: {r['check']} at {r['where']} "
+                    f"({r['schedule']}); last {r['last'].get('status', 'not-run')}"
+                    for r in view.get("watched") or [])
     view["warnings"] = warnings
     return view
 
@@ -307,6 +312,10 @@ def render(view: Dict[str, Any]) -> str:
              + (f" in {view['queue']}" if view["queue"] else "")
              + f"  (owner {c['owner']}, unclassified {c['unclassified']}, dependency "
                f"{c['dependency']}, external {c['external']}, worker {c['worker']})"]
+    lines.append(f"Closed tickets being watched: {len(view.get('watched') or [])}")
+    for row in view.get("watched") or []:
+        lines.append(f"  {row['ref']} {row['check']} at {row['where']} ({row['schedule']}); "
+                     f"last {row['last'].get('status', 'not-run')}")
     release_rows = view.get("awaiting_release") or []
     lines.append(f"Awaiting release: {len(release_rows)} (separate from deferred; no timer wake)")
     for row in view.get("release_attention") or []:

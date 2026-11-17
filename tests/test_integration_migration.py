@@ -1,6 +1,8 @@
 """WT-84 migration preserves real gates and refuses stale or ungated edits."""
 import pytest
 
+from tests.legacy_defer import seed as seed_defer
+
 from tests.test_owner_view import _load, _ticket
 from watchtower import integration_migration as migration
 
@@ -16,7 +18,7 @@ def legacy(env):
     q, _cli, _a, _ov, name = env
     ref = _ticket(q, name)
     reason = "[awaits integration abcdef123: owner reviewer; path review PR] original symptom open"
-    return ref, q.defer(ref, "w1", "+1d", reason)
+    return ref, seed_defer(q, ref, "w1", "+1d", reason)
 
 
 def test_migration_requires_a_real_gate_and_exact_snapshot(env):
@@ -48,3 +50,19 @@ def test_migration_clears_only_timer_preserving_question_claim_and_gate(env, wai
     assert receipt["previous_defer"] == {k: before[k] for k in ("defer_reason", "deferred_until")}
     with pytest.raises(ValueError, match="changed"):
         migration.retire(ref, expected_reason=before["defer_reason"], worker="migration")
+
+
+def test_generic_cleanup_fences_exact_timer_and_resumes_unfinished_work(env):
+    q, *_ = env
+    ref, before = legacy(env)
+    with pytest.raises(ValueError, match='changed'):
+        migration.retire(ref, expected_reason=before['defer_reason'], worker='migration',
+                         integration_only=False, expected_until='stale', resume_work='Finish the original fix')
+    assert q.get(ref) == before
+    after = migration.retire(ref, expected_reason=before['defer_reason'], worker='migration',
+                             integration_only=False, expected_until=before['deferred_until'],
+                             resume_work='Original symptom is still unfixed; ready for implementation, never a future-data wait')
+    assert after['status'] == 'open' and not after.get('deferred_until')
+    assert after['history'][-1]['event'] == 'timer_retired'
+    assert after['history'][-1]['resume_work'].startswith('Original symptom')
+    assert after['history'][-1]['previous_defer']['deferred_until'] == before['deferred_until']

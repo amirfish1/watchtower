@@ -141,41 +141,29 @@ def test_model_floor_above_worker_model_is_not_claimable():
     assert health.queue_status("Q", [it])["claimable_depth"] == 1
 
 
-def test_deferred_ticket_is_claimable_only_after_its_window():
-    """A `wt defer`red ticket is out of claim_next's pool until the window ends,
-    so it must not read as claimable (stalled) work in the meantime (OPS-81)."""
+def test_legacy_timer_never_changes_health_at_its_expiry():
     now = datetime.now(timezone.utc)
-    old = (now - timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    later = (now + timedelta(hours=12)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    earlier = (now - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    waiting = dict(_item(created_at=old), deferred_until=later)
-    row = health.queue_status("Q", [waiting])
-    assert row["depth"] == 1 and row["claimable_depth"] == 0
-    assert row["stuck"] is False
-    row = health.queue_status("Q", [dict(waiting, deferred_until=earlier)])
-    assert row["claimable_depth"] == 1
+    old = (now-timedelta(hours=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    it = dict(_item(created_at=old), deferred_until=(now+timedelta(hours=1)).isoformat())
+    first = health.queue_status("Q", [it], now=now)
+    later = health.queue_status("Q", [it], now=now+timedelta(hours=2))
+    assert first["claimable_depth"] == later["claimable_depth"] == 1
+    assert first["stuck"] is True and later["stuck"] is True
 
 
 def _stamp(now, delta):
     return (now - delta).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def test_expired_defer_inside_window_is_not_stuck():
-    """WT-22: a ticket whose defer expired seconds ago, in a queue quiet for
-    27m, has not been claimable long enough to call the queue stuck."""
+def test_legacy_timer_is_not_a_new_readiness_event():
     now = datetime.now(timezone.utc)
     it = _item(created_at=_stamp(now, timedelta(hours=2)))
     it["deferred_until"] = _stamp(now, timedelta(seconds=14))
     it["history"] = [{"event": "defer", "at": _stamp(now, timedelta(minutes=27))}]
     row = health.queue_status("Q", [it], now=now)
     assert row["claimable_depth"] == 1
-    assert row["since_progress_s"] >= 27 * 60
-    assert row["oldest_claimable_age_s"] == 14
-    assert row["stuck"] is False
-    assert row["state"] == "active"
-    # Once it has waited the whole window, the alarm is real again.
-    later = now + timedelta(minutes=health.STUCK_MINUTES)
-    assert health.queue_status("Q", [it], now=later)["stuck"] is True
+    assert row["oldest_claimable_age_s"] >= 27 * 60
+    assert row["stuck"] is True
 
 
 def test_ticket_released_by_cross_queue_blocker_close_is_not_stuck():

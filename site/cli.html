@@ -422,10 +422,11 @@ wt stages {tick,show} ...</div>
          <code>--actor</code>), a dependency (<code>--ref</code>), or a worker.</p>
     </div>
     <div class="cli-cmd">
-      <h3><span class="verb">wt</span> defer</h3>
-      <div class="sig">wt defer REF --until WHEN --reason TEXT [--progress TEXT] [--json]</div>
-      <p>Take a ticket out of the pool until a data window ends, with no human needed. <code>--until</code> accepts
-         <code>+90m</code>, <code>+24h</code>, <code>+2d</code>, or an ISO time, at most 7 days out.</p>
+      <h3><span class="verb">wt</span> close --watch</h3>
+      <div class="sig">wt close REF --summary TEXT --commit SHA --caveat TEXT --watch NAME</div>
+      <p>Close verified work and attach a registered permanent check for future evidence.
+         Owner view lists the check until its first real-data pass; failures file a new related ticket.
+         Timed ticket parking (<code>wt defer</code>) is retired.</p>
     </div>
     <div class="cli-cmd">
       <h3><span class="verb">wt</span> unresolved-ack</h3>
@@ -533,7 +534,7 @@ wt export-json [-o OUT]</div>
 <span class="cmd">wt block   DEMO-1 --question "ship behind a flag?" \</span>
 <span class="cmd">          --progress "root cause found; fix drafted"</span>  <span class="cm"># park for a human decision</span>
                                <span class="cm">#   (--kind input|rationale|awaiting-client; --wait-on owner|external|dependency|worker)</span>
-<span class="cmd">wt defer   DEMO-1 --until +24h --reason "need a day of data"</span>  <span class="cm"># out of the pool until a data window ends</span></pre></div>
+<span class="cmd">wt close DEMO-1 --summary "fixed" --commit &lt;SHA&gt; --caveat "natural evidence pending" --watch regression-check</span></pre></div>
     </div>
     <div class="note">
       <b>Closes carry how it was fixed.</b> <code class="inline-code">wt close</code> requires <code>--summary</code>

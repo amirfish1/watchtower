@@ -461,7 +461,7 @@ INTEGRATION_CONTRACT = (
     "with `wt edit PARENT --after CHILD`. Real owner/customer/money/reviewer "
     "gates stay `wt block --wait-on owner|worker --wait-actor WHO`. "
     "A hold on source that is deliberately not merged yet stays a plain "
-    "`wt defer` or `wt block` with its real reason. "
+    "ticket dependency or named-person `wt block` with its real reason. "
 )
 MINOR_BLOCK_CONTRACT = (
     "BEFORE BLOCKING: first check whether this is an implementation choice "
@@ -515,8 +515,10 @@ CLOSE_COMPLETENESS = (
     "rejects any item that cites no ticket ref. A follow-up may carry "
     "genuinely separate work, NEVER the ticket's own goal: if the symptom "
     "the ticket exists for still reproduces, do not close it with the rest "
-    "moved to a follow-up -- keep it open (`wt block`, or `wt defer` while "
-    "data accumulates). When you close with a part of the ask left "
+    "moved to a follow-up -- keep working or record a real person/dependency gate. "
+    "Exception WT-87: when only future evidence remains, close with a caveat and "
+    "a permanent registered --watch NAME; no runnable check means an honest "
+    "unresolved item with its tracking ref. When you close with a part of the ask left "
     "unfinished, start the --summary with 'PARTIAL:' so it never reads as "
     "success. PROPORTIONAL VERIFICATION: use the smallest check that proves "
     "the reported fix and meaningful regression risks. Reuse passing evidence "
@@ -525,8 +527,8 @@ CLOSE_COMPLETENESS = (
     "verifier for acceptance criteria already covered by a required gate. "
     "Use one restart owner and shared adoption evidence for related fixes. "
     "Do not hold a worker slot watching peers or waiting for future data: "
-    "record the trigger and success check, defer for a bounded interval, then "
-    "claim ready work. Preserve required gates and unresolved acceptance. "
+    "finish verifiable work and attach a permanent check for future evidence, "
+    "then claim ready work. Preserve required gates and unresolved acceptance. "
     "Follow worker-runbook.md 'Proportional verification and waits'. "
     "CUSTOMER REPORT COVERAGE: a simple report needs a concise record of the "
     "symptom, remedy, relevant check and remaining gaps, not mandatory tables "
@@ -565,8 +567,9 @@ DEPTH_CONTRACT = (
     "sustained work across hours or days: evidence first, an options memo "
     "including product options, a measured goal, progress checkpoints and "
     "a stop rule for unproductive attempts. A checkpoint is not a total "
-    "time limit or permission to close incomplete work. Use `wt defer "
-    "<ref> --until ... --reason ...` to wait for data instead of guessing; "
+    "time limit or permission to close incomplete work. No ticket waits on a "
+    "clock or future event: finish verified work, close with a caveat and "
+    "a registered permanent --watch NAME (or unresolved if no runnable check); "
     "block only for a genuine decision, access or authorization gap. "
 )
 
@@ -7190,6 +7193,8 @@ def _reconcile_once_locked(dry_run: bool = False,
             try:
                 from . import releases as _releases
                 result["releases_observed"] = _releases.reconcile()
+                from . import watches as _watches
+                _watches.schedule()
             except Exception as exc:
                 from .queue import _log
                 _log("RELEASE_OBSERVER_ERROR", str(exc)[:200])

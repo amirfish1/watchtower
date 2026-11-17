@@ -71,13 +71,11 @@ def _fmt_iso(ts: float) -> str:
 def _claimable_since(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]],
                      now_ts: float) -> Optional[str]:
     """ISO time a currently claimable ticket entered the claim pool (WT-22):
-    the latest of its filing, an expired defer or answer-affinity window, a
+    the latest of its filing, an answer-affinity window, a
     blocker's close, and any history event that could release it (reopen,
-    answer, release, edit, plan step). A ticket waking from a defer is not
-    "work waiting since it was filed"."""
+    answer, release, edit, plan step)."""
     stamps = [it.get("created_at")]
-    for until in (it.get("deferred_until"),
-                  (it.get("pending_answer") or {}).get("affinity_until")):
+    for until in ((it.get("pending_answer") or {}).get("affinity_until"),):
         if until and 0 < q._iso_ts(until) <= now_ts:
             stamps.append(_fmt_iso(q._iso_ts(until)))
     for b in it.get("blocked_by") or []:
@@ -236,8 +234,6 @@ def queue_status(
         # WT-28/31: an answer reserved for its parked worker is claimable by
         # that worker only, so it is not open work for the pool.
         and not q._affinity_reserved(it, now_ts)
-        # `wt defer`: a ticket inside its data window is out of the pool.
-        and not q.deferred_now(it, now_ts)
         # Placement: a ticket pinned to the other kind of machine is not open
         # work for this machine's pool either.
         and q.placement_allows(it)

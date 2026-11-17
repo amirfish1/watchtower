@@ -31,16 +31,6 @@ def wt(tmp_path, monkeypatch):
     return ns
 
 
-def _expire_defer(wt, ref):
-    q = wt.q
-    with q._FileLock(q._lock_path()):
-        data = q._load_unlocked()
-        for it in data["items"]:
-            if it.get("ref") == ref:
-                it["deferred_until"] = "2000-01-01T00:00:00Z"
-        q._save_unlocked(data)
-
-
 def test_quick_is_default_and_stores_nothing(wt):
     it = wt.q.enqueue(note="tiny ui fix", project="ZZT")
     assert "depth" not in it and "budget_min" not in it
@@ -66,7 +56,7 @@ def test_deep_brief_carries_goal_rules_and_measure_gate(wt):
     brief = wt.deep.deep_brief(it)
     for needle in ("DEEP TICKET", "EVIDENCE FIRST", "OPTIONS MEMO", "product option",
                    "STOP RULE", "ACCEPT LINE: list refresh p95 < 1s", "./measure.sh",
-                   f"wt defer {it['ref']}", "90 minutes"):
+                   "registered --watch NAME", "90 minutes"):
         assert needle in brief, needle
     assert "{" not in brief and "}" not in brief  # safe inside .format() templates
 
@@ -110,66 +100,19 @@ def test_claim_json_quick_has_no_brief(wt, capsys):
     assert "deep_brief" not in json.loads(capsys.readouterr().out)
 
 
-def test_defer_releases_claim_and_hides_until_window_ends(wt):
+def test_defer_api_always_refuses_without_mutating_claim(wt):
     it = wt.q.enqueue(note="slow list", project="ZZT", depth="deep")
     wt.q.claim_by_ref(it["ref"], "w1")
-    d = wt.q.defer(it["ref"], "w1", "+2h", "need 24h of phase timings", progress="added timers")
-    assert d["status"] == "open" and d["claimed_by"] is None
-    assert wt.q.deferred_now(d)
-    assert wt.q.count_claimable(project="ZZT") == 0
-    events = [h["event"] for h in d["history"]]
-    assert "progress" in events and events[-1] == "defer"
-    _expire_defer(wt, it["ref"])
-    assert wt.q.count_claimable(project="ZZT") == 1
+    before = wt.q.get(it["ref"])
+    with pytest.raises(ValueError, match="retired"):
+        wt.q.defer(it["ref"], "w1", "+2h", "future data")
+    assert wt.q.get(it["ref"]) == before
 
 
-def test_resumed_deep_brief_mentions_defer(wt):
-    it = wt.q.enqueue(note="slow list", project="ZZT", depth="deep")
-    wt.q.claim_by_ref(it["ref"], "w1")
-    wt.q.defer(it["ref"], "w1", "+1h", "collect logs")
-    brief = wt.deep.deep_brief(wt.q.get(it["ref"]))
-    assert "RESUMING: deferred 1x" in brief and "collect logs" in brief
-
-
-@pytest.mark.parametrize("until", ["", "-1h", "+30d", "yesterday", "2000-01-01T00:00:00Z"])
-def test_defer_rejects_bad_windows(wt, until):
-    it = wt.q.enqueue(note="x", project="ZZT")
-    with pytest.raises(ValueError):
-        wt.q.defer(it["ref"], "w1", until, "data")
-
-
-def test_defer_requires_reason_and_claimant(wt):
-    it = wt.q.enqueue(note="x", project="ZZT")
-    with pytest.raises(ValueError):
-        wt.q.defer(it["ref"], "w1", "+1h", "")
-    wt.q.claim_by_ref(it["ref"], "w1")
-    with pytest.raises(ValueError):
-        wt.q.defer(it["ref"], "w2", "+1h", "not mine")
-
-
-def test_defer_refuses_closed(wt):
-    it = wt.q.enqueue(note="x", project="ZZT")
-    wt.q.claim_by_ref(it["ref"], "w1")
-    wt.q.update_status(it["ref"], "closed", "w1")
-    with pytest.raises(ValueError):
-        wt.q.defer(it["ref"], "w1", "+1h", "data")
-
-
-def test_cli_add_deep_and_defer(wt, capsys):
-    rc = wt.cli.main(["add", "-q", "ZZT", "--title", "slow open", "--depth", "deep",
-                      "--budget-min", "60"])
-    assert rc == 0
-    out = capsys.readouterr().out
-    assert "[deep, 60m budget]" in out
-    ref = out.split()[1]
-    assert wt.cli.main(["claim", "-q", "ZZT", ref, "--worker", "w1"]) == 0
-    assert "DEEP TICKET" in capsys.readouterr().out
-    assert wt.cli.main(["defer", ref, "--worker", "w1", "--until", "+3h",
-                        "--reason", "need samples"]) == 0
-    assert "DEFERRED:" in capsys.readouterr().out
-    assert wt.cli.main(["find", ref]) == 0
-    found = capsys.readouterr().out
-    assert "depth: deep (60m budget)" in found and "deferred until" in found
+def test_cli_defer_refuses_legacy_arguments_and_bare_command(wt, capsys):
+    for args in (["defer"], ["defer", "ZZT-1", "--until", "+3h", "--reason", "need samples"]):
+        assert wt.cli.main(args) == 1
+        assert "registered --watch NAME" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("engine", ["claude", "codex", "kimi", "devin", "antigravity"])
