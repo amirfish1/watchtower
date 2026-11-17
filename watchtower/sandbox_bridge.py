@@ -136,6 +136,13 @@ def worker_store(queue, worker):
     from . import config
     if not NAME.fullmatch(worker):
         raise ValueError("invalid sandbox worker id")
+    try:
+        with directory(authority_dir()) as fd:
+            scope = _read(fd, worker + ".json")
+        if scope.get("stage") and scope.get("queue") == queue:
+            return canonical(scope["store"])
+    except FileNotFoundError:
+        pass
     return canonical(config.codex_sandbox_store(queue)) / worker
 
 
@@ -785,6 +792,9 @@ def _commit_proof(scope, commit):
 def _execute(scope, request, key):
     from . import queue as q
     _fields(request, ("op", "body", "claim"))
+    if scope.get("stage"):
+        from . import sandbox_stage_transport
+        return sandbox_stage_transport.execute(scope, request)
     op, body = request["op"], request["body"]
     if op == "claim":
         return _claim(scope, request)
@@ -990,7 +1000,7 @@ def process(worker):
             # Bind before any refusal: restriction must outlive this policy.
             _tombstone("w", worker)
             bind_session(worker, record.get("session_id"))
-            if config.codex_sandbox(scope["queue"]) != "workspace-write":
+            if not scope.get("stage") and config.codex_sandbox(scope["queue"]) != "workspace-write":
                 raise ValueError("sandbox bridge policy is disabled")
             if (not record.get("alive") or record.get("released_at")
                     or record.get("engine") != "codex" or record.get("queue") != scope["queue"]):
@@ -1148,7 +1158,7 @@ def request(op, body, *, timeout=45):
     spool = Path(os.environ["WT_SANDBOX_BRIDGE"])
     with directory(spool) as fd:
         claim = None
-        if op not in ("claim", "current"):
+        if op not in ("claim", "current", "verdict", "assess"):
             try:
                 claim = _read(fd, "claim.json")
             except (OSError, ValueError):
@@ -1182,6 +1192,28 @@ def cli(args):
     as_json = getattr(args, "json", False)
     if getattr(args, "worker", "") and args.worker != me and op in ("claim", "find", "close", "block", "comment"):
         result = {"ok": False, "error": "cannot impersonate another worker"}
+    elif op == "verdict":
+        if getattr(args, "engine", "") or getattr(args, "by", "") not in ("", None, me):
+            result = {"ok": False, "error": "stage verdict cannot choose an engine or identity"}
+        else:
+            result = request(op, {"ref": args.ref, "passed": args.passed, "findings": args.findings or ""})
+    elif op == "assess":
+        if args.assess_cmd != "submit" or getattr(args, "force", False):
+            result = {"ok": False, "error": "stage may only submit its reserved assessment"}
+        else:
+            try:
+                raw = args.json_text or ""
+                if args.file:
+                    if args.file == "-":
+                        raw = sys.stdin.read(MAX_BYTES + 1)
+                    else:
+                        with open(args.file) as file:
+                            raw = file.read(MAX_BYTES + 1)
+                if len(raw.encode()) > MAX_BYTES:
+                    raise ValueError("assessment payload too large")
+                result = request(op, {"ref": args.ref, "token": args.token or "", "payload": json.loads(raw)})
+            except (OSError, ValueError) as exc:
+                result = {"ok": False, "error": str(exc)}
     elif op == "claim":
         if args.queue != os.environ.get("WT_SANDBOX_QUEUE"):
             result = {"ok": False, "error": "claim is restricted to the assigned queue"}

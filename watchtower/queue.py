@@ -7108,14 +7108,16 @@ def assessment_rotate(ident: Any, old_token: str) -> Optional[str]:
     return out[0] if out else None
 
 
-def _assessment_update(ident: Any, fn) -> Optional[Dict[str, Any]]:
+def _assessment_update(ident: Any, fn, require_lock: bool = False) -> Optional[Dict[str, Any]]:
     """Run ``fn(item, assessment_dict)`` under the store lock; one save. ``fn``
     returning ``"skip"`` leaves the store untouched."""
-    with _FileLock(_lock_path()):
+    with _FileLock(_lock_path()) as assessment_lock:
         data = _load_unlocked()
         for it in data["items"]:
             if _matches(it, ident):
                 a = dict(it.get("assessment") or {})
+                if (require_lock or a.get("sandbox_scope")) and assessment_lock._fh is None:
+                    raise AssessmentFenced("sandbox assessment source lock unavailable")
                 if fn(it, a, data) == "skip":
                     return it
                 it["assessment"] = a
@@ -7268,7 +7270,8 @@ def _assessment_summary_text(ref: str, points: Dict[str, Dict[str, Any]]) -> str
     return "\n".join(lines)
 
 
-def assessment_accept_submission(ident: Any, token: str, payload: Any) -> List[Dict[str, Any]]:
+def assessment_accept_submission(ident: Any, token: str, payload: Any,
+                                 sandbox_scope: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     """Phase 1: fence, validate, and persist the op list; ``running`` ->
     ``filing``. A resubmission of the same payload on the same token is a
     resume and returns the stored ops."""
@@ -7277,6 +7280,11 @@ def assessment_accept_submission(ident: Any, token: str, payload: Any) -> List[D
     phash = _hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
 
     def _do(it, a, data):
+        if sandbox_scope is not None:
+            from . import sandbox_stage_transport
+            sandbox_stage_transport.guard(sandbox_scope, it)
+        elif a.get("sandbox_scope"):
+            raise AssessmentFenced("restricted assessment requires its assigned stage scope")
         if a and token and token in (a.get("fenced_tokens") or []):
             raise AssessmentFenced("superseded by a respawn")
         if not a or a.get("token") != token:
@@ -7291,6 +7299,12 @@ def assessment_accept_submission(ident: Any, token: str, payload: Any) -> List[D
         if st != "running":
             raise AssessmentFenced(f"assessment is {st or 'not started'}, not running")
         points = _validate_assessment_payload(data, it, payload)
+        if sandbox_scope is not None:
+            for point in points.values():
+                if point["existing"] or any(f["queue"] != sandbox_scope["queue"]
+                                             for f in point["followups"]):
+                    raise ValueError("restricted assessment cannot select existing refs or other queues")
+            a["sandbox_scope"] = sandbox_scope
         ref, attempt = str(it.get("ref")), int(a.get("attempt", 1))
         ops: List[Dict[str, Any]] = []
         seen = set()
@@ -7313,7 +7327,7 @@ def assessment_accept_submission(ident: Any, token: str, payload: Any) -> List[D
         a["status"] = "filing"
         out.append(ops)
 
-    if _assessment_update(ident, _do) is None:
+    if _assessment_update(ident, _do, require_lock=sandbox_scope is not None) is None:
         raise ValueError(f"no item {ident}")
     return out[0]
 
@@ -7329,12 +7343,17 @@ def _assessment_apply_op(ident: Any, token: str, idx: int) -> Dict[str, Any]:
     if hook:
         hook("before_lock", idx)
     logs: List[tuple] = []
-    with _FileLock(_lock_path()):
+    with _FileLock(_lock_path()) as assessment_lock:
         data = _load_unlocked()
         bug = next((i for i in data["items"] if _matches(i, ident)), None)
         if bug is None:
             raise ValueError(f"no item {ident}")
         a = dict(bug.get("assessment") or {})
+        if a.get("sandbox_scope"):
+            if assessment_lock._fh is None:
+                raise AssessmentFenced("sandbox assessment source lock unavailable")
+            from . import sandbox_stage_transport
+            sandbox_stage_transport.guard(a["sandbox_scope"], bug)
         if a.get("status") != "filing" or a.get("token") != token:
             raise AssessmentFenced(
                 f"superseded by attempt {a.get('attempt')}" if a.get("token") != token
@@ -7354,6 +7373,7 @@ def _assessment_apply_op(ident: Any, token: str, idx: int) -> Dict[str, Any]:
                 tk = _assessment_title_key(op["title"])
                 match = next((i for i in data["items"]
                               if i is not bug
+                              and not a.get("sandbox_scope")
                               and _norm_project(i.get("project")) == op["queue"]
                               and i.get("status") in ("open", "in_progress", "in_review")
                               and _assessment_title_key(i.get("title") or i.get("note")) == tk), None)
@@ -7409,6 +7429,9 @@ def _assessment_apply_op(ident: Any, token: str, idx: int) -> Dict[str, Any]:
 
 def assessment_finalize(ident: Any, token: str) -> Optional[Dict[str, Any]]:
     def _do(it, a, data):
+        if a.get("sandbox_scope"):
+            from . import sandbox_stage_transport
+            sandbox_stage_transport.guard(a["sandbox_scope"], it)
         if a.get("status") != "filing" or a.get("token") != token:
             raise AssessmentFenced("assessment is no longer filing under this token")
         ops = a["pending"]["ops"]

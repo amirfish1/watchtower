@@ -5954,6 +5954,19 @@ def start_assessment(item: Dict[str, Any], *, force: bool = False,
         if dry_run:
             return {"status": "dry_run", "repo": repo, "assessor": target,
                     "prompt": assessor_goal(item, "<token>")}
+        if _q._sandbox_restricted(item):
+            # Use the same reservation/retry/token owner as daemon stages.
+            # A direct ad-hoc launch has no stage attempt to fence its result.
+            from . import stages
+            stages.request_assessment(ref, force=force)
+            actions = stages.reconcile_stages(only_ref=ref)
+            current = _q.get(ref) or {}
+            assessment = current.get("assessment") or {}
+            status = "spawned" if any(action == "spawned" for _, action in actions) else "skipped"
+            if any(action in ("launch_failed", "failed", "blocked") for _, action in actions):
+                status = "failed"
+            return {"status": status, "token": assessment.get("token", ""), "assessor": target,
+                    "worker_id": (assessment.get("assessor") or {}).get("worker_id", "")}
     except Exception as exc:  # noqa: BLE001
         if dry_run:
             return {"status": "failed", "reason": str(exc)}
@@ -8959,7 +8972,15 @@ def spawn_adhoc(
         from . import config, queue as _q
         origin_restricted = bool(ticket_ref and _q._sandbox_restricted(_q.get(ticket_ref) or {}))
         if config.codex_sandbox(ticket_queue) == "workspace-write" or origin_restricted:
-            raise CodexSandboxError("sandbox queue stages require an isolated stage transport; refusing full-access launch")
+            from . import sandbox_stage_transport
+            item = _q.get(ticket_ref) if ticket_ref else None
+            if not item:
+                raise CodexSandboxError("isolated stage transport requires an assigned existing ticket")
+            try:
+                return sandbox_stage_transport.launch(item, stage, engine, model, dry_run=dry_run)
+            except (ValueError, OSError, sandbox_stage_transport.source.StageSandboxError,
+                    sandbox_stage_transport.policy.SandboxPolicyError) as exc:
+                raise CodexSandboxError(str(exc)) from exc
     if report_to:
         from . import messages
         try:
