@@ -4,7 +4,7 @@ import uuid
 import pytest
 
 from watchtower import sandbox_bridge as bridge, sandbox_stage_transport as stage
-from tests.test_sandbox_bridge import env, claim, submit  # noqa: F401
+from tests.test_sandbox_bridge import env, claim, submit as spool_submit  # noqa: F401
 from tests.test_sandbox_policy import base  # noqa: F401
 
 
@@ -48,15 +48,36 @@ def payload(w):
                         for point in w.queue.ASSESSMENT_POINTS}}
 
 
-def test_scoped_verdict_closes_once_and_receipt_replays(env):
+def model_submit(w, op, body):
+    """Simulate the trusted host capture, NEVER the writable tool spool."""
+    with bridge.directory(bridge.authority_dir()) as fd:
+        scope = bridge._read(fd, w.worker + ".json")
+    if op not in ("verdict", "assess"):
+        return spool_submit(w, op, body)
+    try:
+        if body["ref"] != scope["stage"]["ref"]:
+            raise ValueError("wrong assigned ref")
+        if op == "assess":
+            if body["token"] != scope["stage"]["token"]:
+                raise ValueError("wrong assessment token")
+            result = body["payload"]
+        else:
+            result = {k: body[k] for k in ("passed", "findings")}
+        return stage.apply_model_result(scope, result)
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def test_spool_cannot_forge_verdict_and_trusted_result_closes_once(env):
     w = env
     item, _ = scoped(w)
-    key = uuid.uuid4().hex
-    response = submit(w, "verdict", verdict(item), key=key)
+    forged = spool_submit(w, "verdict", verdict(item))
+    assert not forged["ok"] and "trusted final model response" in forged["error"]
+    assert w.queue.get(item["ref"])["status"] == "in_review"
+    response = model_submit(w, "verdict", verdict(item))
     assert response["ok"], response
     assert w.queue.get(item["ref"])["status"] == "closed"
-    assert submit(w, "verdict", verdict(item), key=key) == response
-    assert not submit(w, "verdict", verdict(item))["ok"]
+    assert not model_submit(w, "verdict", verdict(item))["ok"]
     results = w.queue.get(item["ref"])["gate_results"]
     assert len(results) == 1 and results[0]["sandboxed"]
 
@@ -64,7 +85,7 @@ def test_scoped_verdict_closes_once_and_receipt_replays(env):
 def test_scoped_verdict_preserves_required_review_and_failure_reopens(env):
     w = env
     item, _ = scoped(w, stages=["verify", "review"])
-    assert submit(w, "verdict", verdict(item))["ok"]
+    assert model_submit(w, "verdict", verdict(item))["ok"]
     current = w.queue.get(item["ref"])
     assert current["status"] == "in_review" and current["gate_pending"] == "review"
 
@@ -72,7 +93,7 @@ def test_scoped_verdict_preserves_required_review_and_failure_reopens(env):
 def test_failed_verdict_returns_to_restricted_builder_pool(env):
     w = env
     item, _ = scoped(w)
-    assert submit(w, "verdict", verdict(item, False))["ok"]
+    assert model_submit(w, "verdict", verdict(item, False))["ok"]
     current = w.queue.get(item["ref"])
     assert current["status"] == "open" and not current.get("claimed_by")
     assert not current.get("resolution") and not current.get("closed_by")
@@ -89,7 +110,7 @@ def test_stage_stale_result_never_mutates_current_ticket(env, mutation):
     w = env
     item, _ = scoped(w)
     current = change(w, item["ref"], **mutation)
-    assert not submit(w, "verdict", verdict(item))["ok"]
+    assert not model_submit(w, "verdict", verdict(item))["ok"]
     assert w.queue.get(item["ref"]) == current
 
 
@@ -97,9 +118,9 @@ def test_stage_cannot_claim_close_or_select_another_ref(env):
     w = env
     item, _ = scoped(w)
     other = w.queue.enqueue(project="SB", note="peer")
-    assert not submit(w, "claim", {})["ok"]
-    assert not submit(w, "close", {})["ok"]
-    assert not submit(w, "verdict", dict(verdict(item), ref=other["ref"]))["ok"]
+    assert not model_submit(w, "claim", {})["ok"]
+    assert not model_submit(w, "close", {})["ok"]
+    assert not model_submit(w, "verdict", dict(verdict(item), ref=other["ref"]))["ok"]
     assert w.queue.get(other["ref"])["status"] == "open"
     assert w.queue.get(item["ref"])["status"] == "in_review"
 
@@ -111,9 +132,9 @@ def test_assessment_submits_six_points_and_cannot_write_existing_tickets(env):
     bad = payload(w)
     bad["points"]["other"]["existing"] = [other["ref"]]
     request = {"ref": item["ref"], "token": "token1", "payload": bad}
-    assert not submit(w, "assess", request)["ok"]
+    assert not model_submit(w, "assess", request)["ok"]
     assert w.queue.get(other["ref"]) == other
-    result = submit(w, "assess", dict(request, payload=payload(w)))
+    result = model_submit(w, "assess", dict(request, payload=payload(w)))
     assert result["ok"], result
     assert w.queue.get(item["ref"])["assessment"]["status"] == "done"
 
@@ -136,9 +157,9 @@ def test_assessment_followups_are_new_icebox_items_in_assigned_queue(env):
     bad["points"]["other"] = {"verdict": "gap", "note": "Missing check", "followups": [
         {"title": "Regression coverage", "queue": "OTHER"}]}
     request = {"ref": item["ref"], "token": "token1", "payload": bad}
-    assert not submit(w, "assess", request)["ok"]
+    assert not model_submit(w, "assess", request)["ok"]
     bad["points"]["other"]["followups"][0]["queue"] = "SB"
-    result = submit(w, "assess", request)
+    result = model_submit(w, "assess", request)
     assert result["ok"], result
     assert w.queue.get(peer["ref"]) == peer
     new = [i for i in w.queue.list_items() if i.get("assessment_origin")]
@@ -161,7 +182,7 @@ def test_group_verdict_requires_current_child_integration_proof(env, stale):
         bridge._write(fd, w.worker + ".json", scope)
     if stale:
         change(w, child["ref"], resolution={"commit": "c" * 40})
-    result = submit(w, "verdict", verdict(item))
+    result = model_submit(w, "verdict", verdict(item))
     if stale:
         assert not result["ok"]
         assert w.queue.get(item["ref"]) == item
@@ -184,7 +205,7 @@ def test_clarification_delivery_is_not_a_new_answer_but_text_change_is(env):
     item = change(w, item["ref"], pending_answer=dict(item["pending_answer"], state="delivered"))
     stage.guard(scope, item, data={"items": [item]})
     before = change(w, item["ref"], pending_answer=dict(item["pending_answer"], answer="New scope"))
-    assert not submit(w, "verdict", verdict(item))["ok"]
+    assert not model_submit(w, "verdict", verdict(item))["ok"]
     assert w.queue.get(item["ref"]) == before
 
 
@@ -219,8 +240,8 @@ def test_scope_survives_live_policy_disable_without_granting_builder_verbs(env):
     w = env
     item, _ = scoped(w)
     w.config.set_codex_sandbox("SB", "full-access")
-    assert not submit(w, "claim", {})["ok"]
-    assert submit(w, "verdict", verdict(item))["ok"]
+    assert not model_submit(w, "claim", {})["ok"]
+    assert model_submit(w, "verdict", verdict(item))["ok"]
     assert w.queue.get(item["ref"])["status"] == "closed"
 
 
@@ -231,7 +252,7 @@ def test_replaced_stage_source_never_accepts_a_result(env, monkeypatch):
     with bridge.directory(bridge.authority_dir()) as fd:
         bridge._write(fd, w.worker + ".json", scope)
     monkeypatch.setattr(stage.source, "source_unchanged", lambda *a: "repository was replaced")
-    result = submit(w, "verdict", verdict(item))
+    result = model_submit(w, "verdict", verdict(item))
     assert not result["ok"] and "replaced" in result["error"]
     assert w.queue.get(item["ref"]) == item
 
@@ -245,7 +266,7 @@ def test_registration_writes_full_clarification_context_before_launch(env):
         stage_session={"reserved": {"key": "verifier:1", "attempt": 1}})
     scope = stage._register(item, "verifier", w.worker,
         {"workspace": w.repo, "store": w.store, "commit": "a" * 40})
-    stored = json.loads((w.store / "ticket-context.json").read_text())
+    stored = json.loads((w.store / ".agents" / "ticket-context.json").read_text())
     assert stored["pending_answer"]["answer"] == "Preserve all original requirements."
     assert stored["resolution"] == item["resolution"]
     assert scope["stage"]["context_digest"] == stage._digest(stored)
@@ -262,6 +283,7 @@ def test_stage_launch_always_uses_native_profile_and_scoped_store(env, base, mon
              "commit": "a" * 40, "manifest": {"commit": "a" * 40}}
     roots["workspace"].mkdir()
     roots["store"].mkdir()
+    (roots["store"] / ".agents").mkdir()
     monkeypatch.setattr(stage.source, "prepared_source", lambda *a: roots)
     monkeypatch.setattr(stage.source, "pin_source", lambda *a: {"commit": "a" * 40})
     monkeypatch.setattr(stage.policy, "write_wt_shim", lambda *a: None)
@@ -284,5 +306,6 @@ def test_stage_launch_always_uses_native_profile_and_scoped_store(env, base, mon
     assert not any("dangerously" in arg or "danger-full-access" in arg for arg in argv)
     assert any("default_permissions=" in arg for arg in argv)
     assert spawn["cwd"] == "/"
-    assert spawn["env"]["WT_SANDBOX_BRIDGE"] == str(roots["store"])
-    assert spawn["env"]["WATCHTOWER_STORE"] == str(roots["store"] / "queue.db")
+    assert "WT_SANDBOX_BRIDGE" not in spawn["env"]
+    assert spawn["env"].get("WATCHTOWER_STORE") != str(roots["store"] / "queue.db")
+    assert "--output-last-message" in argv and "--output-schema" in argv

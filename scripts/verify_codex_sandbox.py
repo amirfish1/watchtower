@@ -232,7 +232,13 @@ assert all(out.values()), out
             # Fixture controller reviews known arithmetic bytes before executing.
             if (integration / "arithmetic.py").read_text() != "def add(a, b):\n    return a + b\n":
                 raise RuntimeError("adopted fixture patch failed source review")
-            subprocess.run([sys.executable, "-m", "unittest", "-v"], cwd=integration, check=True)
+            # Adopted tests remain untrusted even after a source review.
+            from watchtower import sandbox_stages
+            adopted_gate = sandbox_stages.run_cmd_gate(
+                {"ref": item["ref"], "repo_path": str(integration)},
+                "python3 -m unittest -v", integrated_commit)
+            if not adopted_gate.get("passed"):
+                raise RuntimeError("sandboxed adoption check failed: " + str(adopted_gate))
             # This disposable fixture has a local release ref; real integrations
             # must push and check the configured remote release branch instead.
             subprocess.run(["git", "-C", str(integration), "update-ref", "refs/remotes/origin/main",

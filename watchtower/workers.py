@@ -8826,7 +8826,7 @@ def codex_app_worker_command(
     i = 0
     while i < len(rest):
         flag = rest[i]
-        if flag in ("--model", "-c", "--config") and i + 1 < len(rest):
+        if flag in ("--model", "-c", "--config", "--output-last-message", "--output-schema") and i + 1 < len(rest):
             argv += ["-c" if flag == "--config" else flag, rest[i + 1]]
             i += 2
             continue

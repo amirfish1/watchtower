@@ -793,8 +793,9 @@ def _execute(scope, request, key):
     from . import queue as q
     _fields(request, ("op", "body", "claim"))
     if scope.get("stage"):
-        from . import sandbox_stage_transport
-        return sandbox_stage_transport.execute(scope, request)
+        # Repository code executed by a stage has exactly the same tool
+        # permissions as the stage. Its writable spool is NOT model identity.
+        raise ValueError("stage results require the trusted final model response; spool submissions are forbidden")
     op, body = request["op"], request["body"]
     if op == "claim":
         return _claim(scope, request)

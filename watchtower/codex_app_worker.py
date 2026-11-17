@@ -372,6 +372,43 @@ def _emit(obj: Dict[str, Any]) -> None:
     sys.stdout.flush()
 
 
+class _FinalMessage:
+    """Only typed agent messages from the authenticated app-server socket.
+
+    Tool stdout and command results are never parsed as protocol messages.
+    Notifications can precede the turn/start response, so bind the turn when
+    it completes rather than dropping a fast answer during that race.
+    """
+    def __init__(self):
+        self.messages = []
+        self.error = ""
+
+    def note(self, msg, thread_id):
+        if msg.get("method") != "item/completed":
+            return
+        p = msg.get("params") or {}
+        item = p.get("item") or {}
+        if (p.get("threadId") != thread_id or item.get("type") != "agentMessage"
+                or item.get("phase") not in (None, "final_answer")):
+            return
+        text = item.get("text")
+        if not isinstance(text, str) or len(text.encode()) > 131072 or len(self.messages) >= 32:
+            self.error = "invalid or oversized final model response"
+            return
+        self.messages.append((p.get("turnId"), item.get("phase"), text))
+
+    def finish(self, turn_id):
+        if self.error:
+            raise ValueError(self.error)
+        messages = [x for x in self.messages if x[0] == turn_id]
+        final = [x for x in messages if x[1] == "final_answer"]
+        if len(final) > 1:
+            raise ValueError("multiple terminal model responses")
+        if not messages:
+            raise ValueError("no final model response for completed turn")
+        return (final or messages)[-1][2]
+
+
 def run(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(prog="python -m watchtower.codex_app_worker run")
     p.add_argument("--codex-bin", default=os.environ.get("WATCHTOWER_CODEX_BIN") or "codex")
@@ -390,6 +427,10 @@ def run(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--server-cwd", default="",
                    help="directory the app-server process starts in (default: --cwd). "
                         "Sandboxed workers use a trusted one, not the workspace.")
+    p.add_argument("--output-last-message", default="",
+                   help="host-controlled final model response, never tool output")
+    p.add_argument("--output-schema", default="",
+                   help="JSON schema for the final model response")
     p.add_argument("-c", "--config", action="append", default=[],
                    help="codex config override passed to the app-server (repeatable)")
     p.add_argument("goal")
@@ -422,15 +463,24 @@ def run(argv: Optional[List[str]] = None) -> int:
     server = subprocess.Popen(cmd, cwd=args.server_cwd or args.cwd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               preexec_fn=_pdeathsig if os.name == "posix" else None)
     record_path: Optional[Path] = None
-    state: Dict[str, Any] = {"turn_id": None, "status": None}
+    state: Dict[str, Any] = {"turn_id": None, "status": None, "completed": {}}
+    capture = _FinalMessage()
+    capture_thread = ""
     done = threading.Event()
 
     def on_note(msg: Dict[str, Any]) -> None:
+        if args.output_last_message:
+            capture.note(msg, capture_thread)
         method = str(msg.get("method") or "")
         if not method.endswith(_QUIET_SUFFIXES):
             _emit({"t": round(time.time(), 3), "method": method, "params": msg.get("params")})
         if method == "turn/completed":
-            turn = (msg.get("params") or {}).get("turn") or {}
+            params = msg.get("params") or {}
+            turn = params.get("turn") or {}
+            if params.get("threadId") != capture_thread:
+                return
+            if turn.get("id") and len(state["completed"]) < 32:
+                state["completed"][turn["id"]] = turn.get("status")
             if turn.get("id") and turn.get("id") == state["turn_id"]:
                 state["status"] = turn.get("status")
                 done.set()
@@ -474,6 +524,7 @@ def run(argv: Optional[List[str]] = None) -> int:
         if not thread_id:
             _emit({"type": "error", "error": f"thread/start failed: {_error_text(started)}"})
             return 1
+        capture_thread = thread_id
         if profiled:
             try:
                 sandbox_policy.check_thread_sandbox(
@@ -489,11 +540,17 @@ def run(argv: Optional[List[str]] = None) -> int:
         # First log line: resolve_session_id_from_log reads session_id here.
         _emit({"type": "thread.started", "session_id": thread_id, "transport": "app-server",
                "pid": os.getpid(), "server_pid": server.pid, "sock": sock})
-        turn = client.call("turn/start", {"threadId": thread_id, "input": [{"type": "text", "text": args.goal}]})
+        turn_params = {"threadId": thread_id, "input": [{"type": "text", "text": args.goal}]}
+        if args.output_schema:
+            turn_params["outputSchema"] = json.loads(Path(args.output_schema).read_text())
+        turn = client.call("turn/start", turn_params)
         state["turn_id"] = ((turn.get("result") or {}).get("turn") or {}).get("id")
         if not state["turn_id"]:
             _emit({"type": "error", "error": f"turn/start failed: {_error_text(turn)}"})
             return 1
+        if state["turn_id"] in state["completed"]:
+            state["status"] = state["completed"][state["turn_id"]]
+            done.set()
         record_path = _record_path(thread_id)
         tmp = record_path.with_suffix(".tmp")
         tmp.write_text(json.dumps({
@@ -517,6 +574,16 @@ def run(argv: Optional[List[str]] = None) -> int:
             client.call("turn/interrupt", {"threadId": thread_id, "turnId": state["turn_id"]}, timeout=10)
         _emit({"type": "turn.finished", "session_id": thread_id, "turn_id": state["turn_id"], "status": state["status"]})
         if state["status"] == "completed":
+            if args.output_last_message:
+                try:
+                    text = capture.finish(state["turn_id"])
+                    fd = os.open(args.output_last_message,
+                                 os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                    with os.fdopen(fd, "w") as output:
+                        output.write(text)
+                except (ValueError, OSError) as exc:
+                    _emit({"type": "error", "error": f"final model response capture failed: {exc}"})
+                    return 1
             return 0
         if state["status"] == "signal:policy":
             return 1
