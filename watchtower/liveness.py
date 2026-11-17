@@ -1382,9 +1382,14 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
             evidence = "sent back; inside its release window (WT-34)"
         elif v.verdict == "alive":
             pass
+        elif (github and item.get("claimed_machine") == q.machine_tag()
+              and callable(getattr(q._github_backend_for_project(out["queue"]), "recover_expired_claim", None))):
+            # Cross-host body exclusion now fences the fresh re-read and
+            # release. The owning host still re-proves liveness inside it.
+            action, reason = "reopen", f"owning-host GitHub claim lease expired ({v.evidence})"
         elif github:
-            # WT-39: no automatic block or reopen of a GitHub claim (no
-            # conditional write); an explicit recovery request instead.
+            # Old/unknown host or backend without serialized lease recovery:
+            # preserve the claim and request owning-host evidence.
             due, routed = _owner_route_due(item, by_ref, now, stall)
             evidence += f"; {routed}" if routed else ""
             if due:
@@ -1392,6 +1397,8 @@ def assess(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = N
         elif v.verdict == "dead":
             action = "resume" if _resume_first(item) else "reopen"
             reason = f"claim owner dead ({v.evidence})"
+        elif ctx.ps() is None:
+            evidence += "; process scan unavailable; lease recovery needs readable liveness evidence"
         else:
             # An unobserved local claim is a lease, not permanent ownership.
             # The ordinary idle threshold and recent bound-session evidence

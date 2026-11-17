@@ -3932,6 +3932,47 @@ class GitHubIssuesBackend:
         return self.get(ident)
 
     @_serialized_body_write
+    def recover_expired_claim(self, ident, *, expect, reason):
+        """Own-host lease recovery under the cross-host GitHub body lock.
+
+        Unlike WT-39's old unlocked sweep, replacement claims cannot land
+        between this fresh decision and the write. Unknown/foreign hosts,
+        live sessions, fresh activity, human questions and answer delivery
+        remain protected. No owner question or permission is synthesized.
+        """
+        from . import queue as q, liveness as lv, watches
+        item = self.get(ident)
+        if not item or item.get("claimed_machine") != q.machine_tag() or item.get("pipeline_foreign"):
+            return None
+        # Legacy issue-body answers may be hidden by the modern sidecar
+        # projection. They still own delivery and cannot be reaped.
+        raw_meta = _split_body(item.get("_github_body") or item.get("text", ""))[1]
+        if (raw_meta.get("pending_answer") or {}).get("state") in q.ANSWER_INFLIGHT:
+            return None
+        items = watches.inventory()[0]
+        items = [i for i in items if i.get("ref") != item.get("ref")] + [item]
+        if q._recover_mismatch(item, expect, items) or q.supervision_owns(item):
+            return None
+        if item.get("status") != "in_progress" or not item.get("claimed_by"):
+            return None
+        ctx = lv.ResolverContext()
+        if ctx.ps() is None or lv.claim_owner(item, ctx).verdict == "alive":
+            return None
+        heartbeat_age = lv.claim_heartbeat_age(item, ctx.now)
+        if heartbeat_age is not None and heartbeat_age < lv.stall_s():
+            return None
+        if ctx.now-max(lv._store_activity(item), lv._file_activity(item, ctx)) < lv.stall_s():
+            return None
+        fence = {key: item.get(key) for key in (
+            "claimed_by", "claimed_session_id", "claimed_machine", "claimed_at",
+            "needs_input", "block_question", "answered_at", "claim_heartbeat", "pending_answer")}
+        result = self.update_status(ident, "open", session_id="liveness", require_status="in_progress",
+                                    expect=fence, reason=reason +
+                                    "; routing repair only; existing approval/source/send limits remain. Prior question: " +
+                                    str(item.get("block_question") or ""))
+        return result if result and result.get("status") == "open" and not result.get("claimed_by") else None
+
+    @_serialized_body_write
     def renew_claim_heartbeat(self, ident: Any, *, claimed_by: str,
                               session_id: str) -> bool:
         """WT-39: stamp ``claim_heartbeat`` (this machine, now) on a claim this

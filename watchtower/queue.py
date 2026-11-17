@@ -8257,12 +8257,15 @@ def recover_claim(ident: Any, *, expect: Dict[str, Any], action: str, reason: st
     ``mark`` (record only; the caller acts). Every applied action writes
     ``backstop = {state, action, count, at, fingerprint}`` (the post-write
     fingerprint the loop guard compares) and a ``backstop`` history event in
-    the same step. Local store only (a GitHub-backed claim is routed to an
-    explicit recovery request, ``liveness._route_owner_host``, WT-39)."""
+    the same step. GitHub supports only owning-host expired-lease reopen,
+    revalidated under its cross-host body lock. Foreign/unknown claims still
+    route to an explicit owning-host recovery request."""
     if action not in RECOVER_ACTIONS:
         raise ValueError(f"action must be one of {RECOVER_ACTIONS}")
-    if _github_backend_for_project(_project_from_ident(ident)) is not None:
-        return None
+    backend = _github_backend_for_project(_project_from_ident(ident))
+    if backend is not None:
+        recover = getattr(backend, "recover_expired_claim", None)
+        return recover(ident, expect=expect, reason=reason) if action == "reopen" and callable(recover) else None
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -8927,6 +8930,8 @@ def validate_person_block(on: str, actor: str = "", question: str = "", *,
         text = str(question or "").strip()
         if not text or text in ("?", "..."):
             raise ValueError("a person block needs a concrete question")
+        if re.search(r"(?i)parked off the owner|when convenient|owner.when.convenient", text):
+            raise ValueError("convenience parking is retired; ask the concrete person action now or icebox an explicit owner pause")
         if re.search(r"(?i)\b(?:await(?:ing)?|wait(?:ing)? for) (?:a |the |next )*(?:natural|future)\b", text):
             raise ValueError("future evidence is not a person decision; close + --watch")
         if (on == "owner" and re.match(r"(?i)^(?:\[Q[^]]+\]\s*)?(?:await(?:ing)?|wait(?:ing)? (?:for|on))\b", text)) or dependency_only_question(text) or re.match(

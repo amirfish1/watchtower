@@ -165,3 +165,86 @@ def test_release_reason_migration_preserves_owed_acceptance_and_fences_generatio
     assert any(h['event']=='progress' and 'then natural QA acceptance' in h.get('text','') for h in item['history'])
     with pytest.raises(ValueError,match='generation changed'):
         migration.release_reason(ref,wait,'migration-worker')
+
+
+def test_reviewed_question_clarification_preserves_tag_and_original_receipt(env):
+    q, _, _, _, name = env
+    ref=_ticket(q,name)
+    legacy_block(q,ref,'w1',question='[Q12:login] Parked off the owner list: log in when convenient',wait_on='owner',origin='worker')
+    op=_operation(q,ref,'person',on='owner',question='[Q12:login] Sign in to the existing account, or explicitly retire this task?')
+    wrong=dict(op,question='[Q13:other] Approve another action?')
+    with pytest.raises(ValueError,match='preserve'):
+        migration.apply(wrong,q.list_items(),'migration-worker')
+    migration.apply(op,q.list_items(),'migration-worker')
+    it=q.get(ref)
+    assert it['needs_input'] and it['block_question']==op['question']
+    receipt=next(h for h in reversed(it['history']) if h['event']=='person_block_migrated')
+    assert 'when convenient' in receipt['previous_block']['block_question']
+
+
+def test_convenience_parking_is_not_a_new_person_question(env):
+    q, _, _, _, name=env
+    ref=_ticket(q,name)
+    with pytest.raises(ValueError,match='convenience'):
+        q.block(ref,'w1',question='Parked off the owner list: do this when convenient',wait_on='owner')
+
+
+@pytest.mark.parametrize('protection', ['expired','alive','recent','foreign','replacement','question','answer','ps-failed','heartbeat','postwrite-conflict'])
+def test_github_lease_recovery_rechecks_proof_under_serialized_writer(env,monkeypatch,protection):
+    from watchtower import liveness as lv
+    q, _, _, _, name=env
+    backend=q._github_backend_for_project(name)
+    if backend is None:
+        pytest.skip('GitHub cross-host writer contract')
+    ref=_ticket(q,name);item=q.get(ref)
+    expected=lv._expect(item,{ref:item})
+    monkeypatch.setattr(lv,'_store_activity',lambda i: 0 if protection!='recent' else __import__('time').time())
+    monkeypatch.setattr(lv,'_file_activity',lambda i,c:0)
+    monkeypatch.setattr(lv,'claim_heartbeat_age',lambda i,now:0 if protection=='heartbeat' else None)
+    monkeypatch.setattr(lv.ResolverContext,'ps',lambda ctx:None if protection=='ps-failed' else [])
+    monkeypatch.setattr(lv,'claim_owner',lambda i,ctx:lv.Verdict('alive' if protection=='alive' else 'unproven','','test proof',None))
+    if protection=='foreign':
+        monkeypatch.setattr(q,'machine_tag',lambda:'another-host')
+    if protection=='replacement':
+        expected=dict(expected,claimed_by='previous-worker')
+    if protection=='question':
+        q.block(ref,'w1',question='Approve this exact consequential operation?',wait_on='owner',origin='worker')
+    if protection=='answer':
+        # A routed answer generation cannot be handed to a competing worker.
+        from watchtower.github_backend import _split_body, _serialized_body_write
+        @_serialized_body_write
+        def pending(b):
+            current=b.get(ref);body,meta=_split_body(current['_github_body'])
+            meta['pending_answer']={'state':'routing','gen':9}
+            b._edit_body(current,body,meta)
+        pending(backend)
+    if protection=='postwrite-conflict':
+        monkeypatch.setattr(type(backend),'update_status',lambda self,*a,**k:dict(item,claimed_by='replacement'))
+    result=q.recover_claim(ref,expect=expected,action='reopen',reason='lease expired')
+    if protection=='expired':
+        assert result['status']=='open' and not result.get('claimed_by')
+    else:
+        assert result is None
+        assert q.get(ref)['status']!='closed'
+
+
+@pytest.mark.parametrize('host,alive,heartbeat,expected', [
+    ('here',True,False,'pass'),('here',False,False,'fail'),
+    ('remote',False,False,'fail'),('remote',False,True,'pass'),
+])
+def test_permanent_audit_cannot_pass_without_current_claim_liveness(wt_env,monkeypatch,host,alive,heartbeat,expected):
+    import runpy,time
+    from pathlib import Path
+    from datetime import datetime,timezone
+    from watchtower import queue as q,liveness as lv,watches,config
+    item=dict(ref='AUDIT-1',project='AUDIT',status='in_progress',claimed_by='worker',
+              claimed_machine=q.machine_tag() if host=='here' else 'another-host',
+              claimed_session_id='bound-session',claimed_at='2000-01-01T00:00:00Z',updated_at='2000-01-01T00:00:00Z')
+    if heartbeat:
+        item['claim_heartbeat']=dict(machine=item['claimed_machine'],claimed_by='worker',session_id='bound-session',
+                                    at=datetime.now(timezone.utc).isoformat())
+    monkeypatch.setattr(watches,'inventory',lambda:([item],[]))
+    monkeypatch.setattr(config,'ticket_is_archived',lambda i:False)
+    monkeypatch.setattr(lv,'claim_owner',lambda i,ctx:lv.Verdict('alive' if alive else 'unproven','','proof',None))
+    namespace=runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/audit-no-parking.py'))
+    assert namespace['audit']()['status']==expected

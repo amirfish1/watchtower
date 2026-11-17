@@ -1321,3 +1321,10 @@ def test_owner_route_files_a_real_local_ops_request_once(lv, monkeypatch):
     assert not row.get("needs_input") and not row.get("wait")
     assert "permanent monitor" in row["text"] and "unresolved item" in row["text"]
     assert row["dedupe_key"] == lv.liveness._owner_route_key(item) + "#1"
+
+
+def test_unobserved_claim_does_not_expire_when_process_scan_fails(lv,monkeypatch):
+    ref=_claimed(lv,worker='legacy-worker',sid=SID2)
+    monkeypatch.setattr(lv.liveness.ResolverContext,'ps',lambda ctx:None)
+    assert _sweep(lv)==[]
+    assert lv.q.get(ref)['claimed_by']=='legacy-worker'

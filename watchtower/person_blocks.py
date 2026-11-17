@@ -50,8 +50,15 @@ def transform(item, operation, inventory, worker):
     elif action in ("person", "retain"):
         on = operation.get("on") or (item.get("wait") or {}).get("on")
         actor = operation.get("actor", (item.get("wait") or {}).get("actor", ""))
-        # Reclassification preserves the existing question and its Q tag. This
-        # is not an answer or authorization to perform the requested action.
+        # An explicitly reviewed wording repair may clarify an existing human
+        # action, never answer it or mint a different owner decision/Q tag.
+        if operation.get("question"):
+            import re
+            previous_tags = re.findall(r"\[Q[^]]+\]", item.get("block_question") or "")
+            if re.findall(r"\[Q[^]]+\]", operation["question"]) != previous_tags:
+                raise ValueError("wording repair must preserve existing question tags")
+            q.validate_person_block(on, actor, operation["question"])
+            item["block_question"] = operation["question"]
         q.validate_person_block(on, actor, item.get("block_question"), require_question=False)
         item["wait"] = q.wait_record(on, actor, block_at=item.get("blocked_at") or "", by=worker,
                                     note=operation["reason"],
