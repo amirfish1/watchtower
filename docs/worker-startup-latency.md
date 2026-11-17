@@ -109,9 +109,66 @@ to the enclosing dispatch. Reconcile includes its nested phases and launch
 observation, so durations must not be summed. Logging failures cannot stop
 dispatch. Dry runs do not emit lock or idle-release timings.
 
-Next bounded check: after natural adoption of this instrumentation, inspect
-the next day's natural fresh-ticket timelines, including all slow samples.
-Use phase records to isolate any remaining >30s eligible idle-capacity delay
-before choosing another repair. Do not create real work or extra model
-workers just to obtain samples. If none occurs, record the missing exposure
-and defer again; the original acceptance remains WT-68.
+The November 17 checkpoint below replaces the former timed data wait under
+the owner's WT-87 permanent-monitor policy. Do not park WT-68 for another
+day of samples or infer permission to create real work/model workers.
+
+## November 17: measured explanation and permanent check
+
+The queue-lock regression is repaired (d1c2343); its isolated 30.311s ->
+0.172s claim benchmark remains relevant. Instrumentation 0375420 was adopted;
+natural records now separate process creation from agent briefing and claim.
+These subsequent **fresh, first-worker** cases retain slow observations:
+
+| Ticket | Enqueue UTC | Process | First claim | Total / pre-process / after-process |
+| --- | --- | --- | --- | --- |
+| WT-80 | Nov16 18:30:08 | 18:30:12 | 18:30:32 | 24 / 4 / 20s |
+| CCC-567 | Nov16 18:35:24 | 18:35:31 | 18:35:54 | 30 / 7 / 23s |
+| WT-81 | Nov16 19:42:57 | 19:43:01 | 19:43:21 | 24 / 4 / 20s |
+| WT-82 | Nov16 21:08:11 | 21:08:15 | 21:08:29 | 18 / 4 / 14s |
+| WT-83 | Nov17 01:44:50 | 01:44:53 | 01:45:22 | 32 / 3 / 29s |
+| CCC-575 | Nov17 02:30:01 | 02:30:20 | 02:30:46 | 45 / 19 / 26s |
+| CCC-576 | Nov17 08:07:03 | 08:07:16 | 08:07:34 | 31 / 13 / 18s |
+| WT-85 | Nov17 08:29:53 | 08:29:58 | 08:30:16 | 23 / 5 / 18s |
+
+CCC-575 STARTUP_TIMING: ticket_read 2.890s, busy_read 0.553s,
+notify_workers 0.016s, staffing_lock 0.000431s, idle_release 0.007s,
+reconcile 22.450s. Reconcile includes its six-second launch observation;
+about 14s preceded SPAWN_PLAN after idle_release. That is **not lock wait**;
+existing instrumentation does not identify its individual staffing function.
+A current read-only scoped CCC cProfile took 2.270s, including 1.524s in
+nine local DB reads. This does not reproduce the historical slow staffing.
+WT-83 spent 29s after process creation, so further dispatcher lock changes
+alone cannot establish a universal sub-30-second enqueue-to-claim result.
+WT-84's eight-hour enqueue-to-claim interval is a later explicit RUN, not
+fresh dispatch latency. Reclaims, backlog, capacity/readiness gates, and warm
+pickup are also separate exposures, not silently counted as fast startups.
+
+Options considered: speculative scheduler rewriting without causal evidence;
+prewarming or model changes (outside current fleet-policy authorization);
+or permanent natural measurement using the already-shipped repair. The last
+follows WT-87's explicit owner instruction to finish verifiable work, close
+with a caveat and install a permanent check instead of waiting for time/data.
+It does **not** certify the remaining >30s observations resolved.
+
+`python3 -m watchtower.startup_check --since ISO_UTC` reads existing activity
+logs and durable tickets; it never launches workers, calls models, creates
+traffic or changes fleet settings. Scope is WT/CCC/DECISIONS-FIX local queues,
+one initial worker from zero, with a completed successful launch observation
+and direct enqueue dispatch. It authenticates ENQUEUE against durable ticket
+creation (within five seconds), since shared logs contain leaked test events.
+It joins SPAWN_PLAN -> SPAWN -> SPAWN_START -> DISPATCH -> first CLAIM,
+rejects ambiguous worker prefixes, and excludes explicit RUN/backlog/gated
+exposures. Launch failures before SPAWN are outside this check's exposure;
+existing launch-failure handling owns them. Timestamp precision is one second.
+
+The watch uses a rolling 24h window, never older than its registered baseline.
+Any qualifying >30s sample or still-unclaimed launch older than 30s fails;
+missing exposure/creation evidence is pending, not a real pass. A missing/stale
+activity log (>10min) fails without claiming real data. Faster later samples
+cannot hide a slow first claim. A normal qualifying <=30s claim passes on real
+data. The registered command runs every five minutes on `her`, links failures
+back to WT-68, and stays visible in owner view until its first real pass.
+The original historical window intentionally returns **fail**, retaining
+WT-83/CCC-575/CCC-576; the new monitoring baseline starts at installation,
+with the historical limits preserved here and on the ticket's caveat.
