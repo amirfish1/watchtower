@@ -176,9 +176,40 @@ code or commit. Its transcript records a Bash prototype denial at
 "The user doesn't want to take this action right now. STOP what you are doing
 and wait for the user to tell you how to proceed." The record does not identify
 the denial's source. That command included a scratch-directory `rm -rf *`;
-any resumed implementation should use fresh disposable directories and
-bounded cleanup. Do not treat the earlier lane as pending completed work or
-silently retry its denied prototype; clarify the hold before that step.
+resumed implementation must use fresh disposable directories and bounded
+cleanup. Do not treat the earlier lane as pending completed work or retry its
+denied prototype. On 2026-11-17 Amir answered **ok** in the original session;
+the worker recorded **[Q1121:wt61-stage-hold] answered** on WT-61. This resumes
+the remaining source-only work with those cleanup limits, keeps live policy
+disabled, and retains the final combined security review before integration.
+
+## Resumed source work — 2026-11-17
+
+The private candidate was refreshed against `origin/main` at merge checkpoint
+`9d94cad`; both the sandbox contract and upstream release expectation arguments
+are preserved. The required push checks passed (425 tests). The fresh stage
+implementation lane is `ce5712aa-033c-4afc-861c-d89d0f17d4c7`, branch
+`wt-61-stages-v2-65ecd04d`, starting from that checkpoint. It owns isolated
+command gates, supervised verifier/reviewer results, and assessments. Its work
+still requires integration, verification and review; a running lane is not
+delivery evidence.
+
+The acceptance runner's opt-in `--gated` mode configures a disposable bug
+ticket with a command gate, an explicit Codex verifier and a post-fix assessor.
+After reviewed patch adoption, the controller selects the trusted integration
+checkout and drives only that fixture's stage supervision until a bounded
+deadline. It requires both recorded gate passes and a completed assessment.
+The role choices are fixture configuration, not permission to replace live
+non-Codex targets. Record actual gated verdicts here after the complete source
+candidate passes; earlier ungated verdicts do not establish stage support.
+
+The revised runner's exec smoke passed at
+`/home/hermes/wt-sandbox-acceptance-9laa0ym7/controller/verdict.json`, adopted
+fixture commit `39335d96bf6c5994f6ffc90640124debc9c636f2`. It checks the existing
+boundary/proof/handoff/adoption flow after the runner changes. Seven focused
+runner tests cover assessment completion, failed/blocked stage termination,
+the bounded deadline, and cleanup rejecting peer or reused PID records. The
+gated real-model runs await the stage implementation; this is not their proof.
 
 Review branch/worktree: `wt-61-wt-039caa56`,
 `/home/hermes/Apps/watchtower-wt61-039caa56`. No live policies, customer sends,

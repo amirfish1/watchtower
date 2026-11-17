@@ -2,7 +2,8 @@
 """Opt-in real Codex acceptance against a disposable queue and checkout.
 
 Run from the repository: python3 scripts/verify_codex_sandbox.py --transport exec
-Each invocation starts one model turn on the existing Codex account. It never
+Each invocation starts one builder turn on the existing Codex account; --gated
+also starts an independent verifier and assessor. It never
 uses the real queue, changes live settings, or copies authentication material.
 Evidence is retained in the printed directory for review.
 """
@@ -18,6 +19,40 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
+
+
+def settle_stages(queue, stages, ref, timeout):
+    """Drive only this disposable ticket; retain every observed transition."""
+    deadline = time.monotonic() + timeout
+    transitions = []
+    while True:
+        item = queue.get(ref) or {}
+        assessment = item.get("assessment") or {}
+        state = (item.get("status"), item.get("gate_pending"), assessment.get("status"))
+        if not transitions or transitions[-1]["state"] != list(state):
+            transitions.append({"state": list(state), "elapsed": round(timeout - max(
+                0, deadline - time.monotonic()), 2)})
+        if state[0] == "closed" and state[2] == "done":
+            return item, transitions
+        if (item.get("needs_input") or state[0] in ("open", "awaiting_answer")
+                or state[2] == "failed" or time.monotonic() >= deadline):
+            return item, transitions
+        stages.reconcile_stages(only_ref=ref)
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+
+
+def stop_fixture_stages(workers, stages, ref, project):
+    """Stop only this fixture's recorded stage processes with matching identity."""
+    stopped = []
+    for row in workers.list_workers(prune=False):
+        if row.get("ref") != ref or row.get("ticket_queue") != project or not row.get("stage"):
+            continue
+        pid, token = int(row.get("pid") or 0), str(row.get("pid_started") or "")
+        if pid and token and workers._pid_start_token(pid) == token and workers._pid_alive(pid):
+            stages._kill(pid)
+            stopped.append(row.get("worker_id"))
+    return stopped
 
 
 def main():
@@ -26,7 +61,12 @@ def main():
     parser.add_argument("--codex-home", type=Path, default=Path.home() / ".codex")
     parser.add_argument("--model", default="")
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument("--gated", action="store_true",
+                        help="also require the isolated command gate, verifier and assessment")
+    parser.add_argument("--stage-timeout", type=int, default=600)
     args = parser.parse_args()
+    if args.timeout <= 0 or args.stage_timeout <= 0:
+        parser.error("timeouts must be positive")
     auth_home = args.codex_home.expanduser().resolve(strict=True)
     package = Path(__file__).resolve().parent.parent
     codex = shutil.which("codex")
@@ -60,7 +100,7 @@ def main():
                       WT_NO_SELF_UPDATE="1", WATCHTOWER_DELEGATE_URL="off",
                       WATCHTOWER_CODEX_BIN=codex)
     sys.path.insert(0, str(package))
-    from watchtower import config, queue, sandbox_bridge, sandbox_policy, sandbox_handoff, workers
+    from watchtower import config, queue, sandbox_bridge, sandbox_policy, sandbox_handoff, workers, stages
 
     shim_dir = trusted / "bin"
     shim_dir.mkdir()
@@ -91,7 +131,15 @@ def main():
     config.set_repo_path(queue_name, str(repo))
     # Prevent a manual-run-only fixture from offering zero tickets.
     config.set_auto_drain(queue_name, True)
-    item = queue.enqueue(project=queue_name, note="Fix fixture addition", repo_path=str(repo))
+    if args.gated:
+        config.set_gates(queue_name, ["cmd:python3 -m unittest -v", "verify"])
+        # Explicit fixture-only role choices: never silently replace a configured
+        # live reviewer from another engine to make sandbox acceptance pass.
+        config.set_verifier(queue_name, "codex", args.model)
+        config.set_role(queue_name, "assessor", "codex", args.model)
+        config.set_post_fix_assessment(queue_name, True)
+    item = queue.enqueue(project=queue_name, note="Fix fixture addition", repo_path=str(repo),
+                         item_type="bug")
     store = sandbox_bridge.register(queue_name, worker, str(repo))
     workers.codex_sandbox_prepare(queue_name, worker, str(repo))
     # A worker can plant any executable in its writable PATH. Trusted proof
@@ -154,6 +202,8 @@ assert all(out.values()), out
     stop = threading.Event()
     broker = threading.Thread(target=sandbox_bridge.serve, args=(stop,), daemon=True)
     broker.start()
+    stage_transitions = []
+    stopped_stage_workers = []
     try:
         with log_path.open("wb") as log:
             proc = subprocess.Popen(argv, cwd="/", env=env, stdin=subprocess.DEVNULL,
@@ -171,29 +221,36 @@ assert all(out.values()), out
                     os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait(5)
                 code = 124
+        current = queue.get(item["ref"]) or {}
+        handoff_status = current.get("status")
+        integrated_commit = ""
+        handoffs = list((sandbox_bridge.authority_dir() / "handoffs").glob(worker + "-*.json"))
+        if handoff_status == "awaiting_answer" and len(handoffs) == 1:
+            record = json.loads(handoffs[0].read_text())
+            adopted = sandbox_handoff.adopt(worker, record["commit"], integration)
+            integrated_commit = adopted["commit"]
+            # Fixture controller reviews known arithmetic bytes before executing.
+            if (integration / "arithmetic.py").read_text() != "def add(a, b):\n    return a + b\n":
+                raise RuntimeError("adopted fixture patch failed source review")
+            subprocess.run([sys.executable, "-m", "unittest", "-v"], cwd=integration, check=True)
+            # This disposable fixture has a local release ref; real integrations
+            # must push and check the configured remote release branch instead.
+            subprocess.run(["git", "-C", str(integration), "update-ref", "refs/remotes/origin/main",
+                            integrated_commit], check=True)
+            subprocess.run(["git", "-C", str(integration), "merge-base", "--is-ancestor",
+                            integrated_commit, "origin/main"], check=True)
+            # The trusted integrator chooses its reviewed destination. Worker
+            # spool data is never allowed to choose this controller-side path.
+            queue.update(item["ref"], repo_path=str(integration))
+            resolution = dict(record["resolution"], commit=integrated_commit)
+            current = queue.close(item["ref"], resolution=resolution) or {}
+            if args.gated:
+                current, stage_transitions = settle_stages(queue, stages, item["ref"], args.stage_timeout)
     finally:
+        if args.gated:
+            stopped_stage_workers = stop_fixture_stages(workers, stages, item["ref"], queue_name)
         stop.set()
         broker.join(5)
-    current = queue.get(item["ref"]) or {}
-    handoff_status = current.get("status")
-    integrated_commit = ""
-    handoffs = list((sandbox_bridge.authority_dir() / "handoffs").glob(worker + "-*.json"))
-    if handoff_status == "awaiting_answer" and len(handoffs) == 1:
-        record = json.loads(handoffs[0].read_text())
-        adopted = sandbox_handoff.adopt(worker, record["commit"], integration)
-        integrated_commit = adopted["commit"]
-        # Fixture controller reviews known arithmetic bytes before executing.
-        if (integration / "arithmetic.py").read_text() != "def add(a, b):\n    return a + b\n":
-            raise RuntimeError("adopted fixture patch failed source review")
-        subprocess.run([sys.executable, "-m", "unittest", "-v"], cwd=integration, check=True)
-        # This disposable fixture has a local release ref; real integrations
-        # must push and check the configured remote release branch instead.
-        subprocess.run(["git", "-C", str(integration), "update-ref", "refs/remotes/origin/main",
-                        integrated_commit], check=True)
-        subprocess.run(["git", "-C", str(integration), "merge-base", "--is-ancestor",
-                        integrated_commit, "origin/main"], check=True)
-        resolution = dict(record["resolution"], commit=integrated_commit)
-        current = queue.close(item["ref"], resolution=resolution) or {}
     boundary_file = repo / "boundary.json"
     boundary = json.loads(boundary_file.read_text()) if boundary_file.exists() else {}
     result = {"transport": args.transport, "exit_code": code, "evidence": str(base),
@@ -202,6 +259,15 @@ assert all(out.values()), out
               "handoff_status": handoff_status, "integrated_commit": integrated_commit,
               "forged_commit_rejected": not forged.get("ok"), "forged_export_rejected": export_refused,
               "forbidden_write_absent": not forbidden.exists() and not shared.exists()}
+    if args.gated:
+        gates = current.get("gate_results") or []
+        result.update(gated=True, gate_results=gates,
+                      assessment=current.get("assessment") or {}, stage_transitions=stage_transitions,
+                      stopped_stage_workers=stopped_stage_workers)
+        result["gates_passed"] = all(any(g.get("gate") == name and g.get("passed")
+                                               for g in gates)
+                                      for name in ("cmd:python3 -m unittest -v", "verify"))
+        result["assessment_done"] = result["assessment"].get("status") == "done"
     unit_result = repo / "unit-result.txt"
     result["tests_passed"] = unit_result.exists() and "\nOK\n" in unit_result.read_text()
     result["source_fixed"] = (repo / "arithmetic.py").read_text() == "def add(a, b):\n    return a + b\n"
@@ -211,6 +277,8 @@ assert all(out.values()), out
                              and result["tests_passed"] and result["source_fixed"]
                              and len(boundary) == 4 and all(boundary.values())
                              and result["forbidden_write_absent"])
+    if args.gated:
+        result["passed"] = result["passed"] and result["gates_passed"] and result["assessment_done"]
     (trusted / "verdict.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
     return 0 if result["passed"] else 1
