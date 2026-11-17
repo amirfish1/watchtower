@@ -166,3 +166,16 @@ def test_default_run_uses_raw_inventory_without_ticket_conversion(env, tmp_path,
     monkeypatch.setattr(watches, 'inventory', lambda: ([item], []))
     monkeypatch.setattr(q, 'list_items', lambda *a, **k: pytest.fail('full ticket conversion on watch path'))
     assert watches.run('natural-check')[0]['status'] == 'pending'
+
+
+def test_legacy_resolution_cannot_prevent_other_registered_checks_or_owner_view(env, tmp_path):
+    q, *_ = env
+    check(tmp_path)
+    ref = close(env, tmp_path)
+    watched = q.get(ref)
+    legacy = dict(ref='OLD-1', project='OLD', status='closed', resolution='historical outcome')
+    # Raw inventories deliberately retain the old on-disk representation.
+    results = watches.run('natural-check', items=[legacy, watched])
+    assert len(results) == 1 and results[0]['origin'] == ref
+    rows = watches.owner_rows([legacy, watched])
+    assert len(rows) == 1 and rows[0]['ref'] == ref

@@ -122,7 +122,8 @@ def sync(items):
         for item in items:
             if item.get("status") != "closed":
                 continue
-            for spec in (item.get("resolution") or {}).get("watches") or []:
+            resolution = item.get("resolution")
+            for spec in (resolution.get("watches") or []) if isinstance(resolution, dict) else []:
                 # Issue bodies are external data, not authority to execute
                 # shell commands. Only this host's immutable registry grants it.
                 registered = data["checks"].get(spec.get("name"))
@@ -145,7 +146,8 @@ def owner_rows(items, project=""):
     for item in items:
         if item.get("status") != "closed":
             continue
-        for spec in (item.get("resolution") or {}).get("watches") or []:
+        resolution = item.get("resolution")
+        for spec in (resolution.get("watches") or []) if isinstance(resolution, dict) else []:
             bound = data["bindings"].get(item["ref"] + ":" + spec["name"], {})
             if not bound.get("first_real_pass"):
                 rows.append(dict(ref=item["ref"], check=spec["name"], command=spec["command"],
