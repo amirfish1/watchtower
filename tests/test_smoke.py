@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import importlib
 import json
-import threading
-import urllib.request
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
+
+from portable_transports import http_json, socket_denied
 
 
 @pytest.fixture()
@@ -345,9 +345,10 @@ def test_stuck_detection(store):
     assert rows["STK"]["stuck"] is True
 
 
-def test_spawn_worker_dry_run(store):
+def test_spawn_worker_dry_run(store, monkeypatch):
     import watchtower.workers as workers
 
+    monkeypatch.setattr(workers, "_resolve_engine_bin", lambda engine: engine)
     spawned = workers.spawn_workers("DEMO", n=2, engine="claude", dry_run=True)
     assert len(spawned) == 2
     for s in spawned:
@@ -1068,7 +1069,8 @@ def test_status_includes_workers(store, capsys):
     assert "LIVE" in out
 
 
-def test_dashboard_serves_status_json(store):
+@pytest.mark.parametrize("force_memory", [False, True])
+def test_dashboard_serves_status_json(store, force_memory):
     import os
 
     import watchtower.queue as q
@@ -1089,20 +1091,8 @@ def test_dashboard_serves_status_json(store):
             it["created_at"] = old
         q._save_unlocked(data)
 
-    # Bind an ephemeral port, serve exactly one request, hit it.
-    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
-    port = httpd.server_address[1]
-    t = threading.Thread(target=httpd.handle_request, daemon=True)
-    t.start()
-    try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/status", timeout=5
-        ) as resp:
-            assert resp.status == 200
-            payload = json.loads(resp.read().decode())
-    finally:
-        t.join(timeout=5)
-        httpd.server_close()
+    # Exercise the HTTP parser and route using a permitted test transport.
+    payload = http_json(dashboard, "/api/status", force_memory=force_memory)
 
     assert "queues" in payload and "workers" in payload
     dash = next(r for r in payload["queues"] if r["queue"] == "DASH")
@@ -1176,7 +1166,8 @@ def test_drain_rate_eta_fields(store):
     assert stall["eta_human"] is None
 
 
-def test_api_status_includes_drain_and_activity(store):
+@pytest.mark.parametrize("force_memory", [False, True])
+def test_api_status_includes_drain_and_activity(store, force_memory):
     """/api/status carries drain_rate/eta on queues and active_ref on workers."""
     import os
 
@@ -1193,18 +1184,7 @@ def test_api_status_includes_drain_and_activity(store):
     workers.record_worker(os.getpid(), "DASH", "claude", "dash-live01")
     q.claim_next("dash-live01", project="DASH")
 
-    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
-    port = httpd.server_address[1]
-    t = threading.Thread(target=httpd.handle_request, daemon=True)
-    t.start()
-    try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/status", timeout=5
-        ) as resp:
-            payload = json.loads(resp.read().decode())
-    finally:
-        t.join(timeout=5)
-        httpd.server_close()
+    payload = http_json(dashboard, "/api/status", force_memory=force_memory)
 
     dash = next(r for r in payload["queues"] if r["queue"] == "DASH")
     assert "drain_rate_per_min" in dash
@@ -1218,7 +1198,8 @@ def test_api_status_includes_drain_and_activity(store):
     assert w["active_since_human"] is not None
 
 
-def test_dashboard_drilldown_page_and_api(store):
+@pytest.mark.parametrize("force_memory", [False, True])
+def test_dashboard_drilldown_page_and_api(store, force_memory):
     """/q/<queue> renders the queue's tickets; /api/queue/<name> mirrors wt ls."""
     import watchtower.queue as q
     import watchtower.dashboard as dashboard
@@ -1234,25 +1215,15 @@ def test_dashboard_drilldown_page_and_api(store):
     assert "all queues" in page  # back link
     assert "DRILL-1" in page
 
-    # JSON for the same queue over the wire.
-    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
-    port = httpd.server_address[1]
-    t = threading.Thread(target=httpd.handle_request, daemon=True)
-    t.start()
-    try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/queue/DRILL", timeout=5
-        ) as resp:
-            data = json.loads(resp.read().decode())
-    finally:
-        t.join(timeout=5)
-        httpd.server_close()
+    # JSON through the actual HTTP request parser for the same queue.
+    data = http_json(dashboard, "/api/queue/DRILL", force_memory=force_memory)
     assert data["queue"] == "DRILL"
     assert len(data["tickets"]) == 2
     assert data["tickets"][0]["ref"] == "DRILL-1"
 
 
-def test_dashboard_run_api_spawns_one_worker_for_backlog_queue(store, monkeypatch):
+@pytest.mark.parametrize("force_memory", [False, True])
+def test_dashboard_run_api_spawns_one_worker_for_backlog_queue(store, monkeypatch, force_memory):
     """The row-level Run action records a run request and delegates the spawn.
 
     It deliberately does NOT spawn directly: going through dispatch_after_enqueue
@@ -1272,21 +1243,7 @@ def test_dashboard_run_api_spawns_one_worker_for_backlog_queue(store, monkeypatc
         lambda queue, ref="": dispatched.append((queue, ref)) or "nudged",
     )
 
-    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
-    port = httpd.server_address[1]
-    t = threading.Thread(target=httpd.handle_request, daemon=True)
-    t.start()
-    try:
-        req = urllib.request.Request(
-            f"http://127.0.0.1:{port}/api/ticket/{item['ref']}/run",
-            data=b"{}",
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            payload = json.loads(resp.read().decode())
-    finally:
-        t.join(timeout=5)
-        httpd.server_close()
+    payload = http_json(dashboard, f"/api/ticket/{item['ref']}/run", method="POST", body={}, force_memory=force_memory)
 
     assert payload["ok"] is True
     assert payload["dispatch"] == "nudged"
@@ -1295,7 +1252,8 @@ def test_dashboard_run_api_spawns_one_worker_for_backlog_queue(store, monkeypatc
     assert q.get(item["ref"])["run_requested"] is True
 
 
-def test_dashboard_launch_nonblocking_and_stop(store, tmp_path, monkeypatch, capsys):
+@pytest.mark.parametrize("force_memory", [False, True])
+def test_dashboard_launch_nonblocking_and_stop(store, tmp_path, monkeypatch, capsys, force_memory):
     """`wt dashboard --no-open` returns immediately (non-blocking) and writes a
     pidfile; `wt dashboard --stop` tears the background server down."""
     import importlib
@@ -1309,10 +1267,37 @@ def test_dashboard_launch_nonblocking_and_stop(store, tmp_path, monkeypatch, cap
     # Pick a likely-free ephemeral-ish port for the real background server.
     import socket
 
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
+    child = None
+    try:
+        if force_memory:
+            raise PermissionError(1, "forced process-only launch check")
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+        finally:
+            s.close()
+    except OSError as exc:
+        if not socket_denied(exc):
+            raise
+        # Process lifecycle remains real when the foreground HTTP server
+        # cannot bind. Assert the exact launch contract before substituting
+        # a harmless child; HTTP parsing/routing is covered above.
+        import subprocess
+        import sys
+        real_popen = subprocess.Popen
+        port = 18787
+
+        def launch(cmd, **kwargs):
+            nonlocal child
+            assert cmd == [sys.executable, "-m", "watchtower.cli", "dashboard",
+                           "--foreground", "--host", "127.0.0.1", "--port", str(port)]
+            assert kwargs == dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, start_new_session=True)
+            child = real_popen([sys.executable, "-c", "import time; time.sleep(60)"], **kwargs)
+            return child
+
+        monkeypatch.setattr(subprocess, "Popen", launch)
 
     try:
         # Non-blocking: this call must return without serving forever.
@@ -1339,6 +1324,9 @@ def test_dashboard_launch_nonblocking_and_stop(store, tmp_path, monkeypatch, cap
                 break
             time.sleep(0.05)
         assert not pidfile.exists()
+        if child is not None:
+            child.wait(timeout=5)
+            assert child.returncode != 0
 
 
 def test_close_with_resolution_round_trips(store):
@@ -1518,7 +1506,8 @@ def test_dashboard_drilldown_renders_closed_resolution(store):
     assert "chip caveat" in page  # palette marker for caveats
 
 
-def test_api_queue_includes_closed_with_resolution(store):
+@pytest.mark.parametrize("force_memory", [False, True])
+def test_api_queue_includes_closed_with_resolution(store, force_memory):
     """/api/queue/<name> returns active tickets + a closed array w/ resolution."""
     import watchtower.queue as q
     import watchtower.dashboard as dashboard
@@ -1527,18 +1516,7 @@ def test_api_queue_includes_closed_with_resolution(store):
     q.enqueue(project="ACLOSE", note="to close")
     q.close("ACLOSE-2", "w", resolution="finished it")
 
-    httpd = dashboard.ThreadingHTTPServer(("127.0.0.1", 0), dashboard._Handler)
-    port = httpd.server_address[1]
-    t = threading.Thread(target=httpd.handle_request, daemon=True)
-    t.start()
-    try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}/api/queue/ACLOSE", timeout=5
-        ) as resp:
-            data = json.loads(resp.read().decode())
-    finally:
-        t.join(timeout=5)
-        httpd.server_close()
+    data = http_json(dashboard, "/api/queue/ACLOSE", force_memory=force_memory)
 
     assert data["queue"] == "ACLOSE"
     assert len(data["tickets"]) == 1  # one still open

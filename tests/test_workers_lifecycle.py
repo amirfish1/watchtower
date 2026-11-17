@@ -33,6 +33,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from portable_transports import peer_listener
+
 
 @pytest.fixture()
 def wt(tmp_path, monkeypatch):
@@ -4511,6 +4513,7 @@ def test_engine_activity_lookup_error_is_logged_and_preserved(wt, monkeypatch):
 def test_partial_usage_fallback_preserves_failed_slot_causality(
     wt, monkeypatch
 ):
+    monkeypatch.setattr(wt.workers, "engine_available", lambda engine: True)
     wt.config.set_auto_drain("Q", True)
     wt.config.set_desired_workers("Q", 2)
     wt.config.set_engine("Q", "codex")
@@ -5088,8 +5091,9 @@ def test_find_claude_session_row_matches_by_session_id(wt, monkeypatch, tmp_path
     assert wt.workers._find_claude_session_row("") is None
 
 
+@pytest.mark.parametrize("force_memory", [False, True])
 def test_deliver_release_instruction_uses_uds_when_worker_is_dialable(
-    wt, monkeypatch, tmp_path
+    wt, monkeypatch, tmp_path, force_memory
 ):
     claude_home = tmp_path / "claude-home"
     sessions_dir = claude_home / "sessions"
@@ -5100,9 +5104,8 @@ def test_deliver_release_instruction_uses_uds_when_worker_is_dialable(
     # nests too deep to stay under it (found the hard way in Task 1's
     # review). Bind under a short, fixed path instead.
     sock_path = f"/tmp/wt-peer-uds-test-{uuid.uuid4().hex[:8]}.sock"
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(sock_path)
-    srv.listen(1)
+    srv, sock_path = peer_listener(sock_path, monkeypatch,
+                                   memory_path=tmp_path / "peer.sock", force_memory=force_memory)
     received = {}
 
     def accept_once():
@@ -5155,8 +5158,9 @@ def test_deliver_release_instruction_uses_uds_when_worker_is_dialable(
     assert 'from-mode="bypass"' in user_frame["message"]["content"]
 
 
+@pytest.mark.parametrize("force_memory", [False, True])
 def test_deliver_release_instruction_falls_back_when_uds_receipt_is_held(
-    wt, monkeypatch, tmp_path
+    wt, monkeypatch, tmp_path, force_memory
 ):
     claude_home = tmp_path / "claude-home"
     sessions_dir = claude_home / "sessions"
@@ -5164,9 +5168,8 @@ def test_deliver_release_instruction_falls_back_when_uds_receipt_is_held(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude_home))
 
     sock_path = f"/tmp/wt-peer-uds-test-{uuid.uuid4().hex[:8]}.sock"
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    srv.bind(sock_path)
-    srv.listen(1)
+    srv, sock_path = peer_listener(sock_path, monkeypatch,
+                                   memory_path=tmp_path / "peer.sock", force_memory=force_memory)
     received = {}
 
     def accept_once():

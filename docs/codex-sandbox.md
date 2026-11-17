@@ -59,6 +59,43 @@ the writes, so those runs intentionally failed the attack-attempt acceptance.
 The final fixture isolates only its own local hook lookup and explicitly
 authorizes adversarial writes inside its disposable roots. It never pushes.
 
+## Required-gate portability continuation — 2026-11-17, wt-9aafe8b3
+
+WT-86 candidate `14688d5d22b73f8019db376a7223f7747b1c9cb9` supplies the
+pinned offline runtime. Its normal native four-suite gate ran all 425 tests:
+415 passed, 10 failed. Eight failures were socket-dependent tests; two relied
+on ambient engine availability. See `~/.watchtower/evidence/WT-86/full-gate.log`.
+
+The continuation preserves the complete four required suites and every
+behavior assertion. `tests/portable_transports.py` uses real TCP/UDS sockets
+when allowed, and chooses memory transport only on EPERM/EACCES. Unexpected
+socket errors still fail. The smoke tests feed serialized HTTP through the
+real `BaseHTTPRequestHandler` parser, routes and response serializer. The
+peer tests exercise the real frame writer, endpoint lookup, connect/write/
+half-close protocol, receipt check and fallback. The dashboard lifecycle test
+still starts/stops a real child and checks idempotent PID reuse; when sockets
+are denied it asserts the exact foreground-server argv and detached launch
+options before substituting a harmless sleeper. This is process-management
+evidence, not evidence that a denied HTTP listener started.
+
+Each socket-dependent case is also parameterized to force memory transport
+on unrestricted hosts, so those branches cannot silently rot. The existing
+native boundary tests independently require TCP/IPv6 denial and Unix bind/
+connect denial. No production launcher, policy, roots, gate command or suite
+list changes. Engine assumptions are pinned inside the two affected tests.
+Host smoke+lifecycle: **387 passed**, including eight additional memory
+cases, `/home/hermes/wt61-9aafe8b3-portable.log`. The unchanged full native gate
+is run through `scripts/sandbox_test_commit.py`; its receipt is retained at
+`/home/hermes/wt61-9aafe8b3-native-gate.log` (inspect the result, not just the
+existence of this path).
+
+The Antigravity baseline review has not produced its report after repeated
+provider stream timeouts, HTTP 503 and EOF retries; **OPS-645** records that
+infrastructure gap. Both baseline report assessment and revised combined
+security review remain required before integration. WT-61 stays open,
+source-only and default-off; neither portability nor the runtime alone clears
+that hold. Decision D557 records this reversible test implementation choice.
+
 ## Enforcement and authority
 
 Each registered worker gets two writable roots: its assigned workspace and a
