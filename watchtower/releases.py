@@ -25,6 +25,14 @@ _SHA = re.compile(r"^[0-9a-fA-F]{7,40}$")
 _GITHUB = re.compile(r"^github:([\w.-]+/[\w.-]+):([^:\r\n]+)$")
 
 
+def _legacy_defer(item):
+    """Read retired fields only for explicit migration, never admission."""
+    if item.get("_github_body"):
+        from .github_backend import _split_body
+        return _split_body(item["_github_body"])[1]
+    return item
+
+
 def require_parkable(item, worker, expected_defer=None):
     if item.get("status") not in ("open", "in_progress"):
         raise ValueError(f"{item.get('ref')} is {item.get('status')}; only open/in-progress can await release")
@@ -39,7 +47,7 @@ def require_parkable(item, worker, expected_defer=None):
     if item.get("status") == "in_progress" and item.get("claimed_by") != worker:
         raise ValueError(f"ticket is claimed by {item.get('claimed_by')}, not {worker}")
     if expected_defer is not None and (item.get("status") != "open" or
-                                       item.get("defer_reason") != expected_defer):
+                                       _legacy_defer(item).get("defer_reason") != expected_defer):
         raise ValueError("defer changed since the migration scan; not migrated")
 
 
@@ -76,7 +84,7 @@ def park(ref, worker, *, repo, commit, branch, target, reason, summary="", verif
                 reason=reason, entered_at=q._now_iso(), live_check=live_check,
                 summary=summary, verified=verified, worker=worker, branch_proof=proof["tag"])
     if expected_defer is not None:
-        wait["previous_defer"] = dict(reason=expected_defer, until=item.get("deferred_until", ""))
+        wait["previous_defer"] = dict(reason=expected_defer, until=_legacy_defer(item).get("deferred_until", ""))
     return q.await_release(ref, worker, wait, progress=progress, expected_defer=expected_defer)
 
 
@@ -239,7 +247,7 @@ def migrate(*, project=None, apply=False, repo_override="", target_override=""):
     """
     report = dict(apply=apply, migrated=[], candidates=[], skipped=[])
     for item in q.list_items(status="open", project=project):
-        reason = item.get("defer_reason") or ""
+        reason = _legacy_defer(item).get("defer_reason") or ""
         match = re.match(r"\[awaits release: ([0-9a-f]{7,40}) (?:on|same patch on) ([^\]]+)\]", reason)
         if not match:
             continue

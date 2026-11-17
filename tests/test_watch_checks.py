@@ -28,3 +28,18 @@ def test_historical_errors_and_unrelated_routes_do_not_claim_failure(tmp_path):
     (tmp_path / "alerted.jsonl").write_text(json.dumps(dict(ts=50, path="/a", level="error", excerpt="timeout"))+'\n')
     assert production_logs(tmp_path, "/a", "timeout", 60)["status"] == "pending"
     assert production_logs(tmp_path, "/b", "timeout", 0)["status"] == "pending"
+
+
+def test_timer_audit_reads_raw_issue_metadata_including_closed_and_release_records():
+    from watchtower.watch_checks import ticket_timers
+    from watchtower.github_backend import _body_with_metadata
+    assert ticket_timers([])['status'] == 'pending'
+    item = dict(ref='Q-1', status='closed', _github_body=_body_with_metadata('Historical text',
+                dict(deferred_until='9999-12-31T00:00:00Z', release_wait={'commit':'a'*40})))
+    result = ticket_timers([item])
+    assert result['status'] == 'fail' and 'Q-1' in result['evidence']
+    # Mentioning the former field in prose is not a timer.
+    item['_github_body'] = _body_with_metadata('deferred_until is retired', dict(release_wait={'commit':'a'*40}))
+    assert ticket_timers([item])['status'] == 'pass'
+    assert ticket_timers([item])['real_data'] is True
+    assert ticket_timers([dict(ref='LOCAL-1', deferred_until='2026-01-01')])['status'] == 'fail'

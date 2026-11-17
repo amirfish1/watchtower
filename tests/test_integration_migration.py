@@ -1,7 +1,7 @@
 """WT-84 migration preserves real gates and refuses stale or ungated edits."""
 import pytest
 
-from tests.legacy_defer import seed as seed_defer
+from tests.legacy_defer import seed as seed_defer, snapshot
 
 from tests.test_owner_view import _load, _ticket
 from watchtower import integration_migration as migration
@@ -26,7 +26,7 @@ def test_migration_requires_a_real_gate_and_exact_snapshot(env):
     ref, before = legacy(env)
     with pytest.raises(ValueError, match="real block or dependency"):
         migration.retire(ref, expected_reason=before["defer_reason"], worker="migration")
-    assert q.get(ref) == before
+    assert snapshot(q, ref) == before
     q.block(ref, "reviewer", "Review existing source", wait_on="worker", wait_actor="reviewer")
     blocked = q.get(ref)
     with pytest.raises(ValueError, match="changed"):
@@ -58,7 +58,7 @@ def test_generic_cleanup_fences_exact_timer_and_resumes_unfinished_work(env):
     with pytest.raises(ValueError, match='changed'):
         migration.retire(ref, expected_reason=before['defer_reason'], worker='migration',
                          integration_only=False, expected_until='stale', resume_work='Finish the original fix')
-    assert q.get(ref) == before
+    assert snapshot(q, ref) == before
     after = migration.retire(ref, expected_reason=before['defer_reason'], worker='migration',
                              integration_only=False, expected_until=before['deferred_until'],
                              resume_work='Original symptom is still unfixed; ready for implementation, never a future-data wait')

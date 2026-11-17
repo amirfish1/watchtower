@@ -7193,11 +7193,15 @@ def _reconcile_once_locked(dry_run: bool = False,
             try:
                 from . import releases as _releases
                 result["releases_observed"] = _releases.reconcile()
+            except Exception as exc:
+                from .queue import _log
+                _log("RELEASE_OBSERVER_ERROR", str(exc)[:200])
+            try:
                 from . import watches as _watches
                 _watches.schedule()
             except Exception as exc:
                 from .queue import _log
-                _log("RELEASE_OBSERVER_ERROR", str(exc)[:200])
+                _log("WATCH_SCHEDULER_ERROR", str(exc)[:200])
         # Single supervisor (WT-24): only a real auto-spawn daemon supervises stage
         # sessions -- never a --dry-run or spawn-less one.
         if supervise_stages and not dry_run:

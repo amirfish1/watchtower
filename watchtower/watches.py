@@ -19,6 +19,10 @@ from . import storage
 
 
 def _path():
+    # A custom queue store is a separate environment, including in tests.
+    override = os.environ.get("WATCHTOWER_STORE")
+    if override:
+        return Path(override).expanduser().absolute().with_suffix(".watches.json")
     return storage.data_dir() / "watches.json"
 
 

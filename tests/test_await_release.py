@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from tests.legacy_defer import seed as seed_defer
+from tests.legacy_defer import seed as seed_defer, snapshot
 
 from tests.test_owner_view import _load, _ticket
 from tests.test_release_wait import repo  # noqa: F401
@@ -130,7 +130,7 @@ def test_migration_preserves_old_window_and_never_touches_integration(env, repo,
     assert [i["ref"] for i in result["migrated"]] == [good]
     wait = q.get(good)["release_wait"]
     assert wait["previous_defer"]["until"] == old["deferred_until"]
-    assert q.get(other)["status"] == "open" and q.get(other)["deferred_until"]
+    assert q.get(other)["status"] == "open" and snapshot(q, other)["deferred_until"]
 
 
 def test_probe_failure_does_not_wake_and_targets_are_coalesced(env, repo, monkeypatch):

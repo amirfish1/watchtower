@@ -51,6 +51,23 @@ def related_feedback(since):
                 evidence="Natural worker close feedback: " + json.dumps(report, sort_keys=True))
 
 
+def ticket_timers(items=None):
+    """Audit real ticket storage, including hidden GitHub compatibility fields."""
+    from . import queue as q
+    from .github_backend import _split_body
+    items = q.list_items(strict=True) if items is None else items
+    bad = []
+    for item in items:
+        meta = _split_body(item["_github_body"])[1] if item.get("_github_body") else item
+        if meta.get("deferred_until"):
+            bad.append(item["ref"])
+    if bad:
+        return dict(status="fail", real_data=True,
+                    evidence=f"Retired timer fields remain on {len(bad)} tickets: " + ", ".join(bad[:20]))
+    return dict(status="pass" if items else "pending", real_data=bool(items),
+                evidence=f"Audited {len(items)} real tickets: zero raw deferred_until fields, including closed records and release/pipeline fences")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="kind", required=True)
@@ -62,10 +79,15 @@ def main(argv=None):
     p.add_argument("--success-pattern", default="")
     p = sub.add_parser("related-feedback")
     p.add_argument("--since", required=True)
+    sub.add_parser("ticket-timers")
     args = parser.parse_args(argv)
     try:
-        result = (related_feedback(args.since) if args.kind == "related-feedback" else
-                  production_logs(args.directory, args.route, args.pattern, args.since, args.success_pattern))
+        if args.kind == "ticket-timers":
+            result = ticket_timers()
+        elif args.kind == "related-feedback":
+            result = related_feedback(args.since)
+        else:
+            result = production_logs(args.directory, args.route, args.pattern, args.since, args.success_pattern)
     except (OSError, ValueError, TypeError) as exc:
         result = dict(status="fail", real_data=False, evidence=f"check source unreadable: {type(exc).__name__}")
     print(json.dumps(result))

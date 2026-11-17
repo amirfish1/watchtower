@@ -179,9 +179,9 @@ Use `wt await-release`, not a timed defer, when the code is merged and only
 release/adoption remains. Fetch the release branch first. The commit (or its
 identical cherry-picked patch) must be on that branch; a feature branch is
 still an integration wait. A release wait has distinct status `awaiting_release`,
-no timer, no worker slot, and no periodic reclaims. GitHub issues carry a
-non-expiring compatibility fence for older hosts; current readers expose
-only the release status and remove that fence when the event settles it.
+no timer, no worker slot, and no periodic reclaims. GitHub issues carry an
+explicit release_wait gate. Every active host must run WT-87 or later;
+the former year-9999 compatibility timer is retired.
 
 ```bash
 wt await-release REF --worker ID --repo /path/to/repo --commit SHA \

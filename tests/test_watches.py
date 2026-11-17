@@ -114,3 +114,29 @@ def test_issue_body_cannot_introduce_or_change_an_executable_check(env, tmp_path
     assert watches.run(items=[item]) == []
     assert not watches._load()['bindings']
     assert watches.owner_rows([item])[0]['last']['status'] == 'not-run'
+
+
+def test_pending_watch_reaches_digest_warning_with_result_then_real_pass_removes_it(env, tmp_path, monkeypatch):
+    q, _cli, _a, ov, _name = env
+    receipt = check(tmp_path)
+    ref = close(env, tmp_path)
+    item = q.get(ref)
+    watches.run('natural-check', items=[item])
+    # The existing morning digest consumes snapshot warnings.
+    monkeypatch.setattr(ov.q, 'list_items', lambda *a, **k: [item])
+    from watchtower import related
+    monkeypatch.setattr(related, 'cached_tickets', lambda: ([], {}))
+    view = ov.snapshot()
+    warning = next(w for w in view['warnings'] if f'Watching closed {ref}' in w)
+    assert 'natural-check' in warning and 'test host' in warning
+    assert 'pending' in warning and 'no qualifying records' in warning
+    assert 'no qualifying records' in ov.render(view)
+    receipt.write_text(json.dumps(dict(status='pass', real_data=True, evidence='natural production event')))
+    watches.run('natural-check', items=[item])
+    assert not any('Watching closed' in w for w in ov.snapshot()['warnings'])
+
+
+def test_custom_queue_store_isolates_watch_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv('WATCHTOWER_STORE', str(tmp_path/'isolated.json'))
+    assert watches._path() == tmp_path/'isolated.watches.json'
+    assert not watches._load()['bindings']

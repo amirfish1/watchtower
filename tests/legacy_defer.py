@@ -26,4 +26,16 @@ def seed(q, ident, worker, until, reason, progress=""):
             item.update(deferred_until=until, defer_reason=reason)
             q._append_history(item, "defer", by=q._by("worker", worker), until=until, reason=reason)
             q._save_unlocked(data)
-    return q.get(ident)
+    return snapshot(q, ident)
+
+
+def snapshot(q, ident):
+    """Inspect historical storage fields absent from the admission projection."""
+    item = q.get(ident)
+    if item.get('_github_body'):
+        from watchtower.github_backend import _split_body
+        meta = _split_body(item['_github_body'])[1]
+        for key in ('deferred_until', 'defer_reason'):
+            if key in meta:
+                item[key] = meta[key]
+    return item
