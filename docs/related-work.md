@@ -53,6 +53,24 @@ probe take 42 seconds. Commit search is off the claim critical path.
 `wt related REF --triage` needs `TYPESAFE_API_KEY` or `JEV_API_KEY`, supplied
 from the authorized secret store. The API key is neither persisted nor logged.
 
+For workers that do not inherit a key, opt in to a machine-local credential
+command in `related-credentials.json` under WatchTower's persistent data
+directory (normally `~/.local/share/watchtower/`). For example:
+
+```json
+{"command": ["/absolute/path/to/authorized-key-reader"]}
+```
+
+The reader must print exactly one key and exit successfully within ten seconds.
+It runs as an argv array, without a shell, only for explicit `--triage` when
+neither environment key is set. Its output is captured in memory, never exported
+to worker environments or stored; command errors suppress stdout and stderr.
+Keep the configuration and reader private to the account. A missing or failing
+reader leaves local retrieval available and reports a triage error. Remove the
+configuration to undo the opt-in. Ordinary claims and local recall never execute
+the reader. On hermes, `/home/hermes/.local/bin/wt-jev-key` uses the existing
+Bitwarden secret below; no daemon restart is needed.
+
 On the hermes VM, workers do not inherit the Jev key. The supported invocation
 loads the existing key from Bitwarden for this command only (OPS-630):
 

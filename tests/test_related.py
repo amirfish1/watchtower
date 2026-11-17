@@ -14,6 +14,7 @@ def iso(ts):
 
 @pytest.fixture(autouse=True)
 def isolated(tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_DATA_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "queue.json"))
     monkeypatch.setenv("WATCHTOWER_SHIP_GRAPH", str(tmp_path / "missing-ccc.db"))
     monkeypatch.setattr(gh, "_GH_LIST_CACHE_FILE", tmp_path / "gh.json")

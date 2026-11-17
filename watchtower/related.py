@@ -397,9 +397,8 @@ def _judge_prose(item, query="", excerpt="", budget=12000):
 
 
 def triage(item, hits):
-    key = os.environ.get("TYPESAFE_API_KEY") or os.environ.get("JEV_API_KEY")
-    if not key:
-        raise ValueError("Jev triage needs TYPESAFE_API_KEY or JEV_API_KEY; local retrieval still works")
+    from .related_credentials import triage_key
+    key = triage_key()
     if not hits:
         return dict(answers={}, usage={})
     criteria = {
