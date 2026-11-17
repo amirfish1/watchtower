@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import sandbox_policy as policy
+from . import sandbox_runtime
 
 GATE_TIMEOUT_S = 900.0
 # Total time one close/integration may spend in sandboxed command gates. The
@@ -554,12 +555,16 @@ def run_cmd_gate(item: Dict[str, Any], command: str, commit: str = "",
     except (StageSandboxError, policy.SandboxPolicyError, OSError) as exc:
         return _setup_failed(command, commit, str(exc), started)
     try:
+        try:
+            runtime_env, runtime_proof = sandbox_runtime.prepare(src["store"])
+        except (OSError, ValueError, KeyError) as exc:
+            return _setup_failed(command, commit, f"offline pytest runtime: {exc}", started)
         out_file = src["store"] / "tmp" / "gate.out"
         env = {"WT_GATE_ROOT": str(src["workspace"]), "WT_GATE_CMD": command,
                "WT_GATE_OUT": str(out_file), "WT_GATE_TAIL": str(GATE_OUTPUT_TAIL),
                "WT_GATE_BLOCKS": str(GATE_FILE_BLOCKS), "WT_GATE_COMMIT": src["commit"],
                "WT_TICKET_REF": ref, "WT_GATE_REPO": str(src["workspace"]),
-               "WT_SANDBOX_GATE": "1", "CI": "1"}
+               "WT_SANDBOX_GATE": "1", "CI": "1", **runtime_env}
         try:
             proc = policy.run_sandboxed(["/bin/sh", "-c", _GATE_SCRIPT], src["workspace"],
                                         src["store"], mode="rw", env=env,
@@ -577,7 +582,7 @@ def run_cmd_gate(item: Dict[str, Any], command: str, commit: str = "",
         result = {"gate": "cmd:" + command, "passed": ok, "exit_code": code,
                   "output_tail": tail[-GATE_OUTPUT_TAIL:], "commit": commit or "",
                   "at": _now_iso(), "seconds": round(time.time() - started, 1),
-                  "sandboxed": True,
+                  "sandboxed": True, "runtime": runtime_proof,
                   "source": {k: src["manifest"].get(k) for k in
                              ("commit", "files", "symlinks", "gitlinks", "bytes",
                               "omitted_count", "omitted")}}

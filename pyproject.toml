@@ -30,4 +30,4 @@ dev = ["pytest>=7"]
 include = ["watchtower*"]
 
 [tool.setuptools.package-data]
-watchtower = ["skills/**/*"]
+watchtower = ["skills/**/*", "sandbox_pytest_runtime.zip", "sandbox_pytest_runtime.json"]

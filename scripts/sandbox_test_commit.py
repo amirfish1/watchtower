@@ -27,6 +27,6 @@ if __name__ == "__main__":
     except (ValueError, OSError) as exc:
         p.exit(2, "sandbox test refused: " + str(exc) + "\n")
     print(json.dumps({k: result.get(k) for k in
-                      ("gate", "passed", "exit_code", "commit", "seconds", "sandboxed")}, indent=2))
+                      ("gate", "passed", "exit_code", "commit", "seconds", "sandboxed", "runtime")}, indent=2))
     sys.stderr.write(str(result.get("output_tail") or "") + "\n")
     sys.exit(0 if result.get("passed") else 1)
