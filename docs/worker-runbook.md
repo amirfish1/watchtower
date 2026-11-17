@@ -377,8 +377,9 @@ wt await-release REF --worker ID --commit SHA --release-branch origin/BRANCH \
 - If a parent must compose branches, close the source-complete child only when
   its own acceptance is met, and make the parent depend on it with
   `wt edit PARENT --after CHILD`. Never close away the child's original symptom.
-- A real gate (owner approval, customer/money hard stop, named reviewer) stays
-  `wt block --wait-on owner|worker --wait-actor WHO`. Preserve required review;
+- A real human gate (owner approval, customer/money hard stop, named reviewer)
+  stays `wt block --wait-on owner` or
+  `wt block --wait-on external --wait-actor WHO`. Preserve required review;
   this policy grants no new access or approval.
 - Never switch the branch of a shared checkout to get onto the release branch.
   Work in your own worktree off a fresh copy of it.
@@ -393,16 +394,24 @@ otherwise, so name the actor whenever the owner is not the one who must act:
 
 - `wt block REF --worker ID --question "..." --wait-on external --wait-actor "Sonia"`:
   waiting on a client, studio owner or vendor (blue).
-- `--wait-on dependency --wait-ref OPS-167`: waiting on another ticket or
-  handoff (neutral).
-- `--wait-on worker`: the decision is already made and only worker time is
-  missing (amber).
 - `--wait-on owner`: a decision only the owner can make (red).
 
-Always pass `--wait-on`. A block without it still works and older readers
-still treat it as an owner wait, but `wt block` prints a note and
-`wt owner-view` lists it as **unclassified**: visible, and nobody can tell
-whether it needs the owner.
+Always pass `--wait-on owner|external`; these are the supported person waits.
+Worker waits and text-only dependency blocks are retired. Do authorized work
+yourself, or use `wt edit REF --after DEP` for unfinished work tracked by another
+ticket. This releases the claim without creating a human question. Verify that
+DEP actually owns the missing work and does not already depend on REF; never
+add a cycle or an already-completed prerequisite just to park a ticket.
+
+**Reserved actions are an authority boundary, not a worker wait.** If an explicit
+instruction reserves a shared build, landing, restart or other action for a
+coordinator, retain that restriction. A real unfinished prerequisite can use
+`--after`; otherwise ask the owner to delegate that specific reserved action or
+retain the restriction, using the decision desk and an owner block. State the
+instruction and the exact scope requiring delegation. Do not infer delegation
+from a closed child, a missing coordinator or a dependency cycle; do not relabel
+an agent as an external human. Ordinary reversible implementation choices that
+are already authorized still belong to the worker, not an owner question.
 
 `wt wait-on REF --on external --actor "Sonia" --note "..."` corrects the
 current block in place (no new question, history kept). A later `wt block`
@@ -428,11 +437,11 @@ When `--decide-by` passes, the ticket is flagged for a re-check of the facts.
 It stays blocked and open: a passed time never means handled, expired or
 safe to close. None of these fields grants or removes authority.
 
-**A dependency on another host's local queue** names that host:
-`--wait-on dependency --wait-ref OPS-1635 --wait-ref-host ami` (or
-`wt wait-on REF --on dependency --ref OPS-1635 --ref-host ami`). Local queues
-are per host, so without it the wait resolves only on the host that recorded
-it, and a same-number ticket elsewhere must never answer it.
+**Another host's local queue is a separate identity.** Inspect the dependency
+on its owning host and record the host with the ref in progress. The retired
+dependency-wait flags are not a fallback when `--after` cannot resolve that
+ticket. Never substitute a same-number local ticket or invent an edge; report
+the concrete tooling/access gap and preserve the unfinished acceptance.
 
 `wt owner-view [-q QUEUE] [--json]` shows every blocked ticket by who it
 really waits on, grouped by root, on file and GitHub queues alike. It reads
