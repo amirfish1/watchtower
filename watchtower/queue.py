@@ -86,6 +86,7 @@ from .refs import canonical_ref, display_ref, slug_of, ticket_slug
 import copy
 import json
 import os
+import stat as _stat
 import re as _re
 import sys
 import time
@@ -4653,23 +4654,104 @@ def _run_cmd_gate(command: str, repo_path: str, commit: str, ref: str,
     return res
 
 
-def _sandbox_restricted(item: Dict[str, Any]) -> bool:
-    """Restriction follows the builder's origin, including a group's members.
+def _history_principals(item: Dict[str, Any]) -> Tuple[set, set]:
+    """Every worker id and session id the ticket's own history names."""
+    workers_seen, sessions_seen = set(), set()
+    for event in item.get("history") or ():
+        if not isinstance(event, dict):
+            continue
+        by = event.get("by") if isinstance(event.get("by"), dict) else {}
+        for value in (by.get("worker"), event.get("worker")):
+            if value:
+                workers_seen.add(str(value))
+        for value in (by.get("session_id"), event.get("session")):
+            if value:
+                sessions_seen.add(str(value))
+    parked = item.get("parked") if isinstance(item.get("parked"), dict) else {}
+    if parked.get("worker_id"):
+        workers_seen.add(str(parked["worker_id"]))
+    return workers_seen, sessions_seen
 
-    A queue setting can be disabled after a build. That must not make the
-    checkout safe to execute with the daemon's authority.
+
+def _sandbox_origin_evidence(item: Dict[str, Any]) -> bool:
+    """Durable evidence that a restricted worker or session ever held ``item``.
+
+    Primary: the immutable ``sandbox_origin`` stamped at the first claim by a
+    restricted claimant. Legacy backstop for tickets claimed before the stamp
+    existed: any worker/session named in the ticket's history that carries a
+    write-once restriction tombstone. Both survive claimant changes, workers.json
+    pruning and later queue-policy edits. An unreadable ledger raises or answers
+    True (``sandbox_bridge._tombstoned``), never False.
     """
+    from . import sandbox_bridge
+    if item.get("sandbox_origin"):
+        return True
+    try:
+        ledger = os.lstat(sandbox_bridge._tomb_dir())
+    except FileNotFoundError:
+        ledger = None           # nothing was ever restricted on this host
+    if ledger is not None and not _stat.S_ISDIR(ledger.st_mode):
+        raise ValueError("sandbox restriction ledger is not a directory")
+    workers_seen, sessions_seen = _history_principals(item)
+    if item.get("claimed_by"):
+        workers_seen.add(str(item["claimed_by"]))
+    if item.get("claimed_session_id"):
+        sessions_seen.add(str(item["claimed_session_id"]))
+    return (any(sandbox_bridge._tombstoned("w", w) for w in sorted(workers_seen))
+            or any(sandbox_bridge._tombstoned("s", s) for s in sorted(sessions_seen)))
+
+
+def _stamp_sandbox_origin_unlocked(it: Dict[str, Any], via: str, now: str) -> None:
+    """Write-once sandbox origin, set inside the source lock at a claim.
+
+    Called with the claimant already written to ``it``. Restriction then follows
+    the ticket rather than whoever holds it next, so a trusted reclaim or a
+    disabled queue policy cannot turn its gates, stages or assessment into
+    host-authority work. Never cleared by any path. Tickets never claimed by a
+    restricted worker (and never in a restricted queue) stay full-access.
+    """
+    if it.get("sandbox_origin"):
+        return
+    from . import config, sandbox_bridge
+    worker = str(it.get("claimed_by") or "")
+    session = str(it.get("claimed_session_id") or "")
+    policy_on = config.codex_sandbox(str(it.get("project") or "")) == "workspace-write"
+    if (policy_on or sandbox_bridge._tombstoned("w", worker)
+            or sandbox_bridge._tombstoned("s", session)):
+        it["sandbox_origin"] = {"worker": worker, "session_id": session, "via": via,
+                                "at": now, "policy": policy_on}
+
+
+def _sandbox_restricted(item: Dict[str, Any]) -> bool:
+    """Restriction follows the ticket's origin, including a group's members.
+
+    A queue setting can be disabled and a trusted worker can reclaim the
+    ticket after a build. Neither makes the checkout safe to execute with the
+    daemon's authority. Any lookup failure is restricted (fail closed).
+    """
+    try:
+        return _sandbox_restricted_unchecked(item, 0)
+    except Exception:  # noqa: BLE001 - an unreadable ledger never grants host authority
+        return True
+
+
+def _sandbox_restricted_unchecked(item: Dict[str, Any], depth: int) -> bool:
     from . import config, sandbox_bridge
     if config.codex_sandbox(str(item.get("project") or "")) == "workspace-write":
+        return True
+    if _sandbox_origin_evidence(item):
         return True
     if sandbox_bridge.restricted_session(str(item.get("claimed_session_id") or ""),
                                          str(item.get("claimed_by") or "")):
         return True
-    if group_role(item) == "parent":
+    if depth == 0 and group_role(item) == "parent":
         for ref in group_children(item):
             child = get(ref) or {}
-            if sandbox_bridge.restricted_session(str(child.get("claimed_session_id") or ""),
-                                                 str(child.get("claimed_by") or "")):
+            if (config.codex_sandbox(str(child.get("project") or "")) == "workspace-write"
+                    or _sandbox_origin_evidence(child)
+                    or sandbox_bridge.restricted_session(
+                        str(child.get("claimed_session_id") or ""),
+                        str(child.get("claimed_by") or ""))):
                 return True
     return False
 
@@ -5998,7 +6080,9 @@ def claim_blocked_by_plan(it: Dict[str, Any],
 def _stamp_claim_unlocked(it: Dict[str, Any], items: List[Dict[str, Any]], via: str,
                           now: str) -> Dict[str, Any]:
     """Record which group plan version a child was claimed under; returns the
-    extra fields for the claim history event ({} for a non-group ticket)."""
+    extra fields for the claim history event ({} for a non-group ticket).
+    Also stamps the write-once sandbox origin (WT-61), whatever the claim path."""
+    _stamp_sandbox_origin_unlocked(it, via, now)
     if group_role(it) != "child":
         return {}
     parent = _refs_index(items).get(group_parent_ref(it)) or {}
