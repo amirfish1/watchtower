@@ -7328,7 +7328,7 @@ def assessment_accept_submission(ident: Any, token: str, payload: Any,
     def _do(it, a, data):
         if sandbox_scope is not None:
             from . import sandbox_stage_transport
-            sandbox_stage_transport.guard(sandbox_scope, it)
+            sandbox_stage_transport.guard(sandbox_scope, it, data=data)
         elif a.get("sandbox_scope"):
             raise AssessmentFenced("restricted assessment requires its assigned stage scope")
         if a and token and token in (a.get("fenced_tokens") or []):
@@ -7399,7 +7399,7 @@ def _assessment_apply_op(ident: Any, token: str, idx: int) -> Dict[str, Any]:
             if assessment_lock._fh is None:
                 raise AssessmentFenced("sandbox assessment source lock unavailable")
             from . import sandbox_stage_transport
-            sandbox_stage_transport.guard(a["sandbox_scope"], bug)
+            sandbox_stage_transport.guard(a["sandbox_scope"], bug, data=data)
         if a.get("status") != "filing" or a.get("token") != token:
             raise AssessmentFenced(
                 f"superseded by attempt {a.get('attempt')}" if a.get("token") != token
@@ -7477,7 +7477,7 @@ def assessment_finalize(ident: Any, token: str) -> Optional[Dict[str, Any]]:
     def _do(it, a, data):
         if a.get("sandbox_scope"):
             from . import sandbox_stage_transport
-            sandbox_stage_transport.guard(a["sandbox_scope"], it)
+            sandbox_stage_transport.guard(a["sandbox_scope"], it, data=data)
         if a.get("status") != "filing" or a.get("token") != token:
             raise AssessmentFenced("assessment is no longer filing under this token")
         ops = a["pending"]["ops"]

@@ -124,17 +124,18 @@ combined-source security review is still required before integration.
 
 ## Remaining acceptance — keep WT-61 open
 
-1. **Safe gated workflows.** At the earlier checkpoint, command gates and full-access stage/assessment
-   launches currently refuse sandbox-origin work, including group-parent
-   gates after policy changes. This is a safety boundary, not completed
-   stage support. Implement isolated command/verification/assessment
-   transports with scoped verdicts; never skip a required gate or run hostile
-   tests with daemon authority. Generic resumed/delegated turns remain refused
-   unless the exact restricted policy is retained.
-2. **Revised handoff acceptance.** Exercise the new restricted prompt,
-   adversarial proof rejection, code handoff, trusted adoption and final gate
-   behavior on both real transports. A local fixture release ref is test
-   evidence only; real tickets require fetched remote release ancestry.
+1. **Safe gated workflows.** Isolated command gates, Codex verifiers and
+   assessments are implemented and both real transports passed the disposable
+   gated fixture below. Review the combined implementation and race checks;
+   never skip required gates or run hostile tests with daemon authority.
+   Planner/plan-reviewer and non-Codex stage targets explicitly fail closed;
+   they have no isolated transport and are never silently replaced. A required
+   human review remains pending after a verifier pass. Generic resumed/delegated
+   turns remain refused unless the exact restricted policy is retained.
+2. **Integration.** A local fixture release ref is test evidence only; real
+   tickets require fetched remote release ancestry. The source hold remains
+   until the combined security review is resolved. No live policy enablement
+   is authorized by these fixture results.
 3. **Combined security review.** Review final root/path/config races,
    source replacement and launch/proof records; verify destination pinning
    and protected runtime/control paths. Credentials must remain outside
@@ -187,12 +188,28 @@ disabled, and retains the final combined security review before integration.
 
 The private candidate was refreshed against `origin/main` at merge checkpoint
 `9d94cad`; both the sandbox contract and upstream release expectation arguments
-are preserved. The required push checks passed (425 tests). The fresh stage
-implementation lane is `ce5712aa-033c-4afc-861c-d89d0f17d4c7`, branch
-`wt-61-stages-v2-65ecd04d`, starting from that checkpoint. It owns isolated
-command gates, supervised verifier/reviewer results, and assessments. Its work
-still requires integration, verification and review; a running lane is not
-delivery evidence.
+are preserved. The source materializer is `27a61ec`, stage/result transport is
+`502070f`, and command gate integration is `7869d43` (child `72bf494`). Required
+push checks passed for each checkpoint (425 tests). The stage lane
+`ce5712aa-033c-4afc-861c-d89d0f17d4c7` also pushed gate snapshot hardening
+`db06309`, pending adoption into the parent candidate at this writing.
+
+Command gates materialize a full commit from the trusted integration checkout's
+object stores inside a fresh native sandbox, never the worker's writable Git
+metadata. Gates get system PATH, masked `.git`/`.codex`/`.agents`, no network and
+only fresh workspace/store writes. A shared 1500-second gate budget is below
+the broker close request's 1800-second timeout. A worker tool timeout can still
+leave an indeterminate receipt; inspect that receipt rather than replay blindly.
+
+Supervised verifier/assessor launches retain their configured Codex model and
+transport. Their trusted scope binds source store, ticket, queue, stage key,
+attempt, full commit, request/clarification/accepted-plan context and cycle/token.
+Results recheck the scope under the source write lock; assessment operations
+repeat that check at every write. Follow-ups can only create new icebox items
+in the assigned queue, never comment on an existing ticket selected by the
+stage. A rejected verifier releases the ticket to the restricted builder pool
+with feedback and clears the rejected resolution. Group completion also
+requires the current child commit map to match the integration proof.
 
 The acceptance runner's opt-in `--gated` mode configures a disposable bug
 ticket with a command gate, an explicit Codex verifier and a post-fix assessor.
@@ -200,18 +217,34 @@ After reviewed patch adoption, the controller selects the trusted integration
 checkout and drives only that fixture's stage supervision until a bounded
 deadline. It requires both recorded gate passes and a completed assessment.
 The role choices are fixture configuration, not permission to replace live
-non-Codex targets. Record actual gated verdicts here after the complete source
-candidate passes; earlier ungated verdicts do not establish stage support.
+non-Codex targets. Earlier ungated verdicts do not establish stage support.
 
 The revised runner's exec smoke passed at
 `/home/hermes/wt-sandbox-acceptance-9laa0ym7/controller/verdict.json`, adopted
 fixture commit `39335d96bf6c5994f6ffc90640124debc9c636f2`. It checks the existing
 boundary/proof/handoff/adoption flow after the runner changes. Seven focused
 runner tests cover assessment completion, failed/blocked stage termination,
-the bounded deadline, and cleanup rejecting peer or reused PID records. The
-gated real-model runs await the stage implementation; this is not their proof.
+the bounded deadline, and cleanup rejecting peer or reused PID records.
 
-Review branch/worktree: `wt-61-wt-039caa56`,
-`/home/hermes/Apps/watchtower-wt61-039caa56`. No live policies, customer sends,
+Real gated runs passed command and independent verifier gates, then completed
+a separate post-fix assessment after reviewed patch adoption:
+
+| Transport | Retained evidence | Adopted fixture commit |
+|---|---|---|
+| exec | `/home/hermes/wt-sandbox-acceptance-3qvpdch8/controller/verdict.json` | `baaba8c0279241da03bccce4c28bdb55d16a7c2b` |
+| app-server | `/home/hermes/wt-sandbox-acceptance-3a0t9fn4/controller/verdict.json` | `b8b4b45b74ea79fa315795a5ca718ebf8d48f20f` |
+
+The first exec gate run exposed Codex's checkout check; isolated stage launch
+now explicitly uses `--skip-git-repo-check`. A second run attempted to inspect
+the bootstrap Git alternate, which is intentionally unavailable to the model.
+The prompt now explains the controller-verified full-commit materialization
+and manifest; neither read roots nor network were widened. The verifier checks
+the snapshot's behavior and local tests. Controller provenance checks and
+native pinned-source tests supply the separate commit-binding evidence.
+Later context/rejection regressions passed 135 focused tests, including changed
+clarifications, inherited accepted plans, group proof and follow-up boundaries.
+
+Review branch/worktree: `wt-61-wt-65ecd04d`,
+`/home/hermes/Apps/watchtower-wt61-65ecd04d`. No live policies, customer sends,
 credentials, send switches or services were changed. Source remains deliberately
 held off main until the remaining workflows and final review are complete.
