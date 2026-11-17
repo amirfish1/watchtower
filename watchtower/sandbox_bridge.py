@@ -861,7 +861,7 @@ def _execute(scope, request, key):
             raise ValueError("claim changed during handoff; nothing was resolved")
         return {"ok": True, "integration_pending": True, "item": _project(blocked)}
     # The regular close path still owns gates, product acknowledgement and
-    # ownership checks. It refuses unsafe command gates under bridge mode.
+    # ownership checks. Command gates run in a restricted sandbox, never here.
     closed = q.close(item["ref"], scope["worker"], resolution=resolution,
                      session_uuid=str(item.get("claimed_session_id") or ""),
                      **_fenced(q.close, scope))
@@ -870,7 +870,11 @@ def _execute(scope, request, key):
     if closed.get("status") == "in_review" and closed.get("gate_pending") == "verify":
         from . import stages
         stages.request(closed["ref"], "verify")
-    return {"ok": closed.get("status") in ("closed", "in_review"), "item": _project(closed)}
+    if closed.get("status") not in ("closed", "in_review"):
+        # A failed command gate reopened the ticket: say why, not just "failed".
+        return {"ok": False, "item": _project(closed),
+                "error": str(closed.get("gate_feedback") or "close did not complete")[:2000]}
+    return {"ok": True, "item": _project(closed)}
 
 
 def _bounded(result):
@@ -1153,8 +1157,15 @@ def _exchange(fd, op, body, claim, timeout):
     return {"ok": False, "error": f"bridge timeout; request {key} may still execute; inspect receipt before retry"}
 
 
+# A close may run sandboxed command gates (sandbox_stages.GATES_BUDGET_S in
+# total), so its answer is awaited longer than any other request.
+CLOSE_TIMEOUT_S = 1800
+
+
 def request(op, body, *, timeout=45):
     """Sandbox-side client. Only the request/response spool is writable."""
+    if op == "close":
+        timeout = max(timeout, CLOSE_TIMEOUT_S)
     spool = Path(os.environ["WT_SANDBOX_BRIDGE"])
     with directory(spool) as fd:
         claim = None

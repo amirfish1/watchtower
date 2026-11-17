@@ -3647,7 +3647,7 @@ def update_status(
             if _matches(it, ident):
                 if sandbox_contract is not None:
                     from . import sandbox_bridge
-                    if (status != "closed" or it.get("status") != "in_progress"
+                    if (status not in ("closed", "open") or it.get("status") != "in_progress"
                             or it.get("needs_input")
                             or sandbox_bridge._fence(it) != sandbox_contract["fence"]
                             or effective_gates(it) != sandbox_contract["gates"]):
@@ -4685,25 +4685,49 @@ def evaluate_gates(item: Dict[str, Any], commit: str = "",
     False (and ``stages`` is then empty). ``pinned``: see ``_run_cmd_gate``."""
     results: List[Dict[str, Any]] = []
     gates = effective_gates(item)
-    if any(g.startswith("cmd:") for g in gates) and _sandbox_restricted(item):
-        # This is shared by ordinary closes AND group reconciliation. Guard
-        # before worktree setup: even host git operations can invoke repo code.
-        gate = next(g for g in gates if g.startswith("cmd:"))
-        return [_pinned_setup_failed(gate[4:], commit,
-                "sandbox command gates require an isolated gate transport; "
-                "refusing host execution", time.time())], []
+    sandboxed = any(g.startswith("cmd:") for g in gates) and _sandbox_restricted(item)
     persistent = False
-    if any(g.startswith("cmd:") for g in gates):
+    if any(g.startswith("cmd:") for g in gates) and not sandboxed:
         try:
             from . import config as _config
             persistent = _config.gate_worktree(str(item.get("project") or "")) == "persistent"
         except Exception:
             persistent = False
+    if sandboxed:
+        # WT-61: a sandbox-origin ticket's gates never run with the daemon's
+        # authority, and never in a worker's checkout. They run in the
+        # restricted kernel profile against a fresh materialization of
+        # ``commit`` (or the trusted repository's HEAD) taken from the trusted
+        # repository's objects. Every setup problem is a refusal.
+        from . import sandbox_stages
+        item = dict(item)
+        if not item.get("repo_path"):
+            try:
+                from . import config as _config
+                item["repo_path"] = str(_config.repo_path(str(item.get("project") or "")) or "")
+            except Exception:  # noqa: BLE001 - no repo is a gate setup failure below
+                item["repo_path"] = ""
+        deadline = time.monotonic() + sandbox_stages.GATES_BUDGET_S
     for g in gates:
         if g.startswith("cmd:"):
-            r = _run_cmd_gate(g[4:], str(item.get("repo_path") or ""), commit,
-                              str(item.get("ref") or ""), pinned=pinned,
-                              persistent=persistent)
+            if sandboxed:
+                remaining = deadline - time.monotonic()
+                if remaining < 1.0:
+                    r = _pinned_setup_failed(g[4:], commit, "sandbox gate time budget exhausted",
+                                             time.time())
+                    r["sandboxed"] = True
+                else:
+                    try:
+                        r = sandbox_stages.run_cmd_gate(item, g[4:], commit, timeout=remaining)
+                    except Exception as exc:  # noqa: BLE001 - never a host fallback
+                        r = _pinned_setup_failed(g[4:], commit,
+                                                 f"sandbox gate transport failed: {type(exc).__name__}",
+                                                 time.time())
+                        r["sandboxed"] = True
+            else:
+                r = _run_cmd_gate(g[4:], str(item.get("repo_path") or ""), commit,
+                                  str(item.get("ref") or ""), pinned=pinned,
+                                  persistent=persistent)
             results.append(r)
             if not r["passed"]:
                 return results, []
@@ -5281,12 +5305,14 @@ def reject(ident: Any, reason: str, by: str = "human") -> Optional[Dict[str, Any
 def _reopen_with_feedback(ident: Any, reason: str, results: List[Dict[str, Any]],
                           by_kind: str = "worker", close_owner: str = "",
                           session_id: str = "", session_uuid: str = "",
-                          require_status: Optional[str] = None) -> Optional[Dict[str, Any]]:
+                          require_status: Optional[str] = None,
+                          sandbox_contract: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
     item = update_status(ident, "open", session_id, session_uuid=session_uuid,
                          reason=reason, by_kind=by_kind,
                          close_owner=close_owner, require_status=require_status,
                          extras={"gate_feedback": _clip(reason, 4000),
-                                 "gate_results": results})
+                                 "gate_results": results},
+                         sandbox_contract=sandbox_contract)
     return item
 
 
@@ -5543,8 +5569,6 @@ def close(
                 or force or declined or close_contract is not None):
             raise ValueError("sandbox close requires the current assigned local claim")
         sandbox_gates = effective_gates(cur)
-        if any(g.startswith("cmd:") for g in sandbox_gates):
-            raise ValueError("sandbox close cannot run command gates outside its sandbox; trusted review required")
         sandbox_contract = {"fence": sandbox_expect, "gates": sandbox_gates,
                             "store_id": sandbox_store_id}
     if cur is not None and cur.get("duplicate_of"):
@@ -5582,12 +5606,31 @@ def close(
         if gh is not None:
             return gh
     elif sandbox_contract is not None:
-        # No gate command from a writable checkout is executed by the broker.
-        # Review/verify still enter their ordinary required lifecycle.
-        stages = (["verify"] if "verify" in sandbox_gates else [])
-        stages += next(([g] for g in sandbox_gates
-                        if g == "review" or g.startswith("review:")), [])
-        extras = {"gate_results": [], "gate_stages": stages}
+        # WT-61: a no-code bridge close. Command gates (if any) run in the
+        # restricted sandbox against the trusted repository's HEAD snapshot
+        # (a code close is a patch handoff and is gated when a trusted worker
+        # adopts it). The write-back re-checks the claim fence, gate list and
+        # store identity in its own lock, because the gates ran for minutes.
+        current = get(ident)
+        if current is None:
+            raise ValueError("sandbox close requires the current assigned local claim")
+        results, stages = evaluate_gates(current, "")
+        failed = [r for r in results if not r["passed"]]
+        if failed:
+            f = failed[0]
+            why = (f"gate {f['gate']} failed (exit {f['exit_code']}): "
+                   f"{f['output_tail'][-600:].strip()}")
+            item = _reopen_with_feedback(
+                ident, why, results, close_owner=str(session_id or ""),
+                session_id=str(session_id or ""), session_uuid=session_uuid,
+                require_status=current.get("status"), sandbox_contract=sandbox_contract)
+            if item is None:
+                raise ValueError(
+                    f"{current.get('ref', ident)} changed while its gates ran; nothing was "
+                    "written. Re-check with "
+                    f"`wt find {current.get('ref', ident)}` before closing again.")
+            return item
+        extras = {"gate_results": results, "gate_stages": stages}
         hold_review = stages[0] if stages else ""
     elif not force:
         current = get(ident)
@@ -6346,10 +6389,13 @@ def group_sweep(only_ref: str = "") -> List[Tuple[str, str]]:
                 from . import config as _config
                 repo = str(_config.repo_path(str(snap.get("project") or "")) or "")
             if _group_sandbox_origin(snap):
-                # Before any host git: the member commits live in isolated
-                # stores and the workspace metadata is worker-writable.
-                problem = ("sandbox_restricted: sandbox group reconciliation requires "
-                           "isolated git/gate transport; refusing host git execution")
+                # WT-61: no host git. The containing commit is found by the
+                # trusted Git inside the restricted sandbox, against the
+                # trusted integration repository's objects only (a sandbox
+                # workspace is refused there), and the gates then run
+                # sandboxed at that pinned commit (``evaluate_gates``).
+                from . import sandbox_stages
+                sha, source, problem = sandbox_stages.containing_sha(repo, commits)
             else:
                 sha, source, problem = integration_git.containing_sha(repo, commits)
             if sha and not problem:

@@ -195,3 +195,45 @@ def test_sweep_only_removes_old_owned_stage_directories(base, monkeypatch):
     os.utime(old["dir"], (past, past))
     assert ss.sweep() == 1
     assert not old["dir"].exists() and new["dir"].exists() and stray.exists()
+
+
+# ------------------------------------------------- containing commit (group)
+
+
+def test_native_containing_sha_matches_integration_git_semantics(native, trusted):
+    repo = trusted["repo"]
+    base_sha = trusted["head"]
+    (repo / "b.txt").write_text("b")
+    _git(repo, "add", "b.txt")
+    _git(repo, "commit", "-qm", "b")
+    second = _git(repo, "rev-parse", "HEAD")
+    # a linear chain: the newest member contains the older one
+    sha, source, problem = ss.containing_sha(repo, {"A": base_sha, "B": second})
+    assert (sha, problem) == (second, "") and source.startswith("member:")
+    # no-code members only: HEAD
+    assert ss.containing_sha(repo, {"A": "", "B": ""}) == (second, "head", "")
+    # a short (abbreviated) id resolves; a name never does
+    assert ss.containing_sha(repo, {"A": base_sha[:12]})[0] == base_sha
+    assert ss.containing_sha(repo, {"A": "HEAD"})[2].startswith("commit_missing")
+    assert ss.containing_sha(repo, {"A": "0" * 40})[2].startswith("commit_missing")
+    # diverged branches: nothing contains both
+    trunk = _git(repo, "rev-parse", "--abbrev-ref", "HEAD")
+    _git(repo, "checkout", "-q", "-b", "side", base_sha)
+    (repo / "c.txt").write_text("c")
+    _git(repo, "add", "c.txt")
+    _git(repo, "commit", "-qm", "c")
+    side = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", trunk)
+    assert ss.containing_sha(repo, {"A": second, "B": side}) == ("", "", "diverged")
+    assert _git(repo, "status", "--porcelain") == ""      # host repo untouched
+    assert not any(Path(os.environ["WATCHTOWER_SANDBOX_STAGE_ROOT"]).iterdir())
+
+
+def test_containing_sha_refuses_non_repositories_and_never_uses_host_git(base, monkeypatch):
+    import subprocess as sp_
+    monkeypatch.setenv("WATCHTOWER_SANDBOX_STAGE_ROOT", str(base / "stages"))
+    monkeypatch.setattr(sp_, "run", lambda *a, **k: pytest.fail("host subprocess"))
+    plain = base / "plain"
+    plain.mkdir()
+    assert ss.containing_sha(plain, {"A": "a" * 40})[2].startswith("sandbox_restricted")
+    assert ss.containing_sha("", {"A": "a" * 40})[2].startswith("sandbox_restricted")

@@ -37,6 +37,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from . import sandbox_policy as policy
 
 GATE_TIMEOUT_S = 900.0
+# Total time one close/integration may spend in sandboxed command gates. The
+# bridge client waits longer than this (sandbox_bridge.CLOSE_TIMEOUT_S).
+GATES_BUDGET_S = 1500.0
 MATERIALIZE_TIMEOUT_S = 300.0
 GATE_OUTPUT_TAIL = 2000
 # Limits for a materialized tree. A repository beyond them is refused rather
@@ -240,6 +243,16 @@ def source_objects(repo_path: Any) -> Tuple[Dict[str, Any], List[Path]]:
     if not repo_path:
         raise StageSandboxError("the ticket has no repository path to take source from")
     repo = Path(os.path.expanduser(str(repo_path)))
+    try:
+        from . import close_proof
+        why = close_proof.restricted_repo(str(repo))
+    except Exception as exc:  # noqa: BLE001 - an unreadable ledger never grants source
+        why = f"sandbox restriction ledger is unreadable: {exc}"
+    if why:
+        # The trusted snapshot must come from the host-owned integration
+        # repository, never from a worker-writable workspace (its HEAD and
+        # refs are the worker's to choose).
+        raise StageSandboxError(f"source repository is a sandbox workspace: {why}")
     try:
         meta = policy.git_metadata(repo)
     except policy.SandboxPolicyError as exc:
@@ -482,13 +495,16 @@ def _setup_failed(command: str, commit: str, why: str, started: float) -> Dict[s
             "sandboxed": True}
 
 
-def run_cmd_gate(item: Dict[str, Any], command: str, commit: str = "") -> Dict[str, Any]:
+def run_cmd_gate(item: Dict[str, Any], command: str, commit: str = "",
+                 timeout: Optional[float] = None) -> Dict[str, Any]:
     """Run one ``cmd:`` gate for a sandbox-origin ticket under the restricted
     profile. Source is ``commit`` (a full id; empty means the trusted
     repository's HEAD) materialized from the trusted repository's objects.
     Never raises: every setup problem is a ``setup_failed`` result, and the
-    command is never run outside the sandbox."""
+    command is never run outside the sandbox. ``timeout`` (seconds) can only
+    lower the per-gate limit."""
     started = time.time()
+    limit = GATE_TIMEOUT_S if timeout is None else max(1.0, min(GATE_TIMEOUT_S, float(timeout)))
     ref = str(item.get("ref") or "")
     try:
         src = prepared_source(item.get("repo_path"), commit, "gate")
@@ -504,7 +520,7 @@ def run_cmd_gate(item: Dict[str, Any], command: str, commit: str = "") -> Dict[s
         try:
             proc = policy.run_sandboxed(["/bin/sh", "-c", _GATE_SCRIPT], src["workspace"],
                                         src["store"], mode="rw", env=env,
-                                        timeout=GATE_TIMEOUT_S,
+                                        timeout=limit,
                                         read_roots=_read_roots(src["store"], src["stores"]),
                                         max_output=1 << 20, truncate=True)
             ok, code = proc.returncode == 0, proc.returncode
@@ -512,7 +528,7 @@ def run_cmd_gate(item: Dict[str, Any], command: str, commit: str = "") -> Dict[s
         except policy.SandboxPolicyError as exc:
             text = str(exc)
             if "timed out" in text:
-                ok, code, tail = False, -1, f"timed out after {int(GATE_TIMEOUT_S)}s"
+                ok, code, tail = False, -1, f"timed out after {int(limit)}s"
             else:
                 return _setup_failed(command, commit, text, started)
         result = {"gate": "cmd:" + command, "passed": ok, "exit_code": code,
@@ -525,3 +541,101 @@ def run_cmd_gate(item: Dict[str, Any], command: str, commit: str = "") -> Dict[s
         return result
     finally:
         release(src["dir"])
+
+
+# --------------------------------------------------------------------------
+# group integration: the commit that contains every member's commit
+
+_CONTAINING = r"""
+import json, os, re, subprocess, sys
+git, gdir, alts, head, wanted = sys.argv[1:6]
+wanted = json.loads(wanted)
+base = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+base.update({"GIT_NO_REPLACE_OBJECTS": "1", "GIT_NO_LAZY_FETCH": "1", "GIT_GRAFT_FILE": "/dev/null",
+             "GIT_OPTIONAL_LOCKS": "0", "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+             "GIT_TERMINAL_PROMPT": "0"})
+G = [git, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never",
+     "-c", "core.commitGraph=false", "-c", "gc.auto=0", "-c", "core.alternateRefsCommand=",
+     "--git-dir=" + gdir]
+def run(*a):
+    return subprocess.run(G + list(a), env=base, capture_output=True, text=True)
+def out(sha, source, problem):
+    print(json.dumps({"sha": sha, "source": source, "problem": problem})); sys.exit(0)
+if run("init", "-q", "--bare", gdir).returncode != 0 and not os.path.isdir(gdir):
+    out("", "", "no_repo: cannot create the object lookup directory")
+with open(os.path.join(gdir, "objects", "info", "alternates"), "w") as f:
+    f.write(alts)
+def resolve(rev):
+    p = run("rev-parse", "--verify", "--quiet", rev + "^{commit}")
+    return p.stdout.strip() if p.returncode == 0 else ""
+full = {}
+for ref, sha in wanted.items():
+    if not sha:
+        continue
+    if not re.fullmatch(r"[0-9a-f]{4,64}", sha):
+        out("", "", "commit_missing: %s %s" % (ref, sha))
+    got = resolve(sha)
+    if not got:
+        out("", "", "commit_missing: %s %s" % (ref, sha))
+    full[ref] = got
+headsha = resolve(head) if head else ""
+if not full:
+    out(headsha, "head", "") if headsha else out("", "", "no_repo: HEAD does not resolve")
+dated = []
+for ref, sha in full.items():
+    p = run("show", "-s", "--format=%ct", sha)
+    t = p.stdout.strip()
+    dated.append((int(t) if p.returncode == 0 and t.isdigit() else 0, ref, sha))
+cands = [(sha, "member:" + ref) for _, ref, sha in sorted(dated, key=lambda x: -x[0])]
+if headsha:
+    cands.append((headsha, "head"))
+seen = set()
+for cand, source in cands:
+    if cand in seen:
+        continue
+    seen.add(cand)
+    if all(run("merge-base", "--is-ancestor", c, cand).returncode == 0 for c in full.values()):
+        out(cand, source, "")
+out("", "", "diverged")
+"""
+
+
+def containing_sha(repo_path: Any, commits: Dict[str, str]) -> Tuple[str, str, str]:
+    """``(sha, source, problem)`` exactly as ``integration_git.containing_sha``
+    answers, but computed by the trusted Git inside the sandbox against the
+    trusted repository's objects: no host Git touches the repository. The
+    upstream candidate is not considered (it needs repository config). A
+    sandbox workspace, an unusable repository or any sandbox failure is a
+    ``sandbox_restricted``/``no_repo`` problem, never a host fallback."""
+    try:
+        meta, stores = source_objects(repo_path)
+        head = _head_from_files(meta)
+    except StageSandboxError as exc:
+        return "", "", f"sandbox_restricted: {exc}"
+    sweep()
+    try:
+        roots = allocate("group")
+    except StageSandboxError as exc:
+        return "", "", f"sandbox_restricted: {exc}"
+    try:
+        try:
+            policy.validate_roots(roots["workspace"], roots["store"])
+            policy.preflight(roots["workspace"], roots["store"])
+            git = policy.trusted_git(roots["workspace"], roots["store"])
+            proc = policy.run_sandboxed(
+                [sys.executable, "-I", "-c", _CONTAINING, git, str(roots["store"] / "source.git"),
+                 "\n".join(str(s) for s in stores) + "\n", head,
+                 json.dumps({str(k): str(v or "") for k, v in commits.items()})],
+                roots["workspace"], roots["store"], mode="rw", timeout=MATERIALIZE_TIMEOUT_S,
+                read_roots=_read_roots(roots["store"], stores), max_output=1 << 16)
+        except policy.SandboxPolicyError as exc:
+            return "", "", f"sandbox_restricted: {exc}"
+        lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+        try:
+            answer = json.loads(lines[-1])
+            return str(answer["sha"]), str(answer["source"]), str(answer["problem"])
+        except (ValueError, IndexError, KeyError, TypeError):
+            return "", "", ("sandbox_restricted: containing-commit lookup produced no answer: "
+                            + (proc.stderr or proc.stdout)[-300:].strip())
+    finally:
+        release(roots["dir"])

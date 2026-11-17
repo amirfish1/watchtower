@@ -167,9 +167,14 @@ def test_refuses_privileged_shell_gates(env):
     marker = w.tmp / "escape"
     item = claim(w, gates=["cmd:touch " + str(marker)])
     result = submit(w, "close", close_body(item["ref"]), w.claim)
-    assert not result["ok"] and "command gates" in result["error"]
+    # The gate's source repository here is the builder's own workspace: never
+    # a trusted snapshot, so the gate is refused (setup failure), not run, and
+    # the ticket goes back to the pool with the reason.
+    assert not result["ok"] and "sandbox workspace" in result["error"]
     assert not marker.exists()
-    assert w.queue.get(item["ref"])["status"] == "in_progress"
+    after = w.queue.get(item["ref"])
+    assert after["status"] == "open" and after["gate_results"][0]["setup_failed"]
+    assert after["gate_results"][0]["sandboxed"] is True
 
 
 @pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo", "oversized"])

@@ -64,9 +64,41 @@ def test_parent_command_gate_cannot_run_on_host_after_queue_policy_changes(wt_en
               "group": {"role": "parent", "members": [child["ref"]]}}
     monkeypatch.setattr(w.queue, "_run_cmd_gate", lambda *a, **kw: pytest.fail("host gate execution"))
     results, stages = w.queue.evaluate_gates(parent)
-    assert not results[0]["passed"] and results[0]["setup_failed"]
-    assert "refusing host execution" in results[0]["output_tail"]
+    # No repository to take source from: a setup failure inside the sandbox
+    # transport, never a host run.
+    assert not results[0]["passed"] and results[0]["setup_failed"] and results[0]["sandboxed"]
+    assert "no repository path" in results[0]["output_tail"]
     assert stages == []
+
+
+def test_restricted_gates_run_through_the_sandbox_transport_only(wt_env, monkeypatch):
+    from watchtower import sandbox_stages
+    w = wt_env
+    child = claimed(w)
+    monkeypatch.setattr(sandbox_bridge, "restricted_session",
+                        lambda session_id="", worker_id="": worker_id == "sb-worker")
+    monkeypatch.setattr(w.queue, "_run_cmd_gate", lambda *a, **kw: pytest.fail("host gate execution"))
+    calls = []
+
+    def fake(item, command, commit="", timeout=None):
+        calls.append((item["repo_path"], command, commit, timeout))
+        return {"gate": "cmd:" + command, "passed": command != "false", "exit_code": 0,
+                "output_tail": "", "commit": commit, "sandboxed": True}
+
+    monkeypatch.setattr(sandbox_stages, "run_cmd_gate", fake)
+    parent = {"project": "SB", "ref": "SB-99", "repo_path": "/trusted/repo",
+              "gates": ["cmd:true", "cmd:false", "cmd:never", "verify"],
+              "group": {"role": "parent", "members": [child["ref"]]}}
+    results, stages = w.queue.evaluate_gates(parent, "a" * 40, pinned=True)
+    assert [c[1] for c in calls] == ["true", "false"]           # stops at the first failure
+    assert calls[0][0] == "/trusted/repo" and calls[0][2] == "a" * 40
+    assert 0 < calls[0][3] <= sandbox_stages.GATES_BUDGET_S      # one shared time budget
+    assert [r["passed"] for r in results] == [True, False] and stages == []
+    # A transport that raises is a refusal, not a host run.
+    monkeypatch.setattr(sandbox_stages, "run_cmd_gate",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    results, _stages = w.queue.evaluate_gates({**parent, "gates": ["cmd:true"]}, "a" * 40)
+    assert results[0]["setup_failed"] and results[0]["sandboxed"]
 
 
 def test_restricted_interactive_discussion_refuses_even_printed_unrestricted_resume(wt_env, monkeypatch):

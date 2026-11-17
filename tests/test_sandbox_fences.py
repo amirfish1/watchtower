@@ -222,13 +222,16 @@ def test_group_sweep_checks_restriction_before_host_git(env, monkeypatch):
 def test_group_sweep_in_trusted_queue_with_sandbox_child_never_uses_host_git(env, monkeypatch):
     """A group on a normal queue whose member was built by a sandbox worker
     (tombstoned session) is also refused, whatever repo it names."""
-    from watchtower import integration_git
-    calls = []
+    from watchtower import integration_git, sandbox_stages
+    calls, sandboxed = [], []
     monkeypatch.setattr(integration_git, "containing_sha",
                         lambda *a: calls.append(a) or ("x", "head", ""))
+    monkeypatch.setattr(sandbox_stages, "containing_sha",
+                        lambda repo, commits: sandboxed.append(repo) or ("", "", "commit_missing: X y"))
     parent, kids = _plan_group(env, env.main_repo, "MAIN")
     acted = env.queue.group_sweep(only_ref=parent)
-    assert acted and not calls
+    assert acted and not calls                         # never host git
+    assert sandboxed == [str(env.main_repo)]           # the sandbox transport answered
 
 
 def test_group_sweep_still_integrates_ordinary_groups(env):
