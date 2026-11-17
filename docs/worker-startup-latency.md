@@ -172,3 +172,37 @@ back to WT-68, and stays visible in owner view until its first real pass.
 The original historical window intentionally returns **fail**, retaining
 WT-83/CCC-575/CCC-576; the new monitoring baseline starts at installation,
 with the historical limits preserved here and on the ticket's caveat.
+
+## WT-97: terminal socket timeout after successful process creation
+
+The first permanent watch failure on November 17 was a different path from
+queue contention: WT-93 enqueued at 18:53:41 UTC; worker `wt-83c1490a`
+started at 18:53:46 and passed the six-second launch observation. Its log
+`~/.watchtower/logs/wt-83c1490a.log` then ended with the wrapper's structured
+`app-server did not open ... within 60s` error. No thread or claim existed.
+The original monitor correctly retained this failed attempt even after a
+replacement claimed WT-93 at 19:20:18; do not erase it with the replacement.
+There is no evidence establishing why that particular Codex server stalled.
+The nearby missing-bubblewrap message explicitly says a bundled fallback is
+used; it does not prove a missing prerequisite caused the timeout.
+
+Dead-worker postmortem previously returned no classification for this terminal
+error, losing its launch-failure audit, bounded backoff and repeated-failure
+alerting. It now recognizes the wrapper's exact structured terminal error.
+Plain text, warning events and quoted ticket text do not qualify. Established
+sessions retain the existing postmortem exclusion; auth/quota errors keep their
+more specific classification. No timeout, engine, worker count or fleet policy
+has changed. Reversal is the WT-97 commit's `git revert`.
+
+Options considered: rewriting scheduler locks cannot address a five-second
+dispatch followed by a server stall; raising the socket timeout increases the
+wait; prewarming/changing engines is a fleet product decision. The chosen
+change puts this transport failure through existing recovery and alerting.
+Twelve focused failure/postmortem tests pass, including the actual terminal
+error, false-positive controls and established-session exclusion. A separate
+real installed Codex app-server probe opened its socket in 0.906s and completed
+initialization in 0.936s, with zero threads, turns or model calls; evidence is
+`/home/hermes/wt97-transport-rzp3l55x/result.json`. This verifies present transport
+health, not the cause of the historical stall or universal sub-30s startup.
+Future recurrence remains subject to permanent natural startup measurement;
+the original watch and failed historical evidence remain intact.

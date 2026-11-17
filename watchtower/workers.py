@@ -3646,6 +3646,20 @@ def _quota_exhausted(text: str) -> bool:
     return False
 
 
+def _app_server_socket_timeout(text: str) -> bool:
+    """Match the wrapper's terminal error, not warnings or quoted ticket text."""
+    for line in text.splitlines():
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if (isinstance(event, dict) and event.get("type") == "error"
+                and re.fullmatch(r"app-server did not open .+ within \d+(?:\.\d+)?s",
+                                 str(event.get("error") or ""))):
+            return True
+    return False
+
+
 def _classify_launch_failure_log(
     log_path: Path, now: Optional[float] = None
 ) -> Optional[Dict[str, Any]]:
@@ -3690,6 +3704,8 @@ def _classify_launch_failure_log(
         # these phrases are generic enough that a real auth/quota message
         # mentioning them should still classify as auth/quota.
         reason = "engine binary broken"
+    if not reason and _app_server_socket_timeout(text):
+        reason = "engine app-server socket timeout"
     if not reason:
         return None
     return {"reason": reason, "retry_at": retry_at}

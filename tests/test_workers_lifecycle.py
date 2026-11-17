@@ -1123,6 +1123,42 @@ def test_prune_postmortem_records_late_quota_failure(wt):
     assert cooldown["worker_id"] == "q-late"
 
 
+def test_prune_postmortem_records_codex_socket_timeout(wt):
+    log = json.dumps({"type": "error", "error":
+        "app-server did not open /tmp/wt.sock within 60s"}) + "\n"
+    _dead_launch_worker(wt, worker_id="q-socket", engine="codex", log_text=log)
+
+    wt.workers.list_workers(prune=True)
+
+    cooldown = wt.workers.active_launch_failure_cooldown("Q", "codex")
+    assert cooldown and cooldown["reason"] == "engine app-server socket timeout"
+    assert cooldown["worker_id"] == "q-socket"
+    assert cooldown["consecutive"] == 1
+    assert "LAUNCH_FAIL" in (wt.tmp / "activity.log").read_text()
+
+
+def test_socket_timeout_text_and_warnings_are_not_terminal_failures(wt):
+    log = wt.tmp / "warning.log"
+    for text in (
+        "app-server did not open /tmp/wt.sock within 60s",
+        json.dumps({"type": "warning", "error":
+                    "app-server did not open /tmp/wt.sock within 60s"}),
+        json.dumps({"type": "error", "error":
+                    "ticket mentions: app-server did not open /tmp/wt.sock within 60s"}),
+    ):
+        log.write_text(text)
+        assert wt.workers._classify_launch_failure_log(log) is None
+
+
+def test_socket_timeout_after_established_session_is_not_launch_failure(wt):
+    _dead_launch_worker(wt, worker_id="q-ran", engine="codex",
+        session_id="11111111-1111-1111-1111-111111111111",
+        log_text=json.dumps({"type": "error", "error":
+            "app-server did not open /tmp/wt.sock within 60s"}))
+    wt.workers.list_workers(prune=True)
+    assert wt.workers.active_launch_failure_cooldown("Q", "codex") is None
+
+
 def test_prune_postmortem_skips_workers_that_actually_ran(wt):
     """A worker with an engine session established did real work; a "usage
     limit" string in its log is ticket text, not a launch failure."""
