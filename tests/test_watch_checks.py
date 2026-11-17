@@ -74,3 +74,29 @@ def test_raw_inventory_preserves_watches_and_timer_fields_without_conversion(mon
     assert items[0]['deferred_until'] == '9999-12-31'
     assert items[0]['resolution']['watches'] == [{'name':'registered'}]
     assert not any(c['missing'] or c['stale'] for c in coverage)
+
+
+def test_raw_inventory_honors_pipeline_claim_release_without_hiding_active_claims(monkeypatch):
+    import time
+    from watchtower import watches, queue as q, config, github_backend as gh, github_pipeline as gp
+    monkeypatch.setattr(q, '_load_unlocked', lambda **kw: {'items': []})
+    monkeypatch.setattr(config, 'all_queues', lambda: {'G': {'backend': 'github', 'github_repo': 'test/repo'}})
+    monkeypatch.setattr(config, 'github_queues_for_repo', lambda repo: ['G'])
+    monkeypatch.setattr(gp, '_read_cached', lambda: {'items': {
+        'test/repo#1': {'parked': {'worker_id': 'previous-worker'}},
+    }})
+    meta = dict(claimed_by='previous-worker', claimed_at='2026-01-01T00:00:00Z',
+                needs_input=True, wait={'on': 'owner'}, block_question='Choose retention policy')
+    raw = [dict(number=n, state='OPEN', labels=[{'name': 'watchtower:in-progress'}],
+                body=gh._body_with_metadata('Question', meta)) for n in (1, 2)]
+    monkeypatch.setattr(gh, '_read_persisted_list_cache', lambda: {
+        'test/repo:open': dict(at=time.time(), data=raw),
+        'test/repo:closed': dict(at=time.time(), data=[]),
+    })
+    items, _ = watches.inventory()
+    parked, active = sorted(items, key=lambda it: it['ref'])
+    assert parked['status'] == q.PARKED_STATUS
+    assert parked['claimed_by'] is None
+    assert parked['needs_input'] and parked['block_question'] == meta['block_question']
+    assert parked['wait'] == meta['wait']
+    assert active['status'] == 'in_progress' and active['claimed_by'] == meta['claimed_by']

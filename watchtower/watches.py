@@ -49,7 +49,7 @@ def inventory():
     The daemon's existing poller owns GitHub freshness. Missing/stale coverage
     is explicit; historical prose snapshots cannot masquerade as live state.
     """
-    from . import queue as q, config, github_backend as gh
+    from . import queue as q, config, github_backend as gh, github_pipeline
     projects = config.all_queues()
     github = {p: cfg for p, cfg in projects.items()
               if isinstance(cfg, dict) and cfg.get("backend") == "github"}
@@ -75,13 +75,17 @@ def inventory():
                         continue
                 _body, meta = gh._split_body(str(raw.get("body") or ""))
                 ref = f"{project}-{raw['number']}"
-                items[ref] = dict(meta, ref=ref, project=project, title=raw.get("title") or "",
+                item = dict(meta, ref=ref, project=project, github_repo=repo, number=raw['number'],
+                                  title=raw.get("title") or "",
                                   created_at=raw.get("createdAt"), closed_at=raw.get("closedAt"),
                                   updated_at=raw.get("updatedAt") or meta.get("updated_at"),
                                   status=("closed" if raw.get("state") == "CLOSED" else
                                           "awaiting_release" if meta.get("release_wait") else
                                           "in_progress" if meta.get("claimed_by") or "watchtower:in-progress" in names else "open"),
                                   resolution={"watches": meta.get("resolution_watches") or []})
+                # Local parking/review owns claim release even while GitHub
+                # retains the original claim metadata and in-progress label.
+                items[ref] = github_pipeline.overlay(item)
     return list(items.values()), coverage
 
 
