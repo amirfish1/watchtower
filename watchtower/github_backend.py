@@ -2596,6 +2596,7 @@ class GitHubIssuesBackend:
         fresh: bool = False,
         strict: bool = False,
         poller: bool = False,
+        snapshot_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """Read the issue list for ``state``.
 
@@ -2606,6 +2607,10 @@ class GitHubIssuesBackend:
         AND no poll is in flight. ``strict=True`` (claim/close, about to write)
         is exempt -- correctness of a write outranks quota."""
         key = f"{self.repo}:{state}"
+        if snapshot_only:
+            # Post-write wake hints must never start unrelated remote reads.
+            # Missing/stale snapshots are repaired by the normal poller.
+            return (_read_persisted_list_cache().get(key) or {}).get("data") or []
         now = time.time()
         cached = _LIST_CACHE.get(key)
         backoff_active = False
@@ -3032,14 +3037,17 @@ class GitHubIssuesBackend:
         fresh: bool = False,
         strict: bool = False,
         blocked_only: bool = False,
+        snapshot_only: bool = False,
     ) -> List[Dict[str, Any]]:
         from . import usage
         open_raw = (
-            self._list_issues("open", fresh=fresh, strict=strict)
+            self._list_issues("open", fresh=fresh, strict=strict,
+                              **({"snapshot_only": True} if snapshot_only else {}))
             if status != "closed" else None
         )
         closed_raw = (
-            self._list_issues("closed", fresh=fresh, strict=strict)
+            self._list_issues("closed", fresh=fresh, strict=strict,
+                              **({"snapshot_only": True} if snapshot_only else {}))
             if status in (None, "closed") else None
         )
         # A tick lists every GitHub queue dozens of times off the same cached

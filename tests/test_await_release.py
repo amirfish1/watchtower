@@ -2,6 +2,7 @@
 from tests.legacy_blocks import block as legacy_block, set_wait as legacy_wait
 
 import importlib
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -427,3 +428,48 @@ def test_observed_generation_gets_one_live_check_and_cannot_repark(env, repo):
     with pytest.raises(ValueError, match="already observed"):
         q.await_release(ref, "live-check", previous)
     assert q.get(ref)["status"] == "in_progress"
+
+
+def test_dependent_hints_survive_stale_and_missing_github_snapshots(env, monkeypatch):
+    from watchtower import github_backend as gh
+    q, _cli, _a, _ov, name, _r = env
+    parent = _ticket(q, name)
+    child = q.enqueue(project=name, note="dependent", blocked_by=[parent])["ref"]
+    q.list_items(project=name, fresh=True)
+    cache = gh._read_persisted_list_cache()
+    for entry in cache.values():
+        entry.update(at=0, stale=True)
+    gh._list_cache_path().write_text(json.dumps(cache))
+    calls = []
+
+    def offline(self, args, **kwargs):
+        calls.append(args)
+        raise gh.GitHubBackendError("unrelated GitHub reader unavailable")
+
+    monkeypatch.setattr(gh.GitHubIssuesBackend, "_run_raw", offline)
+    assert q._dependents_of(parent) == [child]
+    assert not calls
+    gh._list_cache_path().unlink()
+    assert q._dependents_of(parent) == ([child] if name == "T" else [])
+    assert not calls
+
+
+def test_release_save_returns_without_revalidating_unrelated_queues(env, repo, monkeypatch):
+    from watchtower import github_backend as gh, config
+    q, _cli, _a, _ov, name, r = env
+    # The saved release must not depend on any other repository being online.
+    config.set_backend("UNRELATED", "github")
+    config.set_github_repo("UNRELATED", "another/repo")
+    original = gh.GitHubIssuesBackend._run_raw
+    calls = []
+
+    def guarded(self, args, **kwargs):
+        if self.repo == "another/repo":
+            calls.append(args)
+            raise gh.GitHubBackendError("unrelated repository is offline")
+        return original(self, args, **kwargs)
+
+    monkeypatch.setattr(gh.GitHubIssuesBackend, "_run_raw", guarded)
+    ref = park(env, repo)
+    assert q.get(ref)["status"] == "awaiting_release"
+    assert not calls

@@ -2268,13 +2268,16 @@ def list_items(
     strict: bool = False,
     blocked_only: bool = False,
     raise_on_error: bool = False,
+    snapshot_only: bool = False,
 ) -> List[Dict[str, Any]]:
+    """List tickets; snapshot_only is a best-effort local hint, never write authority."""
     if project:
         backend = _github_backend_for_project(project)
         if backend is not None:
             return backend.list_items(
                 status=status, lane=lane, fresh=fresh, strict=strict,
                 **({"blocked_only": True} if blocked_only else {}),
+                **({"snapshot_only": True} if snapshot_only else {}),
             )
     data = _load_unlocked(strict=strict or raise_on_error, **({"readonly": True} if blocked_only else {}))
     items = data.get("items", [])
@@ -2303,6 +2306,7 @@ def list_items(
                         backend.list_items(
                             status=status, lane=lane, fresh=fresh, strict=strict,
                             **({"blocked_only": True} if blocked_only else {}),
+                            **({"snapshot_only": True} if snapshot_only else {}),
                         )
                     )
                 except Exception as e:
@@ -4937,7 +4941,7 @@ def _reviewer_target(item: Dict[str, Any], stage: str) -> str:
 
 def _dependents_of(ref: str) -> List[str]:
     try:
-        return [str(i.get("ref")) for i in list_items(fresh=True)
+        return [str(i.get("ref")) for i in list_items(snapshot_only=True)
                 if ref in (i.get("blocked_by") or [])
                 and i.get("status") not in ("closed", "awaiting_release")]
     except Exception:
