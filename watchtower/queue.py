@@ -9544,16 +9544,13 @@ def note_auto_eligible(ident: Any, *, expect_blocked_at: str, checks: List[Dict[
 
 def note_auto_reversed(ident: Any, decision_id: str, *, original: str, revert: str,
                        by: str = "") -> Optional[Dict[str, Any]]:
-    """Mark an auto-decision reversed -- only called after the revert is verified."""
-    with _FileLock(_lock_path()):
-        data = _load_unlocked()
-        for it in data["items"]:
-            if _matches(it, ident):
-                _append_history(it, "auto_decision_reversed", by=_by("human", by), at=_now_iso(),
-                                decision_id=decision_id, original=original, revert=revert)
-                _save_unlocked(data)
-                return it
-    return None
+    """Record a verified revert on the owning backend, including GitHub."""
+    from .decision_undo import record_outcome
+    item = get(ident)
+    if not item:
+        return None
+    return record_outcome(item["ref"], decision_id, "auto_decision_reversed",
+                          original=original, revert=revert, worker=by)
 
 
 _AUTO_ANSWER_MARK = "This is an AUTO-DECISION by WatchTower"
@@ -9599,7 +9596,10 @@ def _auto_decision_rows(it: Dict[str, Any]) -> List[Dict[str, Any]]:
     for h in events:
         rev = next((r for r in hist if r.get("event") == "auto_decision_reversed"
                     and r.get("decision_id") == h.get("decision_id")), None)
-        out.append({"ref": it.get("ref"), "event": h, "reversed": rev,
+        outcomes = [r for r in hist if r.get("event") in
+                    ("auto_decision_consumed", "auto_decision_cancelled")
+                    and r.get("decision_id") == h.get("decision_id")]
+        out.append({"ref": it.get("ref"), "event": h, "reversed": rev, "outcomes": outcomes,
                     "followthrough": autodecide.followthrough(hist, h)})
     return out
 
