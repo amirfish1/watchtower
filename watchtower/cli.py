@@ -5376,7 +5376,8 @@ def cmd_monitor(args: argparse.Namespace) -> int:
             if args.register:
                 result = watches.register(args.register, command=args.cmd, cwd=args.cwd,
                                           where=args.where, schedule=args.schedule,
-                                          queue=args.queue, every=args.every)
+                                          queue=args.queue, every=args.every,
+                                          replace=args.replace, reason=args.reason)
             elif args.run:
                 result = watches.run(args.run, limit=1000)
             else:
@@ -8906,6 +8907,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--list", action="store_true")
     s.add_argument("--cwd", default="", help="registered check working directory")
     s.add_argument("--where", default="", help="execution host/service")
+    s.add_argument("--replace", action="store_true", help="explicitly revise a registered watch and invalidate old acceptance")
+    s.add_argument("--reason", default="", help="audit reason for replacing a watch specification")
     s.add_argument("--schedule", default="", help="human-readable cadence/location")
     s.add_argument("--every", type=int, default=300, help="daemon check cadence in seconds (never a ticket timer)")
     s.add_argument("-q", "--queue", default="")

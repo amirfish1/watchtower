@@ -192,3 +192,110 @@ def test_inventory_retains_github_update_time_for_claim_lease(env, monkeypatch):
                           'updatedAt':'2026-11-17T17:25:00Z'}]}})
     items, _ = watches.inventory()
     assert next(i for i in items if i['ref']=='G-1')['updated_at']=='2026-11-17T17:25:00Z'
+
+
+def test_inherited_origin_shares_execution_and_receipt(env, tmp_path, monkeypatch):
+    q, *_ = env
+    check(tmp_path)
+    ref = close(env, tmp_path)
+    item = q.get(ref)
+    other = dict(item, ref='COPY-551')
+    # Actual CCC-551 defect: duplicate close retained CCC-550's origin.
+    assert other['resolution']['watches'][0]['origin'] == ref
+    calls = []
+    monkeypatch.setattr(watches, '_execute', lambda spec: calls.append(spec) or dict(
+        status='pending', real_data=True, evidence='shared production receipt'))
+    results = watches.run('natural-check', items=[item, other])
+    assert len(calls) == 1
+    assert {r['origin'] for r in results} == {ref, 'COPY-551'}
+    assert all(r['last']['status'] == 'pending' for r in watches.owner_rows([item, other]))
+    assert watches.run(now=results[0]['at'] + 30, items=[item, other]) == []
+    # Another duplicate arriving after execution inherits the receipt immediately.
+    third = dict(item, ref='COPY-552')
+    watches.sync([third])
+    assert watches.owner_rows([third])[-1]['last']['status'] == 'pending'
+
+
+@pytest.mark.parametrize('schedule', ['hourly; pass after 2026-11-18T15:45:47Z',
+                                     'Hourly; original 24h window', 'passes only on 2026-12-01'])
+def test_date_keyed_rules_rejected_at_registration_and_close(env, tmp_path, schedule):
+    q, cli, *_rest, name = env
+    with pytest.raises(ValueError, match='date-keyed'):
+        watches.register('clock', command='true', cwd=str(tmp_path), where='her',
+                         schedule=schedule, queue='WATCH-FAIL')
+    check(tmp_path)
+    with watches._lock():
+        data = watches._load()
+        data['checks']['natural-check']['schedule'] = schedule
+        watches._save(data)
+    ref = _ticket(q, name)
+    assert cli.main(['close', ref, '--worker', 'w1', '--summary', 'fixed', '--no-code',
+                     '--watch', 'natural-check']) == 1
+    assert q.get(ref)['status'] != 'closed'
+
+
+def test_explicit_replacement_preserves_audit_and_invalidates_acceptance(env, tmp_path):
+    q, *_ = env
+    check(tmp_path, dict(status='pass', real_data=True, evidence='old live acceptance'))
+    ref = close(env, tmp_path)
+    item = q.get(ref)
+    watches.run('natural-check', items=[item])
+    old = watches._load()['checks']['natural-check']
+    kwargs = {k: old[k] for k in ('command', 'cwd', 'where', 'schedule', 'queue', 'every')}
+    kwargs['command'] = 'python3 missing-stable-check.py'
+    new = watches.register('natural-check', **kwargs, replace=True, reason='move off disposable worktree')
+    assert new['revision'] != old['revision']
+    bound = watches.sync([item])['bindings'][ref + ':natural-check']
+    assert bound['spec']['command'] == kwargs['command']
+    assert not bound['first_real_pass'] and not bound['last']
+    assert bound['receipt_history'][0]['last']['status'] == 'pass'
+    failure = watches.run('natural-check', items=[item])[0]
+    assert failure['status'] == 'error' and failure['failure_ref']
+    assert watches.owner_rows([item])[0]['last']['status'] == 'error'
+    assert q.get(ref)['status'] == 'closed'
+
+
+def test_missing_command_turns_previously_passing_watch_red(env, tmp_path):
+    q, *_ = env
+    script = tmp_path / 'monitor.py'
+    script.write_text('print(\'{"status":"pass","real_data":true,"evidence":"natural sample"}\')')
+    watches.register('file-check', command=shlex.join([sys.executable, str(script)]), cwd=str(tmp_path),
+                     where='her', schedule='every minute', every=60, queue='WATCH-FAIL')
+    ref = _ticket(q, env[-1])
+    assert env[1].main(['close', ref, '--worker', 'w1', '--summary', 'fixed', '--no-code',
+                        '--watch', 'file-check']) == 0
+    item = q.get(ref)
+    assert watches.run('file-check', items=[item])[0]['status'] == 'pass'
+    script.unlink()
+    result = watches.run('file-check', items=[item])[0]
+    assert result['status'] == 'error' and result['failure_ref']
+    assert watches.owner_rows([item])[0]['last']['status'] == 'error'
+
+
+def test_never_run_overdue_flag_reaches_owner_render_and_digest(env, tmp_path, monkeypatch):
+    q, _cli, _a, ov, _name = env
+    check(tmp_path)
+    ref = close(env, tmp_path)
+    item = q.get(ref)
+    registered = watches._load()['registered_at']['natural-check']
+    monkeypatch.setattr(watches.time, 'time', lambda: registered + 119)
+    assert not watches.owner_rows([item])[0]['overdue']
+    monkeypatch.setattr(watches.time, 'time', lambda: registered + 120)
+    assert watches.owner_rows([item])[0]['overdue']
+    monkeypatch.setattr(ov.q, 'list_items', lambda *a, **k: [item])
+    from watchtower import related
+    monkeypatch.setattr(related, 'cached_tickets', lambda: ([], {}))
+    view = ov.snapshot()
+    assert 'OVERDUE' in ov.render(view)
+    assert any('OVERDUE' in w for w in view['warnings'])
+
+
+def test_replacement_cli_requires_reason_and_preserves_execution_authority(env, tmp_path):
+    _q, cli, *_ = env
+    check(tmp_path)
+    args = ['monitor', '--register', 'natural-check', '--cmd', 'true', '--cwd', str(tmp_path),
+            '--where', 'her', '--schedule', 'pass on matching natural evidence; hourly',
+            '-q', 'WATCH-FAIL', '--replace']
+    assert cli.main(args) == 1
+    assert cli.main(args + ['--reason', 'stable committed entrypoint']) == 0
+    assert watches._load()['revisions']['natural-check'][0]['reason'] == 'stable committed entrypoint'

@@ -292,7 +292,7 @@ def snapshot(project: Optional[str] = None) -> Dict[str, Any]:
                     for job in view.get("fragile_jobs") or [])
     warnings.extend(f"Watching closed {r['ref']}: {r['check']} at {r['where']} "
                     f"({r['schedule']}); last {r['last'].get('status', 'not-run')}: "
-                    f"{str(r['last'].get('evidence') or '')[:160]}"
+                    f"{str(r['last'].get('evidence') or '')[:160]} {r.get('warning', '')}"
                     for r in view.get("watched") or [])
     view["warnings"] = warnings
     return view
@@ -317,7 +317,7 @@ def render(view: Dict[str, Any]) -> str:
     for row in view.get("watched") or []:
         lines.append(f"  {row['ref']} {row['check']} at {row['where']} ({row['schedule']}); "
                      f"last {row['last'].get('status', 'not-run')}: "
-                     f"{str(row['last'].get('evidence') or '')[:160]}")
+                     f"{str(row['last'].get('evidence') or '')[:160]} {row.get('warning', '')}")
     release_rows = view.get("awaiting_release") or []
     lines.append(f"Awaiting release: {len(release_rows)} (untimed release gate)")
     for row in view.get("release_attention") or []:
