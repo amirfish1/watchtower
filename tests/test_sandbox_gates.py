@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import types
 from pathlib import Path
 
 import pytest
@@ -133,11 +134,38 @@ def test_native_group_sweep_finds_commit_and_gates_in_sandbox(native, env, trust
 
 
 def _fake_gate(monkeypatch, mutate, passed=True):
+    """A fake gate transport over a fake trusted source (HEAD ``st.head``)."""
+    st = _fake_source(monkeypatch)
+
     def fake(item, command, commit="", timeout=None):
+        st.commits.append(commit)
         mutate()
         return {"gate": "cmd:" + command, "passed": passed, "exit_code": 0 if passed else 1,
                 "output_tail": "boom" if not passed else "", "commit": commit, "sandboxed": True}
     monkeypatch.setattr(sandbox_stages, "run_cmd_gate", fake)
+    return st
+
+
+def _fake_source(monkeypatch):
+    st = types.SimpleNamespace(head="a" * 40, gone=False, common="/trusted/.git",
+                               pins=0, commits=[])
+
+    def pin(item, commit=""):
+        st.pins += 1
+        return {"repo_path": str(item.get("repo_path") or ""), "common": st.common,
+                "commit": commit or st.head, "head": "" if commit else st.head}
+
+    def unchanged(pin):
+        if st.gone:
+            return "the trusted source repository is gone"
+        if pin.get("common") != st.common:
+            return "the trusted source repository changed identity"
+        if pin.get("head") and pin["head"] != st.head:
+            return "the trusted source HEAD moved while the gates ran"
+        return ""
+    monkeypatch.setattr(sandbox_stages, "pin_source", pin)
+    monkeypatch.setattr(sandbox_stages, "source_unchanged", unchanged)
+    return st
 
 
 def _edit(w, ref, fn):
@@ -194,3 +222,171 @@ def test_passing_fake_gate_closes_and_records_sandboxed_result(env, monkeypatch)
 
 def test_close_client_waits_longer_than_the_gate_budget():
     assert bridge.CLOSE_TIMEOUT_S >= sandbox_stages.GATES_BUDGET_S + 120
+
+
+# ----------------------------------- pinned HEAD / source and request CAS
+
+
+@pytest.mark.parametrize("passed", [True, False])
+def test_one_head_is_pinned_across_every_gate_and_a_moved_head_is_refused(env, monkeypatch, passed):
+    w = env
+    item = _claim(w, w.repo, ["cmd:true", "cmd:echo second"])
+    st = _fake_gate(monkeypatch, lambda: None, passed)
+    moved = {"n": 0}
+
+    def move():
+        moved["n"] += 1
+        st.head = "b" * 40                     # HEAD advances while gates run
+    st_commits = st.commits
+
+    def fake(item, command, commit="", timeout=None):
+        st_commits.append(commit)
+        move()
+        return {"gate": "cmd:" + command, "passed": True if command == "true" else passed,
+                "exit_code": 0 if (command == "true" or passed) else 1,
+                "output_tail": "" if (command == "true" or passed) else "boom",
+                "commit": commit, "sandboxed": True}
+    monkeypatch.setattr(sandbox_stages, "run_cmd_gate", fake)
+    out = submit(w, "close", close_body(item["ref"]), w.claim)
+    assert st.pins == 1                                      # one trusted read for all gates
+    assert st.commits == ["a" * 40] * len(st.commits) and len(st.commits) == 2
+    assert out["ok"] is False and "HEAD moved" in out["error"]
+    after = w.queue.get(item["ref"])
+    assert after["status"] == "in_progress" and not after.get("gate_feedback")
+
+
+def test_stable_head_pins_one_commit_across_gates_and_closes(env, monkeypatch):
+    w = env
+    item = _claim(w, w.repo, ["cmd:true", "cmd:echo second"])
+    st = _fake_gate(monkeypatch, lambda: None)
+    out = submit(w, "close", close_body(item["ref"]), w.claim)
+    assert out["ok"], out
+    assert st.pins == 1 and st.commits == ["a" * 40, "a" * 40]
+    assert w.queue.get(item["ref"])["status"] == "closed"
+
+
+@pytest.mark.parametrize("passed", [True, False])
+@pytest.mark.parametrize("change", ["repo", "source_gone", "source_identity"])
+def test_source_or_repo_change_during_gates_is_refused(env, monkeypatch, change, passed):
+    w = env
+    item = _claim(w, w.repo, ["cmd:true"])
+    box = {}
+
+    def mutate():
+        if change == "repo":
+            _edit(w, item["ref"], lambda it: it.update(repo_path=str(w.repo) + "-moved"))
+        elif change == "source_gone":
+            box["st"].gone = True
+        else:
+            box["st"].common = "/other/.git"
+    box["st"] = _fake_gate(monkeypatch, mutate, passed)
+    out = submit(w, "close", close_body(item["ref"]), w.claim)
+    assert out["ok"] is False
+    after = w.queue.get(item["ref"])
+    assert after["status"] == "in_progress" and not after.get("gate_feedback")
+
+
+def test_changed_request_is_refused_at_the_write_lock(env):
+    w = env
+    item = _claim(w, w.repo, ["cmd:true"])
+    cur = w.queue.get(item["ref"])
+    contract = w.queue._sandbox_snapshot_contract(cur, {"summary": "what was gated"})
+    with pytest.raises(ValueError, match="request changed"):
+        w.queue.update_status(item["ref"], "closed", cur["claimed_by"],
+                              resolution={"summary": "a different request"},
+                              expect_owner=cur["claimed_by"], sandbox_contract=contract)
+    assert w.queue.get(item["ref"])["status"] == "in_progress"
+    done = w.queue.update_status(item["ref"], "closed", cur["claimed_by"],
+                                 resolution={"summary": "what was gated"},
+                                 expect_owner=cur["claimed_by"], sandbox_contract=contract)
+    assert done["status"] == "closed"
+
+
+# -------------------------- trusted adoption close of a sandbox-origin item
+
+
+@pytest.fixture
+def adopted(wt_env, monkeypatch):
+    w = wt_env
+    monkeypatch.setattr(bridge, "restricted_session",
+                        lambda session_id="", worker_id="": worker_id == "sb-worker")
+    st = _fake_source(monkeypatch)
+
+    def make(gates=("cmd:true",), status="awaiting_answer", needs_input=True):
+        item = w.queue.enqueue(project="SB", note="adopted", repo_path=str(w.tmp / "repo"),
+                               gates=list(gates))
+        w.queue.claim_by_ref(item["ref"], "sb-worker")
+        _edit(w, item["ref"], lambda it: it.update(status=status, needs_input=needs_input))
+        return item["ref"]
+    w.make, w.st = make, st
+    return w
+
+
+def _gate_with(monkeypatch, st, mutate, passed=True):
+    def fake(item, command, commit="", timeout=None):
+        st.commits.append(commit)
+        mutate()
+        return {"gate": "cmd:" + command, "passed": passed, "exit_code": 0 if passed else 1,
+                "output_tail": "" if passed else "boom", "commit": commit, "sandboxed": True}
+    monkeypatch.setattr(sandbox_stages, "run_cmd_gate", fake)
+
+
+def test_adopted_close_of_awaiting_answer_item_succeeds_when_stable(adopted, monkeypatch):
+    w = adopted
+    ref = w.make()
+    _gate_with(monkeypatch, w.st, lambda: None)
+    done = w.queue.close(ref, "sb-worker", resolution={"summary": "adopted"})
+    assert done["status"] == "closed" and done["gate_results"][0]["sandboxed"] is True
+    assert w.st.commits == ["a" * 40]
+
+
+@pytest.mark.parametrize("passed", [True, False])
+@pytest.mark.parametrize("change", ["status", "needs_input", "owner", "generation", "gates",
+                                    "repo", "head", "source_gone", "store"])
+def test_adopted_close_refuses_a_change_during_slow_gates(adopted, monkeypatch, change, passed):
+    from watchtower import store_identity
+    w = adopted
+    ref = w.make()
+
+    def mutate():
+        if change == "head":
+            w.st.head = "c" * 40
+        elif change == "source_gone":
+            w.st.gone = True
+        elif change == "store":
+            monkeypatch.setattr(store_identity, "read_unlocked", lambda base: "another-store")
+        else:
+            def fn(it):
+                if change == "status":
+                    it["status"] = "in_progress"
+                elif change == "needs_input":
+                    it["needs_input"] = False
+                elif change == "owner":
+                    it["claimed_by"] = "replacement"
+                elif change == "generation":
+                    it["last_answer_gen"] = 20
+                elif change == "gates":
+                    it["gates"] = ["cmd:true", "cmd:echo added"]
+                elif change == "repo":
+                    it["repo_path"] = it["repo_path"] + "-moved"
+            _edit(w, ref, fn)
+    _gate_with(monkeypatch, w.st, mutate, passed)
+    expected_status = {"status": "in_progress"}.get(change, "awaiting_answer")
+    try:
+        w.queue.close(ref, "sb-worker", resolution={"summary": "adopted"})
+    except ValueError:
+        pass
+    else:
+        pytest.fail("the stale adopted close was written")
+    after = w.queue.get(ref)
+    assert after["status"] == expected_status          # nothing was written over the change
+    assert not after.get("gate_feedback")
+
+
+def test_adopted_force_close_still_skips_gates_and_contract(adopted, monkeypatch):
+    w = adopted
+    ref = w.make()
+    monkeypatch.setattr(sandbox_stages, "run_cmd_gate",
+                        lambda *a, **k: pytest.fail("force must not run gates"))
+    done = w.queue.close(ref, force=True, resolution={"summary": "owner override"})
+    assert done["status"] == "closed" and not done.get("gate_results")

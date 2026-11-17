@@ -3646,12 +3646,10 @@ def update_status(
         for it in data["items"]:
             if _matches(it, ident):
                 if sandbox_contract is not None:
-                    from . import sandbox_bridge
-                    if (status not in ("closed", "open") or it.get("status") != "in_progress"
-                            or it.get("needs_input")
-                            or sandbox_bridge._fence(it) != sandbox_contract["fence"]
-                            or effective_gates(it) != sandbox_contract["gates"]):
-                        raise ValueError("sandbox claim or gates changed during close")
+                    problem = _sandbox_contract_problem_unlocked(it, status, sandbox_contract,
+                                                                 resolution)
+                    if problem:
+                        raise ValueError(problem)
                     if sandbox_contract.get("store_id"):
                         from . import store_identity
                         if store_identity.read_unlocked(_resolve_store_path()) != sandbox_contract["store_id"]:
@@ -4677,12 +4675,15 @@ def _sandbox_restricted(item: Dict[str, Any]) -> bool:
 
 
 def evaluate_gates(item: Dict[str, Any], commit: str = "",
-                   pinned: bool = False) -> Tuple[List[Dict[str, Any]], List[str]]:
+                   pinned: bool = False,
+                   pin_out: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], List[str]]:
     """Run the cmd gates in order, stopping at the first failure. Returns
     ``(results, stages)``: ``stages`` is the ordered list still owed once all
     cmd gates passed (``"verify"`` then ``"review"`` / ``"review:<target>"``),
     empty when the ticket can close outright. A failed result has ``passed``
-    False (and ``stages`` is then empty). ``pinned``: see ``_run_cmd_gate``."""
+    False (and ``stages`` is then empty). ``pinned``: see ``_run_cmd_gate``.
+    ``pin_out`` (sandbox-origin tickets only) receives the one source pin every
+    cmd gate ran against (``sandbox_stages.pin_source``)."""
     results: List[Dict[str, Any]] = []
     gates = effective_gates(item)
     sandboxed = any(g.startswith("cmd:") for g in gates) and _sandbox_restricted(item)
@@ -4707,6 +4708,19 @@ def evaluate_gates(item: Dict[str, Any], commit: str = "",
                 item["repo_path"] = str(_config.repo_path(str(item.get("project") or "")) or "")
             except Exception:  # noqa: BLE001 - no repo is a gate setup failure below
                 item["repo_path"] = ""
+        # ONE trusted snapshot for every gate: without a commit, HEAD is
+        # read once here, never per gate (it may move between gates).
+        first = next(g for g in gates if g.startswith("cmd:"))
+        try:
+            pin = sandbox_stages.pin_source(item, commit)
+        except Exception as exc:  # noqa: BLE001 - a refusal, never a host fallback
+            r = _pinned_setup_failed(first[4:], commit, str(exc), time.time())
+            r["sandboxed"] = True
+            return [r], []
+        commit = pin["commit"]
+        if pin_out is not None:
+            pin_out.clear()
+            pin_out.update(pin)
         deadline = time.monotonic() + sandbox_stages.GATES_BUDGET_S
     for g in gates:
         if g.startswith("cmd:"):
@@ -5302,6 +5316,67 @@ def reject(ident: Any, reason: str, by: str = "human") -> Optional[Dict[str, Any
     return reject_with(ident, f"rejected by {by}: {reason}", by_label=str(by))
 
 
+def _request_digest(resolution: Any) -> str:
+    import hashlib
+    norm = _normalize_resolution(resolution) or {}
+    return hashlib.sha256(json.dumps(norm, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _effective_repo_path(item: Dict[str, Any]) -> str:
+    path = str(item.get("repo_path") or "")
+    if path:
+        return path
+    try:
+        from . import config as _config
+        return str(_config.repo_path(str(item.get("project") or "")) or "")
+    except Exception:  # noqa: BLE001 - an unreadable config is "no repository"
+        return ""
+
+
+def _sandbox_snapshot_contract(item: Dict[str, Any], resolution: Any,
+                               fence: Optional[Dict[str, Any]] = None,
+                               store_id: Optional[str] = None) -> Dict[str, Any]:
+    """What a sandbox-origin close observed before its (slow) gates ran; the
+    write-back re-checks every part under the write lock (``update_status``).
+    The bridge passes its own claim fence and store id; a trusted adoption
+    close observes both from the item and the store."""
+    from . import sandbox_bridge
+    if store_id is None:
+        from . import store_identity
+        try:
+            store_id = store_identity.read_unlocked(_resolve_store_path()) or ""
+        except Exception:  # noqa: BLE001 - recorded as unknown; the lock-time read must match
+            store_id = ""
+    return {"fence": fence if fence is not None else sandbox_bridge._fence(item),
+            "gates": effective_gates(item), "store_id": store_id,
+            "status": item.get("status"), "needs_input": bool(item.get("needs_input")),
+            "repo_path": _effective_repo_path(item), "request": _request_digest(resolution)}
+
+
+def _sandbox_contract_problem_unlocked(it: Dict[str, Any], status: str,
+                                       contract: Dict[str, Any], resolution: Any) -> str:
+    """Why a sandbox close/reopen must not be written ("" when it may). Runs
+    under the write lock, for the pass AND the failed-gate write-back."""
+    from . import sandbox_bridge
+    if (status not in ("closed", "open")
+            or it.get("status") != contract.get("status", "in_progress")
+            or bool(it.get("needs_input")) != bool(contract.get("needs_input", False))
+            or sandbox_bridge._fence(it) != contract["fence"]
+            or effective_gates(it) != contract["gates"]):
+        return "sandbox claim or gates changed during close"
+    if "repo_path" in contract and _effective_repo_path(it) != contract["repo_path"]:
+        return "sandbox source repository changed during close"
+    if status == "closed" and "request" in contract \
+            and _request_digest(resolution) != contract["request"]:
+        return "sandbox close request changed during close"
+    if contract.get("source"):
+        from . import sandbox_stages
+        moved = sandbox_stages.source_unchanged(contract["source"])
+        if moved:
+            return "sandbox source changed during close: " + moved
+    return ""
+
+
 def _reopen_with_feedback(ident: Any, reason: str, results: List[Dict[str, Any]],
                           by_kind: str = "worker", close_owner: str = "",
                           session_id: str = "", session_uuid: str = "",
@@ -5568,9 +5643,8 @@ def close(
                 or not session_id or cur.get("claimed_by") != session_id
                 or force or declined or close_contract is not None):
             raise ValueError("sandbox close requires the current assigned local claim")
-        sandbox_gates = effective_gates(cur)
-        sandbox_contract = {"fence": sandbox_expect, "gates": sandbox_gates,
-                            "store_id": sandbox_store_id}
+        sandbox_contract = _sandbox_snapshot_contract(
+            cur, resolution, fence=sandbox_expect, store_id=sandbox_store_id)
     if cur is not None and cur.get("duplicate_of"):
         raise ValueError(f"{cur.get('ref', ident)} follows duplicate original {cur['duplicate_of']}; clear the link before independent work")
     if _github_backend_for_project(_project_from_ident(ident)) is None:
@@ -5614,7 +5688,10 @@ def close(
         current = get(ident)
         if current is None:
             raise ValueError("sandbox close requires the current assigned local claim")
-        results, stages = evaluate_gates(current, "")
+        pin_out: Dict[str, Any] = {}
+        results, stages = evaluate_gates(current, "", pin_out=pin_out)
+        if pin_out:
+            sandbox_contract["source"] = pin_out
         failed = [r for r in results if not r["passed"]]
         if failed:
             f = failed[0]
@@ -5636,7 +5713,21 @@ def close(
         current = get(ident)
         if current is not None and current.get("status") != "closed" and effective_gates(current):
             norm = _normalize_resolution(resolution) or {}
-            results, stages = evaluate_gates(current, str(norm.get("commit") or ""))
+            # WT-61: adopting a sandbox-origin item runs its command gates
+            # in the sandbox over minutes. Snapshot what was observed (status,
+            # needs_input, claim fence, gates, repository, request) and the
+            # pinned source, and re-check them under the write lock for both
+            # the pass and the failed-gate write-back.
+            adopt_contract = None
+            pin_out = {}
+            if (any(str(g).startswith("cmd:") for g in effective_gates(current))
+                    and _sandbox_restricted(current)):
+                adopt_contract = _sandbox_snapshot_contract(current, resolution)
+            results, stages = evaluate_gates(current, str(norm.get("commit") or ""),
+                                             pin_out=pin_out)
+            if adopt_contract is not None and pin_out:
+                adopt_contract["source"] = pin_out
+            sandbox_contract = adopt_contract
             failed = [r for r in results if not r["passed"]]
             if failed:
                 f = failed[0]
@@ -5648,7 +5739,8 @@ def close(
                     ident, why, results,
                     close_owner="" if force else str(session_id or ""),
                     session_id=str(session_id or ""), session_uuid=session_uuid,
-                    require_status=current.get("status"))
+                    require_status=current.get("status"),
+                    sandbox_contract=adopt_contract)
                 if item is None:
                     now_it = get(ident) or {}
                     raise ValueError(

@@ -86,6 +86,9 @@ def test_restricted_gates_run_through_the_sandbox_transport_only(wt_env, monkeyp
                 "output_tail": "", "commit": commit, "sandboxed": True}
 
     monkeypatch.setattr(sandbox_stages, "run_cmd_gate", fake)
+    monkeypatch.setattr(sandbox_stages, "pin_source", lambda item, commit="": {
+        "repo_path": item["repo_path"], "common": "/trusted/repo/.git",
+        "commit": commit or "b" * 40, "head": "" if commit else "b" * 40})
     parent = {"project": "SB", "ref": "SB-99", "repo_path": "/trusted/repo",
               "gates": ["cmd:true", "cmd:false", "cmd:never", "verify"],
               "group": {"role": "parent", "members": [child["ref"]]}}
@@ -99,6 +102,11 @@ def test_restricted_gates_run_through_the_sandbox_transport_only(wt_env, monkeyp
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     results, _stages = w.queue.evaluate_gates({**parent, "gates": ["cmd:true"]}, "a" * 40)
     assert results[0]["setup_failed"] and results[0]["sandboxed"]
+    # A refused source pin is one sandboxed setup failure; no gate runs.
+    monkeypatch.setattr(sandbox_stages, "pin_source",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no repo")))
+    results, _stages = w.queue.evaluate_gates({**parent, "gates": ["cmd:true"]}, "")
+    assert len(results) == 1 and results[0]["setup_failed"] and results[0]["sandboxed"]
 
 
 def test_restricted_interactive_discussion_refuses_even_printed_unrestricted_resume(wt_env, monkeypatch):

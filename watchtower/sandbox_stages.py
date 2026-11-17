@@ -305,6 +305,35 @@ def _head_from_files(meta: Dict[str, Any]) -> str:
     raise StageSandboxError(f"cannot resolve {ref} from the repository's files")
 
 
+def pin_source(item: Dict[str, Any], commit: str = "") -> Dict[str, Any]:
+    """Pin ONE trusted snapshot for every gate of an evaluation: the
+    repository identity (its common Git directory), the full commit every gate
+    will materialize, and -- when ``commit`` was empty -- the HEAD it was taken
+    from. ``source_unchanged`` re-checks it later, at the write lock."""
+    repo_path = str(item.get("repo_path") or "")
+    meta, _stores = source_objects(repo_path)
+    full = resolve_commit(meta, commit)
+    return {"repo_path": repo_path, "common": os.path.realpath(str(meta["common"])),
+            "commit": full, "head": "" if str(commit or "").strip() else full}
+
+
+def source_unchanged(pin: Dict[str, Any]) -> str:
+    """Why ``pin`` no longer describes the trusted repository ("" when it
+    still does). Reads Git metadata files only, no ledger and no lock: it is
+    called inside the queue write lock."""
+    try:
+        meta = policy.git_metadata(Path(os.path.expanduser(str(pin.get("repo_path") or ""))))
+        if meta["kind"] == "none":
+            return "the trusted source repository is gone"
+        if os.path.realpath(str(meta["common"])) != pin.get("common"):
+            return "the trusted source repository changed identity"
+        if pin.get("head") and _head_from_files(meta) != pin["head"]:
+            return "the trusted source HEAD moved while the gates ran"
+    except (StageSandboxError, policy.SandboxPolicyError, OSError) as exc:
+        return f"the trusted source repository is unreadable: {exc}"
+    return ""
+
+
 def resolve_commit(meta: Dict[str, Any], commit: str) -> str:
     """The full object id the stage will be pinned to: ``commit`` when it is
     one, the repository's HEAD when it is empty, otherwise a refusal (a short
