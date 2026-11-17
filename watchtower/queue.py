@@ -5282,6 +5282,44 @@ def _note_worker_ticket_done(session_id: Any) -> None:
 
 
 
+def _duplicate_proven(original: Dict[str, Any], required: List[str]) -> bool:
+    """Current local close has proof for every inherited gate."""
+    results = {r.get("gate"): r for r in (original.get("gate_results") or [])}
+    history = original.get("history") or []
+    last_close = max((n for n, e in enumerate(history) if e.get("event") == "close"), default=-1)
+    after_close = history[last_close + 1:]
+
+    def proven(g):
+        if g == "verify":
+            return (results.get(g, {}).get("passed") and any(
+                e.get("event") == "verify" and e.get("passed") for e in after_close))
+        if g == "review" or g.startswith("review:"):
+            return any(e.get("event") == "accept" for e in after_close)
+        if g == "plan" or g.startswith("plan:"):
+            return (original.get("plan") or {}).get("status") == "accepted"
+        return results.get(g, {}).get("passed")
+
+    return bool(original.get("status") == "closed" and not original.get("gate_pending")
+                and all(proven(g) for g in required))
+
+
+def sync_duplicates(only_ref: str = "") -> List[str]:
+    """Repair legacy local links even when no other queue mutation occurs."""
+    with _FileLock(_lock_path()):
+        data = _load_unlocked()
+        before = {i["ref"]: json.dumps(i, sort_keys=True) for i in data["items"]
+                  if i.get("duplicate_of") and (not only_ref or only_ref in
+                      (i.get("ref"), i.get("duplicate_of")))}
+        if not before:
+            return []
+        _sync_duplicates_unlocked(data)
+        changed = [i["ref"] for i in data["items"] if i.get("ref") in before
+                   and json.dumps(i, sort_keys=True) != before[i["ref"]]]
+        if changed:
+            _save_unlocked(data)
+        return changed
+
+
 def _sync_duplicates_unlocked(data: Dict[str, Any]) -> None:
     """Duplicate followers share their original's completion, in the same write.
 
@@ -5295,29 +5333,31 @@ def _sync_duplicates_unlocked(data: Dict[str, Any]) -> None:
             continue
         original = by_ref.get(ref)
         required = sorted(set(effective_gates(it)) | set(effective_gates(original or {})))
-        results = {r.get("gate"): r for r in ((original or {}).get("gate_results") or [])}
-        history = (original or {}).get("history") or []
-        last_close = max((n for n, e in enumerate(history) if e.get("event") == "close"), default=-1)
-        after_close = history[last_close + 1:]
-
-        def proven(g):
-            if g == "verify":
-                return (results.get(g, {}).get("passed") and any(
-                    e.get("event") == "verify" and e.get("passed") for e in after_close))
-            if g == "review" or g.startswith("review:"):
-                return any(e.get("event") == "accept" for e in after_close)
-            if g == "plan" or g.startswith("plan:"):
-                return ((original or {}).get("plan") or {}).get("status") == "accepted"
-            return results.get(g, {}).get("passed")
-
-        complete = bool(original and original.get("status") == "closed"
-                        and not original.get("gate_pending")
-                        and all(proven(g) for g in required))
+        complete = bool(original and _duplicate_proven(original, required))
         snapshot = {"ref": ref, "status": (original or {}).get("status", "missing"),
                     "verify_cycle": (original or {}).get("verify_cycle", 0),
                     "closed_at": (original or {}).get("closed_at"),
                     "feedback": (original or {}).get("gate_feedback", ""),
                     "complete": complete}
+        if (original and original.get("status") == "closed"
+                and not original.get("gate_pending") and not complete):
+            # A terminal unverified close cannot ever satisfy this wait.
+            # Release independent work, retaining ALL inherited gate requirements.
+            it.pop("duplicate_of", None)
+            it["duplicate_result"] = dict(snapshot, released=True)
+            it["gates"] = required
+            it["status"], it["closed_at"], it["resolution"] = "open", None, None
+            it["gate_results"] = []
+            it.pop("closed_by", None)
+            it.pop("closed_machine", None)
+            it["gate_feedback"] = (
+                f"Duplicate original {ref} closed without passing all required gates; "
+                "released for independent work. Original result: "
+                + str((original.get("resolution") or {}).get("summary") or "no summary"))
+            it["updated_at"] = _now_iso()
+            _append_history(it, "duplicate_release", by=_by("system"),
+                            original=ref, result=snapshot, reason=it["gate_feedback"])
+            continue
         # An unfinished follower stays ``open`` (a declared status, WT-49):
         # claim paths skip ``duplicate_of`` and liveness/health read it as a
         # dependency wait on the original (blocker_verdict), the same shape
@@ -5421,6 +5461,11 @@ def link_duplicate(ident: Any, original_ref: str, worker: str = "", *,
                 raise ValueError("plan-group tickets cannot be duplicate originals")
             if not set(effective_gates(it)).issubset(effective_gates(original)):
                 raise ValueError("duplicate original must cover every gate required by the follower")
+            if (original.get("status") == "closed" and not original.get("gate_pending")
+                    and not _duplicate_proven(original, effective_gates(original))):
+                raise ValueError(f"duplicate original {original_ref} is closed without passing "
+                                 "all required gates; keep this ticket independent or reopen "
+                                 "the original and complete its gates before linking")
             if (it.get("pending_answer") or {}).get("state") in ANSWER_INFLIGHT:
                 raise ValueError("settle the pending answer before linking a duplicate")
             _retire_sessions_unlocked(it, ("verifier", "assessor", "planner", "plan_reviewer"),

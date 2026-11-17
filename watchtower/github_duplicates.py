@@ -103,12 +103,30 @@ def sync(follower_ref: str) -> Optional[Dict[str, Any]]:
     on a change, so it is safe to run every tick."""
     backend = _backend(follower_ref)
     f = backend.get(follower_ref)
-    if f is None or not f.get("duplicate_of"):
+    if f is None or not f.get("duplicate_of") or _unreadable(f):
         return f
     o = backend.get(str(f["duplicate_of"]))
     snap = evaluate(f, o)
     if snap is None:
         return f
+    if (o and o.get("status") == "closed" and not o.get("review_hold")
+            and not snap["stale"] and not snap["complete"]):
+        # Preserve the original's gates before dropping the relationship hold.
+        from . import queue as q
+        required = sorted(set(_gates(f)) | set(_gates(o)))
+        if set(_gates(f)) != set(required):
+            q.update(follower_ref, gates=required)
+        if f.get("status") == "closed":
+            backend.update_status(follower_ref, "open", reason="unproven duplicate original")
+        reason = (f"Duplicate original {snap['ref']} closed without passing all required gates; "
+                  "released for independent work")
+        backend.update(follower_ref, duplicate_of="", duplicate_gen=None,
+                       duplicate_result=dict(snap, released=True), pipeline_hold="",
+                       _system_history=("duplicate_release", {"original": snap["ref"],
+                                                             "reason": reason}))
+        from . import github_pipeline
+        github_pipeline.record_results(follower_ref, [], reason)
+        return backend.get(follower_ref)
     closed_by_dup = str(f.get("closed_by") or "").startswith("duplicate:")
     in_line = (f.get("duplicate_result") == snap
                and (f.get("status") == "closed") == snap["complete"])
@@ -202,6 +220,11 @@ def link(ident: Any, original_ref: str, worker: str = "") -> Optional[Dict[str, 
         raise ValueError("duplicate chains and cycles are not allowed")
     if not set(_gates(f)).issubset(_gates(o)):
         raise ValueError("duplicate original must cover every gate required by the follower")
+    if (o.get("status") == "closed" and not o.get("review_hold")
+            and not proven(o, _gates(o))):
+        raise ValueError(f"duplicate original {original_ref} is closed without passing "
+                         "all required gates; keep this ticket independent or reopen "
+                         "the original and complete its gates before linking")
     if f.get("status") == "in_review":
         raise ValueError(f"{fref} is in review; settle it (wt accept / wt reject) before linking")
     if f.get("status") == "in_progress":

@@ -2523,8 +2523,8 @@ class GitHubIssuesBackend:
         if meta.get("duplicate_of"):
             item["duplicate_of"] = str(meta["duplicate_of"])
             item["duplicate_gen"] = int(meta.get("duplicate_gen") or 0)
-            if isinstance(meta.get("duplicate_result"), dict):
-                item["duplicate_result"] = dict(meta["duplicate_result"])
+        if isinstance(meta.get("duplicate_result"), dict):
+            item["duplicate_result"] = dict(meta["duplicate_result"])
         history = meta.get("history")
         if isinstance(history, list):
             item["history"] = list(history)
