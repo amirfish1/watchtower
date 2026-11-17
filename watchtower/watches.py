@@ -87,7 +87,7 @@ def inventory():
 def _validate_evidence_rule(spec):
     # Cadence and evidence cohort durations are fine; a calendar is not proof.
     text = " ".join(str(spec.get(k) or "") for k in ("schedule", "command"))
-    if re.search(r"pass(?:es|ing)?\s+(?:only\s+)?(?:after|on|at|not before)\s+[\"\']?\d{4}-\d{2}-\d{2}\b|"
+    if re.search(r"pass(?:es|ing)?\s+(?:only\s+)?(?:after|on|at|not before)\s+[\"\']?\d{4}-\d{2}-\d{2}(?!\d)|"
                  r"original\s+24\s*h(?:our)?\s+window", text, re.I):
         raise ValueError("watch must pass on evidence, not a date-keyed pass condition")
 
