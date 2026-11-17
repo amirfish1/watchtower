@@ -124,3 +124,57 @@ def test_reopening_with_overlap_between_independent_snapshots(report):
     page, _ = q.window_items("REPORT", spec)
     assert page[0]["status"] == "open"
     assert q.window_items("REPORT", q.WindowSpec(closed_since=0))[0] == []
+
+
+def test_unrelated_writer_advances_only_current_projection(report, monkeypatch):
+    q, gh, rc, backend, issue, publish = report
+    spec = q.WindowSpec(refs=["REPORT-3"])
+    before, _ = q.window_items("REPORT", spec)
+    def no_rebuild(*a, **kw):
+        raise AssertionError("unrelated writer rescanned report issues")
+    monkeypatch.setattr(rc, "_publish", no_rebuild)
+    gh._write_persisted_list_entry("other/repo:open", {"data": [issue(99, "OPEN")]})
+    def no_snapshot():
+        raise AssertionError("generation was not advanced by writer")
+    monkeypatch.setattr(gh, "_read_persisted_list_cache", no_snapshot)
+    after, _ = q.window_items("REPORT", spec)
+    assert before == after
+
+
+def test_unrelated_writer_repairs_missed_publication(report, monkeypatch):
+    q, gh, rc, backend, issue, publish = report
+    spec = q.WindowSpec(refs=["REPORT-3"])
+    q.window_items("REPORT", spec)
+    with monkeypatch.context() as patch:
+        def failed(*a, **kw):
+            raise OSError("interrupted publication")
+        patch.setattr(rc, "publish_existing", failed)
+        updated = issue(3, "OPEN")
+        updated["title"] = "changed without changing issue clocks"
+        publish("open", [updated])
+    # This writer did not change our repo, but our projection missed the last
+    # generation and must be repaired rather than marked current.
+    gh._write_persisted_list_entry("other/repo:closed", {"data": []})
+    def no_snapshot():
+        raise AssertionError("stale projection was not repaired by writer")
+    monkeypatch.setattr(gh, "_read_persisted_list_cache", no_snapshot)
+    page, _ = q.window_items("REPORT", spec)
+    assert page[0]["title"] == updated["title"]
+
+
+def test_unrelated_writer_applies_changed_partition_configuration(report):
+    q, gh, rc, backend, issue, publish = report
+    spec = q.WindowSpec(refs=["REPORT-3"])
+    assert q.window_items("REPORT", spec)[0]
+    backend.partition_by_label = True
+    gh._write_persisted_list_entry("other/repo:open", {"data": []})
+    assert not q.window_items("REPORT", spec)[0]
+
+
+def test_invalidation_keeps_affected_projection_coverage_stale(report):
+    q, gh, rc, backend, issue, publish = report
+    spec = q.WindowSpec(closed_since=time.time() - 3600)
+    assert q.window_items("REPORT", spec)[1]["source_complete"]
+    gh._invalidate_list_cache(backend.repo)
+    _, meta = q.window_items("REPORT", spec)
+    assert not meta["source_complete"] and "stale" in meta["coverage"]

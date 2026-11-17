@@ -86,12 +86,14 @@ def _publish(backend, data, cache_path):
     return db
 
 
-def publish_existing(data, cache_path):
+def publish_existing(data, cache_path, *, changed_repos=None, previous_stamp=None):
     """Called by the snapshot writer while holding its lock; no network I/O.
 
     Only opted-in projections (created by a reporting read) pay this cost.
     A failed publication leaves its generation stale; the next reader repairs
     it under the same lock rather than silently serving incorrect coverage.
+    Unchanged repositories can advance without scanning their issue bodies,
+    but only when both the prior generation and configuration are proven.
     """
     from . import queue as q
     for db in _directory(cache_path).glob("*.db"):
@@ -99,11 +101,19 @@ def publish_existing(data, cache_path):
         try:
             project = q._meta_get(conn, "report_queue")
             repo = q._meta_get(conn, "report_repo")
+            backend = q._github_backend_for_project(project)
+            if backend is None or backend.repo != repo:
+                continue
+            if (changed_repos is not None and repo not in changed_repos
+                    and previous_stamp is not None
+                    and q._meta_get(conn, "cache_stamp") == previous_stamp
+                    and q._meta_get(conn, "report_config") == _config_key(backend)):
+                conn.execute(q._META_UPSERT, ("cache_stamp", _stamp(cache_path)))
+                conn.commit()
+                continue
         finally:
             conn.close()
-        backend = q._github_backend_for_project(project)
-        if backend is not None and backend.repo == repo:
-            _publish(backend, data, cache_path)
+        _publish(backend, data, cache_path)
 
 
 def _coverage(conn, backend, spec):

@@ -348,13 +348,15 @@ def _read_persisted_list_cache() -> Dict[str, Any]:
         return dict(data)
 
 
-def _rewrite_persisted_list_cache(mutate) -> None:
+def _rewrite_persisted_list_cache(mutate, *, changed_repos=None) -> None:
     """Load-modify-atomic-write the persisted cache file under its lock.
 
     ``mutate(data) -> bool`` edits ``data`` in place and returns whether
     anything actually changed (skipping the write entirely when it didn't)."""
     path = _list_cache_path()
     with _FileLock(path.with_suffix(".lock")):
+        from . import reporting_cache
+        previous_stamp = reporting_cache._stamp(path) if path.exists() else None
         data = _read_persisted_list_cache()
         if not mutate(data):
             return
@@ -366,8 +368,8 @@ def _rewrite_persisted_list_cache(mutate) -> None:
         # Reporting reads stay local and bounded; the existing writer maintains
         # projections only for queues that have requested them.
         try:
-            from . import reporting_cache
-            reporting_cache.publish_existing(data, path)
+            reporting_cache.publish_existing(data, path, changed_repos=changed_repos,
+                                             previous_stamp=previous_stamp)
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             _log_quota("report_index_error", error=str(exc))
 
@@ -378,7 +380,7 @@ def _write_persisted_list_entry(key: str, entry: Dict[str, Any]) -> None:
         data[key] = entry
         return True
 
-    _rewrite_persisted_list_cache(mutate)
+    _rewrite_persisted_list_cache(mutate, changed_repos={key.rsplit(":", 1)[0]})
 
 
 def _invalidate_list_cache(repo: str) -> None:
@@ -434,7 +436,7 @@ def _invalidate_list_cache(repo: str) -> None:
                 changed = True
         return changed
 
-    _rewrite_persisted_list_cache(mutate)
+    _rewrite_persisted_list_cache(mutate, changed_repos={repo})
 
 
 def refresh_persisted_list_cache(repo: str) -> None:
