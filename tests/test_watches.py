@@ -299,3 +299,142 @@ def test_replacement_cli_requires_reason_and_preserves_execution_authority(env, 
     assert cli.main(args) == 1
     assert cli.main(args + ['--reason', 'stable committed entrypoint']) == 0
     assert watches._load()['revisions']['natural-check'][0]['reason'] == 'stable committed entrypoint'
+
+
+def _remote_registry(tmp_path, *, last=None):
+    spec = dict(name='mac-check', command='touch MUST_NOT_EXECUTE', cwd='/remote/repo',
+                where='mac', schedule='hourly permanently', queue='OPS', every=3600,
+                revision='remote-v2')
+    old = dict(spec, schedule='old schedule', revision='remote-v1')
+    return dict(checks={'mac-check': spec}, revisions={'mac-check': [{'spec': old}]},
+                registered_at={'mac-check': 1000}, bindings={'G-1:mac-check': dict(
+                    spec=dict(spec, origin='G-1'), attached_at='1970-01-01T00:16:40Z',
+                    last=last or {}, first_real_pass='')})
+
+
+def test_remote_source_replaces_historical_specs_and_shares_receipts(env, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    remote = _remote_registry(tmp_path, last=dict(status='pending', at=9000, evidence='natural Mac capture'))
+    watches.add_source('macbook', '/remote/watches.json')
+    calls = []
+    def fetch(argv, **kwargs):
+        calls.append(argv)
+        assert argv[-1] == 'cat -- /remote/watches.json'
+        assert kwargs['timeout'] == 5
+        return SimpleNamespace(returncode=0, stdout=json.dumps(remote))
+    monkeypatch.setattr(watches.subprocess, 'run', fetch)
+    monkeypatch.setattr(watches.time, 'time', lambda: 10000)
+    snapshot = dict(remote['revisions']['mac-check'][0]['spec'], origin='G-1')
+    items = [dict(ref='G-2', project='G', status='closed', closed_at='1970-01-01T00:17:00Z',
+                  resolution={'watches': [snapshot]})]
+    rows = watches.owner_rows(items, project='G')
+    assert {r['ref'] for r in rows} == {'G-1', 'G-2'}
+    for row in rows:
+        assert row['schedule'] == 'hourly permanently'
+        assert row['last']['evidence'] == 'natural Mac capture'
+        assert row['source_host'] == 'macbook'
+        assert not row['overdue']
+    assert watches.owner_rows(items) == rows
+    assert len(calls) == 1  # bounded cache across owner reads
+    assert not watches._load()['checks'] and not watches._load()['bindings']
+    monkeypatch.setattr(watches, '_execute', lambda spec: pytest.fail('remote execution'))
+    assert watches.run(items=items) == []
+    # A modified issue body cannot borrow remote execution evidence.
+    items[0]['resolution']['watches'][0]['command'] = 'other command'
+    row = next(r for r in watches.owner_rows(items) if r['ref'] == 'G-2')
+    assert row['last']['status'] == 'not-run'
+
+
+def test_remote_never_run_overdue_and_source_failure_are_visible(env, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    _q, _cli, _a, ov, _name = env
+    remote = _remote_registry(tmp_path)
+    watches.add_source('macbook', '/remote/watches.json')
+    monkeypatch.setattr(watches.time, 'time', lambda: 8200)
+    monkeypatch.setattr(watches.subprocess, 'run', lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=json.dumps(remote)))
+    row = watches.owner_rows([])[0]
+    assert row['overdue'] and 'OVERDUE' in row['warning']
+    monkeypatch.setattr(watches.time, 'time', lambda: 8261)
+    monkeypatch.setattr(watches.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=255))
+    view = ov.build([])
+    assert view['watch_source_warnings']
+    assert 'OVERDUE' in ov.render(view) and 'unavailable' in ov.render(view)
+    assert 'cached metadata may be stale' in view['watched'][0]['warning']
+
+
+def test_failed_source_without_cache_reaches_digest_and_local_overdue(env, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    q, _cli, _a, ov, _name = env
+    check(tmp_path)
+    ref = close(env, tmp_path)
+    item = q.get(ref)
+    registered = watches._load()['registered_at']['natural-check']
+    watches.add_source('macbook', '/remote/watches.json')
+    monkeypatch.setattr(watches.time, 'time', lambda: registered + 120)
+    monkeypatch.setattr(watches.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=255))
+    monkeypatch.setattr(ov.q, 'list_items', lambda **k: [item])
+    from watchtower import related
+    monkeypatch.setattr(related, 'cached_tickets', lambda: ([], {}))
+    view = ov.snapshot()
+    assert any('Watch source macbook unavailable' in w for w in view['warnings'])
+    assert view['watched'][0]['overdue']
+
+
+def test_existing_empty_duplicate_uses_latest_identical_revision(env, tmp_path):
+    q, *_ = env
+    check(tmp_path)
+    ref = close(env, tmp_path)
+    item = q.get(ref)
+    watches.run('natural-check', items=[item])
+    with watches._lock():
+        data = watches._load()
+        original = data['bindings'][ref + ':natural-check']
+        data['bindings']['COPY-2:natural-check'] = dict(original, spec=dict(original['spec'], origin='COPY-2'), last={})
+        watches._save(data)
+    rows = watches.owner_rows([])
+    assert len(rows) == 2
+    assert all(r['last']['status'] == 'pending' for r in rows)
+
+
+@pytest.mark.parametrize('host,path', [('-oProxyCommand=oops', '/x'), ('mac;cmd', '/x'), ('mac', 'relative')])
+def test_source_registration_rejects_unsafe_arguments(env, host, path):
+    with pytest.raises(ValueError):
+        watches.add_source(host, path)
+
+
+def test_forged_local_snapshot_cannot_borrow_receipt_by_revision_alone(env, tmp_path):
+    q, *_ = env
+    check(tmp_path, dict(status='pass', real_data=True, evidence='real local event'))
+    ref = close(env, tmp_path)
+    item = q.get(ref)
+    watches.run('natural-check', items=[item])
+    forged = dict(item, ref='FORGED-1', resolution={'watches': [dict(
+        item['resolution']['watches'][0], command='not the authorized check')]})
+    row = watches.owner_rows([forged])[0]
+    assert row['ref'] == 'FORGED-1' and row['last']['status'] == 'not-run'
+
+
+def test_source_cli_and_nonobject_registry_error(env, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    cli = env[1]
+    assert cli.main(['monitor', '--add-source', 'macbook', '--registry', '/remote/watch.json']) == 0
+    monkeypatch.setattr(watches.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stdout='[]'))
+    warnings = []
+    assert watches.owner_rows([], source_warnings=warnings) == []
+    assert warnings and 'invalid watch registry' in warnings[0]
+
+
+def test_stale_remote_pass_cannot_silently_clear_owner_attention(env, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    remote = _remote_registry(tmp_path, last=dict(status='pass', real_data=True, at=1000, evidence='natural evidence'))
+    remote['bindings']['G-1:mac-check']['first_real_pass'] = '1970-01-01T00:16:40Z'
+    watches.add_source('macbook', '/remote/watches.json')
+    monkeypatch.setattr(watches.time, 'time', lambda: 2000)
+    monkeypatch.setattr(watches.subprocess, 'run', lambda *a, **k: SimpleNamespace(
+        returncode=0, stdout=json.dumps(remote)))
+    assert watches.owner_rows([]) == []
+    monkeypatch.setattr(watches.time, 'time', lambda: 2061)
+    monkeypatch.setattr(watches.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=255))
+    row = watches.owner_rows([])[0]
+    assert row['last']['status'] == 'pass' and 'stale' in row['warning']

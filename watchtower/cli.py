@@ -5370,10 +5370,12 @@ def cmd_monitor(args: argparse.Namespace) -> int:
     (non-zero exit), file a ticket into the queue so a worker drains it. Pair
     with cron/launchd for scheduled sanity checks (e.g. a landing page)."""
     from . import queue as q
-    if getattr(args, "register", "") or getattr(args, "run", "") or getattr(args, "list", False):
+    if getattr(args, "register", "") or getattr(args, "run", "") or getattr(args, "list", False) or getattr(args, "add_source", ""):
         from . import watches
         try:
-            if args.register:
+            if args.add_source:
+                result = watches.add_source(args.add_source, args.registry)
+            elif args.register:
                 result = watches.register(args.register, command=args.cmd, cwd=args.cwd,
                                           where=args.where, schedule=args.schedule,
                                           queue=args.queue, every=args.every,
@@ -8902,6 +8904,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(func=cmd_config)
 
     s = sub.add_parser("monitor")
+    s.add_argument("--add-source", default="", metavar="SSH_HOST", help="read-only remote watch registry for owner views")
+    s.add_argument("--registry", default="", help="absolute remote watches.json path; never executed locally")
     s.add_argument("--register", default="", metavar="NAME")
     s.add_argument("--run", default="", metavar="NAME")
     s.add_argument("--list", action="store_true")

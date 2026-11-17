@@ -51,3 +51,28 @@ WT-90 live repairs:
 
 This infrastructure repair does not assert that pending natural customer
 acceptance passed. Those checks continue permanently and report actual gaps.
+
+## Cross-host owner views (WT-92)
+
+Issue close snapshots are historical evidence, not a cross-host registry. Opt in
+to read another host's current registered revisions and receipts with:
+
+```
+wt monitor --add-source macbook --registry /Users/amirfish/.local/share/watchtower/watches.json
+```
+
+This authorizes only a read of that registry using the existing SSH identity
+(BatchMode, 3-second connection and 5-second total timeout). Owner views cache
+reads for 60 seconds, use exact current or audited prior specs to associate
+inherited closes, and share the latest receipt for an identical revision. Existing
+empty duplicate bindings also inherit the receipt in the projection. Overdue
+never-run detection uses the executing registry's registration or attachment time,
+regardless of which host displays it. Local registrations retain priority.
+
+Remote checks and bindings remain in the source cache, never in the local
+executable registry; viewing the metadata cannot start a check. A failed read
+retains the last snapshot, labels it stale in rows and digest warnings, and keeps
+cached passes visible until the source is readable again. Even an unreadable
+source with no cache produces a warning. There is no recursive source discovery.
+To remove a source, delete its entry from `watches.json`'s `sources` map under
+the registry lock (or use `watches._lock()`, `_load()` and `_save()`).

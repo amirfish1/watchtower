@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import shlex
 import subprocess
 import time
 
@@ -180,23 +181,100 @@ def sync(items):
         return data
 
 
-def owner_rows(items, project=""):
-    """Read-only projection, including overdue, failed and inherited checks."""
-    data = _load()
-    candidates = dict(data["bindings"])
+def add_source(host, registry):
+    """Authorize metadata reads only. Remote specs never enter ``checks``."""
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.@-]*", host):
+        raise ValueError("source host must be an SSH host or alias")
+    if not registry.startswith("/") or "\n" in registry:
+        raise ValueError("source registry must be an absolute path")
+    with _lock():
+        data = _load()
+        data.setdefault("sources", {})[host] = dict(registry=registry)
+        _save(data)
+    return dict(host=host, registry=registry)
+
+
+def _source_data(host, source):
+    """Read an explicitly authorized registry with a bounded, cached SSH read."""
+    now = time.time()
+    cache = source.get("cache") or {}
+    if now - source.get("attempted_at", 0) >= 60:
+        try:
+            proc = subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3", host,
+                 "cat -- " + shlex.quote(source["registry"])],
+                capture_output=True, text=True, timeout=5)
+            if proc.returncode:
+                raise ValueError(f"SSH registry read exited {proc.returncode}")
+            remote = json.loads(proc.stdout)
+            if not isinstance(remote, dict) or not all(
+                    isinstance(remote.get(k), dict) for k in ("checks", "bindings")):
+                raise ValueError("invalid watch registry")
+            # No source chaining; retain only metadata used in the projection.
+            cache = {k: remote.get(k, {}) for k in
+                     ("checks", "bindings", "revisions", "registered_at")}
+            source.update(cache=cache, fetched_at=now, error="")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            source["error"] = str(exc)
+        source["attempted_at"] = now
+        with _lock():
+            current = _load()
+            # A concurrent source edit must not be overwritten.
+            target = current.get("sources", {}).get(host)
+            if target and target["registry"] == source["registry"]:
+                target.update(source)
+                _save(current)
+    warning = ""
+    if source.get("error") or not source.get("fetched_at"):
+        warning = f"Watch source {host} unavailable; cached metadata may be stale: {source.get('error', 'not fetched')}"
+    return cache, warning
+
+
+def _owner_candidates(data, items, *, remote=False):
+    candidates = {k: dict(b) for k, b in data["bindings"].items()}
     for item in items:
         if item.get("status") != "closed":
             continue
         resolution = item.get("resolution")
         for snapshot in (resolution.get("watches") or []) if isinstance(resolution, dict) else []:
-            spec = dict(_trusted_spec(data, snapshot) or snapshot, origin=item["ref"])
+            trusted = _trusted_spec(data, snapshot)
+            if remote and not trusted:
+                continue
+            spec = dict(trusted or snapshot, origin=item["ref"])
             key = item["ref"] + ":" + spec["name"]
             if key not in candidates:
-                peers = [b for b in data["bindings"].values()
-                         if b["spec"].get("revision") == spec.get("revision")]
-                peer = max(peers, key=lambda b: b.get("last", {}).get("at", 0), default={})
-                candidates[key] = dict(spec=spec, attached_at=item.get("closed_at"),
-                                       last=peer.get("last", {}), first_real_pass=peer.get("first_real_pass", ""))
+                candidates[key] = dict(spec=spec, attached_at=item.get("closed_at"), last={})
+    # Old existing duplicate bindings can predate receipt fan-out. An identical
+    # registered revision has one execution clock even before the next sync.
+    for bound in candidates.values():
+        revision = bound["spec"].get("revision")
+        peers = [b for b in data["bindings"].values()
+                 if revision and b["spec"].get("revision") == revision
+                 and {k: v for k, v in b["spec"].items() if k != "origin"}
+                 == {k: v for k, v in bound["spec"].items() if k != "origin"}]
+        peer = max(peers, key=lambda b: b.get("last", {}).get("at", 0), default={})
+        if peer.get("last", {}).get("at", 0) > bound.get("last", {}).get("at", 0):
+            bound.update(last=peer["last"], first_real_pass=peer.get("first_real_pass", ""))
+    return candidates
+
+
+def owner_rows(items, project="", *, source_warnings=None):
+    """Read-only watch projection; remote metadata cannot authorize execution."""
+    data = _load()
+    candidates = _owner_candidates(data, items)
+    for host, source in data.get("sources", {}).items():
+        remote, warning = _source_data(host, source)
+        if warning and source_warnings is not None:
+            source_warnings.append(warning)
+        if not remote:
+            continue
+        for key, bound in _owner_candidates(remote, items, remote=True).items():
+            # A local registration owns its own clock; remote sources only
+            # replace historical issue snapshots for remotely registered checks.
+            if bound["spec"]["name"] in data["checks"]:
+                continue
+            candidates[key] = dict(bound, source_host=host, source_warning=warning,
+                                   registered_at=remote.get("registered_at", {}).get(bound["spec"]["name"]))
     rows = []
     for bound in candidates.values():
         spec = bound["spec"]
@@ -205,9 +283,9 @@ def owner_rows(items, project=""):
             if _project_from_ident(spec["origin"]) != project:
                 continue
         last = bound.get("last") or {"status": "not-run"}
-        if bound.get("first_real_pass") and last["status"] not in ("error", "fail"):
+        if bound.get("first_real_pass") and last["status"] not in ("error", "fail") and not bound.get("source_warning"):
             continue
-        registered = data.get("registered_at", {}).get(spec["name"])
+        registered = bound.get("registered_at") or data.get("registered_at", {}).get(spec["name"])
         if not registered:
             try:
                 registered = dt.datetime.fromisoformat(bound.get("attached_at", "").replace("Z", "+00:00")).timestamp()
@@ -217,7 +295,10 @@ def owner_rows(items, project=""):
                        and time.time() - registered >= 2 * spec["every"])
         rows.append(dict(ref=spec["origin"], check=spec["name"], command=spec["command"],
                          where=spec["where"], schedule=spec["schedule"], last=last,
-                         overdue=overdue, warning="OVERDUE: never ran after two intervals" if overdue else ""))
+                         overdue=overdue, source_host=bound.get("source_host", ""),
+                         warning="; ".join(filter(None, [
+                             "OVERDUE: never ran after two intervals" if overdue else "",
+                             bound.get("source_warning", "")]))))
     return rows
 
 

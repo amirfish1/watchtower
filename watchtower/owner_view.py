@@ -218,10 +218,12 @@ def build(items: List[Dict[str, Any]], project: Optional[str] = None,
     unresolved = [dep_line(r) for r in shown
                   if r.get("dependency", {}).get("state") in ("not_found_here", "other_host", "no_ref")]
     from . import releases, watches
-    watched = watches.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want], project=want)
+    source_warnings = []
+    watched = watches.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want], project=want, source_warnings=source_warnings)
     release_rows = releases.owner_rows([i for i in items if not want or q._norm_project(i.get("project")) == want], now=now)
     return {
         "watched": watched,
+        "watch_source_warnings": source_warnings,
         "awaiting_release": release_rows,
         "release_attention": [r for r in release_rows if r["attention"]],
         "generated_at": now.isoformat(timespec="seconds"),
@@ -286,6 +288,7 @@ def snapshot(project: Optional[str] = None) -> Dict[str, Any]:
         warnings.append(f"Confirmed repeat-job history could not be read: {exc}")
     # The decision desk's existing morning digest renders owner-view warnings.
     # One connected confirmed job produces one line, never one line per filing.
+    warnings.extend(view.get("watch_source_warnings") or [])
     view["incomplete"] = bool(warnings)
     warnings.extend("Fragile job: " + job["title"][:50] + "; " +
                     ", ".join(job["refs"]) + ". Fix the design, not the latest error."
@@ -322,7 +325,7 @@ def render(view: Dict[str, Any]) -> str:
     lines.append(f"Awaiting release: {len(release_rows)} (untimed release gate)")
     for row in view.get("release_attention") or []:
         lines.append(f"  CHECK RELEASE: {row['ref']} {row['age_days']} days; {row['target']}; branch {row['branch_state']}")
-    for w in view.get("warnings") or []:
+    for w in dict.fromkeys((view.get("warnings") or []) + (view.get("watch_source_warnings") or [])):
         lines.append(f"WARNING: {w}")
     if view["recheck_due"]:
         lines.append("")
