@@ -127,6 +127,41 @@ def test_dead_builder_with_fresh_transcript_is_reopened_next_tick(wt):
     assert ev["orphan"] is True and ev["displaced_session_id"] == S
 
 
+@pytest.mark.parametrize("resumed_write", [False, True])
+def test_codex_reject_resume_requires_new_activity_and_expires(wt, monkeypatch, resumed_write):
+    """OPS-782: the original exec PID cannot own an app-server continuation."""
+    home = wt.tmp / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    monkeypatch.setattr(wt.workers, "_worker_codex_roots",
+                        lambda worker, config: [home / "sessions"])
+    wt.workers.record_worker(_dead_pid(), "Q", "codex", "wt-x", str(wt.tmp),
+                             str(wt.tmp / "codex.log"), session_id=S)
+    item = wt.q.enqueue(project="Q", note="work", source="test")
+    wt.q.claim_by_ref(item["ref"], "wt-x", session_uuid=S)
+    wt.q.update_status(item["ref"], "closed", "wt-x", hold_review="review")
+    wt.q.reject_with(item["ref"], "verifier failed")
+    ref = item["ref"]
+    wt.q.set_resume_state(ref, S, "running", transport="codex-app-server")
+    rollout = home / "sessions" / "2026" / "11" / "18" / f"rollout-{S}.jsonl"
+    rollout.parent.mkdir(parents=True)
+    rollout.write_text('{"type":"response_item"}\n')
+    resume_at = wt.q.get(ref)["resume"]["at"]
+    from watchtower.queue import _iso_ts
+    started = _iso_ts(resume_at)
+    written = started + 60 if resumed_write else started
+    os.utime(rollout, (written, written))
+    wt.clock(90)
+    reopened = _sweep(wt)
+    if resumed_write:
+        assert reopened == []
+        assert wt.q.get(ref)["claimed_by"] == "wt-x"
+        assert wt.q.get(ref)["claimed_session_id"] == S
+        wt.clock(700)
+        assert [i["ref"] for i in _sweep(wt)] == [ref]
+    else:
+        assert [i["ref"] for i in reopened] == [ref]
+
+
 def test_delegate_never_starts_then_busy_window(wt):
     _builder(wt)
     ref = _rejected(wt)

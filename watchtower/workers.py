@@ -6032,6 +6032,14 @@ def _builder_held(it: Dict[str, Any], wid: str, live_ids: set,
     state, transport, age = _effective_resume(resume, now)
     if state == "queued":
         return True                                   # (d)
+    if state == "running" and (it.get("claim_proc") or {}).get("engine") == "codex":
+        # App-server continuations outlive the original exec PID. Require a
+        # write AFTER delivery so the rejected turn's final write cannot
+        # masquerade as a resumed worker; quiet continuations still recover.
+        from .liveness import RECENT_SESSION_S
+        written = _codex_rollout_mtime({"engine": "codex", "session_id": sid})
+        if written > now - age and 0 <= now - written < RECENT_SESSION_S:
+            return True
     if state in ("pending", "running") and transport in ("delegate", ""):
         if age < _resume_start_s():
             return True                               # (e) start window
