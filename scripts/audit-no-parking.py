@@ -28,7 +28,9 @@ def audit():
                 validate_wait(item, release)
             except ValueError as exc:
                 violations.append(dict(ref=ref, reason=str(exc)))
+        # Backstop escalations also use in_progress, without claiming a worker.
         if (item.get('status') == 'in_progress'
+                and (item.get('claimed_by') or item.get('claimed_session_id'))
                 and time.time()-max(q._iso_ts(item.get('updated_at')),q._iso_ts(item.get('claimed_at'))) > liveness.stall_s()):
             if liveness._foreign_host(item):
                 age = liveness.claim_heartbeat_age(item, ctx.now)

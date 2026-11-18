@@ -340,6 +340,40 @@ def test_permanent_audit_cannot_pass_without_current_claim_liveness(wt_env,monke
     assert namespace['audit']()['status']==expected
 
 
+@pytest.mark.parametrize('question,expected', [
+    ('Choose whether to release the unstaffed work?', 'pass'),
+    ('Await coordinator completion', 'fail'),
+])
+def test_audit_unclaimed_escalation_checks_person_gate_not_worker(wt_env, monkeypatch, question, expected):
+    import runpy
+    from pathlib import Path
+    from watchtower import queue as q, liveness as lv, watches
+    item = dict(ref='AUDIT-1', project='AUDIT', status='open',
+                updated_at='2000-01-01T00:00:00Z')
+    q._recover_escalate_unlocked(item, '2000-01-01T00:00:00Z', question)
+    assert item['status'] == 'in_progress' and not item.get('claimed_by')
+    monkeypatch.setattr(watches, 'inventory', lambda: ([item], []))
+    def no_worker_probe(*args):
+        raise AssertionError('An unclaimed escalation has no worker to probe')
+    monkeypatch.setattr(lv, 'claim_owner', no_worker_probe)
+    audit = runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/audit-no-parking.py'))['audit']
+    assert audit()['status'] == expected
+
+
+def test_audit_stale_session_only_claim_still_fails(wt_env, monkeypatch):
+    import runpy
+    from pathlib import Path
+    from watchtower import liveness as lv, watches
+    item = dict(ref='AUDIT-1', project='AUDIT', status='in_progress',
+                claimed_session_id='legacy-session', updated_at='2000-01-01T00:00:00Z')
+    monkeypatch.setattr(watches, 'inventory', lambda: ([item], []))
+    monkeypatch.setattr(lv, 'claim_owner', lambda i, ctx: lv.Verdict('unproven', '', 'missing process', None))
+    audit = runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/audit-no-parking.py'))['audit']
+    result = audit()
+    assert result['status'] == 'fail'
+    assert result['evidence']['violations'] == [dict(ref=item['ref'], reason='stale local claim: missing process')]
+
+
 @pytest.mark.parametrize('protection',['expired','alive','recent','foreign','new-question','answer'])
 def test_expired_github_person_claim_parks_without_answering_or_losing_gate(env,monkeypatch,protection):
     from watchtower import liveness as lv
