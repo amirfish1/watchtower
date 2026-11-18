@@ -2326,6 +2326,29 @@ def items_by_refs(refs: List[str]) -> Dict[str, Dict[str, Any]]:
     return out
 
 
+def dispatch_snapshot(project: str, ref: str = "") -> List[Dict[str, Any]]:
+    """Read the dispatched ticket and busy claims, without loading the archive.
+
+    Advisory notification input only: staffing and claiming must still perform
+    their own fresh reads under their existing locks. Like items_by_refs, the
+    indexed path returns independent persisted payloads without renumbering a
+    subset of the store.
+    """
+    proj = _norm_project(project)
+    ref = canonical_ref(ref) if ref else ""
+    db = _db_path()
+    if _github_backend_for_project(proj) is not None or not db.exists():
+        return [it for it in list_items(project=proj)
+                if it.get("status") == "in_progress" or (ref and _matches(it, ref))]
+    conn = _connect(db)
+    try:
+        return [json.loads(row[0]) for row in conn.execute(
+            "SELECT item_json FROM items WHERE project = ? "
+            "AND (status = 'in_progress' OR ref = ?) ORDER BY number", (proj, ref))]
+    finally:
+        conn.close()
+
+
 def list_items(
     status: Optional[str] = None,
     lane: Optional[str] = None,

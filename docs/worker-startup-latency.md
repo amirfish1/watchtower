@@ -206,3 +206,42 @@ initialization in 0.936s, with zero threads, turns or model calls; evidence is
 health, not the cause of the historical stall or universal sub-30s startup.
 Future recurrence remains subject to permanent natural startup measurement;
 the original watch and failed historical evidence remain intact.
+
+## WT-99: archive reads on the immediate dispatch path
+
+The November 18 failure was CCC-598: enqueue 20:02:58 UTC, process creation
+20:03:08.053, thread start 20:03:10.961, claim command start 20:03:25.988,
+durable CLAIM 20:03:29. Total enqueue-to-claim was **31s**: 10s before the
+process and 21s afterward. Its worker log shows normal initialization and
+briefing (including repeated skill/runbook reads), not WT-97's socket failure.
+Claim command output completed at 20:03:38.759; that later return is distinct
+from the durable claim measured by the watch.
+
+Dispatch's ticket_read took 2.210s and busy_read another 1.483s. Both loaded
+the entire local archive to inspect a single ticket and busy claims, before
+staffing did its own fresh capacity read. Merely sharing that snapshot saved
+only 0.159s in a paired cold-memo benchmark (1.547s -> 1.388s), insufficient
+to account for the reported threshold breach. The implemented read instead
+uses the existing project/status/ref SQLite indexes to deserialize only the
+target ticket and in-progress tickets in its queue, once per notification.
+Staffing and claims retain their own fresh reads and locks. Legacy JSON
+falls back to the existing listing; GitHub retains its cached listing and
+never adds a per-issue network fetch.
+
+Five alternating pairs against the same real-store SQLite backup, clearing
+the memo before every dispatch, measured median notification-read overhead
+**1.604s -> 0.0045s**. Notification, staffing and audit delivery were stubbed:
+no workers, models or synthetic tickets were launched. This measures the
+archive-read repair, not total live model startup. Script and raw results:
+`~/.watchtower/evidence/WT-99/dispatch_bench.py` and
+`paired-benchmark-indexed.json`. Tests cover actual notification exclusions,
+a claim racing the snapshot before staffing, plan gates, archive payloads
+that must never be decoded, and GitHub/legacy fallbacks.
+
+Options considered before implementation: reuse the full snapshot (measured
+above), indexed hot reads (chosen after the first measurement), a broad claim
+transaction rewrite (larger regression surface), or prewarming/changing the
+startup product experience (a separate fleet-policy choice). Historical
+CCC-598 evidence and the 30-second limit remain intact. Future natural cold
+startup is the remaining end-to-end evidence and stays under a permanent
+check; these measurements do not certify universal sub-30-second startup.

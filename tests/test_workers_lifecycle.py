@@ -417,13 +417,13 @@ def test_dispatch_timings_attribute_a_slow_ticket_read(wt, monkeypatch):
         wt.workers, "spawn_workers",
         lambda queue, n=1, **kwargs: [{"worker_id": "q-timed", "queue": queue}],
     )
-    real_list = wt.q.list_items
+    real_list = wt.q.dispatch_snapshot
 
     def slow_read(*args, **kwargs):
         time.sleep(0.02)
         return real_list(*args, **kwargs)
 
-    monkeypatch.setattr(wt.q, "list_items", slow_read)
+    monkeypatch.setattr(wt.q, "dispatch_snapshot", slow_read)
     assert wt.workers.dispatch_after_enqueue("Q", item["ref"]) == "spawned worker q-timed"
     timings = [json.loads(line.split("STARTUP_TIMING", 1)[1])
                for line in (wt.tmp / "activity.log").read_text().splitlines()
@@ -446,6 +446,48 @@ def test_startup_timing_preserves_failure_when_logging_fails(wt, monkeypatch):
             raise ValueError("original failure")
     with wt.workers._startup_timing("Q", "staffing_lock"):
         pass
+
+
+@pytest.mark.parametrize("with_ref", [True, False])
+def test_dispatch_loads_notification_snapshot_once(wt, monkeypatch, with_ref):
+    """WT-99: ticket inspection and busy exclusions pay for one store read."""
+    wt.config.set_auto_drain("Q", True)
+    busy = _live_worker(wt, "Q")
+    _live_worker(wt, "Q")
+    held = wt.q.enqueue(project="Q", note="in flight")
+    wt.q.claim_by_ref(held["ref"], busy["worker_id"])
+    item = wt.q.enqueue(project="Q", note="fresh")
+    real_list = wt.q.dispatch_snapshot
+    reads = []
+
+    def counted_list(*args, **kwargs):
+        reads.append(args[0])
+        return real_list(*args, **kwargs)
+
+    monkeypatch.setattr(wt.q, "dispatch_snapshot", counted_list)
+    assert wt.workers.dispatch_after_enqueue(
+        "Q", item["ref"] if with_ref else "",
+    ) == "nudged 1 live worker(s) — immediate pickup"
+    assert reads == ["Q"]
+    assert [_fifo_pending(fd) for fd in wt._readers] == [False, True]
+
+
+def test_dispatch_rechecks_capacity_after_notification_snapshot(wt, monkeypatch):
+    """A racing claim must stop staffing despite dispatch's open snapshot."""
+    wt.config.set_auto_drain("Q", True)
+    holder = _live_worker(wt, "Q")
+    item = wt.q.enqueue(project="Q", note="claimed during notification")
+
+    def racing_notify(*args, **kwargs):
+        wt.q.claim_by_ref(item["ref"], holder["worker_id"])
+        return 0
+
+    monkeypatch.setattr(wt.workers, "notify_workers", racing_notify)
+    monkeypatch.setattr(wt.workers, "spawn_workers",
+                        lambda *a, **k: pytest.fail("spawned for stale open snapshot"))
+    reason = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+    assert "spawned" not in reason
+    assert wt.q.get(item["ref"])["claimed_by"] == holder["worker_id"]
 
 
 @pytest.mark.parametrize("drain", [False, True])

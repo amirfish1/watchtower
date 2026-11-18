@@ -6296,17 +6296,20 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             return reason
         ref = ref or ""
         run_requested = False
-        # One read of this ticket, from the cached list rather than a
-        # per-issue `gh issue view`: on a GitHub-backed queue that view is an
-        # uncapped live fetch per dispatch (docs/github-read-caps.md), and the
+        # One snapshot of this ticket and busy claims. Local queues use the
+        # project/status/ref indexes instead of loading the ticket archive.
+        # GitHub queues use their cached list rather than a per-issue
+        # `gh issue view` (docs/github-read-caps.md), and the
         # enqueue/mark_runnable that precedes every call here already
         # invalidated the list cache in this same process, so the list is
         # read-your-own-writes fresh without costing an extra round trip.
         item = None
+        dispatch_items = None
         if ref:
             with _startup_timing(queue, "ticket_read", ref):
+                dispatch_items = _q.dispatch_snapshot(queue, ref) or []
                 item = next(
-                    (it for it in (_q.list_items(project=queue) or [])
+                    (it for it in dispatch_items
                      if str(it.get("ref") or "") == ref),
                     None,
                 )
@@ -6377,9 +6380,14 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
             # when it finishes (WT-15). Idle workers get first shot; if none
             # is idle the reconcile below decides whether to staff up.
             with _startup_timing(queue, "busy_read", ref):
+                # Notification exclusions are advisory. Reuse the ticket
+                # snapshot rather than loading the whole store twice;
+                # reconcile still reads fresh capacity under its queue lock.
+                if dispatch_items is None:
+                    dispatch_items = _q.dispatch_snapshot(queue) or []
                 exclude |= {
                     str(it.get("claimed_by") or "")
-                    for it in (_q.list_items(project=queue) or [])
+                    for it in dispatch_items
                     if it.get("status") == "in_progress" and it.get("claimed_by")
                 }
         with _startup_timing(queue, "notify_workers", ref):
