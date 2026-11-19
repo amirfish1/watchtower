@@ -34,7 +34,7 @@ def _config_key(backend):
     return json.dumps([parts, github_pipeline.signature()], sort_keys=True)
 
 
-def _publish(backend, data, cache_path):
+def _publish(backend, data, cache_path, *, metadata_only=False):
     from . import queue as q
     db = _path(backend, cache_path)
     db.parent.mkdir(parents=True, exist_ok=True)
@@ -44,13 +44,13 @@ def _publish(backend, data, cache_path):
         conn.execute("CREATE TABLE IF NOT EXISTS raw_issues (number INTEGER PRIMARY KEY, blob TEXT NOT NULL)")
         conn.commit()
         conn.execute("BEGIN IMMEDIATE")
-        old = dict(conn.execute("SELECT number, blob FROM raw_issues"))
+        old = {} if metadata_only else dict(conn.execute("SELECT number, blob FROM raw_issues"))
         changed_config = q._meta_get(conn, "report_config") != _config_key(backend)
         # Lists are fetched independently. Resolve overlaps before comparing
         # against old rows, or an unchanged open row could leave a stale closed
         # row indexed after processing the closed snapshot first.
         issues = {}
-        for state in ("closed", "open"):
+        for state in (() if metadata_only else ("closed", "open")):
             entry = data.get(f"{backend.repo}:{state}") or {}
             for raw in entry.get("data") or []:
                 issues[int(raw["number"])] = raw
@@ -86,7 +86,8 @@ def _publish(backend, data, cache_path):
     return db
 
 
-def publish_existing(data, cache_path, *, changed_repos=None, previous_stamp=None):
+def publish_existing(data, cache_path, *, changed_repos=None, previous_stamp=None,
+                     changed_data_repos=None):
     """Called by the snapshot writer while holding its lock; no network I/O.
 
     Only opted-in projections (created by a reporting read) pay this cost.
@@ -98,22 +99,28 @@ def publish_existing(data, cache_path, *, changed_repos=None, previous_stamp=Non
     from . import queue as q
     for db in _directory(cache_path).glob("*.db"):
         conn = q._connect(db)
+        metadata_only = False
         try:
             project = q._meta_get(conn, "report_queue")
             repo = q._meta_get(conn, "report_repo")
             backend = q._github_backend_for_project(project)
             if backend is None or backend.repo != repo:
                 continue
-            if (changed_repos is not None and repo not in changed_repos
-                    and previous_stamp is not None
+            current = (previous_stamp is not None
                     and q._meta_get(conn, "cache_stamp") == previous_stamp
-                    and q._meta_get(conn, "report_config") == _config_key(backend)):
+                    and q._meta_get(conn, "report_config") == _config_key(backend))
+            if current and changed_repos is not None and repo not in changed_repos:
                 conn.execute(q._META_UPSERT, ("cache_stamp", _stamp(cache_path)))
                 conn.commit()
                 continue
+            # A revalidation/invalidation changed coverage, but no issue body.
+            # Keep source metadata current without reading all raw blobs in
+            # each queue projection. A missed generation or config edit must
+            # still take the full repair path.
+            metadata_only = current and changed_data_repos is not None and repo not in changed_data_repos
         finally:
             conn.close()
-        _publish(backend, data, cache_path)
+        _publish(backend, data, cache_path, metadata_only=metadata_only)
 
 
 def _coverage(conn, backend, spec):

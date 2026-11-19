@@ -359,6 +359,8 @@ def _rewrite_persisted_list_cache(mutate, *, changed_repos=None) -> None:
         from . import reporting_cache
         previous_stamp = reporting_cache._stamp(path) if path.exists() else None
         data = _read_persisted_list_cache()
+        previous_rows = {key: entry.get("data") for key, entry in data.items()
+                         if isinstance(entry, dict)}
         if not mutate(data):
             return
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -369,15 +371,38 @@ def _rewrite_persisted_list_cache(mutate, *, changed_repos=None) -> None:
         # Reporting reads stay local and bounded; the existing writer maintains
         # projections only for queues that have requested them.
         try:
-            reporting_cache.publish_existing(data, path, changed_repos=changed_repos,
-                                             previous_stamp=previous_stamp)
+            changed_data_repos = {
+                key.rsplit(":", 1)[0] for key in set(previous_rows) | set(data)
+                if previous_rows.get(key) != (data.get(key) or {}).get("data")
+            }
+            reporting_cache.publish_existing(
+                data, path, changed_repos=changed_repos,
+                changed_data_repos=changed_data_repos, previous_stamp=previous_stamp)
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as exc:
             _log_quota("report_index_error", error=str(exc))
 
 
 
-def _write_persisted_list_entry(key: str, entry: Dict[str, Any]) -> None:
+def _write_persisted_list_entry(key: str, entry: Dict[str, Any], *, revalidated=False) -> None:
     def mutate(data: Dict[str, Any]) -> bool:
+        old = data.get(key)
+        # A 304 only validates the list we probed. A concurrent fetch or
+        # invalidation must not be overwritten by that older list.
+        if revalidated and isinstance(old, dict) and (
+                old.get("stale") or old.get("data") != entry.get("data")
+                or old.get("fetched_at") != entry.get("fetched_at")):
+            return False
+        if old == entry:
+            return False
+        # Quiet revalidations only need a bounded heartbeat, not a rewrite of
+        # every repo's issue bodies on every poll. Mutations, changed payloads,
+        # validators and real fetch clocks still publish immediately.
+        if isinstance(old, dict) and not entry.get("stale"):
+            interval = min(60.0, _persisted_list_ttl_s() / 2)
+            if (0 <= float(entry.get("at") or 0) - float(old.get("at") or 0) < interval
+                    and {k: v for k, v in old.items() if k != "at"}
+                    == {k: v for k, v in entry.items() if k != "at"}):
+                return False
         data[key] = entry
         return True
 
@@ -2884,6 +2909,17 @@ class GitHubIssuesBackend:
             if persisted is not None and persisted.get("data") is not None:
                 persisted_age = now - float(persisted.get("at") or 0)
                 persisted_stale = bool(persisted.get("stale"))
+                # Even an expired snapshot supplies the validator and fetch
+                # clock. A cold reader must revalidate it, not start another
+                # unconditional rich list just because the TTL elapsed.
+                if cached is None:
+                    cached = {
+                        "at": persisted["at"], "data": persisted["data"], "error": None,
+                        "etag": str(persisted.get("etag") or ""),
+                        "fetched_at": float(persisted.get("fetched_at") or 0),
+                        "stale": persisted_stale,
+                    }
+                    _LIST_CACHE[key] = cached
                 if (
                     persisted_age < _persisted_list_ttl_s()
                     or backoff_active
@@ -3024,6 +3060,11 @@ class GitHubIssuesBackend:
             )
             if unchanged:
                 cached["at"] = now  # unchanged is as good as re-fetched
+                if not poller:
+                    _write_persisted_list_entry(key, {
+                        "at": now, "data": cached["data"], "etag": str(cached.get("etag") or ""),
+                        "fetched_at": float(cached.get("fetched_at") or 0), "stale": False,
+                    }, revalidated=True)
                 return cached["data"]
             # Heavy-fetch rate cap. On a busy repo the probe returns 200 on
             # EVERY sweep (active workers touch issues every few seconds),
@@ -3146,12 +3187,11 @@ class GitHubIssuesBackend:
             "fetched_at": now, "stale": False, "stale_local": False,
         }
         _LIST_CACHE[key] = entry
-        if cached is not None and cached.get("stale"):
-            # This read was the one the write forced, and it just produced the
-            # authoritative post-write list. Publish it, so the shared entry
-            # goes from stale to current here rather than staying stale until
-            # the poller notices and spends a second `gh issue list` of its own
-            # -- the double fetch every claim/close used to cost the fleet.
+        if not poller:
+            # Cold and expired reader fallbacks must publish too: otherwise
+            # every short-lived reader repeats the same expensive fetch.
+            # This also clears write invalidation immediately, rather than
+            # leaving the poller to fetch the same post-write list again.
             _write_persisted_list_entry(
                 key,
                 {

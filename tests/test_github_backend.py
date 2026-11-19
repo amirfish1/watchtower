@@ -402,6 +402,11 @@ def _fake_opt(args, name):
 
 @pytest.fixture(autouse=True)
 def restore_watchtower_modules(tmp_path, monkeypatch):
+    # Successful fallback lists are shared now, including reads in tests
+    # that only instrument a backend directly. Never publish those fixtures
+    # into the host daemon's snapshot or poll markers.
+    monkeypatch.setenv("WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "autouse-gh-list.json"))
+    monkeypatch.setenv("WATCHTOWER_GH_CLAIM_LOCKS_DIR", str(tmp_path / "autouse-gh-locks"))
     # Isolate the GitHub connectivity state file for every test in this
     # module, including the many below that call `_list_issues` directly
     # without going through `_reload_isolated`. Without this, a synthetic
@@ -1323,6 +1328,7 @@ def test_poll_owner_answers_reads_again_once_the_issue_moves(tmp_path, monkeypat
     # comment once that snapshot refreshes -- within `_LIST_FETCH_MIN_INTERVAL_S`
     # in production, immediately here.
     github_backend._LIST_CACHE.clear()
+    github_backend.refresh_persisted_list_cache("test-owner/test-repo")
     github_backend.poll_owner_answers_once()
 
     assert q.get("GHI-1")["needs_input"] is False
@@ -1991,6 +1997,7 @@ def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
     import watchtower.github_backend as github_backend
 
     monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.05)
+    monkeypatch.setattr(github_backend, "_persisted_list_ttl_s", lambda: 0.0)
     monkeypatch.setattr(github_backend, "_LIST_ERROR_BACKOFF", 0.2)
     # Error-backoff behaviour, not fetch cadence: let every expired read attempt gh.
     monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 0.0)
@@ -2342,6 +2349,66 @@ def test_refresh_persisted_list_cache_writes_file_from_live_fetch(
     assert backend._list_issues() == [open_issue]
 
 
+@pytest.mark.parametrize("state", ["open", "closed"])
+def test_cold_fallback_publishes_for_the_next_process(tmp_path, monkeypatch, state):
+    from watchtower import github_backend as gh
+    monkeypatch.setenv("WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh.json"))
+    gh._LIST_CACHE.clear()
+    backend = gh.GitHubIssuesBackend("T", repo="acme/cold-fallback")
+    calls = []
+    monkeypatch.setattr(backend, "_run", lambda args: (calls.append(args), '[{"number":1}]')[1])
+    monkeypatch.setattr(backend, "_probe_list_change", lambda *a: (False, '"v1"'))
+    assert backend._list_issues(state) == [{"number": 1}]
+    gh._LIST_CACHE.clear()  # another short-lived CLI process
+    assert backend._list_issues(state) == [{"number": 1}]
+    assert len(calls) == 1
+
+
+def test_reader_revalidation_renews_the_shared_snapshot(tmp_path, monkeypatch):
+    from watchtower import github_backend as gh
+    monkeypatch.setenv("WATCHTOWER_GH_LIST_CACHE_FILE", str(tmp_path / "gh.json"))
+    gh._LIST_CACHE.clear()
+    backend = gh.GitHubIssuesBackend("T", repo="acme/expired-fallback")
+    old = time.time() - gh._persisted_list_ttl_s() - 1
+    key = f"{backend.repo}:closed"
+    gh._write_persisted_list_entry(key, dict(at=old, fetched_at=old, etag='"v1"',
+                                             data=[{"number": 1}], stale=False))
+    probes = []
+    monkeypatch.setattr(backend, "_probe_list_change", lambda *a: (probes.append(a), (True, '"v1"'))[1])
+    assert backend._list_issues("closed") == [{"number": 1}]
+    gh._LIST_CACHE.clear()
+    assert backend._list_issues("closed") == [{"number": 1}]
+    assert len(probes) == 1
+    assert time.time() - gh._read_persisted_list_cache()[key]["at"] < 5
+
+
+@pytest.mark.parametrize("concurrent", ["fetch", "invalidate"])
+def test_reader_304_does_not_overwrite_a_concurrent_change(tmp_path, monkeypatch, concurrent):
+    from watchtower import github_backend as gh
+    gh._LIST_CACHE.clear()
+    backend = gh.GitHubIssuesBackend("T", repo="acme/revalidate-race")
+    key = f"{backend.repo}:closed"
+    old = time.time() - gh._persisted_list_ttl_s() - 1
+    entry = dict(at=old, fetched_at=old, etag='"v1"', data=[{"number": 1}], stale=False)
+    gh._write_persisted_list_entry(key, entry)
+
+    def probe(*args):
+        if concurrent == "fetch":
+            gh._write_persisted_list_entry(key, dict(entry, at=time.time(),
+                                                     fetched_at=time.time(), data=[{"number": 2}]))
+        else:
+            gh._invalidate_list_cache(backend.repo)
+        return True, '"v1"'
+
+    monkeypatch.setattr(backend, "_probe_list_change", probe)
+    backend._list_issues("closed")
+    shared = gh._read_persisted_list_cache()[key]
+    if concurrent == "fetch":
+        assert shared["data"] == [{"number": 2}]
+    else:
+        assert shared["stale"]
+
+
 def test_poller_refetches_after_another_process_invalidates_snapshot(
     tmp_path, monkeypatch
 ):
@@ -2558,6 +2625,9 @@ def _etag_backend(monkeypatch, repo="acme/etag-test"):
     import watchtower.github_backend as github_backend
 
     monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.0)
+    # Probe unit tests must get past the shared-snapshot TTL too; successful
+    # reader fallbacks now publish there for other processes.
+    monkeypatch.setattr(github_backend, "_persisted_list_ttl_s", lambda: 0.0)
     # These tests exercise probe semantics (304 vs 200 vs unusable), where
     # every revalidating read must be allowed to fetch. The heavy-fetch rate
     # cap is neutralised here and covered by its own test.
@@ -2643,6 +2713,7 @@ def test_changed_probe_fetch_is_rate_capped_on_a_busy_repo(monkeypatch):
     import watchtower.github_backend as github_backend
 
     monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.0)
+    monkeypatch.setattr(github_backend, "_persisted_list_ttl_s", lambda: 0.0)
     monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 60.0)
     github_backend._LIST_CACHE.clear()
     backend = github_backend.GitHubIssuesBackend("T", repo="acme/cap-test")
@@ -2858,6 +2929,7 @@ def test_a_new_issue_is_visible_to_the_next_revalidating_read(tmp_path, monkeypa
     # the fetch-rate cap (covered separately) would legitimately defer it.
     # Set after _reload_isolated, which reloads this module and would wipe it.
     monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 0.0)
+    monkeypatch.setattr(github_backend, "_persisted_list_ttl_s", lambda: 0.0)
     config.set_backend("GHI", "github")
     config.set_github_repo("GHI", "test-owner/test-repo")
     _write_fake_issues(state, [_fake_issue(1, "first")])
@@ -3288,6 +3360,7 @@ def test_gh_connectivity_stale_data_fallback_still_records_failure(tmp_path, mon
     import watchtower.github_backend as github_backend
 
     monkeypatch.setattr(github_backend, "_LIST_CACHE_TTL", 0.05)
+    monkeypatch.setattr(github_backend, "_persisted_list_ttl_s", lambda: 0.0)
     monkeypatch.setattr(github_backend, "_LIST_ERROR_BACKOFF", 60.0)
     # Ditto: this test is about failure recording, not the fetch-rate cap.
     monkeypatch.setattr(github_backend, "_LIST_FETCH_MIN_INTERVAL_S", 0.0)

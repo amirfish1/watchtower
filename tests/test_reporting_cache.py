@@ -178,3 +178,49 @@ def test_invalidation_keeps_affected_projection_coverage_stale(report):
     gh._invalidate_list_cache(backend.repo)
     _, meta = q.window_items("REPORT", spec)
     assert not meta["source_complete"] and "stale" in meta["coverage"]
+
+
+def test_coverage_only_refresh_does_not_read_raw_issue_blobs(report, monkeypatch):
+    q, gh, rc, backend, issue, publish = report
+    spec = q.WindowSpec(closed_since=time.time() - 3600)
+    before, _ = q.window_items("REPORT", spec)
+    original = q._connect
+    statements = []
+
+    def traced(path):
+        conn = original(path)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(q, "_connect", traced)
+    gh._invalidate_list_cache(backend.repo)
+    assert not any("SELECT number, blob FROM raw_issues" in sql for sql in statements)
+    after, meta = q.window_items("REPORT", spec)
+    assert after == before
+    assert not meta["source_complete"] and "stale" in meta["coverage"]
+
+
+def test_quiet_revalidation_is_bounded_but_changes_publish_immediately(report):
+    q, gh, rc, backend, issue, publish = report
+    path = gh._list_cache_path()
+    key = f"{backend.repo}:open"
+    entry = gh._read_persisted_list_cache()[key]
+    stamp = rc._stamp(path)
+    gh._write_persisted_list_entry(key, dict(entry))
+    gh._write_persisted_list_entry(key, dict(entry, at=entry["at"] + 5))
+    assert rc._stamp(path) == stamp
+    gh._write_persisted_list_entry(key, dict(entry, at=entry["at"] + 61))
+    assert rc._stamp(path) != stamp
+    updated = issue(3, "OPEN")
+    updated["title"] = "same clock, changed body"
+    gh._write_persisted_list_entry(key, dict(entry, at=entry["at"] + 62, data=[updated]))
+    assert gh._read_persisted_list_cache()[key]["data"] == [updated]
+
+
+def test_short_ttl_still_gets_a_timely_heartbeat(report, monkeypatch):
+    q, gh, rc, backend, issue, publish = report
+    monkeypatch.setenv("WATCHTOWER_GH_LIST_TTL_S", "10")
+    key = f"{backend.repo}:open"
+    entry = gh._read_persisted_list_cache()[key]
+    gh._write_persisted_list_entry(key, dict(entry, at=entry["at"] + 6))
+    assert gh._read_persisted_list_cache()[key]["at"] == entry["at"] + 6
