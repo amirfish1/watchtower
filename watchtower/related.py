@@ -365,13 +365,8 @@ def commit_hits(item, limit=3):
 
 def get_cached(ref):
     ref = canonical_ref(ref)
-    with connect() as conn:
-        refresh(conn)
-        row = conn.execute("SELECT payload FROM docs WHERE ref=?", (ref,)).fetchone()
-        if row:
-            return json.loads(row[0])
-    # A just-filed ticket may precede the next projection refresh; old tickets
-    # can still ask about recent work. Read the source locally, never q.get().
+    # Confirmations need current links, not the FTS projection's 60s-old copy.
+    # Source reads also avoid taking an unrelated search-index writer lock.
     items, _ = cached_tickets()
     for it in items:
         if it.get("ref") == ref:

@@ -1,4 +1,5 @@
 import json
+import argparse
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -86,6 +87,30 @@ def test_local_cache_refresh_never_runs_subprocess(tmp_path, monkeypatch):
     with related.connect() as conn:
         assert conn.execute("SELECT count(*) FROM exposures").fetchone()[0] == 1
     assert related.index_path().stat().st_mode & 0o077 == 0
+
+
+def test_confirmation_works_with_search_index_writer_and_does_not_duplicate(capsys):
+    a = q.enqueue(project="A", title="voucher repair", note="voucher recovery")
+    b = q.enqueue(project="B", title="voucher failure", note="voucher recovery")
+    related.lookup(a)
+    with related.connect() as index:
+        index.execute("UPDATE meta SET value='0' WHERE key='refreshed_at'")
+        index.execute("DELETE FROM meta WHERE key='sources'")
+    args = argparse.Namespace(refresh_github=False, feedback_report=False,
+                              ref=a['ref'], confirm=b['ref'], kind='in-progress',
+                              evidence='Verified shared voucher recovery work',
+                              worker='w', json=True)
+    with related.connect() as writer:
+        writer.execute('BEGIN IMMEDIATE')
+        writer.execute("INSERT OR REPLACE INTO meta VALUES('held-writer','1')")
+        assert related_cli.command(args) == 0
+        assert 'Confirmed in-progress' in capsys.readouterr().out
+        assert related_cli.command(args) == 0
+        assert 'Link already recorded' in capsys.readouterr().out
+        writer.rollback()
+    links = related.links(q.get(a['ref']))
+    assert len(links) == 1
+    assert links[0]['ref'] == b['ref']
 
 
 def test_raw_github_full_body_and_metadata_resolution_not_clipped(tmp_path, monkeypatch):
