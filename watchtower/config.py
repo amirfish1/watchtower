@@ -1857,6 +1857,20 @@ def set_archived(queue: str, archived: bool, *,
     return q
 
 
+def restore_queue_for_ticket(item: Dict[str, Any]) -> bool:
+    """Restore an archived queue when active work arrives; keep staffing paused.
+
+    Closed history and tickets explicitly retired by a forced archive do not
+    revive a queue. A new active ticket restores the queue and its history.
+    """
+    queue = str(item.get("project") or "")
+    if (not queue or item.get("status") == "closed"
+            or not is_archived(queue) or ticket_is_archived(item)):
+        return False
+    set_archived(queue, False)
+    return True
+
+
 def all_queues(include_archived: bool = False) -> Dict[str, Any]:
     """Return all configured queues (any queue with an entry in the config file).
 

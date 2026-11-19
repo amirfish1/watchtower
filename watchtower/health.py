@@ -443,6 +443,13 @@ def all_status(
     by_queue: Dict[str, List[Dict[str, Any]]] = {}
     configured = config.all_queues(include_archived=True)
     fetched = items if items is not None else q.list_items(project=project, fresh=fresh)
+    # Repair older stranded tickets and work arriving through other backends.
+    # Persist the restoration so config-based queue pickers agree with health.
+    for item in fetched:
+        name = item.get("project") or "GEN"
+        if isinstance(configured.get(name), dict) and configured[name].get("archived"):
+            if config.restore_queue_for_ticket(item):
+                configured[name] = config.get_queue_config(name)
     # Archiving hides a dead queue, but a ticket filed into it afterwards
     # (automation, a stray `wt add`) must stay visible, not strand unseen (OPS-248).
     unclosed = {it.get("project") or "GEN" for it in fetched

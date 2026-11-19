@@ -102,12 +102,11 @@ def test_force_archive_retires_only_existing_refs_and_restores_on_unarchive(env)
     later.update(needs_input=True, block_question="A real later question")
     env.append(later)
     assert not config.ticket_is_archived(later)
-    assert next(r for r in health.all_status(items=list(env)) if r["queue"] == "DEAD")["depth"] == 1
-    view = owner_view.build(list(env))
-    assert view["blocked"] == 1 and view["unclassified"] == ["DEAD-2"]
-    assert cli.cmd_queue_unarchive(_ns()) == 0
+    assert next(r for r in health.all_status(items=list(env)) if r["queue"] == "DEAD")["depth"] == 2
+    assert not config.is_archived("DEAD")
     assert not config.ticket_is_archived(retired)
     assert owner_view.build(list(env))["blocked"] == 2
+    assert not config.auto_drain("DEAD")
 
 
 def test_closed_tickets_do_not_block(env):
@@ -134,6 +133,44 @@ def test_status_shows_archived_queue_that_gets_a_new_ticket(env):
     cli.cmd_queue_archive(_ns(apply=True))
     env.append(_item("DEAD-2", "open"))
     assert "DEAD" in {r["queue"] for r in health.all_status(items=list(env))}
+    assert not config.is_archived("DEAD")
+    assert "DEAD" in config.all_queues()
+    assert not config.auto_drain("DEAD")
+
+
+@pytest.mark.parametrize("status", ["open", "awaiting_answer", "in_review", "in_progress"])
+def test_status_restores_queue_with_active_work(env, status):
+    config.set_archived("DEAD", True)
+    env.append(_item("DEAD-2", status))
+    health.all_status(items=list(env))
+    assert not config.is_archived("DEAD")
+    assert not config.auto_drain("DEAD")
+
+
+def test_enqueue_restores_archived_queue_and_dedupe_repairs_old_ticket(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("WATCHTOWER_STORE", str(tmp_path / "tickets.json"))
+    monkeypatch.setenv("WATCHTOWER_ACTIVITY_LOG", str(tmp_path / "activity.log"))
+    config.set_archived("DEAD", True)
+    saved = cli.q.enqueue(note="New work", project="DEAD", dedupe_key="example")
+    assert not config.is_archived("DEAD")
+    assert not config.auto_drain("DEAD")
+    config.set_archived("DEAD", True)
+    again = cli.q.enqueue(note="Retry", project="DEAD", dedupe_key="example")
+    assert again["ref"] == saved["ref"]
+    assert not config.is_archived("DEAD")
+
+
+
+def test_github_enqueue_restores_archived_queue(env, monkeypatch):
+    from types import SimpleNamespace
+
+    saved = _item("DEAD-8", "open")
+    backend = SimpleNamespace(enqueue=lambda **kw: saved)
+    monkeypatch.setattr(cli.q, "_github_backend_for_project", lambda project: backend)
+    config.set_archived("DEAD", True)
+    assert cli.q.enqueue(note="New issue", project="DEAD") == saved
+    assert not config.is_archived("DEAD")
+    assert not config.auto_drain("DEAD")
 
 
 def test_models_migrate_skips_archived(env):

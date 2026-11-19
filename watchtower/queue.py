@@ -2035,6 +2035,8 @@ def enqueue(
     ``submitter_explicit`` records attribution from ``--submitter``. Neither
     it nor ``pre_ack`` enables notices. ``submitter_subscribed`` (``wt add
     --subscribe``) opts into the queue-configured status events."""
+    from . import config as _config
+
     note = _clip(note, 4000)
     if not note and not text:
         raise ValueError("note or text is required")
@@ -2103,6 +2105,7 @@ def enqueue(
                 raise ValueError(f"{saved.get('ref')} was filed but NOT gated: {exc}; "
                                  f"retry with `wt edit {saved.get('ref')} --gate ...`") from exc
         _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
+        _config.restore_queue_for_ticket(saved)
         return saved
     dependencies = _dependency_snapshot(refs=blocked_by or [], transitive=True)
     with _FileLock(_lock_path()):
@@ -2111,6 +2114,7 @@ def enqueue(
             existing = next((i for i in data["items"] if i.get("project") == proj
                              and i.get("dedupe_key") == dedupe_key), None)
             if existing is not None:
+                _config.restore_queue_for_ticket(existing)
                 return existing
         saved = _new_item_unlocked(
             data, note=note, text=text, source=source, proj=proj, annotation_id=annotation_id,
@@ -2129,6 +2133,7 @@ def enqueue(
             # Raising here leaves the store untouched (nothing saved yet).
             _group_enqueue_unlocked(data, saved, group_parent, group, list(children or []))
         _save_unlocked(data)
+    _config.restore_queue_for_ticket(saved)
     _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
     if group_parent and children:
         _group_wake([str(saved.get("ref"))], "seal")
