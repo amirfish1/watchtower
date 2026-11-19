@@ -2068,6 +2068,36 @@ def test_list_issues_caches_and_falls_back_to_stale_data_on_error(monkeypatch):
         cold._list_issues()
 
 
+@pytest.mark.parametrize("malformed", ["", "[{"])
+def test_list_issues_retries_invalid_json_before_publishing(monkeypatch, malformed):
+    from watchtower import github_backend
+
+    monkeypatch.setattr(github_backend, "_LIST_CACHE", {})
+    backend = github_backend.GitHubIssuesBackend("T", repo="acme/list-retry")
+    _no_etag_probe(monkeypatch, backend)
+    responses = iter([malformed, '[{"number": 1}]'])
+    monkeypatch.setattr(backend, "_run", lambda args: next(responses))
+
+    assert backend._list_issues() == [{"number": 1}]
+    assert next(responses, None) is None
+
+
+def test_list_issues_repeated_invalid_json_preserves_last_good_list(monkeypatch):
+    from watchtower import github_backend
+
+    monkeypatch.setattr(github_backend, "_LIST_CACHE", {})
+    backend = github_backend.GitHubIssuesBackend("T", repo="acme/list-retry")
+    _no_etag_probe(monkeypatch, backend)
+    responses = iter(['[{"number": 1}]', "[{", "[{"])
+    monkeypatch.setattr(backend, "_run", lambda args: next(responses))
+
+    assert backend._list_issues() == [{"number": 1}]
+    with pytest.raises(github_backend.GitHubBackendError, match="invalid JSON after retry"):
+        backend._list_issues(strict=True, fresh=True)
+    assert backend._list_issues() == [{"number": 1}]
+    assert next(responses, None) is None
+
+
 def test_list_issues_fresh_request_still_honors_error_backoff(monkeypatch):
     """Reconciler freshness must not retry a known GitHub failure per call."""
     import watchtower.github_backend as github_backend

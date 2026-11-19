@@ -3143,11 +3143,24 @@ class GitHubIssuesBackend:
                 # drain rate over a short window). Only the cosmetic total
                 # `closed` count is affected by truncation.
                 args.extend(["--search", f"closed:>={cutoff} sort:updated-desc"])
-            raw = self._run(args)
-            try:
-                data = json.loads(raw or "[]")
-            except json.JSONDecodeError as exc:
-                raise GitHubBackendError("gh issue list returned invalid JSON") from exc
+            for attempt in (1, 2):
+                raw = self._run(args)
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    # Log the shape of the failure without issue content or
+                    # command output, which may contain private information.
+                    _log_quota(
+                        "list_invalid_json", repo=self.repo, state=state,
+                        attempt=attempt, output_length=len(raw),
+                        parse_error=exc.msg, offset=exc.pos,
+                    )
+                    if attempt == 2:
+                        raise GitHubBackendError(
+                            "gh issue list returned invalid JSON after retry"
+                        ) from exc
+                else:
+                    break
             if not isinstance(data, list):
                 raise GitHubBackendError("gh issue list returned a non-list JSON value")
             result = [issue for issue in data if isinstance(issue, dict)]
