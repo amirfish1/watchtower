@@ -114,6 +114,14 @@ one-line question. Scratch output goes under `~/dev/scratch/`, not `/tmp`.
 changelog snippet, stale repo entry, commit/close-proof plumbing): resolve it
 automatically after verifying. Never escalate to the user.
 
+**Rule A hard limit (owner, 2026-11-19):** a hold is never mechanical if
+answering it would authorize a customer message or send, a send switch, money
+(Stripe, prices, charges, refunds) or ad spend, on BECKY queues (BECKY,
+BECKY-CUSTOMER and the like). Treat it as B and leave it for the owner, even
+when it looks stale or a past rule seems to cover it. The BE-queue instruction
+to send Sonia's updates directly does not extend to BECKY. Stale-hold
+auto-answers stay allowed for everything else.
+
 **B. Product / policy decision** (the worker proposes a design or policy and
 asks for approval): first check current rules and prior authorization.
 Routine reversible implementation choices within authorized scope belong to
