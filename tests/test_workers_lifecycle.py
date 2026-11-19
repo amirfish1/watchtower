@@ -2125,6 +2125,48 @@ def _reloaded_cli(wt):
     return cli
 
 
+@pytest.mark.parametrize("by_ref", [False, True])
+def test_claim_timing_keeps_durable_claim_and_json_output(wt, monkeypatch, capsys, by_ref):
+    cli = _reloaded_cli(wt)
+    for name in ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID"):
+        monkeypatch.delenv(name, raising=False)
+    from watchtower import related_cli
+    monkeypatch.setattr(related_cli, "claim_context", lambda *a: {})
+    monkeypatch.setattr(cli, "_rename_claiming_session", lambda *a: None)
+    monkeypatch.setattr(cli, "_start_plan_stage", lambda item: item)
+    item = wt.q.enqueue(project="Q", note="claim timing")
+    args = _claim_ns("Q", "timing-worker", json_out=True)
+    if by_ref:
+        args.ref = item["ref"]
+    assert cli.cmd_claim(args) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["ref"] == item["ref"] and shown["claimed_by_you"]
+    assert wt.q.get(item["ref"])["claimed_by"] == "timing-worker"
+    log = Path(os.environ["WATCHTOWER_ACTIVITY_LOG"]).read_text()
+    timings = [json.loads(line.split("STARTUP_TIMING", 1)[1])
+               for line in log.splitlines() if "STARTUP_TIMING" in line]
+    selection = next(row for row in timings if row["phase"] == "claim_select")
+    assert selection["outcome"] == "ok" and selection["elapsed_s"] >= 0
+    assert selection["ref"] == (item["ref"] if by_ref else "")
+    assert log.index("CLAIM ") < log.index("STARTUP_TIMING")
+
+
+def test_claim_rebind_failure_is_timed_without_claiming(wt, monkeypatch, capsys):
+    cli = _reloaded_cli(wt)
+    monkeypatch.setenv("CODEX_THREAD_ID", str(uuid.uuid4()))
+    monkeypatch.setattr(wt.workers, "_find_engine_ancestor_pid", lambda *a: os.getpid())
+    def refused(*a, **kw):
+        raise ValueError("continuation refused")
+    monkeypatch.setattr(wt.workers, "rebind_continued_worker", refused)
+    monkeypatch.setattr(wt.q, "claim_next", lambda *a, **kw: pytest.fail("must not claim"))
+    assert cli.cmd_claim(_claim_ns("Q", "timing-worker", json_out=True)) == 1
+    assert "continuation refused" in capsys.readouterr().err
+    log = Path(os.environ["WATCHTOWER_ACTIVITY_LOG"]).read_text()
+    timing = json.loads(next(line.split("STARTUP_TIMING", 1)[1]
+                            for line in log.splitlines() if "STARTUP_TIMING" in line))
+    assert timing["phase"] == "claim_rebind" and timing["outcome"] == "error"
+
+
 def test_claim_empty_queue_surplus_worker_stops(wt, capsys):
     """live>desired on an empty queue: the claiming worker is surplus -> stop."""
     cli = _reloaded_cli(wt)

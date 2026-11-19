@@ -1295,17 +1295,19 @@ def cmd_claim(args: argparse.Namespace) -> int:
         continuation_pid = workers._find_engine_ancestor_pid(continuation[0])
         if continuation_pid:
             try:
-                workers.rebind_continued_worker(
-                    worker, continuation[1], continuation_pid,
-                    engine=continuation[0],
-                )
+                with workers._startup_timing(args.queue or "", "claim_rebind", ref or ""):
+                    workers.rebind_continued_worker(
+                        worker, continuation[1], continuation_pid,
+                        engine=continuation[0],
+                    )
             except ValueError as exc:
                 print(f"error: {exc}", file=sys.stderr)
                 return 1
 
     if ref:
         try:
-            item = q.claim_by_ref(ref, worker, session_uuid=session_uuid)
+            with workers._startup_timing(q._project_from_ident(ref) or "", "claim_select", ref):
+                item = q.claim_by_ref(ref, worker, session_uuid=session_uuid)
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1
@@ -1314,16 +1316,17 @@ def cmd_claim(args: argparse.Namespace) -> int:
             return 1
     else:
         try:
-            item = q.claim_next(
-                worker,
-                project=args.queue,
-                session_uuid=session_uuid,
-                oldest=getattr(args, "oldest", False),
-                item_types=getattr(args, "type", None) or [],
-                readiness_filters=getattr(args, "readiness", None) or [],
-                worker_model=workers.worker_model(worker, args.queue),
-                requested_only=getattr(args, "requested_only", False),
-            )
+            with workers._startup_timing(args.queue or "", "claim_select"):
+                item = q.claim_next(
+                    worker,
+                    project=args.queue,
+                    session_uuid=session_uuid,
+                    oldest=getattr(args, "oldest", False),
+                    item_types=getattr(args, "type", None) or [],
+                    readiness_filters=getattr(args, "readiness", None) or [],
+                    worker_model=workers.worker_model(worker, args.queue),
+                    requested_only=getattr(args, "requested_only", False),
+                )
         except ValueError as e:
             print(f"error: {e}", file=sys.stderr)
             return 1

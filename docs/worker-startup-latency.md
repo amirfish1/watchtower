@@ -287,3 +287,56 @@ unrelated archive copying, and cross-queue dependency retention. Historical
 slow samples and the 30-second target remain unchanged. Future natural startup
 remains subject to a new permanent check after adoption, under WT-87; a
 fixture benchmark cannot certify universal sub-30-second model startup.
+
+## WT-104: pre-claim briefing and unattributed command time
+
+The WT-102 watch retained two November 19 failures (all times UTC):
+
+| Ticket | Enqueue | Process | Claim command starts | Durable CLAIM | Total |
+| --- | --- | --- | --- | --- | --- |
+| CCC-615 | 06:22:51 | 06:23:01.069 | 06:23:25.241 tool call, after other reads | 06:23:30 | 39s |
+| WT-103 | 07:29:50 | 07:29:52.938 | 07:30:16.336 tool call | 07:30:41 | 51s |
+
+The tool timestamps are invocation timestamps, not exact shell process starts.
+Both transcripts read the whole runbook and WatchTower skill before claiming.
+CCC-615 reread the skill after truncated output, and explored its checkout
+before the claim. WT-103 spent approximately 25 seconds between the claim tool
+invocation and its durable CLAIM. Historical records do not attribute that
+interval to a particular CLI function or lock. The later tool return includes
+related-work discovery and must not be confused with durable claim latency.
+WT-103 subsequently deployed d418076's GitHub cache churn repair; that does not
+prove the cause of its own earlier slow claim.
+
+Options considered: remove optional pre-claim reads and repeated inference
+round trips (chosen); add phase diagnostics (chosen); rewrite atomic claim
+transactions around hot rows (not justified by the present profile); or
+prewarm/change models/the target (a separate fleet product decision). D971
+records the reversible implementation choice. No model, capacity, launch
+observation, ownership check or 30-second threshold changes.
+
+The drain prompt now asks workers to combine the learnings read and first claim
+in one sequential tool invocation after required startup readings. Optional
+full-runbook and repo exploration move after the claim; triggered runbook
+protocols, mandatory skills/security instructions and Resume Check still apply.
+This removes an observed source of extra reading and round trips, but no
+synthetic model runs were made and no inference-latency reduction is claimed.
+
+`STARTUP_TIMING` now includes `claim_rebind` and `claim_select`. The latter
+covers queue selection through persistence and claimed notification; it ends
+before session renaming, plan-stage startup and related-work recall. It includes
+model lookup for next-ticket claims. Rebind timing covers the rebind operation,
+not ancestor discovery. Both retain monotonic duration, PID, queue, outcome and
+optional ref; a by-ref selection derives its queue from the ref. Timing failures
+cannot alter claims or stdout JSON. These phases narrow future stalls without
+claiming exact attribution to locks, storage or I/O pressure.
+
+Five current copied-live-store claims with a cold memo had median **1.719s**
+(range **1.668–2.422s**, including profiling overhead on the first sample).
+The actual dependency snapshot ran; liveness, usage capture and notifications
+were stubbed, and original storage was never written. The first profile spent
+1.750s loading/copying the full store and 0.515s saving, within 2.368s total.
+This does not reproduce the historical 25-second command delay and is not a
+matched before/after comparison. Raw script, timings and profile live in
+`~/.watchtower/evidence/WT-104/`. The historical watch keeps its failures;
+future startup evidence uses a new permanent watch from actual adoption.
+Natural <=30-second startup remains an explicit caveat until real exposure.
