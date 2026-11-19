@@ -937,18 +937,26 @@ def _read_db(db: Path, *, strict: bool = False, readonly: bool = False) -> Dict[
     # the store's revision + file stamp and hand mutating callers a private copy
     # while read-only counting callers reuse the normalized snapshot directly.
     import pickle
+    def snapshot(memo):
+        if readonly:
+            return memo[2]
+        if memo[1] is None:
+            memo = (memo[0], pickle.dumps(memo[2], protocol=pickle.HIGHEST_PROTOCOL), memo[2])
+            _READ_DB_MEMO[key] = memo
+        return pickle.loads(memo[1])
+
     key = str(db)
     stamp = _db_stamp(db)
     memo = _READ_DB_MEMO.get(key)
     if memo is not None and memo[0][0] == stamp:
-        return memo[2] if readonly else pickle.loads(memo[1])
+        return snapshot(memo)
     try:
         conn = _connect(db)
         try:
             counter = int(_meta_get(conn, "counter", "0") or 0)
             revision = _meta_get(conn, "revision", "0")
             if memo is not None and memo[0] == (stamp, counter, revision):
-                return memo[2] if readonly else pickle.loads(memo[1])
+                return snapshot(memo)
             items = [
                 json.loads(row[0])
                 for row in conn.execute("SELECT item_json FROM items ORDER BY number")
@@ -967,10 +975,9 @@ def _read_db(db: Path, *, strict: bool = False, readonly: bool = False) -> Dict[
     data = {"counter": counter, "items": items, "_normalized": True}
     # Only memoize when nothing moved while we were reading.
     if _db_stamp(db) == stamp:
-        pickled = pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL)
-        _READ_DB_MEMO[key] = ((stamp, counter, revision), pickled, data)
-        if not readonly:
-            return pickle.loads(pickled)
+        memo = ((stamp, counter, revision), None, data)
+        _READ_DB_MEMO[key] = memo
+        return snapshot(memo)
     return data
 
 
@@ -2369,7 +2376,11 @@ def list_items(
                 **({"blocked_only": True} if blocked_only else {}),
                 **({"snapshot_only": True} if snapshot_only else {}),
             )
-    data = _load_unlocked(strict=strict or raise_on_error, **({"readonly": True} if blocked_only else {}))
+    # Scoped readers need private results, not a private copy of every queue's
+    # archive. The normalized memo is immutable to this filtering operation.
+    scoped = bool(project or status or lane)
+    data = _load_unlocked(strict=strict or raise_on_error,
+                          **({"readonly": True} if blocked_only or scoped else {}))
     items = data.get("items", [])
     if blocked_only:
         import copy
@@ -2387,6 +2398,9 @@ def list_items(
     if project:
         proj = _norm_project(project)
         items = [it for it in items if it.get("project") == proj]
+    if scoped and not blocked_only:
+        import copy
+        items = copy.deepcopy(items)
     if not project:
         for gh_project in github_projects:
             backend = _github_backend_for_project(gh_project)
@@ -2914,7 +2928,8 @@ def _claim_candidates(
     always-on VM only ever takes what it can actually run.
     """
     from . import config
-    candidates = [it for it in items if it.get("status") == "open" and not it.get("duplicate_of") and not supervision_owns(it)
+    candidates = [it for it in items if (not project or it.get("project") == project)
+                  and it.get("status") == "open" and not it.get("duplicate_of") and not supervision_owns(it)
                   and not config.is_tracker(it.get("project", ""))]
     if requested_only:
         # OPS-1492: a dispatcher on a manually drained queue only wants what
@@ -2953,8 +2968,6 @@ def _claim_candidates(
             it for it in candidates
             if not it.get("blocked_by") or blocker_verdict(it, by_ref)[0] == "ok"
         ]
-    if project:
-        candidates = [it for it in candidates if it.get("project") == project]
     if lane:
         candidates = [it for it in candidates if it.get("lane") == lane]
     if readiness_filters:
@@ -3235,7 +3248,8 @@ def claim_next(
     if not sb_pre and _github_backend_for_project(project) is None:
         with _FileLock(_lock_path()):
             sb_pre = _sent_back_held_unlocked(
-                _load_unlocked()["items"], str(session_id), str(real_sid or ""),
+                (dispatch_snapshot(project) if project else _load_unlocked(readonly=True)["items"]),
+                str(session_id), str(real_sid or ""),
                 _norm_project(project) if project else None)
 
     try:

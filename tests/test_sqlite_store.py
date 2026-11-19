@@ -238,3 +238,70 @@ def test_export_json_roundtrip(wt, tmp_path, capsys):
     # No -o prints to stdout.
     assert wt.cli.main(["export-json"]) == 0
     assert json.loads(capsys.readouterr().out)["counter"] == 2
+
+
+def test_scoped_listing_isolates_nested_results_and_observes_writes(wt):
+    first = wt.q.enqueue(project="HOT", note="first")
+    wt.q.enqueue(project="OTHER", note="outside scope")
+    page = wt.q.list_items(project="HOT")
+    page[0]["history"][0]["event"] = "caller mutation"
+    page[0]["note"] = "caller mutation"
+    assert wt.q.list_items(project="HOT")[0]["note"] == "first"
+    assert wt.q.list_items(project="HOT")[0]["history"][0]["event"] == "filed"
+    wt.q.claim_by_ref(first["ref"], "worker")
+    assert wt.q.list_items(status="open", project="HOT") == []
+    assert wt.q.list_items(status="in_progress", project="HOT")[0]["claimed_by"] == "worker"
+
+
+def test_scoped_listing_does_not_copy_unrelated_archive(wt):
+    wt.q.enqueue(project="HOT", note="first")
+    wt.q.enqueue(project="OTHER", note="archive")
+    snapshot = wt.q._load_unlocked(readonly=True)
+
+    class CannotCopy:
+        def __deepcopy__(self, memo):
+            raise AssertionError("unrelated archive copied")
+
+        def __reduce__(self):
+            raise AssertionError("unrelated archive serialized")
+
+    other = next(it for it in snapshot["items"] if it["project"] == "OTHER")
+    other["archive_probe"] = CannotCopy()
+    assert wt.q.list_items(project="HOT")[0]["note"] == "first"
+    assert wt.q.list_items(status="in_progress") == []
+
+
+def test_readonly_store_does_not_serialize_archive_and_mutable_read_is_private(wt, monkeypatch):
+    wt.q.enqueue(project="HOT", note="first")
+    wt.q._READ_DB_MEMO.clear()
+    import pickle
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("read-only store serialized the archive")
+
+    with monkeypatch.context() as m:
+        m.setattr(pickle, "dumps", forbidden)
+        snapshot = wt.q._load_unlocked(readonly=True)
+        assert snapshot["items"][0]["note"] == "first"
+        assert wt.q._load_unlocked(readonly=True) == snapshot
+    writable = wt.q._load_unlocked()
+    writable["items"][0]["history"][0]["event"] = "caller mutation"
+    assert snapshot["items"][0]["history"][0]["event"] == "filed"
+    assert wt.q._load_unlocked()["items"][0]["history"][0]["event"] == "filed"
+
+
+def test_scoped_candidates_do_not_evaluate_other_queues_but_keep_dependencies(wt, monkeypatch):
+    target = wt.q.enqueue(project="HOT", note="ready")
+    foreign = wt.q.enqueue(project="OTHER", note="unrelated")
+    from watchtower import config
+
+    def meets_floor(model, floor):
+        assert floor != "foreign-probe", "evaluated a different queue's model policy"
+        return True
+
+    foreign["model_floor"] = "foreign-probe"
+    target["blocked_by"] = [foreign["ref"]]
+    foreign["status"] = "closed"
+    monkeypatch.setattr(config, "model_meets_floor", meets_floor)
+    items = [target, foreign, dict(foreign, ref="OTHER-2", status="open")]
+    assert wt.q._claim_candidates(items, all_items=items, project="HOT", worker_model="test") == [target]

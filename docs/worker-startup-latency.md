@@ -245,3 +245,45 @@ startup product experience (a separate fleet-policy choice). Historical
 CCC-598 evidence and the 30-second limit remain intact. Future natural cold
 startup is the remaining end-to-end evidence and stays under a permanent
 check; these measurements do not certify universal sub-30-second startup.
+
+## WT-102: repeated archive copies during staffing and claim
+
+WT-101 breached the same limit on November 19: enqueue 02:49:48 UTC,
+process creation 02:49:58.837, claim command start 02:50:12.188, durable
+CLAIM 02:50:20. The 32-second total comprises 10 seconds before process
+creation and 22 afterward. WT-99's indexed dispatch reads took 0.001934s;
+the staffing lock took 0.000291s. Seven seconds elapsed between idle release
+and SPAWN_PLAN, but historical instrumentation does not attribute each part.
+The worker initialized normally and read its brief before claiming; this
+was not WT-97's terminal socket failure.
+
+A cold copied-store claim profile identified repeated private copies of the
+whole archive, including preliminary ownership and sent-back reads. Scoped
+listings now filter the normalized read-only snapshot before making private
+nested copies of their results. Read-only snapshots defer pickle generation
+until a mutable caller actually needs a private store. The preliminary
+sent-back check reads only the queue's indexed in-progress rows under its
+existing lock. Candidate filtering excludes other queues before evaluating
+model and eligibility predicates, while retaining the complete dependency
+and group-parent index. The final locked mutation still reloads the full
+store, rechecks ownership and sent-back claims, escalates stuck blockers,
+and saves duplicate/group effects through the existing transaction.
+
+Five alternating before/after pairs on the same real-store SQLite backup,
+clearing the memo each time, measured median staffing reads (queue listing
+plus claimable count) **1.570s -> 0.608s**, and complete local claim operation
+**2.732s -> 1.965s**. Dependencies and side effects were stubbed equally for
+both versions; no workers, models, customer messages or original-store writes
+were made. These phase measurements are not an end-to-end latency promise.
+Script, raw results and original ticket are in
+`~/.watchtower/evidence/WT-102/`.
+
+Options considered: narrow preliminary ownership reads; defer unused archive
+serialization and filter before copying (chosen together); rewrite the claim
+write transaction around hot rows (larger correctness risk); or prewarm/change
+the startup experience (fleet product policy). Tests exercise nested result
+isolation, mutable-store isolation, refreshed state after writes, exclusion of
+unrelated archive copying, and cross-queue dependency retention. Historical
+slow samples and the 30-second target remain unchanged. Future natural startup
+remains subject to a new permanent check after adoption, under WT-87; a
+fixture benchmark cannot certify universal sub-30-second model startup.
