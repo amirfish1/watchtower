@@ -936,8 +936,13 @@ def _supervise(d: Dict[str, Any], rows: List[Dict[str, Any]], budget: _Budget) -
         state, reason, extra = _check_session(item, ss, rows, adopted or ss.get("spawned_at") == "")
         if state == "alive":
             return
-        death = _record_death(ref, project, role, key, reason, extra,
-                              _record_for(str(ss.get("worker_id")), rows))
+        rec = _record_for(str(ss["worker_id"]), rows)
+        # A provider can reject startup after the immediate launch window.
+        quota_failure = (rec and extra.get("rc") and not extra.get("signal")
+                         and workers._postmortem_launch_failure(
+                             rec, required_reason="engine usage limit"))
+        refunded = bool(quota_failure) and int(ss.get("refunds") or 0) < MAX_REFUNDS
+        _record_death(ref, project, role, key, reason, extra, rec, refunded=refunded)
         ss = dict((q.get(ref) or item).get("stage_session") or ss)
         if int(ss.get("attempt") or 0) >= MAX_ATTEMPTS:
             _escalate(q.get(ref) or item, role, key, ss)

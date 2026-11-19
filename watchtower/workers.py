@@ -3547,6 +3547,11 @@ _USAGE_RETRY_TIME_RE = re.compile(
     r"try again at\s+(\d{1,2}:\d{2}\s*(?:AM|PM))",
     re.IGNORECASE,
 )
+_CLAUDE_WEEKLY_LIMIT_RE = re.compile(r"you['’]ve hit your weekly limit\b", re.IGNORECASE)
+_CLAUDE_WEEKLY_RESET_RE = re.compile(
+    _CLAUDE_WEEKLY_LIMIT_RE.pattern + r"\s*·\s*resets\s+(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*\(UTC\)",
+    re.IGNORECASE,
+)
 
 
 def _load_launch_failures() -> Dict[str, Any]:
@@ -3578,7 +3583,7 @@ def _iso_from_epoch(ts: float) -> str:
 
 
 def _parse_usage_retry_at(text: str, now: Optional[float] = None) -> Optional[float]:
-    """Parse Codex quota reset copy like "Jul 9th, 2026 12:09 AM"."""
+    """Parse the reset time reported by the engine."""
     now = time.time() if now is None else now
 
     def _strip_ordinals(s: str) -> str:
@@ -3594,11 +3599,17 @@ def _parse_usage_retry_at(text: str, now: Optional[float] = None) -> Optional[fl
             except ValueError:
                 continue
 
-    m = _USAGE_RETRY_TIME_RE.search(text)
-    if not m:
-        return None
+    claude_reset = _CLAUDE_WEEKLY_RESET_RE.search(text)
+    if claude_reset:
+        hour, minute, period = claude_reset.groups()
+        reset_time = f"{hour}:{minute or '00'} {period}"
+    else:
+        m = _USAGE_RETRY_TIME_RE.search(text)
+        if not m:
+            return None
+        reset_time = m.group(1)
     try:
-        parsed = datetime.strptime(m.group(1).upper(), "%I:%M %p")
+        parsed = datetime.strptime(reset_time.upper(), "%I:%M %p")
     except ValueError:
         return None
     base = datetime.fromtimestamp(now, tz=timezone.utc)
@@ -3631,7 +3642,8 @@ def _quota_exhausted(text: str) -> bool:
         try:
             event = json.loads(line)
         except (ValueError, TypeError):
-            if any(phrase in line.lower() for phrase in phrases):
+            if (_CLAUDE_WEEKLY_LIMIT_RE.match(line.strip())
+                    or any(phrase in line.lower() for phrase in phrases)):
                 return True
             continue
         if not isinstance(event, dict):
@@ -3647,7 +3659,7 @@ def _quota_exhausted(text: str) -> bool:
         if not is_error:
             continue
         lower = json.dumps(event).lower()
-        if any(phrase in lower for phrase in phrases):
+        if _CLAUDE_WEEKLY_LIMIT_RE.search(lower) or any(phrase in lower for phrase in phrases):
             return True
         if event.get("error") == "rate_limit" or event.get("api_error_status") == 429:
             return True
@@ -3965,7 +3977,9 @@ def _alert_repeated_launch_failure(rec: Dict[str, Any]) -> str:
     return ref
 
 
-def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _postmortem_launch_failure(
+    worker: Dict[str, Any], *, required_reason: str = "",
+) -> Optional[Dict[str, Any]]:
     """Classify a dead worker's log as its record is pruned.
 
     ``_wait_for_immediate_launch_failure`` only watches the first
@@ -3986,10 +4000,18 @@ def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any
       * a log small enough to be pure startup output, and
       * no cooldown already active for this queue/engine (so a batch of
         simultaneously-pruned casualties logs one LAUNCH_FAIL, not five).
+
+    A stage can request evidence of its own quota failure to decide whether
+    to refund the attempt. Classify that log even if pruning set the cooldown
+    first, and reuse a matching cooldown without recording another failure.
+    Claude stage IDs are assigned before launch, so an ID alone does not
+    establish that a Claude stage started successfully.
     """
     log_path = str(worker.get("log") or "")
     queue = str(worker.get("ticket_queue") or worker.get("queue") or "")
-    if not log_path or not queue or worker.get("session_id"):
+    engine = str(worker.get("engine") or "")
+    preassigned_stage_id = required_reason and worker.get("stage") and engine == "claude"
+    if not log_path or not queue or (worker.get("session_id") and not preassigned_stage_id):
         return None
     started_at = worker.get("started_at")
     if started_at:
@@ -4006,19 +4028,24 @@ def _postmortem_launch_failure(worker: Dict[str, Any]) -> Optional[Dict[str, Any
             return None
     except OSError:
         return None
-    engine = str(worker.get("engine") or "")
-    if active_launch_failure_cooldown(queue, engine):
+    cooldown = active_launch_failure_cooldown(queue, engine)
+    if cooldown and not required_reason:
         return None
     classified = _classify_launch_failure_log(Path(log_path))
     if not classified:
         return None
+    reason = str(classified["reason"])
+    if required_reason and reason != required_reason:
+        return None
+    if cooldown and cooldown.get("reason") == reason:
+        return cooldown
     return _record_launch_failure(
         queue=queue,
         engine=engine,
         worker_id=str(worker.get("worker_id") or ""),
         pid=int(worker.get("pid") or 0),
         log_path=Path(log_path),
-        reason=str(classified.get("reason") or "worker launch failed"),
+        reason=reason,
         retry_at=classified.get("retry_at"),
         model=str(worker.get("model") or ""),
     )

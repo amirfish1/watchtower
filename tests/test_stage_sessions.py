@@ -486,6 +486,45 @@ def test_classified_launch_failure_sets_cooldown_and_refunds(stg, monkeypatch):
     assert _ss(stg, ref)["attempt"] == 2
 
 
+@pytest.mark.parametrize("grace", ["5", "0"], ids=["immediate", "post-launch"])
+def test_claude_weekly_limit_preserves_verifier_gate(stg, monkeypatch, grace):
+    monkeypatch.setenv("WATCHTOWER_STAGE_LAUNCH_GRACE_S", grace)
+    monkeypatch.setenv("WATCHTOWER_HEADROOM_FILE", str(stg.tmp / "no-headroom.json"))
+    stg.config.set_verifier("ST", eng="claude")
+    diagnostic = "You've hit your weekly limit · resets 7am (UTC)"
+    stg.script[:] = [f"import sys; sys.exit({diagnostic!r})", SLEEP]
+    ref = _verify_ticket(stg)
+    now = dt.datetime.now(dt.timezone.utc)
+    reset = now.replace(hour=7, minute=0, second=0, microsecond=0)
+    if reset <= now:
+        reset += dt.timedelta(days=1)
+    _tick(stg, ref)
+    exit_file = Path(_ss(stg, ref)["exit_file"])
+    assert _wait(lambda: stg.workers.read_exit_file(str(exit_file)).get("ended_at"))
+    _tick(stg, ref)
+    _tick(stg, ref)
+
+    cooldown = stg.workers.active_launch_failure_cooldown("ST", "claude")
+    assert cooldown and cooldown["cooldown_until"] == reset.timestamp()
+    assert [worker["engine"] for worker in stg.spawned] == ["claude"]
+    ss = _ss(stg, ref)
+    assert ss["attempt"] == 0 and ss["deaths"][-1]["refunded"]
+    ticket = stg.q.get(ref)
+    assert ticket["status"] == "in_review"
+    assert ticket["gate_pending"] == "verify"
+    assert not ticket["needs_input"]
+
+    launch_failures = stg.workers._load_launch_failures()
+    launch_failures["ST:claude"]["cooldown_until"] = 0
+    stg.workers._save_launch_failures(launch_failures)
+    _tick(stg, ref)
+    assert [worker["engine"] for worker in stg.spawned] == ["claude", "claude"]
+    assert _ss(stg, ref)["attempt"] == 1
+    assert stg.q.get(ref)["status"] == "in_review"
+    stg.q.verdict(ref, True, "verified", by="human")
+    assert stg.q.get(ref)["status"] == "closed"
+
+
 @pytest.mark.parametrize("script,expect", [
     (EXIT1, "engine exited immediately (exit 1)"),
     (SELF_KILL, "engine exited immediately (exit 137)"),     # the wrapper reports 128+sig
