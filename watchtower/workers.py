@@ -3552,6 +3552,13 @@ _CLAUDE_WEEKLY_RESET_RE = re.compile(
     _CLAUDE_WEEKLY_LIMIT_RE.pattern + r"\s*·\s*resets\s+(\d{1,2})(?::(\d{2}))?\s*(AM|PM)\s*\(UTC\)",
     re.IGNORECASE,
 )
+_DEVIN_FREE_LIMIT_RE = re.compile(
+    r"^Error: Agent error: Reached free model rate limit\b", re.IGNORECASE,
+)
+_DEVIN_FREE_RESET_RE = re.compile(
+    _DEVIN_FREE_LIMIT_RE.pattern + r"[^\n]*\(at (\d{2}:\d{2}) UTC\)",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
 def _load_launch_failures() -> Dict[str, Any]:
@@ -3599,8 +3606,13 @@ def _parse_usage_retry_at(text: str, now: Optional[float] = None) -> Optional[fl
             except ValueError:
                 continue
 
+    devin_reset = _DEVIN_FREE_RESET_RE.search(text)
     claude_reset = _CLAUDE_WEEKLY_RESET_RE.search(text)
-    if claude_reset:
+    time_format = "%I:%M %p"
+    if devin_reset:
+        reset_time = devin_reset.group(1)
+        time_format = "%H:%M"
+    elif claude_reset:
         hour, minute, period = claude_reset.groups()
         reset_time = f"{hour}:{minute or '00'} {period}"
     else:
@@ -3609,7 +3621,7 @@ def _parse_usage_retry_at(text: str, now: Optional[float] = None) -> Optional[fl
             return None
         reset_time = m.group(1)
     try:
-        parsed = datetime.strptime(reset_time.upper(), "%I:%M %p")
+        parsed = datetime.strptime(reset_time.upper(), time_format)
     except ValueError:
         return None
     base = datetime.fromtimestamp(now, tz=timezone.utc)
@@ -3643,6 +3655,7 @@ def _quota_exhausted(text: str) -> bool:
             event = json.loads(line)
         except (ValueError, TypeError):
             if (_CLAUDE_WEEKLY_LIMIT_RE.match(line.strip())
+                    or _DEVIN_FREE_LIMIT_RE.match(line)
                     or any(phrase in line.lower() for phrase in phrases)):
                 return True
             continue

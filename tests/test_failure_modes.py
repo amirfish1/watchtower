@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from datetime import datetime
 
 import pytest
 
@@ -174,6 +175,46 @@ def test_usage_limit_cooldown_honours_the_provider_supplied_retry_time(wt_env, t
     assert verdict["reason"] == "engine usage limit"
     assert verdict["retry_at"] is not None
     assert verdict["retry_at"] > time.time()
+
+
+@pytest.mark.parametrize(
+    "failure_at,reset_clock,reset_at",
+    [
+        ("2026-11-19T06:35:42Z", "08:06", "2026-11-19T08:06:00Z"),
+        ("2026-11-19T23:55:00Z", "00:03", "2026-11-20T00:03:00Z"),
+    ],
+)
+def test_devin_free_model_limit_uses_provider_reset(
+    wt_env, tmp_path, failure_at, reset_clock, reset_at
+):
+    log = tmp_path / "devin.log"
+    log.write_text(
+        "Error: Agent error: Reached free model rate limit. Upgrade to Max for "
+        "higher limits, or switch to a different model. Your limit will reset "
+        f"in 1 hour 29 minutes (at {reset_clock} UTC).: {{\n"
+        '  "cognition.ai/errorKind": "unavailable",\n'
+        '  "cognition.ai/retryable": true\n'
+        "}\n"
+    )
+
+    verdict = wt_env.workers._classify_launch_failure_log(
+        log, now=datetime.fromisoformat(failure_at).timestamp()
+    )
+    assert verdict == {
+        "reason": "engine usage limit",
+        "retry_at": datetime.fromisoformat(reset_at).timestamp(),
+    }
+
+
+def test_devin_generic_unavailable_is_not_a_quota_failure(wt_env, tmp_path):
+    log = tmp_path / "devin.log"
+    log.write_text(
+        'Error: Agent error: service unavailable.: {\n'
+        '  "cognition.ai/errorKind": "unavailable"\n'
+        '}\n'
+    )
+
+    assert wt_env.workers._classify_launch_failure_log(log) is None
 
 
 def test_repeated_launch_failures_back_off_exponentially(wt_env, tmp_path):
