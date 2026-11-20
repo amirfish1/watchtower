@@ -28,6 +28,7 @@ import json
 import os
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -395,7 +396,38 @@ def test_cached_status_payload_serves_snapshot_and_dumps_stacks(monkeypatch):
     finally:
         dashboard._status_compute.release()
     assert len(calls) == 1
+    # Expired + lock free -> serve stale now, refresh on a background thread.
+    assert dashboard.cached_status_payload() == {"n": 1}
+    deadline = time.monotonic() + 5
+    while dashboard._status_cache["payload"] != {"n": 2} and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert dashboard._status_cache["payload"] == {"n": 2}
+    assert dashboard._status_compute.acquire(timeout=5)  # refresher released it
+    dashboard._status_compute.release()
     assert dashboard.cached_status_payload() == {"n": 2}
+
+
+def test_send_swallows_client_disconnect():
+    """A client that hangs up mid-response must not raise (no traceback spam)."""
+    from watchtower import dashboard
+
+    class _Gone:
+        def write(self, _b):
+            raise BrokenPipeError(32, "Broken pipe")
+
+        def flush(self):
+            pass
+
+    h = dashboard._Handler.__new__(dashboard._Handler)
+    h.wfile = _Gone()
+    h.command = "GET"
+    h.request_version = "HTTP/1.1"
+    h.requestline = "GET /api/status HTTP/1.1"
+    h.client_address = ("127.0.0.1", 0)
+    h.close_connection = False
+    h.log_request = lambda *a, **k: None
+    h._send(200, b"{}", "application/json")
+    assert h.close_connection is True
 
 
 def test_sigusr1_dumps_all_stacks_from_a_thread_not_the_handler(monkeypatch):

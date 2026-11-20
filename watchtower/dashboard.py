@@ -201,7 +201,8 @@ def cached_status_payload() -> Dict[str, Any]:
     Concurrent requests used to each recompute the payload, queueing on
     workers.lock behind the daemon tick. Now one thread recomputes at a time;
     the rest get the last snapshot immediately. Only the very first request
-    (no snapshot yet) waits for the computation.
+    (no snapshot yet) waits for the computation; an expired snapshot is
+    served as-is while one background thread refreshes it.
     """
     snap = _status_cache["payload"]
     if snap is not None and time.monotonic() - _status_cache["at"] < STATUS_CACHE_TTL_S:
@@ -209,17 +210,33 @@ def cached_status_payload() -> Dict[str, Any]:
     if snap is not None:
         if not _status_compute.acquire(blocking=False):
             return snap  # someone else is refreshing: serve stale, don't queue
+        # Stale: refresh off the request thread. Computing inline made the
+        # unlucky poller wait seconds behind the daemon tick (GIL + locks);
+        # clients timed out and every write raised BrokenPipeError.
+        threading.Thread(target=_refresh_status_locked, daemon=True,
+                         name="wt-status-refresh").start()
+        return snap
     else:
         _status_compute.acquire()
         snap = _status_cache["payload"]
         if snap is not None and time.monotonic() - _status_cache["at"] < STATUS_CACHE_TTL_S:
             _status_compute.release()
             return snap
+    return _refresh_status_locked()
+
+
+def _refresh_status_locked() -> Optional[Dict[str, Any]]:
+    """Recompute the status snapshot; the caller holds ``_status_compute``."""
     try:
         payload = status_payload()
         _status_cache["payload"] = payload
         _status_cache["at"] = time.monotonic()
         return payload
+    except Exception as exc:
+        if _status_cache["payload"] is None:
+            raise
+        print(f"[watchtower] status refresh failed: {exc}", flush=True)
+        return None  # background refresh: keep serving the last snapshot
     finally:
         _status_compute.release()
 
@@ -1582,9 +1599,14 @@ class _Handler(BaseHTTPRequestHandler):
         # weaken the server-side same-origin checks on action endpoints, which
         # reject cross-origin requests before reaching here.
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+        try:
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The client gave up (poll timeout, closed tab). Nothing to
+            # report: logging a traceback per disconnect buried real errors.
+            self.close_connection = True
 
     def _json(self, code: int, obj: Any) -> None:
         self._send(code, json.dumps(obj, indent=2).encode(), "application/json")
