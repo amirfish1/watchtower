@@ -1235,14 +1235,12 @@ def machine_tag() -> str:
 # tickets simply wait for the Mac.
 VALID_PLACEMENTS = ("any", "mac", "cloud")
 
-# Words that mean "needs the Mac's toolchain/GUI". Deliberately narrow: a
-# false positive only delays a ticket until the Mac is up (and ``--placement
-# any`` overrides it); a false negative sends it to a box that cannot do it.
+# Mac toolchain hints for tickets filed on a Mac. Generic browser automation
+# runs on either platform and a Mac filer may be writing into a Linux store.
 _MAC_HINT_RE = _re.compile(
     r"\b(xcode|xcodebuild|ios|iphone|ipad|simulator|testflight|swiftui|"
-    r"cocoapods|pod install|app ?store ?connect|safari|screenshot|"
-    r"keychain|launchctl|launchd|osascript|macos|mac app|\.app\b|"
-    r"puppeteer|chrome-devtools|playwright)\b",
+    r"cocoapods|pod install|app ?store ?connect|safari|"
+    r"keychain|launchctl|launchd|osascript|macos|mac app|\.app\b)\b",
     _re.IGNORECASE,
 )
 

@@ -91,9 +91,13 @@ def _oneline(s: str) -> str:
 
 
 def _eta_note(r: dict) -> str:
-    """Drain-rate + ETA readout for a queue row, e.g. '~3/min · empty in ~20m'.
-
-    'stalled' when the rate is 0 and there is open work; '' for a clear queue."""
+    """Show a placement wait or the estimated time until the queue empties."""
+    placement_blocked = r.get("placement_blocked") or {}
+    if placement_blocked:
+        requirements = ", ".join(
+            f"{count} {kind}-only" for kind, count in sorted(placement_blocked.items())
+        )
+        return f"placement: {requirements} (this machine: {r['machine_placement']})"
     rate = r.get("drain_rate_per_min") or 0
     if r.get("depth", 0) == 0:
         return ""
@@ -7707,7 +7711,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--placement", default="", choices=list(q.VALID_PLACEMENTS) + [""],
                                help="which machine may run this: mac (waits for the Mac), "
                                     "cloud (Linux/VM only), any. Default: a Mac filer's "
-                                    "Xcode/iOS/simulator/browser keyword heuristic picks mac, "
+                                    "Mac toolchain keyword heuristic picks mac, "
                                     "otherwise unrestricted")
         subparser.add_argument("--planner-model", default="", dest="planner_model",
                                help="model that plans this ticket (overrides the queue)")

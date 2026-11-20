@@ -3,6 +3,7 @@ claim filtering respects the claiming machine's kind."""
 from __future__ import annotations
 
 import importlib
+import json
 
 import pytest
 
@@ -85,6 +86,47 @@ def test_heuristic_marks_mac_only_for_a_mac_filer(wt, monkeypatch):
     _on(monkeypatch, "cloud")
     lin = wt.q.enqueue(project="PL", note="fix Xcode build")
     assert "placement" not in lin
+
+
+@pytest.mark.parametrize("tool", ["Puppeteer", "Playwright", "chrome-devtools", "screenshot"])
+def test_browser_work_filed_on_mac_is_claimable_on_cloud(wt, monkeypatch, tool):
+    monkeypatch.setattr(wt.q.sys, "platform", "darwin")
+    _on(monkeypatch, "mac")
+    filed = wt.q.enqueue(
+        project="PL", note="Open conversation tab stops showing replies",
+        text=f"Reproduce the Mac dashboard issue with {tool}.",
+    )
+    assert "placement" not in filed
+    assert "placement_source" not in filed
+    _on(monkeypatch, "cloud")
+    assert wt.q.claim_next("w-cloud", project="PL")["ref"] == filed["ref"]
+
+
+def test_status_surfaces_remote_placement_even_with_recent_closes(wt, monkeypatch, capsys):
+    _on(monkeypatch, "cloud")
+    done = wt.q.enqueue(project="PL", note="previous task")
+    wt.q.close(done["ref"])
+    wt.q.enqueue(project="PL", note="run the iOS simulator", placement="mac")
+
+    assert wt.cli.main(["status", "-q", "PL", "--json"]) == 0
+    row, = json.loads(capsys.readouterr().out)
+    assert row["claimable_depth"] == 0
+    assert row["machine_placement"] == "cloud"
+    assert row["placement_blocked"] == {"mac": 1}
+    assert row["drain_rate_per_min"] > 0
+    assert row["eta_seconds"] is None
+
+    assert wt.cli.main(["status", "-q", "PL"]) == 0
+    output = capsys.readouterr().out
+    assert "placement: 1 mac-only (this machine: cloud)" in output
+    assert "empty in" not in output
+
+    _on(monkeypatch, "mac")
+    assert wt.cli.main(["status", "-q", "PL", "--json"]) == 0
+    row, = json.loads(capsys.readouterr().out)
+    assert row["claimable_depth"] == 1
+    assert row["placement_blocked"] == {}
+    assert row["eta_seconds"] > 0
 
 
 def test_update_validates_and_clears(wt):

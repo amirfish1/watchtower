@@ -209,6 +209,10 @@ def queue_status(
     ``blocked_by`` dependency (WT-4). They count toward ``depth`` but not
     ``claimable_depth``, and are reported separately as ``blocked``.
 
+    ``placement_blocked`` counts open tickets by the machine kind they
+    require when that kind differs from this host's. This is a local view
+    of eligibility, so it does not assert whether another host is available.
+
     ``auto_drain`` (the queue's policy) shapes the *display* ``state`` but not
     the raw ``stuck`` ground-truth: a queue that's opted out of auto-drain
     (a prioritization backlog) reports ``state="backlog"`` — calm, expected —
@@ -233,6 +237,13 @@ def queue_status(
     closed = [it for it in items if it.get("status") == "closed"]
 
     depth = len(open_items)
+    machine = q.machine_placement()
+    placement_blocked: Dict[str, int] = {}
+    for it in open_items:
+        if not q.placement_allows(it, machine):
+            required = q._norm_placement(it.get("placement"))
+            placement_blocked[required] = placement_blocked.get(required, 0) + 1
+
     group_idx = (q._refs_index(q.list_items())
                  if any(q.group_role(it) for it in open_items) else {})
     claimable_open = [
@@ -253,7 +264,7 @@ def queue_status(
         and not q._affinity_reserved(it, now_ts)
         # Placement: a ticket pinned to the other kind of machine is not open
         # work for this machine's pool either.
-        and q.placement_allows(it)
+        and q.placement_allows(it, machine)
         and (
             not worker_model
             or config.model_meets_floor(worker_model, it.get("model_floor") or "")
@@ -354,8 +365,9 @@ def queue_status(
             closed_in_window += 1
     drain_rate = round(closed_in_window / drain_window_minutes, 2)
 
-    # ETA to empty: depth / rate (seconds). Zero rate => stalled (null/None).
-    if drain_rate > 0 and depth > 0:
+    # With placement waits, this host's drain rate cannot predict when the
+    # queue will empty. Leave the ETA unknown while that work is open.
+    if drain_rate > 0 and depth > 0 and not placement_blocked:
         eta_seconds: Optional[int] = int(round(depth / drain_rate * 60))
     elif depth == 0:
         eta_seconds = 0
@@ -389,6 +401,8 @@ def queue_status(
         "queue": project,
         "depth": depth,
         "claimable_depth": claimable_depth,
+        "machine_placement": machine,
+        "placement_blocked": placement_blocked,
         "blocked": sum(1 for it in open_items if it.get("ref") in (waiting_refs or ())),
         "in_progress": len(in_progress),
         "in_review": sum(1 for it in items if it.get("status") == "in_review"),
