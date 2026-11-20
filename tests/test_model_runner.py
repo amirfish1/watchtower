@@ -101,10 +101,39 @@ def test_capture_timeout(tmp_path):
     with pytest.raises(mr.ModelRunError,match='timed out'):
         mr._capture([sys.executable,'-c','import time;time.sleep(10)'],'',tmp_path,.1,1024,{})
 
-def test_codex_unsupported_tools_fails_closed(tmp_path,monkeypatch):
-    monkeypatch.setattr(mr,'_capture',lambda *a:pytest.fail('must not launch unsupported provider'))
-    with pytest.raises(mr.ModelRunError,match='tools:none execution is unavailable'):
-        mr._attempt({**SECOND,'engine':'codex'},REQUEST,tmp_path,1,1024)
+def test_codex_tools_none_execution_and_isolation(tmp_path,monkeypatch):
+    import json
+    calls=[]
+    def capture(argv,prompt,*a):
+        calls.append((argv,prompt))
+        out_path=argv[argv.index('-o')+1]
+        with open(out_path,'w') as fh:
+            fh.write('{"ok": true}')
+        jsonl='\n'.join([
+            json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'{"ok": true}'}}),
+            json.dumps({'type':'turn.completed','usage':{'input_tokens':50,'output_tokens':5}}),
+        ])
+        return 0,jsonl,''
+    monkeypatch.setattr(mr,'_capture',capture)
+    result,failure=mr._attempt({'engine':'codex','model':'gpt-6.1-sol','effort':'medium'},REQUEST,tmp_path,1,1024)
+    assert result and not failure
+    assert result['structured_output']=={'ok':True}
+    argv=calls[0][0]
+    assert '--output-schema' in argv
+    assert '--ignore-user-config' in argv
+    assert '--ephemeral' in argv
+    assert argv[argv.index('-s')+1]=='read-only'
+
+
+def test_codex_tools_none_rejects_command_execution(tmp_path,monkeypatch):
+    import json
+    jsonl='\n'.join([
+        json.dumps({'type':'item.completed','item':{'type':'command_execution','command':'ls'}}),
+        json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'{"ok": true}'}}),
+    ])
+    monkeypatch.setattr(mr,'_capture',lambda *a:(0,jsonl,''))
+    assert mr._attempt({'engine':'codex','model':'gpt-6.1-sol','effort':'medium'},REQUEST,tmp_path,1,1024)==(None,'failed')
+
 
 def test_claude_restrictions_and_budget(tmp_path,monkeypatch):
     import json
@@ -123,9 +152,9 @@ def test_claude_restrictions_and_budget(tmp_path,monkeypatch):
 
 
 def test_unsupported_profile_rejected_before_any_prompt(monkeypatch):
-    monkeypatch.setattr(mr.config,'model_profile',lambda n:{'models':[FIRST,{**SECOND,'engine':'codex'}]})
+    monkeypatch.setattr(mr.config,'model_profile',lambda n:{'models':[FIRST,{**SECOND,'engine':'cursor'}]})
     monkeypatch.setattr(mr,'_attempt',lambda *a:pytest.fail('must fail before provider invocation'))
-    with pytest.raises(mr.ModelRunError,match='profile_capability_unavailable: codex'):
+    with pytest.raises(mr.ModelRunError,match='profile_capability_unavailable: cursor'):
         mr.run(REQUEST)
 
 

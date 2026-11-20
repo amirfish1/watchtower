@@ -149,10 +149,64 @@ def _attempt(candidate, request, directory, timeout, limit):
                 '--respect-workspace-trust', 'false', '--', combined]
         prompt = ''
     elif engine == 'codex':
-        raise ModelRunError('Codex tools:none execution is unavailable in the installed runtime; profile cannot safely fall back')
+        schema_path = os.path.join(directory, 'codex-schema.json')
+        out_path = os.path.join(directory, 'codex-last.txt')
+        with open(schema_path, 'w') as fh:
+            json.dump(request['json_schema'], fh)
+        argv = [workers._resolve_engine_bin('codex') or 'codex', 'exec',
+                '-s', 'read-only', '--ignore-user-config', '--ignore-rules',
+                '--ephemeral', '--skip-git-repo-check',
+                '-C', str(directory), '-m', model,
+                '-c', f'model_reasoning_effort={json.dumps(effort)}',
+                '--output-schema', schema_path, '-o', out_path, '--json', '-']
+        prompt = (request['system'] + '\n\n' + request['prompt'] +
+                  '\n\nIMPORTANT: Do not invoke any shell, file, or network tools. '
+                  'Answer directly from the prompt.')
     else:
         raise ModelRunError('profile engine does not support tool-free structured execution')
     rc, out, err = _capture(argv, prompt, directory, timeout, limit, env)
+    if engine == 'codex':
+        usage = {}
+        agent_messages = []
+        disallowed = False
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or not line.startswith('{'):
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            ev_type = ev.get('type')
+            if ev_type == 'turn.completed' and isinstance(ev.get('usage'), dict):
+                usage = ev['usage']
+            elif ev_type == 'item.completed' and isinstance(ev.get('item'), dict):
+                item = ev['item']
+                if item.get('type') == 'agent_message' and isinstance(item.get('text'), str):
+                    agent_messages.append(item['text'])
+                elif item.get('type') in ('command_execution', 'file_change'):
+                    disallowed = True
+        if disallowed:
+            return None, 'failed'
+        if rc != 0:
+            spent = any((usage.get(k) or 0) > 0 for k in ('input_tokens', 'output_tokens'))
+            return None, _failure_kind(out + '\n' + err, zero_tokens=not spent)
+        text = ''
+        if os.path.isfile(out_path):
+            with open(out_path, encoding='utf-8', errors='replace') as fh:
+                text = fh.read().strip()
+        if not text and agent_messages:
+            text = agent_messages[-1].strip()
+        try:
+            structured = json.loads(text)
+        except ValueError:
+            return None, 'failed'
+        model_usage = {model: {
+            'inputTokens': int(usage.get('input_tokens') or 0),
+            'outputTokens': int(usage.get('output_tokens') or 0),
+        }} if usage else {}
+        return {'subtype': 'success', 'is_error': False, 'result': text,
+                'structured_output': structured, 'modelUsage': model_usage}, ''
     if engine == 'devin':
         if rc != 0:
             return None, _failure_kind(out + '\n' + err)
@@ -242,7 +296,7 @@ def run(request):
     if not (config.worker_fallback_policy() or {}).get('enabled'):
         candidates = candidates[:1]
     for candidate in candidates:
-        if candidate['engine'] not in ('claude', 'devin'):
+        if candidate['engine'] not in ('claude', 'codex', 'devin'):
             raise ModelRunError('profile_capability_unavailable: ' + candidate['engine'] + ' has no enforceable tools:none structured runner')
     trace = []
     exhausted_engines = set()
