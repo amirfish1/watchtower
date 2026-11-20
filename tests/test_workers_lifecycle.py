@@ -3485,10 +3485,38 @@ def test_peek_next_non_mutating(wt):
     assert claimed["ref"] == peeked["ref"]
 
 
-def test_repo_path_config_priority(wt):
+def test_scoped_first_staffing_reads_only_open_rows_and_named_blockers(wt, monkeypatch):
+    wt.config.set_auto_drain("Q", True)
+    blocker = wt.q.enqueue(project="OTHER", note="prerequisite")
+    wt.q.enqueue(project="Q", note="depends", blocked_by=[blocker["ref"]],
+                 repo_path="/ticket/repo")
+    wt.q.enqueue(project="Q", note="closed history")
+    wt.q.close("Q-2", resolution="done")
+
+    def no_archive_read(*args, **kwargs):
+        pytest.fail("scoped first staffing loaded the full store")
+
+    with monkeypatch.context() as scoped:
+        scoped.setattr(wt.q, "_load_unlocked", no_archive_read)
+        waiting = wt.workers.reconcile_once(dry_run=True, only_queue="Q")
+        assert not waiting["spawned"]
+        assert wt.q.peek_next(project="Q") is None
+
+    wt.q.close(blocker["ref"], resolution="done")
+    with monkeypatch.context() as scoped:
+        scoped.setattr(wt.q, "_load_unlocked", no_archive_read)
+        ready = wt.workers.reconcile_once(dry_run=True, only_queue="Q")
+        assert ready["spawn_plans"][0]["claimable_depth"] == 1
+        assert [row["repo_path"] for row in ready["spawned"]] == ["/ticket/repo"]
+    assert wt.q.claim_next("w1", project="Q")["ref"] == "Q-1"
+
+
+def test_repo_path_config_priority(wt, monkeypatch):
     wt.config.set_auto_drain("Q", True)
     wt.config.set_repo_path("Q", "/configured/path")
     wt.q.enqueue(project="Q", note="work")
+    monkeypatch.setattr(wt.q, "peek_next",
+                        lambda **kwargs: pytest.fail("peeked past configured repo"))
     r = wt.workers.reconcile_once(dry_run=True)
     spawned = [s for s in r["spawned"] if s["queue"] == "Q"]
     assert spawned and spawned[0]["repo_path"] == "/configured/path"

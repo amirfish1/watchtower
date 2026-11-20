@@ -3000,6 +3000,69 @@ def _claim_candidates(
     return candidates
 
 
+def _sqlite_open_items(conn: sqlite3.Connection, project: str) -> List[Dict[str, Any]]:
+    items = [json.loads(row[0]) for row in conn.execute(
+        "SELECT item_json FROM items WHERE project = ? AND status = 'open' ORDER BY number",
+        (project,),
+    )]
+    for item in items:
+        if not item.get("slug"):
+            item["slug"] = slug_of(item)
+    return items
+
+
+def open_staffing_items(project: str) -> Optional[List[Dict[str, Any]]]:
+    """Indexed backlog read for a scoped local staffing pass with no live workers."""
+    db = _db_path()
+    try:
+        conn = sqlite3.connect(db.absolute().as_uri() + "?mode=ro", uri=True)
+        try:
+            return _sqlite_open_items(conn, project)
+        finally:
+            conn.close()
+    except (sqlite3.Error, ValueError):
+        return None  # Legacy or unreadable store: use the normal listing.
+
+
+def _indexed_local_candidates(
+    project: Optional[str], **filters: Any,
+) -> Optional[List[Dict[str, Any]]]:
+    """Read scoped candidates and their local prerequisites under the store lock.
+
+    Remote dependency refreshes use the normal path outside the lock. The
+    indexed path shares the claim filter and does not modify queue state.
+    """
+    from . import config
+
+    if not project:
+        return None
+    db = _db_path()
+    if not db.exists():
+        return None
+    try:
+        with _FileLock(_lock_path()):
+            conn = sqlite3.connect(db.absolute().as_uri() + "?mode=ro", uri=True)
+            try:
+                conn.execute("BEGIN")
+                items = _sqlite_open_items(conn, project)
+                related_refs = {ref for item in items for ref in item.get("blocked_by") or []}
+                related_refs.update(filter(None, (group_parent_ref(item) for item in items)))
+                if any(config.backend(_project_from_ident(ref)) == "github"
+                       for ref in related_refs):
+                    return None
+                related_refs.difference_update(item.get("ref") for item in items)
+                related = [
+                    json.loads(row[0])
+                    for ref in related_refs
+                    for row in conn.execute("SELECT item_json FROM items WHERE ref = ?", (ref,))
+                ]
+            finally:
+                conn.close()
+            return _claim_candidates(items, all_items=items + related, project=project, **filters)
+    except (sqlite3.Error, ValueError):
+        return None
+
+
 def count_claimable(
     project: Optional[str] = None,
     lane: Optional[str] = None,
@@ -3020,6 +3083,11 @@ def count_claimable(
     if backend is not None:
         return backend.count_claimable(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
+    candidates = _indexed_local_candidates(
+        proj, lane=lane, item_types=item_types, worker_model=worker_model,
+    )
+    if candidates is not None:
+        return len(candidates)
     dependencies = _dependency_snapshot(project=proj, fresh=False)
     with _FileLock(_lock_path()):
         data = _load_unlocked(readonly=True)
@@ -3050,6 +3118,11 @@ def count_manual_eligible(
     if backend is not None:
         return backend.count_manual_eligible(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
+    candidates = _indexed_local_candidates(
+        proj, lane=lane, item_types=item_types, requested_only=True,
+    )
+    if candidates is not None:
+        return len(candidates)
     dependencies = _dependency_snapshot(project=proj, fresh=False)
     with _FileLock(_lock_path()):
         data = _load_unlocked(readonly=True)
@@ -3482,6 +3555,7 @@ def peek_next(
 
     Uses the same smart sort as claim_next (priority → type → age).
     Returns None when nothing is open and claimable."""
+    from copy import deepcopy
     from . import config
     if config.is_tracker(project):
         return None
@@ -3489,15 +3563,20 @@ def peek_next(
     if backend is not None:
         return backend.peek_next(lane=lane, item_types=item_types)
     proj = _norm_project(project) if project else None
+    candidates = _indexed_local_candidates(
+        proj, lane=lane, item_types=item_types, worker_model=worker_model,
+    )
+    if candidates is not None:
+        return candidates[0] if candidates else None
     dependencies = _dependency_snapshot(project=proj)
     with _FileLock(_lock_path()):
-        data = _load_unlocked()
+        data = _load_unlocked(readonly=True)
         candidates = _claim_candidates(
             data["items"], all_items=data["items"] + dependencies,
             project=proj, lane=lane, item_types=item_types,
             worker_model=worker_model,
         )
-        return dict(candidates[0]) if candidates else None
+        return deepcopy(candidates[0]) if candidates else None
 
 
 def floor_routed_candidates(

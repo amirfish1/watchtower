@@ -340,3 +340,33 @@ matched before/after comparison. Raw script, timings and profile live in
 `~/.watchtower/evidence/WT-104/`. The historical watch keeps its failures;
 future startup evidence uses a new permanent watch from actual adoption.
 Natural <=30-second startup remains an explicit caveat until real exposure.
+
+## WT-105: first staffing read the archive before launching
+
+The WT-68 watch caught CCC-635 on November 20. It enqueued at 13:10:06 UTC,
+reached SPAWN_PLAN at 13:10:18, started the process at 13:10:20.625 and reached
+durable CLAIM at 13:10:41. The watch measured **35s** (14s before process
+creation, 21s afterward). Staffing lock acquisition and idle release each
+took under 0.006s, and claim selection took 4.187s. The transcript shows the
+combined brief and claim from WT-104. The logs do not resolve the full 12s
+between idle release and the spawn plan.
+
+A cold copied-store profile found two archive costs in scoped staffing.
+Listing and preparing the health snapshot deserialized the full store and
+copied the queue's archived rows, even with zero workers to nudge. Repo
+selection also peeked and copied the store before using the configured path.
+Scoped first staffing now reads indexed open rows. SQLite candidate reads
+use the same claim filter with only the named prerequisites and group parents.
+They keep the local store lock and fall back to the existing resolution path
+for remote dependencies or legacy stores. A configured repo path avoids the
+peek. Scoped timing records the item, health and depth reads separately.
+
+Five alternating cold-process pairs on one copied live store (4,437 items at
+capture, scoped CCC staffing dry run) produced the same plan to launch one
+worker for one eligible ticket. Median time to SPAWN_PLAN fell from **1.344s
+to 0.047s**, and median total scoped reconcile time from **2.143s to 0.051s**.
+No workers or model turns ran. Scripts, timings, profile and original watch
+receipt are under `~/.watchtower/evidence/WT-105/`. This benchmark measures
+staffing work and does not reproduce the entire historical delay. The natural
+monitor keeps the 30s threshold and measures from the new daemon revision's
+adoption. The original watch retains its historical result.

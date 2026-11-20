@@ -7445,10 +7445,20 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
     # spawn decision can staff productive capacity around them instead of
     # waiting on the block to clear.
     from . import queue as _q
-    try:
-        _all_items = _q.list_items(project=staff_queue) or []
-    except Exception:
-        _all_items = None
+    # Local first staffing uses open rows for backlog and eligibility. Without
+    # live workers there is nobody to nudge using historical health, and local
+    # queues do not emit the GitHub eligibility audit.
+    cold_local = (only_queue and not live_by_queue.get(staff_queue)
+                  and config.backend(staff_queue) != "github"
+                  and not config.is_archived(staff_queue))
+    timing = (_startup_timing(staff_queue, "staffing_items")
+              if only_queue and not dry_run else nullcontext())
+    with timing:
+        open_items = _q.open_staffing_items(staff_queue) if cold_local else None
+        try:
+            _all_items = open_items if open_items is not None else _q.list_items(project=staff_queue) or []
+        except Exception:
+            _all_items = None
 
     from . import queue as _q_blocked
     blocked_worker_ids: Dict[str, Set[str]] = {}
@@ -7486,10 +7496,15 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
         retained_parked = set()
 
     # Read this queue's health and capacity again under its staffing lock.
-    health_by_queue: Dict[str, Dict[str, Any]] = {
-        row["queue"]: row
-        for row in health.all_status(project=staff_queue, items=_all_items)
-    }
+    health_by_queue: Dict[str, Dict[str, Any]] = {}
+    if open_items is None:
+        timing = (_startup_timing(staff_queue, "staffing_health")
+                  if only_queue and not dry_run else nullcontext())
+        with timing:
+            health_by_queue = {
+                row["queue"]: row
+                for row in health.all_status(project=staff_queue, items=_all_items)
+            }
 
     # Raw open depth per queue, for the "N open" figure in skip/spawn messages
     # (unfiltered -- just how big the backlog is, regardless of claimability).
@@ -7813,18 +7828,21 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
                 print(f"[watchtower] eligibility audit failed for {q_name}: "
                       f"{type(audit_error).__name__}", file=sys.stderr)
 
+        timing = (_startup_timing(q_name, "staffing_depth")
+                  if only_queue and not dry_run else nullcontext())
         try:
-            if auto:
-                depth, total_open = _claimable_depth(q_name)
-            else:
-                # auto_drain=off means "no *automatic* work" -- it is not a veto
-                # on a run a human explicitly asked for. Without this the ▶
-                # button is a dead end: the ticket is marked run_requested and
-                # then nothing ever spawns for it. Only the requested tickets
-                # count as depth here, so the rest of the backlog stays parked.
-                depth = _manual_depth(q_name)
-                total_open = _total_open_by_q.get(q_name, 0)
-                manual_run = depth > 0
+            with timing:
+                if auto:
+                    depth, total_open = _claimable_depth(q_name)
+                else:
+                    # auto_drain=off means "no *automatic* work" -- it is not a veto
+                    # on a run a human explicitly asked for. Without this the ▶
+                    # button is a dead end: the ticket is marked run_requested and
+                    # then nothing ever spawns for it. Only the requested tickets
+                    # count as depth here, so the rest of the backlog stays parked.
+                    depth = _manual_depth(q_name)
+                    total_open = _total_open_by_q.get(q_name, 0)
+                    manual_run = depth > 0
         except Exception as exc:  # A remote queue must not abort every queue.
             audit_eligibility(None, _total_open_by_q.get(q_name, 0),
                               f"depth_lookup_failed:{type(exc).__name__}")
@@ -8017,14 +8035,12 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
                 )
                 continue
             from . import queue as _q
-            # Peek at the next ticket to get its repo_path; fall back to queue config.
-            peeked = _q.peek_next(
-                project=q_name, worker_model=config.queue_model_id(q_name),
-            )
-            repo_path = (
-                config.repo_path(q_name)
-                or (peeked or {}).get("repo_path", "")
-            )
+            repo_path = config.repo_path(q_name)
+            if not repo_path:
+                peeked = _q.peek_next(
+                    project=q_name, worker_model=config.queue_model_id(q_name),
+                )
+                repo_path = (peeked or {}).get("repo_path", "")
             engine = config.engine(q_name)
             # A fallback engine is a launch-time substitution only
             # (WATCHTOWER-30): the queue's stored engine/model are the user's
