@@ -122,6 +122,10 @@ def _print_status(rows: List[dict]) -> None:
     from . import config as _cfg
     daemon_state = _svc_state(DAEMON_PID_FILE)
     dash_state   = _svc_state(DASHBOARD_PID_FILE)
+    if daemon_state.startswith("running") and not dash_state.startswith("running"):
+        # The daemon always hosts the HTTP dashboard in-process; the pidfile
+        # only tracks a detached `wt dashboard`, so "stopped" here was false.
+        dash_state = "in daemon"
     print(f"service:  daemon={daemon_state}  dashboard={dash_state}")
     print(f"store:    {q.store_path()}")
     try:
