@@ -618,7 +618,7 @@ def test_config_command_resolves_claude_opus_5_alias(store, capsys):
     ]) == 0
     assert config.model("DEMO") == "claude-opus-5"
     assert config.get_queue_config("DEMO")["model"] == "claude-opus-5"
-    assert "opus-5" in config.approved_models("claude")
+    assert "opus-5" not in config.approved_models("claude")
     assert config.is_approved_model("claude", "opus-5")
 
 

@@ -69,11 +69,6 @@ DEFAULT_NOTIFY_EVENTS = ("closed", "needs_input", "awaits_decision")
 # Model ids/aliases/efforts/ranks come from each engine's own catalog
 # (see models.py); nothing in this module names a model.
 
-# Claude short forms that carry a version (``sonnet-5``, ``opus-4-8``) and so
-# need the ``claude-`` prefix to be a valid ``--model`` flag value. Bare family
-# names (``sonnet``) are already accepted by the CLI and must NOT be rewritten.
-_CLAUDE_VERSIONED_ALIAS = re.compile(r"^(sonnet|opus|haiku|fable)-\d", re.IGNORECASE)
-
 _LEGACY_CONFIG_FILE = Path.home() / ".watchtower" / "queue-config.json"
 CONFIG_FILE = Path(
     os.environ.get("WATCHTOWER_CONFIG_FILE")
@@ -1389,7 +1384,9 @@ def _usable_pin(queue: str, eng: str) -> str:
         return pin
     # Approved for ANY engine: a spawn may override the queue's engine, and
     # the pin then rides along (a pin for no engine at all is the bad case).
-    if is_approved_model(eng, pin) or any(pin in approved_models(e) for e in _models.ENGINES):
+    if is_approved_model(eng, pin) or any(
+        canonical_model(e, pin) in approved_models(e) for e in _models.ENGINES
+    ):
         return pin
     return ""
 
@@ -1615,19 +1612,17 @@ def canonical_model(eng: str, model_value: str) -> str:
     aliased = _models.aliases(eng).get(m)
     if aliased:
         return aliased
-    if eng == "claude" and m and not m.lower().startswith("claude-") \
-            and _CLAUDE_VERSIONED_ALIAS.match(m):
-        return f"claude-{m}"
-    return m
+    return _models.claude_launch_id(m) if eng == "claude" else m
 
 
 def approved_models(eng: str) -> tuple[str, ...]:
     """Model identifiers the engine's catalog offers (minus policy-blocked
-    ones), plus their aliases. Empty when no catalog is readable -- see
-    :func:`models.catalog_warning`; :func:`is_approved_model` then accepts
-    any explicit pin."""
+    ones), plus aliases for engines that list them as selectable inputs.
+    Claude exposes canonical launch IDs. Empty when no catalog is readable."""
     eng = str(eng or "").strip().lower()
     canonical = tuple(m for m in (_models.catalog(eng) or ()) if not is_blocked_model(m))
+    if eng == "claude":
+        return canonical
     return canonical + tuple(_models.aliases(eng))
 
 
@@ -1688,11 +1683,12 @@ def is_approved_model(eng: str, value: str) -> bool:
     model_value = str(value or "").strip()
     if not model_value:
         return True
-    if is_blocked_model(canonical_model(eng, model_value)):
+    canonical = canonical_model(eng, model_value)
+    if is_blocked_model(canonical):
         return False
     if _models.catalog(eng) is None:
         return True  # unknown catalog: never reject an explicit pin
-    return model_value in approved_models(eng)
+    return canonical in approved_models(eng)
 
 
 def approved_efforts(eng: str, model: str = "") -> tuple[str, ...]:

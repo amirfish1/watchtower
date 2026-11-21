@@ -47,6 +47,7 @@ USER_MODELS_FILE = _path("WATCHTOWER_MODELS_FILE",
 
 # Fable is a frontier tier reserved for interactive use, never a worker model.
 _EXCLUDED_WORKER = re.compile(r"fable", re.I)
+_CLAUDE_VERSIONED_ALIAS = re.compile(r"^(sonnet|opus|haiku|fable)-\d", re.I)
 
 _cache: Dict[Tuple[str, int, int], Any] = {}
 
@@ -67,6 +68,11 @@ def _read_json(path: Path) -> Any:
 def _entry(model_id: str, efforts: tuple = (), price: Any = None,
            label: str = "") -> Dict[str, Any]:
     return {"id": model_id, "efforts": efforts, "price": price, "label": label}
+
+
+def claude_launch_id(model_id: str) -> str:
+    """Add the CLI prefix to versioned short IDs, preserving bare families."""
+    return f"claude-{model_id}" if _CLAUDE_VERSIONED_ALIAS.match(model_id) else model_id
 
 
 def _codex() -> Optional[List[dict]]:
@@ -124,10 +130,13 @@ def _user(eng: str) -> Optional[List[dict]]:
     out = []
     for r in rows:
         if isinstance(r, str):
-            out.append(_entry(r))
+            out.append(_entry(claude_launch_id(r) if eng == "claude" else r))
         elif isinstance(r, dict) and r.get("id"):
             eff = tuple(e for e in VALID_EFFORTS if e in (r.get("efforts") or ()))
-            out.append(_entry(str(r["id"]), eff, r.get("output_per_mtok"),
+            model_id = str(r["id"])
+            if eng == "claude":
+                model_id = claude_launch_id(model_id)
+            out.append(_entry(model_id, eff, r.get("output_per_mtok"),
                               str(r.get("label") or "")))
     return out
 

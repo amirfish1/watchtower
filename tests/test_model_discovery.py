@@ -1,6 +1,8 @@
 """WT-13: model lists come from engine catalogs, never from code."""
 import json
+import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -40,6 +42,44 @@ def test_catalog_models_approved_with_efforts(catalogs):
     assert not config.is_approved_model("codex", "hidden-one")
     assert config.is_approved_model("claude", "claude-opus-9")
     assert config.canonical_model("claude", "opus-9") == "claude-opus-9"
+
+
+def test_approved_claude_ids_are_canonical(catalogs):
+    assert config.approved_models("claude") == ("claude-opus-9",)
+    assert config.is_approved_model("claude", "opus-9")
+
+
+def test_custom_claude_catalog_normalizes_short_ids(catalogs):
+    catalogs["USER_MODELS_FILE"].write_text(json.dumps({"engines": {"claude": [
+        "opus-9", {"id": "sonnet-9", "label": "Latest Sonnet"},
+    ]}}))
+    assert config.approved_models("claude") == ("claude-opus-9", "claude-sonnet-9")
+    assert config.is_approved_model("claude", "Latest Sonnet")
+
+
+@pytest.mark.skipif(os.environ.get("WT_TEST_LIVE_CLAUDE") != "1",
+                    reason="requires a logged-in Claude subscription")
+def test_live_approved_claude_models_run_in_ccc(monkeypatch, tmp_path):
+    monkeypatch.setattr(models, "CLAUDE_MODELS_FILE",
+                        Path.home() / ".claude/command-center/claude-models.json")
+    monkeypatch.setattr(models, "USER_MODELS_FILE", Path.home() / ".watchtower/models.json")
+    approved = config.approved_models("claude")
+    assert approved
+    failures = {}
+    for model_id in approved:
+        run = subprocess.run(
+            ["ccc", "run", "--cwd", str(tmp_path), "--engine", "claude", "--model", model_id,
+             "--subscription-only", "--tools", "none", "--no-session-persistence",
+             "--max-turns", "1", "--timeout", "25", "--json", "Reply with exactly OK."],
+            capture_output=True, text=True, timeout=35,
+        )
+        if run.returncode:
+            failures[model_id] = run.stderr or run.stdout
+        else:
+            result = json.loads(run.stdout)
+            if not result["ok"] or result["model"] != model_id:
+                failures[model_id] = result
+    assert not failures
 
 
 def test_fable_is_never_a_worker_model(catalogs):

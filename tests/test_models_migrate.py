@@ -56,12 +56,19 @@ def test_apply_changes_only_pinned_matches(env):
     assert json.loads(env.defaults.read_text())["worker_model"] == "sonnet-5"
 
 
-def test_include_default_rewrites_keys_keeping_short_form(env, capsys):
-    assert cli.cmd_models_migrate(_ns(apply=True, include_default=True)) == 0
+def test_include_default_writes_canonical_ids(env, capsys):
+    assert cli.cmd_models_migrate(_ns(to_model="sonnet-5-5", apply=True, include_default=True)) == 0
     data = json.loads(env.defaults.read_text())
-    assert data["worker_model"] == "sonnet-5-5" and data["models"]["claude"] == "sonnet-5-5"
+    assert data["worker_model"] == data["models"]["claude"] == "claude-sonnet-5-5"
     assert config.raw_model("C") == "claude-sonnet-5-5"
     assert "worker_model" in capsys.readouterr().out
+
+
+def test_include_default_can_normalize_the_existing_model(env):
+    plan = mm.plan_migrate("sonnet-5", "claude-sonnet-5", include_default=True)
+    assert {change["key"] for change in plan["default_changes"]} == {"worker_model", "models.claude"}
+    mm.apply_migrate(plan)
+    assert not mm.plan_migrate("sonnet-5", "claude-sonnet-5", include_default=True)["default_changes"]
 
 
 def test_unapproved_target_refused(env, capsys):

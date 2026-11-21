@@ -68,8 +68,8 @@ def _row(queue_name: str, entry: dict, items: List[dict]) -> dict:
 
 
 def _default_changes(frm: str, to: str) -> List[dict]:
-    """Keys in CCC spawn-defaults.json that resolve to ``frm`` and should become
-    ``to``. Original short-form style ("sonnet-5" vs "claude-sonnet-5") kept."""
+    """Keys in CCC spawn-defaults.json that resolve to ``frm`` and should store
+    the canonical target ID ``to``."""
     path = config.CCC_SPAWN_DEFAULTS_FILE
     try:
         data = json.loads(Path(path).read_text())
@@ -80,11 +80,9 @@ def _default_changes(frm: str, to: str) -> List[dict]:
 
     def consider(keypath, cur, cur_engine):
         cur = str(cur or "").strip()
-        if not cur or config.canonical_model(cur_engine, cur) != frm:
+        if not cur or cur == to or config.canonical_model(cur_engine, cur) != frm:
             return
-        new = to[len("claude-"):] if cur_engine == "claude" and not cur.startswith("claude-") \
-            and to.startswith("claude-") else to
-        changes.append({"key": keypath, "from": cur, "to": new})
+        changes.append({"key": keypath, "from": cur, "to": to})
 
     consider("worker_model", data.get("worker_model"),
              str(data.get("worker_engine") or "").strip().lower())
