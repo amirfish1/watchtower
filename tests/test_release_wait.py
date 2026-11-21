@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 from tests.test_owner_view import _load, _ticket  # noqa: F401
-from watchtower import release_wait
+from watchtower import release_wait, releases
 
 
 def _git(repo, *args):
@@ -84,6 +84,65 @@ def test_release_claim_needs_proof_and_integration_is_retired(repo):
 @pytest.fixture(params=["file", "github"])
 def env(request, tmp_path, monkeypatch):
     return _load(tmp_path, monkeypatch, request.param)
+
+
+def test_after_close_holds_requested_claim_until_live_acceptance(env, repo, capsys):
+    q, cli, _a, _ov, name = env
+    prerequisite = _ticket(q, name, note="fix to deploy")
+    consumer = _ticket(q, name, note="verify downstream", worker="prior-worker")
+    q.mark_runnable(consumer)
+    assert cli.main(["edit", consumer, "--after-close", prerequisite]) == 0
+    capsys.readouterr()
+
+    target = "watchtower:local"
+    parked = releases.park(prerequisite, "w1", repo=repo["path"], commit=repo["merged"],
+                           branch="origin/next", target=target, reason="waiting for the build")
+    assert parked["status"] == "awaiting_release"
+    dependent = q.get(consumer)
+    assert dependent["status"] == "open"
+    assert dependent["run_requested"] is True
+    assert q.waiting_on(dependent, {prerequisite: parked}) == [prerequisite]
+    with pytest.raises(ValueError, match="waiting"):
+        q.claim_by_ref(consumer, "worker")
+    assert q.count_manual_eligible(project=name) == 0
+
+    claim = ["claim", "-q", name, "--worker", "worker", "--requested-only", "--json"]
+    assert cli.main(claim) == 0
+    assert not capsys.readouterr().out.strip()
+    source_work = q.enqueue(project=name, note="integrate source", blocked_by=[prerequisite])
+    q.mark_runnable(source_work["ref"])
+    assert cli.main(claim) == 0
+    assert json.loads(capsys.readouterr().out)["ref"] == source_work["ref"]
+    q.close(source_work["ref"], "worker", resolution={"summary": "Integrated", "no_code": True})
+
+    observed = releases.observe(target, repo["merged"], evidence="test build", items=[parked])
+    assert observed == [{"ref": prerequisite, "status": "open"}]
+    q.claim_by_ref(prerequisite, "release-worker")
+    assert cli.main(claim) == 0
+    assert not capsys.readouterr().out.strip()
+    q.close(prerequisite, "release-worker", resolution={"summary": "Live check passed", "no_code": True})
+    assert cli.main(claim) == 0
+    assert json.loads(capsys.readouterr().out)["ref"] == consumer
+
+
+def test_add_after_close_retains_other_dependencies_and_clears_modes(env, capsys):
+    q, cli, _a, _ov, name = env
+    live = _ticket(q, name, note="live prerequisite")
+    source = _ticket(q, name, note="source prerequisite", worker="other-worker")
+    assert cli.main(["add", "-q", name, "--note", "consumer", "--no-dispatch", "--json",
+                     "--after-close", live.lower() + ":live", "--after", source]) == 0
+    dependent = json.loads(capsys.readouterr().out)
+    ref = dependent["ref"]
+    assert set(dependent["blocked_by"]) == {live, source}
+    assert dependent["blocked_by_until_closed"] == [live]
+    assert cli.main(["edit", live, "--after-close", ref]) == 1
+    assert "dependency cycle" in capsys.readouterr().err
+
+    assert cli.main(["edit", ref, "--after", source]) == 0
+    assert q.get(ref)["blocked_by_until_closed"] == [live]
+    assert cli.main(["edit", ref, "--clear-after", "--after", live]) == 0
+    assert q.get(ref)["blocked_by"] == [live]
+    assert not q.get(ref).get("blocked_by_until_closed")
 
 
 @pytest.mark.parametrize("awaits", ["data", "release", "integration"])

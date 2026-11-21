@@ -85,6 +85,17 @@ Entering the wait dispatches dependent queues immediately through the ordinary
 eligibility gates. Existing waits need no data migration: claim and display
 projections use the same completion predicate.
 
+Use `wt add --after-close REF` or `wt edit TICKET --after-close REF` when the
+dependent needs the prerequisite's live acceptance. This edge waits through
+`awaiting_release`, the reopened live check, and any required review. It
+releases on successful closure and preserves an existing run request. Both
+dependency flags are repeatable and may be used together for different refs.
+Adding `--after-close` upgrades an existing edge. To replace its mode, use
+`--clear-after` and specify the full set of dependencies again.
+
+Update all hosts that claim or dispatch a shared queue before using
+`--after-close`. Older readers handle these edges as ordinary `--after` edges.
+
 Group integration uses the parked release commit as the child's commit proof;
 it still requires the containing integration commit and the group's gates.
 The dashboard completion fraction includes parked release work, while actual

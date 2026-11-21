@@ -860,6 +860,8 @@ def cmd_find(args: argparse.Namespace) -> int:
               f"{q.group_parent_ref(item)}")
     if item.get("blocked_by"):
         print(f"  blocked_by: {', '.join(item['blocked_by'])}")
+    if item.get("blocked_by_until_closed"):
+        print(f"  blocked_by_until_closed: {', '.join(item['blocked_by_until_closed'])}")
         try:
             note = _waiting_note(item, q._refs_index(q.list_items()))
         except Exception:
@@ -974,16 +976,17 @@ def cmd_edit(args: argparse.Namespace) -> int:
         if value is not None:
             fields[name] = value
     after = getattr(args, "after", None)
+    after_close = getattr(args, "after_close", None)
+    clear_after = getattr(args, "clear_after", False)
     # --clear-X + --X means "replace": clear first, then apply the new values.
-    if after or getattr(args, "clear_after", False):
-        existing = []
-        if not getattr(args, "clear_after", False):
-            try:
-                existing = list((q.get(args.ref) or {}).get("blocked_by") or [])
-            except Exception:
-                existing = []
-        fields["blocked_by"] = existing + [a for a in (after or []) if a not in existing]
-        if after:
+    if after or after_close or clear_after:
+        existing = {} if clear_after else (q.get(args.ref) or {})
+        fields["blocked_by"] = list(existing.get("blocked_by") or []) + (after or [])
+        if after_close or clear_after:
+            fields["blocked_by_until_closed"] = (
+                list(existing.get("blocked_by_until_closed") or []) + (after_close or [])
+            )
+        if after or after_close:
             fields["_dependency_wait"] = True
     if getattr(args, "clear_gates", False) or getattr(args, "gate", None):
         fields["gates"] = list(getattr(args, "gate", None) or [])
@@ -1000,7 +1003,7 @@ def cmd_edit(args: argparse.Namespace) -> int:
             "error: no fields to edit -- pass at least one of "
             "--title/--slug/--note/--text/--url/--type/--readiness/--priority/"
             "--value/--confidence/--model-floor/--selector/"
-            "--screenshot-path/--repo-path/--queue/--after/--clear-after/--gate/--clear-gates/--accept/"
+            "--screenshot-path/--repo-path/--queue/--after/--after-close/--clear-after/--gate/--clear-gates/--accept/"
             "--depth/--budget-min/--client-id/--subscribe/--no-subscribe",
             file=sys.stderr,
         )
@@ -1104,6 +1107,7 @@ def _cmd_add(args: argparse.Namespace) -> int:
             submitter_explicit=bool((getattr(args, "submitter", "") or "").strip()),
             pre_ack=bool(getattr(args, "pre_ack", False)),
             blocked_by=list(getattr(args, "after", None) or []),
+            blocked_by_until_closed=getattr(args, "after_close", None),
             gates=list(getattr(args, "gate", None) or []) or None,
             accept_line=getattr(args, "accept", "") or "",
             group_parent=bool(getattr(args, "group_parent", False)),
@@ -7738,8 +7742,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--subscribe", action="store_true",
                    help="opt the filer into this ticket's status notices (off by default)")
     s.add_argument("--after", action="append", default=None, metavar="REF",
-                   help="this ticket is not claimable until REF closes as "
-                        "completed (repeatable)")
+                   help="wait for REF to finish source work, including awaiting release (repeatable)")
+    s.add_argument("--after-close", action="append", default=None, metavar="REF",
+                   help="wait for REF to close successfully after any live acceptance (repeatable)")
     s.add_argument("--gate", action="append", default=None, metavar="GATE",
                    help="acceptance gate (repeatable, ordered; overrides the "
                         "queue's): cmd:<command>, verify, review or "
@@ -7829,8 +7834,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--screenshot-path", default=None, dest="screenshot_path")
     s.add_argument("--repo-path", default=None, dest="repo_path")
     s.add_argument("--after", action="append", default=None, metavar="REF",
-                   help="release this ticket to wait for REF to close as completed; "
-                        "clears a legacy dependency question (repeatable)")
+                   help="release this ticket to wait for REF to finish source work (repeatable)")
+    s.add_argument("--after-close", action="append", default=None, metavar="REF",
+                   help="release this ticket to wait for REF to close successfully "
+                        "after any live acceptance (repeatable)")
     s.add_argument("--clear-after", action="store_true", dest="clear_after",
                    help="remove all blockers from this ticket")
     s.add_argument("--gate", action="append", default=None, metavar="GATE",

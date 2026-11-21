@@ -30,7 +30,7 @@ from typing import Any, Dict, List, Optional
 from . import github_history_archive as gha
 from .config import CATCH_ALL_LABEL
 from .queue import (
-    UNCLAIMABLE_READINESS, _FileLock, _refs_index, _validate_blocked_by,
+    UNCLAIMABLE_READINESS, _FileLock, _refs_index, _validate_dependency_fields,
     blocker_verdict, machine_tag,
 )
 
@@ -2704,6 +2704,8 @@ class GitHubIssuesBackend:
             "answer_dispatch": meta.get("answer_dispatch"),
             "blocked_by": [str(r) for r in (meta.get("blocked_by") or []) if r]
             if isinstance(meta.get("blocked_by"), list) else [],
+            "blocked_by_until_closed": [str(r) for r in meta["blocked_by_until_closed"] if r]
+            if isinstance(meta.get("blocked_by_until_closed"), list) else [],
             "client_id": meta.get("client_id", ""),
             "submitter": str(meta.get("submitter") or ""),
             "submitter_explicit": bool(meta.get("submitter_explicit", False)),
@@ -3237,6 +3239,7 @@ class GitHubIssuesBackend:
         submitter_explicit: bool = False,
         submitter_subscribed: bool = False,
         blocked_by: Optional[List[str]] = None,
+        blocked_by_until_closed: Optional[List[str]] = None,
         depth_fields: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         note = _clip(note, 4000)
@@ -3276,8 +3279,9 @@ class GitHubIssuesBackend:
         submitter_node = _local_submitter_node(submitter)
         if submitter_node:
             meta["submitter_node"] = submitter_node
-        if blocked_by:
-            meta["blocked_by"] = self._validate_blockers("", blocked_by)
+        if blocked_by or blocked_by_until_closed:
+            dependencies = self._validate_dependencies("", blocked_by or [], blocked_by_until_closed)
+            meta.update({key: refs for key, refs in dependencies.items() if refs})
         # Pre-validated by queue._depth_fields: {} for quick, else depth+budget_min.
         meta.update(depth_fields or {})
         issue_title = _clip(title or note or "WatchTower ticket", 200)
@@ -3309,6 +3313,8 @@ class GitHubIssuesBackend:
             "type": meta["type"],
             "readiness": meta["readiness"],
             "priority": meta["priority"],
+            "blocked_by": meta.get("blocked_by", []),
+            "blocked_by_until_closed": meta.get("blocked_by_until_closed", []),
             "client_id": client_id,
             "submitter": meta["submitter"],
             "created_at": _now_iso(),
@@ -3881,11 +3887,14 @@ class GitHubIssuesBackend:
         return resolve(items, refs, project=self.queue, fresh=fresh,
                        transitive=transitive)
 
-    def _validate_blockers(self, ref: str, blocked_by: List[str]) -> List[str]:
+    def _validate_dependencies(
+        self, ref: str, blocked_by: List[str], require_closed: Optional[List[str]],
+        existing_closed: Optional[List[str]] = None,
+    ) -> Dict[str, List[str]]:
         items = self.list_items(fresh=True)
-        by_ref = self._blocker_index(items, blocked_by, transitive=True)
-        return _validate_blocked_by(list(by_ref.values()), ref,
-                                    [str(r) for r in blocked_by])
+        by_ref = self._blocker_index(items, [*blocked_by, *(require_closed or [])], transitive=True)
+        return _validate_dependency_fields(list(by_ref.values()), ref, blocked_by,
+                                           require_closed, existing_closed)
 
     def _claim_candidates(
         self,
@@ -4885,12 +4894,14 @@ class GitHubIssuesBackend:
                 from .queue import _apply_ticket_subscription
                 _apply_ticket_subscription(meta, *value)
             elif key == "blocked_by":
-                blockers = self._validate_blockers(
-                    str(item.get("ref") or ""), list(value or []))
-                if blockers:
-                    meta["blocked_by"] = blockers
-                else:
-                    meta.pop("blocked_by", None)
+                dependencies = self._validate_dependencies(
+                    str(item.get("ref") or ""), list(value or []),
+                    fields.get("blocked_by_until_closed"), item.get("blocked_by_until_closed"))
+                for field, refs in dependencies.items():
+                    if refs:
+                        meta[field] = refs
+                    else:
+                        meta.pop(field, None)
             elif key == "depth_fields":
                 # Pre-computed by queue._depth_edit; {} demotes to quick.
                 old = {k: meta[k] for k in ("depth", "budget_min") if k in meta}

@@ -1900,11 +1900,14 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
                        accept_line: str, assessment_origin: str = "",
                        placement: str = "", depth: str = "",
                        budget_min: int = 0, submitter_subscribed: bool = False,
-                       dependency_items: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+                       dependency_items: Optional[List[Dict[str, Any]]] = None,
+                       blocked_by_until_closed: Optional[List[str]] = None) -> Dict[str, Any]:
     """Append a new ``open`` item to an already-loaded local store (the caller
     holds the store lock and saves). Shared by :func:`enqueue` and the
     post-fix-assessment filer so both create identical tickets."""
-    blockers = _validate_blocked_by(data["items"] + (dependency_items or []), "", list(blocked_by or []))
+    dependencies = _validate_dependency_fields(
+        data["items"] + (dependency_items or []), "", blocked_by or [], blocked_by_until_closed
+    )
     data["counter"] = int(data.get("counter", 0)) + 1
     number = data["counter"]
     now = _now_iso()
@@ -1937,7 +1940,9 @@ def _new_item_unlocked(data: Dict[str, Any], *, note: str, text: str, source: st
         "no_auto_drain": False,
         "run_requested": False,
         "pre_ack": bool(pre_ack),
-        "blocked_by": blockers,
+        "blocked_by": dependencies["blocked_by"],
+        **({"blocked_by_until_closed": dependencies["blocked_by_until_closed"]}
+           if dependencies["blocked_by_until_closed"] else {}),
         **({"planner_model": str(planner_model).strip()} if str(planner_model or "").strip() else {}),
         **({"verifier_model": str(verifier_model).strip()} if str(verifier_model or "").strip() else {}),
         **({"gates": validate_gates(gates)} if gates else {}),
@@ -1992,6 +1997,7 @@ def enqueue(
     submitter_subscribed: bool = False,
     pre_ack: bool = False,
     blocked_by: Optional[List[str]] = None,
+    blocked_by_until_closed: Optional[List[str]] = None,
     gates: Optional[List[str]] = None,
     accept_line: str = "",
     assessment_origin: str = "",
@@ -2018,8 +2024,9 @@ def enqueue(
     it); ``children`` attaches those tickets and seals the group in the same
     write. ``group`` files a new member of that unsealed parent.
 
-    ``blocked_by``: refs of tickets that must close (completed) before this one
-    is claimable (WT-4); validated -- unknown refs raise ValueError.
+    ``blocked_by``: refs of tickets that must finish source work before this one
+    is claimable. ``blocked_by_until_closed`` adds refs that must close successfully.
+    Unknown refs raise ValueError.
 
     ``submitter``: an addressable target (worker id / ``@agent`` name /
     session UUID -- the same shape ``messages.resolve_target`` already
@@ -2060,7 +2067,7 @@ def enqueue(
                              "(--group), not both")
         if children and not group_parent:
             raise ValueError("--children needs --group-parent")
-        if group_parent and blocked_by:
+        if group_parent and (blocked_by or blocked_by_until_closed):
             raise ValueError("a group parent's dependencies are its members; use --children "
                              "or `wt group attach`")
         if group_parent:
@@ -2092,6 +2099,7 @@ def enqueue(
             submitter=submitter,
             submitter_explicit=submitter_explicit, submitter_subscribed=submitter_subscribed,
             blocked_by=blocked_by,
+            blocked_by_until_closed=blocked_by_until_closed,
             depth_fields=_depth_fields(depth, budget_min),
         )
         if gates:
@@ -2105,7 +2113,9 @@ def enqueue(
         _log("ENQUEUE", f"{saved.get('ref', '?')} — {saved.get('title') or saved.get('note', '')[:60]}", queue=saved.get('project', ''))
         _config.restore_queue_for_ticket(saved)
         return saved
-    dependencies = _dependency_snapshot(refs=blocked_by or [], transitive=True)
+    dependencies = _dependency_snapshot(
+        refs=[*(blocked_by or []), *(blocked_by_until_closed or [])], transitive=True
+    )
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         if dedupe_key:
@@ -2123,7 +2133,7 @@ def enqueue(
             submitter_explicit=submitter_explicit, submitter_subscribed=submitter_subscribed, pre_ack=pre_ack, blocked_by=blocked_by,
             gates=gates, accept_line=accept_line, assessment_origin=assessment_origin,
             placement=placement, depth=depth, budget_min=budget_min,
-            dependency_items=dependencies)
+            dependency_items=dependencies, blocked_by_until_closed=blocked_by_until_closed)
         saved["client_id"] = client_id
         if dedupe_key:
             saved["dedupe_key"] = dedupe_key
@@ -2574,7 +2584,8 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     Allowed fields: item_type, readiness, priority, value, confidence,
     model_floor, note, text, title, url, selector, screenshot_path,
     repo_path, needs_input, block_question, blocked_by (list of refs; validated
-    -- unknown refs and cycles raise ValueError).
+    -- unknown refs and cycles raise ValueError). Supply blocked_by_until_closed
+    alongside blocked_by to replace the subset requiring successful closure.
 
     Disallowed (managed by state machine): status, claimed_by, claimed_at,
     closed_at, claimed_session_id, number, project, ref, seq, created_at.
@@ -2582,6 +2593,8 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     ``item_type`` and ``"type"`` are aliases — both are stored as ``"type"``.
     Returns the updated item, or None if not found.
     """
+    if "blocked_by_until_closed" in fields and "blocked_by" not in fields:
+        raise ValueError("blocked_by_until_closed requires blocked_by")
     backend = _github_backend_for_project(_project_from_ident(ident))
     if backend is not None:
         if "depth" in fields or "budget_min" in fields:
@@ -2616,7 +2629,8 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
     ALLOWED = frozenset({
         "item_type", "type", "readiness", "priority", "value", "confidence",
         "note", "text", "title", "slug", "url", "selector", "screenshot_path", "repo_path",
-        "needs_input", "block_question", "model_floor", "blocked_by", "gates", "accept",
+        "needs_input", "block_question", "model_floor", "blocked_by", "blocked_by_until_closed",
+        "gates", "accept",
         "planner_model", "verifier_model", "placement", "client_id",
     })
     if "slug" in fields:
@@ -2633,7 +2647,10 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
         depth_edit = (fields.pop("depth", None), fields.pop("budget_min", None))
         if depth_edit[0] is not None:
             norm_depth(depth_edit[0])
-    dependencies = _dependency_snapshot(refs=fields.get("blocked_by") or [], transitive=True)
+    dependencies = _dependency_snapshot(
+        refs=[*(fields.get("blocked_by") or []), *(fields.get("blocked_by_until_closed") or [])],
+        transitive=True,
+    )
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -2661,10 +2678,11 @@ def update(ident: Any, **fields: Any) -> Optional[Dict[str, Any]]:
                         raise ValueError(f"{it.get('ref')} is a group parent: its dependencies "
                                          "are its members (wt group attach / detach)")
                     fields = dict(fields)
-                    fields["blocked_by"] = _validate_blocked_by(
+                    fields.update(_validate_dependency_fields(
                         data["items"] + dependencies, str(it.get("ref") or ""),
                         list(fields["blocked_by"] or []),
-                    )
+                        fields.get("blocked_by_until_closed"), it.get("blocked_by_until_closed") or [],
+                    ))
                     if group_parent_ref(it) and group_parent_ref(it) in fields["blocked_by"]:
                         raise ValueError(f"{it.get('ref')} cannot be blocked by its own group "
                                          f"parent {group_parent_ref(it)}")
@@ -2750,16 +2768,17 @@ def move(ident: Any, new_project: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _blocker_state(blocker: Dict[str, Any]) -> str:
+def _blocker_state(blocker: Dict[str, Any], *, require_closed: bool = False) -> str:
     """The ONE predicate for "is this blocker satisfied" (WT-4).
 
-    ``satisfied``: closed or code complete awaiting release -- not declined
-    at the product gate, and its resolution has no ``unresolved`` items.
+    ``satisfied``: closed (or code complete awaiting release, if allowed)
+    without a product decline or unresolved items.
     ``waiting``: work is not complete yet. ``stuck``: complete, but declined
     or with unresolved items, so the dependent must NOT auto-unblock; a human decides. Unresolved items the owner
     already acknowledged (`wt unresolved-ack`) no longer count. Extend here (e.g. with
     a review/accept state), nowhere else."""
-    if blocker.get("status") not in ("closed", "awaiting_release"):
+    status = blocker.get("status")
+    if status != "closed" and (status != "awaiting_release" or require_closed):
         return "waiting"
     if blocker.get("product_nack"):
         return "stuck"
@@ -2786,9 +2805,10 @@ def blocker_verdict(
     waiting = ""
     if it.get("duplicate_of") and it.get("status") != "closed":
         waiting = str(it["duplicate_of"])
+    require_closed = it.get("blocked_by_until_closed") or []
     for ref in it.get("blocked_by") or []:
         blocker = by_ref.get(str(ref))
-        state = _blocker_state(blocker or {})
+        state = _blocker_state(blocker or {}, require_closed=ref in require_closed)
         if state == "stuck":
             if str(ref) in (it.get("blocker_escalated") or []) and not it.get("needs_input"):
                 continue
@@ -2802,16 +2822,17 @@ def waiting_on(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]) -> List[st
     """Blocker refs of ``it`` not yet completed (WT-9), in ``blocked_by`` order.
 
     Uses ``_blocker_state`` so display and the claim gate share one rule: a
-    blocker counts as completed when closed or awaiting release, not declined,
+    blocker counts as completed when closed or, if allowed, awaiting release, not declined,
     and with no unresolved items. A stuck blocker a human already answered for counts as
     completed (same as ``blocker_verdict``); a missing blocker keeps the dependent waiting.
     Empty when unblocked and for tickets that are not open/in-flight."""
     if it.get("status") in ("closed", "awaiting_release"):
         return []
     out: List[str] = [str(it["duplicate_of"])] if it.get("duplicate_of") else []
+    require_closed = it.get("blocked_by_until_closed") or []
     for ref in it.get("blocked_by") or []:
         blocker = by_ref.get(str(ref))
-        state = _blocker_state(blocker or {})
+        state = _blocker_state(blocker or {}, require_closed=ref in require_closed)
         if state == "satisfied":
             continue
         if (
@@ -2896,6 +2917,20 @@ def _validate_blocked_by(
                 raise ValueError(f"blocker {cur} does not exist in the dependency snapshot; retry")
             stack.extend(str(x) for x in (by_ref[cur].get("blocked_by") or []))
     return out
+
+
+def _validate_dependency_fields(
+    items: List[Dict[str, Any]], ref: str, blocked_by: List[str],
+    require_closed: Optional[List[str]], existing_closed: Optional[List[str]] = None,
+) -> Dict[str, List[str]]:
+    """Keep all edges in blocked_by for graph traversal and validation."""
+    new_closed = _validate_blocked_by(items, "", require_closed) if require_closed else []
+    blockers = _validate_blocked_by(items, ref, [*blocked_by, *new_closed])
+    closed = new_closed if require_closed is not None else (existing_closed or [])
+    return {
+        "blocked_by": blockers,
+        "blocked_by_until_closed": [ref for ref in blockers if ref in closed],
+    }
 
 
 def _claim_candidates(
