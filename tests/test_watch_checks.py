@@ -100,3 +100,40 @@ def test_raw_inventory_honors_pipeline_claim_release_without_hiding_active_claim
     assert parked['needs_input'] and parked['block_question'] == meta['block_question']
     assert parked['wait'] == meta['wait']
     assert active['status'] == 'in_progress' and active['claimed_by'] == meta['claimed_by']
+
+
+def test_raw_inventory_distinguishes_reopened_issues_from_current_claims(wt_env, monkeypatch):
+    import time
+    from watchtower import config, github_backend as gh, queue as q, watches
+
+    repo = 'test/repo'
+    config.set_backend('GHI', 'github')
+    config.set_github_repo('GHI', repo)
+    backend = q._github_backend_for_project('GHI')
+    closed_at = '2026-11-22T06:53:12Z'
+    prior = dict(claimed_by='old-worker', claimed_machine='her',
+                 claimed_session_id='old-session', closed_at=closed_at,
+                 claimed_at='2026-11-22T02:17:27Z')
+    duplicate = dict(claimed_by='duplicate:GHI-9', claimed_machine='ami',
+                     closed_at=closed_at, duplicate_of='GHI-9')
+    current = dict(prior, claimed_by='new-worker', claimed_at='2026-11-22T15:33:17Z')
+    raw = [
+        dict(number=number, state=state, body=gh._body_with_metadata('Issue', meta))
+        for number, (state, meta) in enumerate(
+            [('OPEN', prior), ('OPEN', duplicate), ('OPEN', current), ('CLOSED', prior)], 1)
+    ]
+    monkeypatch.setattr(gh, '_read_persisted_list_cache', lambda: {
+        f'{repo}:open': dict(at=time.time(), data=raw[:3]),
+        f'{repo}:closed': dict(at=time.time(), data=raw[3:]),
+    })
+
+    items, _ = watches.inventory()
+    by_number = {item['number']: item for item in items}
+    for issue in raw:
+        normal = backend._issue_to_item(issue)
+        lightweight = by_number[issue['number']]
+        for key in ('status', 'claimed_by', 'claimed_machine', 'claimed_session_id', 'claimed_at'):
+            assert lightweight.get(key) == normal.get(key)
+    assert by_number[2]['duplicate_of'] == 'GHI-9'
+    assert by_number[3]['claimed_by'] == 'new-worker'
+    assert by_number[4]['claimed_by'] == 'old-worker'

@@ -1354,6 +1354,13 @@ def _claim_predates_close(meta: Dict[str, Any]) -> bool:
     return claimed is None or claimed <= closed
 
 
+def _issue_metadata_for_state(meta: Dict[str, Any], state: str) -> Dict[str, Any]:
+    # A native GitHub reopen leaves the previous run's attribution in the body.
+    if state != "CLOSED" and _claim_predates_close(meta):
+        return {k: v for k, v in meta.items() if k not in _CLAIM_META_KEYS}
+    return meta
+
+
 def _set_pipeline_hold(meta: Dict[str, Any], why: str) -> None:
     """Pipeline admission is explicit metadata, never a year-2099 timer."""
     if why:
@@ -2604,11 +2611,7 @@ class GitHubIssuesBackend:
         # meta is read-only here: the two containers that reach the item are
         # copied below, so the memoized parse can be shared across queues.
         body, meta = _split_body_shared(str(issue.get("body") or ""))
-        if state != "CLOSED" and _claim_predates_close(meta):
-            # Reopened outside wt (a batcher's raw `gh issue reopen`, the
-            # GitHub UI): the claim belongs to the run the close ended, so the
-            # issue is open and unclaimed, not an orphan to recover (WT-42).
-            meta = {k: v for k, v in meta.items() if k not in _CLAIM_META_KEYS}
+        meta = _issue_metadata_for_state(meta, state)
         text = _issue_text(body, meta.get("note"), issue.get("title"), issue.get("comments"))
         labels = _label_names(issue.get("labels"))
         assignees = _assignee_logins(issue.get("assignees"))
