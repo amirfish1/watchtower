@@ -97,6 +97,23 @@ def test_migration_preserves_guards_and_original_question_receipt(env, action):
             assert q.blocker_verdict(it, {i['ref']: i for i in q.list_items()})[0] == 'waiting'
 
 
+def test_migration_preserves_closure_requirement_for_retained_edges(env):
+    q, _, _, _, name = env
+    kept, removed = [q.enqueue(project=name, note=note, source='test')['ref']
+                     for note in ('Retained prerequisite', 'Removed prerequisite')]
+    ref = _ticket(q, name)
+    legacy_block(q, ref, 'w1', question='Await coordinator', wait_on='worker')
+    q.update(ref, blocked_by=[], blocked_by_until_closed=[kept, removed])
+
+    op = _operation(q, ref, 'dependency', after=[kept])
+    migration.apply(op, q.list_items(), 'migration-worker')
+
+    migrated = q.get(ref)
+    assert migrated['blocked_by'] == [kept]
+    assert migrated['blocked_by_until_closed'] == [kept]
+    assert q.blocker_verdict(migrated, {kept: {'status': 'awaiting_release'}}) == ('waiting', kept)
+
+
 def test_migration_fences_changed_question_and_preserves_real_gate(env):
     q, _, _, _, name = env
     ref = _ticket(q, name)

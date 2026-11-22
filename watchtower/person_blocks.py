@@ -24,7 +24,7 @@ def fingerprint(item):
     return hashlib.sha256(json.dumps(fields, sort_keys=True).encode()).hexdigest()
 
 
-def transform(item, operation, inventory, worker):
+def transform(item, operation, inventory, worker, *, dependencies=None):
     if operation["action"] == "already-resolved":
         if item.get("status") != "closed" or fingerprint(item) != operation["expected"]:
             raise ValueError(f"{item.get('ref')}: terminal resolution changed since review")
@@ -41,7 +41,14 @@ def transform(item, operation, inventory, worker):
         deps = operation.get("after") or []
         if action == "dependency" and not deps:
             raise ValueError("dependency disposition requires real --after edges")
-        item["blocked_by"] = q._validate_blocked_by(inventory, item["ref"], deps)
+        if dependencies is None:
+            dependencies = q._validate_dependency_fields(
+                inventory, item["ref"], deps, None, item.get("blocked_by_until_closed"))
+        item["blocked_by"] = dependencies["blocked_by"]
+        if dependencies["blocked_by_until_closed"]:
+            item["blocked_by_until_closed"] = dependencies["blocked_by_until_closed"]
+        else:
+            item.pop("blocked_by_until_closed", None)
         q._dependency_wait_unlocked(item, now, worker_done=False)
     elif action == "icebox":
         q._dependency_wait_unlocked(item, now, worker_done=False)
@@ -105,9 +112,12 @@ def apply(operation, inventory, worker):
             delivery_before["pipeline_local"] = bool(item.get("pipeline_local"))
             body, meta = _split_body(item.get("_github_body") or item.get("text", ""))
             checked = dict(meta, ref=ident, status=item.get("issue_status") or item.get("status"))
+            existing_closed = meta.get("blocked_by_until_closed") or []
+            dependencies = None
             if operation["action"] in ("dependency", "reopen"):
-                backend._validate_blockers(ident, operation.get("after") or [])
-            before = transform(checked, operation, inventory, worker)
+                dependencies = backend._validate_dependencies(
+                    ident, operation.get("after") or [], None, existing_closed)
+            before = transform(checked, operation, inventory, worker, dependencies=dependencies)
             if before is None:
                 return item
             if operation["action"] in ("person", "retain") and meta.get("claimed_session_id"):
@@ -123,12 +133,15 @@ def apply(operation, inventory, worker):
                     if operation["action"] in ("dependency", "reopen", "icebox", "person", "retain") else [])
             fresh = backend.get(ident)
             fresh_meta = _split_body(fresh.get("_github_body") or fresh.get("text", ""))[1]
-            if fingerprint(fresh_meta) != operation["expected"]:
+            if (fingerprint(fresh_meta) != operation["expected"]
+                    or (fresh_meta.get("blocked_by_until_closed") or []) != existing_closed):
                 raise ValueError(f"{ident}: block changed during dependency validation")
             conflicts = backend._edit_body(item, body, meta, *args)
             result = backend.get(ident)
             result_meta = _split_body(result.get("_github_body") or result.get("text", ""))[1]
-            if set(conflicts).intersection(FIELDS) or fingerprint(result_meta) != fingerprint(meta):
+            if (set(conflicts).intersection((*FIELDS, "blocked_by_until_closed"))
+                    or fingerprint(result_meta) != fingerprint(meta)
+                    or result_meta.get("blocked_by_until_closed") != meta.get("blocked_by_until_closed")):
                 raise ValueError(f"{ident}: concurrent issue edit; inspect the retained migration receipt")
             return result
 
