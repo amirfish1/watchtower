@@ -819,6 +819,13 @@ def cmd_find(args: argparse.Namespace) -> int:
     surface for queue.get(), which already matches globally. No -q needed,
     so an agent (or a skill) that only has a bare ref like 'HERMES-20' can
     resolve it without knowing which queue it lives in."""
+    if getattr(args, "dependency_status", False):
+        from .dependencies import local_evidence, local_host
+        if not args.ref.startswith(f"{local_host()}/"):
+            print("dependency reference belongs to another host", file=sys.stderr)
+            return 1
+        print(json.dumps(local_evidence(args.ref)))
+        return 0
     item = q.get(args.ref)
     if not item:
         print(f"not found: {_display_ref(args.ref)}", file=sys.stderr)
@@ -7664,6 +7671,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("find")
     s.add_argument("ref", help="ticket ref (e.g. WT-48) or bare number")
+    s.add_argument("--dependency-status", action="store_true", help=argparse.SUPPRESS)
     s.add_argument(
         "--worker", default="",
         help="your worker id: events you performed are marked claimed_by_you/"
@@ -9079,7 +9087,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     # Normalize only reference arguments, never prose, paths or chat names.
     if getattr(args, "command", "") != "chat":
-        for name in ("ref", "refs", "after", "children", "group", "root",
+        for name in ("ref", "refs", "after", "after_close", "children", "group", "root",
                      "wait_ref", "original", "parent", "section", "of"):
             value = getattr(args, name, None)
             if isinstance(value, str):

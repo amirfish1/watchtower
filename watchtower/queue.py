@@ -2323,9 +2323,11 @@ def _window_from_index(db: Path, proj: str, spec: "WindowSpec", offset: int, lim
 def items_by_refs(refs: List[str]) -> Dict[str, Dict[str, Any]]:
     """Resolve only named dependencies from local stores and GitHub mirrors."""
     wanted = {canonical_ref(r) for r in refs if r}
-    out = {}
+    qualified = {ref for ref in wanted if "/" in ref}
+    from .dependencies import resolve
+    out = resolve([], qualified, fresh=False) if qualified else {}
     by_project = {}
-    for ref in wanted:
+    for ref in wanted - qualified:
         by_project.setdefault(_project_from_ident(ref), []).append(ref)
     for proj, names in by_project.items():
         backend = _github_backend_for_project(proj)
@@ -2846,7 +2848,15 @@ def waiting_on(it: Dict[str, Any], by_ref: Dict[str, Dict[str, Any]]) -> List[st
 
 
 def _refs_index(items: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    return {str(it.get("ref")): it for it in items if it.get("ref")}
+    from .dependencies import local_key
+
+    by_ref = {str(it["ref"]): it for it in items if it.get("ref")}
+    for ref in by_ref:
+        if "/" in ref and (bare := local_key(ref)) != ref and bare in by_ref:
+            # A local transaction may have re-read the owning record since the
+            # dependency snapshot. A qualified self-host edge uses that row.
+            by_ref[ref] = by_ref[bare]
+    return by_ref
 
 
 def _escalate_stuck_blockers(items: List[Dict[str, Any]],
@@ -2891,14 +2901,17 @@ def _validate_blocked_by(
     """Normalise ``blocked_by`` for ticket ``ref`` (may be "" for a not-yet-
     filed ticket): every blocker must exist, none may be the ticket itself,
     and no cycle may result. Raises ValueError."""
+    from .dependencies import local_key
+
     by_ref = _refs_index(items)
+    target = local_key(ref)
     out: List[str] = []
     for raw in blocked_by:
         found = next((it for it in items if _matches(it, raw)), None)
         if found is None:
             raise ValueError(f"blocker {raw} does not exist")
         b = str(found.get("ref"))
-        if ref and b == ref:
+        if ref and local_key(b) == target:
             raise ValueError(f"{ref} cannot be blocked by itself")
         if b not in out:
             out.append(b)
@@ -2908,7 +2921,7 @@ def _validate_blocked_by(
         stack = list(out)
         while stack:
             cur = stack.pop()
-            if cur == ref:
+            if local_key(cur) == target:
                 raise ValueError(f"dependency cycle: {ref} would (transitively) block itself")
             if cur in seen:
                 continue

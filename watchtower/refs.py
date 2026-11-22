@@ -10,10 +10,14 @@ import unicodedata
 from typing import Any
 
 _REF = re.compile(r"^([A-Za-z0-9_]+(?:-[A-Za-z0-9_]+)*?-\d+)(?::.*|-.*)?$", re.S)
+_HOST = re.compile(r"[a-z0-9][a-z0-9-]{0,62}", re.I | re.ASCII)
 
 
 def canonical_ref(value: Any) -> str:
     text = str(value or "").strip()
+    host, sep, ticket = text.partition("/")
+    if sep and _HOST.fullmatch(host) and (match := _REF.fullmatch(ticket)):
+        return f"{host.lower()}/{match.group(1).upper()}"
     match = _REF.fullmatch(text)
     return match.group(1).upper() if match else text
 

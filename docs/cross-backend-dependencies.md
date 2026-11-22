@@ -25,6 +25,30 @@ stuck-blocker escalation fetches its evidence before locking too. Scoped health
 and ordinary CLI listings resolve named parents without listing all queues;
 windowed listings retain their existing bounded mirror lookup.
 
+## Local tickets owned by another host
+
+Use `hostname/QUEUE-N` in `--after` or `--after-close` to target an owning
+host's local record. The host is the lowercase first component of its system
+hostname (`hostname -s`). A bare `QUEUE-N` continues to mean the current
+host's local store or a configured shared GitHub queue.
+
+On each host that needs to resolve a foreign edge, put a JSON object mapping
+owning hostnames to trusted SSH destinations in
+`dependency-hosts.json` in the WatchTower data directory. For example,
+`{"build-mac": "build-mac-ssh-alias"}`. Only an operator-configured route
+may be contacted. Both hosts need a WatchTower version that supports the
+qualified reference, and the SSH route must already support noninteractive
+host-key verification. The peer returns dependency fields only and qualifies
+its own local ancestors, so a same-number ticket on another host cannot satisfy
+an edge or hide a cycle. An unavailable route leaves claims waiting and
+prevents edits that require the unavailable graph. Advisory depth lookups use
+a short-lived cache. Claims and validation read fresh state.
+
+To migrate an existing ambiguous edge, identify the ticket independently on
+its owning host, then replace the bare reference with the qualified one while
+retaining all existing edge types and other prerequisites. Re-read the stored
+graph and test the waiting state from the consuming host.
+
 Regression proof: `tests/test_local_remote_dependencies.py` combines fake
 GitHub issues with actual isolated SQLite persistence, exercising add/edit,
 owner holds, wait-to-wake, explicit and automatic claims, manual/depth/floor

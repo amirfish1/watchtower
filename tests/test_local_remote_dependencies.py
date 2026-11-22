@@ -259,3 +259,88 @@ def test_takeover_remote_parent_wait_and_wake(mixed, monkeypatch, tmp_path):
     q.claim_by_ref(upstream, "upstream")
     q.close(upstream, "upstream", resolution={"summary": "accepted again", "no_code": True})
     assert t.resume(ref, result["generation"])["supervision"]["state"] == "running"
+
+
+@pytest.fixture
+def owning_host(mixed, tmp_path, monkeypatch):
+    import json
+    import os
+    import subprocess
+    import sys
+
+    q, _ = mixed
+    peer = tmp_path / "peer"
+    peer.mkdir()
+    paths = {f"WATCHTOWER_{key}": str(peer / name) for key, name in {
+        "STORE": "queue.json", "CONFIG_FILE": "config.json", "DATA_DIR": "data",
+        "STATE_DIR": "state", "ACTIVITY_LOG": "activity.log",
+    }.items()}
+    (peer / "config.json").write_text(json.dumps({
+        "REMOTE": {"backend": "github", "github_repo": "test-owner/test-repo"},
+    }))
+    monkeypatch.setenv("TEST_DEPENDENCY_PEER", str(peer))
+    ssh = tmp_path / "bin" / "ssh"
+    ssh.write_text(f"""#!{sys.executable}
+import os, shlex, sys
+from pathlib import Path
+if (Path(os.environ["TEST_DEPENDENCY_PEER"]) / "offline").exists():
+    sys.exit(255)
+assert sys.argv[-2] == "build-mac-ssh"
+request = shlex.split(sys.argv[-1])[-3:]
+assert request[0] == "find" and request[-1] == "--dependency-status"
+os.environ.update({paths!r})
+os.execv(sys.executable, [sys.executable, "-c",
+    "import socket; socket.gethostname = lambda: 'Build-Mac.local'; "
+    "from watchtower.cli import main; raise SystemExit(main())", *request])
+""")
+    ssh.chmod(0o755)
+    routes = tmp_path / "data" / "dependency-hosts.json"
+    routes.parent.mkdir(exist_ok=True)
+    routes.write_text('{"build-mac":"build-mac-ssh"}')
+
+    def run(code):
+        subprocess.run([sys.executable, "-c", f"from watchtower import queue as q\n{code}"],
+                       env={**os.environ, **paths}, check=True, timeout=10)
+
+    return q, peer, run
+
+
+def test_qualified_parent_attachment_and_claim_use_the_owning_store(owning_host):
+    q, peer, run = owning_host
+    ref = "build-mac/OPS-2"
+    run('q.enqueue(project="OPS", note="Mac cause")\n'
+        'q.enqueue(project="OPS", note="Mac acceptance", blocked_by=["OPS-1"])')
+    for _ in range(2):
+        local = q.enqueue(project="OPS", note="unrelated local record")["ref"]
+        q.close(local, force=True, resolution={"summary": "unrelated", "no_code": True})
+
+    shared = parent(q)
+    child_ref = parent(q)
+    q.update(shared, blocked_by=[], blocked_by_until_closed=[ref])
+    q.update(child_ref, blocked_by=[], blocked_by_until_closed=[shared])
+    assert q.get(shared)["blocked_by_until_closed"] == [ref]
+    assert q.get(child_ref)["blocked_by_until_closed"] == [shared]
+    with pytest.raises(ValueError, match="waiting on build-mac/OPS-2"):
+        q.claim_by_ref(shared, "consumer")
+
+    run('q.close("OPS-1", force=True, resolution={"summary":"cause found","no_code":True})\n'
+        'q.close("OPS-2", force=True, resolution={"summary":"verified","no_code":True})')
+    (peer / "offline").touch()
+    with pytest.raises(ValueError, match="waiting on build-mac/OPS-2"):
+        q.claim_by_ref(shared, "consumer")
+    with pytest.raises(ValueError, match="could not verify build-mac/OPS-2"):
+        q.update(child_ref, blocked_by=[shared])
+    (peer / "offline").unlink()
+    assert q.claim_by_ref(shared, "consumer")["ref"] == shared
+    q.close(shared, "consumer", resolution={"summary": "live acceptance", "no_code": True})
+    assert q.claim_by_ref(child_ref, "consumer")["ref"] == child_ref
+
+
+def test_qualified_ancestors_cannot_hide_a_cross_host_cycle(owning_host):
+    q, _, run = owning_host
+    shared = parent(q)
+    run(f'q.enqueue(project="OPS", note="Mac cause", blocked_by=["{shared}"])\n'
+        'q.enqueue(project="OPS", note="Mac acceptance", blocked_by=["OPS-1"])')
+    with pytest.raises(ValueError, match="cycle"):
+        q.update(shared, blocked_by=["build-mac/OPS-2"])
+    assert not q.get(shared)["blocked_by"]
