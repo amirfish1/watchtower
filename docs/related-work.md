@@ -71,28 +71,17 @@ configuration to undo the opt-in. Ordinary claims and local recall never execute
 the reader. On hermes, `/home/hermes/.local/bin/wt-jev-key` uses the existing
 Bitwarden secret below; no daemon restart is needed.
 
-On the hermes VM, workers do not inherit the Jev key. The supported invocation
-loads the existing key from Bitwarden for this command only (OPS-630):
+On the hermes VM, use WatchTower's configured Bitwarden reader for triage.
+Clear inherited Jev variables for this invocation so WatchTower uses that reader:
 
 ```bash
-(
-  set +x
-  set -o pipefail
-  set -a
-  source ~/.config/bws/token.env
-  set +a
-  JEV_API_KEY=$(bws secret get 363f445c-1fd1-4785-80cf-b4c8011831a9 |
-    python3 -c 'import json,sys; key=json.load(sys.stdin)["value"]; assert key; print(key)') || exit 1
-  export JEV_API_KEY
-  unset BWS_ACCESS_TOKEN
-  wt related REF --triage --worker WORKER_ID --json
-)
+env -u TYPESAFE_API_KEY -u JEV_API_KEY wt related REF --triage --worker WORKER_ID --json
 ```
 
-Replace `REF` and `WORKER_ID`; do not paste key values into tickets, shell
-profiles or tracked files. The subshell leaves the caller environment unchanged,
-and `pipefail` prevents a failed secret fetch from running triage. This uses the
-existing machine-account permission; it creates or rotates no credentials.
+Replace `REF` and `WORKER_ID`. Running `wt-jev-key` directly prints the key
+to stdout, including when a command is appended as arguments. Use the
+`wt related` command above so WatchTower captures the key in memory.
+Keep key values out of tickets, transcripts, shell profiles and tracked files.
 If the vault or Jev is unavailable, use `wt related REF --json`, inspect useful
 candidates with `wt find OTHER --json`, and verify their source evidence manually.
 Record the triage error in ticket progress, confirm only checked relationships

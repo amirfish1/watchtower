@@ -133,8 +133,13 @@ An error or partial coverage is an evidence gap, not "nothing related".
 
 1. Run `wt related REF --triage --json` to have Jev classify candidates as
    `already-shipped`, `earlier-attempt`, `in-progress`, or `unrelated`.
-   Set `TYPESAFE_API_KEY` (or `JEV_API_KEY`) from the authorized secret store;
-   never print it. Retrieval itself needs no key and makes no network calls.
+   On hermes, use the configured Bitwarden reader through WatchTower:
+   `env -u TYPESAFE_API_KEY -u JEV_API_KEY wt related REF --triage --worker ID --json`.
+   `wt-jev-key` is WatchTower's credential reader. Running it directly prints
+   the key, even with a command appended. Invoke `wt related` itself and let
+   WatchTower capture the reader's output privately.
+   On other hosts, use an authorized credential source as described in
+   [Related work](related-work.md). Local retrieval needs no key or network.
    If triage is unavailable, inspect the candidates yourself and record the gap.
 2. Read useful candidates and verify their evidence. Record confirmed links:
    `wt related REF --confirm OTHER --kind earlier-attempt --worker ID
