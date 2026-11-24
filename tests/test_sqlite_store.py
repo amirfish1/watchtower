@@ -305,3 +305,31 @@ def test_scoped_candidates_do_not_evaluate_other_queues_but_keep_dependencies(wt
     monkeypatch.setattr(config, "model_meets_floor", meets_floor)
     items = [target, foreign, dict(foreign, ref="OTHER-2", status="open")]
     assert wt.q._claim_candidates(items, all_items=items, project="HOT", worker_model="test") == [target]
+
+
+def test_reread_after_write_decodes_only_changed_rows(wt, monkeypatch):
+    # Workers write the store about once a second; a reread must not
+    # re-decode the unchanged archive (it pinned the daemon's CPU).
+    a = wt.q.enqueue(project="RR", note="a")
+    b = wt.q.enqueue(project="RR", note="b")
+    c = wt.q.enqueue(project="RR", note="c")
+    wt.q._load_unlocked(readonly=True)
+    wt.q.claim_by_ref(b["ref"], "w-1")
+
+    decoded = []
+    real_loads = wt.q.json.loads
+
+    def counting_loads(s, *args, **kwargs):
+        decoded.append(s)
+        return real_loads(s, *args, **kwargs)
+
+    monkeypatch.setattr(wt.q.json, "loads", counting_loads)
+    items = {it["ref"]: it for it in wt.q._load_unlocked(readonly=True)["items"]}
+    item_rows = [s for s in decoded if '"note"' in s]
+    assert len(item_rows) == 1 and '"b"' in item_rows[0]
+    assert items[b["ref"]]["status"] == "in_progress"
+    assert items[a["ref"]]["note"] == "a" and items[c["ref"]]["note"] == "c"
+    # Mutable reads stay private copies of the reused rows.
+    writable = wt.q._load_unlocked()
+    writable["items"][0]["note"] = "caller mutation"
+    assert wt.q._load_unlocked(readonly=True)["items"][0]["note"] == "a"

@@ -917,6 +917,8 @@ _META_UPSERT = (
 
 
 _READ_DB_MEMO: Dict[str, tuple] = {}
+# db path -> {number: (item_json text, parsed normalized item)} from the last read.
+_READ_DB_ROWS: Dict[str, Dict[int, tuple]] = {}
 
 
 def _db_stamp(db: Path) -> tuple:
@@ -957,10 +959,22 @@ def _read_db(db: Path, *, strict: bool = False, readonly: bool = False) -> Dict[
             revision = _meta_get(conn, "revision", "0")
             if memo is not None and memo[0] == (stamp, counter, revision):
                 return snapshot(memo)
-            items = [
-                json.loads(row[0])
-                for row in conn.execute("SELECT item_json FROM items ORDER BY number")
-            ]
+            # Workers write the store about once a second, so the snapshot
+            # memo above rarely survives a tick and a full reparse of every
+            # row (~95% closed archive) pinned a core. Reuse the parsed item
+            # of any row whose JSON text is byte-identical to the last read;
+            # only changed rows are decoded again. Reused items are the
+            # normalized objects read-only callers already share.
+            prev_rows = _READ_DB_ROWS.get(key) or {}
+            rows: Dict[int, tuple] = {}
+            items = []
+            for number, raw in conn.execute(
+                "SELECT number, item_json FROM items ORDER BY number"
+            ):
+                hit = prev_rows.get(number)
+                item = hit[1] if hit is not None and hit[0] == raw else json.loads(raw)
+                rows[number] = (raw, item)
+                items.append(item)
         finally:
             conn.close()
     except (sqlite3.Error, ValueError, json.JSONDecodeError):
@@ -968,6 +982,7 @@ def _read_db(db: Path, *, strict: bool = False, readonly: bool = False) -> Dict[
             raise
         return _empty_store()
     _normalize_items(items)
+    _READ_DB_ROWS[key] = rows
     if items:
         max_num = max(int(it.get("number", 0)) for it in items)
         if max_num > counter:
