@@ -55,3 +55,18 @@ def test_usage_pass_builds_one_index(tmp_path, monkeypatch):
     assert calls == [1]
     assert a["path"].endswith(f"{CLAUDE_SID}.jsonl")
     assert b["path"].endswith(f"{CODEX_SID}.jsonl")
+
+
+def test_receipt_sweep_index_matches_probing_stat(tmp_path, monkeypatch):
+    from watchtower import receipts
+    _tree(tmp_path, monkeypatch)
+    cases = [(CLAUDE_SID, "claude"), (CODEX_SID, "codex"), (CODEX_SID, "claude"),
+             (CLAUDE_SID, "codex"), ("not-a-uuid", "claude"), (CLAUDE_SID, "kimi")]
+    probed = [receipts._transcript_stat(sid, eng) for sid, eng in cases]
+    receipts._SWEEP.index = messages.transcript_index()
+    try:
+        indexed = [receipts._transcript_stat(sid, eng) for sid, eng in cases]
+    finally:
+        receipts._SWEEP.index = None
+    assert indexed == probed
+    assert probed[0]["path"] and probed[1]["path"] and not probed[2]["path"]

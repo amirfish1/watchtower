@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import uuid as _uuid
 from pathlib import Path
@@ -108,15 +109,23 @@ def _save(rows: List[Dict[str, Any]]) -> None:
     os.replace(tmp, path)
 
 
+# Thread-local: a sweep's transcript index; other threads keep probing.
+_SWEEP = threading.local()
+
+
 def _transcript_stat(sid: str, engine: str = "claude") -> Dict[str, Any]:
     engine = str(engine or 'claude').lower()
     if engine not in ('claude', 'codex'):
         return {"path": "", "size": 0, "mtime": 0.0}
-    p = (
-        messages._find_codex_rollout(sid)
-        if str(engine).lower() == "codex"
-        else messages._find_transcript(sid)
-    )
+    index = getattr(_SWEEP, "index", None)
+    if index is not None and messages._UUID_RE.fullmatch(str(sid or "")):
+        p = index.get(engine, {}).get(sid)  # one listing per sweep, not ~800 probes per receipt
+    else:
+        p = (
+            messages._find_codex_rollout(sid)
+            if engine == "codex"
+            else messages._find_transcript(sid)
+        )
     if p is None:
         return {"path": "", "size": 0, "mtime": 0.0}
     try:
@@ -303,8 +312,12 @@ def sweep(now: Optional[float] = None) -> Dict[str, int]:
     now = time.time() if now is None else float(now)
     with queue_mod._FileLock(_receipts_lock()):
         rows = _load()
-        for rec in rows:
-            _verify_one(rec, now)
+        _SWEEP.index = messages.transcript_index()
+        try:
+            for rec in rows:
+                _verify_one(rec, now)
+        finally:
+            _SWEEP.index = None
         _save(rows)
     counts: Dict[str, int] = {}
     for rec in rows:
