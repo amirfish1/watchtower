@@ -993,7 +993,8 @@ def _read_db(db: Path, *, strict: bool = False, readonly: bool = False) -> Dict[
         memo = ((stamp, counter, revision), None, data)
         _READ_DB_MEMO[key] = memo
         return snapshot(memo)
-    return data
+    # Items are shared with the row cache: mutating callers get a private copy.
+    return data if readonly else pickle.loads(pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL))
 
 
 def _create_db(db: Path, data: Dict[str, Any]) -> None:

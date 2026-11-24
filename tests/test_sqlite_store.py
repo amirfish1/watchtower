@@ -352,3 +352,17 @@ def test_readonly_list_items_skips_store_copy_and_keeps_memo_list(wt, monkeypatc
         listed.append({"ref": "GH-1"})  # what the GitHub merge does
         assert len(wt.q.list_items(readonly=True)) == 2
         assert [it["note"] for it in wt.q.list_items(project="RO", readonly=True)] == ["one", "two"]
+
+
+def test_unmemoized_mutable_read_does_not_leak_into_row_cache(wt, monkeypatch):
+    # When the store moves mid-read the snapshot is not memoized; a mutating
+    # caller that never saves (takeover dry-run cancel) must still get
+    # private items, not the shared parsed rows.
+    wt.q.enqueue(project="LK", note="orig")
+    wt.q._load_unlocked(readonly=True)
+    wt.q.enqueue(project="LK", note="other")
+    stamps = iter(range(1000))
+    monkeypatch.setattr(wt.q, "_db_stamp", lambda db: (next(stamps),))
+    data = wt.q._load_unlocked()
+    shared = {id(row[1]) for rows in wt.q._READ_DB_ROWS.values() for row in rows.values()}
+    assert shared and not any(id(it) in shared for it in data["items"])
