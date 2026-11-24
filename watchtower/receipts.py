@@ -118,7 +118,7 @@ def _transcript_stat(sid: str, engine: str = "claude") -> Dict[str, Any]:
     if engine not in ('claude', 'codex'):
         return {"path": "", "size": 0, "mtime": 0.0}
     index = getattr(_SWEEP, "index", None)
-    if index is not None and messages._UUID_RE.fullmatch(str(sid or "")):
+    if index is not None and messages._SESSION_UUID_RE.fullmatch(str(sid or "")):
         p = index.get(engine, {}).get(sid)  # one listing per sweep, not ~800 probes per receipt
     else:
         p = (

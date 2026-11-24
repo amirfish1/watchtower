@@ -670,7 +670,7 @@ def _find_codex_rollout(sid: str) -> Optional[Path]:
     return newest
 
 
-_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_SESSION_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 
 
 def transcript_index() -> Dict[str, Dict[str, Path]]:
@@ -718,7 +718,7 @@ def locate_indexed(index: Dict[str, Dict[str, Path]], sid: str, engine_hint: str
     Non-UUID ids keep the probing finders (codex matches by suffix)."""
     if not sid:
         return ""
-    if not _UUID_RE.fullmatch(sid):
+    if not _SESSION_UUID_RE.fullmatch(sid):
         return locate_transcript(sid, engine_hint)
     order = [engine_hint] + [e for e in ("claude", "codex") if e != engine_hint]
     for engine in order:
