@@ -333,3 +333,22 @@ def test_reread_after_write_decodes_only_changed_rows(wt, monkeypatch):
     writable = wt.q._load_unlocked()
     writable["items"][0]["note"] = "caller mutation"
     assert wt.q._load_unlocked(readonly=True)["items"][0]["note"] == "a"
+
+
+def test_readonly_list_items_skips_store_copy_and_keeps_memo_list(wt, monkeypatch):
+    wt.q.enqueue(project="RO", note="one")
+    wt.q.enqueue(project="RO", note="two")
+    wt.q._load_unlocked(readonly=True)
+    import pickle
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("read-only listing copied the store")
+
+    with monkeypatch.context() as m:
+        m.setattr(pickle, "loads", forbidden)
+        m.setattr(pickle, "dumps", forbidden)
+        listed = wt.q.list_items(readonly=True)
+        assert [it["note"] for it in listed] == ["one", "two"]
+        listed.append({"ref": "GH-1"})  # what the GitHub merge does
+        assert len(wt.q.list_items(readonly=True)) == 2
+        assert [it["note"] for it in wt.q.list_items(project="RO", readonly=True)] == ["one", "two"]

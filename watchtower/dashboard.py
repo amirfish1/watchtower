@@ -122,7 +122,8 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
     sequential ``gh`` subprocess calls, so calling it twice per request quietly
     doubled every poll's latency.
     """
-    items = q.list_items()
+    # Read-only consumers below; a private copy of the store cost ~0.25 s per poll.
+    items = q.list_items(readonly=True)
     rows = health.all_status(stuck_minutes=stuck_minutes, items=items)
     # One roster listing: each list_workers() takes workers.lock exclusively
     # and probes every pid, so listing it three times per poll starved the
@@ -1001,7 +1002,7 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
     closed_by_q: Dict[str, int] = {}
     total_by_q: Dict[str, int] = {}
     try:
-        for it in (q.list_items() or []):
+        for it in (q.list_items(readonly=True) or []):
             qn = str(it.get("project") or "").upper()
             if not qn:
                 continue

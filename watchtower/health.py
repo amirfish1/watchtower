@@ -244,7 +244,7 @@ def queue_status(
             required = q._norm_placement(it.get("placement"))
             placement_blocked[required] = placement_blocked.get(required, 0) + 1
 
-    group_idx = (q._refs_index(q.list_items())
+    group_idx = (q._refs_index(q.list_items(readonly=True))
                  if any(q.group_role(it) for it in open_items) else {})
     claimable_open = [
         it for it in open_items

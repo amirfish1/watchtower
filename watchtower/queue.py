@@ -2396,8 +2396,13 @@ def list_items(
     blocked_only: bool = False,
     raise_on_error: bool = False,
     snapshot_only: bool = False,
+    readonly: bool = False,
 ) -> List[Dict[str, Any]]:
-    """List tickets; snapshot_only is a best-effort local hint, never write authority."""
+    """List tickets; snapshot_only is a best-effort local hint, never write authority.
+
+    ``readonly=True`` returns the shared parsed tickets (in a fresh list)
+    instead of a private copy of the whole store. Only for callers that
+    never modify a returned ticket; an unscoped copy costs ~0.25 s."""
     if project:
         backend = _github_backend_for_project(project)
         if backend is not None:
@@ -2410,8 +2415,10 @@ def list_items(
     # archive. The normalized memo is immutable to this filtering operation.
     scoped = bool(project or status or lane)
     data = _load_unlocked(strict=strict or raise_on_error,
-                          **({"readonly": True} if blocked_only or scoped else {}))
+                          **({"readonly": True} if blocked_only or scoped or readonly else {}))
     items = data.get("items", [])
+    if readonly and not (blocked_only or scoped):
+        items = list(items)  # GitHub rows are appended below; never to the memo
     if blocked_only:
         import copy
         items = [copy.deepcopy(it) for it in items if _is_blocked(it)]
@@ -2428,7 +2435,7 @@ def list_items(
     if project:
         proj = _norm_project(project)
         items = [it for it in items if it.get("project") == proj]
-    if scoped and not blocked_only:
+    if scoped and not blocked_only and not readonly:
         import copy
         items = copy.deepcopy(items)
     if not project:
