@@ -670,6 +670,64 @@ def _find_codex_rollout(sid: str) -> Optional[Path]:
     return newest
 
 
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def transcript_index() -> Dict[str, Dict[str, Path]]:
+    """One listing of every transcript root: ``{"claude": {sid: path},
+    "codex": {sid: newest rollout}}``.
+
+    ``locate_transcript`` probes each of the ~800 project dirs per call;
+    a usage pass resolving ~2k sessions did ~2M stats. A pass builds this
+    once and answers lookups from it (``locate_indexed``)."""
+    from . import config
+    claude: Dict[str, Path] = {}
+    root = _claude_projects_root()
+    try:
+        project_dirs = [d for d in root.iterdir() if d.is_dir()]
+    except OSError:
+        project_dirs = []
+    for d in project_dirs:  # same order as _find_transcript: first dir wins
+        try:
+            with os.scandir(d) as entries:
+                for e in entries:
+                    if e.name.endswith(".jsonl"):
+                        claude.setdefault(e.name[:-len(".jsonl")], d / e.name)
+        except OSError:
+            continue
+    codex: Dict[str, Path] = {}
+    mtimes: Dict[str, float] = {}
+    for sessions in config.codex_session_roots():
+        try:
+            paths = list(sessions.glob("*/*/*/*.jsonl"))
+        except OSError:
+            continue
+        for path in paths:
+            sid = path.name[:-len(".jsonl")][-36:]
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > mtimes.get(sid, -1.0):
+                codex[sid], mtimes[sid] = path, mtime
+    return {"claude": claude, "codex": codex}
+
+
+def locate_indexed(index: Dict[str, Dict[str, Path]], sid: str, engine_hint: str = "") -> str:
+    """``locate_transcript`` answered from a ``transcript_index`` snapshot.
+    Non-UUID ids keep the probing finders (codex matches by suffix)."""
+    if not sid:
+        return ""
+    if not _UUID_RE.fullmatch(sid):
+        return locate_transcript(sid, engine_hint)
+    order = [engine_hint] + [e for e in ("claude", "codex") if e != engine_hint]
+    for engine in order:
+        path = index.get(engine, {}).get(sid)
+        if path is not None:
+            return str(path)
+    return ""
+
+
 def locate_transcript(sid: str, engine_hint: str = "") -> str:
     """Resolve a session id to its transcript path on this machine, if any.
 

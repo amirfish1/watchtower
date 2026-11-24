@@ -1,0 +1,57 @@
+"""messages.transcript_index / locate_indexed answer exactly what the
+probing locate_transcript answers, from one listing per usage pass."""
+
+from __future__ import annotations
+
+import os
+
+from watchtower import config, messages, usage
+
+CLAUDE_SID = "11111111-2222-3333-4444-555555555555"
+CODEX_SID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+
+
+def _tree(tmp_path, monkeypatch):
+    projects = tmp_path / "projects"
+    (projects / "-repo-a").mkdir(parents=True)
+    (projects / "-repo-b").mkdir()
+    (projects / "-repo-b" / f"{CLAUDE_SID}.jsonl").write_text("{}\n")
+    codex_home = tmp_path / "codex"
+    day = codex_home / "sessions" / "2026" / "11" / "24"
+    day.mkdir(parents=True)
+    old = day / f"rollout-2026-11-24T01-00-00-{CODEX_SID}.jsonl"
+    new = day / f"rollout-2026-11-24T02-00-00-{CODEX_SID}.jsonl"
+    old.write_text("{}\n")
+    new.write_text("{}\n")
+    os.utime(old, (1, 1))
+    monkeypatch.setenv("WATCHTOWER_CLAUDE_PROJECTS_DIR", str(projects))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(config, "codex_homes", lambda: [codex_home])
+    return new
+
+
+def test_indexed_lookup_matches_probing_finders(tmp_path, monkeypatch):
+    newest = _tree(tmp_path, monkeypatch)
+    index = messages.transcript_index()
+    for sid in (CLAUDE_SID, CODEX_SID, "99999999-9999-9999-9999-999999999999", "", "not-a-uuid"):
+        for hint in ("claude", "codex", ""):
+            assert messages.locate_indexed(index, sid, hint) == messages.locate_transcript(sid, hint)
+    assert messages.locate_indexed(index, CODEX_SID, "codex") == str(newest)
+
+
+def test_usage_pass_builds_one_index(tmp_path, monkeypatch):
+    _tree(tmp_path, monkeypatch)
+    calls = []
+    real = messages.transcript_index
+    monkeypatch.setattr(messages, "transcript_index", lambda: calls.append(1) or real())
+    monkeypatch.setattr(messages, "_find_transcript",
+                        lambda sid: (_ for _ in ()).throw(AssertionError("probed")))
+    usage._PASS.cache = {"registry": {"workers": []}, "located": {}}
+    try:
+        a = usage.observe("w-1", CLAUDE_SID)
+        b = usage.observe("w-2", CODEX_SID)
+    finally:
+        usage._PASS.cache = None
+    assert calls == [1]
+    assert a["path"].endswith(f"{CLAUDE_SID}.jsonl")
+    assert b["path"].endswith(f"{CODEX_SID}.jsonl")

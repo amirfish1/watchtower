@@ -165,7 +165,9 @@ def observe(worker: str, sid: str = "") -> dict:
     elif pass_cache:
         located = pass_cache["located"]
         if (sid, engine) not in located:
-            located[(sid, engine)] = messages.locate_transcript(sid, engine)
+            if "index" not in pass_cache:
+                pass_cache["index"] = messages.transcript_index()
+            located[(sid, engine)] = messages.locate_indexed(pass_cache["index"], sid, engine)
         path = located[(sid, engine)]
     else:
         path = messages.locate_transcript(sid, engine)
