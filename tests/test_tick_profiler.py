@@ -26,6 +26,7 @@ def test_tick_profiler_profiles_requested_ticks_then_stops(wt_env):
     report = out.read_text()
     assert report.startswith("2 loop iteration(s)")
     assert "busy_tick_work" in report
+    assert (storage.data_dir() / "profile-ticks.prof").stat().st_size > 0
     assert prof.prof is None
 
 

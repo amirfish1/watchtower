@@ -6248,7 +6248,9 @@ def _deploy_sync_tick(boot_head: str, held: str = "") -> str:
 class _TickProfiler:
     """``echo N > <data dir>/profile-ticks`` makes the daemon's main thread
     cProfile its next N loop iterations (ticks plus the sleep between them)
-    and write the stats to ``profile-ticks.out`` (WT-113). SIGUSR1 stacks
+    and write the stats to ``profile-ticks.out`` and ``profile-ticks.prof``
+    (WT-113). On Python 3.12+ cProfile sees every thread, and wall time
+    includes GIL waits, so trust call counts over cumulative times. SIGUSR1 stacks
     misattribute GIL-holding C calls to the blocking call that follows them;
     this measures the tick itself. Costs one stat per tick when not asked."""
 
@@ -6312,6 +6314,8 @@ class _TickProfiler:
         tmp = dest.with_name(dest.name + ".tmp")
         tmp.write_text(out.getvalue())
         os.replace(tmp, dest)
+        # Raw stats too, for ``pstats.Stats(path).print_callers(...)``.
+        stats.dump_stats(str(dest.with_suffix(".prof")))
 
 
 def _daemon_loop(args: argparse.Namespace) -> None:
