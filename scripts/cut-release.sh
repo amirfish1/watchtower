@@ -18,6 +18,13 @@
 #   ./scripts/cut-release.sh minor                # auto-bump from pyproject.toml
 #   ./scripts/cut-release.sh patch --dry-run      # print every step, change nothing
 #   ./scripts/cut-release.sh 0.2.0 --notes-file notes.md
+#   ./scripts/cut-release.sh patch --source-commit <40-char SHA on origin/main>
+#
+# --source-commit is for the scheduled cut (CCC's release-daily.sh). Other
+# sessions commit and push in this shared clone while the suite runs, so the
+# pinned cut tests, bumps and tags that exact revision in a detached worktree,
+# then merges the bump into the current remote branch and pushes the branch and
+# the tag atomically. Later untested commits never land in the tag.
 #
 # Prereqs: clean tree on main, `gh` logged in, push rights on origin.
 set -euo pipefail
@@ -29,6 +36,7 @@ VERSION=""
 BUMP=""
 DRY_RUN=0
 NOTES_FILE=""
+SOURCE_COMMIT=""
 # Releases are cut from main. Overridable only so this script can be exercised
 # end-to-end from a git worktree; leave WT_RELEASE_BRANCH unset for real releases.
 RELEASE_BRANCH="${WT_RELEASE_BRANCH:-main}"
@@ -42,6 +50,8 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --notes-file=*) NOTES_FILE="${1#*=}" ;;
     --notes-file) shift; NOTES_FILE="${1:-}" ;;
+    --source-commit=*) SOURCE_COMMIT="${1#*=}" ;;
+    --source-commit) shift; SOURCE_COMMIT="${1:-}" ;;
     -h|--help) usage; exit 0 ;;
     -*) echo "cut-release: unknown flag $1" >&2; usage; exit 2 ;;
     patch|minor|major) [ -z "$VERSION$BUMP" ] && BUMP="$1" ;;
@@ -57,6 +67,29 @@ die()  { echo "${RED}cut-release: $*${NC}" >&2; exit 1; }
 run()  { if [ "$DRY_RUN" = 1 ]; then echo "   ${YEL}[dry-run]${NC} $*"; else eval "$@"; fi; }
 # GNU sed (the VM's daily release) takes -i with no suffix; BSD sed (macOS) needs -i ''.
 sed_i() { if sed --version >/dev/null 2>&1; then sed -i "$@"; else sed -i '' "$@"; fi; }
+
+if [ -n "$SOURCE_COMMIT" ]; then
+  if [[ ! "$SOURCE_COMMIT" =~ ^[a-f0-9]{40}$ ]] || [ "$DRY_RUN" != 0 ]; then
+    echo "cut-release: --source-commit needs a full commit SHA and a live cut" >&2
+    exit 2
+  fi
+  git fetch --quiet origin "$RELEASE_BRANCH" || die "git fetch origin ${RELEASE_BRANCH} failed"
+  git merge-base --is-ancestor "$SOURCE_COMMIT" FETCH_HEAD \
+    || die "pinned source ${SOURCE_COMMIT} is not on origin/${RELEASE_BRANCH}"
+  SHARED_REPO="$REPO_ROOT"
+  RELEASE_WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/wt-release-cut.XXXXXX")"
+  cleanup_release_worktree() {
+    cd "$SHARED_REPO"
+    if [ -f "$RELEASE_WORKDIR/source/.git" ]; then
+      git worktree remove --force "$RELEASE_WORKDIR/source"
+    fi
+    rmdir "$RELEASE_WORKDIR"
+  }
+  trap cleanup_release_worktree EXIT
+  REPO_ROOT="$RELEASE_WORKDIR/source"
+  git worktree add --quiet --detach "$REPO_ROOT" "$SOURCE_COMMIT"
+  cd "$REPO_ROOT"
+fi
 
 # ── Resolve the target version ──────────────────────────────────────────────
 # pyproject.toml is the source of truth for "where we are now"; __init__.py is
@@ -85,9 +118,11 @@ step "Cutting v${VERSION}  (current: ${CURRENT})  dry-run=${DRY_RUN}"
 
 # ── Preflight ───────────────────────────────────────────────────────────────
 step "Preflight checks"
-BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-[ "$BRANCH" = "$RELEASE_BRANCH" ] \
-  || die "on branch '${BRANCH}', releases are cut from '${RELEASE_BRANCH}'"
+if [ -z "$SOURCE_COMMIT" ]; then
+  BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+  [ "$BRANCH" = "$RELEASE_BRANCH" ] \
+    || die "on branch '${BRANCH}', releases are cut from '${RELEASE_BRANCH}'"
+fi
 # Tracked modifications only: a dirty tree means the tag would point at code
 # that differs from what anyone can check out. Untracked files ride along
 # harmlessly (the commit below stages by explicit path), so they only warn.
@@ -130,9 +165,37 @@ fi
 
 # ── 4. Tag + push ───────────────────────────────────────────────────────────
 step "4/5  Tag and push ${RELEASE_BRANCH} + v${VERSION}"
-run "git tag -a v${VERSION} -m 'v${VERSION}'"
-run "git push origin ${RELEASE_BRANCH}"
-run "git push origin v${VERSION}"
+if [ -n "$SOURCE_COMMIT" ]; then
+  RELEASE_COMMIT="$(git rev-parse HEAD)"
+  # Only a tag object is created here; the shared clone's refs/tags stays
+  # untouched unless the atomic push below publishes the tag.
+  TAG_OBJECT="$(printf 'object %s\ntype commit\ntag v%s\ntagger %s\n\nv%s\n' \
+    "$RELEASE_COMMIT" "$VERSION" "$(git var GIT_COMMITTER_IDENT)" "$VERSION" | git mktag)"
+  LAST_UPSTREAM=""
+  PUSHED=0
+  for attempt in 1 2 3; do
+    git fetch --quiet origin "$RELEASE_BRANCH"
+    UPSTREAM="$(git rev-parse FETCH_HEAD)"
+    [ "$UPSTREAM" != "$LAST_UPSTREAM" ] || break
+    git merge-base --is-ancestor "$SOURCE_COMMIT" "$UPSTREAM" \
+      || die "origin/${RELEASE_BRANCH} no longer contains the tested source"
+    git checkout --quiet --detach "$UPSTREAM"
+    # The branch gets the version bump on top of whatever landed meanwhile; the
+    # tag stays on the tested source plus the bump.
+    git merge --ff --no-edit "$RELEASE_COMMIT"
+    if git push --atomic origin "HEAD:refs/heads/${RELEASE_BRANCH}" "${TAG_OBJECT}:refs/tags/v${VERSION}"; then
+      PUSHED=1
+      break
+    fi
+    LAST_UPSTREAM="$UPSTREAM"
+  done
+  [ "$PUSHED" = 1 ] || die "could not publish ${RELEASE_BRANCH} and v${VERSION} atomically"
+  git checkout --quiet --detach "$RELEASE_COMMIT"
+else
+  run "git tag -a v${VERSION} -m 'v${VERSION}'"
+  run "git push origin ${RELEASE_BRANCH}"
+  run "git push origin v${VERSION}"
+fi
 
 # ── 5. GitHub release ───────────────────────────────────────────────────────
 step "5/5  Create the GitHub release"
@@ -140,9 +203,9 @@ step "5/5  Create the GitHub release"
 # tag) is the notes source unless the caller supplies better ones.
 if [ -n "$NOTES_FILE" ]; then
   [ -f "$NOTES_FILE" ] || die "--notes-file '${NOTES_FILE}' does not exist"
-  run "gh release create v${VERSION} --title 'v${VERSION}' --notes-file '${NOTES_FILE}'"
+  run "gh release create v${VERSION} --verify-tag --title 'v${VERSION}' --notes-file '${NOTES_FILE}'"
 else
-  run "gh release create v${VERSION} --title 'v${VERSION}' --generate-notes"
+  run "gh release create v${VERSION} --verify-tag --title 'v${VERSION}' --generate-notes"
 fi
 
 if [ "$DRY_RUN" = 0 ]; then
