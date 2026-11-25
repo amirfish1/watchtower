@@ -635,16 +635,53 @@ def _deliver_fifo(resolved: Dict[str, Any], text: str) -> Dict[str, Any]:
     return {"ok": False, "error": "fifo write failed (worker not listening)"}
 
 
+# root -> (root mtime_ns, project dirs, {sid: transcript found under them})
+_PROJECT_DIRS_MEMO: Dict[str, tuple] = {}
+_PROJECT_DIRS_SETTLE_S = 2.0
+
+
+def _claude_project_dirs(root: Path) -> tuple:
+    """``(project dirs, positive-hit cache)`` for ``root``; raises OSError.
+
+    The daemon looked up transcripts ~100 times per tick, and each lookup
+    listed and stat-ed all ~800 project dirs (~240k stats per tick, WT-113).
+    The listing only changes when a dir is added or removed, which moves the
+    root's mtime. A listing taken within the settle window of that mtime is
+    not memoized, because a dir created in the same timestamp tick would not
+    move it again.
+    """
+    st = root.stat()
+    key = str(root)
+    hit = _PROJECT_DIRS_MEMO.get(key)
+    if hit is not None and hit[0] == st.st_mtime_ns:
+        return hit[1], hit[2]
+    dirs = [d for d in root.iterdir() if d.is_dir()]
+    found: Dict[str, Path] = {}
+    if time.time() - st.st_mtime_ns / 1e9 >= _PROJECT_DIRS_SETTLE_S:
+        if len(_PROJECT_DIRS_MEMO) >= 16:
+            _PROJECT_DIRS_MEMO.clear()
+        _PROJECT_DIRS_MEMO[key] = (st.st_mtime_ns, dirs, found)
+    return dirs, found
+
+
 def _find_transcript(sid: str) -> Optional[Path]:
     """Locate a session's transcript under the claude projects dir, if any."""
     root = _claude_projects_root()
     try:
-        project_dirs = [d for d in root.iterdir() if d.is_dir()]
+        project_dirs, found = _claude_project_dirs(root)
     except OSError:
         return None
+    cached = found.get(sid)
+    if cached is not None:
+        if cached.exists():
+            return cached
+        found.pop(sid, None)
     for d in project_dirs:
         p = d / f"{sid}.jsonl"
         if p.exists():
+            if len(found) >= 8192:
+                found.clear()
+            found[sid] = p
             return p
     return None
 
@@ -684,7 +721,7 @@ def transcript_index() -> Dict[str, Dict[str, Path]]:
     claude: Dict[str, Path] = {}
     root = _claude_projects_root()
     try:
-        project_dirs = [d for d in root.iterdir() if d.is_dir()]
+        project_dirs, _found = _claude_project_dirs(root)
     except OSError:
         project_dirs = []
     for d in project_dirs:  # same order as _find_transcript: first dir wins
