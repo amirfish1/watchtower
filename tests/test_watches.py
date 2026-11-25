@@ -70,6 +70,80 @@ def test_watch_roundtrip_pending_real_pass_and_permanent_regression(env, tmp_pat
     assert not q.get(ref).get("needs_input")
 
 
+def test_real_pending_allows_a_new_failure_after_the_previous_ticket_closes(env, tmp_path):
+    q, *_ = env
+    receipt = check(tmp_path)
+    ref = close(env, tmp_path)
+    items = [q.get(ref)]
+
+    def run(status, real_data, evidence):
+        receipt.write_text(json.dumps(dict(status=status, real_data=real_data, evidence=evidence)))
+        return watches.run("natural-check", items=items)[0]
+
+    first = run("fail", False, "query HTTP 504")["failure_ref"]
+    assert q.close(first, resolution="Upstream outage resolved")["status"] == "closed"
+    assert run("pending", False, "no data available")["status"] == "pending"
+    assert run("fail", True, "new diagnostic")["failure_ref"] == first
+
+    pending = run("pending", True, "query healthy; no qualifying event")
+    assert pending["status"] == "pending" and pending["real_data"] is True
+    assert not pending.get("failure_ref")
+    assert watches.owner_rows(items)[0]["last"]["status"] == "pending"
+    # An existing registry has the pending receipt from before this fix.
+    with watches._lock():
+        data = watches._load()
+        binding = data["bindings"][ref + ":natural-check"]
+        binding.pop("pending_after_failure", None)
+        watches._save(data)
+
+    assert run("fail", False, "query HTTP 504")["failure_ref"] == first
+    new = run("fail", True, "new diagnostic")["failure_ref"]
+    assert new != first and q.get(new)["status"] == "open"
+    assert q.get(first)["status"] == q.get(ref)["status"] == "closed"
+    assert run("fail", True, "new diagnostic")["failure_ref"] == new
+    assert run("pending", True, "healthy again")["status"] == "pending"
+    assert run("fail", True, "another new diagnostic")["failure_ref"] == new
+    assert q.close(new, resolution="Diagnostic resolved")["status"] == "closed"
+    assert run("fail", True, "new diagnostic")["failure_ref"] == new
+    assert run("fail", True, "another new diagnostic")["failure_ref"] != new
+
+
+def test_shared_watch_rearms_once_when_originals_change(env, tmp_path):
+    from watchtower import related
+
+    q, *_ = env
+    receipt = check(tmp_path, dict(status="fail", real_data=False, evidence="outage"))
+    ref = close(env, tmp_path)
+    second = close(env, tmp_path)
+    original = q.get(ref)
+    other = q.get(second)
+    first, again = watches.run("natural-check", items=[original, other])
+    assert first["failure_ref"] == again["failure_ref"]
+    assert q.close(first["failure_ref"], resolution="Outage resolved")["status"] == "closed"
+
+    receipt.write_text(json.dumps(dict(status="pending", real_data=True, evidence="healthy read")))
+    assert {row["status"] for row in watches.run("natural-check", items=[original, other])} == {"pending"}
+    third = close(env, tmp_path)
+    later = q.get(third)
+    # The first binding is temporarily ineligible when a new sibling joins.
+    reopened = dict(original, status="open")
+    before_failure = watches.sync([later])
+    receipt.write_text(json.dumps(dict(status="fail", real_data=True, evidence="distinct regression")))
+    results = watches.run("natural-check", items=[reopened, other, later])
+    assert {row["origin"] for row in results} == {second, third}
+    new = results[0]["failure_ref"]
+    assert new != first["failure_ref"] and q.get(new)["status"] == "open"
+    assert {row["failure_ref"] for row in results} == {new}
+    # Replay from the registry state before the receipt write. The queue has
+    # already committed the replacement ticket.
+    with watches._lock():
+        watches._save(before_failure)
+    results = watches.run("natural-check", items=[original, other, later])
+    assert {row["failure_ref"] for row in results} == {new}
+    assert {link["ref"] for link in related.links(q.get(new))} == {ref, second, third}
+    assert all(q.get(origin)["status"] == "closed" for origin in (ref, second, third))
+
+
 def test_schedule_changes_only_check_cadence_not_original_state(env, tmp_path):
     q, *_ = env
     check(tmp_path)

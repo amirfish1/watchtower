@@ -1994,6 +1994,7 @@ def enqueue(
     annotation_id: str = "",
     client_id: str = "",
     dedupe_key: str = "",
+    dedupe_while_active: str = "",
     url: str = "",
     title: str = "",
     selector: str = "",
@@ -2025,6 +2026,9 @@ def enqueue(
     budget_min: int = 0,
 ) -> Dict[str, Any]:
     """Append a new ``open`` item and return it (with its assigned ref).
+
+    ``dedupe_while_active`` is a predecessor ref in the same local queue.
+    Reuse it while it is active, unless the new dedupe key already exists.
 
     ``depth``: ``quick`` (default) or ``deep`` -- a deep ticket's claim carries
     the deep-work brief (watchtower/deep.py); ``budget_min`` is its active-work
@@ -2074,6 +2078,8 @@ def enqueue(
     backend = _github_backend_for_project(proj)
     if dedupe_key and backend is not None:
         raise ValueError("dedupe keys currently require a local queue")
+    if dedupe_while_active and not dedupe_key:
+        raise ValueError("an active dedupe predecessor requires a dedupe key")
     grouped = bool(group_parent or group or children)
     if grouped:
         if backend is not None:
@@ -2137,6 +2143,10 @@ def enqueue(
         if dedupe_key:
             existing = next((i for i in data["items"] if i.get("project") == proj
                              and i.get("dedupe_key") == dedupe_key), None)
+            if existing is None and dedupe_while_active:
+                existing = next((i for i in data["items"] if i.get("project") == proj
+                                 and i.get("ref") == dedupe_while_active
+                                 and i.get("status") != "closed"), None)
             if existing is not None:
                 _config.restore_queue_for_ticket(existing)
                 return existing

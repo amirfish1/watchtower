@@ -128,7 +128,8 @@ def register(name, *, command, cwd, where, schedule, queue, every=300,
                         spec=bound["spec"], last=bound["last"],
                         first_real_pass=bound.get("first_real_pass", "")))
                     bound.update(spec=dict(spec, origin=bound["spec"]["origin"]),
-                                 last={}, first_real_pass="", episode=bound.get("episode", 0) + 1)
+                                 last={}, first_real_pass="", episode=bound.get("episode", 0) + 1,
+                                 failure_ref="", pending_after_failure=False)
         data["checks"][name] = spec
         data.setdefault("registered_at", {}).setdefault(name, time.time())
         _save(data)
@@ -180,7 +181,9 @@ def sync(items):
                     data["bindings"][key] = dict(spec=spec, attached_at=item.get("closed_at"),
                                                 last=peer.get("last", {}),
                                                 first_real_pass=peer.get("first_real_pass", ""),
-                                                episode=peer.get("episode", 0))
+                                                episode=peer.get("episode", 0),
+                                                failure_ref=peer.get("failure_ref", ""),
+                                                pending_after_failure=peer.get("pending_after_failure", False))
                 data["bindings"][key]["origin_item"] = {
                     k: item[k] for k in ("ref", "project", "title", "created_at", "status") if k in item}
         _save(data)
@@ -339,6 +342,24 @@ def _execute(spec):
     return {k: result.get(k) for k in ("status", "real_data", "evidence")}
 
 
+_FAILURE_FOOTER = "\nInvestigate this regression; do not reopen or park the original."
+
+
+def _real_pending(result):
+    return result.get("status") == "pending" and result.get("real_data") is True
+
+
+def _new_failure_evidence(previous, evidence):
+    """Compare against the diagnostic actually filed, even for old bindings."""
+    _, marker, filed = previous.get("note", "").partition("\nEvidence: ")
+    if not marker:
+        return False
+    evidence = str(evidence)
+    if filed.endswith("…"):  # Queue note clipping preserves a known prefix.
+        return not (evidence + _FAILURE_FOOTER).startswith(filed[:-1])
+    return filed.removesuffix(_FAILURE_FOOTER).strip() != evidence.strip()
+
+
 def run(name="", *, now=None, items=None, limit=1):
     """Run due permanent checks with a bounded per-tick budget, not ticket timers."""
     from . import queue as q, related
@@ -364,46 +385,74 @@ def run(name="", *, now=None, items=None, limit=1):
             spec = bound["spec"]
             original = by_ref.get(spec["origin"], bound.get("origin_item") or
                                   dict(ref=spec["origin"], status="closed"))
-            if original.get("status") == "closed" and (not name or spec["name"] == name):
+            if not name or spec["name"] == name:
                 groups.setdefault((spec["name"], spec["revision"]), []).append((key, bound, original))
         ordered = sorted(groups.values(), key=lambda g: max(b.get("last", {}).get("at", 0) for _, b, _ in g))
         executed = 0
-        for group in ordered:
-            _, representative, _ = group[0]
-            spec = representative["spec"]
-            last_at = max(b.get("last", {}).get("at", 0) for _, b, _ in group)
+        for peers in ordered:
+            group = [row for row in peers if row[2].get("status") == "closed"]
+            if not group:
+                continue
+            spec = group[0][1]["spec"]
+            last_at = max(b.get("last", {}).get("at", 0) for _, b, _ in peers)
             if not name and last_at and now - last_at < spec["every"]:
                 continue
             result = dict(_execute(spec), at=now)
-            episode = max(b.get("episode", 0) for _, b, _ in group)
+            _, representative, _ = max(peers, key=lambda row: (
+                row[1].get("episode", 0), row[1].get("last", {}).get("at", 0)))
+            episode = representative.get("episode", 0)
+            failure_ref = representative.get("failure_ref", "")
+            # An older registry can have the pending receipt without the latch.
+            pending_after_failure = bool(failure_ref and (
+                representative.get("pending_after_failure") or _real_pending(representative.get("last", {}))))
+            first_real_pass = representative.get("first_real_pass", "")
             failure = None
             if result["status"] in ("fail", "error"):
-                origins = ", ".join(b["spec"]["origin"] for _, b, _ in group)
+                previous = (by_ref.get(failure_ref) or q.get(failure_ref)) if failure_ref else None
+                # The first binding anchors the key even while its origin is reopened.
+                anchor = peers[0][0]
+                dedupe_key = f"watch:{anchor}:{episode}"
+                predecessor = ""
+                previous_key = (previous or {}).get("dedupe_key", "")
+                # Older registration replacements advanced the episode but
+                # could leave the previous revision's failure ref in place.
+                if previous_key.endswith(f":{episode}"):
+                    if pending_after_failure and _new_failure_evidence(previous, result["evidence"]):
+                        dedupe_key = f"watch:{anchor}:{episode + 1}"
+                        predecessor = failure_ref
+                    else:
+                        dedupe_key = previous_key
+                origins = ", ".join(original["ref"] for _, _, original in group)
                 failure = q.enqueue(project=spec["queue"], source="wt-watch",
-                                    dedupe_key=f"watch:{group[0][0]}:{episode}",
+                                    dedupe_key=dedupe_key, dedupe_while_active=predecessor,
                                     title=f"Watch {spec['name']} failed ({spec['origin']})",
                                     note=f"Originals: {origins}\nCheck: {spec['name']}\n"
                                          f"Command: {spec['command']}\nWhere: {spec['where']}\n"
-                                         f"Evidence: {result['evidence']}\n"
-                                         "Investigate this regression; do not reopen or park the original.")
-                result["failure_ref"] = failure["ref"]
+                                         f"Evidence: {result['evidence']}{_FAILURE_FOOTER}")
+                if failure["ref"] != failure_ref:
+                    if predecessor:
+                        episode += 1
+                    pending_after_failure = False
+                failure_ref = result["failure_ref"] = failure["ref"]
+            elif result["status"] == "pass":
+                first_real_pass = first_real_pass or q._now_iso()
+                if failure_ref:
+                    episode += 1
+                failure_ref = ""
+                pending_after_failure = False
+            elif failure_ref and _real_pending(result):
+                pending_after_failure = True
             with _lock():
                 current = _load()
-                for key, bound, original in group:
+                for key, _, original in peers:
                     # A concurrent explicit replacement invalidates this receipt.
                     target = current["bindings"].get(key)
                     if not target or target["spec"]["revision"] != spec["revision"]:
                         continue
-                    if result["status"] == "pass":
-                        bound["first_real_pass"] = bound.get("first_real_pass") or q._now_iso()
-                        if bound.get("failure_ref"):
-                            bound["episode"] += 1
-                            bound.pop("failure_ref", None)
-                    if failure:
-                        bound["failure_ref"] = failure["ref"]
-                    bound["last"] = result
-                    current["bindings"][key] = bound
-                    results.append(dict(origin=bound["spec"]["origin"], check=spec["name"], **result))
+                    target.update(episode=episode, failure_ref=failure_ref, first_real_pass=first_real_pass,
+                                  pending_after_failure=pending_after_failure, last=result)
+                    if original.get("status") == "closed":
+                        results.append(dict(origin=original["ref"], check=spec["name"], **result))
                 _save(current)
             if failure:
                 for _, _, original in group:
