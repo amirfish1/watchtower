@@ -531,6 +531,21 @@ def isolated_attribution_state(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_launch_failures(tmp_path, monkeypatch):
+    """No test reads or prunes the host's ~/.watchtower/launch-failures.json.
+
+    Hand-built fixtures (test_gates' ``vcfg``, the liveness suites) redirect
+    only the files they think of. Since WT-117 any other queue's usage-limit
+    cooldown on the same engine login applies to every queue, so a live
+    fleet's codex cooldown made those tests' stage spawns "wait" (WT-121).
+    Tests that set their own path (env + reload, or setattr) still win."""
+    from watchtower import workers
+    path = tmp_path / "launch-failures.isolated.json"
+    monkeypatch.setenv("WATCHTOWER_LAUNCH_FAILURES_FILE", str(path))
+    monkeypatch.setattr(workers, "LAUNCH_FAILURES_FILE", path)
+
+
+@pytest.fixture(autouse=True)
 def isolated_engine_ancestry(monkeypatch):
     """Synthetic identity tests must not see the developer agent ancestry."""
     from watchtower import sender_envelope
