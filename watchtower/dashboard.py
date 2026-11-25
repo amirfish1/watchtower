@@ -998,11 +998,14 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
         qn = str(w.get("queue", ""))
         workers_by_queue.setdefault(qn, []).append(w)
 
-    # Get completed/total counts per queue from one pass over all items
+    # Get completed/total counts per queue from one pass over all items.
+    # Display-only: GitHub queues come from the poller's persisted snapshot.
+    # A live read here ran up to two ``gh`` probes per GitHub queue inside the
+    # request (14 queues: GET / took up to 14 s, WT-113).
     closed_by_q: Dict[str, int] = {}
     total_by_q: Dict[str, int] = {}
     try:
-        for it in (q.list_items(readonly=True) or []):
+        for it in (q.list_items(readonly=True, snapshot_only=True) or []):
             qn = str(it.get("project") or "").upper()
             if not qn:
                 continue

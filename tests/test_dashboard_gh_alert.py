@@ -80,3 +80,17 @@ def test_status_payload_includes_github_connectivity_block(tmp_path, monkeypatch
     payload = dashboard.status_payload()
     assert "github" in payload
     assert payload["github"]["alert"] is False
+
+
+def test_home_page_counts_never_start_a_live_github_read(monkeypatch):
+    """WT-113: GET / counted tickets with a live list of every GitHub queue,
+    up to two ``gh`` probes per queue inside the request (up to 14 s). The
+    display-only counts must come from the poller's snapshot."""
+    import watchtower.dashboard as dashboard
+
+    calls = []
+    monkeypatch.setattr(dashboard.q, "list_items",
+                        lambda **kw: calls.append(kw) or [{"project": "A", "status": "closed"}])
+    page = dashboard.render_index(_base_payload(), chat_rows=[])
+    assert calls and all(kw.get("snapshot_only") for kw in calls)
+    assert "A" in page
