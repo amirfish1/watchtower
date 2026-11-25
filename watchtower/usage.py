@@ -45,14 +45,23 @@ def parse(path: str, engine: str) -> dict:
         stamp = None
     hit = _PARSE_MEMO.get((path, engine)) if stamp else None
     if hit is not None and hit[0] == stamp:
+        _PARSED.last = (path, engine, stamp)
         return dict(hit[1], units=dict(hit[1]["units"]))
+    _PARSED.last = None
     result = _parse(path, engine)
     if stamp and result["status"] != "unavailable":
         if len(_PARSE_MEMO) >= 4096:
             _PARSE_MEMO.clear()
         _PARSE_MEMO[(path, engine)] = (stamp, result)
+        _PARSED.last = (path, engine, stamp)
         result = dict(result, units=dict(result["units"]))
     return result
+
+
+# Per thread: (path, engine, stamp) of the memoized parse() result last
+# returned, or None. Lets _snapshot_fingerprint key on the file identity
+# instead of re-serializing every unit (WT-122).
+_PARSED = threading.local()
 
 
 _PARSE_MEMO: dict = {}
@@ -547,17 +556,46 @@ def _late_snapshot(worker_id, session_id, saved_path, saved_engine,
     return snap
 
 
+def _snapshot_fingerprint(snap: dict, parsed) -> str:
+    """``_fingerprint(snap)`` for a snapshot built from a memoized parse.
+
+    The units of a parse result are fixed by the transcript's (path, engine,
+    stat stamp); everything else in the snapshot is small. Thousands of
+    settled shared-session attempts are re-checked every tick, and hashing
+    their full units cost ~3 CPU-s per tick (WT-122). ``parsed`` is the
+    (path, engine, stamp) parse() recorded for this snapshot, or None.
+    """
+    if not parsed or (snap.get("path"), snap.get("engine")) != parsed[:2]:
+        return _fingerprint(snap)
+    rest = json.dumps({k: v for k, v in snap.items() if k != "units"},
+                      sort_keys=True, default=str)
+    key = (parsed, rest)
+    fp = _SNAP_FP_MEMO.get(key)
+    if fp is None:
+        fp = _fingerprint(snap)
+        if len(_SNAP_FP_MEMO) >= 16384:
+            _SNAP_FP_MEMO.clear()
+        _SNAP_FP_MEMO[key] = fp
+    return fp
+
+
+_SNAP_FP_MEMO: dict = {}
+
+
 def _has_work(digests, owners) -> bool:
     """Would the locked pass change this ledger? May say yes spuriously, never no."""
     from . import workers
     for d in digests:
+        _PARSED.last = None
         snap = _late_snapshot(d["worker_id"], d["session_id"], d["path"], d["engine"],
                               d["saved_session_id"], d["requested_model"])
+        parsed = getattr(_PARSED, "last", None)
         exited = bool(workers.read_exit_file(d["exit_file"]).get("ended_at"))
         if not exited and not snap.get("terminal"):
             continue
         if len(owners[d["session_id"] or d["worker_id"]]) != 1:
-            if d["late"] == _fingerprint(snap) and d["completeness"] == "ambiguous_shared_session":
+            if (d["completeness"] == "ambiguous_shared_session"
+                    and d["late"] == _snapshot_fingerprint(snap, parsed)):
                 continue
         return True
     return False
@@ -590,6 +628,10 @@ def _reconcile() -> None:
             record = _read(path)
             ledger = record.get("token_usage") or {}
             changed = False
+            # finish() can recompute an unattributable attempt to the same
+            # "partial" state every tick; rewriting the identical ledger each
+            # time churned every reader keyed on its stat (WT-122).
+            before = json.dumps(record, sort_keys=True, default=str)
             for a in ledger.get("attempts", []):
                 if _skips(a):
                     continue  # Frozen historical bounds must never expand to later session usage.
@@ -617,7 +659,7 @@ def _reconcile() -> None:
                 finish(record, a["role"], a["ended_at"], original_outcome, a["worker_id"])
                 a["completeness"] = "complete" if a.get("models") and a.get("attribution") == "measured_interval" else "partial"
                 changed = True
-            if changed:
+            if changed and json.dumps(record, sort_keys=True, default=str) != before:
                 _write(path, record)
 
 

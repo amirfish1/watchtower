@@ -7566,7 +7566,11 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
     with timing:
         open_items = _q.open_staffing_items(staff_queue) if cold_local else None
         try:
-            _all_items = open_items if open_items is not None else _q.list_items(project=staff_queue) or []
+            # Read-only: every consumer below only filters and counts, and a
+            # private copy of each queue's archive per tick cost ~2.6% of a
+            # core (WT-122).
+            _all_items = (open_items if open_items is not None
+                          else _q.list_items(project=staff_queue, readonly=True) or [])
         except Exception:
             _all_items = None
 

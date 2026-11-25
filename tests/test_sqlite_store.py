@@ -366,3 +366,71 @@ def test_unmemoized_mutable_read_does_not_leak_into_row_cache(wt, monkeypatch):
     data = wt.q._load_unlocked()
     shared = {id(row[1]) for rows in wt.q._READ_DB_ROWS.values() for row in rows.values()}
     assert shared and not any(id(it) in shared for it in data["items"])
+
+
+# ------------------------------------------------- incremental refresh (WT-122)
+
+
+def _decodes(monkeypatch, q):
+    """Count json.loads calls made while refreshing the store."""
+    calls = []
+    real = q.json.loads
+
+    def counting(raw, *a, **k):
+        calls.append(raw)
+        return real(raw, *a, **k)
+
+    monkeypatch.setattr(q.json, "loads", counting)
+    return calls
+
+
+def test_refresh_decodes_only_changed_rows(wt, monkeypatch):
+    for i in range(6):
+        wt.q.enqueue(project="RV", note=f"n{i}")
+    conn = sqlite3.connect(str(wt.db))
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+    conn.close()
+    assert "rev" in cols
+    before = {it["number"]: it for it in wt.q._load_unlocked(readonly=True)["items"]}
+    wt.q.update_status("RV-3", "in_progress", "w1")
+    calls = _decodes(monkeypatch, wt.q)
+    after = {it["number"]: it for it in wt.q._load_unlocked(readonly=True)["items"]}
+    assert len(calls) == 1
+    changed = [n for n in after if after[n] is not before[n]]
+    assert [after[n]["ref"] for n in changed] == ["RV-3"]
+    assert after[changed[0]]["status"] == "in_progress"
+
+
+def test_refresh_sees_direct_sql_writes(wt):
+    # Older binaries and direct SQL (owner_wait_init) bypass _save_store; the
+    # triggers still move the row's rev, so readers never serve stale rows.
+    a = wt.q.enqueue(project="RV", note="orig")
+    wt.q.enqueue(project="RV", note="other")
+    wt.q._load_unlocked(readonly=True)
+    item = dict(a, note="edited")
+    conn = sqlite3.connect(str(wt.db))
+    with conn:
+        conn.execute("UPDATE items SET item_json=? WHERE number=?",
+                     (wt.q._canon(item), a["number"]))
+    conn.close()
+    wt.q._READ_DB_MEMO.clear()  # same-second write: the stamp may not move
+    notes = {it["ref"]: it["note"] for it in wt.q._load_unlocked(readonly=True)["items"]}
+    assert notes == {a["ref"]: "edited", "RV-2": "other"}
+
+
+def test_store_without_rev_column_reads_and_upgrades(wt):
+    wt.q.enqueue(project="OLD", note="one")
+    conn = sqlite3.connect(str(wt.db))
+    with conn:
+        for name in wt.q._REV_TRIGGERS:
+            conn.execute(f"DROP TRIGGER {name}")
+        conn.execute("ALTER TABLE items DROP COLUMN rev")
+    conn.close()
+    wt.q._READ_DB_MEMO.clear()
+    wt.q._READ_DB_ROWS.clear()
+    assert [it["note"] for it in wt.q._load_unlocked(readonly=True)["items"]] == ["one"]
+    wt.q.enqueue(project="OLD", note="two")  # a save adds the column back
+    conn = sqlite3.connect(str(wt.db))
+    assert "rev" in {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+    conn.close()
+    assert [it["note"] for it in wt.q._load_unlocked(readonly=True)["items"]] == ["one", "two"]

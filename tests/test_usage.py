@@ -364,3 +364,34 @@ def test_historical_partial_backfill_does_not_expand_on_settlement(measured, tmp
     assert item["token_usage"]["measured_totals"]["input"] == 20
     assert item["token_usage"]["attempts"][0]["completeness"] == "historical_partial"
     assert usage._read(target)["token_usage"]["attempts"][0]["observed"]["units"].get("later-unrelated") is None
+
+
+def test_settled_shared_session_is_not_rehashed_each_pass(measured, tmp_path, monkeypatch):
+    # WT-122: thousands of settled shared-session attempts were re-hashed in
+    # full every tick. The fingerprint is memoized on the transcript's parse
+    # stamp, and a transcript change is still noticed.
+    monkeypatch.setenv("WATCHTOWER_USAGE_DIR", str(tmp_path / "usage"))
+    first = {"ref": "TOK-1", "history": []}
+    second = {"ref": "TOK-2", "history": []}
+    claim = {"event": "claim", "at": "t0", "by": {"worker": "w"}}
+    close = {"event": "close", "at": "t1", "by": {"worker": "w"}}
+    usage.capture(first, usage.on_event, claim)
+    usage.capture(first, usage.on_event, close)
+    usage.capture(second, usage.on_event, claim)
+    usage.capture(second, usage.on_event, close)
+    rows = [claude("preexisting"), claude("late", inp=70), {"type": "result"}]
+    write(measured, rows)
+    usage.reconcile()
+    path = usage._location(first)
+    assert usage._read(path)["token_usage"]["attempts"][0]["completeness"] == "ambiguous_shared_session"
+    usage.reconcile()  # warms the memo
+    hashed = []
+    real = usage._fingerprint
+    monkeypatch.setattr(usage, "_fingerprint", lambda v: (hashed.append(v), real(v))[1])
+    stamp = path.stat().st_mtime_ns
+    usage.reconcile()
+    assert hashed == [] and path.stat().st_mtime_ns == stamp
+    write(measured, rows + [claude("later", inp=5), {"type": "result"}])
+    usage.reconcile()
+    late = usage._read(path)["token_usage"]["attempts"][0]["late_observed"]
+    assert any(u.get("input") == 5 for u in late["units"].values())

@@ -813,6 +813,27 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_items_project_status ON items(project, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_items_ref ON items(ref)")
     _ensure_time_index_schema(conn)
+    _ensure_rev_schema(conn)
+
+
+# Per-row change token (WT-122). Triggers stamp a fresh random ``rev`` on every
+# insert and every item_json update, including writes from older binaries and
+# direct SQL, so a reader re-fetches only rows whose (number, rev) moved
+# instead of every row's JSON (~45 MB) after each store write. Rows untouched
+# since the column was added keep rev 0, which is still a stable token.
+_REV_TRIGGERS = {
+    "items_rev_insert": "AFTER INSERT ON items",
+    "items_rev_update": "AFTER UPDATE OF item_json ON items",
+}
+
+
+def _ensure_rev_schema(conn: sqlite3.Connection) -> None:
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(items)")}
+    if "rev" not in cols:
+        conn.execute("ALTER TABLE items ADD COLUMN rev INTEGER NOT NULL DEFAULT 0")
+    for name, when in _REV_TRIGGERS.items():
+        conn.execute(f"CREATE TRIGGER IF NOT EXISTS {name} {when} BEGIN "
+                     "UPDATE items SET rev = random() WHERE number = NEW.number; END")
 
 
 # Derived reporting indexes. Triggers record changed primary keys, including writes
@@ -1034,20 +1055,11 @@ def _read_db_refresh(db: Path, key: str, strict: bool) -> tuple:
                 return ("memo", memo)
             # Workers write the store about once a second, so the snapshot
             # memo above rarely survives a tick and a full reparse of every
-            # row (~95% closed archive) pinned a core. Reuse the parsed item
-            # of any row whose JSON text is byte-identical to the last read;
-            # only changed rows are decoded again. Reused items are the
-            # normalized objects read-only callers already share.
+            # row (~95% closed archive) pinned a core. Only rows that changed
+            # since the last read are fetched and decoded (_read_db_rows).
             prev_rows = _READ_DB_ROWS.get(key) or {}
-            rows: Dict[int, tuple] = {}
-            items = []
-            for number, raw in conn.execute(
-                "SELECT number, item_json FROM items ORDER BY number"
-            ):
-                hit = prev_rows.get(number)
-                item = hit[1] if hit is not None and hit[0] == raw else json.loads(raw)
-                rows[number] = (raw, item)
-                items.append(item)
+            rows = _read_db_rows(conn, prev_rows)
+            items = [row[1] for row in rows.values()]
         finally:
             conn.close()
     except (sqlite3.Error, ValueError, json.JSONDecodeError):
@@ -1067,6 +1079,61 @@ def _read_db_refresh(db: Path, key: str, strict: bool) -> tuple:
         _READ_DB_MEMO[key] = memo
         return ("memo", memo)
     return ("data", data)
+
+
+def _read_db_rows(conn: sqlite3.Connection, prev_rows: Dict[int, tuple]) -> Dict[int, tuple]:
+    """{number: (token, parsed item)} in number order, reusing ``prev_rows``.
+
+    With the ``rev`` column (see ``_ensure_rev_schema``) the token is
+    ``("rev", rev)`` and only rows whose rev moved are fetched and decoded,
+    inside one read transaction so both queries see the same snapshot.
+    Without it (a store no new writer has touched yet) the token is the row's
+    JSON text, compared byte for byte. Reused items are the normalized
+    objects read-only callers already share.
+    """
+    rows: Dict[int, tuple] = {}
+    conn.execute("BEGIN")
+    try:
+        try:
+            revs = conn.execute("SELECT number, rev FROM items ORDER BY number").fetchall()
+        except sqlite3.OperationalError:
+            revs = None
+        if revs is None:
+            for number, raw in conn.execute(
+                "SELECT number, item_json FROM items ORDER BY number"
+            ):
+                hit = prev_rows.get(number)
+                item = hit[1] if hit is not None and hit[0] == raw else json.loads(raw)
+                rows[number] = (raw, item)
+            return rows
+        stale = []
+        for number, rev in revs:
+            token = ("rev", rev)
+            hit = prev_rows.get(number)
+            if hit is not None and hit[0] == token:
+                rows[number] = hit
+            else:
+                rows[number] = (token, None)
+                stale.append(number)
+        if stale:
+            if len(stale) > len(revs) // 4:
+                fetched = conn.execute("SELECT number, item_json FROM items")
+            else:
+                fetched = []
+                for i in range(0, len(stale), 500):
+                    chunk = stale[i:i + 500]
+                    fetched += conn.execute(
+                        "SELECT number, item_json FROM items WHERE number IN ("
+                        + ",".join("?" * len(chunk)) + ")", chunk).fetchall()
+            for number, raw in fetched:
+                row = rows.get(number)
+                if row is not None and row[1] is None:
+                    rows[number] = (row[0], json.loads(raw))
+            if any(rows[n][1] is None for n in stale):
+                raise ValueError("store rows changed during a snapshot read")
+        return rows
+    finally:
+        conn.rollback()
 
 
 def _create_db(db: Path, data: Dict[str, Any]) -> None:
