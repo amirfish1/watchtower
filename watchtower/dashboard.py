@@ -1694,6 +1694,8 @@ class _Handler(BaseHTTPRequestHandler):
         elif path == "/api/version":
             from . import releases
             self._json(200, {"code_rev": releases.RUNTIME_BUILD, "pid": os.getpid()})
+        elif path == "/api/store-stats":
+            self._json(200, q.store_stats())
         elif path == "/api/status":
             self._json(200, cached_status_payload())
         elif path == "/api/queues":

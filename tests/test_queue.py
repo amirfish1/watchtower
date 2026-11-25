@@ -825,3 +825,23 @@ def test_acked_unresolved_blocker_does_not_reblock_dependent(wt):
     got = q.get(b["ref"])
     assert not got.get("needs_input")
     assert q.claim_next("w2", project="DEP")["ref"] == b["ref"]
+
+
+def test_store_stats_attribute_mutable_loads_and_saves_to_callers(wt):
+    """WT-113: daemon HTTP stalls behind whole-store copies; the counters name who pays."""
+    q = wt.q
+    q.enqueue(project="STATS", title="first", note="first")
+
+    def mutate_once():
+        with q._FileLock(q._lock_path()):
+            data = q._load_unlocked()
+            q._save_unlocked(data)
+
+    before = q.store_stats()["ops"].get("save", {}).get("count", 0)
+    mutate_once()
+    q._load_unlocked(readonly=True)
+    stats = q.store_stats()
+    assert stats["ops"]["save"]["count"] == before + 1
+    callers = {row["op_caller"] for row in stats["top_callers"]}
+    assert "save test_queue.mutate_once" in callers
+    assert "mutable_load test_queue.mutate_once" in callers

@@ -1089,7 +1089,66 @@ def export_data() -> Dict[str, Any]:
     return {"counter": int(data.get("counter", 0)), "items": data.get("items", [])}
 
 
+# Per-process store cost counters (WT-113). Mutable loads deep-copy the whole
+# store and saves diff every row while holding the GIL, so HTTP threads in the
+# daemon stall behind them; ``GET /api/store-stats`` shows who pays for them.
+import threading as _threading
+
+_STORE_STATS_LOCK = _threading.Lock()
+_STORE_STATS: Dict[str, Any] = {"since": time.time(), "ops": {}, "callers": {}}
+_STORE_STATS_SKIP = frozenset({"_load_unlocked", "_save_unlocked", "_timed_store_op",
+                               "_mutate", "mutate", "__enter__", "__exit__", "wrapper"})
+
+
+def _store_caller() -> str:
+    frame = sys._getframe(2)
+    for _ in range(6):
+        if frame is None:
+            break
+        if frame.f_code.co_name not in _STORE_STATS_SKIP:
+            module = frame.f_globals.get("__name__", "?").rsplit(".", 1)[-1]
+            return f"{module}.{frame.f_code.co_name}"
+        frame = frame.f_back
+    return "?"
+
+
+def _record_store_op(op: str, elapsed: float, caller: str) -> None:
+    with _STORE_STATS_LOCK:
+        total = _STORE_STATS["ops"].setdefault(op, [0, 0.0, 0.0])
+        total[0] += 1
+        total[1] += elapsed
+        total[2] = max(total[2], elapsed)
+        callers = _STORE_STATS["callers"]
+        key = f"{op} {caller}"
+        if key in callers or len(callers) < 300:
+            row = callers.setdefault(key, [0, 0.0])
+            row[0] += 1
+            row[1] += elapsed
+
+
+def store_stats(top: int = 25) -> Dict[str, Any]:
+    """Counts/seconds of mutable loads and saves in this process since start."""
+    with _STORE_STATS_LOCK:
+        ops = {k: {"count": v[0], "seconds": round(v[1], 3), "max_s": round(v[2], 3)}
+               for k, v in _STORE_STATS["ops"].items()}
+        callers = sorted(_STORE_STATS["callers"].items(), key=lambda kv: -kv[1][1])[:top]
+        return {"pid": os.getpid(), "since": _STORE_STATS["since"],
+                "uptime_s": round(time.time() - _STORE_STATS["since"], 1), "ops": ops,
+                "top_callers": [{"op_caller": k, "count": v[0], "seconds": round(v[1], 3)}
+                                for k, v in callers]}
+
+
 def _load_unlocked(*, strict: bool = False, readonly: bool = False) -> Dict[str, Any]:
+    if readonly:
+        return _load_store(strict=strict, readonly=True)
+    started = time.perf_counter()
+    try:
+        return _load_store(strict=strict, readonly=False)
+    finally:
+        _record_store_op("mutable_load", time.perf_counter() - started, _store_caller())
+
+
+def _load_store(*, strict: bool = False, readonly: bool = False) -> Dict[str, Any]:
     db = _db_path()
     if db.exists():
         data = _read_db(db, strict=strict, readonly=readonly)
@@ -1132,6 +1191,14 @@ def _load_unlocked(*, strict: bool = False, readonly: bool = False) -> Dict[str,
 
 
 def _save_unlocked(data: Dict[str, Any]) -> None:
+    started = time.perf_counter()
+    try:
+        _save_store(data)
+    finally:
+        _record_store_op("save", time.perf_counter() - started, _store_caller())
+
+
+def _save_store(data: Dict[str, Any]) -> None:
     """Persist the store to SQLite, diffing so a mutation writes one row.
 
     First save on a machine (no .db yet) builds the DB from ``data`` — which
