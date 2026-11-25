@@ -3366,9 +3366,14 @@ class GitHubIssuesBackend:
         # worker's ledger write moves the directory stamp, and for 2 s after
         # it the stamp is unusable). Those cases now re-attach usage to the
         # memoized items instead of rebuilding every item (WT-113).
+        # Strict readers (about to write) get fresh raw lists from
+        # _list_issues, and the memo is keyed on those lists' identity, so
+        # they may share the conversion; their usage is always re-attached
+        # (a None stamp). Skipping the memo reconverted every issue of every
+        # GitHub queue on each /api/blocked poll (WT-113).
         ledger_stamp = None if strict else usage.ledger_dir_stamp()
         now = time.time()
-        hit = None if strict else self._LIST_ITEMS_MEMO.get(memo_key)
+        hit = self._LIST_ITEMS_MEMO.get(memo_key)
         if (
             hit is not None
             and hit[0] is open_raw
@@ -3423,13 +3428,12 @@ class GitHubIssuesBackend:
             items = [it for it in items if it.get("lane") == lane]
         bases = sorted(items, key=lambda it: int(it.get("number", 0)))
         items = [self._attach_usage(_copy_listed_item(it)) for it in bases]
-        if not strict:
-            if len(self._LIST_ITEMS_MEMO) >= 512:
-                self._LIST_ITEMS_MEMO.clear()
-            self._LIST_ITEMS_MEMO[memo_key] = (
-                open_raw, closed_raw, ledger_stamp, valid_until,
-                [_copy_listed_item(it) for it in items], bases,
-            )
+        if len(self._LIST_ITEMS_MEMO) >= 512:
+            self._LIST_ITEMS_MEMO.clear()
+        self._LIST_ITEMS_MEMO[memo_key] = (
+            open_raw, closed_raw, ledger_stamp, valid_until,
+            [_copy_listed_item(it) for it in items], bases,
+        )
         return items
 
     def mark_runnable(self, ident: Any) -> Optional[Dict[str, Any]]:

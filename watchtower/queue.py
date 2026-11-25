@@ -497,10 +497,25 @@ def _empty_store() -> Dict[str, Any]:
     return {"counter": 0, "items": []}
 
 
+_NORM_PROJECT_MEMO: Dict[str, str] = {}
+
+
 def _norm_project(value: Any) -> str:
-    """Uppercase, alnum-only short queue code (e.g. 'DEMO'). Empty -> ''."""
+    """Uppercase, alnum-only short queue code (e.g. 'DEMO'). Empty -> ''.
+
+    Memoized for str input: list_items calls it per item, and the
+    per-character generator was ~1.5M steps per daemon tick (WT-113).
+    """
+    memo = type(value) is str
+    if memo and (hit := _NORM_PROJECT_MEMO.get(value)) is not None:
+        return hit
     s = "".join(ch for ch in str(value or "").upper() if ch.isalnum() or ch in "-_")
-    return s.strip("-_")
+    s = s.strip("-_")
+    if memo:
+        if len(_NORM_PROJECT_MEMO) >= 4096:
+            _NORM_PROJECT_MEMO.clear()
+        _NORM_PROJECT_MEMO[value] = s
+    return s
 
 
 def _git_config_path(repo_path: str) -> str:
@@ -734,12 +749,34 @@ def _normalize_items(items: List[Dict[str, Any]], *, backfill_slugs: bool = True
     return items
 
 
+_MATCH_KEYS: Dict[tuple, tuple] = {}
+
+
+def _match_key(ident: Any) -> tuple:
+    """(number or None, uppercased canonical ref) for ``ident``.
+
+    Callers scan every item with the same ident; canonicalizing once per
+    ident instead of once per item was ~650k regex calls per tick (WT-113).
+    """
+    hashable = isinstance(ident, (str, int))
+    key = (type(ident), ident) if hashable else None
+    if key is not None and (hit := _MATCH_KEYS.get(key)) is not None:
+        return hit
+    s = canonical_ref(ident)
+    out = (int(s) if s.isdigit() else None, s.upper())
+    if key is not None:
+        if len(_MATCH_KEYS) >= 4096:
+            _MATCH_KEYS.clear()
+        _MATCH_KEYS[key] = out
+    return out
+
+
 def _matches(it: Dict[str, Any], ident: Any) -> bool:
     """Match an item by global number or by ref ('DEMO-2', case-insensitive)."""
-    s = canonical_ref(ident)
-    if s.isdigit() and int(it.get("number", 0)) == int(s):
+    number, upper = _match_key(ident)
+    if number is not None and int(it.get("number", 0)) == number:
         return True
-    return str(it.get("ref", "")).upper() == s.upper()
+    return str(it.get("ref", "")).upper() == upper
 
 
 # ---------------------------------------------------------------------------

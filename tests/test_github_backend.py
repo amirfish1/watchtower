@@ -794,6 +794,31 @@ def test_list_items_memo_invalidates_on_new_listing_or_ledger_write(tmp_path, mo
     assert conversions == [1, 1]
 
 
+def test_strict_list_items_share_the_conversion_but_reattach_usage(tmp_path, monkeypatch):
+    """WT-113: a strict read (claim/close, /api/blocked) gets fresh raw lists
+    from _list_issues; with the same lists it reuses the converted items
+    instead of rebuilding every issue, and still reads usage ledgers fresh."""
+    backend, raw, conversions, usage_dir = _memo_backend(
+        tmp_path, monkeypatch, [_fake_issue(1, "one")]
+    )
+    backend.list_items(strict=True)
+    backend.list_items(strict=True)
+    backend.list_items()
+    assert conversions == [1]
+    from watchtower import usage
+    ledger = {"attempts": [], "totals": dict.fromkeys(usage.COUNTERS, None)}
+    ledger["totals"]["input"] = 7
+    target = usage._location({"ref": "GHI-1",
+                              "_usage_namespace": f"github:{backend.repo}:{backend.queue}"})
+    usage._write(target, {"ref": "GHI-1", "token_usage": ledger})
+    # No dir-stamp change at all: a strict read must still see the ledger.
+    os.utime(usage_dir, (time.time() - 60, time.time() - 60))
+    assert backend.list_items(strict=True)[0]["token_usage"]["totals"]["input"] == 7
+    raw["open"] = [_fake_issue(1, "one", body="edited")]  # a fresh fetch
+    backend.list_items(strict=True)
+    assert conversions == [1, 1]
+
+
 def test_list_items_memo_expires_when_an_issue_leaves_its_grace_period(tmp_path, monkeypatch):
     import watchtower.github_backend as github_backend
 
