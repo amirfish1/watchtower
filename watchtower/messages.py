@@ -73,6 +73,7 @@ same ``fcntl`` file lock the queue store uses. Stdlib only.
 
 from __future__ import annotations
 
+import glob as _glob
 import json
 import os
 import re
@@ -710,7 +711,10 @@ def _find_codex_rollout(sid: str) -> Optional[Path]:
     newest_mtime = -1.0
     for sessions in config.codex_session_roots():
         try:
-            paths = sessions.glob(f"*/*/*/*{sid}.jsonl")
+            # glob.glob, not Path.glob: ~3x cheaper over the dated tree (WT-122).
+            paths = [Path(p) for p in sorted(_glob.glob(os.path.join(
+                _glob.escape(str(sessions)), "*", "*", "*", f"*{_glob.escape(sid)}.jsonl"),
+                include_hidden=True))]
             for path in paths:
                 try:
                     mtime = path.stat().st_mtime

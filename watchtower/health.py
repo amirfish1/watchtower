@@ -21,6 +21,7 @@ whole point of WatchTower.
 
 from __future__ import annotations
 
+import functools
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -131,14 +132,23 @@ DRAIN_WINDOW_MINUTES = 30
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
-    if not value:
+    if not value or not isinstance(value, str):
         return None
+    return _parse_iso_str(value)
+
+
+@functools.lru_cache(maxsize=16384)
+def _parse_iso_str(value: str) -> Optional[datetime]:
+    """Exactly ``%Y-%m-%dT%H:%M:%SZ``. strptime cost ~1% of daemon CPU on
+    the status refresh (WT-122); the same timestamps recur every refresh."""
     try:
-        return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
-    except (ValueError, TypeError):
+        if len(value) == 20 and value[10] == "T" and value[19] == "Z":
+            dt = datetime.fromisoformat(value[:19])
+        else:  # rare unpadded forms strptime also accepts
+            dt = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
         return None
+    return dt.replace(tzinfo=timezone.utc)
 
 
 def _age_seconds(value: Optional[str], now: datetime) -> Optional[int]:

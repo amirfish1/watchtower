@@ -35,6 +35,7 @@ import json
 import os
 import re
 import sys
+import time as _time_mod
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
@@ -157,23 +158,20 @@ _PATH_MEMO: Dict[Any, Path] = {}
 # harmless there. 0 (every other process, and tests) stats on every read.
 # This process's own _save() invalidates it immediately.
 STAT_TTL_S = 0.0
-_STAT_MEMO: Dict[str, Any] = {"key": None, "at": 0.0, "value": None}
+_STAT_MEMO: Dict[str, Any] = {"at": float("-inf"), "value": None}
 
 
 def _config_stat():
     if STAT_TTL_S > 0:
-        import time as _time
-        from . import storage
-        env = os.environ
-        key = (CONFIG_FILE, _LEGACY_CONFIG_FILE, storage.data_dir,
-               env.get("WATCHTOWER_CONFIG_FILE"), env.get("WATCHTOWER_DATA_DIR"),
-               env.get("XDG_DATA_HOME"), env.get("HOME"))
-        now = _time.monotonic()
+        # Only the clock is checked here: building the path key from the
+        # environment cost as much as the stat it saved. A process that sets
+        # the TTL (the daemon) does not move its settings path at runtime.
+        now = _time_mod.monotonic()
         memo = _STAT_MEMO
-        if memo["key"] == key and now - memo["at"] < STAT_TTL_S:
+        if now - memo["at"] < STAT_TTL_S:
             return memo["value"]
         value = _config_stat_uncached()
-        memo.update(key=key, at=now, value=value)
+        memo.update(at=now, value=value)
         return value
     return _config_stat_uncached()
 
@@ -353,7 +351,7 @@ def _save(data: Dict[str, Any], source: str = "") -> None:
         f.write(text)
     os.replace(tmp, path)
     _LOAD_MEMO["sig"] = None
-    _STAT_MEMO["at"] = 0.0
+    _STAT_MEMO["at"] = float("-inf")
     _record_audit(text, data)
     a = actor()
     if source:
@@ -920,6 +918,30 @@ def set_engine(queue: str, eng: str) -> Dict[str, Any]:
     return q
 
 
+_SPAWN_DEFAULTS_MEMO: Dict[str, Any] = {"sig": None, "data": None}
+
+
+def _spawn_defaults_data() -> Any:
+    """Parsed spawn-defaults.json, reparsed only when the file changes.
+
+    The status payload asks for the engine/effort defaults once per queue
+    per refresh; reparsing the file each time was ~2% of daemon CPU (WT-122).
+    A file modified in the last 2 s is reparsed every call, so two writes
+    inside one mtime tick are never confused. Raises OSError/ValueError like
+    open()+json.load; callers must not mutate the result."""
+    path = CCC_SPAWN_DEFAULTS_FILE
+    st = os.stat(path)
+    sig = (str(path), st.st_ino, st.st_size, st.st_mtime_ns)
+    memo = _SPAWN_DEFAULTS_MEMO
+    if memo["sig"] == sig:
+        return memo["data"]
+    with open(path) as f:
+        data = json.load(f)
+    fresh = _time_mod.time() - st.st_mtime_ns / 1e9 < 2.0
+    memo.update(sig=None if fresh else sig, data=data)
+    return data
+
+
 def _ccc_worker_engine_default() -> str:
     """CCC's shared *worker*-spawn engine default, read from spawn-defaults.json's
     ``worker_engine`` field -- a separate key from that file's own top-level
@@ -927,8 +949,7 @@ def _ccc_worker_engine_default() -> str:
     stay untouched by WT (WT-105). Returns "" if the file is missing,
     unreadable, or has no such key."""
     try:
-        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
-            data = json.load(f)
+        data = _spawn_defaults_data()
         return str(data.get("worker_engine") or "")
     except (OSError, ValueError, AttributeError):
         return ""
@@ -937,8 +958,7 @@ def _ccc_worker_engine_default() -> str:
 def _ccc_worker_effort_default() -> str:
     """CCC's shared worker-only reasoning effort, if one is configured."""
     try:
-        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
-            data = json.load(f)
+        data = _spawn_defaults_data()
         value = str(data.get("worker_reasoning_effort") or "").strip().lower()
         return value if value in VALID_EFFORTS else ""
     except (OSError, ValueError, AttributeError):
@@ -947,9 +967,8 @@ def _ccc_worker_effort_default() -> str:
 
 def _ccc_spawn_defaults() -> Dict[str, Any]:
     try:
-        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
+        data = _spawn_defaults_data()
+        return dict(data) if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 

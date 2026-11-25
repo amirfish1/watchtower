@@ -1173,7 +1173,7 @@ def _codex_rollout_mtime(w: Dict[str, Any]) -> float:
     newest = 0.0
     for sessions in _worker_codex_roots(w, config):
         try:
-            for path in sessions.glob(f"*/*/*/*{session_id}.jsonl"):
+            for path in _glob_paths(sessions, f"*/*/*/*{_glob.escape(session_id)}.jsonl"):
                 try:
                     newest = max(newest, path.stat().st_mtime)
                 except OSError:
@@ -2131,6 +2131,14 @@ def _file_activity(path: Optional[Path], source: str) -> Dict[str, Any]:
     }
 
 
+def _glob_paths(root: Path, pattern: str) -> List[Path]:
+    """``root.glob(pattern)`` via glob.glob: Path.glob over the dated Codex
+    and per-project Claude trees cost ~1.5% of daemon CPU (WT-122). Hidden
+    names still match, as with Path.glob; sorted for a stable order."""
+    return [Path(p) for p in sorted(_glob.glob(
+        os.path.join(_glob.escape(str(root)), pattern), include_hidden=True))]
+
+
 def _newest_matching_path(paths: Any) -> tuple:
     newest_path: Optional[Path] = None
     newest_mtime = 0.0
@@ -2168,12 +2176,12 @@ def _engine_activity(w: Dict[str, Any]) -> Dict[str, Any]:
     if engine == "codex":
         from . import config
         roots = _worker_codex_roots(w, config) or [config.codex_default_home() / "sessions"]
-        pattern = f"*/*/*/*{session_id}.jsonl"
+        pattern = f"*/*/*/*{_glob.escape(session_id)}.jsonl"
 
         def _all_rollouts():
             for sessions in roots:
                 try:
-                    yield from sessions.glob(pattern)
+                    yield from _glob_paths(sessions, pattern)
                 except OSError:
                     continue
         return _matched_activity(
@@ -2185,9 +2193,9 @@ def _engine_activity(w: Dict[str, Any]) -> Dict[str, Any]:
         home = Path(
             os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")
         )
-        pattern = f"*/{session_id}.jsonl"
+        pattern = f"*/{_glob.escape(session_id)}.jsonl"
         return _matched_activity(
-            (home / "projects").glob(pattern),
+            _glob_paths(home / "projects", pattern),
             "claude_transcript",
             str(home / "projects" / pattern),
         )
@@ -2195,9 +2203,9 @@ def _engine_activity(w: Dict[str, Any]) -> Dict[str, Any]:
         home = Path(
             os.environ.get("KIMI_CODE_HOME") or (Path.home() / ".kimi-code")
         )
-        pattern = f"*/{session_id}/agents/*/wire.jsonl"
+        pattern = f"*/{_glob.escape(session_id)}/agents/*/wire.jsonl"
         return _matched_activity(
-            (home / "sessions").glob(pattern),
+            _glob_paths(home / "sessions", pattern),
             "kimi_wire",
             str(home / "sessions" / pattern),
         )

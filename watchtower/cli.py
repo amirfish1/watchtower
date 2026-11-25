@@ -6385,6 +6385,8 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     last_config_sanitize = 0.0  # 0 -> the first tick below heals at daemon start
     from . import config as _config_mod
     _config_mod.STAT_TTL_S = 1.0  # see config.STAT_TTL_S (WT-122)
+    from . import github_pipeline as _pipeline_mod
+    _pipeline_mod.STAT_TTL_S = 1.0  # see github_pipeline.STAT_TTL_S (WT-122)
     tick_profiler = _TickProfiler()
     while True:
         tick_profiler.tick()

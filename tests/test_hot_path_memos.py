@@ -119,7 +119,7 @@ def test_config_stat_ttl_reuses_stat_and_own_save_invalidates(tmp_path, monkeypa
     cfg.write_text(json.dumps({"AA": {"desired_workers": 1}}))
     monkeypatch.setenv("WATCHTOWER_CONFIG_FILE", str(cfg))
     monkeypatch.setattr(config, "CONFIG_FILE", cfg)
-    monkeypatch.setattr(config, "_STAT_MEMO", {"key": None, "at": 0.0, "value": None})
+    monkeypatch.setattr(config, "_STAT_MEMO", {"at": float("-inf"), "value": None})
     monkeypatch.setattr(config, "_LOAD_MEMO", {"sig": None, "data": {}})
     monkeypatch.setattr(config, "STAT_TTL_S", 0.0)
     assert config._queue_entry("AA") == {"desired_workers": 1}
@@ -137,3 +137,77 @@ def test_config_stat_ttl_reuses_stat_and_own_save_invalidates(tmp_path, monkeypa
     data["AA"]["desired_workers"] = 3
     config._save(data)
     assert config._queue_entry("AA") == {"desired_workers": 3}
+
+
+def test_pipeline_sidecar_stat_ttl_and_own_write_invalidates(tmp_path, monkeypatch):
+    from watchtower import github_pipeline as gp
+
+    side = tmp_path / "github-pipeline.json"
+    monkeypatch.setattr(gp, "path", lambda: side)
+    monkeypatch.setattr(gp, "_CACHE", {"sig": None, "data": None})
+    gp._write({"version": 1, "items": {"r#1": {"gen": 1}}})
+    monkeypatch.setattr(gp, "STAT_TTL_S", 3600.0)
+    assert gp._read_cached()["items"]["r#1"]["gen"] == 1
+    stats = []
+    real = gp._read_cached_stat
+    monkeypatch.setattr(gp, "_read_cached_stat", lambda: stats.append(1) or real())
+    assert gp._read_cached()["items"]["r#1"]["gen"] == 1
+    assert stats == []
+    gp._write({"version": 1, "items": {"r#1": {"gen": 2}}})
+    assert gp._read_cached()["items"]["r#1"]["gen"] == 2
+    monkeypatch.setattr(gp, "STAT_TTL_S", 0.0)
+    gp._read_cached()
+    assert len(stats) == 2
+
+
+def test_connectivity_state_is_reread_only_when_the_file_changes(tmp_path, monkeypatch):
+    import json
+    import os
+    import time
+    from pathlib import Path
+    from watchtower import github_backend as gb
+
+    f = tmp_path / "conn.json"
+    f.write_text(json.dumps({"next_retry_at": None, "n": 1}))
+    old = time.time() - 60
+    os.utime(f, (old, old))
+    monkeypatch.setenv("WATCHTOWER_GH_CONNECTIVITY_FILE", str(f))
+    monkeypatch.setattr(gb, "_CONNECTIVITY_MEMO", {"sig": None, "text": ""})
+    reads = []
+    real = Path.read_text
+    monkeypatch.setattr(Path, "read_text", lambda self, *a, **k: reads.append(self) or real(self, *a, **k))
+    a = gb._load_connectivity()
+    a["n"] = 99  # callers get private dicts
+    assert gb._load_connectivity()["n"] == 1
+    assert len(reads) == 1
+    f.write_text(json.dumps({"next_retry_at": None, "n": 2}))  # fresh mtime: not memoized
+    assert gb._load_connectivity()["n"] == 2
+    assert gb._load_connectivity()["n"] == 2
+    assert len(reads) == 3
+
+
+def test_spawn_defaults_reparsed_only_when_file_changes(tmp_path, monkeypatch):
+    import json
+    import os
+    from watchtower import config
+    spawn = tmp_path / "spawn.json"
+    spawn.write_text(json.dumps({"worker_engine": "kimi"}))
+    old = 1_700_000_000
+    os.utime(spawn, (old, old))
+    monkeypatch.setattr(config, "CCC_SPAWN_DEFAULTS_FILE", spawn)
+    monkeypatch.setattr(config, "_SPAWN_DEFAULTS_MEMO", {"sig": None, "data": None})
+    loads = []
+    real_load = json.load
+    monkeypatch.setattr(config.json, "load", lambda f: loads.append(1) or real_load(f))
+    assert config._ccc_worker_engine_default() == "kimi"
+    assert config._ccc_worker_engine_default() == "kimi"
+    assert config._ccc_worker_effort_default() == ""
+    assert len(loads) == 1
+    # Mutating the returned dict must not poison the memo.
+    config._ccc_spawn_defaults()["worker_engine"] = "x"
+    assert config._ccc_worker_engine_default() == "kimi"
+    # A fresh write (same size, new content) is seen immediately.
+    spawn.write_text(json.dumps({"worker_engine": "codx"}))
+    assert config._ccc_worker_engine_default() == "codx"
+    spawn.unlink()
+    assert config._ccc_worker_engine_default() == ""

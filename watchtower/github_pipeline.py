@@ -157,9 +157,25 @@ def signature() -> Any:
     return (st.st_mtime_ns, st.st_size, st.st_ino)
 
 
+# Seconds the daemon may reuse the sidecar's stat (WT-122): the overlay runs
+# once per GitHub ticket built, thousands of times per tick, and each stat was
+# ~1% of a core. 0 (every other process, and tests) checks on every read; this
+# process's own _write() invalidates immediately.
+STAT_TTL_S = 0.0
+
+
 def _read_cached() -> Optional[Dict[str, Any]]:
     """Lock-free read for the overlay (writes are atomic replaces). None when
     the file is corrupt: every marked ticket then fails closed."""
+    if (STAT_TTL_S > 0 and _CACHE["sig"] is not None
+            and time.monotonic() - _CACHE.get("checked", 0.0) < STAT_TTL_S):
+        return _CACHE["data"]
+    data = _read_cached_stat()
+    _CACHE["checked"] = time.monotonic()
+    return data
+
+
+def _read_cached_stat() -> Optional[Dict[str, Any]]:
     p = path()
     try:
         st = p.stat()
@@ -181,6 +197,7 @@ def _write(data: Dict[str, Any]) -> None:
     tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
     tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
     os.replace(tmp, p)
+    _CACHE["checked"] = 0.0
 
 
 def _hold(item: Dict[str, Any]) -> None:

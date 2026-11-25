@@ -1202,9 +1202,30 @@ def _empty_connectivity() -> Dict[str, Any]:
     }
 
 
+_CONNECTIVITY_MEMO: Dict[str, Any] = {"sig": None, "text": ""}
+
+
 def _load_connectivity() -> Dict[str, Any]:
+    """The persisted GitHub connectivity state; a private dict per call.
+
+    Every GitHub-backed read checks backoff, and opening and reading the file
+    each time was ~0.6% of the daemon's CPU (WT-122). The text is reused
+    while the file's stat is unchanged; a file written within the last 2 s is
+    re-read every time, since a same-size rewrite in the same timestamp tick
+    would not move its stat.
+    """
+    path = _connectivity_path()
     try:
-        return json.loads(_connectivity_path().read_text())
+        st = os.stat(path)
+        sig = (str(path), st.st_ino, st.st_size, st.st_mtime_ns)
+        memo = _CONNECTIVITY_MEMO
+        if memo["sig"] == sig:
+            text = memo["text"]
+        else:
+            text = path.read_text()
+            settled = time.time() - st.st_mtime_ns / 1e9 >= 2.0
+            memo.update(sig=sig if settled else None, text=text)
+        return json.loads(text)
     except (OSError, json.JSONDecodeError):
         return _empty_connectivity()
 
