@@ -246,7 +246,10 @@ def queue_status(
 
     group_idx = (q._refs_index(q.list_items(readonly=True))
                  if any(q.group_role(it) for it in open_items) else {})
-    claimable_open = [
+    # WT-116: a tracker queue keeps records only; claim_next/count_claimable
+    # refuse it outright, so none of its open tickets is claimable work.
+    tracker = config.is_tracker(project)
+    claimable_open = [] if tracker else [
         it for it in open_items
         if it.get("claimable", True)
         and it.get("readiness", "") not in q.UNCLAIMABLE_READINESS
@@ -389,7 +392,9 @@ def queue_status(
     elif depth == 0:
         state = "clear"
     elif claimable_depth == 0:
-        state = "backlog"   # open items exist but all filtered out by claim_types — parked
+        # Open items exist but none is claimable (claim_types, gates, or a
+        # tracker queue that never drains): parked, not an alarm.
+        state = "backlog"
     elif stuck and not auto_drain:
         state = "backlog"   # opted out: non-empty is normal, not an alarm
     elif stuck:
@@ -399,6 +404,7 @@ def queue_status(
 
     return {
         "queue": project,
+        "kind": "tracker" if tracker else "work",
         "depth": depth,
         "claimable_depth": claimable_depth,
         "machine_placement": machine,

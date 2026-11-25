@@ -263,3 +263,26 @@ def test_claim_working_needs_live_owner_and_recent_activity(monkeypatch):
     monkeypatch.setattr(liveness, "last_activity",
                         lambda item, c=None: now.timestamp() - liveness.stall_s() - 1)
     assert health._claim_working(it, ctx) is False
+
+
+def test_tracker_queue_reports_no_claimable_work_and_is_not_stuck(wt_env):
+    """WT-116: count_claimable returns 0 for a tracker queue and no worker may
+    claim from it, so health must not report its open records as claimable,
+    stuck backlog (queue care and CCC stuck alerts read these fields)."""
+    from watchtower import config, queue as q
+    old = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    items = [_item(readiness="ready", created_at=old), _item(created_at=old)]
+    work = health.queue_status("LOG", items, auto_drain=False)
+    assert work["claimable_depth"] == 2 and work["stuck"] is True
+    assert work["kind"] == "work"
+
+    config.set_queue_kind("LOG", "tracker")
+    row = health.queue_status("LOG", items, auto_drain=config.auto_drain("LOG"))
+    assert row["kind"] == "tracker"
+    assert row["depth"] == 2
+    assert row["claimable_depth"] == 0 == q.count_claimable("LOG")
+    assert row["oldest_claimable_age_s"] is None
+    assert row["stuck"] is False
+    assert row["state"] == "backlog"
+    assert row["stuck_reason"] == ""
+    assert health.queue_status("LOG", [], auto_drain=False)["state"] == "clear"
