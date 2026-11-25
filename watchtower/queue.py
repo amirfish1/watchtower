@@ -1100,16 +1100,24 @@ _STORE_STATS_SKIP = frozenset({"_load_unlocked", "_save_unlocked", "_timed_store
                                "_mutate", "mutate", "__enter__", "__exit__", "wrapper"})
 
 
+# Generic readers: attribute their store copies to whoever called them.
+_STORE_STATS_PASSTHROUGH = frozenset({"list_items", "get", "_items"})
+
+
 def _store_caller() -> str:
     frame = sys._getframe(2)
-    for _ in range(6):
+    names: List[str] = []
+    for _ in range(8):
         if frame is None:
             break
-        if frame.f_code.co_name not in _STORE_STATS_SKIP:
+        name = frame.f_code.co_name
+        if name not in _STORE_STATS_SKIP:
             module = frame.f_globals.get("__name__", "?").rsplit(".", 1)[-1]
-            return f"{module}.{frame.f_code.co_name}"
+            names.append(f"{module}.{name}")
+            if name not in _STORE_STATS_PASSTHROUGH or len(names) == 2:
+                break
         frame = frame.f_back
-    return "?"
+    return "<-".join(names) or "?"
 
 
 def _record_store_op(op: str, elapsed: float, caller: str) -> None:

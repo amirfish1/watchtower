@@ -845,3 +845,10 @@ def test_store_stats_attribute_mutable_loads_and_saves_to_callers(wt):
     callers = {row["op_caller"] for row in stats["top_callers"]}
     assert "save test_queue.mutate_once" in callers
     assert "mutable_load test_queue.mutate_once" in callers
+
+    def scan():
+        return q.list_items()
+
+    scan()
+    callers = {row["op_caller"] for row in q.store_stats()["top_callers"]}
+    assert "mutable_load queue.list_items<-test_queue.scan" in callers
