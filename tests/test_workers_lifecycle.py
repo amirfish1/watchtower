@@ -1238,6 +1238,87 @@ def test_prune_postmortem_is_not_run_when_not_pruning(wt):
     assert wt.workers.active_launch_failure_cooldown("Q", "kimi") is None
 
 
+# WT-117: the Codex app-server opens its thread before the first model call
+# meets the account's usage limit (~18s after spawn, past the launch grace).
+_CODEX_QUOTA_LOG = "\n".join(json.dumps(e) for e in (
+    {"type": "thread.started", "thread_id": "01a212c9-114c-7bb1-a0df-122bf9fc2947"},
+    {"method": "error", "params": {"error": {
+        "message": "You\u2019ve hit your usage limit. Visit "
+                   "https://chatgpt.com/settings/usage to purchase more credits "
+                   "or try again at Nov 26th, 2099 5:05 AM.",
+        "codexErrorInfo": "usageLimitExceeded"}, "willRetry": False}},
+)) + "\n"
+
+
+@pytest.fixture
+def codex_account(wt, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(wt.tmp / "codex-home"))
+    (wt.tmp / "codex-home").mkdir()
+    monkeypatch.setenv("WATCHTOWER_HEADROOM_FILE", str(wt.tmp / "no-headroom.json"))
+    return wt
+
+
+def test_prune_postmortem_records_codex_quota_death_after_its_thread_opened(codex_account):
+    wt = codex_account
+    _dead_launch_worker(wt, worker_id="q-codex", engine="codex",
+                        session_id="01a212c9-114c-7bb1-a0df-122bf9fc2947",
+                        log_text=_CODEX_QUOTA_LOG)
+
+    wt.workers.list_workers(prune=True)
+
+    cooldown = wt.workers.active_launch_failure_cooldown("Q", "codex")
+    assert cooldown and cooldown["reason"] == "engine usage limit"
+    assert cooldown["worker_id"] == "q-codex"
+    assert cooldown["cooldown_until_human"] == "2099-11-26T05:05:00Z"
+
+
+def test_usage_limit_cooldown_covers_every_queue_on_the_same_login(codex_account):
+    """One exhausted account must not be rediscovered by a doomed launch per queue."""
+    wt = codex_account
+    log = wt.tmp / "limit.log"
+    log.write_text(_CODEX_QUOTA_LOG)
+    wt.workers._record_launch_failure(
+        queue="OPS", engine="codex", worker_id="ops-1", pid=0, log_path=log,
+        reason="engine usage limit", retry_at=time.time() + 3600)
+
+    shared = wt.workers.active_launch_failure_cooldown("WT", "codex")
+    assert shared and shared["reason"] == "engine usage limit"
+    assert shared["shared_from"] == "OPS"
+    # Other engines, and transient failures, stay per queue.
+    assert wt.workers.active_launch_failure_cooldown("WT", "claude") is None
+    wt.workers._record_launch_failure(
+        queue="CCC", engine="kimi", worker_id="ccc-1", pid=0, log_path=log,
+        reason="engine api unavailable")
+    assert wt.workers.active_launch_failure_cooldown("WT", "kimi") is None
+    # Nothing is written for the borrowing queue.
+    data = json.loads((wt.tmp / "launch-failures.json").read_text())
+    assert "WT:codex" not in data
+
+
+def test_usage_limit_cooldown_is_not_shared_with_another_codex_login(codex_account, monkeypatch):
+    wt = codex_account
+    log = wt.tmp / "limit.log"
+    log.write_text(_CODEX_QUOTA_LOG)
+    wt.workers._record_launch_failure(
+        queue="OPS", engine="codex", worker_id="ops-1", pid=0, log_path=log,
+        reason="engine usage limit", retry_at=time.time() + 3600)
+    (wt.tmp / "second-account").mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(wt.tmp / "second-account"))
+
+    assert wt.workers.active_launch_failure_cooldown("WT", "codex") is None
+    assert wt.workers.active_launch_failure_cooldown("OPS", "codex") is not None
+
+
+def test_session_bearing_postmortem_ignores_quota_phrases_outside_engine_errors(codex_account):
+    wt = codex_account
+    _dead_launch_worker(wt, worker_id="q-ran", engine="codex",
+                        session_id="01a212c9-114c-7bb1-a0df-122bf9fc2947",
+                        log_text="ticket: customers hit a usage limit\n"
+                        + json.dumps({"type": "item.completed", "text": "usage limit"}) + "\n")
+    wt.workers.list_workers(prune=True)
+    assert wt.workers.active_launch_failure_cooldown("Q", "codex") is None
+
+
 def _fail(wt, **kw):
     log = wt.tmp / "fail.log"
     log.write_text(kw.pop("log_text", "usage limit reached\n"))

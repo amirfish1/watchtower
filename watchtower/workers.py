@@ -3585,6 +3585,28 @@ def _launch_failure_key(queue: str, engine: str) -> str:
     return f"{queue}:{engine or 'claude'}"
 
 
+def _engine_account(engine: str) -> str:
+    """The provider login a fresh worker on ``engine`` spends, or "" if unknown.
+
+    A usage limit belongs to that login, not to the queue that hit it
+    (WT-117): one exhausted Codex account cost nine queues a doomed launch
+    each. Only engines whose login is host-wide are named; per-launch accounts
+    (antigravity) and unknown engines return "" and share nothing."""
+    engine = str(engine or "claude").lower()
+    try:
+        if engine == "codex":
+            from . import config
+            home = config.codex_worker_home() or config.codex_default_home()
+            return "codex:" + str(Path(home).expanduser().resolve())
+        if engine == "claude":
+            home = Path(os.environ.get("CLAUDE_CONFIG_DIR")
+                        or (Path.home() / ".claude")).expanduser()
+            return "claude:" + str(home.resolve())
+    except (OSError, RuntimeError):
+        return ""
+    return ""
+
+
 def _iso_from_epoch(ts: float) -> str:
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -3641,11 +3663,12 @@ _AUTH_FAILED_RE = re.compile(
 )
 
 
-def _quota_exhausted(text: str) -> bool:
+def _quota_exhausted(text: str, *, structured_only: bool = False) -> bool:
     """Provider exhaustion, including Claude's spend wall and structured errors.
 
     Structured output must be an actual error, not a tool result quoting an
-    error string. Plain CLI diagnostics remain supported.
+    error string. Plain CLI diagnostics remain supported unless
+    ``structured_only`` asks for the engine's own error events alone.
     """
     phrases = ("usage limit", "monthly spend limit", "weekly limit reached",
                "insufficient_quota", "quota exceeded", "quota exhausted",
@@ -3654,6 +3677,8 @@ def _quota_exhausted(text: str) -> bool:
         try:
             event = json.loads(line)
         except (ValueError, TypeError):
+            if structured_only:
+                continue
             if (_CLAUDE_WEEKLY_LIMIT_RE.match(line.strip())
                     or _DEVIN_FREE_LIMIT_RE.match(line)
                     or any(phrase in line.lower() for phrase in phrases)):
@@ -3856,6 +3881,10 @@ def _record_launch_failure(
         rec["exit_code"] = exit_code
     if session_id:
         rec["session_id"] = session_id
+    if reason == "engine usage limit":
+        account = _engine_account(engine)
+        if account:
+            rec["account"] = account
     prior = data.get(key)
     if isinstance(prior, dict) and prior.get("alerted_ref"):
         # Carry the alert across the streak so one outage files one ticket.
@@ -4024,7 +4053,12 @@ def _postmortem_launch_failure(
     queue = str(worker.get("ticket_queue") or worker.get("queue") or "")
     engine = str(worker.get("engine") or "")
     preassigned_stage_id = required_reason and worker.get("stage") and engine == "claude"
-    if not log_path or not queue or (worker.get("session_id") and not preassigned_stage_id):
+    # WT-117: Codex opens its thread (the session id) before the first model
+    # call meets the account's usage limit, so a session alone does not prove
+    # the launch worked. Such a worker is still post-mortemed, but only the
+    # engine's own structured quota error counts -- never ticket text.
+    ran = bool(worker.get("session_id")) and not preassigned_stage_id
+    if not log_path or not queue:
         return None
     started_at = worker.get("started_at")
     if started_at:
@@ -4048,6 +4082,14 @@ def _postmortem_launch_failure(
     if not classified:
         return None
     reason = str(classified["reason"])
+    if ran:
+        try:
+            text = Path(log_path).read_text(errors="replace")
+        except OSError:
+            return None
+        if (reason != "engine usage limit"
+                or not _quota_exhausted(text, structured_only=True)):
+            return None
     if required_reason and reason != required_reason:
         return None
     if cooldown and cooldown.get("reason") == reason:
@@ -4214,7 +4256,7 @@ def active_launch_failure_cooldown(
     data = _load_launch_failures()
     rec = data.get(key)
     if not isinstance(rec, dict):
-        return None
+        return _shared_quota_cooldown(queue, engine, data)
     now = time.time()
     try:
         until = float(rec.get("cooldown_until") or 0)
@@ -4229,7 +4271,48 @@ def active_launch_failure_cooldown(
     if not _recent_failure_streak(rec, now):
         data.pop(key, None)
         _save_launch_failures(data)
-    return None
+    return _shared_quota_cooldown(queue, engine, data)
+
+
+def _shared_quota_cooldown(
+    queue: str, engine: str, data: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """Another queue's active usage-limit cooldown on the same engine login.
+
+    WT-117: each queue used to rediscover an account-wide usage limit by
+    launching into it, and a Codex worker can take ~18s to surface the error
+    -- past the launch grace -- so a fresh ticket waited minutes for the
+    fallback engine. The returned copy is read-only evidence (``shared_from``
+    names the queue that hit the wall); nothing is written for this queue, so
+    the owning queue's expiry or headroom lift ends it everywhere at once."""
+    own = _launch_failure_key(queue, engine)
+    engine = str(engine or "claude")
+    now = time.time()
+    account = None
+    best: Optional[Dict[str, Any]] = None
+    best_until = 0.0
+    for key, rec in data.items():
+        if (key == own or not isinstance(rec, dict)
+                or rec.get("reason") != "engine usage limit"
+                or str(rec.get("engine") or "claude") != engine
+                or not rec.get("account")):
+            continue
+        try:
+            until = float(rec.get("cooldown_until") or 0)
+        except (TypeError, ValueError):
+            continue
+        if until <= now or until <= best_until:
+            continue
+        if account is None:
+            account = _engine_account(engine)
+        if not account or rec.get("account") != account:
+            continue
+        if _quota_cooldown_lifted(rec, until):
+            continue
+        best, best_until = rec, until
+    if best is None:
+        return None
+    return dict(best, shared_from=str(best.get("queue") or ""))
 
 
 # A usage-limit cooldown is lifted early only when CCC reports this much quota
