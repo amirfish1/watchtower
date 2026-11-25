@@ -1146,6 +1146,26 @@ def store_stats(top: int = 25) -> Dict[str, Any]:
                                 for k, v in callers]}
 
 
+def _readonly_items() -> List[Dict[str, Any]]:
+    """Shared normalized tickets for a lock-free prescan; never modify them.
+
+    Periodic sweeps ask "is there anything to do?" every reconcile tick and
+    almost always find nothing. Answering that from a private copy of the
+    whole store (~95% closed archive) cost ~1 s of GIL each time and stalled
+    the daemon's HTTP threads (WT-113). A prescan that finds a candidate still
+    takes the lock and re-checks the authoritative copy; one that misses a row
+    changing concurrently sees it on the next tick.
+    """
+    return _load_unlocked(readonly=True).get("items", [])
+
+
+def _sent_back_waiting(it: Dict[str, Any], proj: Optional[str] = None) -> bool:
+    sb = it.get("sent_back")
+    return (isinstance(sb, dict) and it.get("status") == "in_progress"
+            and not it.get("needs_input") and not sb.get("progress_at")
+            and (not proj or it.get("project") == proj))
+
+
 def _load_unlocked(*, strict: bool = False, readonly: bool = False) -> Dict[str, Any]:
     if readonly:
         return _load_store(strict=strict, readonly=True)
@@ -5648,6 +5668,24 @@ def _duplicate_proven(original: Dict[str, Any], required: List[str]) -> bool:
 
 def sync_duplicates(only_ref: str = "") -> List[str]:
     """Repair legacy local links even when no other queue mutation occurs."""
+    # Dry-run the repair on private copies of the followers and their
+    # originals (all it reads); only a real change pays for the store copy.
+    items = _readonly_items()
+    followers = [i for i in items if i.get("duplicate_of") and (not only_ref or only_ref in
+                 (i.get("ref"), i.get("duplicate_of")))]
+    if not followers:
+        return []
+    by_ref = _refs_index(items)
+    subset = {id(i): i for i in followers}
+    for i in followers:
+        original = by_ref.get(i["duplicate_of"])
+        if original is not None:
+            subset.setdefault(id(original), original)
+    probe = {"items": copy.deepcopy(list(subset.values()))}
+    before = [json.dumps(i, sort_keys=True) for i in probe["items"]]
+    _sync_duplicates_unlocked(probe)
+    if before == [json.dumps(i, sort_keys=True) for i in probe["items"]]:
+        return []
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         before = {i["ref"]: json.dumps(i, sort_keys=True) for i in data["items"]
@@ -6666,6 +6704,9 @@ def group_sweep(only_ref: str = "") -> List[Tuple[str, str]]:
     Returns ``(ref, outcome)`` pairs."""
     import uuid
     leases: List[Tuple[str, str, Dict[str, Any], Dict[str, str]]] = []
+    if not any(not only_ref or str(p.get("ref")) == only_ref
+               for p in _group_due_unlocked(_readonly_items())):
+        return []
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         due = [p for p in _group_due_unlocked(data["items"])
@@ -8371,6 +8412,8 @@ def sent_back_claims(project: Optional[str] = None) -> List[Dict[str, Any]]:
     Stamps ``progress_at`` the first time progress is seen. File store only."""
     proj = _norm_project(project) if project else None
     out: List[Dict[str, Any]] = []
+    if not any(_sent_back_waiting(it, proj) for it in _readonly_items()):
+        return out
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         dirty = False
@@ -8399,6 +8442,8 @@ def release_stalled_sent_back(now: Optional[float] = None) -> List[Dict[str, Any
     keeping the rejection text. One lock; CAS on status + unchanged marker."""
     now_ts = time.time() if now is None else float(now)
     released: List[Dict[str, Any]] = []
+    if not any(_sent_back_waiting(it) for it in _readonly_items()):
+        return released
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         dirty = False
@@ -9188,6 +9233,11 @@ def pa_transition(ident: Any, gen: int, from_state: Any, to_state: str, *,
 def mark_park_retention_expired(ident: Any) -> bool:
     """Stamp ``parked.retention_expired_at`` once (PARK-EXPIRED is logged only
     when this returns True)."""
+    if not any(_matches(it, ident) and it.get("status") == PARKED_STATUS
+               and isinstance(it.get("parked"), dict) and it["parked"]
+               and not it["parked"].get("retention_expired_at")
+               for it in _readonly_items()):
+        return False
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         for it in data["items"]:
@@ -9214,6 +9264,9 @@ def migrate_legacy_blocks(queue: Optional[str] = None, dry_run: bool = False) ->
     by a worker). Local queues only; idempotent. Returns the refs selected."""
     proj = _norm_project(queue) if queue else None
     picked: List[str] = []
+    if not any(it.get("status") == "in_progress" and it.get("needs_input")
+               and (not proj or it.get("project") == proj) for it in _readonly_items()):
+        return picked
     with _FileLock(_lock_path()):
         data = _load_unlocked()
         github = set(_github_projects())

@@ -852,3 +852,42 @@ def test_store_stats_attribute_mutable_loads_and_saves_to_callers(wt):
     scan()
     callers = {row["op_caller"] for row in q.store_stats()["top_callers"]}
     assert "mutable_load queue.list_items<-test_queue.scan" in callers
+
+
+def test_idle_sweeps_take_no_private_store_copy(wt):
+    """WT-113: 97% of the daemon's whole-store copies were sweeps with nothing to do."""
+    q = wt.q
+    ref = q.enqueue(project="SWEEP", title="idle", note="idle")["ref"]
+    q.enqueue(project="SWEEP", title="follower", note="follower")
+    from watchtower import takeover
+
+    def copies():
+        return q.store_stats()["ops"].get("mutable_load", {}).get("count", 0)
+
+    before = copies()
+    assert q.migrate_legacy_blocks() == []
+    assert q.release_stalled_sent_back() == []
+    assert q.sent_back_claims() == []
+    assert q.sync_duplicates() == []
+    assert q.group_sweep() == []
+    assert q.mark_park_retention_expired(ref) is False
+    assert takeover.reconcile() == []
+    assert copies() == before
+
+
+def test_sync_duplicates_prescan_still_repairs_a_stale_follower(wt):
+    q = wt.q
+    original = q.enqueue(project="DUPS", title="original", note="original")["ref"]
+    follower = q.enqueue(project="DUPS", title="follower", note="follower")["ref"]
+    stale = dict(q.get(follower), duplicate_of=original)
+    with q._FileLock(q._lock_path()):
+        q.migrate_store()
+        conn = q._connect(q._db_path())  # a legacy link written without the save-time sync
+        with conn:
+            conn.execute(q._ITEM_UPSERT, q._item_row(stale))
+            conn.execute("UPDATE meta SET value = value + 1 WHERE key = 'revision'")
+        conn.close()
+    assert q.get(follower)["duplicate_of"] == original and not q.get(follower).get("duplicate_result")
+    assert q.sync_duplicates() == [follower]
+    assert q.get(follower)["duplicate_result"]["ref"] == original
+    assert q.sync_duplicates() == []

@@ -28,7 +28,8 @@ def _lock():
 
 
 def _items():
-    return q._load_unlocked(strict=True).get('items', [])
+    # Read-only callers: mutations reload through _update (WT-113).
+    return q._load_unlocked(strict=True, readonly=True).get('items', [])
 
 
 def comment_target(it):
