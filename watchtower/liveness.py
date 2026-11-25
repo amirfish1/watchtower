@@ -1749,7 +1749,7 @@ VERIFIED_SENDERS = frozenset({
 })
 ADVISORY_SENDERS = frozenset({
     "answers._wake", "queue._notify_ticket_event", "cli.cmd_comment", "cli.cmd_send",
-    "cli.cmd_chat_new", "cli.cmd_chat_nudge", "cli._daemon_loop_ticks", "dashboard.do_POST",
+    "cli.cmd_chat_new", "cli.cmd_chat_nudge", "cli._daemon_loop_ticks", "dashboard._do_post",
     "messages.ask", "messages.stop_displaced_successor",
 })
 TRANSPORT_LAYER = frozenset({

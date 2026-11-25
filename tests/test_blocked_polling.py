@@ -22,9 +22,9 @@ def test_raw_filter_skips_unblocked_projection(wt, monkeypatch):
     }})
     projected = []
     original = backend._issue_to_item
-    def project(issue):
+    def project(issue, **kw):
         projected.append(issue["number"])
-        return original(issue)
+        return original(issue, **kw)
     monkeypatch.setattr(backend, "_issue_to_item", project)
     items = backend.list_items(blocked_only=True)
     assert projected == [4, 5]
