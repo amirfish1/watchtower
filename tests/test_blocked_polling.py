@@ -89,3 +89,20 @@ def test_single_get_returns_private_copy(wt):
     got["history"].append({"event": "not persisted"})
     assert wt.q.get(item["ref"])["note"] == "private projection"
     assert not any(h.get("event") == "not persisted" for h in wt.q.get(item["ref"])["history"])
+
+
+def test_request_stats_group_requests_by_route_shape(api, monkeypatch):
+    """WT-113: /api/request-stats names which route costs the daemon time,
+    collapsing ticket refs so one route is one row."""
+    base, d = api
+    monkeypatch.setitem(d._REQUEST_STATS, "routes", {})
+    monkeypatch.setattr(d.q, "get", lambda ref: {"ref": ref})
+    read(base + "/api/ticket/WT-1")
+    read(base + "/api/ticket/WT-2?x=1")
+    read(base + "/api/version")
+    routes = {r["route"]: r for r in read(base + "/api/request-stats")["routes"]}
+    assert routes["GET /api/ticket/*"]["n"] == 2
+    assert routes["GET /api/version"]["n"] == 1
+    assert d._route_label("GET", "/q/WT") == "GET /q/*"
+    assert d._route_label("GET", "/") == "GET /"
+    assert d._route_label("POST", "/api/queue/WT/reconcile") == "POST /api/queue/*"

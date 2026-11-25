@@ -441,3 +441,31 @@ def test_boot_time_reads_the_kernel():
     from watchtower import workers
     workers._BOOT_TIME = None
     assert 0 < workers.boot_time() <= time.time()
+
+
+def test_pid_start_token_reuses_ps_only_for_the_same_process(monkeypatch):
+    """WT-113: one ``ps`` per process, not per call; a reused pid (new
+    kernel starttime) must ask ``ps`` again and never get the old token."""
+    from watchtower import workers
+
+    workers._PID_START_CACHE.clear()
+    starttime = {"v": "1000"}
+    calls = []
+
+    def fake_run(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout=f"start-{starttime['v']}\n", stderr="")
+
+    monkeypatch.setattr(workers, "_proc_starttime", lambda pid: starttime["v"])
+    monkeypatch.setattr(workers.subprocess, "run", fake_run)
+
+    assert workers._pid_start_token(4242) == "start-1000"
+    assert workers._pid_start_token(4242) == "start-1000"
+    assert len(calls) == 1
+    assert workers._pid_start_token(4242, utc=True) == "start-1000"
+    assert len(calls) == 2  # UTC rendering is cached separately
+
+    starttime["v"] = "2000"  # pid reused by a different process
+    assert workers._pid_start_token(4242) == "start-2000"
+    assert len(calls) == 3
+    workers._PID_START_CACHE.clear()

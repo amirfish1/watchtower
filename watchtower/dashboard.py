@@ -1587,6 +1587,46 @@ def render_html(payload: Dict[str, Any]) -> str:
 
 
 # --------------------------------------------------------------------------- server
+_REQUEST_STATS: Dict[str, Any] = {"since": time.time(), "routes": {}}
+_REQUEST_STATS_LOCK = threading.Lock()
+
+
+def _route_label(method: str, raw_path: str) -> str:
+    """``GET /q/*``: the route shape, without the ticket/queue/chat name."""
+    path = raw_path.split("?", 1)[0].rstrip("/") or "/"
+    parts = path.split("/")
+    if len(parts) > 3 and parts[1] == "api":
+        path = "/".join(parts[:3]) + "/*"
+    elif len(parts) > 2 and parts[1] != "api":
+        path = "/".join(parts[:2]) + "/*"
+    return f"{method} {path}"
+
+
+def _record_request(method: str, raw_path: str, elapsed: float) -> None:
+    """WT-113: per-route request count and time, served at
+    ``/api/request-stats`` so a slow home page can be blamed on its route."""
+    label = _route_label(method, raw_path)
+    with _REQUEST_STATS_LOCK:
+        row = _REQUEST_STATS["routes"].setdefault(label, {"n": 0, "total_s": 0.0, "max_s": 0.0})
+        row["n"] += 1
+        row["total_s"] += elapsed
+        row["max_s"] = max(row["max_s"], elapsed)
+
+
+def request_stats() -> Dict[str, Any]:
+    with _REQUEST_STATS_LOCK:
+        routes = {k: dict(v) for k, v in _REQUEST_STATS["routes"].items()}
+        since = _REQUEST_STATS["since"]
+    rows = sorted(
+        ({"route": k, "n": v["n"], "total_s": round(v["total_s"], 3),
+          "mean_s": round(v["total_s"] / v["n"], 3), "max_s": round(v["max_s"], 3)}
+         for k, v in routes.items()),
+        key=lambda r: -r["total_s"],
+    )
+    return {"pid": os.getpid(), "since": since, "uptime_s": round(time.time() - since, 1),
+            "routes": rows}
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "WatchTower/dashboard"
 
@@ -1637,6 +1677,13 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802 (http.server contract)
+        started = time.perf_counter()
+        try:
+            self._do_get()
+        finally:
+            _record_request(self.command, self.path, time.perf_counter() - started)
+
+    def _do_get(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/") or "/"
         if path == "/":
             from . import chats
@@ -1696,6 +1743,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, {"code_rev": releases.RUNTIME_BUILD, "pid": os.getpid()})
         elif path == "/api/store-stats":
             self._json(200, q.store_stats())
+        elif path == "/api/request-stats":
+            self._json(200, request_stats())
         elif path == "/api/status":
             self._json(200, cached_status_payload())
         elif path == "/api/queues":
@@ -1727,6 +1776,13 @@ class _Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def do_POST(self) -> None:  # noqa: N802
+        started = time.perf_counter()
+        try:
+            self._do_post()
+        finally:
+            _record_request("POST", self.path, time.perf_counter() - started)
+
+    def _do_post(self) -> None:
         path = self.path.split("?", 1)[0].rstrip("/")
         if path.startswith("/api/queue/") and path.endswith("/reconcile"):
             if not _check_same_origin(self):

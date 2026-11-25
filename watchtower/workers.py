@@ -4664,6 +4664,14 @@ def _pid_start_token(pid: int, utc: bool = False) -> str:
     registry row's ``procStart``."""
     if not pid:
         return ""
+    # WT-113: a status render asked ``ps`` ~33 times (~1 s). On Linux the
+    # kernel's starttime ticks identify one process for its whole life, so
+    # the token ``ps`` printed for (pid, starttime) is reused; a reused pid
+    # has a different starttime and misses the cache.
+    ident = _proc_starttime(pid)
+    key = (pid, ident, bool(utc))
+    if ident and key in _PID_START_CACHE:
+        return _PID_START_CACHE[key]
     try:
         env = dict(os.environ, TZ="UTC") if utc else None
         result = subprocess.run(
@@ -4673,8 +4681,27 @@ def _pid_start_token(pid: int, utc: bool = False) -> str:
             timeout=2,
             env=env,
         )
-        return result.stdout.strip() if result.returncode == 0 else ""
+        token = result.stdout.strip() if result.returncode == 0 else ""
     except Exception:
+        return ""
+    if ident and token and _proc_starttime(pid) == ident:
+        if len(_PID_START_CACHE) > 4096:
+            _PID_START_CACHE.clear()
+        _PID_START_CACHE[key] = token
+    return token
+
+
+_PID_START_CACHE: Dict[Tuple[int, str, bool], str] = {}
+
+
+def _proc_starttime(pid: int) -> str:
+    """Kernel starttime ticks for ``pid`` from /proc (Linux), else ``""``."""
+    if not sys.platform.startswith("linux"):
+        return ""
+    try:
+        # Field 22; comm (field 2) may itself contain spaces or parens.
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
         return ""
 
 
