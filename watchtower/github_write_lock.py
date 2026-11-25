@@ -21,6 +21,12 @@ from . import github_backend as gb
 LABEL = "watchtower:body-lock:v1"
 WAIT_SECONDS = 30
 REEXEC_WAIT_SECONDS = 30
+DELETE_ATTEMPTS = 4
+# GitHub server-side failures (OPS-1037): label POST on a taken name can
+# answer 500/502 with an EMPTY body (gh: "unexpected end of JSON input")
+# instead of 422 already_exists, and deleteLabel can answer "Something went
+# wrong". Neither says anything about the lock, so neither may end an attempt.
+_TRANSIENT = re.compile(r"HTTP 5\d\d|unexpected end of JSON input|Something went wrong")
 
 
 _LOCAL = threading.local()
@@ -83,11 +89,15 @@ def _fence_path(nonce):
 
 
 def _json(proc):
+    if proc.returncode:
+        # Before parsing: a 5xx body may be HTML or empty, and gh's stderr
+        # carries the status that tells a transient failure from a refusal.
+        raise gb.GitHubBackendError(f"GitHub write lock API failed: {proc.stderr or proc.stdout}")
     try:
         result = json.loads(proc.stdout or "{}")
     except (TypeError, ValueError) as exc:
         raise gb.GitHubBackendError("GitHub write lock received invalid JSON; refusing to write") from exc
-    if proc.returncode or not isinstance(result, dict) or result.get("errors"):
+    if not isinstance(result, dict) or result.get("errors"):
         raise gb.GitHubBackendError(f"GitHub write lock API failed: {proc.stderr or proc.stdout}")
     return result
 
@@ -116,15 +126,36 @@ def _read(backend):
     return label
 
 
+def _transient(text):
+    return bool(_TRANSIENT.search(str(text or "")))
+
+
 def _delete(backend, node_id):
     # The name may already have been reused. deleteLabel addresses ONLY the
     # captured object, including when two dead-owner recoverers race.
-    result = _json(backend._gh_api("POST", "graphql", {
-        "query": "mutation($id:ID!){deleteLabel(input:{id:$id}){clientMutationId}}",
-        "variables": {"id": node_id},
-    }))
-    if not isinstance(result.get("data", {}).get("deleteLabel"), dict):
-        raise gb.GitHubBackendError("GitHub write lock deletion was not confirmed; refusing to continue")
+    for attempt in range(1, DELETE_ATTEMPTS + 1):
+        try:
+            result = _json(backend._gh_api("POST", "graphql", {
+                "query": "mutation($id:ID!){deleteLabel(input:{id:$id}){clientMutationId}}",
+                "variables": {"id": node_id},
+            }))
+            if isinstance((result.get("data") or {}).get("deleteLabel"), dict):
+                return
+            error = gb.GitHubBackendError("GitHub write lock deletion was not confirmed; refusing to continue")
+        except gb.GitHubBackendError as exc:
+            error = exc
+        # A failed response can hide a completed deletion. The immutable node
+        # ID, never the reusable name, decides whether our object is gone.
+        try:
+            current = _read(backend)
+        except gb.GitHubBackendError:
+            pass
+        else:
+            if current is None or current["node_id"] != node_id:
+                return
+        if attempt == DELETE_ATTEMPTS or not _transient(error):
+            raise error
+        time.sleep(attempt)
 
 
 def _recover_here(backend, label):
@@ -160,12 +191,7 @@ def _recover_here(backend, label):
             return False
         if not dead and fence.read() != "ended":
             return False
-        try:
-            _delete(backend, label["node_id"])
-        except gb.GitHubBackendError:
-            current = _read(backend)
-            if current and current["node_id"] == label["node_id"]:
-                raise
+        _delete(backend, label["node_id"])
         # Keep the small fence file: a second recoverer may already have
         # opened it, and deleting/recreating its path would split the lock.
     return True
@@ -192,21 +218,36 @@ def _acquire(backend, description):
             if label.get("name") != LABEL or label.get("description") != description or not label.get("node_id"):
                 raise gb.GitHubBackendError("GitHub write lock creation not confirmed; refusing to write")
             return label["node_id"]
-        label = _read(backend)
+        try:
+            label = _read(backend)
+        except gb.GitHubBackendError as exc:
+            if not _transient(exc) or time.monotonic() >= deadline:
+                raise
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+            continue
         if label and label.get("description") == description:
             return label["node_id"]
         # Do not turn a permissions/quota/validation error into a retry or
-        # recovery write. Only GitHub's explicit uniqueness conflict waits.
+        # recovery write. Only GitHub's explicit uniqueness conflict or a
+        # server error (which hides whether the name was taken) waits.
         try:
             errors = json.loads(proc.stdout or "{}").get("errors", [])
-        except ValueError:
+        except (AttributeError, ValueError):
             errors = []
-        if not any(isinstance(e, dict) and e.get("code") == "already_exists" for e in errors):
+        server_error = _transient(proc.stderr or proc.stdout)
+        if not (server_error or any(isinstance(e, dict) and e.get("code") == "already_exists"
+                                    for e in errors)):
             raise gb.GitHubBackendError(f"Cannot acquire GitHub write lock: {proc.stderr or proc.stdout}")
         if label is None:
             if time.monotonic() < deadline:
+                if server_error:
+                    time.sleep(min(1, max(0, deadline - time.monotonic())))
                 continue
+            if server_error:
+                raise gb.GitHubBackendError(f"Cannot acquire GitHub write lock: {proc.stderr or proc.stdout}")
             raise gb.GitHubBackendError("GitHub write lock changed during acquisition; retry")
+        # A foreign holder exists, so the name was taken whatever status the
+        # POST reported: wait for it or recover it exactly like a 422.
         if _recover_here(backend, label):
             continue
         if time.monotonic() >= deadline:

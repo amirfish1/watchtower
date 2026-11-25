@@ -9,7 +9,14 @@ reproduction returned two successful claims and lost the earlier claim history.
 The backend retains its per-repository, reentrant critical section. Inside the
 local flock it acquires the unique repository label `watchtower:body-lock:v1` by
 REST POST (never `label create --force`). A uniqueness conflict waits up to 30s;
-other errors fail closed. Every existing serialized body writer participates,
+GitHub server errors (5xx, an empty body that gh reports as "unexpected end of
+JSON input", GraphQL "Something went wrong") wait the same way, because they say
+nothing about the lock: GitHub has answered a taken name with 500/502 instead of
+422 (OPS-1037). If a read then shows a foreign holder, it is waited for or
+recovered exactly like a 422. Permission, quota and validation errors fail closed.
+Cleanup retries transient `deleteLabel` failures (4 attempts) and treats a read
+showing the captured node gone as success, since a lost response can hide a
+completed deletion. Every existing serialized body writer participates,
 including claim, close, release, heartbeat, comment, answer and gate metadata.
 The lock stays held through the last issue side effect, including reopen/close.
 It is an unattached repository label, not a label applied to user issues.

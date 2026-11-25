@@ -171,9 +171,9 @@ def test_crash_recovery_requires_owning_host_and_drained_children(tmp_path, monk
             with backend._body_lock():
                 replacement = json.loads(state.read_text())['mutex_labels'][lock.LABEL]
                 assert replacement['node_id'] != original['node_id']
-                # Delayed cleanup of the OLD object cannot erase this one.
-                with pytest.raises(gb.GitHubBackendError, match='API failed'):
-                    lock._delete(backend, original['node_id'])
+                # Delayed cleanup of the OLD object cannot erase this one;
+                # the old node is already gone, so that cleanup is complete.
+                lock._delete(backend, original['node_id'])
                 assert json.loads(state.read_text())['mutex_labels'][lock.LABEL] == replacement
         assert json.loads(state.read_text())['mutex_labels'] == {}
         assert backend.claim_by_ref(ref, 'recovered')['claimed_by'] == 'recovered'
@@ -200,16 +200,18 @@ def test_failed_cleanup_recovers_ended_transaction_in_live_process(tmp_path, mon
     state, q, ref, backend = _setup(tmp_path, monkeypatch)
     from watchtower import github_write_lock as lock
     real_api = backend._gh_api
-    failed = []
+    outage = [True]
     def lost_cleanup(method, path, *args, **kw):
-        if path == 'graphql' and not failed:
-            failed.append(True)
+        if path == 'graphql' and outage[0]:
             return subprocess.CompletedProcess([], 1, '{}', 'gh: Service Unavailable (HTTP 503)')
         return real_api(method, path, *args, **kw)
     monkeypatch.setattr(backend, '_gh_api', lost_cleanup)
+    monkeypatch.setattr(lock, 'DELETE_ATTEMPTS', 2)
+    # An outage that outlasts cleanup's retries strands the lock.
     with pytest.raises(gb.GitHubBackendError, match='API failed'):
         with backend._body_lock():
             pass
+    outage[0] = False
     stranded = json.loads(state.read_text())['mutex_labels'][lock.LABEL]
     monkeypatch.setattr(lock, 'WAIT_SECONDS', 0)
     # The daemon PID is STILL alive. Its completed transaction, not its
@@ -217,4 +219,54 @@ def test_failed_cleanup_recovers_ended_transaction_in_live_process(tmp_path, mon
     with backend._body_lock():
         replacement = json.loads(state.read_text())['mutex_labels'][lock.LABEL]
         assert replacement['node_id'] != stranded['node_id']
+    assert json.loads(state.read_text())['mutex_labels'] == {}
+
+
+def test_server_error_conflict_still_recovers_stranded_lock(tmp_path, monkeypatch):
+    """OPS-1037: GitHub answered a taken label name with HTTP 500 and an empty
+    body (gh: "unexpected end of JSON input") instead of 422 already_exists.
+    That status says nothing about the lock, so the owning host must still
+    recover its own ended transaction instead of failing every writer."""
+    state, q, ref, backend = _setup(tmp_path, monkeypatch)
+    from watchtower import github_write_lock as lock
+    real_api = backend._gh_api
+    outage = [True]
+    def flaky(method, path, *args, **kw):
+        if path == 'graphql' and outage[0]:
+            return subprocess.CompletedProcess([], 1, '{"errors":[{"message":"Something went wrong"}]}',
+                                               'gh: Something went wrong while executing your query')
+        result = real_api(method, path, *args, **kw)
+        if method == 'POST' and path.endswith('/labels') and result.returncode:
+            return subprocess.CompletedProcess([], 1, '', 'unexpected end of JSON input')
+        return result
+    monkeypatch.setattr(backend, '_gh_api', flaky)
+    monkeypatch.setattr(lock, 'DELETE_ATTEMPTS', 1)
+    with pytest.raises(gb.GitHubBackendError, match='Something went wrong'):
+        with backend._body_lock():
+            pass
+    assert lock.LABEL in json.loads(state.read_text())['mutex_labels']
+    outage[0] = False
+    monkeypatch.setattr(lock, 'WAIT_SECONDS', 0)
+    assert backend.claim_by_ref(ref, 'after-outage')['claimed_by'] == 'after-outage'
+    assert json.loads(state.read_text())['mutex_labels'] == {}
+
+
+def test_transient_or_lost_cleanup_response_does_not_fail_finished_write(tmp_path, monkeypatch):
+    """A deleteLabel that errors, then succeeds with its response lost, has
+    still removed our node: the transaction succeeded and leaves no lock."""
+    state, q, ref, backend = _setup(tmp_path, monkeypatch)
+    real_api = backend._gh_api
+    calls = []
+    def flaky_cleanup(method, path, *args, **kw):
+        if path == 'graphql':
+            calls.append(path)
+            if len(calls) == 1:
+                return subprocess.CompletedProcess([], 1, '', 'gh: Internal Server Error (HTTP 500)')
+            if len(calls) == 2:
+                real_api(method, path, *args, **kw)
+                return subprocess.CompletedProcess([], 1, '', 'gh: Bad Gateway (HTTP 502)')
+        return real_api(method, path, *args, **kw)
+    monkeypatch.setattr(backend, '_gh_api', flaky_cleanup)
+    assert backend.claim_by_ref(ref, 'flaky')['claimed_by'] == 'flaky'
+    assert len(calls) == 2
     assert json.loads(state.read_text())['mutex_labels'] == {}
