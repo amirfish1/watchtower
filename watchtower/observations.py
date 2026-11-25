@@ -65,6 +65,11 @@ def _roots():
 # lookup globs every project dir (~1% of daemon CPU; WT-122). Enrollment needs
 # 120 s of idleness, so a lookup up to a minute old changes no decision.
 PATHS_TTL_S = 0.0
+# A found transcript stays put for its session: once found, a lookup is
+# reused this many times longer (each reuse still checks the file exists).
+# Only a second, ambiguous copy of the same session id appearing is noticed
+# late, by at most PATHS_TTL_S * PATHS_HIT_TTL_FACTOR.
+PATHS_HIT_TTL_FACTOR = 10.0
 _PATHS_MEMO = {}
 
 
@@ -74,7 +79,8 @@ def _paths(engine, sid=''):
         key = (engine, str(sid), str(root))
         now = time.monotonic()
         hit = _PATHS_MEMO.get(key)
-        if (hit is not None and now - hit[0] < PATHS_TTL_S
+        ttl = PATHS_TTL_S * (PATHS_HIT_TTL_FACTOR if hit and hit[1] else 1.0)
+        if (hit is not None and now - hit[0] < ttl
                 and all(os.path.exists(p) for p in hit[1])):
             return list(hit[1])
         paths = list(_paths_uncached(engine, sid))

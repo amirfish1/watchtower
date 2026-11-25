@@ -113,3 +113,33 @@ def test_needle_matches_json_encoded_text(wt):
     needle = rc._needle(text)
     encoded_line = json.dumps({"message": {"content": text}})
     assert needle in encoded_line
+
+
+def test_settled_advanced_receipts_are_not_rescanned_or_rewritten(wt, monkeypatch):
+    """WT-122: an advanced needle receipt whose transcript has not changed
+    cannot change, so a sweep neither re-reads it nor rewrites the file;
+    verified_at keeps the time the receipt reached its status."""
+    rc = _receipts(wt)
+    _write_transcript(wt, SID_B, age_s=600)
+    monkeypatch.setattr(wt.messages.subprocess, "Popen", _fake_popen([]))
+    res = wt.messages.send(SID_B, "an old message that never shows up verbatim")
+    _append_user_event(wt, SID_B, "unrelated progress")
+    rc.sweep(now=time.time() + 5)
+    rec = rc.get(res["receipt_id"], refresh=False)
+    assert rec["status"] == "advanced"
+    first_verified = rec["verified_at"]
+
+    saves, built = [], []
+    real_save, real_index = rc._save, wt.messages.transcript_index
+    monkeypatch.setattr(rc, "_save", lambda rows: saves.append(1) or real_save(rows))
+    monkeypatch.setattr(wt.messages, "transcript_index",
+                        lambda: built.append(1) or real_index())
+    rc.sweep(now=time.time() + 50)
+    assert saves == [] and built == []
+    assert rc.get(res["receipt_id"], refresh=False)["verified_at"] == first_verified
+
+    # The transcript moves: re-checked, and the message now lands.
+    _append_user_event(wt, SID_B, "an old message that never shows up verbatim")
+    rc.sweep(now=time.time() + 60)
+    rec = rc.get(res["receipt_id"], refresh=False)
+    assert rec["status"] == "landed" and saves == [1]

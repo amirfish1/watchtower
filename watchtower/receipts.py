@@ -118,6 +118,9 @@ def _transcript_stat(sid: str, engine: str = "claude") -> Dict[str, Any]:
     if engine not in ('claude', 'codex'):
         return {"path": "", "size": 0, "mtime": 0.0}
     index = getattr(_SWEEP, "index", None)
+    if (index is None and getattr(_SWEEP, "lazy", False)
+            and messages._SESSION_UUID_RE.fullmatch(str(sid or ""))):
+        index = _SWEEP.index = messages.transcript_index()
     if index is not None and messages._SESSION_UUID_RE.fullmatch(str(sid or "")):
         p = index.get(engine, {}).get(sid)  # one listing per sweep, not ~800 probes per receipt
     else:
@@ -280,6 +283,7 @@ def _verify_one(rec: Dict[str, Any], now: float) -> Dict[str, Any]:
         return _verify_nonce(rec, now)
     sid = str(rec.get("sid") or "")
     cur = _transcript_stat(sid, str(rec.get("engine") or "claude"))
+    _SWEEP.cur = cur
     needle = str(rec.get("needle") or "")
     if cur["path"] and needle:
         try:
@@ -307,18 +311,61 @@ def _verify_one(rec: Dict[str, Any], now: float) -> Dict[str, Any]:
     return rec
 
 
+# Receipt -> transcript (path, size, mtime) when a needle receipt last stayed
+# "advanced". Such a receipt cannot change while its transcript has not: the
+# needle is not in an unchanged tail, it already grew past at_send, and only
+# "pending" receipts time out. ~800 of them were re-read every tick and the
+# 3 MB receipts file rewritten each time (WT-122).
+_ADVANCED_SEEN: Dict[tuple, tuple] = {}
+
+
+def _receipt_key(rec: Dict[str, Any]) -> tuple:
+    return (str(rec.get("sid") or ""), str(rec.get("engine") or ""),
+            str(rec.get("needle") or ""), rec.get("sent_at"))
+
+
+def _advanced_unchanged(rec: Dict[str, Any]) -> bool:
+    if rec.get("status") != "advanced" or rec.get("nonce"):
+        return False
+    seen = _ADVANCED_SEEN.get(_receipt_key(rec))
+    if not seen:
+        return False
+    try:
+        st = os.stat(seen[0])
+    except OSError:
+        return False
+    return (st.st_size, st.st_mtime) == seen[1:]
+
+
 def sweep(now: Optional[float] = None) -> Dict[str, int]:
-    """Verify every pending/advanced receipt (daemon tick + CLI refresh)."""
+    """Verify every pending/advanced receipt (daemon tick + CLI refresh).
+
+    ``verified_at`` records when a receipt reached its current status; the
+    file is rewritten only when some receipt changed."""
     now = time.time() if now is None else float(now)
     with queue_mod._FileLock(_receipts_lock()):
         rows = _load()
-        _SWEEP.index = messages.transcript_index()
+        changed = False
+        _SWEEP.index, _SWEEP.lazy = None, True  # list transcripts only if needed
         try:
             for rec in rows:
+                if rec.get("status") not in ("pending", "advanced") or _advanced_unchanged(rec):
+                    continue
+                before = dict(rec)
+                _SWEEP.cur = None
                 _verify_one(rec, now)
+                if rec.get("status") == before.get("status") and "verified_at" in before:
+                    rec["verified_at"] = before["verified_at"]
+                changed = changed or rec != before
+                cur = _SWEEP.cur
+                if rec.get("status") == "advanced" and not rec.get("nonce") and cur and cur["path"]:
+                    if len(_ADVANCED_SEEN) >= 8192:
+                        _ADVANCED_SEEN.clear()
+                    _ADVANCED_SEEN[_receipt_key(rec)] = (cur["path"], cur["size"], cur["mtime"])
         finally:
-            _SWEEP.index = None
-        _save(rows)
+            _SWEEP.index, _SWEEP.lazy, _SWEEP.cur = None, False, None
+        if changed:
+            _save(rows)
     counts: Dict[str, int] = {}
     for rec in rows:
         counts[rec.get("status", "?")] = counts.get(rec.get("status", "?"), 0) + 1

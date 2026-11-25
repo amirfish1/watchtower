@@ -303,3 +303,27 @@ def test_unscoped_status_reuses_full_list_for_group_index(monkeypatch):
     rows = health.all_status(items=items, include_archived=True)
     assert {r["queue"] for r in rows} >= {"GA", "GB"}
     assert seen and all(idx is not None and set(idx) >= {"GA-1", "GB-2"} for idx in seen)
+
+
+def test_observation_hits_kept_longer_than_misses(tmp_path, monkeypatch):
+    import time
+    from watchtower import observations
+    root = tmp_path / "projects"
+    (root / "-repo").mkdir(parents=True)
+    monkeypatch.setattr(observations, "_roots", lambda: {"claude": root})
+    monkeypatch.setattr(observations, "_PATHS_MEMO", {})
+    monkeypatch.setattr(observations, "PATHS_TTL_S", 60.0)
+    calls = []
+    real = observations._paths_uncached
+    monkeypatch.setattr(observations, "_paths_uncached",
+                        lambda e, s="": calls.append(s) or real(e, s))
+    hit, miss = "a" * 8, "b" * 8
+    (root / "-repo" / f"{hit}.jsonl").write_text("{}\n")
+    observations._paths("claude", hit)
+    observations._paths("claude", miss)
+    assert len(calls) == 2
+    for key, (at, paths) in list(observations._PATHS_MEMO.items()):
+        observations._PATHS_MEMO[key] = (time.monotonic() - 120, paths)  # past 60 s
+    assert observations._paths("claude", hit)    # hit: still within 10x
+    assert observations._paths("claude", miss) == []
+    assert calls == [hit, miss, miss]
