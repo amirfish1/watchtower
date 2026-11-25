@@ -2561,7 +2561,18 @@ class GitHubIssuesBackend:
             self.grace_s,
         )
 
-    def _issue_to_item(self, issue: Dict[str, Any]) -> Dict[str, Any]:
+    def _attach_usage(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge the ticket's private usage ledger projection (in place)."""
+        from . import usage
+        item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
+        usage.attach(item)
+        item.pop("_usage_namespace", None)
+        return item
+
+    def _issue_to_item(self, issue: Dict[str, Any], *, attach_usage: bool = True) -> Dict[str, Any]:
+        """``attach_usage=False`` leaves the body's own ``token_usage``: the
+        list memo attaches ledgers per read, since the sidecar overlay never
+        reads or writes ``token_usage`` (WT-113)."""
         comments_raw = issue.get("comments")
         # A fetched list, even an empty one (every comment deleted), is not
         # an omitted one: get() must resolve against it, so it is never
@@ -2602,10 +2613,8 @@ class GitHubIssuesBackend:
                 item = dict(cached_base)
                 if "token_usage" in item:
                     item["token_usage"] = copy.copy(item["token_usage"])
-                from . import usage
-                item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
-                usage.attach(item)
-                item.pop("_usage_namespace", None)
+                if attach_usage:
+                    self._attach_usage(item)
                 from . import github_pipeline
                 return github_pipeline.overlay(item)
         # meta is read-only here: the two containers that reach the item are
@@ -2797,10 +2806,8 @@ class GitHubIssuesBackend:
             if len(self._ISSUE_TO_ITEM_MEMO) >= 16384:
                 self._ISSUE_TO_ITEM_MEMO.clear()
             self._ISSUE_TO_ITEM_MEMO[memo_key] = dict(item)
-        from . import usage
-        item["_usage_namespace"] = f"github:{self.repo}:{self.queue}"
-        usage.attach(item)
-        item.pop("_usage_namespace", None)
+        if attach_usage:
+            self._attach_usage(item)
         from . import github_pipeline
         return github_pipeline.overlay(item)
 
@@ -3354,18 +3361,29 @@ class GitHubIssuesBackend:
             # OPS-201: a sidecar-only transition changes eligibility too.
             self._memo_config(), status, lane, blocked_only, github_pipeline.signature(),
         )
+        # The converted items (before usage) depend only on the raw lists, the
+        # config and the sidecar; usage ledgers change far more often (any
+        # worker's ledger write moves the directory stamp, and for 2 s after
+        # it the stamp is unusable). Those cases now re-attach usage to the
+        # memoized items instead of rebuilding every item (WT-113).
         ledger_stamp = None if strict else usage.ledger_dir_stamp()
         now = time.time()
-        hit = self._LIST_ITEMS_MEMO.get(memo_key)
+        hit = None if strict else self._LIST_ITEMS_MEMO.get(memo_key)
         if (
             hit is not None
-            and ledger_stamp is not None
             and hit[0] is open_raw
             and hit[1] is closed_raw
-            and hit[2] == ledger_stamp
             and now < hit[3]
         ):
-            return [_copy_listed_item(it) for it in hit[4]]
+            if ledger_stamp is not None and hit[2] == ledger_stamp:
+                return [_copy_listed_item(it) for it in hit[4]]
+            items = [self._attach_usage(_copy_listed_item(it)) for it in hit[5]]
+            if ledger_stamp is not None:
+                self._LIST_ITEMS_MEMO[memo_key] = (
+                    open_raw, closed_raw, ledger_stamp, hit[3],
+                    [_copy_listed_item(it) for it in items], hit[5],
+                )
+            return items
         valid_until = now + _LIST_ITEMS_MEMO_TTL_S
         issues: List[Dict[str, Any]] = list(open_raw or [])
         if self.auto_drain and self.grace_s > 0:
@@ -3394,7 +3412,7 @@ class GitHubIssuesBackend:
                 return (not entry.get("tombstone")
                         and (entry.get("pending_answer") or {}).get("state") == "routing")
             issues = [issue for issue in issues if candidate(issue)]
-        items = [self._issue_to_item(issue) for issue in issues]
+        items = [self._issue_to_item(issue, attach_usage=False) for issue in issues]
         if self.partition_by_label:
             # Two or more queues share this repo: each shows only its own
             # slice, because nothing but the legacy label can tell them apart.
@@ -3403,13 +3421,14 @@ class GitHubIssuesBackend:
             items = [it for it in items if it.get("status") == status]
         if lane:
             items = [it for it in items if it.get("lane") == lane]
-        items = sorted(items, key=lambda it: int(it.get("number", 0)))
-        if ledger_stamp is not None:
+        bases = sorted(items, key=lambda it: int(it.get("number", 0)))
+        items = [self._attach_usage(_copy_listed_item(it)) for it in bases]
+        if not strict:
             if len(self._LIST_ITEMS_MEMO) >= 512:
                 self._LIST_ITEMS_MEMO.clear()
             self._LIST_ITEMS_MEMO[memo_key] = (
                 open_raw, closed_raw, ledger_stamp, valid_until,
-                [_copy_listed_item(it) for it in items],
+                [_copy_listed_item(it) for it in items], bases,
             )
         return items
 

@@ -741,7 +741,7 @@ def _memo_backend(tmp_path, monkeypatch, issues, **kwargs):
     real = backend._issue_to_item
     monkeypatch.setattr(
         backend, "_issue_to_item",
-        lambda issue: conversions.append(issue["number"]) or real(issue),
+        lambda issue, **kw: conversions.append(issue["number"]) or real(issue, **kw),
     )
     return backend, raw, conversions, usage_dir
 
@@ -771,14 +771,27 @@ def test_list_items_memo_invalidates_on_new_listing_or_ledger_write(tmp_path, mo
     raw["open"] = [_fake_issue(1, "one", body="edited")]  # poller refreshed
     backend.list_items()
     assert conversions == [1, 1]
+    # WT-113: a ledger write re-attaches usage to the memoized items; it no
+    # longer rebuilds every item of every GitHub queue.
+    from watchtower import usage
+    assert "token_usage" not in backend.list_items()[0]
+    ledger = {"attempts": [], "totals": dict.fromkeys(usage.COUNTERS, None)}
+    ledger["totals"]["input"] = 42
+    target = usage._location({"ref": backend.list_items()[0]["ref"],
+                              "_usage_namespace": f"github:{backend.repo}:{backend.queue}"})
+    usage._write(target, {"ref": "GHI-1", "token_usage": ledger})
     os.utime(usage_dir, (time.time() - 30, time.time() - 30))  # a ledger was replaced
-    backend.list_items()
-    assert conversions == [1, 1, 1]
-    # A just-touched dir is not trusted (coarse mtimes): no memo at all.
+    assert backend.list_items()[0]["token_usage"]["totals"]["input"] == 42
+    assert conversions == [1, 1]
+    # A just-touched dir is not trusted (coarse mtimes): usage is re-attached
+    # on every read, still without reconverting.
     os.utime(usage_dir, None)
+    ledger["totals"]["input"] = 43
+    usage._write(target, {"ref": "GHI-1", "token_usage": ledger})
+    os.utime(usage_dir, None)
+    assert backend.list_items()[0]["token_usage"]["totals"]["input"] == 43
     backend.list_items()
-    backend.list_items()
-    assert conversions == [1, 1, 1, 1, 1]
+    assert conversions == [1, 1]
 
 
 def test_list_items_memo_expires_when_an_issue_leaves_its_grace_period(tmp_path, monkeypatch):
