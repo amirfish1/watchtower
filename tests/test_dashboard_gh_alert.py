@@ -91,6 +91,15 @@ def test_home_page_counts_never_start_a_live_github_read(monkeypatch):
     calls = []
     monkeypatch.setattr(dashboard.q, "list_items",
                         lambda **kw: calls.append(kw) or [{"project": "A", "status": "closed"}])
-    page = dashboard.render_index(_base_payload(), chat_rows=[])
+    fallback = dashboard.render_index(_base_payload(), chat_rows=[])
     assert calls and all(kw.get("snapshot_only") for kw in calls)
-    assert "A" in page
+
+    # The status refresh precomputes the counts: GET / reads no store at all.
+    calls.clear()
+    payload = dict(_base_payload(), ticket_counts={"A": [1, 1]})
+    assert dashboard.render_index(payload, chat_rows=[]) == fallback
+    assert calls == []
+    assert dashboard._ticket_counts([
+        {"project": "a", "status": "closed"}, {"project": "A", "status": "open"},
+        {"project": "A", "status": "awaiting_release"}, {"project": ""},
+    ]) == {"A": [2, 3]}

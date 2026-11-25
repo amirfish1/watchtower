@@ -88,6 +88,7 @@ import json
 import os
 import re as _re
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -917,6 +918,18 @@ _META_UPSERT = (
 
 
 _READ_DB_MEMO: Dict[str, tuple] = {}
+_READ_DB_LOCKS: Dict[str, Any] = {}
+_READ_DB_LOCKS_GUARD = threading.Lock()
+
+
+def _read_db_lock(key: str):
+    with _READ_DB_LOCKS_GUARD:
+        lock = _READ_DB_LOCKS.get(key)
+        if lock is None:
+            lock = _READ_DB_LOCKS[key] = threading.RLock()
+        return lock
+
+
 # db path -> {number: (item_json text, parsed normalized item)} from the last read.
 _READ_DB_ROWS: Dict[str, Dict[int, tuple]] = {}
 
@@ -952,13 +965,36 @@ def _read_db(db: Path, *, strict: bool = False, readonly: bool = False) -> Dict[
     memo = _READ_DB_MEMO.get(key)
     if memo is not None and memo[0][0] == stamp:
         return snapshot(memo)
+    # Single flight (WT-113): after any store write, the reconcile thread,
+    # the status refresh and each HTTP request all missed the memo at once
+    # and each re-read every row; now one re-reads and the rest reuse it.
+    # Private copies for mutating callers are made after the lock is released.
+    with _read_db_lock(key):
+        fresh = _read_db_refresh(db, key, strict)
+    if fresh[0] == "memo":
+        return snapshot(fresh[1])
+    data = fresh[1]
+    if data is None:
+        return _empty_store()
+    # Items are shared with the row cache: mutating callers get a private copy.
+    return data if readonly else pickle.loads(pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL))
+
+
+def _read_db_refresh(db: Path, key: str, strict: bool) -> tuple:
+    """Under the per-store read lock: ``("memo", memo)`` when the memo is (or
+    is now) current, else ``("data", store)`` for a store that moved while it
+    was read (not memoized), or ``("data", None)`` for an unreadable store."""
+    stamp = _db_stamp(db)
+    memo = _READ_DB_MEMO.get(key)
+    if memo is not None and memo[0][0] == stamp:
+        return ("memo", memo)
     try:
         conn = _connect(db)
         try:
             counter = int(_meta_get(conn, "counter", "0") or 0)
             revision = _meta_get(conn, "revision", "0")
             if memo is not None and memo[0] == (stamp, counter, revision):
-                return snapshot(memo)
+                return ("memo", memo)
             # Workers write the store about once a second, so the snapshot
             # memo above rarely survives a tick and a full reparse of every
             # row (~95% closed archive) pinned a core. Reuse the parsed item
@@ -980,7 +1016,7 @@ def _read_db(db: Path, *, strict: bool = False, readonly: bool = False) -> Dict[
     except (sqlite3.Error, ValueError, json.JSONDecodeError):
         if strict:
             raise
-        return _empty_store()
+        return ("data", None)
     _normalize_items(items)
     _READ_DB_ROWS[key] = rows
     if items:
@@ -992,9 +1028,8 @@ def _read_db(db: Path, *, strict: bool = False, readonly: bool = False) -> Dict[
     if _db_stamp(db) == stamp:
         memo = ((stamp, counter, revision), None, data)
         _READ_DB_MEMO[key] = memo
-        return snapshot(memo)
-    # Items are shared with the row cache: mutating callers get a private copy.
-    return data if readonly else pickle.loads(pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL))
+        return ("memo", memo)
+    return ("data", data)
 
 
 def _create_db(db: Path, data: Dict[str, Any]) -> None:

@@ -169,7 +169,25 @@ def status_payload(stuck_minutes: int = health.STUCK_MINUTES) -> Dict[str, Any]:
             r["configuration_error"] = (
                 f"{model or f'{engine} default model'} does not support effort {effort!r}"
             )
-    return {"queues": rows, "workers": wrows, "github": health.github_connectivity()}
+    return {"queues": rows, "workers": wrows, "github": health.github_connectivity(),
+            "ticket_counts": _ticket_counts(items)}
+
+
+def _ticket_counts(items: List[Dict[str, Any]]) -> Dict[str, List[int]]:
+    """``{QUEUE: [done, total]}`` for the home page's per-queue progress.
+
+    Computed in the status refresh (WT-113): counting in ``render_index``
+    re-read the whole store inside every GET / after any store write."""
+    counts: Dict[str, List[int]] = {}
+    for it in items or []:
+        qn = str(it.get("project") or "").upper()
+        if not qn:
+            continue
+        row = counts.setdefault(qn, [0, 0])
+        row[1] += 1
+        if it.get("status") in ("closed", "awaiting_release"):
+            row[0] += 1
+    return counts
 
 
 BLOCKED_CACHE_TTL_S = 5.0
@@ -1002,18 +1020,16 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
     # Display-only: GitHub queues come from the poller's persisted snapshot.
     # A live read here ran up to two ``gh`` probes per GitHub queue inside the
     # request (14 queues: GET / took up to 14 s, WT-113).
-    closed_by_q: Dict[str, int] = {}
-    total_by_q: Dict[str, int] = {}
-    try:
-        for it in (q.list_items(readonly=True, snapshot_only=True) or []):
-            qn = str(it.get("project") or "").upper()
-            if not qn:
-                continue
-            total_by_q[qn] = total_by_q.get(qn, 0) + 1
-            if it.get("status") in ("closed", "awaiting_release"):
-                closed_by_q[qn] = closed_by_q.get(qn, 0) + 1
-    except Exception:
-        pass
+    # The status refresh precomputes them (``ticket_counts``); the fallback
+    # serves payloads built without it (tests, older snapshots).
+    counts = payload.get("ticket_counts")
+    if counts is None:
+        try:
+            counts = _ticket_counts(q.list_items(readonly=True, snapshot_only=True))
+        except Exception:
+            counts = {}
+    closed_by_q: Dict[str, int] = {k: v[0] for k, v in counts.items()}
+    total_by_q: Dict[str, int] = {k: v[1] for k, v in counts.items()}
 
     def _queue_state_class(r: Dict[str, Any]) -> str:
         s = r.get("state", "clear")

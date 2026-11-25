@@ -74,3 +74,40 @@ def test_reconcile_readers_never_modify_the_shared_snapshot(wt_env):
     assert raw_after != raw_before
     # ... and the readers themselves no longer copy the whole store.
     assert list_copies() == copies
+
+
+def test_concurrent_readers_share_one_reread_after_a_write(wt_env, monkeypatch):
+    """After a store write, every thread that read the store re-read every
+    row at once (reconcile, status refresh, each HTTP request). One re-reads;
+    the others wait and reuse its snapshot."""
+    import threading
+    import time
+
+    q = wt_env.queue
+    q.enqueue(project="RO", note="first")
+    q._load_unlocked(readonly=True)
+    item = dict(q._load_unlocked(readonly=True)["items"][0], title="changed")
+    _write(q, item)
+
+    rereads = []
+    real = q._normalize_items
+
+    def slow_normalize(items):
+        rereads.append(1)
+        time.sleep(0.3)  # long enough that unserialized re-reads overlap
+        return real(items)
+
+    monkeypatch.setattr(q, "_normalize_items", slow_normalize)
+    seen = []
+    threads = [threading.Thread(target=lambda: seen.append(q._load_unlocked(readonly=True)))
+               for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert len(seen) == 4 and all(s is seen[0] for s in seen)
+    assert seen[0]["items"][0]["title"] == "changed"
+    assert len(rereads) == 1
+    mutable = q._load_unlocked()  # a private copy, still made off the shared read
+    assert mutable["items"][0]["title"] == "changed" and mutable is not seen[0]
+    assert len(rereads) == 1
