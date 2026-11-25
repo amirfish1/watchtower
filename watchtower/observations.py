@@ -66,11 +66,20 @@ def _paths(engine, sid=''):
         raise OSError(f'{engine} native store unavailable: {root}')
     pattern = f'*/{sid or "*"}.jsonl' if engine == 'claude' else f'*/*/*/*{sid}.jsonl'
     if engine != 'codex':
-        return root.glob(pattern)
+        return _glob(root, pattern)
     # Workers may run under another Codex account's home (CCC worker account).
     from . import config
     roots = [root] + [r for r in config.codex_session_roots() if r.resolve() != root.resolve()]
-    return (p for r in roots for p in r.glob(pattern))
+    return (p for r in roots for p in _glob(r, pattern))
+
+
+def _glob(root, pattern):
+    """``root.glob(pattern)`` via glob.glob, ~3-4x cheaper across ~850 Claude
+    project dirs (measured 55 -> 14-20 ms per lookup; WT-122). Hidden names
+    still match, as with Path.glob; sorted for a stable order."""
+    import glob as _globmod
+    return [Path(p) for p in sorted(_globmod.glob(os.path.join(_globmod.escape(str(root)), pattern),
+                                                 include_hidden=True))]
 
 
 def _empty(session_id, engine='', source='native'):

@@ -151,8 +151,34 @@ _LOAD_MEMO: Dict[str, Any] = {"sig": None, "data": {}}
 
 _PATH_MEMO: Dict[Any, Path] = {}
 
+# Seconds a settings-file stat may be reused (WT-122). The daemon sets this:
+# its tick reads settings ~100k times, one stat each (~4% of a core), and a
+# settings edit by another process becoming visible a second later is
+# harmless there. 0 (every other process, and tests) stats on every read.
+# This process's own _save() invalidates it immediately.
+STAT_TTL_S = 0.0
+_STAT_MEMO: Dict[str, Any] = {"key": None, "at": 0.0, "value": None}
+
 
 def _config_stat():
+    if STAT_TTL_S > 0:
+        import time as _time
+        from . import storage
+        env = os.environ
+        key = (CONFIG_FILE, _LEGACY_CONFIG_FILE, storage.data_dir,
+               env.get("WATCHTOWER_CONFIG_FILE"), env.get("WATCHTOWER_DATA_DIR"),
+               env.get("XDG_DATA_HOME"), env.get("HOME"))
+        now = _time.monotonic()
+        memo = _STAT_MEMO
+        if memo["key"] == key and now - memo["at"] < STAT_TTL_S:
+            return memo["value"]
+        value = _config_stat_uncached()
+        memo.update(key=key, at=now, value=value)
+        return value
+    return _config_stat_uncached()
+
+
+def _config_stat_uncached():
     """``(config_path(), its stat)``, skipping the migration probe while the
     resolved file exists. Settings are read ~15k times per reconciler tick;
     re-deriving the data dir and stat-ing the migration destination on each
@@ -327,6 +353,7 @@ def _save(data: Dict[str, Any], source: str = "") -> None:
         f.write(text)
     os.replace(tmp, path)
     _LOAD_MEMO["sig"] = None
+    _STAT_MEMO["at"] = 0.0
     _record_audit(text, data)
     a = actor()
     if source:

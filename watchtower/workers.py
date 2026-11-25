@@ -6709,7 +6709,9 @@ def _session_title_backfill_row(
     if not dry_run:
         try:
             from . import messages as _messages
-            updated = _messages.set_session_title(session_id, title)
+            # A repair pass: a brand-new session may be renamed a few minutes
+            # late rather than re-scanning every project dir per tick (WT-122).
+            updated = _messages.set_session_title(session_id, title, miss_ttl_s=300.0)
         except Exception:
             updated = False
     return {

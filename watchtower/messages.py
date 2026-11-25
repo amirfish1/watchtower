@@ -664,8 +664,17 @@ def _claude_project_dirs(root: Path) -> tuple:
     return dirs, found
 
 
-def _find_transcript(sid: str) -> Optional[Path]:
-    """Locate a session's transcript under the claude projects dir, if any."""
+# sid -> monotonic time of a full scan that found no transcript. Only callers
+# passing ``miss_ttl_s`` consult it (WT-122: the title backfill re-scanned all
+# ~850 project dirs every tick for each Codex session id).
+_TRANSCRIPT_MISSES: Dict[str, float] = {}
+
+
+def _find_transcript(sid: str, miss_ttl_s: float = 0.0) -> Optional[Path]:
+    """Locate a session's transcript under the claude projects dir, if any.
+
+    ``miss_ttl_s`` > 0 lets a caller that tolerates a late answer skip the
+    full scan for a sid that was not found within that many seconds."""
     root = _claude_projects_root()
     try:
         project_dirs, found = _claude_project_dirs(root)
@@ -676,13 +685,21 @@ def _find_transcript(sid: str) -> Optional[Path]:
         if cached.exists():
             return cached
         found.pop(sid, None)
+    if miss_ttl_s > 0:
+        missed = _TRANSCRIPT_MISSES.get(sid)
+        if missed is not None and time.monotonic() - missed < miss_ttl_s:
+            return None
     for d in project_dirs:
         p = d / f"{sid}.jsonl"
         if p.exists():
             if len(found) >= 8192:
                 found.clear()
             found[sid] = p
+            _TRANSCRIPT_MISSES.pop(sid, None)
             return p
+    if len(_TRANSCRIPT_MISSES) >= 8192:
+        _TRANSCRIPT_MISSES.clear()
+    _TRANSCRIPT_MISSES[sid] = time.monotonic()
     return None
 
 
@@ -788,8 +805,30 @@ def locate_transcript(sid: str, engine_hint: str = "") -> str:
     return ""
 
 
+# path -> ((ino, size, mtime_ns), title). The reconciler's title backfill asks
+# for every recent worker session each tick; re-reading multi-MB transcripts
+# for an unchanged answer was ~1% of a core (WT-122).
+_TITLE_MEMO: Dict[str, tuple] = {}
+
+
 def _latest_session_title(path: Path) -> str:
     """Return the last explicit Claude title/agent-name in a transcript."""
+    try:
+        st = os.stat(path)
+        stamp = (st.st_ino, st.st_size, st.st_mtime_ns)
+    except OSError:
+        return ""
+    hit = _TITLE_MEMO.get(str(path))
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    title = _scan_session_title(path)
+    if len(_TITLE_MEMO) >= 4096:
+        _TITLE_MEMO.clear()
+    _TITLE_MEMO[str(path)] = (stamp, title)
+    return title
+
+
+def _scan_session_title(path: Path) -> str:
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except OSError:
@@ -809,7 +848,7 @@ def _latest_session_title(path: Path) -> str:
     return ""
 
 
-def set_session_title(sid: str, name: str) -> bool:
+def set_session_title(sid: str, name: str, miss_ttl_s: float = 0.0) -> bool:
     """Rename a claude session by appending a ``custom-title`` event to its
     own transcript -- the exact event shape Claude writes for the in-session
     ``/rename`` command (verified against ``claude-command-center``'s
@@ -822,8 +861,9 @@ def set_session_title(sid: str, name: str) -> bool:
     Returns False (no-op) when the session has no transcript on disk yet --
     e.g. a non-claude engine, or a session id that hasn't flushed its first
     turn -- so callers (``wt claim``/``wt close``) can treat this as
-    best-effort and never fail the ticket operation over it."""
-    path = _find_transcript(sid)
+    best-effort and never fail the ticket operation over it. ``miss_ttl_s``
+    is passed to ``_find_transcript``."""
+    path = _find_transcript(sid, miss_ttl_s=miss_ttl_s)
     if path is None or not name:
         return False
     if _latest_session_title(path) == name:
