@@ -6269,6 +6269,13 @@ class _TickProfiler:
         except Exception as e:  # noqa: BLE001 - a diagnostic must never kill the loop
             print(f"[watchtower] tick profiler failed: {e}", flush=True)
             self.prof = None
+        try:
+            # echo SECONDS > <data dir>/profile-cpu: CPU-weighted stack
+            # sampling of every thread (WT-122).
+            from . import cpu_sampler
+            cpu_sampler.maybe_start()
+        except Exception as e:  # noqa: BLE001
+            print(f"[watchtower] cpu sampler failed: {e}", flush=True)
 
     def _maybe_start(self) -> None:
         if self.prof is not None:
