@@ -211,3 +211,33 @@ def test_spawn_defaults_reparsed_only_when_file_changes(tmp_path, monkeypatch):
     assert config._ccc_worker_engine_default() == "codx"
     spawn.unlink()
     assert config._ccc_worker_engine_default() == ""
+
+
+def test_observation_path_lookup_ttl(tmp_path, monkeypatch):
+    from watchtower import observations
+    root = tmp_path / "projects"
+    (root / "-repo").mkdir(parents=True)
+    monkeypatch.setattr(observations, "_roots", lambda: {"claude": root})
+    monkeypatch.setattr(observations, "_PATHS_MEMO", {})
+    sid = "11111111-2222-3333-4444-555555555555"
+    calls = []
+    real = observations._paths_uncached
+    monkeypatch.setattr(observations, "_paths_uncached",
+                        lambda e, s="": calls.append(s) or real(e, s))
+    # Off by default: every call looks again.
+    assert list(observations._paths("claude", sid)) == []
+    assert list(observations._paths("claude", sid)) == []
+    assert len(calls) == 2
+    monkeypatch.setattr(observations, "PATHS_TTL_S", 60.0)
+    assert observations._paths("claude", sid) == []
+    found = root / "-repo" / f"{sid}.jsonl"
+    found.write_text("{}\n")
+    assert observations._paths("claude", sid) == []  # a miss is reused within the TTL
+    assert len(calls) == 3
+    observations._PATHS_MEMO.clear()
+    assert observations._paths("claude", sid) == [found]
+    assert observations._paths("claude", sid) == [found]
+    assert len(calls) == 4
+    found.unlink()  # a vanished hit is looked up again
+    assert observations._paths("claude", sid) == []
+    assert len(calls) == 5

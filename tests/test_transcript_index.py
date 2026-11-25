@@ -39,6 +39,31 @@ def test_indexed_lookup_matches_probing_finders(tmp_path, monkeypatch):
     assert messages.locate_indexed(index, CODEX_SID, "codex") == str(newest)
 
 
+def test_non_uuid_ids_are_answered_from_the_index(tmp_path, monkeypatch):
+    """Devin-style names and codex suffixes give the probing answer without
+    probing (each probe stats every project dir; WT-122)."""
+    _tree(tmp_path, monkeypatch)
+    projects = tmp_path / "projects"
+    (projects / "-repo-a" / "scythe-statistic.jsonl").write_text("{}\n")
+    day = tmp_path / "codex" / "sessions" / "2026" / "11" / "24"
+    (day / "rollout-2026-11-24T03-00-00-odd-thread.jsonl").write_text("{}\n")
+    index = messages.transcript_index()
+    sids = ("scythe-statistic", "odd-thread", "thread", "eeeeeeeeeeee", "dddd-eeeeeeeeeeee",
+            "pickle-television", "x" * 40)
+    expected = {(sid, hint): messages.locate_transcript(sid, hint)
+                for sid in sids for hint in ("claude", "codex", "devin", "")}
+    assert expected[("eeeeeeeeeeee", "codex")].endswith(f"{CODEX_SID}.jsonl")
+    assert expected[("thread", "")].endswith("odd-thread.jsonl")
+
+    def no_probe(*_a, **_k):
+        raise AssertionError("probed")
+    monkeypatch.setattr(messages, "_find_transcript", no_probe)
+    monkeypatch.setattr(messages, "_find_codex_rollout", no_probe)
+    for (sid, hint), want in expected.items():
+        if len(sid) <= 36:
+            assert messages.locate_indexed(index, sid, hint) == want, (sid, hint)
+
+
 def test_usage_pass_builds_one_index(tmp_path, monkeypatch):
     _tree(tmp_path, monkeypatch)
     calls = []

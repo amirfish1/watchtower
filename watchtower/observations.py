@@ -60,7 +60,32 @@ def _roots():
             'codex': Path(os.environ.get('CODEX_HOME', str(Path.home()/'.codex')))/'sessions'}
 
 
+# Daemon-only (cli sets it): reuse a session's transcript lookup for this
+# long. Takeover enrollment observes ~70 policy sessions every tick and each
+# lookup globs every project dir (~1% of daemon CPU; WT-122). Enrollment needs
+# 120 s of idleness, so a lookup up to a minute old changes no decision.
+PATHS_TTL_S = 0.0
+_PATHS_MEMO = {}
+
+
 def _paths(engine, sid=''):
+    if PATHS_TTL_S > 0 and sid:
+        root = _roots()[engine]
+        key = (engine, str(sid), str(root))
+        now = time.monotonic()
+        hit = _PATHS_MEMO.get(key)
+        if (hit is not None and now - hit[0] < PATHS_TTL_S
+                and all(os.path.exists(p) for p in hit[1])):
+            return list(hit[1])
+        paths = list(_paths_uncached(engine, sid))
+        if len(_PATHS_MEMO) >= 4096:
+            _PATHS_MEMO.clear()
+        _PATHS_MEMO[key] = (now, tuple(paths))
+        return paths
+    return _paths_uncached(engine, sid)
+
+
+def _paths_uncached(engine, sid=''):
     root = _roots()[engine]
     if not root.is_dir():
         raise OSError(f'{engine} native store unavailable: {root}')

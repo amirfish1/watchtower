@@ -1110,8 +1110,7 @@ def worker_auto_compact_tokens() -> int:
     as ``-c model_auto_compact_token_limit=<N>``. 0 means "do not set"."""
     k = 250
     try:
-        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
-            data = json.load(f)
+        data = _spawn_defaults_data()
         if "worker_auto_compact_k" in data:
             k = float(data["worker_auto_compact_k"])
     except (OSError, ValueError, TypeError, AttributeError):
@@ -1183,8 +1182,7 @@ def _ccc_default_model(eng: str) -> str:
     or a machine without CCC installed just gets the pre-existing "" (ambient
     CLI default) behavior."""
     try:
-        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
-            data = json.load(f)
+        data = _spawn_defaults_data()
         m = str((data.get("models") or {}).get(eng) or "")
     except (OSError, ValueError, AttributeError):
         return ""
@@ -1207,8 +1205,7 @@ def _ccc_worker_model_default(eng: str) -> str:
     override.
     """
     try:
-        with open(CCC_SPAWN_DEFAULTS_FILE) as f:
-            data = json.load(f)
+        data = _spawn_defaults_data()
         worker_engine = str(data.get("worker_engine") or "").strip().lower()
         model = str(data.get("worker_model") or "").strip()
     except (OSError, ValueError, AttributeError):
@@ -1231,8 +1228,8 @@ FALLBACK_ENGINES = ("claude", "codex", "kimi", "grok", "devin")
 
 def _ccc_model_settings() -> Dict[str, Any]:
     try:
-        data = json.loads(CCC_SPAWN_DEFAULTS_FILE.read_text())
-        return data if isinstance(data, dict) else {}
+        data = _spawn_defaults_data()
+        return dict(data) if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 

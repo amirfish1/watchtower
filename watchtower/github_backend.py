@@ -25,7 +25,7 @@ import functools
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import github_history_archive as gha
 from .config import CATCH_ALL_LABEL
@@ -404,9 +404,52 @@ def _write_persisted_list_entry(key: str, entry: Dict[str, Any], *, revalidated=
                     == {k: v for k, v in entry.items() if k != "at"}):
                 return False
         data[key] = entry
+        _note_my_write(key, entry)
+        _piggyback_heartbeats(data, skip=key)
         return True
 
     _rewrite_persisted_list_cache(mutate, changed_repos={key.rsplit(":", 1)[0]})
+
+
+# key -> (at, etag, fetched_at, data object) of the entry this process last
+# persisted. Lets one rewrite carry the quiet heartbeat of every other key
+# whose list this process has revalidated (304) since then: the poller's 14
+# keys used to each rewrite the 4.7 MB file once a minute (WT-122).
+_MY_PERSISTED: Dict[str, Tuple[float, str, float, Any]] = {}
+
+
+def _note_my_write(key: str, entry: Dict[str, Any]) -> None:
+    if entry.get("stale") or entry.get("data") is None:
+        _MY_PERSISTED.pop(key, None)
+        return
+    _MY_PERSISTED[key] = (float(entry.get("at") or 0), str(entry.get("etag") or ""),
+                          float(entry.get("fetched_at") or 0), entry["data"])
+
+
+def _piggyback_heartbeats(data: Dict[str, Any], *, skip: str) -> None:
+    """Advance ``at`` on other keys whose persisted entry is still exactly the
+    one this process wrote and whose in-memory list (the same object) has
+    been revalidated since. Only the validation clock moves; any entry
+    another process rewrote, invalidated or replaced is left alone."""
+    for other, mine in list(_MY_PERSISTED.items()):
+        if other == skip:
+            continue
+        old = data.get(other)
+        cached = _LIST_CACHE.get(other)
+        if not isinstance(old, dict) or not isinstance(cached, dict):
+            continue
+        at, etag, fetched_at, rows = mine
+        if (old.get("stale") or old.get("at") != at or str(old.get("etag") or "") != etag
+                or float(old.get("fetched_at") or 0) != fetched_at):
+            continue
+        if (cached.get("error") is not None or cached.get("stale") or cached.get("data") is not rows
+                or str(cached.get("etag") or "") != etag
+                or float(cached.get("fetched_at") or 0) != fetched_at):
+            continue
+        new_at = float(cached.get("at") or 0)
+        if new_at > at:
+            old["at"] = new_at
+            _MY_PERSISTED[other] = (new_at, etag, fetched_at, rows)
 
 
 def _invalidate_list_cache(repo: str) -> None:

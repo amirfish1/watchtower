@@ -4799,6 +4799,13 @@ def started_before_boot(rec: Dict[str, Any]) -> bool:
     return bool(started) and started < boot - BOOT_SLACK_S
 
 
+# Daemon-only (cli sets it): reuse a pid's answer for this long. One tick
+# lists the workers registry several times (reconcile, staffing, retention,
+# status), probing ~1.3k pids each time (~1% of daemon CPU; WT-122).
+PID_ALIVE_TTL_S = 0.0
+_PID_ALIVE_MEMO: Dict[int, tuple] = {}
+
+
 def _pid_alive(pid: int) -> bool:
     """Check if a process is truly alive (not a zombie).
 
@@ -4807,6 +4814,20 @@ def _pid_alive(pid: int) -> bool:
     """
     if not pid:
         return False
+    if PID_ALIVE_TTL_S > 0:
+        now = time.monotonic()
+        hit = _PID_ALIVE_MEMO.get(pid)
+        if hit is not None and now - hit[0] < PID_ALIVE_TTL_S:
+            return hit[1]
+        alive = _pid_alive_probe(pid)
+        if len(_PID_ALIVE_MEMO) >= 16384:
+            _PID_ALIVE_MEMO.clear()
+        _PID_ALIVE_MEMO[pid] = (now, alive)
+        return alive
+    return _pid_alive_probe(pid)
+
+
+def _pid_alive_probe(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

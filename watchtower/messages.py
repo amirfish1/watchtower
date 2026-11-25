@@ -756,10 +756,9 @@ def transcript_index() -> Dict[str, Dict[str, Path]]:
     codex: Dict[str, Path] = {}
     mtimes: Dict[str, float] = {}
     for sessions in config.codex_session_roots():
-        try:
-            paths = list(sessions.glob("*/*/*/*.jsonl"))
-        except OSError:
-            continue
+        # glob.glob, not Path.glob: ~3x cheaper over the dated tree (WT-122).
+        paths = [Path(p) for p in sorted(_glob.glob(os.path.join(
+            _glob.escape(str(sessions)), "*", "*", "*", "*.jsonl"), include_hidden=True))]
         for path in paths:
             sid = path.name[:-len(".jsonl")][-36:]
             try:
@@ -777,12 +776,58 @@ def locate_indexed(index: Dict[str, Dict[str, Path]], sid: str, engine_hint: str
     if not sid:
         return ""
     if not _SESSION_UUID_RE.fullmatch(sid):
-        return locate_transcript(sid, engine_hint)
+        if len(sid) > 36 or "claude" not in index or "codex" not in index:
+            return locate_transcript(sid, engine_hint)
+        return _locate_indexed_suffix(index, sid, engine_hint)
     order = [engine_hint] + [e for e in ("claude", "codex") if e != engine_hint]
     for engine in order:
         path = index.get(engine, {}).get(sid)
         if path is not None:
             return str(path)
+    return ""
+
+
+_HEX_UUID_CHARS = frozenset("0123456789abcdef-")
+
+
+def _locate_indexed_suffix(index: Dict[str, Any], sid: str, engine_hint: str) -> str:
+    """``locate_transcript`` for a non-UUID id (Devin names like
+    "scythe-statistic"), answered from the index. Probing cost ~23 ms per id
+    and ~77 such ids were re-probed every usage pass (WT-122).
+
+    Claude: the index holds every ``<stem>.jsonl``, first project dir wins,
+    as in ``_find_transcript``. Codex: ``_find_codex_rollout`` matches
+    ``*<sid>.jsonl`` and keeps the newest; the index keys each rollout by its
+    name's last 36 characters, so for ``len(sid) <= 36`` a name ends with sid
+    exactly when its key does. A sid with a non-hex character cannot be the
+    suffix of a UUID-shaped key, so only the odd keys need scanning."""
+    codex = index["codex"]
+    order = [engine_hint] + [e for e in ("claude", "codex") if e != engine_hint]
+    for engine in order:
+        if engine == "claude":
+            path = index["claude"].get(sid)
+            if path is not None:
+                return str(path)
+        elif engine == "codex":
+            if set(sid) <= _HEX_UUID_CHARS:
+                keys = codex
+            else:
+                keys = index.get("_codex_odd_keys")
+                if keys is None:
+                    keys = [k for k in codex if not _SESSION_UUID_RE.fullmatch(k)]
+                    index["_codex_odd_keys"] = keys  # type: ignore[assignment]
+            newest: Optional[Path] = None
+            newest_mtime = -1.0
+            for key in keys:
+                if key.endswith(sid):
+                    try:
+                        mtime = codex[key].stat().st_mtime
+                    except OSError:
+                        continue
+                    if mtime > newest_mtime:
+                        newest, newest_mtime = codex[key], mtime
+            if newest is not None:
+                return str(newest)
     return ""
 
 

@@ -626,3 +626,46 @@ def test_an_expired_marker_does_not_make_the_claim_unwinnable(monkeypatch):
     os.utime(marker, (old, old))
 
     assert github_backend._try_claim_poll(repo) is True
+
+
+def test_one_rewrite_carries_heartbeats_of_revalidated_keys(monkeypatch):
+    """WT-122: the poller's quiet heartbeats rode one rewrite per key (14
+    rewrites a minute of a multi-MB file). A write now also advances `at` on
+    keys this process persisted and has since revalidated, so their own
+    heartbeat is not due; anything another process changed is left alone."""
+    import watchtower.github_backend as github_backend
+
+    monkeypatch.setattr(github_backend, "_MY_PERSISTED", {})
+    t0 = time.time() - 100
+    rows = {k: [_issue(i, repo="acme/hb")] for i, k in enumerate(("a:open", "b:open", "c:open"))}
+    for key, data in rows.items():
+        entry = {"at": t0, "data": data, "etag": "e-" + key, "fetched_at": t0, "stale": False}
+        github_backend._LIST_CACHE[key] = dict(entry, error=None)
+        github_backend._write_persisted_list_entry(key, entry)
+    # b and c revalidate (304) in memory; c is then rewritten by another process.
+    github_backend._LIST_CACHE["b:open"]["at"] = t0 + 50
+    github_backend._LIST_CACHE["c:open"]["at"] = t0 + 50
+
+    def foreign(data):
+        data["c:open"] = dict(data["c:open"], etag="foreign", at=t0 + 10)
+        return True
+    github_backend._rewrite_persisted_list_cache(foreign)
+
+    writes = []
+    real_rewrite = github_backend._rewrite_persisted_list_cache
+    monkeypatch.setattr(github_backend, "_rewrite_persisted_list_cache",
+                        lambda m, **kw: writes.append(1) or real_rewrite(m, **kw))
+    fresh = [_issue(9, "new", repo="acme/hb")]
+    github_backend._write_persisted_list_entry(
+        "a:open", {"at": t0 + 60, "data": fresh, "etag": "e2", "fetched_at": t0 + 60, "stale": False})
+    disk = github_backend._read_persisted_list_cache()
+    assert disk["a:open"]["data"] == fresh
+    assert disk["b:open"]["at"] == t0 + 50       # carried
+    assert disk["c:open"]["etag"] == "foreign"   # untouched
+    assert disk["c:open"]["at"] == t0 + 10
+    # b's own heartbeat is now inside the interval: no second rewrite of the file.
+    github_backend._write_persisted_list_entry(
+        "b:open", {"at": t0 + 55, "data": rows["b:open"], "etag": "e-b:open",
+                   "fetched_at": t0, "stale": False})
+    assert len(writes) == 2  # a's write and b's call; b's mutate wrote nothing
+    assert github_backend._read_persisted_list_cache()["b:open"]["at"] == t0 + 50

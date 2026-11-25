@@ -6387,6 +6387,10 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     _config_mod.STAT_TTL_S = 1.0  # see config.STAT_TTL_S (WT-122)
     from . import github_pipeline as _pipeline_mod
     _pipeline_mod.STAT_TTL_S = 1.0  # see github_pipeline.STAT_TTL_S (WT-122)
+    from . import observations as _observations_mod
+    _observations_mod.PATHS_TTL_S = 60.0  # see observations.PATHS_TTL_S (WT-122)
+    from . import workers as _workers_mod
+    _workers_mod.PID_ALIVE_TTL_S = 1.0  # see workers.PID_ALIVE_TTL_S (WT-122)
     tick_profiler = _TickProfiler()
     while True:
         tick_profiler.tick()
