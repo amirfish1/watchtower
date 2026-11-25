@@ -512,3 +512,32 @@ def test_stale_remote_pass_cannot_silently_clear_owner_attention(env, tmp_path, 
     monkeypatch.setattr(watches.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=255))
     row = watches.owner_rows([])[0]
     assert row['last']['status'] == 'pass' and 'stale' in row['warning']
+
+
+def test_identically_executing_watches_run_once_and_file_one_ticket(env, tmp_path, monkeypatch):
+    """WT-120: six startup watches with one command each re-filed one stale sample."""
+    q, cli, *_ = env
+    receipt = check(tmp_path, dict(status="fail", real_data=True, evidence="sample WT-116 took 146s"))
+    spec = watches._load()["checks"]["natural-check"]
+    watches.register("renamed-check", command=spec["command"], cwd=spec["cwd"], where=spec["where"],
+                     schedule="another worker's wording", every=spec["every"], queue=spec["queue"])
+    ref = close(env, tmp_path)
+    other = _ticket(q, env[4])
+    assert cli.main(["close", other, "--worker", "w1", "--summary", "Verified; watching", "--no-code",
+                     "--caveat", "Natural behavior remains unverified", "--watch", "renamed-check"]) == 0
+    items = [q.get(ref), q.get(other)]
+    calls = []
+    real = watches._execute
+    monkeypatch.setattr(watches, "_execute", lambda s: calls.append(s["name"]) or real(s))
+    results = watches.run(items=items, limit=1000)
+    assert len(calls) == 1
+    assert {(r["origin"], r["check"]) for r in results} == {(ref, "natural-check"), (other, "renamed-check")}
+    failure = {r["failure_ref"] for r in results}
+    assert len(failure) == 1
+    note = q.get(failure.pop())["note"]
+    assert "Check: natural-check, renamed-check" in note and ref in note and other in note
+    # A named manual run executes the shared check and updates every binding.
+    receipt.write_text(json.dumps(dict(status="pending", real_data=True, evidence="healthy")))
+    results = watches.run("renamed-check", items=items)
+    assert len(calls) == 2 and {r["origin"] for r in results} == {ref, other}
+    assert {r["status"] for r in results} == {"pending"}

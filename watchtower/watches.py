@@ -360,6 +360,16 @@ def _new_failure_evidence(previous, evidence):
     return filed.removesuffix(_FAILURE_FOOTER).strip() != evidence.strip()
 
 
+def _execution_key(spec):
+    """What a check actually executes and where its failures are filed.
+
+    Differently named registrations of one command are one check: they run
+    once per tick and file one ticket per regression (WT-120: six identical
+    startup watches each re-filed the same already-fixed sample).
+    """
+    return tuple(spec.get(k) for k in ("command", "cwd", "where", "queue", "every"))
+
+
 def run(name="", *, now=None, items=None, limit=1):
     """Run due permanent checks with a bounded per-tick budget, not ticket timers."""
     from . import queue as q, related
@@ -380,13 +390,14 @@ def run(name="", *, now=None, items=None, limit=1):
         except BlockingIOError:
             return []
         data = _load()
+        wanted = _execution_key(data["checks"][name]) if name else None
         groups = {}
         for key, bound in data["bindings"].items():
             spec = bound["spec"]
             original = by_ref.get(spec["origin"], bound.get("origin_item") or
                                   dict(ref=spec["origin"], status="closed"))
-            if not name or spec["name"] == name:
-                groups.setdefault((spec["name"], spec["revision"]), []).append((key, bound, original))
+            if not name or spec["name"] == name or _execution_key(spec) == wanted:
+                groups.setdefault(_execution_key(spec), []).append((key, bound, original))
         ordered = sorted(groups.values(), key=lambda g: max(b.get("last", {}).get("at", 0) for _, b, _ in g))
         executed = 0
         for peers in ordered:
@@ -423,10 +434,11 @@ def run(name="", *, now=None, items=None, limit=1):
                     else:
                         dedupe_key = previous_key
                 origins = ", ".join(original["ref"] for _, _, original in group)
+                names = ", ".join(dict.fromkeys(b["spec"]["name"] for _, b, _ in group))
                 failure = q.enqueue(project=spec["queue"], source="wt-watch",
                                     dedupe_key=dedupe_key, dedupe_while_active=predecessor,
                                     title=f"Watch {spec['name']} failed ({spec['origin']})",
-                                    note=f"Originals: {origins}\nCheck: {spec['name']}\n"
+                                    note=f"Originals: {origins}\nCheck: {names}\n"
                                          f"Command: {spec['command']}\nWhere: {spec['where']}\n"
                                          f"Evidence: {result['evidence']}{_FAILURE_FOOTER}")
                 if failure["ref"] != failure_ref:
@@ -444,15 +456,15 @@ def run(name="", *, now=None, items=None, limit=1):
                 pending_after_failure = True
             with _lock():
                 current = _load()
-                for key, _, original in peers:
+                for key, bound, original in peers:
                     # A concurrent explicit replacement invalidates this receipt.
                     target = current["bindings"].get(key)
-                    if not target or target["spec"]["revision"] != spec["revision"]:
+                    if not target or target["spec"]["revision"] != bound["spec"]["revision"]:
                         continue
                     target.update(episode=episode, failure_ref=failure_ref, first_real_pass=first_real_pass,
                                   pending_after_failure=pending_after_failure, last=result)
                     if original.get("status") == "closed":
-                        results.append(dict(origin=original["ref"], check=spec["name"], **result))
+                        results.append(dict(origin=original["ref"], check=bound["spec"]["name"], **result))
                 _save(current)
             if failure:
                 for _, _, original in group:
