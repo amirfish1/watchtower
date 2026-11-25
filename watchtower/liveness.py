@@ -494,7 +494,7 @@ def project(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = 
         readiness = "claimable"
     if item.get("blocked_by") or item.get("duplicate_of"):
         if by_ref is None:
-            by_ref = q._refs_index(q.list_items())
+            by_ref = q._refs_index(q.list_items(readonly=True))
         dep = q.blocker_verdict(item, by_ref)[0]
     else:
         dep = "ok"
@@ -503,7 +503,7 @@ def project(item: Dict[str, Any], by_ref: Optional[Dict[str, Dict[str, Any]]] = 
     if role == "parent":
         readiness = "claimable"   # a parent is never claimed; readiness is moot
         if by_ref is None and (item.get("group") or {}).get("members"):
-            by_ref = q._refs_index(q.list_items())
+            by_ref = q._refs_index(q.list_items(readonly=True))
         gplan = "settled" if q.group_plan_settled(item) else "pending"
         gint = q.group_integration_state(item, now)
         gproof = q.group_proof_state(item, by_ref)
@@ -1659,7 +1659,7 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
 
 def report(queue: str = "", ref: str = "", now: Optional[float] = None) -> List[Dict[str, Any]]:
     """``assess`` for every ticket (or one), read-only (``wt liveness``)."""
-    items = q.list_items()
+    items = q.list_items(readonly=True)
     by_ref = q._refs_index(items)
     ctx = ResolverContext(now)
     out = []
@@ -1681,7 +1681,7 @@ def sweep(now: Optional[float] = None, only_ref: str = "") -> List[Dict[str, Any
     """One backstop pass: ``assess`` every live ticket and apply the due
     actions. Logs one BACKSTOP line per action. Returns the acted rows."""
     try:
-        items = q.list_items()
+        items = q.list_items(readonly=True)
     except Exception:  # noqa: BLE001
         return []
     by_ref = q._refs_index(items)

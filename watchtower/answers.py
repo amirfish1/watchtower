@@ -416,7 +416,7 @@ def route_pending_answers(now: Optional[float] = None) -> List[str]:
     now = time.time() if now is None else now
     acted: List[str] = []
     try:
-        items = q.list_items()
+        items = q.list_items(readonly=True)
     except Exception:  # noqa: BLE001
         return acted
     try:
@@ -525,7 +525,7 @@ def resume_dependency_waits(items: Optional[List[Dict[str, Any]]] = None) -> Lis
     acted: List[str] = []
     if items is None:
         try:
-            items = q.list_items()
+            items = q.list_items(readonly=True)
         except Exception:  # noqa: BLE001
             return acted
     by_ref = {str(it.get("ref") or "").upper(): it for it in items if it.get("ref")}

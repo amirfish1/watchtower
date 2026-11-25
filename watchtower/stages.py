@@ -1072,7 +1072,7 @@ def reconcile_stages(only_ref: str = "") -> List[Tuple[str, str]]:
     except Exception as exc:  # one broken local link must not stop stage supervision
         _log("DUPLICATE", f"local duplicate sweep error: {exc}")
     from . import config
-    items = [it for it in (q.list_items() or []) if not config.is_tracker(it.get("project", ""))]
+    items = [it for it in (q.list_items(readonly=True) or []) if not config.is_tracker(it.get("project", ""))]
     try:
         from . import github_duplicates
         for ref in github_duplicates.sweep(items, only_ref):

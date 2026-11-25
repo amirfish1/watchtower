@@ -2859,7 +2859,7 @@ def release_zombie_workers(queue: Optional[str] = None,
 
     released: List[Dict[str, Any]] = []
     try:
-        items = _q.list_items()
+        items = _q.list_items(readonly=True)
     except Exception:
         items = []
 
@@ -5319,7 +5319,7 @@ def _affinity_rows(queue: Optional[str] = None,
     now = time.time() if now is None else now
     if items is None:
         try:
-            items = _q.list_items()
+            items = _q.list_items(readonly=True)
         except Exception:
             return []
     out = []
@@ -5337,7 +5337,7 @@ def expire_parked_retention(now: Optional[float] = None) -> List[str]:
     now = time.time() if now is None else now
     done: List[str] = []
     try:
-        items = _q.list_items()
+        items = _q.list_items(readonly=True)
     except Exception:
         return done
     for it in items:
@@ -5362,7 +5362,7 @@ def _parked_rows(queue: Optional[str] = None, items: Optional[List[Dict[str, Any
     now = time.time() if now is None else now
     if items is None:
         try:
-            items = _q.list_items()
+            items = _q.list_items(readonly=True)
         except Exception:
             return []
     rows = []
@@ -5401,7 +5401,7 @@ def retained_parked_ids(queue: Optional[str] = None,
     if items is None:
         try:
             from . import queue as _q
-            items = _q.list_items()
+            items = _q.list_items(readonly=True)
         except Exception:
             items = []
     ids = {str((it.get("parked") or {}).get("worker_id")) for it in _parked_rows(queue, items)}
@@ -6230,7 +6230,7 @@ def requeue_orphaned_tickets(
     now = _time.time()
     reopened: List[Dict[str, Any]] = []
     try:
-        items = _q.list_items()
+        items = _q.list_items(readonly=True)
     except Exception:
         return reopened
     from . import liveness as _liveness
@@ -6590,7 +6590,7 @@ def backfill_claimed_session_ids() -> List[str]:
     if not wid_to_sid:
         return backfilled
     try:
-        items = _q.list_items()
+        items = _q.list_items(readonly=True)
     except Exception:
         return backfilled
     for it in items:
@@ -6955,7 +6955,7 @@ def backfill_recent_session_titles(
     except OSError:
         return []
     try:
-        items = _q.list_items()
+        items = _q.list_items(readonly=True)
     except Exception:
         items = []
     out: List[Dict[str, Any]] = []
@@ -7454,7 +7454,7 @@ def _reconcile_once_locked(dry_run: bool = False,
         # Discover first-ticket queues as well as configured/released ones.
         # Every queue's capacity is read afresh INSIDE its lock: dispatch may
         # have staffed it while this pass was launching on an earlier queue.
-        seen = {str(it.get("project") or "") for it in _q.list_items()}
+        seen = {str(it.get("project") or "") for it in _q.list_items(readonly=True)}
         config.ensure_entries(seen - {""})
         queues = (set(config.all_queues()) | seen |
                   {str(w.get("queue") or "") for w in staffing_before} |

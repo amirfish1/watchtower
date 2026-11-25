@@ -462,7 +462,7 @@ def all_status(
     now = now or datetime.now(timezone.utc)
     by_queue: Dict[str, List[Dict[str, Any]]] = {}
     configured = config.all_queues(include_archived=True)
-    fetched = items if items is not None else q.list_items(project=project, fresh=fresh)
+    fetched = items if items is not None else q.list_items(project=project, fresh=fresh, readonly=True)
     # Repair older stranded tickets and work arriving through other backends.
     # Persist the restoration so config-based queue pickers agree with health.
     for item in fetched:

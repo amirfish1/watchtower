@@ -7822,7 +7822,7 @@ def assessment_targets_for_sweep(now_ts: Optional[float] = None) -> Dict[str, Li
 
     res: Dict[str, List[Dict[str, Any]]] = {"due": [], "filing": [], "running": []}
     from . import config
-    for it in list_items():
+    for it in list_items(readonly=True):
         if config.is_tracker(it.get("project", "")):
             continue
         a = it.get("assessment") or {}
