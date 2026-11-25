@@ -203,8 +203,13 @@ def queue_status(
     by_ref: Optional[Dict[str, Dict[str, Any]]] = None,
     claim_working: Optional[Callable[[Dict[str, Any]], bool]] = None,
     worker_cap: Optional[int] = None,
+    group_index: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Compute the status row for a single queue from its items.
+
+    ``group_index``: ``q._refs_index`` of every ticket, when the caller already
+    holds the full list; otherwise a queue with group tickets lists them all
+    again (once per queue per status refresh; WT-122).
 
     ``claim_working`` / ``worker_cap`` (WT-33): when the stuck rule fires but
     the queue holds at least ``worker_cap`` (default: its desired_workers)
@@ -254,7 +259,8 @@ def queue_status(
             required = q._norm_placement(it.get("placement"))
             placement_blocked[required] = placement_blocked.get(required, 0) + 1
 
-    group_idx = (q._refs_index(q.list_items(readonly=True))
+    group_idx = ((group_index if group_index is not None
+                  else q._refs_index(q.list_items(readonly=True)))
                  if any(q.group_role(it) for it in open_items) else {})
     # WT-116: a tracker queue keeps records only; claim_next/count_claimable
     # refuse it outright, so none of its open tickets is claimable work.
@@ -503,6 +509,9 @@ def all_status(
             continue
         by_queue.setdefault(it.get("project") or "GEN", []).append(it)
     by_ref = q._refs_index(fetched)
+    # Unscoped, ``fetched`` is every ticket: the group-plan index each queue
+    # row needs. A scoped read holds one queue, so rows list the rest.
+    group_index = None if project else by_ref
     # Resolve only named parents for scoped health; never enumerate unrelated
     # GitHub queues just to explain a local dependency.
     if project:
@@ -527,6 +536,7 @@ def all_status(
             claim_types=config.claim_types(name),
             worker_model=config.queue_model_id(name) or None,
             by_ref=by_ref,
+            group_index=group_index,
         )
         for name, items in by_queue.items()
     ]

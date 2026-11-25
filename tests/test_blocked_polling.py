@@ -106,3 +106,24 @@ def test_request_stats_group_requests_by_route_shape(api, monkeypatch):
     assert d._route_label("GET", "/q/WT") == "GET /q/*"
     assert d._route_label("GET", "/") == "GET /"
     assert d._route_label("POST", "/api/queue/WT/reconcile") == "POST /api/queue/*"
+
+
+def test_blocked_body_encoded_once_per_snapshot(api, monkeypatch):
+    """WT-122: pollers share one encoding of each snapshot; a new snapshot
+    is re-encoded, and large bodies are compact JSON."""
+    base, d = api
+    rows = [{"ref": "WT-1", "project": "WT", "note": "x" * 100}]
+    monkeypatch.setattr(d.q, "list_blocked", lambda **kw: [dict(r) for r in rows])
+    encodes = []
+    real = d._encode_json
+    monkeypatch.setattr(d, "_encode_json", lambda obj: encodes.append(1) or real(obj))
+    assert read(base + "/api/blocked") == rows
+    assert read(base + "/api/blocked") == rows
+    assert len(encodes) == 1
+    rows[0]["note"] = "changed"
+    d._blocked_cache["at"] = 0
+    assert read(base + "/api/blocked") == rows
+    assert len(encodes) == 2
+    assert d._encode_json({"a": 1}) == b'{\n  "a": 1\n}'
+    monkeypatch.setattr(d, "PRETTY_JSON_MAX_BYTES", 4)
+    assert d._encode_json({"a": 1}) == b'{"a":1}'

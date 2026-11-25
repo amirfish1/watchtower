@@ -109,8 +109,7 @@ def blocked_models() -> frozenset:
         if key:
             blocked.add(key)
     try:
-        with open(CCC_MODEL_POLICY_FILE) as f:
-            data = json.load(f)
+        data = _cached_json_file(CCC_MODEL_POLICY_FILE)
         raw = data.get("blocked_models") if isinstance(data, dict) else None
         for item in raw or []:
             key = str(item or "").strip().lower()
@@ -918,28 +917,50 @@ def set_engine(queue: str, eng: str) -> Dict[str, Any]:
     return q
 
 
-_SPAWN_DEFAULTS_MEMO: Dict[str, Any] = {"sig": None, "data": None}
+# path -> (checked_at, stat sig or None, error or None, data)
+_JSON_FILE_MEMO: Dict[str, Tuple[float, Any, Any, Any]] = {}
+
+
+def _cached_json_file(path: Any) -> Any:
+    """Parsed JSON at ``path``, reparsed only when the file changes.
+
+    The status payload asks for engine/model/effort defaults and the blocked
+    model list once per queue per refresh; reparsing CCC's files each time
+    was ~3% of daemon CPU (WT-122). A file modified in the last 2 s is
+    reparsed every call, so two writes inside one mtime tick are never
+    confused. Under ``STAT_TTL_S`` (the daemon) even the stat is skipped
+    within the TTL. Raises OSError/ValueError like open()+json.load; callers
+    must not mutate the result."""
+    key = str(path)
+    memo = _JSON_FILE_MEMO.get(key)
+    now = _time_mod.monotonic()
+    if memo is None or not (STAT_TTL_S > 0 and now - memo[0] < STAT_TTL_S):
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            memo = (now, None, exc, None)
+        else:
+            sig = (st.st_ino, st.st_size, st.st_mtime_ns)
+            if memo is not None and memo[1] == sig:
+                memo = (now, sig, memo[2], memo[3])
+            else:
+                fresh = _time_mod.time() - st.st_mtime_ns / 1e9 < 2.0
+                try:
+                    with open(path) as f:
+                        memo = (now, None if fresh else sig, None, json.load(f))
+                except (OSError, ValueError) as exc:
+                    memo = (now, None, exc, None)
+        if len(_JSON_FILE_MEMO) >= 64:
+            _JSON_FILE_MEMO.clear()
+        _JSON_FILE_MEMO[key] = memo
+    if memo[2] is not None:
+        raise memo[2].with_traceback(None)
+    return memo[3]
 
 
 def _spawn_defaults_data() -> Any:
-    """Parsed spawn-defaults.json, reparsed only when the file changes.
-
-    The status payload asks for the engine/effort defaults once per queue
-    per refresh; reparsing the file each time was ~2% of daemon CPU (WT-122).
-    A file modified in the last 2 s is reparsed every call, so two writes
-    inside one mtime tick are never confused. Raises OSError/ValueError like
-    open()+json.load; callers must not mutate the result."""
-    path = CCC_SPAWN_DEFAULTS_FILE
-    st = os.stat(path)
-    sig = (str(path), st.st_ino, st.st_size, st.st_mtime_ns)
-    memo = _SPAWN_DEFAULTS_MEMO
-    if memo["sig"] == sig:
-        return memo["data"]
-    with open(path) as f:
-        data = json.load(f)
-    fresh = _time_mod.time() - st.st_mtime_ns / 1e9 < 2.0
-    memo.update(sig=None if fresh else sig, data=data)
-    return data
+    """Parsed spawn-defaults.json (see ``_cached_json_file``)."""
+    return _cached_json_file(CCC_SPAWN_DEFAULTS_FILE)
 
 
 def _ccc_worker_engine_default() -> str:

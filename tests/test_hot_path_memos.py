@@ -195,7 +195,7 @@ def test_spawn_defaults_reparsed_only_when_file_changes(tmp_path, monkeypatch):
     old = 1_700_000_000
     os.utime(spawn, (old, old))
     monkeypatch.setattr(config, "CCC_SPAWN_DEFAULTS_FILE", spawn)
-    monkeypatch.setattr(config, "_SPAWN_DEFAULTS_MEMO", {"sig": None, "data": None})
+    monkeypatch.setattr(config, "_JSON_FILE_MEMO", {})
     loads = []
     real_load = json.load
     monkeypatch.setattr(config.json, "load", lambda f: loads.append(1) or real_load(f))
@@ -241,3 +241,65 @@ def test_observation_path_lookup_ttl(tmp_path, monkeypatch):
     found.unlink()  # a vanished hit is looked up again
     assert observations._paths("claude", sid) == []
     assert len(calls) == 5
+
+
+def test_cached_json_file_ttl_and_errors(tmp_path, monkeypatch):
+    import json
+    import os
+    from watchtower import config
+    monkeypatch.setattr(config, "_JSON_FILE_MEMO", {})
+    policy = tmp_path / "policy.json"
+    monkeypatch.setattr(config, "CCC_MODEL_POLICY_FILE", policy)
+    monkeypatch.delenv("WATCHTOWER_BLOCKED_MODELS", raising=False)
+    assert config.blocked_models() == frozenset()   # missing file: no block
+    assert config.blocked_models() == frozenset()
+    policy.write_text("{not json")
+    assert config.blocked_models() == frozenset()   # fresh write is seen at once
+    policy.write_text(json.dumps({"blocked_models": ["Gpt-X"]}))
+    assert config.is_blocked_model("gpt-x")
+    monkeypatch.setattr(config, "STAT_TTL_S", 60.0)
+    os.utime(policy, (1_700_000_000, 1_700_000_000))
+    config._JSON_FILE_MEMO.clear()
+    assert config.is_blocked_model("gpt-x")
+    policy.write_text(json.dumps({"blocked_models": []}))
+    assert config.is_blocked_model("gpt-x")         # within the daemon's stat TTL
+    config._JSON_FILE_MEMO.clear()
+    assert not config.is_blocked_model("gpt-x")
+    policy.unlink()
+    config._JSON_FILE_MEMO.clear()
+    depths = []
+    for _ in range(3):  # a remembered error re-raises without growing its traceback
+        try:
+            config._cached_json_file(policy)
+        except FileNotFoundError as exc:
+            tb, depth = exc.__traceback__, 0
+            while tb is not None:
+                tb, depth = tb.tb_next, depth + 1
+            depths.append(depth)
+        else:
+            raise AssertionError("expected FileNotFoundError")
+    assert len(set(depths)) == 1
+
+
+def test_unscoped_status_reuses_full_list_for_group_index(monkeypatch):
+    """WT-122: each queue row with group tickets re-listed every ticket."""
+    from watchtower import health
+    from watchtower import queue as q
+    items = [
+        {"ref": "GA-1", "project": "GA", "status": "open", "title": "parent",
+         "created_at": "2026-11-25T00:00:00Z", "group": {"role": "parent"}},
+        {"ref": "GB-2", "project": "GB", "status": "open", "title": "member",
+         "created_at": "2026-11-25T00:00:00Z", "group": {"role": "child", "parent": "GA-1"}},
+    ]
+    seen = []
+    real_status = health.queue_status
+    monkeypatch.setattr(health, "queue_status",
+                        lambda name, its, **kw: seen.append(kw.get("group_index")) or
+                        real_status(name, its, **kw))
+
+    def no_list(*_a, **_k):
+        raise AssertionError("re-listed every ticket")
+    monkeypatch.setattr(q, "list_items", no_list)
+    rows = health.all_status(items=items, include_archived=True)
+    assert {r["queue"] for r in rows} >= {"GA", "GB"}
+    assert seen and all(idx is not None and set(idx) >= {"GA-1", "GB-2"} for idx in seen)

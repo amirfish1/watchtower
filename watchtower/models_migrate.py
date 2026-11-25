@@ -103,6 +103,7 @@ def _write_defaults(changes: List[dict]) -> str:
         json.dump(data, f, indent=2)
         f.write("\n")
     os.replace(tmp, path)
+    config._JSON_FILE_MEMO.clear()
     return path
 
 

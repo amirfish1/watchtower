@@ -209,6 +209,33 @@ def cached_blocked_payload() -> List[Dict[str, Any]]:
         return _blocked_cache["payload"]
 
 
+def cached_blocked_body() -> bytes:
+    """The encoded unfiltered /api/blocked body, encoded once per snapshot.
+
+    Several pollers fetch the same ~3 MB snapshot every few seconds;
+    re-encoding it per request was the bulk of request-thread CPU (WT-122)."""
+    rows = cached_blocked_payload()
+    with _blocked_compute:
+        if _blocked_cache.get("body_for") is not rows:
+            _blocked_cache.update(body=_encode_json(rows), body_for=rows)
+        return _blocked_cache["body"]
+
+
+PRETTY_JSON_MAX_BYTES = 64 * 1024
+
+
+def _encode_json(obj: Any) -> bytes:
+    """Indented JSON for small, human-curled responses; compact for large ones.
+
+    ``indent`` forces the pure-Python encoder: the 3 MB /api/blocked body,
+    polled every ~4 s, cost ~0.5% of daemon CPU that way (WT-122). Compact
+    output goes through the C encoder; every JSON client parses either."""
+    compact = json.dumps(obj, separators=(",", ":"))
+    if len(compact) > PRETTY_JSON_MAX_BYTES:
+        return compact.encode()
+    return json.dumps(obj, indent=2).encode()
+
+
 STATUS_CACHE_TTL_S = 5.0
 _status_cache: Dict[str, Any] = {"at": 0.0, "payload": None}
 _status_compute = threading.Lock()
@@ -1669,7 +1696,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def _json(self, code: int, obj: Any) -> None:
-        self._send(code, json.dumps(obj, indent=2).encode(), "application/json")
+        self._send(code, _encode_json(obj), "application/json")
 
     def _html(self, code: int, page: str) -> None:
         self._send(code, page.encode(), "text/html; charset=utf-8")
@@ -1743,10 +1770,12 @@ class _Handler(BaseHTTPRequestHandler):
             params = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
             project = params.get("queue", [""])[0]
             try:
+                if not project:
+                    self._send(200, cached_blocked_body(), "application/json")
+                    return
                 rows = cached_blocked_payload()
-                if project:
-                    project = q._norm_project(project)
-                    rows = [it for it in rows if it.get("project") == project]
+                project = q._norm_project(project)
+                rows = [it for it in rows if it.get("project") == project]
                 self._json(200, rows)
             except Exception as exc:
                 self._json(503, {"error": str(exc)})
