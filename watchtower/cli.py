@@ -6245,6 +6245,75 @@ def _deploy_sync_tick(boot_head: str, held: str = "") -> str:
     return held
 
 
+class _TickProfiler:
+    """``echo N > <data dir>/profile-ticks`` makes the daemon's main thread
+    cProfile its next N loop iterations (ticks plus the sleep between them)
+    and write the stats to ``profile-ticks.out`` (WT-113). SIGUSR1 stacks
+    misattribute GIL-holding C calls to the blocking call that follows them;
+    this measures the tick itself. Costs one stat per tick when not asked."""
+
+    MAX_TICKS = 50
+
+    def __init__(self) -> None:
+        self.prof: Any = None
+        self.left = 0
+        self.ticks = 0
+        self.started = 0.0
+
+    def tick(self) -> None:
+        try:
+            self._finish_one()
+            self._maybe_start()
+        except Exception as e:  # noqa: BLE001 - a diagnostic must never kill the loop
+            print(f"[watchtower] tick profiler failed: {e}", flush=True)
+            self.prof = None
+
+    def _maybe_start(self) -> None:
+        if self.prof is not None:
+            return
+        from . import storage
+        req = storage.data_dir() / "profile-ticks"
+        try:
+            text = req.read_text().strip()
+        except OSError:
+            return
+        try:
+            req.unlink()
+        except OSError:
+            pass
+        try:
+            n = int(text or "1")
+        except ValueError:
+            n = 1
+        import cProfile
+        self.left = self.ticks = max(1, min(n, self.MAX_TICKS))
+        self.started = time.time()
+        self.prof = cProfile.Profile()
+        self.prof.enable()
+
+    def _finish_one(self) -> None:
+        if self.prof is None:
+            return
+        self.left -= 1
+        if self.left > 0:
+            return
+        self.prof.disable()
+        import io
+        import pstats
+        from . import storage
+        out = io.StringIO()
+        out.write(f"{self.ticks} loop iteration(s), wall {time.time() - self.started:.1f} s, "
+                  f"pid {os.getpid()}\n")
+        stats = pstats.Stats(self.prof, stream=out)
+        stats.sort_stats("tottime").print_stats(60)
+        stats.sort_stats("cumulative").print_stats(100)
+        self.prof = None
+        dest = storage.data_dir() / "profile-ticks.out"
+        tmp = dest.with_name(dest.name + ".tmp")
+        tmp.write_text(out.getvalue())
+        os.replace(tmp, dest)
+
+
 def _daemon_loop(args: argparse.Namespace) -> None:
     """Own the GitHub-list-cache poller thread's lifetime, then run the tick
     loop. A ``try/finally`` here (rather than inside the loop itself) is
@@ -6303,7 +6372,9 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     except Exception:
         pass
     last_config_sanitize = 0.0  # 0 -> the first tick below heals at daemon start
+    tick_profiler = _TickProfiler()
     while True:
+        tick_profiler.tick()
         # Only a real auto-spawn daemon supervises stage sessions (WT-24).
         result = workers.reconcile_once(
             dry_run=dry_run,
