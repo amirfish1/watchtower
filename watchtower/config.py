@@ -1255,7 +1255,8 @@ def _ccc_model_settings() -> Dict[str, Any]:
         return {}
 
 
-def _configured_model_routes(raw: Any, *, distinct_engines: bool = True) -> List[Dict[str, str]]:
+def _configured_model_routes(raw: Any, *, distinct_engines: bool = True,
+                             stale: Optional[List[str]] = None) -> List[Dict[str, str]]:
     """Validate ordered routes without inventing a model or raising budgets.
 
     Worker fallback is one entry per engine: an exhausted account cannot
@@ -1264,6 +1265,12 @@ def _configured_model_routes(raw: Any, *, distinct_engines: bool = True) -> List
     a transient model fault can recover there; the runner skips same-engine
     entries after a quota failure. Reject malformed config rather than
     accidentally reverting to ambient CLI defaults.
+
+    When ``stale`` is a list, a well-formed route whose model or effort the
+    engine's current catalog no longer approves (a retired model, WT-123) is
+    skipped and described in ``stale`` instead of rejecting every route:
+    one provider retiring a model must not disable the other engines'
+    fallback. Structural errors still reject the whole list.
     """
     if not isinstance(raw, list) or len(raw) > len(FALLBACK_ENGINES):
         raise ValueError(f"model routes must be a list of at most {len(FALLBACK_ENGINES)} engines")
@@ -1278,30 +1285,49 @@ def _configured_model_routes(raw: Any, *, distinct_engines: bool = True) -> List
         if eng not in FALLBACK_ENGINES or (eng if distinct_engines else (eng, model_value)) in seen:
             raise ValueError("model routes must use distinct supported engines"
                              if distinct_engines else "model routes must be distinct supported models")
-        if (not model_value or is_blocked_model(model_value)
-                or not is_approved_model(eng, model_value)):
+        seen.add(eng if distinct_engines else (eng, model_value))
+        if not model_value:
             raise ValueError("model route is missing, unsupported, or blocked")
+        if is_blocked_model(model_value) or not is_approved_model(eng, model_value):
+            if stale is None:
+                raise ValueError("model route is missing, unsupported, or blocked")
+            stale.append(f"{eng} model {model_value!r} is blocked or not in the {eng} catalog")
+            continue
         if effort_value and (effort_value not in VALID_EFFORTS
                              or _effort_rejected(eng, model_value, effort_value)):
-            raise ValueError("model route effort is not supported")
+            if stale is None or effort_value not in VALID_EFFORTS:
+                raise ValueError("model route effort is not supported")
+            stale.append(f"{eng} model {model_value!r} no longer supports effort {effort_value!r}")
+            continue
         routes.append({"engine": eng, "model": model_value, "effort": effort_value})
-        seen.add(eng if distinct_engines else (eng, model_value))
     return routes
 
 
 def worker_fallback_policy() -> Optional[Dict[str, Any]]:
     """Machine policy owned by CCC; absence preserves legacy queue behavior."""
+    return _worker_fallback_policy_and_issues()[0]
+
+
+def worker_fallback_policy_issues() -> List[str]:
+    """Why CCC's worker fallback policy is degraded: routes skipped because
+    their model was retired, or the reason a malformed policy was rejected.
+    Empty when the policy is absent or every route is usable."""
+    return _worker_fallback_policy_and_issues()[1]
+
+
+def _worker_fallback_policy_and_issues() -> Tuple[Optional[Dict[str, Any]], List[str]]:
     data = _ccc_model_settings()
     if "worker_fallback" not in data:
-        return None
+        return None, []
     policy = data["worker_fallback"]
     if not isinstance(policy, dict) or not isinstance(policy.get("enabled"), bool):
-        return {"enabled": False, "models": []}
+        return {"enabled": False, "models": []}, ["worker_fallback policy is malformed"]
+    stale: List[str] = []
     try:
-        routes = _configured_model_routes(policy.get("models"))
-    except ValueError:
-        return {"enabled": False, "models": []}
-    return {"enabled": policy["enabled"], "models": routes}
+        routes = _configured_model_routes(policy.get("models"), stale=stale)
+    except ValueError as exc:
+        return {"enabled": False, "models": []}, [f"worker_fallback policy rejected: {exc}"]
+    return {"enabled": policy["enabled"], "models": routes}, stale
 
 
 def model_profile(name: str) -> Dict[str, Any]:

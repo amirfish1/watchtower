@@ -131,3 +131,34 @@ def test_profiles_allow_distinct_models_on_one_engine_but_fallback_does_not(wt_e
     monkeypatch.setattr(wt_env.workers, "engine_available", lambda e: True)
     save_policy(wt_env, worker_fallback={"enabled": True, "models": [opus, CLAUDE]})
     assert c.worker_fallback_policy() == {"enabled": False, "models": []}
+
+
+def test_retired_route_model_drops_only_that_route(wt_env, monkeypatch):
+    """WT-123: a provider retiring the codex route's model (catalog no longer
+    lists it) must not erase the claude route -- that left every opted-in
+    queue with 'no fallback engine is available' for 14 h."""
+    c = wt_env.config
+    monkeypatch.setattr(wt_env.workers, "engine_available", lambda e: True)
+    claude = {"engine": "claude", "model": "claude-sonnet-5-5", "effort": "high"}
+    retired = {"engine": "codex", "model": "gpt-retired-9", "effort": "medium"}
+    real_approved = c.is_approved_model
+    monkeypatch.setattr(
+        c, "is_approved_model",
+        lambda eng, value: value != "gpt-retired-9" and real_approved(eng, value),
+    )
+    save_policy(wt_env, worker_fallback={"enabled": True, "models": [claude, retired]})
+    assert c.worker_fallback_policy() == {"enabled": True, "models": [claude]}
+    assert c.fallback_to_default_worker("Q")
+    assert c.fallback_engine("codex") == "claude"
+    assert c.fallback_model("claude") == "claude-sonnet-5-5"
+    assert c.fallback_engine("claude") == ""  # never invents a codex model
+    issues = c.worker_fallback_policy_issues()
+    assert issues and "gpt-retired-9" in issues[0]
+    assert "gpt-retired-9" in wt_env.workers._no_fallback_hint()
+    # Structural errors still reject the whole policy.
+    save_policy(wt_env, worker_fallback={"enabled": True, "models": [claude, claude]})
+    assert c.worker_fallback_policy() == {"enabled": False, "models": []}
+    assert "rejected" in c.worker_fallback_policy_issues()[0]
+    save_policy(wt_env, worker_fallback={"enabled": True, "models": [claude]})
+    assert c.worker_fallback_policy_issues() == []
+    assert wt_env.workers._no_fallback_hint() == "no fallback engine is available"

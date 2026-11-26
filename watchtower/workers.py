@@ -4141,6 +4141,21 @@ def _warrants_engine_swap(rec: Optional[Dict[str, Any]]) -> bool:
     return consecutive >= _LAUNCH_FAILURE_ALERT_STREAK
 
 
+def _no_fallback_hint() -> str:
+    """SPAWN_SKIP wording when an opted-in queue finds no fallback engine,
+    naming a degraded CCC fallback policy so a retired model's effect on the
+    whole chain is visible rather than silent (WT-123)."""
+    from . import config
+    try:
+        issues = config.worker_fallback_policy_issues()
+    except Exception:  # noqa: BLE001 - wording only
+        issues = []
+    hint = "no fallback engine is available"
+    if issues:
+        hint += " (" + "; ".join(issues) + ")"
+    return hint
+
+
 def _launch_substitute(queue: str, engine: str, *, attempted=()) -> str:
     """Engine to launch this queue's workers on instead of its failing
     ``engine``, or "" to not substitute. Only a queue that opted in to
@@ -8207,7 +8222,7 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
                         {"queue": q_name, "reason": skip_reason}
                     )
                     hint = (
-                        "no fallback engine is available"
+                        _no_fallback_hint()
                         if config.fallback_to_default_worker(q_name)
                         else "fallback to the default worker is off for this queue"
                     )
@@ -8385,7 +8400,7 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
                         },
                     )
                     why_not = (
-                        "no fallback engine is available"
+                        _no_fallback_hint()
                         if config.fallback_to_default_worker(q_name)
                         else "fallback to the CCC default worker is off for "
                         "this queue"
