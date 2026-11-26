@@ -360,6 +360,31 @@ def _new_failure_evidence(previous, evidence):
     return filed.removesuffix(_FAILURE_FOOTER).strip() != evidence.strip()
 
 
+_VOLATILE_TIME = re.compile(r"\d{4}-\d\d-\d\d(?:[T ]\d\d:\d\d(?::\d\d(?:\.\d+)?)?(?:Z|[+-]\d\d:?\d\d)?)?")
+_VOLATILE_NUMBER = re.compile(r"(?<![\w.])-?\d+(?:\.\d+)?(?![\w.])")
+
+
+def _mask_volatile(text):
+    return _VOLATILE_NUMBER.sub("#", _VOLATILE_TIME.sub("@", text))
+
+
+def _material_change(previous, evidence):
+    """New evidence for a closed alert, ignoring rolling counts and times.
+
+    A check that stays red after its alert closes re-alerts only when its
+    diagnostic changes in kind (a new row id, status, key or message), not
+    when a sample count, latency or window timestamp moves (WT-125).
+    """
+    _, marker, filed = previous.get("note", "").partition("\nEvidence: ")
+    if not marker:
+        return False
+    evidence = _mask_volatile(str(evidence).strip())
+    if filed.endswith("…"):  # Drop the clipped token: a cut number masks differently.
+        prefix = re.sub(r"[\w.:+-]*$", "", filed[:-1])
+        return not evidence.startswith(_mask_volatile(prefix))
+    return _mask_volatile(filed.removesuffix(_FAILURE_FOOTER).strip()) != evidence
+
+
 def _execution_key(spec):
     """What a check actually executes and where its failures are filed.
 
@@ -428,7 +453,10 @@ def run(name="", *, now=None, items=None, limit=1):
                 # Older registration replacements advanced the episode but
                 # could leave the previous revision's failure ref in place.
                 if previous_key.endswith(f":{episode}"):
-                    if pending_after_failure and _new_failure_evidence(previous, result["evidence"]):
+                    # A closed alert covered only the evidence it filed; a check
+                    # that stays red must still surface materially new evidence.
+                    if (pending_after_failure and _new_failure_evidence(previous, result["evidence"])) or (
+                            previous.get("status") == "closed" and _material_change(previous, result["evidence"])):
                         dedupe_key = f"watch:{anchor}:{episode + 1}"
                         predecessor = failure_ref
                     else:

@@ -83,7 +83,7 @@ def test_real_pending_allows_a_new_failure_after_the_previous_ticket_closes(env,
     first = run("fail", False, "query HTTP 504")["failure_ref"]
     assert q.close(first, resolution="Upstream outage resolved")["status"] == "closed"
     assert run("pending", False, "no data available")["status"] == "pending"
-    assert run("fail", True, "new diagnostic")["failure_ref"] == first
+    assert run("fail", False, "query HTTP 504")["failure_ref"] == first
 
     pending = run("pending", True, "query healthy; no qualifying event")
     assert pending["status"] == "pending" and pending["real_data"] is True
@@ -106,6 +106,57 @@ def test_real_pending_allows_a_new_failure_after_the_previous_ticket_closes(env,
     assert q.close(new, resolution="Diagnostic resolved")["status"] == "closed"
     assert run("fail", True, "new diagnostic")["failure_ref"] == new
     assert run("fail", True, "another new diagnostic")["failure_ref"] != new
+
+
+def test_still_red_watch_files_new_evidence_after_its_ticket_closes(env, tmp_path):
+    """WT-125: OPS-1050 closed while red, then new lost rows reused it."""
+    q, *_ = env
+    receipt = check(tmp_path)
+    ref = close(env, tmp_path)
+    items = [q.get(ref)]
+
+    def run(evidence):
+        receipt.write_text(json.dumps(dict(status="fail", real_data=True, evidence=evidence)))
+        return watches.run("natural-check", items=items)[0]["failure_ref"]
+
+    def rows(*ids, eligible=956, at="2026-11-23T04:02:42Z"):
+        return str(dict(since=at, eligible=eligible, counts=dict(pending=len(ids)), rows=list(ids)))
+
+    first = run(rows("8ea066ff"))
+    assert run(rows("8ea066ff")) == first
+    assert q.close(first, resolution="Investigated 8ea066ff; retained")["status"] == "closed"
+    # The filed evidence stays on the closed alert: closing does not re-alert,
+    # and neither do rolling counts or window timestamps.
+    assert run(rows("8ea066ff")) == first
+    assert run(rows("8ea066ff", eligible=1227, at="2026-11-26T04:02:42.5+00:00")) == first
+    new = run(rows("8ea066ff", "99ae28f7", "07c55845"))
+    assert new != first and q.get(new)["status"] == "open"
+    assert q.get(first)["status"] == q.get(ref)["status"] == "closed"
+    assert run(rows("8ea066ff", "99ae28f7", "07c55845")) == new
+    # Changes absorbed by an open alert were never filed, so they surface
+    # once it closes rather than being swallowed with it.
+    assert run(rows("8ea066ff", "99ae28f7", "07c55845", "0d0d")) == new
+    assert q.close(new, resolution="Investigated")["status"] == "closed"
+    assert run(rows("8ea066ff", "99ae28f7", "07c55845", eligible=2000)) == new
+    third = run(rows("8ea066ff", "99ae28f7", "07c55845", "0d0d"))
+    assert third not in (first, new) and q.get(third)["status"] == "open"
+
+
+def test_material_change_ignores_volatile_numbers_and_clipped_tokens():
+    def filed(evidence):
+        return dict(note=f"Check: x\nEvidence: {evidence}{watches._FAILURE_FOOTER}")
+
+    gate = "{'gates': [{'kind': 'list_read', 'status': '%s', 'samples': %d, 'p95_ms': %.1f}]}"
+    assert not watches._material_change(filed(gate % ("fail", 849, 295.0)), gate % ("fail", 245, 279.5))
+    assert watches._material_change(filed(gate % ("pass", 849, 295.0)), gate % ("fail", 849, 295.0))
+    assert watches._material_change(filed("run 2050e112 failed"), "run 7968d6a5 failed")
+    assert not watches._material_change(dict(note="no evidence marker"), "anything")
+    long = "rows " + "x" * 3990 + " at 2026-11-25T07:00:00Z total 12345"
+    cut = long.index("2026-11-25") + len("2026-11")  # clip inside the timestamp
+    clipped = dict(note="Check: x\nEvidence: " + long[:cut] + "…")
+    assert long[:cut].endswith(" at 2026-11")
+    assert not watches._material_change(clipped, long.replace("2026-11-25T07", "2026-11-26T09"))
+    assert watches._material_change(clipped, long.replace("rows ", "cols "))
 
 
 def test_shared_watch_rearms_once_when_originals_change(env, tmp_path):
