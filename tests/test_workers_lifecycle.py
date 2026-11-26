@@ -5521,6 +5521,20 @@ def test_dispatch_still_nudges_for_an_unclaimed_ticket(wt):
     assert item["ref"] in msg["message"]["content"][0]["text"]
 
 
+def test_dispatch_never_announces_a_finished_ticket(wt):
+    """WT-1 notices: a CCC test dispatched a long-closed ref through the live
+    install, and an idle worker was told 'New ticket WT-1 filed'."""
+    wt.config.set_auto_drain("Q", True)
+    _live_worker(wt, "Q")
+    item = wt.q.enqueue(project="Q", note="done long ago")
+    wt.q.close(item["ref"], resolution="done")
+
+    reason = wt.workers.dispatch_after_enqueue("Q", item["ref"])
+
+    assert reason == f"no action — {item['ref']} is closed"
+    assert [_fifo_pending(fd) for fd in wt._readers] == [False]
+
+
 def test_dispatch_nudges_idle_workers_not_ones_holding_a_ticket(wt):
     """WT-15: a worker mid-ticket is not disturbed by a new ticket while
     another worker is idle and can take it."""

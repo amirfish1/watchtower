@@ -6515,6 +6515,12 @@ def dispatch_after_enqueue(queue: str, ref: str = "") -> str:
                      if str(it.get("ref") or "") == ref),
                     None,
                 )
+        if item and item.get("status") in ("closed", "awaiting_release"):
+            # A finished ticket has nothing to dispatch; nudging a live
+            # worker about it sends a stale "new ticket" notice (WT-1 leak).
+            reason = f"no action — {ref} is {item.get('status')}"
+            _log("DISPATCH", f"{ref} — {reason}", queue=queue)
+            return reason
         if item and _q.plan_pending(item):
             # Plan-gated (WT-22): plan first; no worker until it is accepted
             # (cmd_plan's accept verdict dispatches again).
