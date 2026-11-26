@@ -10,9 +10,12 @@ import os
 import stat
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 from pathlib import Path
+
+import pytest
 
 # Fake `codex app-server --listen unix://SOCK`: a stdlib WebSocket server
 # that answers thread/start + turn/start, and completes the turn only after a
@@ -21,8 +24,10 @@ from pathlib import Path
 FAKE_CODEX = textwrap.dedent(r'''
     import base64, hashlib, json, os, socket, struct, sys, threading
     sock_path = sys.argv[sys.argv.index("--listen") + 1][len("unix://"):]
-    # Real codex outlives a SIGKILLed host mid-turn despite PR_SET_PDEATHSIG.
-    import ctypes; ctypes.CDLL(None).prctl(1, 0)
+    if sys.platform.startswith("linux"):
+        # Real codex outlives a SIGKILLed host mid-turn despite PR_SET_PDEATHSIG.
+        import ctypes
+        ctypes.CDLL(None).prctl(1, 0)  # Clear PR_SET_PDEATHSIG.
     srv = socket.socket(socket.AF_UNIX); srv.bind(sock_path); srv.listen(8)
     owner = {}
     def frame(obj):
@@ -70,6 +75,24 @@ FAKE_CODEX = textwrap.dedent(r'''
 ''')
 
 
+@pytest.fixture
+def fake_app_server(wt_env, monkeypatch):
+    fake = wt_env.bin / "codex"
+    fake.write_text(f"#!{sys.executable}\n" + FAKE_CODEX)
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+
+    # macOS pytest paths can exceed the Unix socket path limit. Use the same
+    # short registry path in the host subprocess and the test's steering client.
+    with (
+        tempfile.TemporaryDirectory(prefix="wt-app-", dir="/tmp") as directory,
+        monkeypatch.context() as registry_env,
+    ):
+        workers_file = Path(directory) / "workers.json"
+        registry_env.setenv("WATCHTOWER_WORKERS_FILE", str(workers_file))
+        registry_env.setattr(wt_env.workers, "WORKERS_FILE", workers_file)
+        yield fake
+
+
 def test_app_server_is_default_transport_and_exec_pin_keeps_settings(wt_env):
     """OPS-237: an unconfigured (e.g. newly created) codex queue spawns
     steerable app-server workers; an explicit exec pin survives and spawns
@@ -94,19 +117,16 @@ def test_app_server_is_default_transport_and_exec_pin_keeps_settings(wt_env):
     assert "watchtower.codex_app_worker" in " ".join(wt.workers.build_drain_command("Q", "codex", "q-1", "/repo"))
 
 
-def test_second_process_steers_hosted_worker_through_its_own_server(wt_env):
+def test_second_process_steers_hosted_worker_through_its_own_server(wt_env, fake_app_server):
     """The real launch argv, as a real process: it advertises its thread, a
     separate client's deliver() steers the live turn on the worker's own
     server, and the worker exits 0 and withdraws its record on completion."""
     wt = wt_env
-    fake = wt.bin / "codex"
-    fake.write_text(f"#!{sys.executable}\n" + FAKE_CODEX)
-    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
     from watchtower import codex_app_worker, codex_rpc
 
     wt.config.set_codex_transport("Q", "app-server")
     argv = wt.workers.build_drain_command("Q", "codex", "q-1", str(wt.tmp))
-    argv[argv.index("--codex-bin") + 1] = str(fake)
+    argv[argv.index("--codex-bin") + 1] = str(fake_app_server)
     log = wt.tmp / "q-1.log"
     with open(log, "wb") as out:
         proc = subprocess.Popen(argv, cwd=wt.tmp, stdout=out, stderr=subprocess.STDOUT, start_new_session=True)
@@ -131,19 +151,20 @@ def test_second_process_steers_hosted_worker_through_its_own_server(wt_env):
     assert codex_app_worker.find_worker(thread_id) is None
 
 
-def test_server_orphaned_by_a_killed_host_is_stopped_by_the_sweep(wt_env):
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="orphan sweep verifies the app-server via Linux /proc",
+)
+def test_server_orphaned_by_a_killed_host_is_stopped_by_the_sweep(wt_env, fake_app_server):
     """SIGKILL of the host mid-turn skips all its cleanup; the reconcile-tick
     sweep must still stop the server so no hidden writer keeps working."""
     import signal
     wt = wt_env
-    fake = wt.bin / "codex"
-    fake.write_text(f"#!{sys.executable}\n" + FAKE_CODEX)
-    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
     from watchtower import codex_app_worker
 
     wt.config.set_codex_transport("Q", "app-server")
     argv = wt.workers.build_drain_command("Q", "codex", "q-2", str(wt.tmp))
-    argv[argv.index("--codex-bin") + 1] = str(fake)
+    argv[argv.index("--codex-bin") + 1] = str(fake_app_server)
     proc = subprocess.Popen(argv, cwd=wt.tmp, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             start_new_session=True)
     thread_id = "11111111-2222-7333-8444-555555555555"
