@@ -113,3 +113,25 @@ def test_dry_run_is_not_paced(wt_env, pacing):
     _queues(wt_env, [f"D{i}" for i in range(5)])
     pacing.load[0] = 9.0
     assert len(wt_env.workers.reconcile_once(dry_run=True)["spawned"]) == 5
+
+
+def test_watch_check_fails_unpaced_wave_and_passes_paced_one(tmp_path):
+    from watchtower import watch_checks
+    log = tmp_path / "activity.log"
+
+    def write(lines):
+        log.write_text("".join(f"2026-11-26 {t} UTC  Q  {verb} x\n" for t, verb in lines))
+
+    since = "2026-11-26T13:00:00Z"
+    write([(f"14:00:{s:02d}", "SPAWN_START") for s in range(0, 50, 8)])  # incident shape
+    result = watch_checks.spawn_pacing(since, log)
+    assert result["status"] == "fail" and "peak 7 in any 120s" in result["evidence"]
+    write([("13:59:00", "SPAWN_START")] * 9 + [("14:00:00", "SPAWN_START")] * 3)
+    assert watch_checks.spawn_pacing(since, log)["status"] == "fail"
+    assert watch_checks.spawn_pacing("2026-11-26T13:59:30Z", log)["status"] == "pending"
+    log.write_text(log.read_text() + "2026-11-26 14:00:05 UTC  Q  SPAWN_DEFERRED spawning 0 of 1: "
+                   "3 cold starts in the last 120s (max 3)\n"
+                   "2026-11-26 14:02:01 UTC  Q  SPAWN_START x\n")
+    result = watch_checks.spawn_pacing("2026-11-26T13:59:30Z", log)
+    assert result["status"] == "pass" and result["real_data"] is True
+    assert "1 window deferrals" in result["evidence"]
