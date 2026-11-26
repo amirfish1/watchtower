@@ -1624,6 +1624,13 @@ def _apply(item: Dict[str, Any], a: Dict[str, Any], by_ref: Dict[str, Dict[str, 
     # stage / spawn / assessment_run_ops: record first (CAS), then act.
     if action == "spawn" and a["queue"] in spawned:
         return "queue already staffed this sweep"
+    if action == "spawn":
+        from . import spawn_pacing
+        admitted, deferred = spawn_pacing.admit(a["queue"], 1)
+        if not admitted:
+            q._log("SPAWN_DEFERRED", f"backstop spawn for {ref}: {deferred['reason']}; "
+                   "the next sweep retries", queue=a["queue"])
+            return f"spawn deferred: {deferred['reason']}"
     marked = q.recover_claim(ref, expect=_expect(item, by_ref), action="mark",
                              reason=f"backstop {action}: {reason}", evidence=evidence,
                              state=a["row"])

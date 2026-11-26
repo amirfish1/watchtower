@@ -546,6 +546,17 @@ def isolated_launch_failures(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def isolated_spawn_pacing(tmp_path, monkeypatch):
+    """Host load and the host's cold-start ledger never defer test spawns.
+
+    WT-126 paces automatic spawns by real os.getloadavg(); a loaded test
+    host would otherwise make every non-dry reconcile test flaky. Pacing
+    tests turn it back on with WATCHTOWER_SPAWN_PACING=on."""
+    monkeypatch.setenv("WATCHTOWER_SPAWN_PACING", "off")
+    monkeypatch.setenv("WATCHTOWER_SPAWN_PACING_FILE", str(tmp_path / "spawn-pacing.isolated.json"))
+
+
+@pytest.fixture(autouse=True)
 def isolated_engine_ancestry(monkeypatch):
     """Synthetic identity tests must not see the developer agent ancestry."""
     from watchtower import sender_envelope

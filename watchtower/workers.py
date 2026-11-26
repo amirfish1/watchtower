@@ -8286,6 +8286,30 @@ def _reconcile_staffing_locked(dry_run, only_queue, result, reconcile_id, staffi
                 launch_effort = {
                     "effort": config.fallback_effort(q_name, launch_engine)
                 }
+            if not dry_run:
+                # WT-126: fleet-wide cold-start pacing; the next pass resumes.
+                from . import spawn_pacing
+                admitted, deferred = spawn_pacing.admit(
+                    q_name, to_spawn, manual=manual_run)
+                if deferred:
+                    _q._log(
+                        "SPAWN_DEFERRED",
+                        f"spawning {admitted} of {to_spawn}: {deferred['reason']}; "
+                        "the next reconcile pass retries | "
+                        + _audit_detail(
+                            reconcile_id=reconcile_id, queue=q_name,
+                            requested=to_spawn, admitted=admitted,
+                            **{k: v for k, v in deferred.items() if k != "reason"},
+                        ),
+                        queue=q_name,
+                    )
+                    result["skipped"].append({
+                        "queue": q_name,
+                        "reason": f"spawn deferred: {deferred['reason']}",
+                    })
+                if not admitted:
+                    continue
+                to_spawn = admitted
             launch_failed: List[Dict[str, Any]] = []
             spawned = spawn_workers(
                 q_name, n=to_spawn, engine=launch_engine, model=launch_model,

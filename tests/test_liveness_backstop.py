@@ -562,6 +562,27 @@ def test_unstaffed_open_work_spawns_once_per_queue(lv):
     assert len(lv.spawned) == 1 and lv.spawned[0][0] == PQ
 
 
+def test_backstop_spawn_defers_under_host_load_without_marking(lv, monkeypatch):
+    """WT-126: the backstop shares the reconciler's cold-start pacing."""
+    import sys
+    pacing = sys.modules["watchtower.spawn_pacing"]
+    monkeypatch.setenv("WATCHTOWER_SPAWN_PACING", "on")
+    load = [0.1]
+    monkeypatch.setattr(pacing, "load_per_core", lambda: load[0])
+    assert pacing.admit("OTHER", 1)[0] == 1  # a recent start: no starvation slot
+    load[0] = 3.0
+    ref = _file(lv)
+    lv.config.set_auto_drain(PQ, True)
+    lv.config.set_repo_path(PQ, str(lv.tmp))
+    spawns = [a for a in _sweep(lv) if a["action"] == "spawn"]
+    assert spawns and spawns[0]["result"].startswith("spawn deferred: host load 3.00/core")
+    assert not lv.spawned and not lv.q.get(ref).get("backstop")
+    assert "SPAWN_DEFERRED" in _log(lv)
+    load[0] = 0.5
+    _sweep(lv)
+    assert len(lv.spawned) == 1 and lv.spawned[0][0] == PQ
+
+
 def test_auto_drain_off_open_work_is_a_backlog(lv):
     ref = _file(lv)
     a = _assess(lv, ref)

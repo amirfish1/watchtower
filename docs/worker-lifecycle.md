@@ -370,6 +370,7 @@ an operator to reconstruct the transaction without reading a worker transcript.
 | `RELEASE` | Durable detachment, delivery outcome, sentinel state, and `pid_signalled=false`. |
 | `SPAWN_PLAN` | Claimable depth, before/after staffing, releases, deficit, requested count, and cause for one reconcile pass. |
 | `SPAWN` / `SPAWN_FAIL` | Launch result correlated to its reconcile pass and any replacement release. |
+| `SPAWN_DEFERRED` | Cold-start pacing (WT-126, `watchtower/spawn_pacing.py`) held back some or all requested spawns: host 1-min load at or above 1.5/core, or 3 cold starts already in the last 120 s fleet-wide. Nothing is dropped; the next pass recomputes the deficit, and queues waiting longest go first. |
 
 Every evaluation has an `evaluation_id`, every release a `release_id`, and every
 reconcile pass a `reconcile_id`. The worker record stores the last evidence
@@ -397,6 +398,7 @@ events when a new ticket is filed:
 |------|-------------|---------------|
 | **SPAWN_PLAN** | `reconcile_once()` / reconciler | The staffing calculation, including cause and release correlation. A release with no claimable work records `requested=0`. |
 | **SPAWN** | `reconcile_once()` / reconciler | A new worker process was created, labeled with cause and reconcile ID. |
+| **SPAWN_DEFERRED** | `reconcile_once()`, liveness backstop | Fleet-wide pacing postponed a spawn until load or the cold-start window allows it (one spawn per 10 min still goes through under sustained load). `WATCHTOWER_SPAWN_PACING=off` disables it. |
 | **DISPATCH** | `dispatch_after_enqueue()` | The routing decision for *this ticket* — what happened to ensure it gets worked. One line per ticket, one of: nudged an existing worker, spawned new worker(s), or queued as backlog. |
 
 **Why do I see two SPAWN lines for one ticket?**  
