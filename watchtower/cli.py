@@ -147,7 +147,7 @@ def _print_status(rows: List[dict]) -> None:
         print(hdr)
         print("-" * len(hdr))
         for r in rows:
-            flag = {"stuck": "STUCK", "backlog": "backlog",
+            flag = {"stuck": "STUCK", "backlog": "backlog", "parked": "PARKED",
                     "active": "draining", "clear": "ok"}.get(r.get("state"), "ok")
             if _cfg.is_archived(r["queue"]):
                 flag = "archived"

@@ -74,6 +74,11 @@ Safe mechanical repairs:
 - **Nothing draining**: check auto-drain. Turning it ON spends money and backlog
   mode is often deliberate: raise a decision card (depth, oldest ticket,
   recommendation); `wt drain on|off <Q>` only on the owner's say-so.
+  Exception: `state: "parked"` / `auto_parked` in `wt status --json` means
+  the reconciler parked the queue because its engine keeps failing at launch.
+  That is not a drain-on decision: chase `auto_parked.alert_ref` (or file
+  an OPS ticket from the LAUNCH_FAIL lines); it resumes by itself when the
+  engine changes or `cooldown_until` passes.
 - Looks like a WatchTower bug: file it in WT with evidence; don't work around it.
 
 Confirm with `wt wait -q <Q> --timeout 600` (always bounded). Recurring

@@ -684,6 +684,7 @@ _STYLE = """
     .qh-state.draining { background: rgba(63,185,80,.15); color: #3fb950; }
     .qh-state.stuck { background: rgba(255,92,92,.18); color: #ff5c5c; animation: beat 2.4s ease-in-out infinite; }
     .qh-state.backlog { background: rgba(139,148,158,.16); color: var(--muted); }
+    .qh-state.parked { background: rgba(210,153,34,.18); color: #d29922; }
 
     .wk-row { display: flex; align-items: center; gap: 8px; padding: 6px 12px 6px 16px; border-bottom: 1px solid rgba(37,50,74,.6); font-size: 12px; color: var(--muted); }
     .wk-row:last-child { border-bottom: 0; }
@@ -864,10 +865,11 @@ def _readout(row: Dict[str, Any]) -> str:
     depth = row.get("depth", 0)
     if depth == 0:
         return '<div class="readout clear mono">clear</div>'
-    if row.get("state") == "backlog":
+    if row.get("state") in ("backlog", "parked"):
+        word = row.get("state")
         return (
             f'<div class="readout backlog mono">{depth} open '
-            '<span style="font-size:14px">·</span> backlog</div>'
+            f'<span style="font-size:14px">·</span> {word}</div>'
         )
     rate = row.get("drain_rate_per_min") or 0
     open_lbl = "open"
@@ -885,14 +887,14 @@ def _readout(row: Dict[str, Any]) -> str:
 
 def _state_word(row: Dict[str, Any]) -> str:
     return {
-        "stuck": "stalled", "backlog": "backlog",
+        "stuck": "stalled", "backlog": "backlog", "parked": "parked",
         "active": "draining", "clear": "clear",
     }.get(row.get("state"), "clear")
 
 
 def _card_class(row: Dict[str, Any]) -> str:
     return {
-        "stuck": "stuck", "backlog": "backlog",
+        "stuck": "stuck", "backlog": "backlog", "parked": "backlog",
         "active": "draining", "clear": "clear",
     }.get(row.get("state"), "clear")
 
@@ -1060,8 +1062,8 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
 
     def _queue_state_class(r: Dict[str, Any]) -> str:
         s = r.get("state", "clear")
-        if s == "stuck":
-            return "stuck"
+        if s in ("stuck", "parked"):
+            return s
         depth = r.get("depth", 0)
         auto = r.get("auto_drain", False)
         workers_live = r.get("workers_live", 0)
@@ -1091,7 +1093,7 @@ def render_index(payload: Dict[str, Any], chat_rows: Optional[List[Dict[str, Any
         sc = _queue_state_class(r)
         state_labels = {
             "ready": "READY", "draining": "DRAINING",
-            "stuck": "STUCK", "backlog": "BACKLOG",
+            "stuck": "STUCK", "backlog": "BACKLOG", "parked": "PARKED",
         }
         state_lbl = state_labels.get(sc, sc.upper())
 

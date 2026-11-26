@@ -204,8 +204,14 @@ def queue_status(
     claim_working: Optional[Callable[[Dict[str, Any]], bool]] = None,
     worker_cap: Optional[int] = None,
     group_index: Optional[Dict[str, Dict[str, Any]]] = None,
+    auto_parked: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Compute the status row for a single queue from its items.
+
+    ``auto_parked`` (WT-124): the reconciler's launch-failure park marker
+    (see ``parked_status``). A parked queue reports ``state="parked"``
+    instead of ``backlog``/``active``: auto-drain is off because its engine
+    keeps failing at launch, not because someone chose a backlog.
 
     ``group_index``: ``q._refs_index`` of every ticket, when the caller already
     holds the full list; otherwise a queue with group tickets lists them all
@@ -417,6 +423,10 @@ def queue_status(
         state = "stuck"     # real alarm: open work, no progress, should drain
     else:
         state = "active"    # open work, progressing
+    if auto_parked and not auto_drain and state in ("backlog", "active"):
+        # WT-124: auto-drain is off because the reconciler parked the queue
+        # for launch failures, not by choice; don't let it read as backlog.
+        state = "parked"
 
     return {
         "queue": project,
@@ -442,6 +452,7 @@ def queue_status(
         "stage_stuck": stage_stuck,
         "stuck_reason": stuck_reason,
         "auto_drain": bool(auto_drain),
+        "auto_parked": dict(auto_parked) if auto_parked else None,
         "state": state,
         "drain_rate_per_min": drain_rate,
         "eta_seconds": eta_seconds,
@@ -524,6 +535,14 @@ def all_status(
         if it.get("status") == "open" and (it.get("blocked_by") or it.get("duplicate_of"))
         and q.blocker_verdict(it, by_ref)[0] != "ok"
     }
+    failures: Optional[Dict[str, Any]] = None
+    parked: Dict[str, Optional[Dict[str, Any]]] = {}
+    for name in by_queue:
+        marker = config.auto_parked(name)
+        if marker:
+            if failures is None:
+                failures = _launch_failures()
+            parked[name] = parked_status(name, marker, failures)
     rows = [
         queue_status(
             name,
@@ -537,6 +556,7 @@ def all_status(
             worker_model=config.queue_model_id(name) or None,
             by_ref=by_ref,
             group_index=group_index,
+            auto_parked=parked.get(name),
         )
         for name, items in by_queue.items()
     ]
@@ -544,6 +564,56 @@ def all_status(
     # A backlog (opted out) is calm, so it sorts with the normal rows.
     rows.sort(key=lambda r: (r["state"] != "stuck", -r["depth"], r["queue"]))
     return rows
+
+
+def _launch_failures() -> Dict[str, Any]:
+    try:
+        from .workers import _load_launch_failures
+        return _load_launch_failures()
+    except Exception:  # noqa: BLE001 - status must render without it
+        return {}
+
+
+def parked_status(queue: str, marker: Dict[str, Any],
+                  failures: Dict[str, Any]) -> Dict[str, Any]:
+    """The ``auto_parked`` field of a status row (WT-124).
+
+    ``marker`` is the reconciler's park marker (``config.auto_parked``:
+    engine, engines, at, reason). ``failures`` is launch-failures.json; the
+    records for the engines tried add when the launch-failure cooldown ends
+    (the queue resumes by itself then, or when its engine changes) and the
+    alert ticket the failure streak filed, so a reader is pointed at the
+    real cause rather than at turning drain back on."""
+    engines = [str(e) for e in (marker.get("engines") or []) if e]
+    engine = str(marker.get("engine") or "")
+    if not engines and engine:
+        engines = [engine]
+    until = 0.0
+    alert_refs: List[str] = []
+    for eng in engines:
+        rec = failures.get(f"{queue}:{eng or 'claude'}")
+        if not isinstance(rec, dict):
+            continue
+        try:
+            until = max(until, float(rec.get("cooldown_until") or 0))
+        except (TypeError, ValueError):
+            pass
+        ref = str(rec.get("alerted_ref") or "")
+        if ref and ref not in alert_refs:
+            alert_refs.append(ref)
+    cooldown_until = (
+        datetime.fromtimestamp(until, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        if until else None
+    )
+    return {
+        "at": marker.get("at") or None,
+        "reason": marker.get("reason") or "repeated launch failures",
+        "engine": engine or None,
+        "engines": engines,
+        "cooldown_until": cooldown_until,
+        "alert_ref": alert_refs[0] if alert_refs else None,
+        "alert_refs": alert_refs,
+    }
 
 
 # GitHub connectivity alert threshold (2026-07-27 design): a single failed

@@ -519,6 +519,33 @@ def test_auto_park_is_labelled_in_the_config_audit_line(wt_env, no_engines):
     assert marker["engine"] == "codex" and "codex" in marker["engines"]
 
 
+def test_auto_parked_queue_shows_parked_in_wt_status_json(wt_env, no_engines, capsys):
+    """WT-124: queue care read a launch-failure park as a deliberate
+    ``drain off`` backlog and asked for an owner card to turn drain on. The
+    status row must carry the park marker and a distinct ``parked`` state."""
+    _park(wt_env)
+    data = wt_env.workers._load_launch_failures()
+    data[f"{QUEUE}:codex"]["alerted_ref"] = "OPS-9999"
+    wt_env.workers._save_launch_failures(data)
+    capsys.readouterr()
+    assert wt_env.cli.main(["status", "-q", QUEUE, "--json"]) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+    assert row["auto_drain"] is False
+    assert row["state"] == "parked"
+    parked = row["auto_parked"]
+    assert parked["engine"] == "codex" and "codex" in parked["engines"]
+    assert parked["at"] and parked["reason"]
+    assert parked["alert_ref"] == "OPS-9999"
+    assert parked["cooldown_until"].endswith("Z")
+    assert wt_env.cli.main(["status", "-q", QUEUE]) == 0
+    assert "PARKED" in capsys.readouterr().out
+
+    # A deliberate drain off clears the marker: an ordinary backlog again.
+    wt_env.config.set_auto_drain(QUEUE, False)
+    row = wt_env.health.all_status(project=QUEUE)[0]
+    assert row["auto_parked"] is None and row["state"] != "parked"
+
+
 def test_parked_queue_stays_parked_while_the_engine_cools_down(wt_env, no_engines):
     _park(wt_env)
     result = wt_env.workers.reconcile_once()
