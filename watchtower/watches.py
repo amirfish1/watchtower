@@ -395,8 +395,19 @@ def _execution_key(spec):
     return tuple(spec.get(k) for k in ("command", "cwd", "where", "queue", "every"))
 
 
-def run(name="", *, now=None, items=None, limit=1):
-    """Run due permanent checks with a bounded per-tick budget, not ticket timers."""
+# Checks run in parallel subprocesses; queue and registry writes stay serial.
+SCHEDULER_WORKERS = 4
+
+
+def run(name="", *, now=None, items=None, limit=1, workers=1):
+    """Run due permanent checks with a bounded per-tick budget, not ticket timers.
+
+    ``limit=None`` drains every due group (oldest receipt first). Running one
+    check per daemon tick capped the scheduler near 75 runs/hour against
+    ~450 demanded, so every watch ran ~every 95 min regardless of its
+    interval (OPS-1087). Only the check subprocesses run on ``workers``
+    threads; receipts and failure tickets are recorded in this thread.
+    """
     from . import queue as q, related
     now = time.time() if now is None else now
     items = inventory()[0] if items is None else items
@@ -424,7 +435,7 @@ def run(name="", *, now=None, items=None, limit=1):
             if not name or spec["name"] == name or _execution_key(spec) == wanted:
                 groups.setdefault(_execution_key(spec), []).append((key, bound, original))
         ordered = sorted(groups.values(), key=lambda g: max(b.get("last", {}).get("at", 0) for _, b, _ in g))
-        executed = 0
+        due = []
         for peers in ordered:
             group = [row for row in peers if row[2].get("status") == "closed"]
             if not group:
@@ -433,75 +444,95 @@ def run(name="", *, now=None, items=None, limit=1):
             last_at = max(b.get("last", {}).get("at", 0) for _, b, _ in peers)
             if not name and last_at and now - last_at < spec["every"]:
                 continue
-            result = dict(_execute(spec), at=now)
-            _, representative, _ = max(peers, key=lambda row: (
-                row[1].get("episode", 0), row[1].get("last", {}).get("at", 0)))
-            episode = representative.get("episode", 0)
-            failure_ref = representative.get("failure_ref", "")
-            # An older registry can have the pending receipt without the latch.
-            pending_after_failure = bool(failure_ref and (
-                representative.get("pending_after_failure") or _real_pending(representative.get("last", {}))))
-            first_real_pass = representative.get("first_real_pass", "")
-            failure = None
-            if result["status"] in ("fail", "error"):
-                previous = (by_ref.get(failure_ref) or q.get(failure_ref)) if failure_ref else None
-                # The first binding anchors the key even while its origin is reopened.
-                anchor = peers[0][0]
-                dedupe_key = f"watch:{anchor}:{episode}"
-                predecessor = ""
-                previous_key = (previous or {}).get("dedupe_key", "")
-                # Older registration replacements advanced the episode but
-                # could leave the previous revision's failure ref in place.
-                if previous_key.endswith(f":{episode}"):
-                    # A closed alert covered only the evidence it filed; a check
-                    # that stays red must still surface materially new evidence.
-                    if (pending_after_failure and _new_failure_evidence(previous, result["evidence"])) or (
-                            previous.get("status") == "closed" and _material_change(previous, result["evidence"])):
-                        dedupe_key = f"watch:{anchor}:{episode + 1}"
-                        predecessor = failure_ref
-                    else:
-                        dedupe_key = previous_key
-                origins = ", ".join(original["ref"] for _, _, original in group)
-                names = ", ".join(dict.fromkeys(b["spec"]["name"] for _, b, _ in group))
-                failure = q.enqueue(project=spec["queue"], source="wt-watch",
-                                    dedupe_key=dedupe_key, dedupe_while_active=predecessor,
-                                    title=f"Watch {spec['name']} failed ({spec['origin']})",
-                                    note=f"Originals: {origins}\nCheck: {names}\n"
-                                         f"Command: {spec['command']}\nWhere: {spec['where']}\n"
-                                         f"Evidence: {result['evidence']}{_FAILURE_FOOTER}")
-                if failure["ref"] != failure_ref:
-                    if predecessor:
-                        episode += 1
-                    pending_after_failure = False
-                failure_ref = result["failure_ref"] = failure["ref"]
-            elif result["status"] == "pass":
-                first_real_pass = first_real_pass or q._now_iso()
-                if failure_ref:
-                    episode += 1
-                failure_ref = ""
-                pending_after_failure = False
-            elif failure_ref and _real_pending(result):
-                pending_after_failure = True
-            with _lock():
-                current = _load()
-                for key, bound, original in peers:
-                    # A concurrent explicit replacement invalidates this receipt.
-                    target = current["bindings"].get(key)
-                    if not target or target["spec"]["revision"] != bound["spec"]["revision"]:
-                        continue
-                    target.update(episode=episode, failure_ref=failure_ref, first_real_pass=first_real_pass,
-                                  pending_after_failure=pending_after_failure, last=result)
-                    if original.get("status") == "closed":
-                        results.append(dict(origin=original["ref"], check=bound["spec"]["name"], **result))
-                _save(current)
-            if failure:
-                for _, _, original in group:
-                    related.confirm(failure, original, "earlier-attempt",
-                                    f"Registered check {spec['name']} failed: {result['evidence']}", "watchtower-watch")
-            executed += 1
-            if executed >= limit:
+            due.append((peers, group, spec))
+            if limit is not None and len(due) >= limit:
                 break
+        for (peers, group, spec), result in _execute_all(due, workers):
+            _record(peers, group, spec, dict(result, at=now), by_ref, results, q, related)
     return results
+
+
+def _execute_all(due, workers):
+    """Yield (group, receipt) as checks finish; one slow check delays no other."""
+    def timed(spec):
+        started = time.monotonic()
+        return dict(_execute(spec), took=round(time.monotonic() - started, 1))
+    if workers <= 1 or len(due) <= 1:
+        for row in due:
+            yield row, timed(row[2])
+        return
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="watchtower-check") as pool:
+        futures = {pool.submit(timed, row[2]): row for row in due}
+        for future in as_completed(futures):
+            yield futures[future], future.result()
+
+
+def _record(peers, group, spec, result, by_ref, results, q, related):
+    _, representative, _ = max(peers, key=lambda row: (
+        row[1].get("episode", 0), row[1].get("last", {}).get("at", 0)))
+    episode = representative.get("episode", 0)
+    failure_ref = representative.get("failure_ref", "")
+    # An older registry can have the pending receipt without the latch.
+    pending_after_failure = bool(failure_ref and (
+        representative.get("pending_after_failure") or _real_pending(representative.get("last", {}))))
+    first_real_pass = representative.get("first_real_pass", "")
+    failure = None
+    if result["status"] in ("fail", "error"):
+        previous = (by_ref.get(failure_ref) or q.get(failure_ref)) if failure_ref else None
+        # The first binding anchors the key even while its origin is reopened.
+        anchor = peers[0][0]
+        dedupe_key = f"watch:{anchor}:{episode}"
+        predecessor = ""
+        previous_key = (previous or {}).get("dedupe_key", "")
+        # Older registration replacements advanced the episode but
+        # could leave the previous revision's failure ref in place.
+        if previous_key.endswith(f":{episode}"):
+            # A closed alert covered only the evidence it filed; a check
+            # that stays red must still surface materially new evidence.
+            if (pending_after_failure and _new_failure_evidence(previous, result["evidence"])) or (
+                    previous.get("status") == "closed" and _material_change(previous, result["evidence"])):
+                dedupe_key = f"watch:{anchor}:{episode + 1}"
+                predecessor = failure_ref
+            else:
+                dedupe_key = previous_key
+        origins = ", ".join(original["ref"] for _, _, original in group)
+        names = ", ".join(dict.fromkeys(b["spec"]["name"] for _, b, _ in group))
+        failure = q.enqueue(project=spec["queue"], source="wt-watch",
+                            dedupe_key=dedupe_key, dedupe_while_active=predecessor,
+                            title=f"Watch {spec['name']} failed ({spec['origin']})",
+                            note=f"Originals: {origins}\nCheck: {names}\n"
+                                 f"Command: {spec['command']}\nWhere: {spec['where']}\n"
+                                 f"Evidence: {result['evidence']}{_FAILURE_FOOTER}")
+        if failure["ref"] != failure_ref:
+            if predecessor:
+                episode += 1
+            pending_after_failure = False
+        failure_ref = result["failure_ref"] = failure["ref"]
+    elif result["status"] == "pass":
+        first_real_pass = first_real_pass or q._now_iso()
+        if failure_ref:
+            episode += 1
+        failure_ref = ""
+        pending_after_failure = False
+    elif failure_ref and _real_pending(result):
+        pending_after_failure = True
+    with _lock():
+        current = _load()
+        for key, bound, original in peers:
+            # A concurrent explicit replacement invalidates this receipt.
+            target = current["bindings"].get(key)
+            if not target or target["spec"]["revision"] != bound["spec"]["revision"]:
+                continue
+            target.update(episode=episode, failure_ref=failure_ref, first_real_pass=first_real_pass,
+                          pending_after_failure=pending_after_failure, last=result)
+            if original.get("status") == "closed":
+                results.append(dict(origin=original["ref"], check=bound["spec"]["name"], **result))
+        _save(current)
+    if failure:
+        for _, _, original in group:
+            related.confirm(failure, original, "earlier-attempt",
+                            f"Registered check {spec['name']} failed: {result['evidence']}", "watchtower-watch")
 
 
 _runner = None
@@ -516,7 +547,7 @@ def schedule():
 
     def work():
         try:
-            run()
+            run(limit=None, workers=SCHEDULER_WORKERS)
         except Exception as exc:
             from .queue import _log
             _log("WATCH_ERROR", str(exc)[:200])

@@ -592,3 +592,26 @@ def test_identically_executing_watches_run_once_and_file_one_ticket(env, tmp_pat
     results = watches.run("renamed-check", items=items)
     assert len(calls) == 2 and {r["origin"] for r in results} == {ref, other}
     assert {r["status"] for r in results} == {"pending"}
+
+
+def test_scheduled_pass_runs_every_due_check_not_one_per_tick(env, tmp_path, monkeypatch):
+    """Regression for OPS-1087: one check per daemon tick starved 15-minute watches."""
+    q, cli, _a, _ov, name = env
+    names = [f"due-check-{n}" for n in range(6)]
+    for n, check_name in enumerate(names):
+        receipt = tmp_path / f"receipt{n}.json"
+        receipt.write_text(json.dumps({"status": "pending", "evidence": f"check {n} saw nothing yet"}))
+        command = shlex.join([sys.executable, "-c",
+                              f"from pathlib import Path; print(Path('receipt{n}.json').read_text())"])
+        watches.register(check_name, command=command, cwd=str(tmp_path), where="test host",
+                         schedule="daemon every minute", every=60, queue="WATCH-FAIL")
+    ref = _ticket(q, name)
+    assert cli.main(["close", ref, "--worker", "w1", "--summary", "watching", "--no-code",
+                     *[arg for check_name in names for arg in ("--watch", check_name)]]) == 0
+    # The daemon's GitHub list cache owns live inventory; this test owns scheduling.
+    monkeypatch.setattr(watches, "inventory", lambda: ([q.get(ref)], []))
+    watches.schedule()
+    watches._runner.join(timeout=60)
+    receipts = {b["spec"]["name"]: b.get("last", {}) for b in watches._load()["bindings"].values()}
+    assert {n for n, last in receipts.items() if last.get("status") == "pending"} == set(names)
+    assert q.get(ref)["status"] == "closed"
