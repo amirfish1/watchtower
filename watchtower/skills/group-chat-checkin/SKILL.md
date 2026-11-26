@@ -1,14 +1,13 @@
 ---
-
-Use named ticket refs in prose (`WT-79:add-ticket-subscribe`); JSON keeps the
-bare `ref` and separate `slug`. Commands accept bare refs and stale names.
-
 name: group-chat-checkin
 description: Coordinate parallel sessions for discussion, task execution, and git commits.
 allowed-tools: Read, Edit, Write, Bash
 ---
 
 Coordinate with parallel sessions via a dedicated file per discussion, located in the `group-chats/` directory at the workspace root. Use this to ask questions, propose work division, or safely execute tasks.
+
+Use named ticket refs in prose (`WT-79:add-ticket-subscribe`); JSON keeps the
+bare `ref` and separate `slug`. Commands accept bare refs and stale names.
 
 ## 1. Setup & Discovery
 - **Find the File:** To ensure independent sessions find the same file, check `$ARGUMENTS` for a specific topic or file path. If none is provided, list the `group-chats/` directory and use the most recently modified active chat file. Note that group-chat-checkin is for participating in a chat you have already been added to; to create a new chat and invite a peer by UUID, you cannot create the file manually (as hand-creating a `.md` file yields an orphan with no `name_map`, no registered participants, and no CCC wakeups). Instead, you must use the CCC API endpoint `POST /api/group-chat/create` (or the CCC UI at `http://127.0.0.1:8090`).
