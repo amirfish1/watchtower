@@ -530,7 +530,8 @@ def _record(peers, group, spec, result, by_ref, results, q, related):
                 results.append(dict(origin=original["ref"], check=bound["spec"]["name"], **result))
         _save(current)
     if failure:
-        for _, _, original in group:
+        # A failure ticket closed with this same watch is one of its origins.
+        for _, _, original in (row for row in group if row[2]["ref"] != failure["ref"]):
             related.confirm(failure, original, "earlier-attempt",
                             f"Registered check {spec['name']} failed: {result['evidence']}", "watchtower-watch")
 

@@ -615,3 +615,15 @@ def test_scheduled_pass_runs_every_due_check_not_one_per_tick(env, tmp_path, mon
     receipts = {b["spec"]["name"]: b.get("last", {}) for b in watches._load()["bindings"].values()}
     assert {n for n, last in receipts.items() if last.get("status") == "pending"} == set(names)
     assert q.get(ref)["status"] == "closed"
+
+
+def test_red_watch_on_its_own_closed_failure_ticket_does_not_abort_the_pass(env, tmp_path):
+    """Regression for OPS-1087: linking a failure ticket to itself raised mid-drain."""
+    q, cli, _a, _ov, _name = env
+    check(tmp_path, {"status": "fail", "real_data": True, "evidence": "same diagnostic"})
+    ref = close(env, tmp_path)
+    failure = watches.run("natural-check", items=[q.get(ref)])[0]["failure_ref"]
+    assert cli.main(["close", failure, "--worker", "w1", "--summary", "Investigated; watching", "--no-code",
+                     "--watch", "natural-check"]) == 0
+    again = watches.run("natural-check", items=[q.get(ref), q.get(failure)])
+    assert {row["failure_ref"] for row in again} == {failure}
