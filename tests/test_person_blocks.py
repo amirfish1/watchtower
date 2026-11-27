@@ -436,3 +436,22 @@ def test_expired_github_person_claim_parks_without_answering_or_losing_gate(env,
     else:
         assert result is None
         assert q.get(ref)['claimed_by']=='w1'
+
+
+@pytest.mark.parametrize('files_idle_s,expected', [(1500, 'pass'), (1800 + 600 + 60, 'fail')])
+def test_audit_spares_dead_local_claim_inside_backstop_window(wt_env, monkeypatch, files_idle_s, expected):
+    """OPS-1098: the backstop parks a dead local claim only after its session files are
+    idle for stall_s; the audit must not call a claim stale while recovery still protects it."""
+    import runpy, time
+    from pathlib import Path
+    from watchtower import liveness as lv, watches, config, queue as q
+    item = dict(ref='AUDIT-1', project='AUDIT', status='in_progress', claimed_by='worker',
+                needs_input=True, block_question='Approve the exact proposed operation?', wait={'on': 'owner'},
+                claimed_machine=q.machine_tag(), claimed_session_id='bound-session',
+                claimed_at='2000-01-01T00:00:00Z', updated_at='2000-01-01T00:00:00Z')
+    monkeypatch.setattr(watches, 'inventory', lambda: ([item], []))
+    monkeypatch.setattr(config, 'ticket_is_archived', lambda i: False)
+    monkeypatch.setattr(lv, 'claim_owner', lambda i, ctx: lv.Verdict('dead', '', 'process gone', None))
+    monkeypatch.setattr(lv, '_file_activity', lambda i, ctx: time.time() - files_idle_s)
+    audit = runpy.run_path(str(Path(__file__).resolve().parents[1]/'scripts/audit-no-parking.py'))['audit']
+    assert audit()['status'] == expected

@@ -7,6 +7,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from watchtower import config, liveness, queue as q, watches
 
+SWEEP_SLACK_S = 600
+
 
 def audit():
     items, coverage = watches.inventory()
@@ -38,7 +40,12 @@ def audit():
                     violations.append(dict(ref=ref, reason='stale foreign claim signal; owning-host proof required, not proof of death'))
             else:
                 verdict = liveness.claim_owner(item, ctx)
-                if verdict.verdict != 'alive':
+                # The backstop retires a dead local claim only once its store AND
+                # session files have been idle for stall_s (liveness.assess). Until
+                # then, plus one sweep of slack, the claim is protected, not stale:
+                # BECKY-3904 was flagged at 1509 s idle and parked at 1844 s (OPS-1098).
+                idle = ctx.now - max(liveness._store_activity(item), liveness._file_activity(item, ctx))
+                if verdict.verdict != 'alive' and idle > liveness.stall_s() + SWEEP_SLACK_S:
                     violations.append(dict(ref=ref, reason='stale local claim: '+verdict.evidence))
     stale = [c for c in coverage if c['source'].endswith(':open') and (c['missing'] or c['stale'])]
     return dict(status='fail' if violations else 'pending' if stale else 'pass', real_data=True,
