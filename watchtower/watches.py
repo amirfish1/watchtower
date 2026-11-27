@@ -136,6 +136,17 @@ def register(name, *, command, cwd, where, schedule, queue, every=300,
     return spec
 
 
+def revision_registered_at(data, name):
+    """When the check's CURRENT revision was registered, or None.
+
+    A replacement resets every binding's receipt, so a not-yet-run revision
+    is timed from its replacement, not the first registration (OPS-1099).
+    """
+    revisions = data.get("revisions", {}).get(name) or []
+    return max([r.get("replaced_at") or 0 for r in revisions]
+               + [data.get("registered_at", {}).get(name) or 0]) or None
+
+
 def snapshots(names, ref):
     """Validate before close; include runnable specification in the resolution."""
     with _lock():
@@ -283,7 +294,7 @@ def owner_rows(items, project="", *, source_warnings=None):
             if bound["spec"]["name"] in data["checks"]:
                 continue
             candidates[key] = dict(bound, source_host=host, source_warning=warning,
-                                   registered_at=remote.get("registered_at", {}).get(bound["spec"]["name"]))
+                                   registered_at=revision_registered_at(remote, bound["spec"]["name"]))
     rows = []
     for bound in candidates.values():
         spec = bound["spec"]
@@ -294,7 +305,7 @@ def owner_rows(items, project="", *, source_warnings=None):
         last = bound.get("last") or {"status": "not-run"}
         if bound.get("first_real_pass") and last["status"] not in ("error", "fail") and not bound.get("source_warning"):
             continue
-        registered = bound.get("registered_at") or data.get("registered_at", {}).get(spec["name"])
+        registered = bound.get("registered_at") or revision_registered_at(data, spec["name"])
         if not registered:
             try:
                 registered = dt.datetime.fromisoformat(bound.get("attached_at", "").replace("Z", "+00:00")).timestamp()

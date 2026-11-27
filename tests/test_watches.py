@@ -415,6 +415,23 @@ def test_never_run_overdue_flag_reaches_owner_render_and_digest(env, tmp_path, m
     assert any('OVERDUE' in w for w in view['warnings'])
 
 
+def test_replaced_check_overdue_clock_starts_at_its_replacement(env, tmp_path, monkeypatch):
+    """Regression for OPS-1099: a replacement must not read as 'never ran' for days."""
+    q, *_ = env
+    check(tmp_path)
+    item = q.get(close(env, tmp_path))
+    data = watches._load()
+    kwargs = {k: data['checks']['natural-check'][k] for k in ('command', 'cwd', 'where', 'schedule', 'queue', 'every')}
+    replaced = data['registered_at']['natural-check'] + 86400
+    monkeypatch.setattr(watches.time, 'time', lambda: replaced)
+    watches.register('natural-check', **dict(kwargs, schedule='revised bounds'), replace=True, reason='new bounds')
+    assert watches.revision_registered_at(watches._load(), 'natural-check') == replaced
+    monkeypatch.setattr(watches.time, 'time', lambda: replaced + 119)
+    assert not watches.owner_rows([item])[0]['overdue']
+    monkeypatch.setattr(watches.time, 'time', lambda: replaced + 120)
+    assert watches.owner_rows([item])[0]['overdue']
+
+
 def test_replacement_cli_requires_reason_and_preserves_execution_authority(env, tmp_path):
     _q, cli, *_ = env
     check(tmp_path)
