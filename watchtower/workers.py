@@ -3845,6 +3845,37 @@ def _clear_launch_failure(queue: str, engine: str) -> None:
         _save_launch_failures(data)
 
 
+def prune_stale_launch_failures(now: Optional[float] = None) -> List[str]:
+    """Drop every launch-failure record that no longer means anything.
+
+    ``active_launch_failure_cooldown`` prunes a record only when something
+    asks about that exact queue/engine. A queue that moved off the failing
+    engine (the fleet switched Codex -> Claude after Codex rejected
+    gpt-6.2-sol, WATCHTOWER-8) never asks again, so its record stayed in
+    launch-failures.json indefinitely -- and CCC's Queue panel treats a
+    present record as an open launch alert, so a two-day-old, resolved
+    incident kept being filed for investigation. Applies the same rule as the
+    on-demand prune: the cooldown has ended AND the failure is outside the
+    streak window. Returns the dropped keys."""
+    now = time.time() if now is None else now
+    data = _load_launch_failures()
+    dropped: List[str] = []
+    for key, rec in list(data.items()):
+        if not isinstance(rec, dict):
+            continue
+        try:
+            until = float(rec.get("cooldown_until") or 0)
+        except (TypeError, ValueError):
+            until = 0.0
+        if until > now or _recent_failure_streak(rec, now):
+            continue
+        data.pop(key, None)
+        dropped.append(key)
+    if dropped:
+        _save_launch_failures(data)
+    return dropped
+
+
 def _record_launch_failure(
     *,
     queue: str,
@@ -7343,6 +7374,7 @@ def _reconcile_once_locked(dry_run: bool = False,
                               "backfilled": [],
                               "session_title_backfilled": [],
                               "ledger_backfilled": [],
+                              "launch_failures_pruned": [],
                               "launch_failed": [], "fallbacks": [],
                               "parked": [], "unparked": [],
                               "spawn_plans": [],
@@ -7520,6 +7552,13 @@ def _reconcile_once_locked(dry_run: bool = False,
         # ledger (and therefore CCC's worker views) complete anyway.
         try:
             result["ledger_backfilled"] = backfill_worker_session_ledger()
+        except Exception:
+            pass
+        # Expired launch-failure records for engines a queue no longer uses
+        # are never re-checked per queue; sweep them so CCC stops showing a
+        # resolved incident as an open alert (WATCHTOWER-8).
+        try:
+            result["launch_failures_pruned"] = prune_stale_launch_failures()
         except Exception:
             pass
 

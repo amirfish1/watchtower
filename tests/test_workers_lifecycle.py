@@ -1390,6 +1390,39 @@ def test_stale_failure_record_does_not_inherit_a_streak(wt):
     assert _fail(wt)["consecutive"] == 1
 
 
+def test_sweep_drops_stale_records_for_engines_no_queue_asks_about(wt):
+    """WATCHTOWER-8: a queue moved off Codex never re-checks its codex record,
+    so the reconciler sweep must drop it once cooldown and streak window end,
+    while keeping records that are still cooling or still inside the window."""
+    now = time.time()
+    old = now - (wt.workers._LAUNCH_FAILURE_STREAK_WINDOW_S + 60)
+    data = {
+        "OPS:codex": {"queue": "OPS", "engine": "codex", "consecutive": 17,
+                      "failed_at": old, "cooldown_until": old + 3600},
+        "WT:codex": {"queue": "WT", "engine": "codex", "consecutive": 2,
+                     "failed_at": now - 600, "cooldown_until": now - 1},
+        "BECKY:codex": {"queue": "BECKY", "engine": "codex", "consecutive": 5,
+                        "failed_at": old, "cooldown_until": now + 3600},
+    }
+    (wt.tmp / "launch-failures.json").write_text(json.dumps(data))
+
+    assert wt.workers.prune_stale_launch_failures(now=now) == ["OPS:codex"]
+    left = json.loads((wt.tmp / "launch-failures.json").read_text())
+    assert set(left) == {"WT:codex", "BECKY:codex"}
+    assert wt.workers.prune_stale_launch_failures(now=now) == []
+
+
+def test_reconcile_tick_sweeps_stale_launch_failures(wt):
+    old = time.time() - (wt.workers._LAUNCH_FAILURE_STREAK_WINDOW_S + 60)
+    (wt.tmp / "launch-failures.json").write_text(json.dumps({
+        "OPS:codex": {"queue": "OPS", "engine": "codex", "consecutive": 17,
+                      "failed_at": old, "cooldown_until": old + 3600},
+    }))
+    result = wt.workers.reconcile_once()
+    assert result["launch_failures_pruned"] == ["OPS:codex"]
+    assert json.loads((wt.tmp / "launch-failures.json").read_text()) == {}
+
+
 def test_established_session_clears_the_failure_streak(wt):
     """A worker that reaches a session proves the engine works again."""
     _fail(wt)
