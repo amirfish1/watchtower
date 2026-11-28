@@ -199,8 +199,13 @@ def test_non_claude_engines_need_ps_and_transcript(wt, procs, monkeypatch, engin
     monkeypatch.setattr(lv, "ps_argv", lambda: None)
     v = _owner(wt, ref)
     assert v.verdict == "unproven" and "ps scan failed" in v.evidence
+    # WT-127: the session itself running (argv identity) is alive; a
+    # process that merely mentions the id leaves death unproven.
     monkeypatch.setattr(lv, "ps_argv", lambda: [f"{engine} resume {SID}"])
-    assert "still names the session" in _owner(wt, ref).evidence
+    assert _owner(wt, ref)[:2] == ("alive", "session_process")
+    monkeypatch.setattr(lv, "ps_argv", lambda: [f"tail -f /tmp/{SID}.jsonl"])
+    v = _owner(wt, ref)
+    assert v.verdict == "unproven" and "still names the session" in v.evidence
     monkeypatch.setattr(lv, "ps_argv", lambda: ["bash"])
     monkeypatch.setattr(lv, "_transcript_mtime", lambda e, s: 0.0)
     assert "transcript not found" in _owner(wt, ref).evidence

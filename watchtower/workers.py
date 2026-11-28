@@ -6246,7 +6246,7 @@ def _effective_resume(resume: Dict[str, Any], now: float) -> Tuple[str, str, flo
 
 
 def _builder_held(it: Dict[str, Any], wid: str, live_ids: set,
-                  live_sessions: set, now: float) -> bool:
+                  live_sessions: set, now: float, ctx: Any = None) -> bool:
     """True while the ticket's builder/resume still shows evidence of life."""
     sid = str(it.get("claimed_session_id") or "")
     if wid and wid in live_ids:
@@ -6257,6 +6257,15 @@ def _builder_held(it: Dict[str, Any], wid: str, live_ids: set,
     try:
         if sid and messages.live_resume_child(sid):
             return True                               # (c)
+    except Exception:
+        pass
+    # (c2) WT-127: a live process whose argv identity is this session, from
+    # any parent. The resume ledger above only knows WatchTower's own
+    # children; a CCC-hosted resume waiting quietly is just as alive.
+    try:
+        from . import liveness as _liveness
+        if sid and _liveness.session_process_live(it, ctx or _liveness.ResolverContext(now)):
+            return True
     except Exception:
         pass
     resume = it.get("resume") if isinstance(it.get("resume"), dict) else None
@@ -6380,7 +6389,7 @@ def requeue_orphaned_tickets(
                 continue  # stage (WT-24) or never a spawned worker (OPS-104)
         if claimer and claimer in live_ids:
             continue  # its worker is alive — leave it
-        if _builder_held(it, wid, live_ids, live_sessions, now):
+        if _builder_held(it, wid, live_ids, live_sessions, now, ctx):
             continue
         # Grace window guards against a just-claimed ticket whose worker record
         # hasn't been written yet (spawn/claim race). A reject reclaim cannot

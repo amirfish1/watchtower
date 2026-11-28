@@ -748,6 +748,44 @@ def _engine_checks(cp: Dict[str, Any], sid: str, died_at: float,
     return ""
 
 
+# Engine executables whose argv can carry a session identity, and the flags
+# (or codex's ``resume`` subcommand) that name it. A process matching both is
+# the session itself, whoever launched it: a WT worker, a WT resume child, or
+# a CCC-hosted ``claude -p --resume <sid>`` (WT-127).
+_SESSION_ENGINES = ("claude", "codex", "kimi")
+_SESSION_FLAGS = ("--resume", "-r", "--session-id", "resume")
+
+
+def argv_names_session(command: str, sid: str) -> bool:
+    """True when ``command`` is an engine process whose argv identity is
+    ``sid``. A shell loop, grep or ``tail`` merely mentioning the id is not."""
+    if not sid:
+        return False
+    tokens = str(command or "").split()
+    if not tokens or tokens[0].rsplit("/", 1)[-1] not in _SESSION_ENGINES:
+        return False
+    for i, tok in enumerate(tokens[1:], 1):
+        if tok in _SESSION_FLAGS and i + 1 < len(tokens) and tokens[i + 1] == sid:
+            return True
+        if any(tok == f"{flag}={sid}" for flag in _SESSION_FLAGS if flag.startswith("--")):
+            return True
+    return False
+
+
+def session_process_live(item: Dict[str, Any], ctx: ResolverContext) -> bool:
+    """A live process on this host runs the claim's session (WT-127).
+
+    Covers sessions no WatchTower record or resume ledger knows about, such
+    as a CCC-hosted resume blocked in a long background wait whose
+    transcript has gone quiet. A claim recorded on another host is never
+    proven from this host's process table."""
+    sid = str(item.get("claimed_session_id") or "")
+    if not sid or _foreign_host(item):
+        return False
+    argv = ctx.ps()
+    return bool(argv) and any(argv_names_session(line, sid) for line in argv)
+
+
 def _bound_session_working(item: Dict[str, Any], ctx: ResolverContext) -> str:
     """Proof source when a claim with no ``claim_proc`` (a GitHub-backed claim,
     or a legacy local one) is held by a native session bound to this exact
@@ -764,6 +802,8 @@ def _bound_session_working(item: Dict[str, Any], ctx: ResolverContext) -> str:
     machine = str(item.get("claimed_machine") or "")
     if machine and machine != q.machine_tag():
         return ""
+    if session_process_live(item, ctx):
+        return "session_process"
     if q._hosted_codex_thread_owns_worker(wid, sid):
         source, engine = "hosted_codex_thread", "codex"
     else:
@@ -1074,6 +1114,10 @@ def claim_owner(item: Dict[str, Any], ctx: Optional[ResolverContext] = None) -> 
     sid = str(cp.get("session_id") or item.get("claimed_session_id") or "")
     if sid and _registry_alive(sid):
         return Verdict("alive", "claude_registry", "", cp)
+    if sid and session_process_live(dict(item, claimed_session_id=sid), ctx):
+        # WT-127: the bound pid can be gone while the session runs on in a
+        # resume no record knows (e.g. CCC-hosted), quietly waiting.
+        return Verdict("alive", "session_process", "", cp)
     if sid and any(w.get("alive") and str(w.get("session_id") or "") == sid
                    and workers.record_liveness(w)[0] == "alive" for w in ctx.rows()):
         return Verdict("alive", "wt_record", "", cp)

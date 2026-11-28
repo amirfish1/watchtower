@@ -1349,3 +1349,53 @@ def test_unobserved_claim_does_not_expire_when_process_scan_fails(lv,monkeypatch
     monkeypatch.setattr(lv.liveness.ResolverContext,'ps',lambda ctx:None)
     assert _sweep(lv)==[]
     assert lv.q.get(ref)['claimed_by']=='legacy-worker'
+
+
+def test_requeue_preserves_github_claim_held_by_live_unledgered_resume(lv, monkeypatch):
+    """WT-127: a GitHub claim whose session lives on in a CCC-hosted
+    ``claude -p --resume <sid>`` (no WT record, not in the resume ledger),
+    blocked in a long background wait so its transcript is quiet for more
+    than RECENT_SESSION_S, is alive: no recovery request is routed."""
+    lv.worker()
+    ref = _claimed(lv)
+    lv.kill()
+    monkeypatch.setattr(lv.liveness, "_github", lambda project: True)
+    reopened, routes = [], []
+    monkeypatch.setattr(lv.q, "update_status",
+                        lambda r, status, **kw: reopened.append(r) or {"ref": r})
+    monkeypatch.setattr(lv.q, "enqueue", lambda **k: routes.append(k) or {"ref": "OPS-1"})
+    base = time.time()
+    monkeypatch.setattr(time, "time", lambda: base + 3600)
+    monkeypatch.setattr(lv.liveness, "_file_activity", lambda it, ctx: base - 3600)
+    resume = (f"/home/u/.local/bin/claude -p --resume {SID} --input-format stream-json "
+              f"--output-format stream-json --verbose")
+    loop = (f"/bin/bash -c until git merge-base --is-ancestor abc origin/main; "
+            f"do sleep 60; done # {SID}")
+    argv = [resume, loop]
+    monkeypatch.setattr(lv.liveness, "ps_argv", lambda: list(argv))
+
+    assert lv.workers.requeue_orphaned_tickets() == [] and reopened == [] and routes == []
+    # The backstop's claim_owner proves the same session alive.
+    item = lv.q.get(ref)
+    assert lv.liveness.claim_owner(
+        dict(item, claim_proc=None), lv.liveness.ResolverContext()).verdict == "alive"
+    # A process merely mentioning the id (shell loop, grep, tail) is not the
+    # session: once the resume exits the quiet claim is routed as before.
+    argv.remove(resume)
+    assert lv.workers.requeue_orphaned_tickets() == [] and reopened == []
+    assert len(routes) == 1 and f"wt release {ref}`" in routes[0]["text"]
+
+
+@pytest.mark.parametrize("command,expected", [
+    (f"/usr/local/bin/claude -p --resume {SID} --verbose", True),
+    (f"claude --resume={SID}", True),
+    (f"claude --session-id {SID} -p", True),
+    (f"/opt/codex exec resume {SID}", True),
+    (f"claude -p --resume {SID2}", False),
+    (f"tail -f /home/u/.claude/projects/x/{SID}.jsonl", False),
+    (f"grep --resume {SID}", False),
+    (f"[claude] <defunct>", False),
+    ("", False),
+])
+def test_argv_names_session(lv, command, expected):
+    assert lv.liveness.argv_names_session(command, SID) is expected
