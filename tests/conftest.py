@@ -223,6 +223,20 @@ def reset_gh_quota_cache():
     github_backend._GH_GRAPHQL_QUOTA_CACHE.update(empty)
 
 
+@pytest.fixture(autouse=True)
+def daemon_memo_ttls_off(monkeypatch):
+    """OPS-1126: a test that runs the daemon loop in-process turns on the
+    daemon's memo TTLs (cli.DAEMON_MEMO_TTLS), which are process globals in
+    modules no fixture reloads. Left on, the next test inside the window read
+    the previous test's GitHub pipeline sidecar and observation paths."""
+    import importlib
+
+    from watchtower import cli
+
+    for module, attr, _ttl in cli.DAEMON_MEMO_TTLS:
+        monkeypatch.setattr(importlib.import_module(f"watchtower.{module}"), attr, 0.0)
+
+
 # Every path-ish knob WatchTower reads from the environment. Redirecting all of
 # them is what makes a test hermetic; missing one means a test writes into
 # ~/.watchtower on a live fleet machine.

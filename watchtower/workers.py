@@ -3851,7 +3851,7 @@ def prune_stale_launch_failures(now: Optional[float] = None) -> List[str]:
     ``active_launch_failure_cooldown`` prunes a record only when something
     asks about that exact queue/engine. A queue that moved off the failing
     engine (the fleet switched Codex -> Claude after Codex rejected
-    gpt-6.2-sol, WATCHTOWER-8) never asks again, so its record stayed in
+    ``gpt-6.2-sol``, WATCHTOWER-8) never asks again, so its record stayed in
     launch-failures.json indefinitely -- and CCC's Queue panel treats a
     present record as an open launch alert, so a two-day-old, resolved
     incident kept being filed for investigation. Applies the same rule as the

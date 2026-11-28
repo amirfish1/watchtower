@@ -6350,6 +6350,24 @@ def _daemon_loop(args: argparse.Namespace) -> None:
         gh_poller_stop.set()
 
 
+# Memo TTLs only the long-lived daemon enables (WT-122); every other process
+# keeps each module's 0 default. They are process globals, so the test suite
+# pins them back to 0 around every test that runs the daemon loop in-process
+# (OPS-1126: a leaked 1 s pipeline TTL served one test's sidecar to the next).
+DAEMON_MEMO_TTLS = (
+    ("config", "STAT_TTL_S", 1.0),
+    ("github_pipeline", "STAT_TTL_S", 1.0),
+    ("observations", "PATHS_TTL_S", 60.0),
+    ("workers", "PID_ALIVE_TTL_S", 1.0),
+)
+
+
+def _enable_daemon_memo_ttls() -> None:
+    import importlib
+    for module, attr, ttl in DAEMON_MEMO_TTLS:
+        setattr(importlib.import_module(f"{__package__}.{module}"), attr, ttl)
+
+
 def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     # Read before anything can move the tree, so "what this process imported"
     # is compared with "what is installed" on every deploy tick below.
@@ -6383,14 +6401,7 @@ def _daemon_loop_ticks(args: argparse.Namespace) -> None:
     except Exception:
         pass
     last_config_sanitize = 0.0  # 0 -> the first tick below heals at daemon start
-    from . import config as _config_mod
-    _config_mod.STAT_TTL_S = 1.0  # see config.STAT_TTL_S (WT-122)
-    from . import github_pipeline as _pipeline_mod
-    _pipeline_mod.STAT_TTL_S = 1.0  # see github_pipeline.STAT_TTL_S (WT-122)
-    from . import observations as _observations_mod
-    _observations_mod.PATHS_TTL_S = 60.0  # see observations.PATHS_TTL_S (WT-122)
-    from . import workers as _workers_mod
-    _workers_mod.PID_ALIVE_TTL_S = 1.0  # see workers.PID_ALIVE_TTL_S (WT-122)
+    _enable_daemon_memo_ttls()
     tick_profiler = _TickProfiler()
     while True:
         tick_profiler.tick()
